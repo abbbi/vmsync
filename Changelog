@@ -1,0 +1,112 @@
+Version 0.21
+-----------
+ * Add -target-disk-path parameter: place disks on target system on different
+ path, adjust domain xml accordingly.
+
+Version 0.20
+-----------
+ * Small code cleanups
+
+Version 0.19
+-----------
+ * Check for active block job on source domain before attempting to start any
+ other operation, fail early in case an already existing block job
+ is running and abort.
+
+Version 0.18
+-----------
+ * Add version and parameter to log output.
+
+Version 0.17
+-----------
+ * Set cleanup commands before waiting for NBD endpoint to appear,
+ so qemu-nbd processes are stopped even if NBD connection might
+ fail due to network constraints.
+
+Version 0.16
+-----------
+ * Parse disc discard mode from libvirt disk xml and use it for the target nbd
+ server.
+ * Use original cluster_size of qemu images for the target images.
+
+Version 0.15
+-----------
+ * Re-Define VM with new configuration on the target system after each
+ synchronization so the vm configuration does always represent the verison
+ from the source system.
+ * Add builds for Debian related distros.
+
+Version 0.14
+-----------
+ * Colorize log output, can be disabled by using NO_COLOR environment
+ variable.
+ * If VM is started in pause mode, skip attempt to freeze filesystems as
+ qemu agent is not reachable in these cases.
+
+Version 0.13
+-----------
+ * Add -start option: if VM is not running, start in PAUSED mode to allow
+ replication, destroy after replication has finished.
+
+Version 0.12
+-----------
+ * Use multiple concurrent processes for syncing, one worker for each disk.
+
+Version 0.11
+-----------
+ * rework logging facility
+
+Version 0.10
+-----------
+ * use libvirt.org/libvirtxml for parsing or modifying domain XML in case
+ different name should be used.
+ * move some logging statement so debug (enabled via -debug true)
+ * Code cleanups
+ * Thaw freezed filesystems if checkpoint creation fails.
+
+Version 0.9
+-----------
+ * Use temporary images for incremental sync on target system with pointing to
+ the full sync as base image. After successfull copy of the changed regions,
+ commit the changes to the base image and remove the temporary qcow file.
+
+Version 0.8
+-----------
+ * Get nbd maximum request size from source and target and use one that
+ both backends support.
+ * Enable pprof endpoint if PROFILE=development is set.
+ * Start qemu-nbd process on target using --discard=unmap
+
+Version 0.7
+-----------
+ * Add filesystem freeze/thaw functions using qemu guest agent, issue warning
+ in case action fails.
+ * Change wording for stopping the backup job
+
+Version 0.6
+-----------
+ * Remove obsolete -output-dir option
+
+Version 0.5
+-----------
+ * Log skipped devices
+
+Version 0.4
+-----------
+ * Delete parent checkpoints if sync is successfull, keep only one checkpoint
+ defined for source VM which will then be synced on next execution.
+
+Version 0.3
+-----------
+ * Fix throughput shown after change to slog
+ * Do not attempt any action on target system in case no dirty extents are
+ found during copy.
+
+Version 0.2
+-----------
+ * Check if source domain is running before attempting sync
+ * Use slog for logging
+
+Version 0.1
+-----------
+ * Inital Release
