@@ -1,0 +1,38 @@
+ARG DEBIAN_VERSION=trixie
+ARG GO_VERSION=1.25.0
+
+FROM golang:${GO_VERSION} AS go-toolchain
+
+FROM debian:${DEBIAN_VERSION} AS build
+ARG TARGETARCH=amd64
+
+RUN apt-get update -y && \
+    apt-get  -qy install \
+      ca-certificates \
+      gcc \
+      git \
+      libnbd-dev \
+      libvirt-dev \
+      libc6-dev \
+      make && \
+      mkdir -p /tmp/go/src/ && \
+    apt-get clean
+
+COPY --from=go-toolchain /usr/local/go /usr/local/go
+COPY --exclude=vmsync_* --exclude=.git --exclude=go.sum --exclude=go.mod . /tmp/go/src
+WORKDIR /tmp/go/src/
+
+ENV PATH="/usr/local/go/bin:${PATH}"
+RUN GOOS=linux GOARCH=${TARGETARCH} go mod init vmsync && go mod tidy && go build -o /out/vmsync ./cmd/vmsync/
+
+FROM build AS package
+ARG DEBIAN_VERSION
+ARG TARGETARCH
+RUN arch="${TARGETARCH}" && \
+    if [ "${arch}" = "amd64" ]; then arch="x86_64"; fi && \
+    out="/export/vmsync_debian_${DEBIAN_VERSION}_${arch}" && \
+    mkdir -p "${out}" && \
+    cp /out/vmsync "${out}/vmsync"
+
+FROM scratch AS artifact
+COPY --from=package /export/ /
