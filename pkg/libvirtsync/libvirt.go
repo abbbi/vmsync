@@ -35,6 +35,11 @@ import (
 
 const CheckpointPrefix = "vmsync-cpt"
 
+const (
+	metadataStart = `<vmsync:last_checkpoint xmlns:vmsync="vmsync">`
+	metadataEnd   = `</vmsync:last_checkpoint>`
+)
+
 type Manager struct {
 	Conn *libvirt.Connect
 	URI  string
@@ -217,6 +222,36 @@ func replaceDomainName(domainXML, name string) (string, error) {
 	}
 
 	return changed, nil
+}
+
+func AddMetadata(domainXML string, checkpoint string) (string, error) {
+	domcfg := &libvirtxml.Domain{}
+	err := domcfg.Unmarshal(domainXML)
+	if err != nil {
+		return "", err
+	}
+
+	entry := metadataEntry(checkpoint)
+	if domcfg.Metadata == nil {
+		domcfg.Metadata = &libvirtxml.DomainMetadata{XML: entry}
+	} else if !strings.Contains(domcfg.Metadata.XML, `<vmsync:last_checkpoint`) {
+		domcfg.Metadata.XML += entry
+	}
+
+	changed, err := domcfg.Marshal()
+	if err != nil {
+		return "", err
+	}
+
+	return changed, nil
+}
+
+func metadataEntry(checkpoint string) string {
+	var b strings.Builder
+	b.WriteString(metadataStart)
+	_ = xml.EscapeText(&b, []byte(checkpoint))
+	b.WriteString(metadataEnd)
+	return b.String()
 }
 
 func stripDomainUUID(domainXML string) string {
