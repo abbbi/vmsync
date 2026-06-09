@@ -355,6 +355,7 @@ func run(cfg struct {
 	}
 
 	tgtDom, err := tgtMgr.LookupDomain(cfg.TargetDomain)
+	var metadataEntry string
 	if err != nil {
 		if parent == "" {
 			trace.Info("Domain does not exist on target system")
@@ -375,13 +376,26 @@ func run(cfg struct {
 			return fmt.Errorf("read source domain xml: %w", err)
 		}
 
-		metadataEntry, err := libvirtsync.ParseMetadata(tgtXML)
+		metadataEntry, err = libvirtsync.ParseMetadata(tgtXML)
 		if err != nil {
 			trace.Warning("unable to prase target domain metadata entry")
 		} else {
 			trace.Info("Target domain metadata", "checkpoint", metadataEntry)
 		}
 		defer tgtDom.Free()
+	}
+
+	if parent == "" {
+		trace.Info("created initial", "checkpoint", checkpointName)
+	} else {
+		if metadataEntry != "" {
+			if metadataEntry != parent {
+				return fmt.Errorf("checkpoint inconsistency detected: target VM definition lists [%s] as parent checkpoint, but parent checkpoint defined is [%s]", metadataEntry, parent)
+			} else {
+				trace.Info("Successfully verified checkpoint chain")
+			}
+		}
+		trace.Info("creating incremental", "checkpoint", checkpointName, "parent", parent)
 	}
 
 	if srcState {
@@ -399,13 +413,6 @@ func run(cfg struct {
 		libvirtsync.ThawFs(srcDom, freezed)
 		return err
 	}
-
-	if parent == "" {
-		trace.Info("created initial", "checkpoint", checkpointName)
-	} else {
-		trace.Info("created incremental", "checkpoint", checkpointName, "parent", parent)
-	}
-
 	libvirtsync.ThawFs(srcDom, freezed)
 
 	defer func() {
