@@ -591,9 +591,11 @@ func run(cfg struct {
 		}
 	}
 	trace.Info("Adding metadata information")
-	newXML, err := libvirtsync.AddMetadata(srcXML, checkpointName)
+	var newXML string
+	newXML, err = libvirtsync.AddMetadata(srcXML, checkpointName)
 	if err != nil {
 		trace.Warning("Unable to add metadata info", err)
+		newXML = srcXML
 	}
 
 	if err := libvirtsync.DefineDomain(tgtMgr, cfg.TargetDomain, newXML, cfg.TargetDiskPath); err != nil {
