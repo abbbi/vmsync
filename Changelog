@@ -2,10 +2,11 @@ Version 0.23
 -----------
  * Add information about last checkpoint used for sync and timestamp to the
  target virtual machine XML metadata values.
- * On incremental syncs, verify the checkpoint chain is in line (by using the
- values from the metadata fields), use the timestamp value from the metadata
- field to also check if files have been changed since the last
- synchronization. Fail if both cases happen
+ * On incremental syncs, verify the checkpoint chain is in line , use the
+ timestamp value from the metadata field to also check if files have been
+ changed since the last synchronization. Fail if both cases happen.
+ Note: The system clocks of both systems involved must be synchronized
+ correctly, for example with NTP.
 
 Version 0.21
 -----------
