@@ -246,12 +246,45 @@ func AddMetadata(domainXML string, checkpoint string) (string, error) {
 	return changed, nil
 }
 
+func ParseMetadata(domainXML string) (string, error) {
+	domcfg := &libvirtxml.Domain{}
+	err := domcfg.Unmarshal(domainXML)
+	if err != nil {
+		return "", err
+	}
+	if domcfg.Metadata == nil {
+		return "", nil
+	}
+
+	return parseMetadataValue(domcfg.Metadata.XML), nil
+}
+
 func metadataEntry(checkpoint string) string {
 	var b strings.Builder
 	b.WriteString(metadataStart)
 	_ = xml.EscapeText(&b, []byte(checkpoint))
 	b.WriteString(metadataEnd)
 	return b.String()
+}
+
+func parseMetadataValue(metadataXML string) string {
+	decoder := xml.NewDecoder(strings.NewReader("<metadata>" + metadataXML + "</metadata>"))
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return ""
+		}
+		start, ok := token.(xml.StartElement)
+		if !ok || start.Name.Space != "vmsync" || start.Name.Local != "last_checkpoint" {
+			continue
+		}
+
+		var value string
+		if err := decoder.DecodeElement(&value, &start); err != nil {
+			return ""
+		}
+		return value
+	}
 }
 
 func stripDomainUUID(domainXML string) string {

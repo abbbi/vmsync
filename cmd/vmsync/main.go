@@ -368,6 +368,19 @@ func run(cfg struct {
 		if tgtState == true {
 			return fmt.Errorf("target domain %s is active require shutoff before sync", cfg.TargetDomain)
 		}
+		trace.Info("Target domain exists, parse metadata info")
+
+		tgtXML, err := tgtDom.GetXMLDesc(0)
+		if err != nil {
+			return fmt.Errorf("read source domain xml: %w", err)
+		}
+
+		metadataEntry, err := libvirtsync.ParseMetadata(tgtXML)
+		if err != nil {
+			trace.Warning("unable to prase target domain metadata entry")
+		} else {
+			trace.Info("Target domain metadata", "checkpoint", metadataEntry)
+		}
 		defer tgtDom.Free()
 	}
 
