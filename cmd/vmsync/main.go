@@ -391,6 +391,18 @@ func run(cfg struct {
 				trace.Warning("empty target domain metadata entry, cannot verify timestamp")
 			} else {
 				trace.Info("Target domain metadata", "timestamp", metadataEntryTimestamp)
+				for _, d := range qcowDisks {
+					targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.Source)
+					out, err := targetSSHClient.Run(ctx, "stat -c '%Y' "+targetPath)
+					if err != nil {
+						return fmt.Errorf("%w: %s", err, out)
+					}
+					if out > metadataEntryTimestamp {
+						return fmt.Errorf("Target file on system is newer (%s)  than last sync timestamp: %s: file on target has been changed between syncs", out, targetPath)
+
+					}
+				}
+				trace.Info("Successfully verified target file timestamps")
 			}
 		}
 		defer tgtDom.Free()
