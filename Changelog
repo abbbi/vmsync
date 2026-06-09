@@ -1,3 +1,12 @@
+Version 0.23
+-----------
+ * Add information about last checkpoint used for sync and timestamp to the
+ target virtual machine XML metadata values.
+ * On incremental syncs, verify the checkpoint chain is in line (by using the
+ values from the metadata fields), use the timestamp value from the metadata
+ field to also check if files have been changed since the last
+ synchronization. Fail if both cases happen
+
 Version 0.21
 -----------
  * Add -target-disk-path parameter: place disks on target system on different
@@ -32,7 +41,7 @@ Version 0.16
 Version 0.15
 -----------
  * Re-Define VM with new configuration on the target system after each
- synchronization so the vm configuration does always represent the verison
+ synchronization so the vm configuration does always represent the version
  from the source system.
  * Add builds for Debian related distros.
 
@@ -67,7 +76,7 @@ Version 0.10
 Version 0.9
 -----------
  * Use temporary images for incremental sync on target system with pointing to
- the full sync as base image. After successfull copy of the changed regions,
+ the full sync as base image. After successful copy of the changed regions,
  commit the changes to the base image and remove the temporary qcow file.
 
 Version 0.8
@@ -93,7 +102,7 @@ Version 0.5
 
 Version 0.4
 -----------
- * Delete parent checkpoints if sync is successfull, keep only one checkpoint
+ * Delete parent checkpoints if sync is successful, keep only one checkpoint
  defined for source VM which will then be synced on next execution.
 
 Version 0.3
@@ -109,4 +118,4 @@ Version 0.2
 
 Version 0.1
 -----------
- * Inital Release
+ * Initial Release
