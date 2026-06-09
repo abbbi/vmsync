@@ -355,7 +355,8 @@ func run(cfg struct {
 	}
 
 	tgtDom, err := tgtMgr.LookupDomain(cfg.TargetDomain)
-	var metadataEntry string
+	var metadataEntryCheckpoint string
+	var metadataEntryTimestamp string
 	if err != nil {
 		if parent == "" {
 			trace.Info("Domain does not exist on target system")
@@ -376,14 +377,20 @@ func run(cfg struct {
 			return fmt.Errorf("read source domain xml: %w", err)
 		}
 
-		metadataEntry, err = libvirtsync.ParseMetadata(tgtXML)
+		metadataEntryCheckpoint, err = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastCheckpoint)
+		metadataEntryTimestamp, err = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastSync)
 		if err != nil {
 			trace.Warning("unable to parse target domain metadata entry")
 		} else {
-			if metadataEntry == "" {
+			if metadataEntryCheckpoint == "" {
 				trace.Warning("empty target domain metadata entry, cannot verify checkpoint chain")
 			} else {
-				trace.Info("Target domain metadata", "checkpoint", metadataEntry)
+				trace.Info("Target domain metadata", "checkpoint", metadataEntryCheckpoint)
+			}
+			if metadataEntryTimestamp == "" {
+				trace.Warning("empty target domain metadata entry, cannot verify timestamp")
+			} else {
+				trace.Info("Target domain metadata", "timestamp", metadataEntryTimestamp)
 			}
 		}
 		defer tgtDom.Free()
@@ -392,9 +399,9 @@ func run(cfg struct {
 	if parent == "" {
 		trace.Info("created initial", "checkpoint", checkpointName)
 	} else {
-		if metadataEntry != "" {
-			if metadataEntry != parent {
-				return fmt.Errorf("checkpoint inconsistency detected: target VM definition lists [%s] as parent checkpoint, but parent checkpoint defined is [%s]", metadataEntry, parent)
+		if metadataEntryCheckpoint != "" {
+			if metadataEntryCheckpoint != parent {
+				return fmt.Errorf("checkpoint inconsistency detected: target VM definition lists [%s] as parent checkpoint, but parent checkpoint defined is [%s]", metadataEntryCheckpoint, parent)
 			} else {
 				trace.Info("Successfully verified checkpoint chain")
 			}

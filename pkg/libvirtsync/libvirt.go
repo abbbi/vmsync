@@ -36,8 +36,12 @@ import (
 const CheckpointPrefix = "vmsync-cpt"
 
 const (
-	metadataStart = `<vmsync:last_checkpoint xmlns:vmsync="vmsync">`
-	metadataEnd   = `</vmsync:last_checkpoint>`
+	metadataNamespace = `http://vmsync.org/xmlns/libvirt/domain/1.0`
+	metadataStart     = `<vmsync:vmsync xmlns:vmsync="` + metadataNamespace + `">`
+	metadataEnd       = `</vmsync:vmsync>`
+
+	MetadataFieldLastCheckpoint = "last_checkpoint"
+	MetadataFieldLastSync       = "last_sync_timestamp"
 )
 
 type Manager struct {
@@ -246,7 +250,7 @@ func AddMetadata(domainXML string, checkpoint string) (string, error) {
 	return changed, nil
 }
 
-func ParseMetadata(domainXML string) (string, error) {
+func ParseMetadata(domainXML string, metadataField string) (string, error) {
 	domcfg := &libvirtxml.Domain{}
 	err := domcfg.Unmarshal(domainXML)
 	if err != nil {
@@ -256,18 +260,40 @@ func ParseMetadata(domainXML string) (string, error) {
 		return "", nil
 	}
 
-	return parseMetadataValue(domcfg.Metadata.XML), nil
+	return parseMetadataValue(domcfg.Metadata.XML, metadataField), nil
+}
+
+func ParseMetadataField(domainXML string, field string) (string, error) {
+	domcfg := &libvirtxml.Domain{}
+	err := domcfg.Unmarshal(domainXML)
+	if err != nil {
+		return "", err
+	}
+	if domcfg.Metadata == nil {
+		return "", nil
+	}
+
+	return parseMetadataValue(domcfg.Metadata.XML, field), nil
 }
 
 func metadataEntry(checkpoint string) string {
 	var b strings.Builder
 	b.WriteString(metadataStart)
+	b.WriteString("\n  <vmsync:")
+	b.WriteString(MetadataFieldLastCheckpoint)
+	b.WriteString(" id=\"")
 	_ = xml.EscapeText(&b, []byte(checkpoint))
+	b.WriteString("\"/>\n")
+	b.WriteString("  <vmsync:")
+	b.WriteString(MetadataFieldLastSync)
+	b.WriteString(" id=\"")
+	b.WriteString(strconv.FormatInt(time.Now().Unix(), 10))
+	b.WriteString("\"/>\n")
 	b.WriteString(metadataEnd)
 	return b.String()
 }
 
-func parseMetadataValue(metadataXML string) string {
+func parseMetadataValue(metadataXML string, field string) string {
 	decoder := xml.NewDecoder(strings.NewReader("<metadata>" + metadataXML + "</metadata>"))
 	for {
 		token, err := decoder.Token()
@@ -275,15 +301,17 @@ func parseMetadataValue(metadataXML string) string {
 			return ""
 		}
 		start, ok := token.(xml.StartElement)
-		if !ok || start.Name.Space != "vmsync" || start.Name.Local != "last_checkpoint" {
+		if !ok || start.Name.Space != metadataNamespace || start.Name.Local != field {
 			continue
 		}
 
-		var value string
-		if err := decoder.DecodeElement(&value, &start); err != nil {
-			return ""
+		for _, attr := range start.Attr {
+			if attr.Name.Local == "id" {
+				return attr.Value
+			}
 		}
-		return value
+
+		return ""
 	}
 }
 
