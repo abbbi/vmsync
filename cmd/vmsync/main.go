@@ -378,9 +378,13 @@ func run(cfg struct {
 
 		metadataEntry, err = libvirtsync.ParseMetadata(tgtXML)
 		if err != nil {
-			trace.Warning("unable to prase target domain metadata entry")
+			trace.Warning("unable to parse target domain metadata entry")
 		} else {
-			trace.Info("Target domain metadata", "checkpoint", metadataEntry)
+			if metadataEntry == "" {
+				trace.Warning("empty target domain metadata entry, cannot verify checkpoint chain")
+			} else {
+				trace.Info("Target domain metadata", "checkpoint", metadataEntry)
+			}
 		}
 		defer tgtDom.Free()
 	}
