@@ -41,7 +41,7 @@ import (
 	"libvirt.org/go/libvirt"
 )
 
-const VERSION = "0.22"
+const VERSION = "0.23"
 
 func main() {
 	if os.Getenv("PROFILE") == "development" {
