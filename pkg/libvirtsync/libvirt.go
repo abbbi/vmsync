@@ -183,6 +183,13 @@ func replaceDomainDiskPath(domainXML, targetDiskPath string) (string, error) {
 	}
 
 	for i, d := range domcfg.Devices.Disks {
+		if d.Device == "cdrom" {
+			continue
+		}
+		if d.Driver.Type != "qcow2" {
+			continue
+		}
+
 		domcfg.Devices.Disks[i].Source.File.File = util.SetTargetPath(targetDiskPath, d.Source.File.File)
 	}
 
