@@ -1,3 +1,9 @@
+Version 0.24
+-----------
+ * #5: replace only qcow related disk pathes if --target-disk-path  is
+ specified
+
+
 Version 0.23
 -----------
  * Add information about last checkpoint used for sync and timestamp to the
