@@ -37,6 +37,14 @@ The current operation workflow is:
         -ssh-user root                          # user for all ssh related
 ```
 
+# Limitations
+
+ * Both source and target libvirt host should run on the same libvirt/qemu
+   version/distribution
+ * The utility at its current state does not identify custom specified
+   kernel/nvram/tpm devices
+ * Special devices like iso files attached to the cdrom are not copied
+
 # Build
 
 Several components are required to build from source, see the provided
