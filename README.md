@@ -22,6 +22,11 @@ The current operation workflow is:
  * Stop target NDB Service
  * Define VM on target system with latest configuration
 
+# Screenshot
+
+![Alt text](screenshot.jpg?raw=true "Title")
+
+
 # Example command:
 
 ```
