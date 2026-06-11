@@ -2,7 +2,7 @@ Version 0.24
 -----------
  * #5: replace only qcow related disk pathes if --target-disk-path  is
  specified
-
+ * #6: -start keeps VM in paused mode when replication failed
 
 Version 0.23
 -----------

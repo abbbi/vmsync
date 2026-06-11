@@ -176,6 +176,16 @@ func run(cfg struct {
 	if srcState, err = libvirtsync.DomainRunning(srcDom); err != nil {
 		return err
 	}
+
+	onExit := func() {
+		abortOnce.Do(func() {
+			if started {
+				trace.Info("destroying vm as it was started by sync process")
+				srcDom.Destroy()
+			}
+		})
+	}
+
 	if srcState == false {
 		if cfg.Start {
 			trace.Info("Starting VM in paused mode")
@@ -183,6 +193,7 @@ func run(cfg struct {
 				return fmt.Errorf("unable to start domain %s in paused mode.", cfg.SourceDomain)
 			}
 			started = true
+			defer onExit()
 		} else {
 			return fmt.Errorf("source domain %s is inactive require running state before sync (or use -start option)", cfg.SourceDomain)
 		}
