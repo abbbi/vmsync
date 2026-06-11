@@ -190,7 +190,7 @@ func run(cfg struct {
 		if cfg.Start {
 			trace.Info("Starting VM in paused mode")
 			if err := srcDom.CreateWithFlags(libvirt.DOMAIN_START_PAUSED); err != nil {
-				return fmt.Errorf("unable to start domain %s in paused mode.", cfg.SourceDomain)
+				return fmt.Errorf("unable to start domain %s in paused mode: %s", cfg.SourceDomain, err)
 			}
 			started = true
 			defer onExit()

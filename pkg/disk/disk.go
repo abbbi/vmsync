@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"strings"
 	"vmsync/pkg/trace"
+	"vmsync/pkg/util"
 
 	"libvirt.org/go/libvirtxml"
 )
@@ -58,14 +59,12 @@ func ParseQcowDisks(domainXML string) ([]QcowDisk, error) {
 
 	var out []QcowDisk
 	for _, d := range domcfg.Devices.Disks {
-		if d.Device == "cdrom" {
-			trace.Info("skipping cdrom device", "device", d.Target.Dev)
+
+		if util.IgnoreDevice(d) == true {
+			trace.Info("skipping incompatible", "device", d.Target.Dev)
 			continue
 		}
-		if d.Driver.Type != "qcow2" {
-			trace.Info("skipping non qcow device", "device", d.Target.Dev)
-			continue
-		}
+
 		out = append(out, QcowDisk{
 			TargetDev:   d.Target.Dev,
 			Source:      d.Source.File.File,

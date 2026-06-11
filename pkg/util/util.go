@@ -23,6 +23,8 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+
+	"libvirt.org/go/libvirtxml"
 )
 
 func UriUsesSSH(raw string) bool {
@@ -71,4 +73,15 @@ func SetTargetPath(targetDiskPath string, diskPath string) string {
 	}
 
 	return targetPath
+}
+
+func IgnoreDevice(d libvirtxml.DomainDisk) bool {
+	if d.Device == "cdrom" {
+		return true
+	}
+	if d.Driver.Type != "qcow2" {
+		return true
+	}
+
+	return false
 }
