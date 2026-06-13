@@ -73,6 +73,7 @@ func main() {
 		SSHTimeoutSec  int
 		Debug          bool
 		Start          bool
+		ShowVersion    bool
 	}
 
 	flag.StringVar(&cfg.SourceURI, "source-uri", "", "libvirt source URI (example: qemu+ssh://src/system)")
@@ -95,8 +96,13 @@ func main() {
 	flag.IntVar(&cfg.SSHTimeoutSec, "ssh-timeout-sec", 10, "ssh connection timeout in seconds")
 	flag.BoolVar(&cfg.Start, "start", false, "In case vm is in non-running state, start in paused mode to allow sync.")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
+	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
 	flag.Parse()
 
+	if cfg.ShowVersion {
+		trace.Info(fmt.Sprintf("vmsync Version: %s", VERSION))
+		os.Exit(0)
+	}
 	if cfg.SourceURI == "" || cfg.TargetURI == "" || cfg.SourceDomain == "" {
 		flag.Usage()
 		os.Exit(2)
@@ -134,6 +140,7 @@ func run(cfg struct {
 	SSHTimeoutSec  int
 	Debug          bool
 	Start          bool
+	ShowVersion    bool
 }) (runErr error) {
 
 	var tgtState bool
