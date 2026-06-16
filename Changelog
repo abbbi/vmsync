@@ -1,6 +1,7 @@
 Version 0.25
 -----------
  * Add -v and -version flags.
+ * Include libvirt version for source and target connection in log output
 
 Version 0.24
 -----------

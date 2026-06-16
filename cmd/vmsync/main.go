@@ -168,12 +168,14 @@ func run(cfg struct {
 		return err
 	}
 	defer srcMgr.Close()
+	trace.Info("Connected to source libvirt", "version", srcMgr.Conn.GetVersion)
 
 	tgtMgr, err := libvirtsync.Connect(cfg.TargetURI)
 	if err != nil {
 		return err
 	}
 	defer tgtMgr.Close()
+	trace.Info("Connected to target libvirt", "version", tgtMgr.Conn.GetVersion)
 
 	srcDom, err := srcMgr.LookupDomain(cfg.SourceDomain)
 	if err != nil {
