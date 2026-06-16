@@ -1,3 +1,7 @@
+Version 0.25
+-----------
+ * Add -v and -version flags.
+
 Version 0.24
 -----------
  * #5: replace only qcow related disk pathes if --target-disk-path  is

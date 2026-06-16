@@ -41,7 +41,7 @@ import (
 	"libvirt.org/go/libvirt"
 )
 
-const VERSION = "0.24"
+const VERSION = "0.25"
 
 func main() {
 	if os.Getenv("PROFILE") == "development" {
@@ -96,6 +96,7 @@ func main() {
 	flag.IntVar(&cfg.SSHTimeoutSec, "ssh-timeout-sec", 10, "ssh connection timeout in seconds")
 	flag.BoolVar(&cfg.Start, "start", false, "In case vm is in non-running state, start in paused mode to allow sync.")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
+	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
 	flag.Parse()
 
