@@ -1,3 +1,7 @@
+Version 0.26
+-----------
+ * Detect and warn if virtual machine has loader/nvram setting
+
 Version 0.25
 -----------
  * Add -v and -version flags.

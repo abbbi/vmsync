@@ -254,6 +254,36 @@ func AddMetadata(domainXML string, checkpoint string) (string, error) {
 	return changed, nil
 }
 
+func DetectNvram(domainXML string) (string, error) {
+	domcfg := &libvirtxml.Domain{}
+	err := domcfg.Unmarshal(domainXML)
+	if err != nil {
+		return "", err
+	}
+	if domcfg.OS != nil && domcfg.OS.NVRam != nil {
+
+		nvram := domcfg.OS.NVRam
+		return nvram.NVRam, nil
+
+	}
+	return "", nil
+}
+
+func DetectLoader(domainXML string) (string, error) {
+	domcfg := &libvirtxml.Domain{}
+	err := domcfg.Unmarshal(domainXML)
+	if err != nil {
+		return "", err
+	}
+	if domcfg.OS != nil && domcfg.OS.Loader != nil {
+
+		loader := domcfg.OS.Loader
+		return loader.Path, nil
+
+	}
+	return "", nil
+}
+
 func ParseMetadata(domainXML string, metadataField string) (string, error) {
 	domcfg := &libvirtxml.Domain{}
 	err := domcfg.Unmarshal(domainXML)

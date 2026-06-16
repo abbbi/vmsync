@@ -41,7 +41,7 @@ import (
 	"libvirt.org/go/libvirt"
 )
 
-const VERSION = "0.25"
+const VERSION = "0.26"
 
 func main() {
 	if os.Getenv("PROFILE") == "development" {
@@ -272,6 +272,22 @@ func run(cfg struct {
 	}
 	trace.Info("discovered source domain", "domain", cfg.SourceDomain)
 
+	nvram, err := libvirtsync.DetectNvram(srcXML)
+	if err != nil {
+		return err
+	}
+	if nvram != "" {
+		trace.Warning("nvram setting detected in vm config", "path", nvram, "files may require manual copy")
+	}
+
+	loader, lerr := libvirtsync.DetectLoader(srcXML)
+	if lerr != nil {
+		return lerr
+	}
+	if nvram != "" {
+		trace.Warning("loader setting detected in vm config", "path", loader, "files may require manual copy")
+	}
+
 	qcowDisks, err := disk.ParseQcowDisks(srcXML)
 	if err != nil {
 		return err
@@ -279,7 +295,6 @@ func run(cfg struct {
 	if len(qcowDisks) == 0 {
 		return fmt.Errorf("no qcow2 disks found for domain %s", cfg.SourceDomain)
 	}
-
 	trace.Info("discovered qcow2 disks", "count", len(qcowDisks))
 
 	if err := libvirtsync.FailIfBlockJobActive(srcDom, qcowDisks); err != nil {
