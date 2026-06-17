@@ -279,7 +279,7 @@ func run(cfg struct {
 	if nvram != "" {
 		x, _ := util.RemotePathExists(ctx, targetSSHClient, nvram)
 		if !x {
-			trace.Warning("loader setting detected in vm config", "path", nvram, "but files do not exist on target host")
+			trace.Warning("nvram setting detected in vm config", "path", nvram, "but files do not exist on target host")
 		}
 	}
 
