@@ -1,3 +1,8 @@
+Version 0.27
+-----------
+ * Fix loader/nvram setting detection, issue warning only if configured
+ files do not exist on the target host.
+
 Version 0.26
 -----------
  * Detect and warn if virtual machine has loader/nvram setting

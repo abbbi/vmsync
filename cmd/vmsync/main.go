@@ -41,7 +41,7 @@ import (
 	"libvirt.org/go/libvirt"
 )
 
-const VERSION = "0.26"
+const VERSION = "0.27"
 
 func main() {
 	if os.Getenv("PROFILE") == "development" {
@@ -277,15 +277,21 @@ func run(cfg struct {
 		return err
 	}
 	if nvram != "" {
-		trace.Warning("nvram setting detected in vm config", "path", nvram, "files may require manual copy")
+		x, _ := util.RemotePathExists(ctx, targetSSHClient, nvram)
+		if !x {
+			trace.Warning("loader setting detected in vm config", "path", nvram, "but files do not exist on target host")
+		}
 	}
 
 	loader, lerr := libvirtsync.DetectLoader(srcXML)
 	if lerr != nil {
 		return lerr
 	}
-	if nvram != "" {
-		trace.Warning("loader setting detected in vm config", "path", loader, "files may require manual copy")
+	if loader != "" {
+		x, _ := util.RemotePathExists(ctx, targetSSHClient, loader)
+		if !x {
+			trace.Warning("loader setting detected in vm config", "path", loader, "but files do not exist on target host")
+		}
 	}
 
 	qcowDisks, err := disk.ParseQcowDisks(srcXML)
