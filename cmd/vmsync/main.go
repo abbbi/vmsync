@@ -614,9 +614,9 @@ func run(cfg struct {
 		}
 
 		if incrementalMode {
-			trace.Info("Commiting changes to base", "image", targetPath)
+			trace.Info("Committing changes to base", "image", targetPath)
 			commitCmd := "qemu-img commit -b " + targetPath + " " + targetPathInc
-			if err := runTargetCommand(commitCmd, fmt.Sprintf("commiting changes for %s", targetPathInc)); err != nil {
+			if err := runTargetCommand(commitCmd, fmt.Sprintf("committing changes for %s", targetPathInc)); err != nil {
 				return err
 			}
 			trace.Info("Removing temporary", "image", targetPathInc)
