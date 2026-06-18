@@ -41,7 +41,7 @@ The current operation workflow is:
 
  * Both source and target libvirt host should run on the same libvirt/qemu
    version/distribution
- * The utility at its current state does not identify custom specified
+ * The utility at its current state does not copy custom specified
    kernel/nvram/tpm devices
  * Special devices like iso files attached to the cdrom are not copied
 
