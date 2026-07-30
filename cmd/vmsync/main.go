@@ -558,7 +558,8 @@ func run(cfg struct {
 			return nil
 		}
 
-		targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.Source)
+		// Avoid datarace in this goroutine by declaring targetPath as local var instead of a shared one
+		targetPath := util.SetTargetPath(cfg.TargetDiskPath, d.Source)
 		createCmd := "qemu-img create -f qcow2 " + util.ShQuote(targetPath) + " -o cluster_size=" + fmt.Sprintf("%d", d.ClusterSize) + " " + fmt.Sprintf("%d", d.VirtualSize)
 		var targetPathInc string
 		if incrementalMode {
