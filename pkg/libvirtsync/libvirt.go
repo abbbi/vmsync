@@ -186,6 +186,11 @@ func replaceDomainDiskPath(domainXML, targetDiskPath string) (string, error) {
 		if util.IgnoreDevice(d) == true {
 			continue
 		}
+		// IgnoreDevice only guarantees a non-nil Driver; Source/Source.File
+		// are separate pointers and could still be nil for a malformed disk.
+		if d.Source == nil || d.Source.File == nil {
+			continue
+		}
 
 		domcfg.Devices.Disks[i].Source.File.File = util.SetTargetPath(targetDiskPath, d.Source.File.File)
 	}
