@@ -380,7 +380,10 @@ func run(cfg struct {
 	if err != nil {
 		return err
 	}
-	checkpointName, parent = libvirtsync.NextCheckpointName(existing)
+	checkpointName, parent, err = libvirtsync.NextCheckpointName(existing)
+	if err != nil {
+		return err
+	}
 	var targetPath string
 	if parent == "" {
 		// Preflight for full sync: fail before sync operations if target disk path exists.
