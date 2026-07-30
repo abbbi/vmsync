@@ -141,7 +141,7 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 
 	// Keep source XML intact (including UUID) unless libvirt rejects duplicate UUID.
 	if targetDiskPath != "" {
-		updatedXML, err = replaceDomainDiskPath(sourceDomainXML, targetDiskPath)
+		updatedXML, err = replaceDomainDiskPath(updatedXML, targetDiskPath)
 		if err != nil {
 			return fmt.Errorf("rewrite target domain xml: %w", err)
 		}
