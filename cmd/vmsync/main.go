@@ -272,28 +272,6 @@ func run(cfg struct {
 	}
 	trace.Info("discovered source domain", "domain", cfg.SourceDomain)
 
-	nvram, err := libvirtsync.DetectNvram(srcXML)
-	if err != nil {
-		return err
-	}
-	if nvram != "" {
-		x, _ := util.RemotePathExists(ctx, targetSSHClient, nvram)
-		if !x {
-			trace.Warning("nvram setting detected in vm config", "path", nvram, "but files do not exist on target host")
-		}
-	}
-
-	loader, lerr := libvirtsync.DetectLoader(srcXML)
-	if lerr != nil {
-		return lerr
-	}
-	if loader != "" {
-		x, _ := util.RemotePathExists(ctx, targetSSHClient, loader)
-		if !x {
-			trace.Warning("loader setting detected in vm config", "path", loader, "but files do not exist on target host")
-		}
-	}
-
 	qcowDisks, err := disk.ParseQcowDisks(srcXML)
 	if err != nil {
 		return err
@@ -373,6 +351,28 @@ func run(cfg struct {
 	}
 	defer targetSSHClient.Close()
 	defer cleanupTargetNBD("cleanup")
+
+	nvram, err := libvirtsync.DetectNvram(srcXML)
+	if err != nil {
+		return err
+	}
+	if nvram != "" {
+		x, _ := util.RemotePathExists(ctx, targetSSHClient, nvram)
+		if !x {
+			trace.Warning("nvram setting detected in vm config", "path", nvram, "but files do not exist on target host")
+		}
+	}
+
+	loader, lerr := libvirtsync.DetectLoader(srcXML)
+	if lerr != nil {
+		return lerr
+	}
+	if loader != "" {
+		x, _ := util.RemotePathExists(ctx, targetSSHClient, loader)
+		if !x {
+			trace.Warning("loader setting detected in vm config", "path", loader, "but files do not exist on target host")
+		}
+	}
 
 	existing, err := libvirtsync.ListManagedCheckpoints(srcDom)
 	if err != nil {
