@@ -36,6 +36,9 @@ type Extent struct {
 }
 
 func ChangedExtentsTCP(ctx context.Context, host string, port int, exportName, checkpointName string, incremental bool) ([]Extent, uint64, uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, 0, err
+	}
 	trace.Info("nbd connect for extents", "host", host, "port", port, "export", exportName, "checkpoint", checkpointName, "incremental", incremental)
 	h, err := nbd.Create()
 	if err != nil {
@@ -79,6 +82,12 @@ func ChangedExtentsTCP(ctx context.Context, host string, port int, exportName, c
 	lastProgress := uint64(0)
 	var dirty uint64 = 0
 	for offset < uint64(size) {
+		select {
+		case <-ctx.Done():
+			return nil, 0, 0, fmt.Errorf("nbd extent scan cancelled at offset %d: %w", offset, ctx.Err())
+		default:
+		}
+
 		chunk := req
 		if remain := uint64(size) - offset; remain < chunk {
 			chunk = remain
@@ -122,6 +131,9 @@ func ChangedExtentsTCP(ctx context.Context, host string, port int, exportName, c
 }
 
 func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport string, dstHost string, dstPort int, extents []Extent) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	src, err := nbd.Create()
 	if err != nil {
 		return fmt.Errorf("create source nbd handle: %w", err)
@@ -171,6 +183,12 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 		remaining := ex.Length
 		cur := ex.Offset
 		for remaining > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("nbd copy cancelled at offset %d: %w", cur, ctx.Err())
+			default:
+			}
+
 			step := uint64(len(buf))
 			if remaining < step {
 				step = remaining

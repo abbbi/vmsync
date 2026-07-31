@@ -79,7 +79,10 @@ func IgnoreDevice(d libvirtxml.DomainDisk) bool {
 	if d.Device == "cdrom" {
 		return true
 	}
-	if d.Driver.Type != "qcow2" {
+	// Driver is a pointer and nil whenever <disk> has no <driver> element
+	// (allowed by the schema); a disk with no declared driver can't be
+	// confirmed qcow2, so treat it the same as any other non-qcow2 disk.
+	if d.Driver == nil || d.Driver.Type != "qcow2" {
 		return true
 	}
 

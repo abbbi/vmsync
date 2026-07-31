@@ -141,7 +141,7 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 
 	// Keep source XML intact (including UUID) unless libvirt rejects duplicate UUID.
 	if targetDiskPath != "" {
-		updatedXML, err = replaceDomainDiskPath(sourceDomainXML, targetDiskPath)
+		updatedXML, err = replaceDomainDiskPath(updatedXML, targetDiskPath)
 		if err != nil {
 			return fmt.Errorf("rewrite target domain xml: %w", err)
 		}
@@ -184,6 +184,11 @@ func replaceDomainDiskPath(domainXML, targetDiskPath string) (string, error) {
 
 	for i, d := range domcfg.Devices.Disks {
 		if util.IgnoreDevice(d) == true {
+			continue
+		}
+		// IgnoreDevice only guarantees a non-nil Driver; Source/Source.File
+		// are separate pointers and could still be nil for a malformed disk.
+		if d.Source == nil || d.Source.File == nil {
 			continue
 		}
 
@@ -443,18 +448,21 @@ func buildCheckpointXML(name, parent string, diskTargets []disk.QcowDisk) string
 	return b.String()
 }
 
-func NextCheckpointName(existing []Checkpoint) (name string, parent string) {
+func NextCheckpointName(existing []Checkpoint) (name string, parent string, err error) {
 	if len(existing) == 0 {
-		return fmt.Sprintf("%s-%06d", CheckpointPrefix, 1), ""
+		return fmt.Sprintf("%s-%06d", CheckpointPrefix, 1), "", nil
 	}
 	latest := existing[len(existing)-1]
 
 	re := regexp.MustCompile(`^(.*-)(\d+)$`)
 	m := re.FindStringSubmatch(latest.Name)
+	if m == nil {
+		return "", "", fmt.Errorf("checkpoint name %q does not end in a numeric suffix, cannot determine next checkpoint name", latest.Name)
+	}
 	numStr := m[2]
 	n, _ := strconv.Atoi(numStr)
 	n = n + 1
-	return fmt.Sprintf("%s-%0*d", CheckpointPrefix, len(numStr), n), latest.Name
+	return fmt.Sprintf("%s-%0*d", CheckpointPrefix, len(numStr), n), latest.Name, nil
 }
 
 func FailIfBlockJobActive(dom *libvirt.Domain, qcowDisks []disk.QcowDisk) error {
