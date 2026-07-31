@@ -403,8 +403,13 @@ func run(cfg struct {
 	}
 	trace.Info("discovered qcow2 disks", "count", len(qcowDisks))
 
-	if err := libvirtsync.FailIfBlockJobActive(srcDom, qcowDisks); err != nil {
-		return err
+	// Skipped under -reinit: a stuck block job is exactly the kind of state
+	// -reinit is meant to clear (via AbortActiveBlockJobs below), so failing
+	// here first would make -reinit unable to reach it.
+	if !cfg.Reinit {
+		if err := libvirtsync.FailIfBlockJobActive(srcDom, qcowDisks); err != nil {
+			return err
+		}
 	}
 
 	sourceNeedsSSH := util.UriUsesSSH(cfg.SourceURI)
@@ -482,6 +487,9 @@ func run(cfg struct {
 
 	if cfg.Reinit {
 		trace.Warning("reinit requested: discarding checkpoint chain and existing target state", "domain", cfg.SourceDomain)
+		if err := libvirtsync.AbortActiveBlockJobs(srcDom, qcowDisks); err != nil {
+			return fmt.Errorf("reinit: abort active block jobs: %w", err)
+		}
 		if err := libvirtsync.DeleteAllManagedCheckpoints(srcDom); err != nil {
 			return fmt.Errorf("reinit: delete existing checkpoints: %w", err)
 		}

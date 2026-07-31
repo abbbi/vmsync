@@ -600,6 +600,30 @@ func FailIfBlockJobActive(dom *libvirt.Domain, qcowDisks []disk.QcowDisk) error 
 	return nil
 }
 
+// AbortActiveBlockJobs cancels any running block job (typically a backup job
+// left over from a previous, interrupted sync) on each of qcowDisks. Used by
+// -reinit to clear the state that would otherwise make FailIfBlockJobActive
+// permanently refuse to proceed -- a stuck job is exactly the kind of broken
+// state -reinit is meant to recover from (see the "Bitmap already exists"
+// failure in https://github.com/abbbi/vmsync/issues/9).
+func AbortActiveBlockJobs(dom *libvirt.Domain, qcowDisks []disk.QcowDisk) error {
+	for _, d := range qcowDisks {
+		info, err := dom.GetBlockJobInfo(d.TargetDev, 0)
+		if err != nil {
+			return fmt.Errorf("check block job on disk %s: %w", d.TargetDev, err)
+		}
+		// Same "no active job" signature FailIfBlockJobActive checks for.
+		if info.Type == libvirt.DOMAIN_BLOCK_JOB_TYPE_UNKNOWN && info.Cur == 0 && info.End == 0 {
+			continue
+		}
+		trace.Warning("reinit: aborting active block job", "disk", d.TargetDev, "type", info.Type)
+		if err := dom.BlockJobAbort(d.TargetDev, 0); err != nil {
+			return fmt.Errorf("abort block job on disk %s: %w", d.TargetDev, err)
+		}
+	}
+	return nil
+}
+
 func DeleteCheckpointIfExists(dom *libvirt.Domain, checkpointName string) error {
 	cp, err := dom.CheckpointLookupByName(checkpointName, 0)
 	if err != nil {
