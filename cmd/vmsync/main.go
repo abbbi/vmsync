@@ -44,11 +44,6 @@ import (
 
 const VERSION = "0.30"
 
-// nbdBridgePortOffset derives each remote bridge's listen port from the real
-// NBD export port it forwards to, the same deterministic-offset approach
-// already used for per-disk target qemu-nbd ports (TargetNBDPort + i).
-const nbdBridgePortOffset = 10000
-
 func main() {
 	if os.Getenv("PROFILE") == "development" {
 		host := "localhost:6060"
@@ -670,14 +665,20 @@ func run(cfg struct {
 	if nbdHost == "" {
 		nbdHost = util.ConnectHostFromBindOrURI(cfg.SourceNBDBind, cfg.SourceURI)
 	}
-	trace.Info("libvirt backup export started on source via tcp", "host", nbdHost, "port", cfg.SourceNBDPort)
+	trace.Info("source nbd port in use", "side", "source", "kind", "nbd_export", "host", nbdHost, "port", cfg.SourceNBDPort)
 	targetNBDHost := cfg.TargetNBDHost
 	if targetNBDHost == "" {
 		targetNBDHost = util.ConnectHostFromBindOrURI(cfg.TargetNBDBind, cfg.TargetURI)
 	}
 
+	// Bridge ports are derived from the target's own base port so they stay
+	// small and predictable
+	// each disk's real target port already increases by one per disk
+	// (TargetNBDPort + i, below), and bridge ports track the same spacing.
+	nbdBridgePortOffset := cfg.TargetNBDPort + 1
+
 	// Default to the direct, uncompressed path; overridden below when
-	// --compress is set and the source is reachable via SSH.
+	// --compress/--mbuffer are set and the source is reachable via SSH.
 	effectiveSourceHost := nbdHost
 	effectiveSourcePort := cfg.SourceNBDPort
 	var sourceBridgeCounters *nbdbridge.ByteCounters
@@ -690,6 +691,7 @@ func run(cfg struct {
 		stopMu.Lock()
 		sourceStopCommands = append(sourceStopCommands, stopCmd)
 		stopMu.Unlock()
+		trace.Info("source nbd port in use", "side", "source", "kind", "bridge_remote", "host", nbdHost, "port", sourceBridgePort)
 		if err := nbdbridge.WaitForRemoteReady(sourceSSHClient, sourceBridgePort, 10*time.Second); err != nil {
 			return err
 		}
@@ -701,7 +703,7 @@ func run(cfg struct {
 		effectiveSourceHost = "127.0.0.1"
 		effectiveSourcePort = localPort
 		sourceBridgeCounters = counters
-		trace.Info("source nbd traffic compressed via local bridge", "local_port", localPort, "remote_bridge_port", sourceBridgePort)
+		trace.Info("source nbd port in use", "side", "source", "kind", "bridge_local", "host", "127.0.0.1", "port", localPort)
 	}
 
 	var wg sync.WaitGroup
@@ -776,10 +778,10 @@ func run(cfg struct {
 		targetStopCommands = append(targetStopCommands, stopCmd+" || true")
 		stopMu.Unlock()
 
-		trace.Info("target nbd export started", "path", targetPath, "host", targetNBDHost, "port", targetPort)
+		trace.Info("target nbd port in use", "side", "target", "kind", "nbd_export", "disk", d.TargetDev, "host", targetNBDHost, "port", targetPort)
 
 		// Default to the direct, uncompressed path; overridden below when
-		// --compress is set (target SSH is always available).
+		// --compress/--mbuffer are set (target SSH is always available).
 		effectiveTargetHost := targetNBDHost
 		effectiveTargetPort := targetPort
 		var targetBridgeCounters *nbdbridge.ByteCounters
@@ -792,6 +794,7 @@ func run(cfg struct {
 			stopMu.Lock()
 			targetStopCommands = append(targetStopCommands, bridgeStopCmd)
 			stopMu.Unlock()
+			trace.Info("target nbd port in use", "side", "target", "kind", "bridge_remote", "disk", d.TargetDev, "host", targetNBDHost, "port", targetBridgePort)
 			if err := nbdbridge.WaitForRemoteReady(targetSSHClient, targetBridgePort, 10*time.Second); err != nil {
 				return err
 			}
@@ -803,7 +806,7 @@ func run(cfg struct {
 			effectiveTargetHost = "127.0.0.1"
 			effectiveTargetPort = localPort
 			targetBridgeCounters = counters
-			trace.Info("target nbd traffic compressed via local bridge", "disk", d.TargetDev, "local_port", localPort, "remote_bridge_port", targetBridgePort)
+			trace.Info("target nbd port in use", "side", "target", "kind", "bridge_local", "disk", d.TargetDev, "host", "127.0.0.1", "port", localPort)
 		} else {
 			if err := nbdsync.WaitForTCPExport(targetNBDHost, targetPort, 10*time.Second); err != nil {
 				return fmt.Errorf("wait for target nbd export %s:%d: %w", targetNBDHost, targetPort, err)
