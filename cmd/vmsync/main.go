@@ -33,6 +33,7 @@ import (
 
 	"vmsync/pkg/disk"
 	"vmsync/pkg/libvirtsync"
+	"vmsync/pkg/nbdbridge"
 	"vmsync/pkg/nbdsync"
 	"vmsync/pkg/remotessh"
 	"vmsync/pkg/trace"
@@ -42,6 +43,11 @@ import (
 )
 
 const VERSION = "0.30"
+
+// nbdBridgePortOffset derives each remote bridge's listen port from the real
+// NBD export port it forwards to, the same deterministic-offset approach
+// already used for per-disk target qemu-nbd ports (TargetNBDPort + i).
+const nbdBridgePortOffset = 10000
 
 func main() {
 	if os.Getenv("PROFILE") == "development" {
@@ -75,6 +81,8 @@ func main() {
 		Start               bool
 		Reinit              bool
 		ReinitAfterFailures int
+		Compress            bool
+		CompressLevel       int
 		ShowVersion         bool
 	}
 
@@ -99,6 +107,8 @@ func main() {
 	flag.BoolVar(&cfg.Start, "start", false, "In case vm is in non-running state, start in paused mode to allow sync.")
 	flag.BoolVar(&cfg.Reinit, "reinit", false, "Discard all vmsync checkpoints on the source and the existing target domain/disks, then perform a fresh full sync. Use to recover from a broken checkpoint chain (e.g. \"Bitmap already exists\" errors).")
 	flag.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "After this many consecutive sync failures (tracked in the target domain's vmsync metadata), automatically reinit (as with -reinit) instead of trying again the same way. 0 disables this (default).")
+	flag.BoolVar(&cfg.Compress, "compress", false, "Compress NBD traffic between hosts using zstd, tunneled over the existing SSH connection. Requires 'zstd' locally and 'socat'+'zstd' on any remote host reached via SSH; core sync behavior is unchanged when this is not set.")
+	flag.IntVar(&cfg.CompressLevel, "compress-level", 3, "zstd compression level to use when --compress is set (1-19)")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
@@ -114,6 +124,12 @@ func main() {
 	}
 	if cfg.TargetDomain == "" {
 		cfg.TargetDomain = cfg.SourceDomain
+	}
+	if cfg.Compress {
+		if err := nbdbridge.ValidateCompressLevel(cfg.CompressLevel); err != nil {
+			trace.Error("invalid compress configuration", "error", err)
+			os.Exit(2)
+		}
 	}
 
 	trace.SetDebug(cfg.Debug)
@@ -170,22 +186,44 @@ func run(cfg struct {
 	Start               bool
 	Reinit              bool
 	ReinitAfterFailures int
+	Compress            bool
+	CompressLevel       int
 	ShowVersion         bool
 }) (runErr error) {
 
 	var tgtState bool
 	var srcState bool
 	var targetSSHClient *remotessh.Client
+	var sourceSSHClient *remotessh.Client
 	var abortOnce sync.Once
 	var backupMu sync.Mutex
 	var backupActive bool = false
 	var targetCleanupOnce sync.Once
+	var sourceCleanupOnce sync.Once
 	var stopMu sync.Mutex
 	targetStopCommands := make([]string, 0)
+	sourceStopCommands := make([]string, 0)
 	var checkpointName string
 	var parent string
 	var freezed bool = false
 	var started bool = false
+
+	bridgeCfg := nbdbridge.Config{Compress: cfg.Compress, CompressLevel: cfg.CompressLevel}
+	if err := nbdbridge.CheckLocal(bridgeCfg); err != nil {
+		return err
+	}
+	if bridgeCfg.Enabled() {
+		if util.UriUsesSSH(cfg.SourceURI) && cfg.SourceNBDHost != "" {
+			if uriHost := util.HostFromURIOrLocal(cfg.SourceURI); cfg.SourceNBDHost != uriHost {
+				return fmt.Errorf("--compress requires --source-nbd-host to match the host in --source-uri (got %s, expected %s): the remote bridge only forwards to 127.0.0.1 on that same host", cfg.SourceNBDHost, uriHost)
+			}
+		}
+		if cfg.TargetNBDHost != "" {
+			if uriHost := util.HostFromURIOrLocal(cfg.TargetURI); cfg.TargetNBDHost != uriHost {
+				return fmt.Errorf("--compress requires --target-nbd-host to match the host in --target-uri (got %s, expected %s): the remote bridge only forwards to 127.0.0.1 on that same host", cfg.TargetNBDHost, uriHost)
+			}
+		}
+	}
 
 	trace.Info(fmt.Sprintf("%s, Version: %s", os.Args, VERSION))
 
@@ -272,9 +310,26 @@ func run(cfg struct {
 			}
 			cctx, ccancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer ccancel()
-			for i := len(stopCommands) - 1; i >= 0; i-- {
+		for i := len(stopCommands) - 1; i >= 0; i-- {
 				if out, err := targetSSHClient.Run(cctx, stopCommands[i]); err != nil {
 					trace.Error("failed to stop target qemu-nbd export", "trigger", trigger, "error", err, "output", out)
+				}
+			}
+		})
+	}
+	cleanupSourceBridge := func(trigger string) {
+		sourceCleanupOnce.Do(func() {
+			stopMu.Lock()
+			stopCommands := append([]string(nil), sourceStopCommands...)
+			stopMu.Unlock()
+			if sourceSSHClient == nil || len(stopCommands) == 0 {
+				return
+			}
+			cctx, ccancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer ccancel()
+			for i := len(stopCommands) - 1; i >= 0; i-- {
+				if out, err := sourceSSHClient.Run(cctx, stopCommands[i]); err != nil {
+					trace.Error("failed to stop source nbd bridge", "trigger", trigger, "error", err, "output", out)
 				}
 			}
 		})
@@ -291,6 +346,7 @@ func run(cfg struct {
 			trace.Info("received signal", "signal", sig.String())
 			abortBackup(sig.String())
 			cleanupTargetNBD(sig.String())
+			cleanupSourceBridge(sig.String())
 			cancel()
 		case <-doneCh:
 			return
@@ -339,7 +395,6 @@ func run(cfg struct {
 	}
 
 	sourceNeedsSSH := util.UriUsesSSH(cfg.SourceURI)
-	var sourceSSHClient *remotessh.Client
 	if sourceNeedsSSH {
 		sourceSSHConfig, err := remotessh.ConfigFromLibvirtURI(
 			cfg.SourceURI,
@@ -360,6 +415,9 @@ func run(cfg struct {
 			return fmt.Errorf("connect ssh for source qemu-img execution: %w", err)
 		}
 		defer sourceSSHClient.Close()
+		if err := nbdbridge.CheckRemote(ctx, sourceSSHClient, bridgeCfg, sourceSSHConfig.Address); err != nil {
+			return err
+		}
 	} else {
 		trace.Info("source URI does not use SSH; qemu-img info will run locally")
 	}
@@ -404,6 +462,10 @@ func run(cfg struct {
 	}
 	defer targetSSHClient.Close()
 	defer cleanupTargetNBD("cleanup")
+	defer cleanupSourceBridge("cleanup")
+	if err := nbdbridge.CheckRemote(ctx, targetSSHClient, bridgeCfg, targetSSHConfig.Address); err != nil {
+		return err
+	}
 
 	if cfg.Reinit {
 		trace.Warning("reinit requested: discarding checkpoint chain and existing target state", "domain", cfg.SourceDomain)
@@ -595,6 +657,35 @@ func run(cfg struct {
 	if targetNBDHost == "" {
 		targetNBDHost = util.ConnectHostFromBindOrURI(cfg.TargetNBDBind, cfg.TargetURI)
 	}
+
+	// Default to the direct, uncompressed path; overridden below when
+	// --compress is set and the source is reachable via SSH.
+	effectiveSourceHost := nbdHost
+	effectiveSourcePort := cfg.SourceNBDPort
+	var sourceBridgeCounters *nbdbridge.ByteCounters
+	if bridgeCfg.Enabled() && sourceNeedsSSH {
+		sourceBridgePort := cfg.SourceNBDPort + nbdBridgePortOffset
+		stopCmd, err := nbdbridge.StartRemote(ctx, sourceSSHClient, sourceBridgePort, cfg.SourceNBDPort, bridgeCfg)
+		if err != nil {
+			return fmt.Errorf("start source nbd bridge: %w", err)
+		}
+		stopMu.Lock()
+		sourceStopCommands = append(sourceStopCommands, stopCmd)
+		stopMu.Unlock()
+		if err := nbdbridge.WaitForRemoteReady(sourceSSHClient, sourceBridgePort, 10*time.Second); err != nil {
+			return err
+		}
+		localPort, counters, stopLocal, err := nbdbridge.StartLocal(ctx, sourceSSHClient, fmt.Sprintf("127.0.0.1:%d", sourceBridgePort), bridgeCfg)
+		if err != nil {
+			return fmt.Errorf("start local nbd bridge relay for source: %w", err)
+		}
+		defer stopLocal()
+		effectiveSourceHost = "127.0.0.1"
+		effectiveSourcePort = localPort
+		sourceBridgeCounters = counters
+		trace.Info("source nbd traffic compressed via local bridge", "local_port", localPort, "remote_bridge_port", sourceBridgePort)
+	}
+
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(qcowDisks))
 	reportWorkerErr := func(err error) {
@@ -615,7 +706,7 @@ func run(cfg struct {
 		}
 
 		trace.Info("reading disk via libvirt backup NBD tcp export", "disk", d.TargetDev, "export", d.TargetDev)
-		extents, diskSize, dirty, err := nbdsync.ChangedExtentsTCP(ctx, nbdHost, cfg.SourceNBDPort, d.TargetDev, bitmapForRead, incrementalMode)
+		extents, diskSize, dirty, err := nbdsync.ChangedExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, bitmapForRead, incrementalMode)
 		if err != nil {
 			return err
 		}
@@ -668,13 +759,51 @@ func run(cfg struct {
 		stopMu.Unlock()
 
 		trace.Info("target nbd export started", "path", targetPath, "host", targetNBDHost, "port", targetPort)
-		if err := nbdsync.WaitForTCPExport(targetNBDHost, targetPort, 10*time.Second); err != nil {
-			return fmt.Errorf("wait for target nbd export %s:%d: %w", targetNBDHost, targetPort, err)
+
+		// Default to the direct, uncompressed path; overridden below when
+		// --compress is set (target SSH is always available).
+		effectiveTargetHost := targetNBDHost
+		effectiveTargetPort := targetPort
+		var targetBridgeCounters *nbdbridge.ByteCounters
+		if bridgeCfg.Enabled() {
+			targetBridgePort := targetPort + nbdBridgePortOffset
+			bridgeStopCmd, err := nbdbridge.StartRemote(ctx, targetSSHClient, targetBridgePort, targetPort, bridgeCfg)
+			if err != nil {
+				return fmt.Errorf("start target nbd bridge for %s: %w", d.TargetDev, err)
+			}
+			stopMu.Lock()
+			targetStopCommands = append(targetStopCommands, bridgeStopCmd)
+			stopMu.Unlock()
+			if err := nbdbridge.WaitForRemoteReady(targetSSHClient, targetBridgePort, 10*time.Second); err != nil {
+				return err
+			}
+			localPort, counters, stopLocal, err := nbdbridge.StartLocal(ctx, targetSSHClient, fmt.Sprintf("127.0.0.1:%d", targetBridgePort), bridgeCfg)
+			if err != nil {
+				return fmt.Errorf("start local nbd bridge relay for %s: %w", d.TargetDev, err)
+			}
+			defer stopLocal()
+			effectiveTargetHost = "127.0.0.1"
+			effectiveTargetPort = localPort
+			targetBridgeCounters = counters
+			trace.Info("target nbd traffic compressed via local bridge", "disk", d.TargetDev, "local_port", localPort, "remote_bridge_port", targetBridgePort)
+		} else {
+			if err := nbdsync.WaitForTCPExport(targetNBDHost, targetPort, 10*time.Second); err != nil {
+				return fmt.Errorf("wait for target nbd export %s:%d: %w", targetNBDHost, targetPort, err)
+			}
 		}
 
 		trace.Info("copy extents to remote target", "extents", len(extents), "path", targetPath, "disk_size", diskSize)
-		if err := nbdsync.CopyExtentsTCP(ctx, nbdHost, cfg.SourceNBDPort, d.TargetDev, targetNBDHost, targetPort, extents); err != nil {
+		if err := nbdsync.CopyExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, effectiveTargetHost, effectiveTargetPort, extents); err != nil {
 			return err
+		}
+
+		if targetBridgeCounters != nil {
+			logicalBytes := nbdbridge.SumLogicalDirtyBytes(extents)
+			trace.Info("target nbd bridge compression", "disk", d.TargetDev, "savings", nbdbridge.FormatSavings(logicalBytes, targetBridgeCounters.SentSnapshot()))
+		}
+		if sourceBridgeCounters != nil {
+			logicalBytes := nbdbridge.SumLogicalDirtyBytes(extents)
+			trace.Info("source nbd bridge compression", "disk", d.TargetDev, "savings", nbdbridge.FormatSavings(logicalBytes, sourceBridgeCounters.SentSnapshot()))
 		}
 
 		trace.Info("Stopping remote daemon", "device", d.TargetDev)

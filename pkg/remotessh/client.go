@@ -117,6 +117,16 @@ func (c *Client) Close() error {
 	return c.client.Close()
 }
 
+// DialTCP opens a direct-tcpip channel to addr (host:port) through this
+// client's SSH connection, so the remote endpoint only has to be reachable
+// from the remote host itself, not from the machine running vmsync.
+func (c *Client) DialTCP(addr string) (net.Conn, error) {
+	if c == nil || c.client == nil {
+		return nil, errors.New("ssh client is not connected")
+	}
+	return c.client.Dial("tcp", addr)
+}
+
 func (c *Client) Run(ctx context.Context, command string) (string, error) {
 	if c == nil || c.client == nil {
 		return "", errors.New("ssh client is not connected")
