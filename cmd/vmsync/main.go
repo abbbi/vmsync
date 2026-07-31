@@ -696,9 +696,6 @@ func run(cfg struct {
 		sourceStopCommands = append(sourceStopCommands, stopCmd)
 		stopMu.Unlock()
 		trace.Info("source nbd port in use", "side", "source", "kind", "bridge_remote", "host", nbdHost, "port", sourceBridgePort)
-		if err := nbdbridge.WaitForRemoteReady(sourceSSHClient, sourceBridgePort, 10*time.Second); err != nil {
-			return err
-		}
 		localPort, counters, stopLocal, err := nbdbridge.StartLocal(ctx, sourceSSHClient, fmt.Sprintf("127.0.0.1:%d", sourceBridgePort), bridgeCfg)
 		if err != nil {
 			return fmt.Errorf("start local nbd bridge relay for source: %w", err)
@@ -802,9 +799,6 @@ func run(cfg struct {
 			targetStopCommands = append(targetStopCommands, bridgeStopCmd)
 			stopMu.Unlock()
 			trace.Info("target nbd port in use", "side", "target", "kind", "bridge_remote", "disk", d.TargetDev, "host", targetNBDHost, "port", targetBridgePort)
-			if err := nbdbridge.WaitForRemoteReady(targetSSHClient, targetBridgePort, 10*time.Second); err != nil {
-				return err
-			}
 			localPort, counters, stopLocal, err := nbdbridge.StartLocal(ctx, targetSSHClient, fmt.Sprintf("127.0.0.1:%d", targetBridgePort), bridgeCfg)
 			if err != nil {
 				return fmt.Errorf("start local nbd bridge relay for %s: %w", d.TargetDev, err)
