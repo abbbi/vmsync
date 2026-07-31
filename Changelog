@@ -1,3 +1,17 @@
+Version 0.30
+-----------
+
+ * #3, #9: Implement --reinit command to start replication from scratch
+ * Implement --reinit-after-failures=N to automate restarts from scratch 
+ * Fix domains with multiple disks had a race condition on tests
+ * Fix target disk path changes would only be kept for last disk
+ for domains with multiple disks
+ * Fix checking for nvram is done before client SSH initialization
+ * Fix fetching Libvirt version
+ * Fix possible crash if disks / driver section is absent
+ * #10: Fix CTRL+C didn't stop nbd server
+ * Harden checkpoint numbering verification
+
 Version 0.27
 -----------
  * Fix loader/nvram setting detection, issue warning only if configured
