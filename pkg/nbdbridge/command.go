@@ -19,16 +19,46 @@ package nbdbridge
 
 import (
 	"fmt"
+	"strings"
 
 	"vmsync/pkg/util"
 )
 
+// mbufferStage renders one mbuffer invocation from cfg's block/buffer size.
+func mbufferStage(cfg Config) string {
+	return fmt.Sprintf("mbuffer -q -s %s -m %s", cfg.MbufferBlock, cfg.MbufferSize)
+}
+
 // innerPipeline is the per-connection filter chain socat hands each accepted
-// TCP connection's stdin/stdout to. It reads compressed bytes coming from the
-// bridge client, decompresses, forwards to the real NBD export, and
-// compresses the replies flowing back.
+// TCP connection's stdin/stdout to. It reads (compressed/buffered) bytes
+// coming from the bridge client, restores them, forwards to the real NBD
+// export, and re-applies the same treatment to the replies flowing back.
+//
+// socat's "-" <-> "TCP:..." bridging is itself bidirectional -- it reads its
+// own stdin and forwards to the TCP peer, while independently reading the
+// TCP peer and writing its own stdout -- so a single shell pipe built around
+// it naturally splits into two simplex halves: everything before socat only
+// ever sees the client-to-server direction, everything after it only ever
+// sees the server-to-client direction. mbuffer, unlike socat, is a simplex
+// filter, so it needs one instance on each side of socat to smooth both
+// directions; zstd needs the same per-direction split to compress/decompress
+// independently.
 func innerPipeline(cfg Config, realPort int) string {
-	return fmt.Sprintf("zstd -dq | socat - TCP:127.0.0.1:%d | zstd -q -%d", realPort, cfg.CompressLevel)
+	var stages []string
+	if cfg.Compress {
+		stages = append(stages, "zstd -dq")
+	}
+	if cfg.MbufferEnabled() {
+		stages = append(stages, mbufferStage(cfg))
+	}
+	stages = append(stages, fmt.Sprintf("socat - TCP:127.0.0.1:%d", realPort))
+	if cfg.MbufferEnabled() {
+		stages = append(stages, mbufferStage(cfg))
+	}
+	if cfg.Compress {
+		stages = append(stages, fmt.Sprintf("zstd -q -%d", cfg.CompressLevel))
+	}
+	return strings.Join(stages, " | ")
 }
 
 // BuildStartCommand returns a shell command that backgrounds a socat

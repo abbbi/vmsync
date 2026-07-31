@@ -29,11 +29,15 @@ import (
 // vmsync are present. It is a no-op when bridging isn't requested, so the
 // core sync path never depends on zstd being installed.
 func CheckLocal(cfg Config) error {
-	if !cfg.Compress {
-		return nil
+	if cfg.Compress {
+		if _, err := exec.LookPath("zstd"); err != nil {
+			return fmt.Errorf("--compress requires the 'zstd' binary to be installed locally: %w", err)
+		}
 	}
-	if _, err := exec.LookPath("zstd"); err != nil {
-		return fmt.Errorf("--compress requires the 'zstd' binary to be installed locally: %w", err)
+	if cfg.MbufferEnabled() {
+		if _, err := exec.LookPath("mbuffer"); err != nil {
+			return fmt.Errorf("--mbuffer requires the 'mbuffer' binary to be installed locally: %w", err)
+		}
 	}
 	return nil
 }
@@ -48,9 +52,12 @@ func CheckRemote(ctx context.Context, client *remotessh.Client, cfg Config, host
 	if cfg.Compress {
 		tools = append(tools, "zstd")
 	}
+	if cfg.MbufferEnabled() {
+		tools = append(tools, "mbuffer")
+	}
 	for _, tool := range tools {
 		if out, err := client.Run(ctx, "command -v "+tool); err != nil {
-			return fmt.Errorf("--compress requires the %q binary to be installed on %s: %w: %s", tool, host, err, out)
+			return fmt.Errorf("nbd bridge requires the %q binary to be installed on %s: %w: %s", tool, host, err, out)
 		}
 	}
 	return nil

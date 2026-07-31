@@ -17,20 +17,32 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package nbdbridge
 
-import "fmt"
+import (
+	"fmt"
+	"regexp"
+	"strings"
+)
 
 // Config describes how NBD traffic should be bridged/compressed between
 // hosts. The zero value disables bridging entirely, which is the required
 // default: vmsync's core sync path must work unchanged when none of these
-// options are used.
+// options are used. --compress and --mbuffer are independent: either can be
+// used alone, or both together.
 type Config struct {
 	Compress      bool
 	CompressLevel int
+	MbufferBlock  string // e.g. "64k"; empty means mbuffer is disabled
+	MbufferSize   string // e.g. "512M"
+}
+
+// MbufferEnabled reports whether --mbuffer was set.
+func (c Config) MbufferEnabled() bool {
+	return c.MbufferBlock != "" || c.MbufferSize != ""
 }
 
 // Enabled reports whether any bridging is requested at all.
 func (c Config) Enabled() bool {
-	return c.Compress
+	return c.Compress || c.MbufferEnabled()
 }
 
 // ValidateCompressLevel checks the --compress-level value is one zstd
@@ -40,4 +52,26 @@ func ValidateCompressLevel(level int) error {
 		return fmt.Errorf("--compress-level must be between 1 and 19, got %d", level)
 	}
 	return nil
+}
+
+var mbufferSizeRe = regexp.MustCompile(`(?i)^[0-9]+[bkmgt]?$`)
+
+// ParseMbufferSpec parses a --mbuffer value of the form
+// "<blocksize>,<buffersize>" (e.g. "64k,512M") into its two mbuffer -s/-m
+// arguments. An empty spec is valid and means mbuffer is disabled.
+func ParseMbufferSpec(spec string) (block, size string, err error) {
+	if spec == "" {
+		return "", "", nil
+	}
+	parts := strings.SplitN(spec, ",", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("--mbuffer must be of the form <blocksize>,<buffersize> (e.g. 64k,512M), got %q", spec)
+	}
+	if !mbufferSizeRe.MatchString(parts[0]) {
+		return "", "", fmt.Errorf("--mbuffer block size %q is invalid (expected a number optionally followed by b/k/m/g/t)", parts[0])
+	}
+	if !mbufferSizeRe.MatchString(parts[1]) {
+		return "", "", fmt.Errorf("--mbuffer buffer size %q is invalid (expected a number optionally followed by b/k/m/g/t)", parts[1])
+	}
+	return parts[0], parts[1], nil
 }

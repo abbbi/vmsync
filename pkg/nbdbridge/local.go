@@ -114,10 +114,92 @@ func StartLocal(ctx context.Context, sshClient *remotessh.Client, remoteBridgeAd
 	return port, counters, stopFn, nil
 }
 
+// outboundStages returns the local filter chain for the accepted-conn ->
+// SSH-channel direction: compress first (nearest the real, plaintext
+// endpoint), then buffer (nearest the SSH channel) -- symmetric with the
+// remote side's own stage ordering around its network hop.
+func outboundStages(cfg Config) [][]string {
+	var stages [][]string
+	if cfg.Compress {
+		stages = append(stages, []string{"zstd", "-q", fmt.Sprintf("-%d", cfg.CompressLevel)})
+	}
+	if cfg.MbufferEnabled() {
+		stages = append(stages, []string{"mbuffer", "-q", "-s", cfg.MbufferBlock, "-m", cfg.MbufferSize})
+	}
+	return stages
+}
+
+// inboundStages returns the local filter chain for the SSH-channel ->
+// accepted-conn direction: buffer first (nearest the SSH channel), then
+// decompress (nearest the real, plaintext endpoint).
+func inboundStages(cfg Config) [][]string {
+	var stages [][]string
+	if cfg.MbufferEnabled() {
+		stages = append(stages, []string{"mbuffer", "-q", "-s", cfg.MbufferBlock, "-m", cfg.MbufferSize})
+	}
+	if cfg.Compress {
+		stages = append(stages, []string{"zstd", "-dq"})
+	}
+	return stages
+}
+
+// startPipelineStages runs each stage in order, wiring stage i's stdout to
+// stage i+1's stdin (Go's exec package copies a non-*os.File Stdin reader in
+// a background goroutine, so no manual piping is needed between stages). It
+// returns the final stage's stdout for the caller to drain, and the started
+// commands for later cleanup via waitStages/killStages. If stages is empty,
+// in is returned unchanged and no commands are started.
+func startPipelineStages(ctx context.Context, in io.Reader, stages [][]string) (out io.Reader, cmds []*exec.Cmd, err error) {
+	cur := in
+	for _, args := range stages {
+		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+		cmd.Stdin = cur
+		stdout, perr := cmd.StdoutPipe()
+		if perr != nil {
+			killStages(cmds)
+			return nil, nil, fmt.Errorf("stdout pipe for %s: %w", args[0], perr)
+		}
+		if serr := cmd.Start(); serr != nil {
+			killStages(cmds)
+			return nil, nil, fmt.Errorf("start %s: %w", args[0], serr)
+		}
+		cmds = append(cmds, cmd)
+		cur = stdout
+	}
+	return cur, cmds, nil
+}
+
+// waitStages reaps started commands in reverse order. Each stage's stdout is
+// only guaranteed fully drained once the next stage's Wait (which internally
+// waits for the copy-into-stdin goroutine it started) has returned, so
+// reaping must go from the last stage backwards.
+func waitStages(cmds []*exec.Cmd) error {
+	var firstErr error
+	for i := len(cmds) - 1; i >= 0; i-- {
+		if err := cmds[i].Wait(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// killStages forcibly terminates and reaps commands that were started but
+// must be abandoned because a later stage in the same chain failed to start.
+func killStages(cmds []*exec.Cmd) {
+	for _, cmd := range cmds {
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+	}
+	for _, cmd := range cmds {
+		cmd.Wait()
+	}
+}
+
 // relayConnection bridges one accepted plaintext connection (from the local
-// NBD client) to remoteBridgeAddr over the SSH tunnel, compressing the
-// outbound direction and decompressing the inbound direction with local zstd
-// subprocesses.
+// NBD client) to remoteBridgeAddr over the SSH tunnel, running it through the
+// enabled zstd/mbuffer filters -- compressing/buffering the outbound
+// direction and reversing that for the inbound direction.
 func relayConnection(ctx context.Context, conn net.Conn, sshClient *remotessh.Client, remoteBridgeAddr string, cfg Config, counters *ByteCounters) error {
 	defer conn.Close()
 
@@ -127,36 +209,18 @@ func relayConnection(ctx context.Context, conn net.Conn, sshClient *remotessh.Cl
 	}
 	defer remote.Close()
 
-	compress := exec.CommandContext(ctx, "zstd", "-q", fmt.Sprintf("-%d", cfg.CompressLevel))
-	compressIn, err := compress.StdinPipe()
+	outboundOut, outCmds, err := startPipelineStages(ctx, conn, outboundStages(cfg))
 	if err != nil {
-		return fmt.Errorf("compress stdin pipe: %w", err)
+		return fmt.Errorf("start outbound filter chain: %w", err)
 	}
-	compressOut, err := compress.StdoutPipe()
+	inboundOut, inCmds, err := startPipelineStages(ctx, remote, inboundStages(cfg))
 	if err != nil {
-		return fmt.Errorf("compress stdout pipe: %w", err)
+		killStages(outCmds)
+		return fmt.Errorf("start inbound filter chain: %w", err)
 	}
-	if err := compress.Start(); err != nil {
-		return fmt.Errorf("start local zstd compressor: %w", err)
-	}
-	defer compress.Wait()
-
-	decompress := exec.CommandContext(ctx, "zstd", "-dq")
-	decompressIn, err := decompress.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("decompress stdin pipe: %w", err)
-	}
-	decompressOut, err := decompress.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("decompress stdout pipe: %w", err)
-	}
-	if err := decompress.Start(); err != nil {
-		return fmt.Errorf("start local zstd decompressor: %w", err)
-	}
-	defer decompress.Wait()
 
 	var relayWg sync.WaitGroup
-	relayWg.Add(4)
+	relayWg.Add(2)
 	var firstErr error
 	var errOnce sync.Once
 	reportErr := func(err error) {
@@ -168,29 +232,20 @@ func relayConnection(ctx context.Context, conn net.Conn, sshClient *remotessh.Cl
 
 	go func() {
 		defer relayWg.Done()
-		_, err := io.Copy(compressIn, conn)
-		compressIn.Close()
-		reportErr(err)
-	}()
-	go func() {
-		defer relayWg.Done()
-		n, err := io.Copy(remote, compressOut)
+		n, err := io.Copy(remote, outboundOut)
 		counters.addSent(n)
 		reportErr(err)
 	}()
 	go func() {
 		defer relayWg.Done()
-		n, err := io.Copy(decompressIn, remote)
+		n, err := io.Copy(conn, inboundOut)
 		counters.addReceived(n)
-		decompressIn.Close()
 		reportErr(err)
 	}()
-	go func() {
-		defer relayWg.Done()
-		_, err := io.Copy(conn, decompressOut)
-		reportErr(err)
-	}()
-
 	relayWg.Wait()
+
+	reportErr(waitStages(outCmds))
+	reportErr(waitStages(inCmds))
+
 	return firstErr
 }

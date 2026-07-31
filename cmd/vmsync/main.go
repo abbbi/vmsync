@@ -83,6 +83,7 @@ func main() {
 		ReinitAfterFailures int
 		Compress            bool
 		CompressLevel       int
+		Mbuffer             string
 		ShowVersion         bool
 	}
 
@@ -109,6 +110,7 @@ func main() {
 	flag.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "After this many consecutive sync failures (tracked in the target domain's vmsync metadata), automatically reinit (as with -reinit) instead of trying again the same way. 0 disables this (default).")
 	flag.BoolVar(&cfg.Compress, "compress", false, "Compress NBD traffic between hosts using zstd, tunneled over the existing SSH connection. Requires 'zstd' locally and 'socat'+'zstd' on any remote host reached via SSH; core sync behavior is unchanged when this is not set.")
 	flag.IntVar(&cfg.CompressLevel, "compress-level", 3, "zstd compression level to use when --compress is set (1-19)")
+	flag.StringVar(&cfg.Mbuffer, "mbuffer", "", "Buffer NBD bridge traffic through mbuffer to smooth throughput, formatted as <blocksize>,<buffersize> (e.g. 64k,512M). Requires 'mbuffer' locally and on any remote host reached via SSH. Independent of --compress -- usable alone or combined with it.")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
@@ -128,6 +130,12 @@ func main() {
 	if cfg.Compress {
 		if err := nbdbridge.ValidateCompressLevel(cfg.CompressLevel); err != nil {
 			trace.Error("invalid compress configuration", "error", err)
+			os.Exit(2)
+		}
+	}
+	if cfg.Mbuffer != "" {
+		if _, _, err := nbdbridge.ParseMbufferSpec(cfg.Mbuffer); err != nil {
+			trace.Error("invalid mbuffer configuration", "error", err)
 			os.Exit(2)
 		}
 	}
@@ -188,6 +196,7 @@ func run(cfg struct {
 	ReinitAfterFailures int
 	Compress            bool
 	CompressLevel       int
+	Mbuffer             string
 	ShowVersion         bool
 }) (runErr error) {
 
@@ -208,19 +217,28 @@ func run(cfg struct {
 	var freezed bool = false
 	var started bool = false
 
-	bridgeCfg := nbdbridge.Config{Compress: cfg.Compress, CompressLevel: cfg.CompressLevel}
+	mbufferBlock, mbufferSize, err := nbdbridge.ParseMbufferSpec(cfg.Mbuffer)
+	if err != nil {
+		return err
+	}
+	bridgeCfg := nbdbridge.Config{
+		Compress:      cfg.Compress,
+		CompressLevel: cfg.CompressLevel,
+		MbufferBlock:  mbufferBlock,
+		MbufferSize:   mbufferSize,
+	}
 	if err := nbdbridge.CheckLocal(bridgeCfg); err != nil {
 		return err
 	}
 	if bridgeCfg.Enabled() {
 		if util.UriUsesSSH(cfg.SourceURI) && cfg.SourceNBDHost != "" {
 			if uriHost := util.HostFromURIOrLocal(cfg.SourceURI); cfg.SourceNBDHost != uriHost {
-				return fmt.Errorf("--compress requires --source-nbd-host to match the host in --source-uri (got %s, expected %s): the remote bridge only forwards to 127.0.0.1 on that same host", cfg.SourceNBDHost, uriHost)
+				return fmt.Errorf("--compress/--mbuffer require --source-nbd-host to match the host in --source-uri (got %s, expected %s): the remote bridge only forwards to 127.0.0.1 on that same host", cfg.SourceNBDHost, uriHost)
 			}
 		}
 		if cfg.TargetNBDHost != "" {
 			if uriHost := util.HostFromURIOrLocal(cfg.TargetURI); cfg.TargetNBDHost != uriHost {
-				return fmt.Errorf("--compress requires --target-nbd-host to match the host in --target-uri (got %s, expected %s): the remote bridge only forwards to 127.0.0.1 on that same host", cfg.TargetNBDHost, uriHost)
+				return fmt.Errorf("--compress/--mbuffer require --target-nbd-host to match the host in --target-uri (got %s, expected %s): the remote bridge only forwards to 127.0.0.1 on that same host", cfg.TargetNBDHost, uriHost)
 			}
 		}
 	}
