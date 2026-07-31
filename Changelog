@@ -1,9 +1,11 @@
 Version 0.30
 -----------
 
+ * Implement optional zstd compression for WAN links
+ * Implement optional mbuffer for non constant IO over WAN links
  * #3, #9: Implement --reinit command to start replication from scratch
  * Implement --reinit-after-failures=N to automate restarts from scratch 
- * Fix domains with multiple disks had a race condition on tests
+ * #10: Fix domains with multiple disks had a race condition on tests
  * Fix target disk path changes would only be kept for last disk
  for domains with multiple disks
  * Fix checking for nvram is done before client SSH initialization
