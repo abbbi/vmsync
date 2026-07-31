@@ -1,0 +1,61 @@
+# nbdbridge
+
+vmsync usually works with two connections:
+
+- an ssh connection to launch remote nbd server
+- a direct tcp nbd connection that is unencrypted
+
+When using zstd compression / mbuffer, we use the ssh connection as single transport.
+This has the advantage that the nbd connection is also encrypted by ssh.
+nbd being a bidirectional protocdol, we need two instances of zstd/mbuffer (incoming/outgoing traffic), for both source and target.
+
+In order to achieve bidirectional communications, we launch socat on the target which listens on 127.0.0.1:bridgeport (bridgeport = targetport + 1)
+zstd is optionally launched for outgoing traffic and zstd -d is launched for incoming traffic, on both source and target
+mbuffer is also optionnaly launched twice on both source and target
+
+Example with vmsync --compress --mbuffer=64k,1G
+
+ vmsync host (local)                                           Target host (remote, reached via SSH)
+ ════════════════════                                          ═══════════════════════════════════════
+                                                               For EACH disk i independently:
+                                                               qemu-nbd real port  = TargetNBDPort + i
+                                                               bridge port         = qemu-nbd port + (TargetNBDPort + 1)
+ ┌── disk 0 ──────────────────────────┐                        ┌── disk 0 ─────────────────────────────────────────────┐
+ │ nbdsync.CopyExtentsTCP             │                        │  qemu-nbd --fork --persistent --format=qcow2          │
+ │      │ dials 127.0.0.1:localPort0  │                        │           --bind 0.0.0.0 --port <targetPort>          │
+ │      ▼                             │                        │           --pid-file /tmp/vmsync-qemu-nbd-...pid      │
+ │ ┌─────────────────────────────┐    │                        │  (this is the REAL, uncompressed NBD server,          │
+ │ │ Go relay (StartLocal)       │    │                        │   listening on 127.0.0.1:<targetPort> only)           │
+ │ │ 127.0.0.1:<localPort0>      │    │                        │              ▲                                        │
+ │ │  (net.Listen "tcp", :0 --   │    │                        │              │ TCP (plaintext)                        │
+ │ │   ephemeral, one per disk)  │    │                        │              │                                        │
+ │ │                             │    │                        │  ┌───────────┴──────────────────────────────────┐     │
+ │ │ outbound (to target):       │    │                        │  │ socat - TCP:127.0.0.1:<targetPort>           │     │
+ │ │  conn → zstd -3 → mbuffer   │    │      SSH channel       │  │   (bidirectional pivot: reads/writes its own │     │
+ │ │  → sshClient.DialTCP() ─────┼────┼──── (direct-tcpip, ────┼──┤    stdin/stdout AND the TCP socket at once)  │     │
+ │ │                             │    │      one channel per   │  │        ▲                    │                │     │
+ │ │ inbound (from target):      │    │      accepted conn)    │  │        │ mbuffer            ▼ mbuffer        │     │
+ │ │  DialTCP() → mbuffer        │    │                        │  │        │                    │                │     │
+ │ │  → zstd -d → conn           │    │                        │  │        │ zstd -d            ▼ zstd -3        │     │
+ │ └─────────────────────────────┘    │                        │  └────────┴────────────────────┴────────────────┘     │
+ │                                    │                        │           ▲                    │                      │
+ │                                    │                        │           │ (this whole 5-stage chain is spawned      │
+ │                                    │                        │           │  by socat's SYSTEM: option, once per      │
+ │                                    │                        │           │  accepted connection)                     │
+ │                                    │                        │  ┌────────┴────────────────────┴───────────────────┐  │
+ │                                    │                        │  │ socat TCP-LISTEN:<bridgePort0>,bind=127.0.0.1,  │  │
+ │                                    │                        │  │   reuseaddr,fork  (StartRemote)                 │  │
+ │                                    │                        │  │ backgrounded via: setsid sh -c '...' &          │  │
+ │                                    │                        │  │ pid  → /tmp/vmsync-bridge-<bridgePort0>.pid     │  │
+ │                                    │                        │  │ log  → /tmp/vmsync-bridge-<bridgePort0>.log     │  │
+ │                                    │                        │  └─────────────────────────────────────────────────┘  │
+ └────────────────────────────────────┘                        └───────────────────────────────────────────────────────┘
+ ┌── disk 1 ───────────────────────────┐                        ┌── disk 1 ────────────────────────────────────────────┐
+ │ same shape, independent:            │                        │ same shape, independent:                             │
+ │ localPort1 ≠ localPort0             │                        │ targetPort1 = TargetNBDPort+1                        │
+ │                                     │                        │ bridgePort1 = targetPort1 + (TargetNBDPort+1)        │
+ └─────────────────────────────────────┘                        └──────────────────────────────────────────────────────┘
+                                                                  ...one such block per disk, all torn down independently
+ Source side (for contrast): only ONE shared bridge for the whole sync,
+ since every disk reads through the same libvirt backup NBD export
+ (differentiated by export name, not by port) — no per-disk repetition there.
