@@ -59,15 +59,26 @@ func ParseQcowDisks(domainXML string) ([]QcowDisk, error) {
 
 	var out []QcowDisk
 	for _, d := range domcfg.Devices.Disks {
+		// Target/Source are pointers and can be nil for malformed or
+		// unusual disk entries; don't dereference them blindly.
+		targetDev := ""
+		if d.Target != nil {
+			targetDev = d.Target.Dev
+		}
 
 		if util.IgnoreDevice(d) == true {
-			trace.Info("skipping incompatible", "device", d.Target.Dev)
+			trace.Info("skipping incompatible", "device", targetDev)
 			continue
 		}
 
+		source := ""
+		if d.Source != nil && d.Source.File != nil {
+			source = d.Source.File.File
+		}
+
 		out = append(out, QcowDisk{
-			TargetDev:   d.Target.Dev,
-			Source:      d.Source.File.File,
+			TargetDev:   targetDev,
+			Source:      source,
 			Format:      d.Driver.Type,
 			DiscardMode: d.Driver.Discard,
 		})

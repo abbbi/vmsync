@@ -197,14 +197,16 @@ func run(cfg struct {
 		return err
 	}
 	defer srcMgr.Close()
-	trace.Info("Connected to source libvirt", "version", srcMgr.Conn.GetVersion)
+	srcLibvirtVersion, _ := srcMgr.Conn.GetVersion()
+	trace.Info("Connected to source libvirt", "version", srcLibvirtVersion)
 
 	tgtMgr, err := libvirtsync.Connect(cfg.TargetURI)
 	if err != nil {
 		return err
 	}
 	defer tgtMgr.Close()
-	trace.Info("Connected to target libvirt", "version", tgtMgr.Conn.GetVersion)
+	tgtLibvirtVersion, _ := tgtMgr.Conn.GetVersion()
+	trace.Info("Connected to target libvirt", "version", tgtLibvirtVersion)
 
 	srcDom, err := srcMgr.LookupDomain(cfg.SourceDomain)
 	if err != nil {
@@ -300,8 +302,8 @@ func run(cfg struct {
 		return fmt.Errorf("read source domain xml: %w", err)
 	}
 	trace.Info("discovered source domain", "domain", cfg.SourceDomain)
-
-	nvram, err := libvirtsync.DetectNvram(srcXML)
+  
+  nvram, err := libvirtsync.DetectNvram(srcXML)
 	if err != nil {
 		return err
 	}
@@ -322,7 +324,7 @@ func run(cfg struct {
 			trace.Warning("loader setting detected in vm config", "path", loader, "but files do not exist on target host")
 		}
 	}
-
+  
 	qcowDisks, err := disk.ParseQcowDisks(srcXML)
 	if err != nil {
 		return err
@@ -441,7 +443,10 @@ func run(cfg struct {
 	if err != nil {
 		return err
 	}
-	checkpointName, parent = libvirtsync.NextCheckpointName(existing)
+	checkpointName, parent, err = libvirtsync.NextCheckpointName(existing)
+	if err != nil {
+		return err
+	}
 	var targetPath string
 	if parent == "" {
 		// Preflight for full sync: fail before sync operations if target disk path exists.
@@ -619,7 +624,8 @@ func run(cfg struct {
 			return nil
 		}
 
-		targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.Source)
+		// Avoid datarace in this goroutine by declaring targetPath as local var instead of a shared one
+		targetPath := util.SetTargetPath(cfg.TargetDiskPath, d.Source)
 		createCmd := "qemu-img create -f qcow2 " + util.ShQuote(targetPath) + " -o cluster_size=" + fmt.Sprintf("%d", d.ClusterSize) + " " + fmt.Sprintf("%d", d.VirtualSize)
 		var targetPathInc string
 		if incrementalMode {
