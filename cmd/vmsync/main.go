@@ -679,19 +679,15 @@ func run(cfg struct {
 		targetNBDHost = util.ConnectHostFromBindOrURI(cfg.TargetNBDBind, cfg.TargetURI)
 	}
 
-	// Bridge ports are derived from the target's own base port so they stay
-	// small and predictable
-	// each disk's real target port already increases by one per disk
-	// (TargetNBDPort + i, below), and bridge ports track the same spacing.
-	nbdBridgePortOffset := cfg.TargetNBDPort + 1
-
 	// Default to the direct, uncompressed path; overridden below when
 	// --compress/--mbuffer are set and the source is reachable via SSH.
 	effectiveSourceHost := nbdHost
 	effectiveSourcePort := cfg.SourceNBDPort
 	var sourceBridgeCounters *nbdbridge.ByteCounters
 	if bridgeCfg.Enabled() && sourceNeedsSSH {
-		sourceBridgePort := cfg.SourceNBDPort + nbdBridgePortOffset
+		// The source has a single shared NBD export (no per-disk ports), so
+		// its bridge port simply sits right next to it.
+		sourceBridgePort := cfg.SourceNBDPort + 1
 		stopCmd, err := nbdbridge.StartRemote(ctx, sourceSSHClient, sourceBridgePort, cfg.SourceNBDPort, bridgeCfg)
 		if err != nil {
 			return fmt.Errorf("start source nbd bridge: %w", err)
@@ -794,7 +790,10 @@ func run(cfg struct {
 		effectiveTargetPort := targetPort
 		var targetBridgeCounters *nbdbridge.ByteCounters
 		if bridgeCfg.Enabled() {
-			targetBridgePort := targetPort + nbdBridgePortOffset
+			// All real qemu-nbd ports occupy [TargetNBDPort, TargetNBDPort+N),
+			// so the bridge ports lay out right after them, as one contiguous
+			// block [TargetNBDPort+N, TargetNBDPort+2N).
+			targetBridgePort := targetPort + len(qcowDisks)
 			bridgeStopCmd, err := nbdbridge.StartRemote(ctx, targetSSHClient, targetBridgePort, targetPort, bridgeCfg)
 			if err != nil {
 				return fmt.Errorf("start target nbd bridge for %s: %w", d.TargetDev, err)
