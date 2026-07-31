@@ -71,9 +71,11 @@ func main() {
 		SSHInsecure    bool
 		KnownHosts     string
 		SSHTimeoutSec  int
-		Debug          bool
-		Start          bool
-		ShowVersion    bool
+		Debug               bool
+		Start               bool
+		Reinit              bool
+		ReinitAfterFailures int
+		ShowVersion         bool
 	}
 
 	flag.StringVar(&cfg.SourceURI, "source-uri", "", "libvirt source URI (example: qemu+ssh://src/system)")
@@ -95,6 +97,8 @@ func main() {
 	flag.StringVar(&cfg.KnownHosts, "ssh-known-hosts", "", "known_hosts file path (defaults to ~/.ssh/known_hosts)")
 	flag.IntVar(&cfg.SSHTimeoutSec, "ssh-timeout-sec", 10, "ssh connection timeout in seconds")
 	flag.BoolVar(&cfg.Start, "start", false, "In case vm is in non-running state, start in paused mode to allow sync.")
+	flag.BoolVar(&cfg.Reinit, "reinit", false, "Discard all vmsync checkpoints on the source and the existing target domain/disks, then perform a fresh full sync. Use to recover from a broken checkpoint chain (e.g. \"Bitmap already exists\" errors).")
+	flag.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "After this many consecutive sync failures (tracked in the target domain's vmsync metadata), automatically reinit (as with -reinit) instead of trying again the same way. 0 disables this (default).")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
@@ -114,10 +118,33 @@ func main() {
 
 	trace.SetDebug(cfg.Debug)
 
+	// Consecutive failure count lives in the target domain's own vmsync
+	// metadata (alongside last_checkpoint/last_sync_timestamp), not in local
+	// state -- so it survives being tracked from a different host and stays
+	// in one place with the rest of vmsync's bookkeeping.
+	if cfg.ReinitAfterFailures > 0 {
+		failures, err := libvirtsync.ReadTargetFailureCount(cfg.TargetURI, cfg.TargetDomain)
+		if err != nil {
+			trace.Warning("unable to read failure count from target metadata", "error", err)
+		} else if failures >= cfg.ReinitAfterFailures {
+			trace.Warning("reinit-after-failures threshold reached, forcing reinit", "consecutive_failures", failures, "threshold", cfg.ReinitAfterFailures)
+			cfg.Reinit = true
+		}
+	}
+
 	if err := run(cfg); err != nil {
 		trace.Error("sync failed", "error", err)
+		if cfg.ReinitAfterFailures > 0 {
+			if count, rerr := libvirtsync.RecordTargetSyncFailure(cfg.TargetURI, cfg.TargetDomain); rerr != nil {
+				trace.Warning("failed to record sync failure in target metadata", "error", rerr)
+			} else {
+				trace.Info("recorded sync failure in target metadata", "consecutive_failures", count)
+			}
+		}
 		os.Exit(1)
 	}
+	// On success, failure_count is already reset to 0 as part of the normal
+	// UpdateSyncMetadata call in run() -- nothing further to do here.
 }
 
 func run(cfg struct {
@@ -138,10 +165,12 @@ func run(cfg struct {
 	SSHPort        int
 	SSHInsecure    bool
 	KnownHosts     string
-	SSHTimeoutSec  int
-	Debug          bool
-	Start          bool
-	ShowVersion    bool
+	SSHTimeoutSec       int
+	Debug               bool
+	Start               bool
+	Reinit              bool
+	ReinitAfterFailures int
+	ShowVersion         bool
 }) (runErr error) {
 
 	var tgtState bool
@@ -373,6 +402,40 @@ func run(cfg struct {
 	}
 	defer targetSSHClient.Close()
 	defer cleanupTargetNBD("cleanup")
+
+	if cfg.Reinit {
+		trace.Warning("reinit requested: discarding checkpoint chain and existing target state", "domain", cfg.SourceDomain)
+		if err := libvirtsync.DeleteAllManagedCheckpoints(srcDom); err != nil {
+			return fmt.Errorf("reinit: delete existing checkpoints: %w", err)
+		}
+
+		if tgtDom, lookupErr := tgtMgr.LookupDomain(cfg.TargetDomain); lookupErr == nil {
+			running, runErr := libvirtsync.DomainRunning(tgtDom)
+			if runErr != nil {
+				tgtDom.Free()
+				return fmt.Errorf("reinit: check target domain state: %w", runErr)
+			}
+			if running {
+				tgtDom.Free()
+				return fmt.Errorf("reinit: target domain %s is running, shut it down before reinitializing", cfg.TargetDomain)
+			}
+			if err := tgtDom.Undefine(); err != nil {
+				tgtDom.Free()
+				return fmt.Errorf("reinit: undefine target domain %s: %w", cfg.TargetDomain, err)
+			}
+			tgtDom.Free()
+			trace.Info("reinit: undefined existing target domain", "vm", cfg.TargetDomain)
+		}
+
+		for _, d := range qcowDisks {
+			reinitTargetPath := util.SetTargetPath(cfg.TargetDiskPath, d.Source)
+			trace.Info("reinit: removing target disk", "path", reinitTargetPath)
+			if out, err := targetSSHClient.Run(ctx, "rm -f "+util.ShQuote(reinitTargetPath)); err != nil {
+				return fmt.Errorf("reinit: remove target disk %s: %w: %s", reinitTargetPath, err, out)
+			}
+		}
+		trace.Info("reinit complete, proceeding with full sync")
+	}
 
 	existing, err := libvirtsync.ListManagedCheckpoints(srcDom)
 	if err != nil {
@@ -657,7 +720,7 @@ func run(cfg struct {
 	}
 	trace.Info("Adding metadata information")
 	var newXML string
-	newXML, err = libvirtsync.AddMetadata(srcXML, checkpointName)
+	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, checkpointName)
 	if err != nil {
 		trace.Warning("Unable to add metadata info", err)
 		newXML = srcXML

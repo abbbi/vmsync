@@ -42,7 +42,18 @@ const (
 
 	MetadataFieldLastCheckpoint = "last_checkpoint"
 	MetadataFieldLastSync       = "last_sync_timestamp"
+	MetadataFieldFailureCount   = "failure_count"
 )
+
+// metadataFieldOrder fixes the field order vmsync writes its own metadata
+// entries in, purely for stable/readable XML output.
+var metadataFieldOrder = []string{
+	MetadataFieldLastCheckpoint,
+	MetadataFieldLastSync,
+	MetadataFieldFailureCount,
+}
+
+var vmsyncBlockRe = regexp.MustCompile(`(?s)<vmsync:vmsync[^>]*>.*?</vmsync:vmsync>`)
 
 type Manager struct {
 	Conn *libvirt.Connect
@@ -232,17 +243,35 @@ func replaceDomainName(domainXML, name string) (string, error) {
 	return changed, nil
 }
 
-func AddMetadata(domainXML string, checkpoint string) (string, error) {
+// SetMetadataFields merges the given vmsync:field->value pairs into
+// domainXML's <metadata> block, preserving any existing vmsync fields not
+// mentioned in updates (and any unrelated, non-vmsync metadata some other
+// tool may have added) untouched.
+func SetMetadataFields(domainXML string, updates map[string]string) (string, error) {
 	domcfg := &libvirtxml.Domain{}
 	err := domcfg.Unmarshal(domainXML)
 	if err != nil {
 		return "", err
 	}
 
-	entry := metadataEntry(checkpoint)
+	current := map[string]string{}
+	if domcfg.Metadata != nil {
+		for _, field := range metadataFieldOrder {
+			if v := parseMetadataValue(domcfg.Metadata.XML, field); v != "" {
+				current[field] = v
+			}
+		}
+	}
+	for field, value := range updates {
+		current[field] = value
+	}
+	entry := buildMetadataEntry(current)
+
 	if domcfg.Metadata == nil {
 		domcfg.Metadata = &libvirtxml.DomainMetadata{XML: entry}
-	} else if !strings.Contains(domcfg.Metadata.XML, `<vmsync:last_checkpoint`) {
+	} else if vmsyncBlockRe.MatchString(domcfg.Metadata.XML) {
+		domcfg.Metadata.XML = vmsyncBlockRe.ReplaceAllLiteralString(domcfg.Metadata.XML, entry)
+	} else {
 		domcfg.Metadata.XML += entry
 	}
 
@@ -252,6 +281,92 @@ func AddMetadata(domainXML string, checkpoint string) (string, error) {
 	}
 
 	return changed, nil
+}
+
+// UpdateSyncMetadata records a fresh checkpoint/timestamp and resets
+// failure_count to 0; called once a sync completes successfully.
+func UpdateSyncMetadata(domainXML string, checkpoint string) (string, error) {
+	return SetMetadataFields(domainXML, map[string]string{
+		MetadataFieldLastCheckpoint: checkpoint,
+		MetadataFieldLastSync:       strconv.FormatInt(time.Now().Unix(), 10),
+		MetadataFieldFailureCount:   "0",
+	})
+}
+
+// ReadTargetFailureCount reconnects to the target and returns the
+// failure_count currently recorded in its domain metadata. Returns 0 (no
+// error) if the target domain doesn't exist yet or has no such field.
+func ReadTargetFailureCount(targetURI, targetDomain string) (int, error) {
+	mgr, err := Connect(targetURI)
+	if err != nil {
+		return 0, fmt.Errorf("reconnect target libvirt: %w", err)
+	}
+	defer mgr.Close()
+
+	dom, err := mgr.Conn.LookupDomainByName(targetDomain)
+	if err != nil {
+		return 0, nil
+	}
+	defer dom.Free()
+
+	domXML, err := dom.GetXMLDesc(0)
+	if err != nil {
+		return 0, fmt.Errorf("read target domain xml: %w", err)
+	}
+	value, err := ParseMetadata(domXML, MetadataFieldFailureCount)
+	if err != nil || value == "" {
+		return 0, nil
+	}
+	count, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, nil
+	}
+	return count, nil
+}
+
+// RecordTargetSyncFailure reconnects to the target, increments
+// failure_count in its domain metadata (leaving the rest of its definition
+// untouched) and returns the new count. A target domain that doesn't exist
+// yet has nothing to record against and is treated as a no-op.
+func RecordTargetSyncFailure(targetURI, targetDomain string) (int, error) {
+	mgr, err := Connect(targetURI)
+	if err != nil {
+		return 0, fmt.Errorf("reconnect target libvirt: %w", err)
+	}
+	defer mgr.Close()
+
+	dom, err := mgr.Conn.LookupDomainByName(targetDomain)
+	if err != nil {
+		return 0, nil
+	}
+	defer dom.Free()
+
+	domXML, err := dom.GetXMLDesc(0)
+	if err != nil {
+		return 0, fmt.Errorf("read target domain xml: %w", err)
+	}
+
+	current := 0
+	if value, err := ParseMetadata(domXML, MetadataFieldFailureCount); err == nil && value != "" {
+		if n, err := strconv.Atoi(value); err == nil {
+			current = n
+		}
+	}
+	next := current + 1
+
+	updatedXML, err := SetMetadataFields(domXML, map[string]string{
+		MetadataFieldFailureCount: strconv.Itoa(next),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("update failure_count metadata: %w", err)
+	}
+	newDom, err := mgr.Conn.DomainDefineXML(updatedXML)
+	if err != nil {
+		return 0, fmt.Errorf("redefine target domain with updated failure_count: %w", err)
+	}
+	defer newDom.Free()
+
+	return next, nil
 }
 
 func DetectNvram(domainXML string) (string, error) {
@@ -310,19 +425,24 @@ func ParseMetadataField(domainXML string, field string) (string, error) {
 	return parseMetadataValue(domcfg.Metadata.XML, field), nil
 }
 
-func metadataEntry(checkpoint string) string {
+// buildMetadataEntry renders a full <vmsync:vmsync> block from the given
+// field values, in the fixed order defined by metadataFieldOrder. Fields
+// absent from the map are simply omitted.
+func buildMetadataEntry(fields map[string]string) string {
 	var b strings.Builder
 	b.WriteString(metadataStart)
-	b.WriteString("\n  <vmsync:")
-	b.WriteString(MetadataFieldLastCheckpoint)
-	b.WriteString(" id=\"")
-	_ = xml.EscapeText(&b, []byte(checkpoint))
-	b.WriteString("\"/>\n")
-	b.WriteString("  <vmsync:")
-	b.WriteString(MetadataFieldLastSync)
-	b.WriteString(" id=\"")
-	b.WriteString(strconv.FormatInt(time.Now().Unix(), 10))
-	b.WriteString("\"/>\n")
+	for _, field := range metadataFieldOrder {
+		value, ok := fields[field]
+		if !ok {
+			continue
+		}
+		b.WriteString("\n  <vmsync:")
+		b.WriteString(field)
+		b.WriteString(" id=\"")
+		_ = xml.EscapeText(&b, []byte(value))
+		b.WriteString("\"/>")
+	}
+	b.WriteString("\n")
 	b.WriteString(metadataEnd)
 	return b.String()
 }
@@ -483,6 +603,27 @@ func DeleteCheckpointIfExists(dom *libvirt.Domain, checkpointName string) error 
 	defer cp.Free()
 	if err := cp.Delete(0); err != nil {
 		return fmt.Errorf("delete checkpoint %s: %w", checkpointName, err)
+	}
+	return nil
+}
+
+// DeleteAllManagedCheckpoints removes every vmsync-managed checkpoint on dom,
+// used by -reinit to recover from a broken checkpoint chain (e.g. the
+// "Bitmap already exists" failure in
+// https://github.com/abbbi/vmsync/issues/9) by discarding it entirely and
+// letting the next sync start over as a fresh full sync.
+func DeleteAllManagedCheckpoints(dom *libvirt.Domain) error {
+	existing, err := ListManagedCheckpoints(dom)
+	if err != nil {
+		return err
+	}
+	// Newest-to-oldest: a checkpoint with children still attached to it
+	// cannot be deleted, so always remove children before their parent.
+	// ListManagedCheckpoints sorts oldest-first.
+	for i := len(existing) - 1; i >= 0; i-- {
+		if err := DeleteCheckpointIfExists(dom, existing[i].Name); err != nil {
+			return fmt.Errorf("delete checkpoint %s: %w", existing[i].Name, err)
+		}
 	}
 	return nil
 }
