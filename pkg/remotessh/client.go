@@ -132,9 +132,36 @@ func (c *Client) Run(ctx context.Context, command string) (string, error) {
 		return "", errors.New("ssh client is not connected")
 	}
 
-	session, err := c.client.NewSession()
-	if err != nil {
-		return "", fmt.Errorf("open ssh session: %w", err)
+	// NewSession blocks on the underlying SSH transport with no timeout of
+	// its own; if that transport is wedged (e.g. the connection is alive at
+	// the TCP level but no longer servicing channel requests), this would
+	// otherwise hang forever regardless of ctx. Race it against ctx instead.
+	type sessionResult struct {
+		session *ssh.Session
+		err     error
+	}
+	sessCh := make(chan sessionResult, 1)
+	go func() {
+		session, err := c.client.NewSession()
+		sessCh <- sessionResult{session: session, err: err}
+	}()
+
+	var session *ssh.Session
+	select {
+	case <-ctx.Done():
+		// Best-effort: close the session if NewSession eventually completes,
+		// so it isn't leaked -- but don't make the caller wait for it.
+		go func() {
+			if r := <-sessCh; r.session != nil {
+				r.session.Close()
+			}
+		}()
+		return "", fmt.Errorf("open ssh session: %w", ctx.Err())
+	case r := <-sessCh:
+		if r.err != nil {
+			return "", fmt.Errorf("open ssh session: %w", r.err)
+		}
+		session = r.session
 	}
 	defer session.Close()
 

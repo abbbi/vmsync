@@ -291,6 +291,25 @@ func run(cfg struct {
 		}
 	}
 
+	// callWithTimeout runs a blocking libvirt/cgo call in its own goroutine
+	// and gives up waiting for it after timeout. libvirt calls have no
+	// built-in cancellation, so a genuinely stuck call still runs to
+	// completion in the background (and its goroutine/OS thread with it) --
+	// but the *caller* (the signal handler) is no longer blocked by it, so
+	// the rest of cleanup can still proceed instead of requiring a SIGKILL.
+	callWithTimeout := func(name string, timeout time.Duration, fn func() error) error {
+		done := make(chan error, 1)
+		go func() {
+			done <- fn()
+		}()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(timeout):
+			return fmt.Errorf("%s timed out after %s", name, timeout)
+		}
+	}
+
 	abortBackup := func(trigger string) {
 		abortOnce.Do(func() {
 			backupMu.Lock()
@@ -301,15 +320,22 @@ func run(cfg struct {
 			backupActive = false
 			backupMu.Unlock()
 			trace.Info("stopping libvirt backup job", "trigger", trigger)
-			if err := libvirtsync.StopBackup(srcDom); err != nil {
-				trace.Error("stop backup job failed on primary connection", "trigger", trigger, "error", err)
+			stopErr := callWithTimeout("abort backup job", 15*time.Second, func() error {
+				return libvirtsync.StopBackup(srcDom)
+			})
+			if stopErr != nil {
+				trace.Error("stop backup job failed on primary connection", "trigger", trigger, "error", stopErr)
 				if retryErr := libvirtsync.StopBackupViaReconnect(cfg.SourceURI, cfg.SourceDomain); retryErr != nil {
 					trace.Error("stop backup retry via reconnect also failed", "trigger", trigger, "error", retryErr)
 				}
 			}
 			if started {
 				trace.Info("destroying vm as it was started by sync process")
-				srcDom.Destroy()
+				if destroyErr := callWithTimeout("destroy vm", 15*time.Second, func() error {
+					return srcDom.Destroy()
+				}); destroyErr != nil {
+					trace.Error("destroy vm timed out or failed", "trigger", trigger, "error", destroyErr)
+				}
 			}
 		})
 	}
