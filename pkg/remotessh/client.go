@@ -49,6 +49,14 @@ type Client struct {
 	client *ssh.Client
 }
 
+// LoopbackSelfAddress returns 127.0.0.1:<ssh-port> for this client's remote
+// host -- a destination sshd itself is always listening on, usable as a
+// self-test direct-tcpip dial target without depending on hostname
+// resolution working the same way from the remote side as it did locally.
+func (c *Client) LoopbackSelfAddress() string {
+	return net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", c.cfg.Port))
+}
+
 func ConfigFromLibvirtURI(libvirtURI, user, keyPath, password, knownHostsPath string, port int, insecure bool, timeout time.Duration) (Config, error) {
 	u, err := url.Parse(libvirtURI)
 	if err != nil {

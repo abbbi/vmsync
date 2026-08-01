@@ -60,5 +60,21 @@ func CheckRemote(ctx context.Context, client *remotessh.Client, cfg Config, host
 			return fmt.Errorf("nbd bridge used for compression / buffering requires the %q binary to be installed on %s: %w: %s", tool, host, err, out)
 		}
 	}
+
+	// The bridge relies entirely on SSH direct-tcpip channels (DialTCP) to
+	// reach the remote listener -- separate from, and independent of, the
+	// session channels client.Run just used above. A server can (and
+	// commonly does, as a hardening measure) allow command execution while
+	// rejecting port forwarding outright via "AllowTcpForwarding no", or
+	// restrict it per-key via "no-port-forwarding" in authorized_keys.
+	// Either shows up as "administratively prohibited (open failed)" only
+	// once we actually try to open one -- check for it now, before any sync
+	// work starts, rather than deep inside a running sync.
+	conn, err := client.DialTCP(client.LoopbackSelfAddress())
+	if err != nil {
+		return fmt.Errorf("nbd bridge requires SSH port forwarding (direct-tcpip channels) to be permitted on %s, but a test connection failed: %w -- check 'AllowTcpForwarding' in sshd_config and for a 'no-port-forwarding' restriction on this key in authorized_keys", host, err)
+	}
+	conn.Close()
+
 	return nil
 }
