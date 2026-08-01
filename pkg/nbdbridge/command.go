@@ -24,9 +24,25 @@ import (
 	"vmsync/pkg/util"
 )
 
+// quoteArgs renders a command as individually shell-quoted tokens rather than
+// relying on the remote shell's own whitespace word-splitting. This chain
+// runs inside a shell spawned by socat's SYSTEM: (via libc system(), not a
+// shell we invoke ourselves), which inherits whatever environment socat
+// itself started with -- if $IFS there isn't the default, an unquoted
+// argument like "TCP:127.0.0.1:20200" can silently be split into pieces
+// socat then sees as the wrong number of address parameters. Quoting each
+// token is immune to $IFS entirely, regardless of what it's set to.
+func quoteArgs(args ...string) string {
+	quoted := make([]string, len(args))
+	for i, a := range args {
+		quoted[i] = util.ShQuote(a)
+	}
+	return strings.Join(quoted, " ")
+}
+
 // mbufferStage renders one mbuffer invocation from cfg's block/buffer size.
 func mbufferStage(cfg Config) string {
-	return fmt.Sprintf("mbuffer -q -s %s -m %s", cfg.MbufferBlock, cfg.MbufferSize)
+	return quoteArgs("mbuffer", "-q", "-s", cfg.MbufferBlock, "-m", cfg.MbufferSize)
 }
 
 // innerPipeline is the per-connection filter chain socat hands each accepted
@@ -46,17 +62,17 @@ func mbufferStage(cfg Config) string {
 func innerPipeline(cfg Config, realPort int) string {
 	var stages []string
 	if cfg.Compress {
-		stages = append(stages, "zstd -dq")
+		stages = append(stages, quoteArgs("zstd", "-dq"))
 	}
 	if cfg.MbufferEnabled() {
 		stages = append(stages, mbufferStage(cfg))
 	}
-	stages = append(stages, fmt.Sprintf("socat - TCP:127.0.0.1:%d", realPort))
+	stages = append(stages, quoteArgs("socat", "-", fmt.Sprintf("TCP:127.0.0.1:%d", realPort)))
 	if cfg.MbufferEnabled() {
 		stages = append(stages, mbufferStage(cfg))
 	}
 	if cfg.Compress {
-		stages = append(stages, fmt.Sprintf("zstd -q -%d", cfg.CompressLevel))
+		stages = append(stages, quoteArgs("zstd", "-q", fmt.Sprintf("-%d", cfg.CompressLevel)))
 	}
 	return strings.Join(stages, " | ")
 }
@@ -67,8 +83,8 @@ func innerPipeline(cfg Config, realPort int) string {
 // socat's SYSTEM: address (rather than EXEC:) is required here since the
 // filter chain is itself a shell pipeline, not a single program.
 func BuildStartCommand(cfg Config, bridgePort, realPort int, pidFile, logFile string) string {
-	listen := fmt.Sprintf("socat TCP-LISTEN:%d,bind=127.0.0.1,reuseaddr,fork SYSTEM:%s",
-		bridgePort, util.ShQuote(innerPipeline(cfg, realPort)))
+	listen := quoteArgs("socat", fmt.Sprintf("TCP-LISTEN:%d,bind=127.0.0.1,reuseaddr,fork", bridgePort)) +
+		" SYSTEM:" + util.ShQuote(innerPipeline(cfg, realPort))
 	return fmt.Sprintf("setsid sh -c %s </dev/null >%s 2>&1 & echo $! > %s",
 		util.ShQuote(listen), util.ShQuote(logFile), util.ShQuote(pidFile))
 }
