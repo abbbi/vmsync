@@ -42,17 +42,18 @@ func StartRemote(ctx context.Context, client *remotessh.Client, bridgePort, real
 		return "", fmt.Errorf("start remote nbd bridge on port %d: %w: %s", bridgePort, err, out)
 	}
 
-	if err := waitForRemoteProcess(ctx, client, pidFile, 10*time.Second); err != nil {
+	if err := waitForRemoteListening(ctx, client, bridgePort, 10*time.Second); err != nil {
 		return "", fmt.Errorf("remote nbd bridge on port %d did not start: %w", bridgePort, err)
 	}
 
 	return BuildStopCommand(pidFile, logFile), nil
 }
 
-// waitForRemoteProcess polls until the process recorded in pidFile is alive,
-// using a plain liveness check ("kill -0") rather than a TCP connection.
+// waitForRemoteListening polls the remote host's own socket table (via "ss")
+// until bridgePort is actually in LISTEN state, rather than merely checking
+// that the process exists ("kill -0") or attempting a real TCP connection.
 //
-// A real TCP connect-and-close probe was used here previously and caused a
+// A real TCP connect-and-close probe was used here originally and caused a
 // deadlock: socat's "fork" option treats ANY accepted connection as a real
 // one and immediately runs the full decompress/forward/compress pipeline for
 // it, including opening a genuine connection to the real NBD export --
@@ -60,19 +61,25 @@ func StartRemote(ctx context.Context, client *remotessh.Client, bridgePort, real
 // client. A disposable readiness probe occupied that one slot until its side
 // of the pipeline fully unwound, racing against (and usually losing to) the
 // real data connection that immediately followed it, wedging the whole sync.
-func waitForRemoteProcess(ctx context.Context, client *remotessh.Client, pidFile string, timeout time.Duration) error {
-	check := "kill -0 $(cat " + util.ShQuote(pidFile) + ") 2>/dev/null"
+//
+// A "kill -0" liveness check was used after that, but only proves the
+// process exists, not that it has reached bind()/listen() yet -- under
+// enough load/latency the local relay could dial in before the remote
+// listener was actually up, getting connection-refused and tearing down the
+// client connection it was serving. Reading the socket table directly avoids
+// both problems: it's a passive read of kernel state, so it can never
+// trigger socat's fork machinery, and it only succeeds once the socket is
+// genuinely listening.
+func waitForRemoteListening(ctx context.Context, client *remotessh.Client, bridgePort int, timeout time.Duration) error {
+	filter := fmt.Sprintf("( sport = :%d )", bridgePort)
+	check := "ss -Htln " + util.ShQuote(filter) + " | grep -q ."
 	deadline := time.Now().Add(timeout)
 	for {
 		if _, err := client.Run(ctx, check); err == nil {
-			// The process exists; give socat a brief moment to reach its
-			// bind()/listen() call. Startup has no heavy work before that
-			// point, so this is a generous margin, not a race of its own.
-			time.Sleep(150 * time.Millisecond)
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("process tracked by %s did not start in time", pidFile)
+			return fmt.Errorf("port %d is not listening after %s", bridgePort, timeout)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
