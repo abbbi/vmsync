@@ -57,7 +57,7 @@ func CheckRemote(ctx context.Context, client *remotessh.Client, cfg Config, host
 	}
 	for _, tool := range tools {
 		if out, err := client.Run(ctx, "command -v "+tool); err != nil {
-			return fmt.Errorf("nbd bridge requires the %q binary to be installed on %s: %w: %s", tool, host, err, out)
+			return fmt.Errorf("nbd bridge used for compression / buffering requires the %q binary to be installed on %s: %w: %s", tool, host, err, out)
 		}
 	}
 	return nil

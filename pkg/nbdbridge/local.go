@@ -105,7 +105,7 @@ func StartLocal(ctx context.Context, sshClient *remotessh.Client, remoteBridgeAd
 			go func() {
 				defer wg.Done()
 				if relayErr := relayConnection(ctx, conn, sshClient, remoteBridgeAddr, cfg, counters); relayErr != nil {
-					trace.Debug("nbd bridge connection ended", "error", relayErr)
+					trace.Warning("nbd bridge connection ended with error", "remote", remoteBridgeAddr, "error", relayErr)
 				}
 			}()
 		}
