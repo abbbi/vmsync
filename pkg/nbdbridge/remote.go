@@ -27,6 +27,15 @@ import (
 	"vmsync/pkg/util"
 )
 
+// bridgeStateDir holds bridge PID/log files. Deliberately NOT under /tmp:
+// hardened hosts commonly run pam_namespace to give each login session its
+// own private, bind-mounted /tmp, so a file written by the SSH session that
+// starts the bridge can be genuinely invisible to a different SSH session
+// (or an interactive shell) checking it afterward, even though it exists.
+// /run is session-independent tmpfs, the standard location for this kind of
+// daemon state, and isn't subject to that per-session isolation.
+const bridgeStateDir = "/run/vmsync-bridge"
+
 // StartRemote launches a backgrounded socat+zstd bridge on client, listening
 // on 127.0.0.1:bridgePort and forwarding (decompressed) to the real NBD
 // export already listening on 127.0.0.1:realPort on the same host. It waits
@@ -34,8 +43,12 @@ import (
 // returns a stop command the caller should append to its own teardown list
 // -- this function does not manage the bridge's lifecycle itself beyond that.
 func StartRemote(ctx context.Context, client *remotessh.Client, bridgePort, realPort int, cfg Config) (stopCmd string, err error) {
-	pidFile := path.Join("/tmp", fmt.Sprintf("vmsync-bridge-%d.pid", bridgePort))
-	logFile := path.Join("/tmp", fmt.Sprintf("vmsync-bridge-%d.log", bridgePort))
+	if out, err := client.Run(ctx, "mkdir -p "+util.ShQuote(bridgeStateDir)); err != nil {
+		return "", fmt.Errorf("create bridge state dir %s: %w: %s", bridgeStateDir, err, out)
+	}
+
+	pidFile := path.Join(bridgeStateDir, fmt.Sprintf("vmsync-bridge-%d.pid", bridgePort))
+	logFile := path.Join(bridgeStateDir, fmt.Sprintf("vmsync-bridge-%d.log", bridgePort))
 
 	startCmd := BuildStartCommand(cfg, bridgePort, realPort, pidFile, logFile)
 	if out, err := client.Run(ctx, startCmd); err != nil {
