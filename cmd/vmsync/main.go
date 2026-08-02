@@ -383,17 +383,48 @@ func run(cfg struct {
 		select {
 		case sig := <-sigCh:
 			trace.Info("received signal", "signal", sig.String())
-			// These three touch independent connections (source libvirt,
-			// target SSH) with no dependency on each other, so run them
+			// These touch independent connections (source libvirt, target
+			// SSH) with no dependency on each other, so run them
 			// concurrently -- worst-case wait is the slowest ONE of them,
 			// not their sum, before the process can actually exit.
 			var cleanupWg sync.WaitGroup
-			cleanupWg.Add(3)
+			cleanupWg.Add(4)
 			go func() { defer cleanupWg.Done(); abortBackup(sig.String()) }()
 			go func() { defer cleanupWg.Done(); cleanupTargetNBD(sig.String()) }()
 			go func() { defer cleanupWg.Done(); cleanupSourceBridge(sig.String()) }()
+			go func() {
+				defer cleanupWg.Done()
+				// Mirrors the deferred checkpoint cleanup further down in
+				// run() -- duplicated here because that defer never gets a
+				// chance to run if we os.Exit below without waiting for it.
+				if checkpointName == "" {
+					return
+				}
+				if err := callWithTimeout("delete checkpoint", 5*time.Second, func() error {
+					return libvirtsync.DeleteCheckpointIfExists(srcDom, checkpointName)
+				}); err != nil {
+					trace.Error("failed to delete checkpoint after interrupt", "checkpoint", checkpointName, "error", err)
+					if retryErr := libvirtsync.DeleteCheckpointViaReconnect(cfg.SourceURI, cfg.SourceDomain, checkpointName); retryErr != nil {
+						trace.Error("failed to delete checkpoint via reconnect after interrupt", "checkpoint", checkpointName, "error", retryErr)
+					}
+				} else {
+					trace.Info("removed checkpoint after interrupt", "checkpoint", checkpointName)
+				}
+			}()
 			cleanupWg.Wait()
 			cancel()
+
+			// Everything externally visible (backup job, target bridge/
+			// qemu-nbd, checkpoint) is now torn down above. Don't wait for
+			// wg.Wait() in run() below to unblock: if a sync goroutine is
+			// stuck inside a synchronous libnbd call (Pread/Pwrite/
+			// BlockStatus) against a wedged connection, context cancellation
+			// alone can never force it to return -- Go has no way to
+			// interrupt a blocked cgo call from another goroutine, so the
+			// process could otherwise sit there forever despite a clean
+			// signal handler. Exit directly instead.
+			trace.Warning("cleanup complete, forcing process exit", "signal", sig.String())
+			os.Exit(1)
 		case <-doneCh:
 			return
 		}
