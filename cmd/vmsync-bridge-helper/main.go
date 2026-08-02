@@ -21,12 +21,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // accepted connection wired to its stdin/stdout, and relays bytes between
 // that connection and a real, plaintext NBD endpoint (-connect), optionally
 // compressing and/or buffering the wire-facing side natively via
-// pkg/zstdrelay -- replacing what used to be a `zstd`/`mbuffer` CLI shell
-// pipe, which was proven unable to flush data through a long-lived,
-// synchronous, small-message connection like NBD's.
+// pkg/zstdrelay -- replacing what used to be an external CLI shell pipe,
+// which was proven unable to flush data through a long-lived, synchronous,
+// small-message connection like NBD's.
 //
-// This binary must be deployed to any target host --compress/--mbuffer will
-// run against by the user themselves (e.g. via scp or configuration
+// This binary must be deployed to any target host --compress/--netbuffer
+// will run against by the user themselves (e.g. via scp or configuration
 // management) -- vmsync does not upload it. See -bridge-helper-path in
 // `vmsync`'s own flags.
 package main
@@ -46,7 +46,7 @@ func main() {
 	connectAddr := flag.String("connect", "", "real endpoint host:port to forward plaintext traffic to/from (required)")
 	compress := flag.Bool("compress", false, "compress the wire-facing (stdin/stdout) traffic with zstd")
 	level := flag.Int("level", 3, "zstd compression level (1-19), only used with -compress")
-	mbuffer := flag.String("mbuffer", "", "buffer wire-facing traffic through a bounded in-memory buffer, "+
+	netbuffer := flag.String("netbuffer", "", "buffer wire-facing traffic through a bounded in-memory buffer, "+
 		"formatted as <blocksize>,<buffersize> (e.g. 64k,256M); empty disables it")
 	flag.Parse()
 
@@ -55,23 +55,23 @@ func main() {
 		os.Exit(2)
 	}
 
-	var mbufferBlock, mbufferSize string
-	if *mbuffer != "" {
-		parts := strings.SplitN(*mbuffer, ",", 2)
+	var netbufferBlock, netbufferSize string
+	if *netbuffer != "" {
+		parts := strings.SplitN(*netbuffer, ",", 2)
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: -mbuffer must be of the form <blocksize>,<buffersize>, got %q\n", *mbuffer)
+			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: -netbuffer must be of the form <blocksize>,<buffersize>, got %q\n", *netbuffer)
 			os.Exit(2)
 		}
-		mbufferBlock, mbufferSize = parts[0], parts[1]
+		netbufferBlock, netbufferSize = parts[0], parts[1]
 	}
 
-	if err := run(*connectAddr, *compress, *level, mbufferBlock, mbufferSize); err != nil {
+	if err := run(*connectAddr, *compress, *level, netbufferBlock, netbufferSize); err != nil {
 		fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(connectAddr string, compress bool, level int, mbufferBlock, mbufferSize string) error {
+func run(connectAddr string, compress bool, level int, netbufferBlock, netbufferSize string) error {
 	conn, err := net.Dial("tcp", connectAddr)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", connectAddr, err)
@@ -92,7 +92,7 @@ func run(connectAddr string, compress bool, level int, mbufferBlock, mbufferSize
 	// stdin (wire, compressed/buffered client traffic) -> [buffer] -> [decompress] -> conn (plaintext, to the real NBD server)
 	go func() {
 		defer wg.Done()
-		reportErr(zstdrelay.RelayFromWire(conn, os.Stdin, compress, mbufferBlock, mbufferSize, nil))
+		reportErr(zstdrelay.RelayFromWire(conn, os.Stdin, compress, netbufferBlock, netbufferSize, nil))
 		if tc, ok := conn.(*net.TCPConn); ok {
 			tc.CloseWrite() // half-close: tell the real server we're done sending
 		}
@@ -101,7 +101,7 @@ func run(connectAddr string, compress bool, level int, mbufferBlock, mbufferSize
 	// conn (plaintext, from the real NBD server) -> [compress+flush] -> [buffer] -> stdout (wire, back to the client)
 	go func() {
 		defer wg.Done()
-		reportErr(zstdrelay.Relay(os.Stdout, conn, compress, level, mbufferBlock, mbufferSize, nil))
+		reportErr(zstdrelay.Relay(os.Stdout, conn, compress, level, netbufferBlock, netbufferSize, nil))
 	}()
 
 	wg.Wait()

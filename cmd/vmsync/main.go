@@ -78,7 +78,7 @@ func main() {
 		ReinitAfterFailures int
 		Compress            bool
 		CompressLevel       int
-		Mbuffer             string
+		NetBuffer           string
 		BridgeHelperPath    string
 		ShowVersion         bool
 	}
@@ -106,8 +106,8 @@ func main() {
 	flag.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "After this many consecutive sync failures (tracked in the target domain's vmsync metadata), automatically reinit (as with -reinit) instead of trying again the same way. 0 disables this (default).")
 	flag.BoolVar(&cfg.Compress, "compress", false, "Compress NBD traffic between hosts using zstd, tunneled over the existing SSH connection. Compression runs natively (no local tool dependency); the remote side requires 'socat' plus vmsync-bridge-helper deployed at -bridge-helper-path. Core sync behavior is unchanged when this is not set.")
 	flag.IntVar(&cfg.CompressLevel, "compress-level", 3, "zstd compression level to use when --compress is set (1-19)")
-	flag.StringVar(&cfg.Mbuffer, "mbuffer", "", "Buffer NBD bridge traffic through a bounded in-memory buffer to smooth throughput, formatted as <blocksize>,<buffersize> (e.g. 64k,512M). Runs natively on both ends (no local or remote 'mbuffer' tool dependency). Independent of --compress -- usable alone or combined with it.")
-	flag.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/local/bin/vmsync-bridge-helper", "Remote path to the vmsync-bridge-helper binary, used when --compress/--mbuffer is set. Must already be deployed there by you (e.g. via scp) -- vmsync does not upload it.")
+	flag.StringVar(&cfg.NetBuffer, "netbuffer", "", "Buffer NBD bridge traffic through a bounded in-memory buffer to smooth throughput, formatted as <blocksize>,<buffersize> (e.g. 64k,512M). Runs natively on both ends (no external tool dependency). Independent of --compress -- usable alone or combined with it.")
+	flag.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/local/bin/vmsync-bridge-helper", "Remote path to the vmsync-bridge-helper binary, used when --compress/--netbuffer is set. Must already be deployed there by you (e.g. via scp) -- vmsync does not upload it.")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
@@ -130,9 +130,9 @@ func main() {
 			os.Exit(2)
 		}
 	}
-	if cfg.Mbuffer != "" {
-		if _, _, err := nbdbridge.ParseMbufferSpec(cfg.Mbuffer); err != nil {
-			trace.Error("invalid mbuffer configuration", "error", err)
+	if cfg.NetBuffer != "" {
+		if _, _, err := nbdbridge.ParseNetBufferSpec(cfg.NetBuffer); err != nil {
+			trace.Error("invalid netbuffer configuration", "error", err)
 			os.Exit(2)
 		}
 	}
@@ -193,7 +193,7 @@ func run(cfg struct {
 	ReinitAfterFailures int
 	Compress            bool
 	CompressLevel       int
-	Mbuffer             string
+	NetBuffer           string
 	BridgeHelperPath    string
 	ShowVersion         bool
 }) (runErr error) {
@@ -219,16 +219,16 @@ func run(cfg struct {
 	var freezed bool = false
 	var started bool = false
 
-	mbufferBlock, mbufferSize, err := nbdbridge.ParseMbufferSpec(cfg.Mbuffer)
+	netbufferBlock, netbufferSize, err := nbdbridge.ParseNetBufferSpec(cfg.NetBuffer)
 	if err != nil {
 		return err
 	}
 	bridgeCfg := nbdbridge.Config{
-		Compress:      cfg.Compress,
-		CompressLevel: cfg.CompressLevel,
-		MbufferBlock:  mbufferBlock,
-		MbufferSize:   mbufferSize,
-		HelperPath:    cfg.BridgeHelperPath,
+		Compress:       cfg.Compress,
+		CompressLevel:  cfg.CompressLevel,
+		NetBufferBlock: netbufferBlock,
+		NetBufferSize:  netbufferSize,
+		HelperPath:     cfg.BridgeHelperPath,
 	}
 	if err := nbdbridge.CheckLocal(bridgeCfg); err != nil {
 		return err
@@ -236,12 +236,12 @@ func run(cfg struct {
 	if bridgeCfg.Enabled() {
 		if util.UriUsesSSH(cfg.SourceURI) && cfg.SourceNBDHost != "" {
 			if uriHost := util.HostFromURIOrLocal(cfg.SourceURI); cfg.SourceNBDHost != uriHost {
-				return fmt.Errorf("--compress/--mbuffer require --source-nbd-host to match the host in --source-uri (got %s, expected %s): the remote bridge only forwards to 127.0.0.1 on that same host", cfg.SourceNBDHost, uriHost)
+				return fmt.Errorf("--compress/--netbuffer require --source-nbd-host to match the host in --source-uri (got %s, expected %s): the remote bridge only forwards to 127.0.0.1 on that same host", cfg.SourceNBDHost, uriHost)
 			}
 		}
 		if cfg.TargetNBDHost != "" {
 			if uriHost := util.HostFromURIOrLocal(cfg.TargetURI); cfg.TargetNBDHost != uriHost {
-				return fmt.Errorf("--compress/--mbuffer require --target-nbd-host to match the host in --target-uri (got %s, expected %s): the remote bridge only forwards to 127.0.0.1 on that same host", cfg.TargetNBDHost, uriHost)
+				return fmt.Errorf("--compress/--netbuffer require --target-nbd-host to match the host in --target-uri (got %s, expected %s): the remote bridge only forwards to 127.0.0.1 on that same host", cfg.TargetNBDHost, uriHost)
 			}
 		}
 	}
@@ -752,7 +752,7 @@ func run(cfg struct {
 	}
 
 	// Default to the direct, uncompressed path; overridden below when
-	// --compress/--mbuffer are set and the source is reachable via SSH.
+	// --compress/--netbuffer are set and the source is reachable via SSH.
 	effectiveSourceHost := nbdHost
 	effectiveSourcePort := cfg.SourceNBDPort
 	var sourceBridgeCounters *nbdbridge.ByteCounters
@@ -855,7 +855,7 @@ func run(cfg struct {
 		trace.Info("target nbd port in use", "side", "target", "kind", "nbd_export", "disk", d.TargetDev, "host", targetNBDHost, "port", targetPort)
 
 		// Default to the direct, uncompressed path; overridden below when
-		// --compress/--mbuffer are set (target SSH is always available).
+		// --compress/--netbuffer are set (target SSH is always available).
 		effectiveTargetHost := targetNBDHost
 		effectiveTargetPort := targetPort
 		var targetBridgeCounters *nbdbridge.ByteCounters

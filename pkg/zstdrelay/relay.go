@@ -27,10 +27,10 @@ import (
 
 // ParseByteSize parses a size string like "64k", "512M", or a bare number of
 // bytes, returning the value in bytes. Suffixes are case-insensitive and
-// binary (k=1024, m=1024*1024, ...), matching mbuffer's own -s/-m suffix
-// conventions. Deliberately independent of pkg/nbdbridge's ParseMbufferSpec
-// (which only validates the CLI flag's string format) to avoid an import
-// cycle -- nbdbridge imports zstdrelay, not the other way around.
+// binary (k=1024, m=1024*1024, ...). Deliberately independent of
+// pkg/nbdbridge's ParseNetBufferSpec (which only validates the CLI flag's
+// string format) to avoid an import cycle -- nbdbridge imports zstdrelay,
+// not the other way around.
 func ParseByteSize(s string) (int, error) {
 	if s == "" {
 		return 0, fmt.Errorf("empty size")
@@ -70,18 +70,18 @@ func ParseByteSize(s string) (int, error) {
 // (pkg/nbdbridge/local.go) and the remote vmsync-bridge-helper binary, so
 // the two ends can never drift apart in behavior.
 //
-// mbufferSize (the "buffersize" half of --mbuffer=blocksize,buffersize) sets
-// the bounded buffer's capacity; mbufferBlock is accepted for CLI-format
-// symmetry but not otherwise used -- BoundedBuffer has no fixed block-size
-// concept of its own. wireCounter, if non-nil, is atomically incremented
-// with the bytes actually written to dst (the wire), for the caller's own
-// compression-savings reporting.
+// netbufferSize (the "buffersize" half of --netbuffer=blocksize,buffersize)
+// sets the bounded buffer's capacity; netbufferBlock is accepted for
+// CLI-format symmetry but not otherwise used -- BoundedBuffer has no fixed
+// block-size concept of its own. wireCounter, if non-nil, is atomically
+// incremented with the bytes actually written to dst (the wire), for the
+// caller's own compression-savings reporting.
 //
 // Relay runs until src reaches EOF (returning nil) or a real error occurs.
 // On EOF it properly finalizes each active stage (closing the zstd encoder
 // so the peer's decoder sees a clean end-of-frame rather than an abrupt
 // disconnect, and draining/closing the bounded buffer) before returning.
-func Relay(dst io.Writer, src io.Reader, compress bool, level int, mbufferBlock, mbufferSize string, wireCounter *uint64) error {
+func Relay(dst io.Writer, src io.Reader, compress bool, level int, netbufferBlock, netbufferSize string, wireCounter *uint64) error {
 	var effectiveDst io.Writer = dst
 	if wireCounter != nil {
 		effectiveDst = &CountingWriter{W: dst, Counter: wireCounter}
@@ -89,10 +89,10 @@ func Relay(dst io.Writer, src io.Reader, compress bool, level int, mbufferBlock,
 
 	var bufStage *BoundedBuffer
 	var drainDone chan error
-	if mbufferBlock != "" || mbufferSize != "" {
-		maxBytes, err := ParseByteSize(mbufferSize)
+	if netbufferBlock != "" || netbufferSize != "" {
+		maxBytes, err := ParseByteSize(netbufferSize)
 		if err != nil {
-			return fmt.Errorf("parse mbuffer size %q: %w", mbufferSize, err)
+			return fmt.Errorf("parse netbuffer size %q: %w", netbufferSize, err)
 		}
 		bufStage = NewBoundedBuffer(maxBytes)
 		// Snapshot the pre-buffer destination now: effectiveDst is
@@ -144,7 +144,7 @@ func Relay(dst io.Writer, src io.Reader, compress bool, level int, mbufferBlock,
 // itself closes the buffer once src is drained, so the decoder (or the
 // final io.Copy, if compression is off) sees a clean end rather than
 // hanging.
-func RelayFromWire(dst io.Writer, src io.Reader, compress bool, mbufferBlock, mbufferSize string, wireCounter *uint64) error {
+func RelayFromWire(dst io.Writer, src io.Reader, compress bool, netbufferBlock, netbufferSize string, wireCounter *uint64) error {
 	var effectiveSrc io.Reader = src
 	if wireCounter != nil {
 		effectiveSrc = &CountingReader{R: src, Counter: wireCounter}
@@ -152,10 +152,10 @@ func RelayFromWire(dst io.Writer, src io.Reader, compress bool, mbufferBlock, mb
 
 	var bufStage *BoundedBuffer
 	var fillDone chan error
-	if mbufferBlock != "" || mbufferSize != "" {
-		maxBytes, err := ParseByteSize(mbufferSize)
+	if netbufferBlock != "" || netbufferSize != "" {
+		maxBytes, err := ParseByteSize(netbufferSize)
 		if err != nil {
-			return fmt.Errorf("parse mbuffer size %q: %w", mbufferSize, err)
+			return fmt.Errorf("parse netbuffer size %q: %w", netbufferSize, err)
 		}
 		bufStage = NewBoundedBuffer(maxBytes)
 		// Same snapshot-before-reassignment reasoning as Relay above:

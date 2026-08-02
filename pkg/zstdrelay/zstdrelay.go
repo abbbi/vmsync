@@ -128,14 +128,13 @@ func (c *CountingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// BoundedBuffer is a bounded, concurrent-safe FIFO byte queue: the native
-// replacement for the external `mbuffer` tool. Write blocks once the buffer
-// already holds maxBytes worth of data (backpressure, matching mbuffer's -m
-// total-buffer-size option); Read blocks until data is available or the
-// buffer has been closed and fully drained, at which point it returns
-// io.EOF. Decoupling a producer and a consumer this way is exactly
-// mbuffer's throughput-smoothing role, reimplemented natively so it doesn't
-// depend on an external CLI's own (unverified) flushing behavior.
+// BoundedBuffer is a bounded, concurrent-safe FIFO byte queue: the netbuffer
+// stage's implementation. Write blocks once the buffer already holds
+// maxBytes worth of data (backpressure against the configured total buffer
+// size); Read blocks until data is available or the buffer has been closed
+// and fully drained, at which point it returns io.EOF. Decoupling a producer
+// and a consumer this way provides throughput smoothing natively, without
+// depending on an external CLI's own (unverified) flushing behavior.
 type BoundedBuffer struct {
 	mu       sync.Mutex
 	notEmpty *sync.Cond

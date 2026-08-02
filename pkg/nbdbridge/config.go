@@ -26,24 +26,24 @@ import (
 // Config describes how NBD traffic should be bridged/compressed between
 // hosts. The zero value disables bridging entirely, which is the required
 // default: vmsync's core sync path must work unchanged when none of these
-// options are used. --compress and --mbuffer are independent: either can be
+// options are used. --compress and --netbuffer are independent: either can be
 // used alone, or both together.
 type Config struct {
-	Compress      bool
-	CompressLevel int
-	MbufferBlock  string // e.g. "64k"; empty means mbuffer is disabled
-	MbufferSize   string // e.g. "512M"
-	HelperPath    string // remote path to the vmsync-bridge-helper binary
+	Compress       bool
+	CompressLevel  int
+	NetBufferBlock string // e.g. "64k"; empty means netbuffer is disabled
+	NetBufferSize  string // e.g. "512M"
+	HelperPath     string // remote path to the vmsync-bridge-helper binary
 }
 
-// MbufferEnabled reports whether --mbuffer was set.
-func (c Config) MbufferEnabled() bool {
-	return c.MbufferBlock != "" || c.MbufferSize != ""
+// NetBufferEnabled reports whether --netbuffer was set.
+func (c Config) NetBufferEnabled() bool {
+	return c.NetBufferBlock != "" || c.NetBufferSize != ""
 }
 
 // Enabled reports whether any bridging is requested at all.
 func (c Config) Enabled() bool {
-	return c.Compress || c.MbufferEnabled()
+	return c.Compress || c.NetBufferEnabled()
 }
 
 // ValidateCompressLevel checks the --compress-level value is one zstd
@@ -55,24 +55,24 @@ func ValidateCompressLevel(level int) error {
 	return nil
 }
 
-var mbufferSizeRe = regexp.MustCompile(`(?i)^[0-9]+[bkmgt]?$`)
+var netbufferSizeRe = regexp.MustCompile(`(?i)^[0-9]+[bkmgt]?$`)
 
-// ParseMbufferSpec parses a --mbuffer value of the form
-// "<blocksize>,<buffersize>" (e.g. "64k,512M") into its two mbuffer -s/-m
-// arguments. An empty spec is valid and means mbuffer is disabled.
-func ParseMbufferSpec(spec string) (block, size string, err error) {
+// ParseNetBufferSpec parses a --netbuffer value of the form
+// "<blocksize>,<buffersize>" into its two block-size/limit-size arguments.
+// An empty spec is valid and means netbuffer is disabled.
+func ParseNetBufferSpec(spec string) (block, size string, err error) {
 	if spec == "" {
 		return "", "", nil
 	}
 	parts := strings.SplitN(spec, ",", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", fmt.Errorf("--mbuffer must be of the form <blocksize>,<buffersize> (e.g. 64k,512M), got %q", spec)
+		return "", "", fmt.Errorf("--netbuffer must be of the form <blocksize>,<buffersize> (e.g. 64k,512M), got %q", spec)
 	}
-	if !mbufferSizeRe.MatchString(parts[0]) {
-		return "", "", fmt.Errorf("--mbuffer block size %q is invalid (expected a number optionally followed by b/k/m/g/t)", parts[0])
+	if !netbufferSizeRe.MatchString(parts[0]) {
+		return "", "", fmt.Errorf("--netbuffer block size %q is invalid (expected a number optionally followed by b/k/m/g/t)", parts[0])
 	}
-	if !mbufferSizeRe.MatchString(parts[1]) {
-		return "", "", fmt.Errorf("--mbuffer buffer size %q is invalid (expected a number optionally followed by b/k/m/g/t)", parts[1])
+	if !netbufferSizeRe.MatchString(parts[1]) {
+		return "", "", fmt.Errorf("--netbuffer buffer size %q is invalid (expected a number optionally followed by b/k/m/g/t)", parts[1])
 	}
 	return parts[0], parts[1], nil
 }

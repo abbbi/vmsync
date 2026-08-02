@@ -58,8 +58,8 @@ func BuildStartCommand(cfg Config, bridgePort, realPort int, pidFile, logFile st
 	if cfg.Compress {
 		args = append(args, "-compress", "-level", strconv.Itoa(cfg.CompressLevel))
 	}
-	if cfg.MbufferEnabled() {
-		args = append(args, "-mbuffer", cfg.MbufferBlock+","+cfg.MbufferSize)
+	if cfg.NetBufferEnabled() {
+		args = append(args, "-netbuffer", cfg.NetBufferBlock+","+cfg.NetBufferSize)
 	}
 	helperCmd := quoteArgs(args...)
 

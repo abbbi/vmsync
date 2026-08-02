@@ -133,7 +133,7 @@ func relayConnection(conn net.Conn, sshClient *remotessh.Client, remoteBridgeAdd
 	// conn (plaintext, from the local NBD client) -> [compress+flush] -> [buffer] -> remote (wire, over SSH)
 	go func() {
 		defer relayWg.Done()
-		err := zstdrelay.Relay(remote, conn, cfg.Compress, cfg.CompressLevel, cfg.MbufferBlock, cfg.MbufferSize, &counters.Sent)
+		err := zstdrelay.Relay(remote, conn, cfg.Compress, cfg.CompressLevel, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Sent)
 		// Half-close the SSH channel once we're done sending, mirroring what
 		// cmd/vmsync-bridge-helper does on its own outbound direction
 		// (tc.CloseWrite() after its stdin hits EOF). Without this, nothing
@@ -153,7 +153,7 @@ func relayConnection(conn net.Conn, sshClient *remotessh.Client, remoteBridgeAdd
 	// remote (wire, over SSH) -> [buffer] -> [decompress] -> conn (plaintext, to the local NBD client)
 	go func() {
 		defer relayWg.Done()
-		reportErr(zstdrelay.RelayFromWire(conn, remote, cfg.Compress, cfg.MbufferBlock, cfg.MbufferSize, &counters.Received))
+		reportErr(zstdrelay.RelayFromWire(conn, remote, cfg.Compress, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Received))
 	}()
 	relayWg.Wait()
 
