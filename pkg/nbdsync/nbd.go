@@ -223,7 +223,12 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 	if err := dst.Flush(nil); err != nil {
 		return fmt.Errorf("flush target nbd: %w", err)
 	}
-	trace.Info("nbd copy complete", "written_bytes", writtenBytes, "device", srcExport)
+	elapsed := time.Since(start)
+	avgMibPerSec := 0.0
+	if elapsed.Seconds() > 0 {
+		avgMibPerSec = (float64(writtenBytes) / (1024.0 * 1024.0)) / elapsed.Seconds()
+	}
+	trace.Info("nbd copy complete", "written_bytes", writtenBytes, "device", srcExport, "elapsed", elapsed.Round(time.Millisecond).String(), "avg_mib_per_sec", fmt.Sprintf("%.2f", avgMibPerSec))
 	return nil
 }
 

@@ -197,6 +197,10 @@ func run(cfg struct {
 	BridgeHelperPath    string
 	ShowVersion         bool
 }) (runErr error) {
+	runStart := time.Now()
+	defer func() {
+		trace.Info("vmsync run finished", "elapsed", time.Since(runStart).Round(time.Millisecond).String(), "success", runErr == nil)
+	}()
 
 	var tgtState bool
 	var srcState bool
@@ -785,6 +789,7 @@ func run(cfg struct {
 		errCh <- err
 	}
 	syncDisk := func(i int, d disk.QcowDisk) error {
+		diskStart := time.Now()
 		runTargetCommand := func(command, action string) error {
 			trace.Debug(command)
 			out, err := targetSSHClient.Run(ctx, command)
@@ -800,7 +805,7 @@ func run(cfg struct {
 			return err
 		}
 		if dirty == 0 {
-			trace.Info("No changed extents selected, skipping copy", "disk", d.TargetDev)
+			trace.Info("No changed extents selected, skipping copy", "disk", d.TargetDev, "elapsed", time.Since(diskStart).Round(time.Millisecond).String())
 			return nil
 		}
 
@@ -912,6 +917,7 @@ func run(cfg struct {
 				return err
 			}
 		}
+		trace.Info("disk sync complete", "disk", d.TargetDev, "elapsed", time.Since(diskStart).Round(time.Millisecond).String())
 		return nil
 	}
 
