@@ -133,7 +133,22 @@ func relayConnection(conn net.Conn, sshClient *remotessh.Client, remoteBridgeAdd
 	// conn (plaintext, from the local NBD client) -> [compress+flush] -> [buffer] -> remote (wire, over SSH)
 	go func() {
 		defer relayWg.Done()
-		reportErr(zstdrelay.Relay(remote, conn, cfg.Compress, cfg.CompressLevel, cfg.MbufferBlock, cfg.MbufferSize, &counters.Sent))
+		err := zstdrelay.Relay(remote, conn, cfg.Compress, cfg.CompressLevel, cfg.MbufferBlock, cfg.MbufferSize, &counters.Sent)
+		// Half-close the SSH channel once we're done sending, mirroring what
+		// cmd/vmsync-bridge-helper does on its own outbound direction
+		// (tc.CloseWrite() after its stdin hits EOF). Without this, nothing
+		// ever signals "no more data" on remote: it's a long-lived SSH
+		// direct-tcpip channel, not a pipe that closes on process exit, so
+		// the remote helper's stdin never sees EOF, its matching relay
+		// goroutine blocks forever, its process never exits, and the whole
+		// bridge connection hangs even after the real NBD client has
+		// finished and closed -- observed directly via a SIGQUIT goroutine
+		// dump: the decoder on this same connection's inbound direction was
+		// blocked waiting on data that could now never arrive.
+		if wc, ok := remote.(interface{ CloseWrite() error }); ok {
+			wc.CloseWrite()
+		}
+		reportErr(err)
 	}()
 	// remote (wire, over SSH) -> [buffer] -> [decompress] -> conn (plaintext, to the local NBD client)
 	go func() {
