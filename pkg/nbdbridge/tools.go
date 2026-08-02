@@ -20,45 +20,35 @@ package nbdbridge
 import (
 	"context"
 	"fmt"
-	"os/exec"
 
 	"vmsync/pkg/remotessh"
+	"vmsync/pkg/util"
 )
 
 // CheckLocal verifies the tools this bridge needs on the machine running
-// vmsync are present. It is a no-op when bridging isn't requested, so the
-// core sync path never depends on zstd being installed.
+// vmsync are present. Compression and buffering are now done natively in Go
+// (pkg/zstdrelay), so there is no local external-binary dependency at all --
+// this always succeeds. Kept as a function (rather than removed outright) so
+// call sites don't need to change if that ever stops being true.
 func CheckLocal(cfg Config) error {
-	if cfg.Compress {
-		if _, err := exec.LookPath("zstd"); err != nil {
-			return fmt.Errorf("--compress requires the 'zstd' binary to be installed locally: %w", err)
-		}
-	}
-	if cfg.MbufferEnabled() {
-		if _, err := exec.LookPath("mbuffer"); err != nil {
-			return fmt.Errorf("--mbuffer requires the 'mbuffer' binary to be installed locally: %w", err)
-		}
-	}
 	return nil
 }
 
-// CheckRemote verifies the tools this bridge needs are present on host,
+// CheckRemote verifies the remote side of the bridge is usable on host,
 // reached through client. It is a no-op when bridging isn't requested.
 func CheckRemote(ctx context.Context, client *remotessh.Client, cfg Config, host string) error {
 	if !cfg.Enabled() {
 		return nil
 	}
-	tools := []string{"socat"}
-	if cfg.Compress {
-		tools = append(tools, "zstd")
+
+	if out, err := client.Run(ctx, "command -v socat"); err != nil {
+		return fmt.Errorf("nbd bridge requires the \"socat\" binary to be installed on %s: %w: %s", host, err, out)
 	}
-	if cfg.MbufferEnabled() {
-		tools = append(tools, "mbuffer")
-	}
-	for _, tool := range tools {
-		if out, err := client.Run(ctx, "command -v "+tool); err != nil {
-			return fmt.Errorf("nbd bridge used for compression / buffering requires the %q binary to be installed on %s: %w: %s", tool, host, err, out)
-		}
+
+	if out, err := client.Run(ctx, "test -x "+util.ShQuote(cfg.HelperPath)); err != nil {
+		return fmt.Errorf("vmsync-bridge-helper not found (or not executable) at %s on %s: %w: %s\n"+
+			"build cmd/vmsync-bridge-helper and deploy it there yourself, or pass -bridge-helper-path "+
+			"to point at wherever you've placed it", cfg.HelperPath, host, err, out)
 	}
 
 	// The bridge relies entirely on SSH direct-tcpip channels (DialTCP) to

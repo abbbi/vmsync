@@ -20,35 +20,23 @@ package nbdbridge
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
-	"os/exec"
 	"strconv"
 	"sync"
 	"sync/atomic"
 
 	"vmsync/pkg/remotessh"
 	"vmsync/pkg/trace"
+	"vmsync/pkg/zstdrelay"
 )
 
 // ByteCounters tracks bytes actually sent/received over the SSH-tunneled
 // (compressed) leg of a bridged connection, updated concurrently from the
-// relay goroutines.
+// relay goroutines via pkg/zstdrelay's CountingWriter/CountingReader, which
+// operate directly on these exported fields.
 type ByteCounters struct {
 	Sent     uint64
 	Received uint64
-}
-
-func (b *ByteCounters) addSent(n int64) {
-	if n > 0 {
-		atomic.AddUint64(&b.Sent, uint64(n))
-	}
-}
-
-func (b *ByteCounters) addReceived(n int64) {
-	if n > 0 {
-		atomic.AddUint64(&b.Received, uint64(n))
-	}
 }
 
 // SentSnapshot atomically reads the total bytes sent over the wire so far.
@@ -62,9 +50,9 @@ func (b *ByteCounters) ReceivedSnapshot() uint64 {
 	return atomic.LoadUint64(&b.Received)
 }
 
-// StartLocal opens a local TCP listener that transparently compresses
-// traffic to/from remoteBridgeAddr (reached through sshClient's SSH tunnel)
-// using zstd subprocesses run locally, symmetric with the remote bridge.
+// StartLocal opens a local TCP listener that transparently compresses/buffers
+// traffic to/from remoteBridgeAddr (reached through sshClient's SSH tunnel),
+// symmetric with the remote vmsync-bridge-helper process on the other end.
 // Callers should redirect their real NBD dial target from the real host:port
 // to 127.0.0.1:<returned port> for the bridged leg.
 func StartLocal(ctx context.Context, sshClient *remotessh.Client, remoteBridgeAddr string, cfg Config) (localPort int, counters *ByteCounters, stop func() error, err error) {
@@ -104,7 +92,7 @@ func StartLocal(ctx context.Context, sshClient *remotessh.Client, remoteBridgeAd
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if relayErr := relayConnection(ctx, conn, sshClient, remoteBridgeAddr, cfg, counters); relayErr != nil {
+				if relayErr := relayConnection(conn, sshClient, remoteBridgeAddr, cfg, counters); relayErr != nil {
 					trace.Warning("nbd bridge connection ended with error", "remote", remoteBridgeAddr, "error", relayErr)
 				}
 			}()
@@ -114,93 +102,15 @@ func StartLocal(ctx context.Context, sshClient *remotessh.Client, remoteBridgeAd
 	return port, counters, stopFn, nil
 }
 
-// outboundStages returns the local filter chain for the accepted-conn ->
-// SSH-channel direction: compress first (nearest the real, plaintext
-// endpoint), then buffer (nearest the SSH channel) -- symmetric with the
-// remote side's own stage ordering around its network hop.
-func outboundStages(cfg Config) [][]string {
-	var stages [][]string
-	if cfg.Compress {
-		stages = append(stages, []string{"zstd", "-q", fmt.Sprintf("-%d", cfg.CompressLevel)})
-	}
-	if cfg.MbufferEnabled() {
-		stages = append(stages, []string{"mbuffer", "-q", "-s", cfg.MbufferBlock, "-m", cfg.MbufferSize})
-	}
-	return stages
-}
-
-// inboundStages returns the local filter chain for the SSH-channel ->
-// accepted-conn direction: buffer first (nearest the SSH channel), then
-// decompress (nearest the real, plaintext endpoint).
-func inboundStages(cfg Config) [][]string {
-	var stages [][]string
-	if cfg.MbufferEnabled() {
-		stages = append(stages, []string{"mbuffer", "-q", "-s", cfg.MbufferBlock, "-m", cfg.MbufferSize})
-	}
-	if cfg.Compress {
-		stages = append(stages, []string{"zstd", "-dq"})
-	}
-	return stages
-}
-
-// startPipelineStages runs each stage in order, wiring stage i's stdout to
-// stage i+1's stdin (Go's exec package copies a non-*os.File Stdin reader in
-// a background goroutine, so no manual piping is needed between stages). It
-// returns the final stage's stdout for the caller to drain, and the started
-// commands for later cleanup via waitStages/killStages. If stages is empty,
-// in is returned unchanged and no commands are started.
-func startPipelineStages(ctx context.Context, in io.Reader, stages [][]string) (out io.Reader, cmds []*exec.Cmd, err error) {
-	cur := in
-	for _, args := range stages {
-		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-		cmd.Stdin = cur
-		stdout, perr := cmd.StdoutPipe()
-		if perr != nil {
-			killStages(cmds)
-			return nil, nil, fmt.Errorf("stdout pipe for %s: %w", args[0], perr)
-		}
-		if serr := cmd.Start(); serr != nil {
-			killStages(cmds)
-			return nil, nil, fmt.Errorf("start %s: %w", args[0], serr)
-		}
-		cmds = append(cmds, cmd)
-		cur = stdout
-	}
-	return cur, cmds, nil
-}
-
-// waitStages reaps started commands in reverse order. Each stage's stdout is
-// only guaranteed fully drained once the next stage's Wait (which internally
-// waits for the copy-into-stdin goroutine it started) has returned, so
-// reaping must go from the last stage backwards.
-func waitStages(cmds []*exec.Cmd) error {
-	var firstErr error
-	for i := len(cmds) - 1; i >= 0; i-- {
-		if err := cmds[i].Wait(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
-}
-
-// killStages forcibly terminates and reaps commands that were started but
-// must be abandoned because a later stage in the same chain failed to start.
-func killStages(cmds []*exec.Cmd) {
-	for _, cmd := range cmds {
-		if cmd.Process != nil {
-			cmd.Process.Kill()
-		}
-	}
-	for _, cmd := range cmds {
-		cmd.Wait()
-	}
-}
-
 // relayConnection bridges one accepted plaintext connection (from the local
-// NBD client) to remoteBridgeAddr over the SSH tunnel, running it through the
-// enabled zstd/mbuffer filters -- compressing/buffering the outbound
-// direction and reversing that for the inbound direction.
-func relayConnection(ctx context.Context, conn net.Conn, sshClient *remotessh.Client, remoteBridgeAddr string, cfg Config, counters *ByteCounters) error {
+// NBD client) to remoteBridgeAddr over the SSH tunnel, compressing/buffering
+// the outbound direction and reversing that for the inbound direction via
+// pkg/zstdrelay -- the same logic cmd/vmsync-bridge-helper uses on the
+// remote end, so both sides of the bridge can never drift apart in
+// behavior. There's no subprocess left to bind to a context for
+// cancellation (unlike the old CLI-piped version); closing conn/remote from
+// the caller's own teardown is what unblocks a relay in progress.
+func relayConnection(conn net.Conn, sshClient *remotessh.Client, remoteBridgeAddr string, cfg Config, counters *ByteCounters) error {
 	defer conn.Close()
 
 	remote, err := sshClient.DialTCP(remoteBridgeAddr)
@@ -209,43 +119,28 @@ func relayConnection(ctx context.Context, conn net.Conn, sshClient *remotessh.Cl
 	}
 	defer remote.Close()
 
-	outboundOut, outCmds, err := startPipelineStages(ctx, conn, outboundStages(cfg))
-	if err != nil {
-		return fmt.Errorf("start outbound filter chain: %w", err)
-	}
-	inboundOut, inCmds, err := startPipelineStages(ctx, remote, inboundStages(cfg))
-	if err != nil {
-		killStages(outCmds)
-		return fmt.Errorf("start inbound filter chain: %w", err)
-	}
-
 	var relayWg sync.WaitGroup
 	relayWg.Add(2)
 	var firstErr error
 	var errOnce sync.Once
 	reportErr := func(err error) {
-		if err == nil || err == io.EOF {
+		if err == nil {
 			return
 		}
 		errOnce.Do(func() { firstErr = err })
 	}
 
+	// conn (plaintext, from the local NBD client) -> [compress+flush] -> [buffer] -> remote (wire, over SSH)
 	go func() {
 		defer relayWg.Done()
-		n, err := io.Copy(remote, outboundOut)
-		counters.addSent(n)
-		reportErr(err)
+		reportErr(zstdrelay.Relay(remote, conn, cfg.Compress, cfg.CompressLevel, cfg.MbufferBlock, cfg.MbufferSize, &counters.Sent))
 	}()
+	// remote (wire, over SSH) -> [buffer] -> [decompress] -> conn (plaintext, to the local NBD client)
 	go func() {
 		defer relayWg.Done()
-		n, err := io.Copy(conn, inboundOut)
-		counters.addReceived(n)
-		reportErr(err)
+		reportErr(zstdrelay.RelayFromWire(conn, remote, cfg.Compress, cfg.MbufferBlock, cfg.MbufferSize, &counters.Received))
 	}()
 	relayWg.Wait()
-
-	reportErr(waitStages(outCmds))
-	reportErr(waitStages(inCmds))
 
 	return firstErr
 }

@@ -33,6 +33,7 @@ type Config struct {
 	CompressLevel int
 	MbufferBlock  string // e.g. "64k"; empty means mbuffer is disabled
 	MbufferSize   string // e.g. "512M"
+	HelperPath    string // remote path to the vmsync-bridge-helper binary
 }
 
 // MbufferEnabled reports whether --mbuffer was set.

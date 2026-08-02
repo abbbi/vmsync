@@ -24,7 +24,9 @@ COPY --exclude=vmsync_* --exclude=.git --exclude=go.sum --exclude=go.mod . /tmp/
 WORKDIR /tmp/go/src/
 
 ENV PATH="/usr/local/go/bin:${PATH}"
-RUN GOOS=linux GOARCH=${TARGETARCH} go mod init vmsync && go mod tidy && go build -o /out/vmsync ./cmd/vmsync/
+RUN GOOS=linux GOARCH=${TARGETARCH} go mod init vmsync && go mod tidy && \
+    go build -o /out/vmsync ./cmd/vmsync/ && \
+    CGO_ENABLED=0 go build -o /out/vmsync-bridge-helper ./cmd/vmsync-bridge-helper/
 
 FROM build AS package
 ARG ROCKY_VERSION
@@ -33,7 +35,8 @@ RUN arch="${TARGETARCH}" && \
     if [ "${arch}" = "amd64" ]; then arch="x86_64"; fi && \
     out="/export/vmsync_rocky_${ROCKY_VERSION}_${arch}" && \
     mkdir -p "${out}" && \
-    cp /out/vmsync "${out}/vmsync"
+    cp /out/vmsync "${out}/vmsync" && \
+    cp /out/vmsync-bridge-helper "${out}/vmsync-bridge-helper"
 
 FROM scratch AS artifact
 COPY --from=package /export/ /

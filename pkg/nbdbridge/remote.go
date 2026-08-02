@@ -36,12 +36,13 @@ import (
 // daemon state, and isn't subject to that per-session isolation.
 const bridgeStateDir = "/run/vmsync-bridge"
 
-// StartRemote launches a backgrounded socat+zstd bridge on client, listening
-// on 127.0.0.1:bridgePort and forwarding (decompressed) to the real NBD
-// export already listening on 127.0.0.1:realPort on the same host. It waits
-// for the bridge process to actually be running before returning, and
-// returns a stop command the caller should append to its own teardown list
-// -- this function does not manage the bridge's lifecycle itself beyond that.
+// StartRemote launches a backgrounded socat listener on client, forwarding
+// each accepted connection on 127.0.0.1:bridgePort to vmsync-bridge-helper
+// (cfg.HelperPath), which relays to the real NBD export already listening on
+// 127.0.0.1:realPort on the same host. It waits for the bridge process to
+// actually be running before returning, and returns a stop command the
+// caller should append to its own teardown list -- this function does not
+// manage the bridge's lifecycle itself beyond that.
 func StartRemote(ctx context.Context, client *remotessh.Client, bridgePort, realPort int, cfg Config) (stopCmd string, err error) {
 	if out, err := client.Run(ctx, "mkdir -p "+util.ShQuote(bridgeStateDir)); err != nil {
 		return "", fmt.Errorf("create bridge state dir %s: %w: %s", bridgeStateDir, err, out)
