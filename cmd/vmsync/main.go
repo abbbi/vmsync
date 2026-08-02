@@ -320,7 +320,7 @@ func run(cfg struct {
 			backupActive = false
 			backupMu.Unlock()
 			trace.Info("stopping libvirt backup job", "trigger", trigger)
-			stopErr := callWithTimeout("abort backup job", 15*time.Second, func() error {
+			stopErr := callWithTimeout("abort backup job", 5*time.Second, func() error {
 				return libvirtsync.StopBackup(srcDom)
 			})
 			if stopErr != nil {
@@ -331,7 +331,7 @@ func run(cfg struct {
 			}
 			if started {
 				trace.Info("destroying vm as it was started by sync process")
-				if destroyErr := callWithTimeout("destroy vm", 15*time.Second, func() error {
+				if destroyErr := callWithTimeout("destroy vm", 5*time.Second, func() error {
 					return srcDom.Destroy()
 				}); destroyErr != nil {
 					trace.Error("destroy vm timed out or failed", "trigger", trigger, "error", destroyErr)
@@ -347,7 +347,7 @@ func run(cfg struct {
 			if targetSSHClient == nil || len(stopCommands) == 0 {
 				return
 			}
-			cctx, ccancel := context.WithTimeout(context.Background(), 15*time.Second)
+			cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer ccancel()
 		for i := len(stopCommands) - 1; i >= 0; i-- {
 				if out, err := targetSSHClient.Run(cctx, stopCommands[i]); err != nil {
@@ -364,7 +364,7 @@ func run(cfg struct {
 			if sourceSSHClient == nil || len(stopCommands) == 0 {
 				return
 			}
-			cctx, ccancel := context.WithTimeout(context.Background(), 15*time.Second)
+			cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer ccancel()
 			for i := len(stopCommands) - 1; i >= 0; i-- {
 				if out, err := sourceSSHClient.Run(cctx, stopCommands[i]); err != nil {
@@ -383,9 +383,16 @@ func run(cfg struct {
 		select {
 		case sig := <-sigCh:
 			trace.Info("received signal", "signal", sig.String())
-			abortBackup(sig.String())
-			cleanupTargetNBD(sig.String())
-			cleanupSourceBridge(sig.String())
+			// These three touch independent connections (source libvirt,
+			// target SSH) with no dependency on each other, so run them
+			// concurrently -- worst-case wait is the slowest ONE of them,
+			// not their sum, before the process can actually exit.
+			var cleanupWg sync.WaitGroup
+			cleanupWg.Add(3)
+			go func() { defer cleanupWg.Done(); abortBackup(sig.String()) }()
+			go func() { defer cleanupWg.Done(); cleanupTargetNBD(sig.String()) }()
+			go func() { defer cleanupWg.Done(); cleanupSourceBridge(sig.String()) }()
+			cleanupWg.Wait()
 			cancel()
 		case <-doneCh:
 			return
