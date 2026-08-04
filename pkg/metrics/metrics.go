@@ -61,6 +61,12 @@ type RunMetric struct {
 	TargetHost string
 	VM         string
 	State      int
+	// Timestamp is the Unix time (seconds) this run finished, for staleness
+	// detection (e.g. "time() - vmsync_last_run_timestamp_seconds > 86400"
+	// in an alert rule or dashboard panel) -- the textfile itself doesn't
+	// carry a reliable "last written" signal node_exporter exposes on its
+	// own, so vmsync has to report it itself.
+	Timestamp int64
 }
 
 // WriteTextfile renders disks and run in the Prometheus text exposition
@@ -109,6 +115,11 @@ func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 	fmt.Fprintln(&b, "# TYPE vmsync_sync_state gauge")
 	fmt.Fprintf(&b, "vmsync_sync_state{source_host=%q,target_host=%q,vm=%q} %d\n",
 		run.SourceHost, run.TargetHost, run.VM, run.State)
+
+	fmt.Fprintln(&b, "# HELP vmsync_last_run_timestamp_seconds Unix time (seconds) this vmsync run finished, success or failure.")
+	fmt.Fprintln(&b, "# TYPE vmsync_last_run_timestamp_seconds gauge")
+	fmt.Fprintf(&b, "vmsync_last_run_timestamp_seconds{source_host=%q,target_host=%q,vm=%q} %d\n",
+		run.SourceHost, run.TargetHost, run.VM, run.Timestamp)
 
 	return writeAtomic(path, b.String())
 }
