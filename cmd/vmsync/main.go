@@ -769,7 +769,7 @@ func run(cfg struct {
 			if runErr != nil {
 				state = metrics.StateFailure
 			}
-			run := metrics.RunMetric{SourceHost: nbdHost, TargetHost: targetNBDHost, VM: cfg.SourceDomain, State: state}
+			run := metrics.RunMetric{SourceHost: nbdHost, TargetHost: targetNBDHost, VM: cfg.SourceDomain, State: state, Timestamp: time.Now().Unix()}
 			if err := metrics.WriteTextfile(cfg.PrometheusTextfile, diskMetrics, run); err != nil {
 				trace.Warning("failed to write prometheus textfile", "path", cfg.PrometheusTextfile, "error", err)
 			}
