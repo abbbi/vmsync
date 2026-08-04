@@ -110,7 +110,7 @@ func main() {
 	flag.IntVar(&cfg.CompressLevel, "compress-level", 3, "zstd compression level to use when --compress is set (1-19)")
 	flag.StringVar(&cfg.NetBuffer, "netbuffer", "", "Buffer NBD bridge traffic through a bounded in-memory buffer to smooth throughput, formatted as <blocksize>,<buffersize> (e.g. 64k,512M). Runs natively on both ends (no external tool dependency). Independent of --compress -- usable alone or combined with it.")
 	flag.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/local/bin/vmsync-bridge-helper", "Remote path to the vmsync-bridge-helper binary, used when --compress/--netbuffer is set. Must already be deployed there by you (e.g. via scp) -- vmsync does not upload it.")
-	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write per-disk sync metrics (source/target host, vm, disk, disk size, transferred bytes, duration, throughput, success/failure) to this path in Prometheus textfile-collector format. Written atomically (temp file + rename). Empty disables it (default).")
+	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write sync metrics to this path in Prometheus textfile-collector format: per disk, source/target host, vm, disk size, transferred and compressed-transferred bytes, and duration; plus one overall success/failure state for the whole run. Written atomically (temp file + rename). Empty disables it (default).")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
@@ -757,6 +757,25 @@ func run(cfg struct {
 		targetNBDHost = util.ConnectHostFromBindOrURI(cfg.TargetNBDBind, cfg.TargetURI)
 	}
 
+	if cfg.PrometheusTextfile != "" {
+		// Registered here (rather than where the per-disk metrics are
+		// collected) so it fires last, once runErr holds its final value --
+		// vmsync_sync_state reflects the whole run's outcome, not any single
+		// disk's, since a later step (checkpoint cleanup, metadata update,
+		// DefineDomain) can still fail after every disk has already synced
+		// successfully.
+		defer func() {
+			state := metrics.StateSuccess
+			if runErr != nil {
+				state = metrics.StateFailure
+			}
+			run := metrics.RunMetric{SourceHost: nbdHost, TargetHost: targetNBDHost, VM: cfg.SourceDomain, State: state}
+			if err := metrics.WriteTextfile(cfg.PrometheusTextfile, diskMetrics, run); err != nil {
+				trace.Warning("failed to write prometheus textfile", "path", cfg.PrometheusTextfile, "error", err)
+			}
+		}()
+	}
+
 	// Default to the direct, uncompressed path; overridden below when
 	// --compress/--netbuffer are set and the source is reachable via SSH.
 	effectiveSourceHost := nbdHost
@@ -798,32 +817,33 @@ func run(cfg struct {
 		diskStart := time.Now()
 		var diskSize uint64
 		var writtenBytes uint64
+		var targetBridgeCounters *nbdbridge.ByteCounters
 		if cfg.PrometheusTextfile != "" {
 			// Runs on every exit path (including early "return err"s further
 			// down), so each disk always gets a metric -- diskSize/writtenBytes
 			// simply stay at their zero value if the sync failed before
 			// reaching the step that would have set them.
 			defer func() {
-				state := metrics.StateSuccess
-				if err != nil {
-					state = metrics.StateFailure
-				}
-				elapsed := time.Since(diskStart).Seconds()
-				avgMiBPerSec := 0.0
-				if elapsed > 0 {
-					avgMiBPerSec = (float64(writtenBytes) / (1024.0 * 1024.0)) / elapsed
+				compressedBytes := writtenBytes
+				if targetBridgeCounters != nil || sourceBridgeCounters != nil {
+					compressedBytes = 0
+					if targetBridgeCounters != nil {
+						compressedBytes += targetBridgeCounters.SentSnapshot()
+					}
+					if sourceBridgeCounters != nil {
+						compressedBytes += sourceBridgeCounters.SentSnapshot()
+					}
 				}
 				metricsMu.Lock()
 				diskMetrics = append(diskMetrics, metrics.DiskMetric{
-					SourceHost:       nbdHost,
-					TargetHost:       targetNBDHost,
-					VM:               cfg.SourceDomain,
-					Disk:             d.TargetDev,
-					DiskSizeBytes:    diskSize,
-					TransferredBytes: writtenBytes,
-					DurationSeconds:  elapsed,
-					AvgMiBPerSecond:  avgMiBPerSec,
-					State:            state,
+					SourceHost:                 nbdHost,
+					TargetHost:                 targetNBDHost,
+					VM:                         cfg.SourceDomain,
+					Disk:                       d.TargetDev,
+					DiskSizeBytes:              diskSize,
+					TransferredBytes:           writtenBytes,
+					CompressedTransferredBytes: compressedBytes,
+					DurationSeconds:            time.Since(diskStart).Seconds(),
 				})
 				metricsMu.Unlock()
 			}()
@@ -898,7 +918,6 @@ func run(cfg struct {
 		// --compress/--netbuffer are set (target SSH is always available).
 		effectiveTargetHost := targetNBDHost
 		effectiveTargetPort := targetPort
-		var targetBridgeCounters *nbdbridge.ByteCounters
 		if bridgeCfg.Enabled() {
 			// All real qemu-nbd ports occupy [TargetNBDPort, TargetNBDPort+N),
 			// so the bridge ports lay out right after them, as one contiguous
@@ -976,12 +995,6 @@ func run(cfg struct {
 	trace.Info("waiting for all processes to finish")
 	wg.Wait()
 	close(errCh)
-
-	if cfg.PrometheusTextfile != "" {
-		if err := metrics.WriteTextfile(cfg.PrometheusTextfile, diskMetrics); err != nil {
-			trace.Warning("failed to write prometheus textfile", "path", cfg.PrometheusTextfile, "error", err)
-		}
-	}
 
 	for err := range errCh {
 		if err != nil {

@@ -15,8 +15,9 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Package metrics renders per-disk sync results as a Prometheus textfile
-// collector file (see -prometheus-textfile in cmd/vmsync).
+// Package metrics renders per-disk sync results and the overall run result
+// as a Prometheus textfile collector file (see -prometheus-textfile in
+// cmd/vmsync).
 package metrics
 
 import (
@@ -26,7 +27,7 @@ import (
 	"strings"
 )
 
-// StateSuccess and StateFailure are the only two values DiskMetric.State
+// StateSuccess and StateFailure are the only two values RunMetric.State
 // takes -- there is no partial/degraded "warning" state in vmsync today.
 const (
 	StateSuccess = 0
@@ -42,22 +43,38 @@ type DiskMetric struct {
 	Disk             string
 	DiskSizeBytes    uint64
 	TransferredBytes uint64
-	DurationSeconds  float64
-	AvgMiBPerSecond  float64
-	State            int
+	// CompressedTransferredBytes is the actual bytes that crossed the
+	// network for this disk (the sum of whichever bridge legs -- source
+	// read, target write -- were active). It equals TransferredBytes
+	// whenever neither --compress nor --netbuffer bridged that leg, since
+	// then nothing sat between the plain NBD read and write.
+	CompressedTransferredBytes uint64
+	DurationSeconds            float64
 }
 
-// WriteTextfile renders metrics in the Prometheus text exposition format and
-// writes them to path, atomically (write to a temp file in the same
-// directory, then rename) so a node_exporter textfile collector scanning
-// that directory concurrently never observes a partially written file.
+// RunMetric holds the overall result of one vmsync invocation -- unlike
+// DiskMetric, this is not per-disk: a single sync either succeeded or
+// failed as a whole, regardless of which (if any) individual disk caused a
+// failure.
+type RunMetric struct {
+	SourceHost string
+	TargetHost string
+	VM         string
+	State      int
+}
+
+// WriteTextfile renders disks and run in the Prometheus text exposition
+// format and writes them to path, atomically (write to a temp file in the
+// same directory, then rename) so a node_exporter textfile collector
+// scanning that directory concurrently never observes a partially written
+// file.
 //
 // Each call overwrites path with exactly the metrics passed in -- there is
 // no merge with whatever the file already contained. If multiple domains
 // share the same textfile path across separate vmsync invocations, only the
 // most recent invocation's disks will be represented; point -prometheus-textfile
 // at a distinct path per domain (e.g. one per cron job/timer) to avoid that.
-func WriteTextfile(path string, disks []DiskMetric) error {
+func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 	var b strings.Builder
 
 	fmt.Fprintln(&b, "# HELP vmsync_disk_size_bytes Virtual size of the disk being synced, in bytes.")
@@ -67,11 +84,18 @@ func WriteTextfile(path string, disks []DiskMetric) error {
 			m.SourceHost, m.TargetHost, m.VM, m.Disk, m.DiskSizeBytes)
 	}
 
-	fmt.Fprintln(&b, "# HELP vmsync_transferred_bytes Bytes actually copied from source to target in this sync.")
+	fmt.Fprintln(&b, "# HELP vmsync_transferred_bytes Logical bytes actually copied from source to target in this sync.")
 	fmt.Fprintln(&b, "# TYPE vmsync_transferred_bytes gauge")
 	for _, m := range disks {
 		fmt.Fprintf(&b, "vmsync_transferred_bytes{source_host=%q,target_host=%q,vm=%q,disk=%q} %d\n",
 			m.SourceHost, m.TargetHost, m.VM, m.Disk, m.TransferredBytes)
+	}
+
+	fmt.Fprintln(&b, "# HELP vmsync_compressed_transferred_bytes Bytes actually sent over the network for this sync. Equal to vmsync_transferred_bytes when neither --compress nor --netbuffer bridged that leg.")
+	fmt.Fprintln(&b, "# TYPE vmsync_compressed_transferred_bytes gauge")
+	for _, m := range disks {
+		fmt.Fprintf(&b, "vmsync_compressed_transferred_bytes{source_host=%q,target_host=%q,vm=%q,disk=%q} %d\n",
+			m.SourceHost, m.TargetHost, m.VM, m.Disk, m.CompressedTransferredBytes)
 	}
 
 	fmt.Fprintln(&b, "# HELP vmsync_sync_duration_seconds Duration of the sync for this disk, in seconds.")
@@ -81,19 +105,10 @@ func WriteTextfile(path string, disks []DiskMetric) error {
 			m.SourceHost, m.TargetHost, m.VM, m.Disk, m.DurationSeconds)
 	}
 
-	fmt.Fprintln(&b, "# HELP vmsync_transfer_avg_mib_per_second Average transfer throughput for this disk's sync, in MiB/s.")
-	fmt.Fprintln(&b, "# TYPE vmsync_transfer_avg_mib_per_second gauge")
-	for _, m := range disks {
-		fmt.Fprintf(&b, "vmsync_transfer_avg_mib_per_second{source_host=%q,target_host=%q,vm=%q,disk=%q} %.3f\n",
-			m.SourceHost, m.TargetHost, m.VM, m.Disk, m.AvgMiBPerSecond)
-	}
-
-	fmt.Fprintln(&b, "# HELP vmsync_sync_state Result of the last sync for this disk (0=success, 1=failure).")
+	fmt.Fprintln(&b, "# HELP vmsync_sync_state Result of the last vmsync run as a whole (0=success, 1=failure).")
 	fmt.Fprintln(&b, "# TYPE vmsync_sync_state gauge")
-	for _, m := range disks {
-		fmt.Fprintf(&b, "vmsync_sync_state{source_host=%q,target_host=%q,vm=%q,disk=%q} %d\n",
-			m.SourceHost, m.TargetHost, m.VM, m.Disk, m.State)
-	}
+	fmt.Fprintf(&b, "vmsync_sync_state{source_host=%q,target_host=%q,vm=%q} %d\n",
+		run.SourceHost, run.TargetHost, run.VM, run.State)
 
 	return writeAtomic(path, b.String())
 }
