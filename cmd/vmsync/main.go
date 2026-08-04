@@ -81,6 +81,7 @@ func main() {
 		CompressLevel       int
 		NetBuffer           string
 		BridgeHelperPath    string
+		UseSSH              bool
 		PrometheusTextfile  string
 		ShowVersion         bool
 	}
@@ -106,10 +107,11 @@ func main() {
 	flag.BoolVar(&cfg.Start, "start", false, "In case vm is in non-running state, start in paused mode to allow sync.")
 	flag.BoolVar(&cfg.Reinit, "reinit", false, "Discard all vmsync checkpoints on the source and the existing target domain/disks, then perform a fresh full sync. Use to recover from a broken checkpoint chain (e.g. \"Bitmap already exists\" errors).")
 	flag.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "After this many consecutive sync failures (tracked in the target domain's vmsync metadata), automatically reinit (as with -reinit) instead of trying again the same way. 0 disables this (default).")
-	flag.BoolVar(&cfg.Compress, "compress", false, "Compress NBD traffic between hosts using zstd, tunneled over the existing SSH connection. Compression runs natively on both ends (no external tool dependency); the remote side requires vmsync-bridge-helper deployed at -bridge-helper-path. Core sync behavior is unchanged when this is not set.")
+	flag.BoolVar(&cfg.Compress, "compress", false, "Compress NBD traffic between hosts using zstd. Compression runs natively on both ends (no external tool dependency); the remote side requires vmsync-bridge-helper deployed at -bridge-helper-path. By default the bridged traffic goes directly between hosts, not through SSH -- see -use-ssh. Core sync behavior is unchanged when this is not set.")
 	flag.IntVar(&cfg.CompressLevel, "compress-level", 3, "zstd compression level to use when --compress is set (1-19)")
 	flag.StringVar(&cfg.NetBuffer, "netbuffer", "", "Buffer NBD bridge traffic through a bounded in-memory buffer to smooth throughput, formatted as <blocksize>,<buffersize> (e.g. 64k,512M). Runs natively on both ends (no external tool dependency). Independent of --compress -- usable alone or combined with it.")
 	flag.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/local/bin/vmsync-bridge-helper", "Remote path to the vmsync-bridge-helper binary, used when --compress/--netbuffer is set. Must already be deployed there by you (e.g. via scp) -- vmsync does not upload it.")
+	flag.BoolVar(&cfg.UseSSH, "use-ssh", false, "When --compress/--netbuffer is set, route the bridged NBD traffic through the existing SSH connection as an encrypted tunnel, instead of the default: vmsync-bridge-helper listening on all interfaces and the local relay connecting to it directly over plain TCP. The default (false) has NO encryption or authentication of its own for that traffic -- only appropriate when the network path between the hosts is already secured some other way (e.g. a VPN/WireGuard tunnel). When false, requires the bridge port range to be reachable directly between the two hosts (firewall/routing) -- vmsync does not verify this itself. No effect without --compress/--netbuffer.")
 	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write sync metrics to this path in Prometheus textfile-collector format: per disk, source/target host, vm, disk size, transferred and compressed-transferred bytes, and duration; plus one overall success/failure state for the whole run. Written atomically (temp file + rename). Empty disables it (default).")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
@@ -218,6 +220,7 @@ func run(cfg struct {
 	CompressLevel       int
 	NetBuffer           string
 	BridgeHelperPath    string
+	UseSSH              bool
 	PrometheusTextfile  string
 	ShowVersion         bool
 }) (runErr error) {
@@ -300,6 +303,7 @@ func run(cfg struct {
 		NetBufferBlock: netbufferBlock,
 		NetBufferSize:  netbufferSize,
 		HelperPath:     cfg.BridgeHelperPath,
+		UseSSH:         cfg.UseSSH,
 	}
 	if err := nbdbridge.CheckLocal(bridgeCfg); err != nil {
 		return err
@@ -853,7 +857,11 @@ func run(cfg struct {
 		sourceStopCommands = append(sourceStopCommands, stopCmd)
 		stopMu.Unlock()
 		trace.Info("source nbd port in use", "side", "source", "kind", "bridge_remote", "host", nbdHost, "port", sourceBridgePort)
-		localPort, counters, stopLocal, err := nbdbridge.StartLocal(ctx, sourceSSHClient, fmt.Sprintf("127.0.0.1:%d", sourceBridgePort), bridgeCfg)
+		sourceBridgeDialAddr := fmt.Sprintf("%s:%d", nbdHost, sourceBridgePort)
+		if cfg.UseSSH {
+			sourceBridgeDialAddr = fmt.Sprintf("127.0.0.1:%d", sourceBridgePort)
+		}
+		localPort, counters, stopLocal, err := nbdbridge.StartLocal(ctx, sourceSSHClient, sourceBridgeDialAddr, bridgeCfg)
 		if err != nil {
 			return fmt.Errorf("start local nbd bridge relay for source: %w", err)
 		}
@@ -991,7 +999,11 @@ func run(cfg struct {
 			targetStopCommands = append(targetStopCommands, bridgeStopCmd)
 			stopMu.Unlock()
 			trace.Info("target nbd port in use", "side", "target", "kind", "bridge_remote", "disk", d.TargetDev, "host", targetNBDHost, "port", targetBridgePort)
-			localPort, counters, stopLocal, err := nbdbridge.StartLocal(ctx, targetSSHClient, fmt.Sprintf("127.0.0.1:%d", targetBridgePort), bridgeCfg)
+			targetBridgeDialAddr := fmt.Sprintf("%s:%d", targetNBDHost, targetBridgePort)
+			if cfg.UseSSH {
+				targetBridgeDialAddr = fmt.Sprintf("127.0.0.1:%d", targetBridgePort)
+			}
+			localPort, counters, stopLocal, err := nbdbridge.StartLocal(ctx, targetSSHClient, targetBridgeDialAddr, bridgeCfg)
 			if err != nil {
 				return fmt.Errorf("start local nbd bridge relay for %s: %w", d.TargetDev, err)
 			}

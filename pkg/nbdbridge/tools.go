@@ -47,6 +47,17 @@ func CheckRemote(ctx context.Context, client *remotessh.Client, cfg Config, host
 			"to point at wherever you've placed it", cfg.HelperPath, host, err, out)
 	}
 
+	// Bridging bypasses SSH tunneling for the bridged connection entirely by
+	// default (see Config.UseSSH), so the SSH-port-forwarding requirement
+	// below only applies when UseSSH is explicitly set. There's no way to
+	// pre-check direct network reachability between the two hosts here (the
+	// remote bridge port isn't listening yet at this point), so that failure
+	// mode surfaces naturally, with a clear error, the first time the local
+	// relay actually tries to dial it.
+	if !cfg.UseSSH {
+		return nil
+	}
+
 	// The bridge relies entirely on SSH direct-tcpip channels (DialTCP) to
 	// reach the remote listener -- separate from, and independent of, the
 	// session channels client.Run just used above. A server can (and

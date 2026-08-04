@@ -51,10 +51,15 @@ func (b *ByteCounters) ReceivedSnapshot() uint64 {
 }
 
 // StartLocal opens a local TCP listener that transparently compresses/buffers
-// traffic to/from remoteBridgeAddr (reached through sshClient's SSH tunnel),
-// symmetric with the remote vmsync-bridge-helper process on the other end.
-// Callers should redirect their real NBD dial target from the real host:port
-// to 127.0.0.1:<returned port> for the bridged leg.
+// traffic to/from remoteBridgeAddr, symmetric with the remote
+// vmsync-bridge-helper process on the other end. remoteBridgeAddr is dialed
+// directly over plain TCP by default (so it must be the remote host's real,
+// routable address:port), or reached through sshClient's SSH tunnel when
+// cfg.UseSSH is set (so it should then be the remote host's own loopback
+// address, e.g. 127.0.0.1:<bridgePort>, instead -- the caller is responsible
+// for passing the right one for the mode requested). Callers should redirect
+// their real NBD dial target from the real host:port to
+// 127.0.0.1:<returned port> for the bridged leg.
 func StartLocal(ctx context.Context, sshClient *remotessh.Client, remoteBridgeAddr string, cfg Config) (localPort int, counters *ByteCounters, stop func() error, err error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -103,19 +108,30 @@ func StartLocal(ctx context.Context, sshClient *remotessh.Client, remoteBridgeAd
 }
 
 // relayConnection bridges one accepted plaintext connection (from the local
-// NBD client) to remoteBridgeAddr over the SSH tunnel, compressing/buffering
-// the outbound direction and reversing that for the inbound direction via
-// pkg/zstdrelay -- the same logic cmd/vmsync-bridge-helper uses on the
-// remote end, so both sides of the bridge can never drift apart in
-// behavior. There's no subprocess left to bind to a context for
-// cancellation (unlike the old CLI-piped version); closing conn/remote from
-// the caller's own teardown is what unblocks a relay in progress.
+// NBD client) to remoteBridgeAddr -- a plain direct TCP connection by
+// default, or over the SSH tunnel when cfg.UseSSH is set (see
+// Config.UseSSH) -- compressing/buffering the outbound direction and
+// reversing that for the inbound direction via pkg/zstdrelay -- the same
+// logic cmd/vmsync-bridge-helper uses on the remote end, so both sides of
+// the bridge can never drift apart in behavior. There's no subprocess left
+// to bind to a context for cancellation (unlike the old CLI-piped version);
+// closing conn/remote from the caller's own teardown is what unblocks a
+// relay in progress.
 func relayConnection(conn net.Conn, sshClient *remotessh.Client, remoteBridgeAddr string, cfg Config, counters *ByteCounters) error {
 	defer conn.Close()
 
-	remote, err := sshClient.DialTCP(remoteBridgeAddr)
-	if err != nil {
-		return fmt.Errorf("dial remote nbd bridge %s over ssh: %w", remoteBridgeAddr, err)
+	var remote net.Conn
+	var err error
+	if cfg.UseSSH {
+		remote, err = sshClient.DialTCP(remoteBridgeAddr)
+		if err != nil {
+			return fmt.Errorf("dial remote nbd bridge %s over ssh: %w", remoteBridgeAddr, err)
+		}
+	} else {
+		remote, err = net.Dial("tcp", remoteBridgeAddr)
+		if err != nil {
+			return fmt.Errorf("dial remote nbd bridge %s directly: %w", remoteBridgeAddr, err)
+		}
 	}
 	defer remote.Close()
 

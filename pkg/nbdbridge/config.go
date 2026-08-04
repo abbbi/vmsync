@@ -34,6 +34,19 @@ type Config struct {
 	NetBufferBlock string // e.g. "64k"; empty means netbuffer is disabled
 	NetBufferSize  string // e.g. "512M"
 	HelperPath     string // remote path to the vmsync-bridge-helper binary
+	// UseSSH, when false (the default), bridges directly: vmsync-bridge-helper
+	// binds its listener to all interfaces instead of loopback, and the local
+	// relay dials the remote host's real, routable address over plain TCP,
+	// bypassing SSH entirely for the bridged connection. This has no
+	// encryption or authentication of its own -- only appropriate when the
+	// network path between the two hosts is already secured some other way
+	// (e.g. a VPN/WireGuard tunnel) -- and requires the bridge port range to
+	// actually be reachable between the two hosts (firewall/routing), which
+	// vmsync does not itself verify. Set UseSSH to true to instead route the
+	// bridged connection through the existing SSH connection as an encrypted
+	// tunnel (an SSH direct-tcpip channel), at the cost of SSH's own
+	// channel-level flow-control overhead.
+	UseSSH bool
 }
 
 // NetBufferEnabled reports whether --netbuffer was set.

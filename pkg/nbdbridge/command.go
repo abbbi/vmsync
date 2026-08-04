@@ -40,15 +40,24 @@ func quoteArgs(args ...string) string {
 // BuildStartCommand returns a shell command that backgrounds cfg.HelperPath
 // (vmsync-bridge-helper, deployed to the remote host by the user ahead of
 // time -- see pkg/nbdbridge/tools.go's CheckRemote) listening on
-// 127.0.0.1:bridgePort and forwarding each accepted connection to the real
-// NBD export on 127.0.0.1:realPort, and records its PID in pidFile.
+// bridgePort and forwarding each accepted connection to the real NBD export
+// on 127.0.0.1:realPort, and records its PID in pidFile.
+//
+// The listen address is 0.0.0.0:bridgePort by default, so the local relay
+// can dial it directly over the network, or 127.0.0.1:bridgePort when
+// cfg.UseSSH is set (reachable only through the caller's own SSH tunnel) --
+// see Config.UseSSH's doc comment for the tradeoff.
 //
 // No socat (or any other external tool) is involved: the helper does its own
 // listening, accepting, compression, and buffering natively in one program.
 func BuildStartCommand(cfg Config, bridgePort, realPort int, pidFile, logFile string) string {
+	listenHost := "0.0.0.0"
+	if cfg.UseSSH {
+		listenHost = "127.0.0.1"
+	}
 	args := []string{
 		cfg.HelperPath,
-		"-listen", fmt.Sprintf("127.0.0.1:%d", bridgePort),
+		"-listen", fmt.Sprintf("%s:%d", listenHost, bridgePort),
 		"-connect", fmt.Sprintf("127.0.0.1:%d", realPort),
 	}
 	if cfg.Compress {
