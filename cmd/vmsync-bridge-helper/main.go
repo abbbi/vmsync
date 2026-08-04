@@ -43,8 +43,9 @@ import (
 func main() {
 	listenAddr := flag.String("listen", "", "local host:port to listen on for bridged connections (required)")
 	connectAddr := flag.String("connect", "", "real endpoint host:port to dial and forward plaintext traffic to/from, once per accepted connection (required)")
-	compress := flag.Bool("compress", false, "compress the wire-facing traffic with zstd")
-	level := flag.Int("level", 3, "zstd compression level (1-19), only used with -compress")
+	compress := flag.Bool("compress", false, "compress the wire-facing traffic")
+	algoFlag := flag.String("algo", "zstd", "compression format to use with -compress: \"zstd\" or \"s2\"")
+	level := flag.Int("level", 3, "zstd compression level (1-19), only used with -compress and -algo=zstd")
 	netbuffer := flag.String("netbuffer", "", "buffer wire-facing traffic through a bounded in-memory buffer, "+
 		"formatted as <blocksize>,<buffersize> (e.g. 64k,256M); empty disables it")
 	flag.Parse()
@@ -55,6 +56,11 @@ func main() {
 	}
 	if *connectAddr == "" {
 		fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -connect is required")
+		os.Exit(2)
+	}
+	algo, err := zstdrelay.ParseAlgo(*algoFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -68,7 +74,7 @@ func main() {
 		netbufferBlock, netbufferSize = parts[0], parts[1]
 	}
 
-	if err := serve(*listenAddr, *connectAddr, *compress, *level, netbufferBlock, netbufferSize); err != nil {
+	if err := serve(*listenAddr, *connectAddr, *compress, algo, *level, netbufferBlock, netbufferSize); err != nil {
 		fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
 		os.Exit(1)
 	}
@@ -78,7 +84,7 @@ func main() {
 // handleConn on its own goroutine, indefinitely -- the same "listen, fork
 // per connection" role socat's "TCP-LISTEN:...,fork" used to play, now done
 // natively so the remote host no longer needs socat installed at all.
-func serve(listenAddr, connectAddr string, compress bool, level int, netbufferBlock, netbufferSize string) error {
+func serve(listenAddr, connectAddr string, compress bool, algo zstdrelay.Algo, level int, netbufferBlock, netbufferSize string) error {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", listenAddr, err)
@@ -90,7 +96,7 @@ func serve(listenAddr, connectAddr string, compress bool, level int, netbufferBl
 		if err != nil {
 			return fmt.Errorf("accept on %s: %w", listenAddr, err)
 		}
-		go handleConn(conn, connectAddr, compress, level, netbufferBlock, netbufferSize)
+		go handleConn(conn, connectAddr, compress, algo, level, netbufferBlock, netbufferSize)
 	}
 }
 
@@ -101,7 +107,7 @@ func serve(listenAddr, connectAddr string, compress bool, level int, netbufferBl
 // the OS), all connections now share this one long-lived process, so an
 // unrecovered panic here would take down every other connection this helper
 // is currently serving, not just this one.
-func handleConn(conn net.Conn, connectAddr string, compress bool, level int, netbufferBlock, netbufferSize string) {
+func handleConn(conn net.Conn, connectAddr string, compress bool, algo zstdrelay.Algo, level int, netbufferBlock, netbufferSize string) {
 	defer conn.Close()
 	defer func() {
 		if r := recover(); r != nil {
@@ -130,7 +136,7 @@ func handleConn(conn net.Conn, connectAddr string, compress bool, level int, net
 	// conn (wire, compressed/buffered client traffic) -> [buffer] -> [decompress] -> real (plaintext, to the real NBD server)
 	go func() {
 		defer wg.Done()
-		reportErr(zstdrelay.RelayFromWire(real, conn, compress, netbufferBlock, netbufferSize, nil))
+		reportErr(zstdrelay.RelayFromWire(real, conn, compress, algo, netbufferBlock, netbufferSize, nil))
 		if tc, ok := real.(*net.TCPConn); ok {
 			tc.CloseWrite() // half-close: tell the real server we're done sending
 		}
@@ -148,7 +154,7 @@ func handleConn(conn net.Conn, connectAddr string, compress bool, level int, net
 	// diagnosed via a SIGQUIT goroutine dump on the opposite direction).
 	go func() {
 		defer wg.Done()
-		reportErr(zstdrelay.Relay(conn, real, compress, level, netbufferBlock, netbufferSize, nil))
+		reportErr(zstdrelay.Relay(conn, real, compress, algo, level, netbufferBlock, netbufferSize, nil))
 		if tc, ok := conn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}

@@ -61,7 +61,11 @@ func BuildStartCommand(cfg Config, bridgePort, realPort int, pidFile, logFile st
 		"-connect", fmt.Sprintf("127.0.0.1:%d", realPort),
 	}
 	if cfg.Compress {
-		args = append(args, "-compress", "-level", strconv.Itoa(cfg.CompressLevel))
+		algo := cfg.CompressAlgo
+		if algo == "" {
+			algo = "zstd"
+		}
+		args = append(args, "-compress", "-algo", algo, "-level", strconv.Itoa(cfg.CompressLevel))
 	}
 	if cfg.NetBufferEnabled() {
 		args = append(args, "-netbuffer", cfg.NetBufferBlock+","+cfg.NetBufferSize)

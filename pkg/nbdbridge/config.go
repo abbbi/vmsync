@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"vmsync/pkg/zstdrelay"
 )
 
 // Config describes how NBD traffic should be bridged/compressed between
@@ -31,6 +33,7 @@ import (
 type Config struct {
 	Compress       bool
 	CompressLevel  int
+	CompressAlgo   string // "zstd" (default) or "s2" -- see zstdrelay.Algo
 	NetBufferBlock string // e.g. "64k"; empty means netbuffer is disabled
 	NetBufferSize  string // e.g. "512M"
 	HelperPath     string // remote path to the vmsync-bridge-helper binary
@@ -66,6 +69,13 @@ func ValidateCompressLevel(level int) error {
 		return fmt.Errorf("--compress-level must be between 1 and 19, got %d", level)
 	}
 	return nil
+}
+
+// ValidateCompressAlgo checks the --compress-algo value is one
+// pkg/zstdrelay recognizes.
+func ValidateCompressAlgo(algo string) error {
+	_, err := zstdrelay.ParseAlgo(algo)
+	return err
 }
 
 var netbufferSizeRe = regexp.MustCompile(`(?i)^[0-9]+[bkmgt]?$`)

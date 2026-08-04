@@ -31,38 +31,100 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package zstdrelay
 
 import (
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
 
+	"github.com/klauspost/compress/s2"
 	"github.com/klauspost/compress/zstd"
 )
 
-// NewEncoder wraps w with a zstd encoder configured for low-latency,
+// Algo selects which compression format Relay/RelayFromWire use.
+type Algo string
+
+const (
+	// AlgoZstd is zstd (github.com/klauspost/compress/zstd) -- better
+	// compression ratio, run single-threaded here for exact per-chunk
+	// Flush() semantics. The default: the better fit when the network link
+	// itself, not CPU, is the bottleneck, since every byte saved matters
+	// more than compression speed.
+	AlgoZstd Algo = "zstd"
+	// AlgoS2 is S2 (github.com/klauspost/compress/s2), a Snappy-derived
+	// format trading compression ratio for substantially higher throughput.
+	// The better fit when the link (or underlying storage) is fast enough
+	// that compression speed itself, not ratio, ends up being the
+	// bottleneck -- e.g. observed directly: a link capable of hundreds of
+	// MB/s, where raising zstd's level made things worse (more CPU work)
+	// while lowering it made no difference (already at the link's own
+	// ceiling, not zstd's).
+	AlgoS2 Algo = "s2"
+)
+
+// ParseAlgo validates a --compress-algo value, treating "" as AlgoZstd (the
+// default).
+func ParseAlgo(s string) (Algo, error) {
+	switch Algo(s) {
+	case AlgoZstd, "":
+		return AlgoZstd, nil
+	case AlgoS2:
+		return AlgoS2, nil
+	default:
+		return "", fmt.Errorf("--compress-algo must be \"zstd\" or \"s2\", got %q", s)
+	}
+}
+
+// flushCloser is satisfied by both *zstd.Encoder and *s2.Writer -- both
+// expose this same Write/Flush/Close shape, letting Relay use either
+// interchangeably without caring which. Flush pushes everything written so
+// far to the underlying writer without ending the compressed stream --
+// unlike Close, the stream can still be written to afterward.
+type flushCloser interface {
+	Write(p []byte) (int, error)
+	Flush() error
+	Close() error
+}
+
+// flushWriter is the subset of flushCloser CopyFlushing actually needs.
+// Satisfied by anything satisfying flushCloser too.
+type flushWriter interface {
+	Write(p []byte) (int, error)
+	Flush() error
+}
+
+// NewEncoder wraps w with an encoder for algo, configured for low-latency,
 // per-chunk-flush use against a live, long-lived connection rather than a
-// file: concurrency=1 disables the library's internal parallel-block
-// goroutines (there to help bulk file throughput, not to push small chunks
-// out immediately), which is what makes Flush()'s guarantees exact.
-func NewEncoder(w io.Writer, level int) (*zstd.Encoder, error) {
+// file. For zstd, concurrency=1 disables the library's internal
+// parallel-block goroutines (there to help bulk file throughput, not to
+// push small chunks out immediately), which is what makes Flush()'s
+// guarantees exact. level only applies to zstd -- S2 always runs in its
+// default (fastest) mode, since speed is the entire reason to choose it
+// over zstd (see Algo).
+func NewEncoder(algo Algo, w io.Writer, level int) (flushCloser, error) {
+	if algo == AlgoS2 {
+		return s2.NewWriter(w, s2.WriterConcurrency(1)), nil
+	}
 	return zstd.NewWriter(w,
 		zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)),
 		zstd.WithEncoderConcurrency(1),
 	)
 }
 
-// NewDecoder wraps r with a zstd decoder that decompresses incrementally, on
-// demand, as bytes are requested -- rather than the library's default mode,
-// which uses background goroutines tuned for bulk throughput.
-func NewDecoder(r io.Reader) (*zstd.Decoder, error) {
-	return zstd.NewReader(r, zstd.WithDecoderConcurrency(1))
-}
-
-// flushWriter is satisfied by *zstd.Encoder. Flush pushes everything written
-// so far to the underlying writer without ending the compressed frame --
-// unlike Close, the stream can still be written to afterward.
-type flushWriter interface {
-	Write(p []byte) (int, error)
-	Flush() error
+// NewDecoder wraps r with a decoder for algo that decompresses
+// incrementally, on demand, as bytes are requested. It returns a close
+// function to call once done reading, rather than a concrete decoder type:
+// *zstd.Decoder has a Close method (no error return) but *s2.Reader has none
+// at all, so there's no single interface to hand back that covers both --
+// the returned closure is a no-op for S2.
+func NewDecoder(algo Algo, r io.Reader) (io.Reader, func(), error) {
+	if algo == AlgoS2 {
+		return s2.NewReader(r), func() {}, nil
+	}
+	dec, err := zstd.NewReader(r, zstd.WithDecoderConcurrency(1))
+	if err != nil {
+		return nil, nil, err
+	}
+	return dec, dec.Close, nil
 }
 
 // CopyFlushing is io.Copy's loop shape, plus an explicit Flush() after every

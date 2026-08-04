@@ -21,8 +21,6 @@ import (
 	"fmt"
 	"io"
 	"strconv"
-
-	"github.com/klauspost/compress/zstd"
 )
 
 // ParseByteSize parses a size string like "64k", "512M", or a bare number of
@@ -70,6 +68,9 @@ func ParseByteSize(s string) (int, error) {
 // (pkg/nbdbridge/local.go) and the remote vmsync-bridge-helper binary, so
 // the two ends can never drift apart in behavior.
 //
+// algo selects the compression format (see Algo); it's only consulted when
+// compress is true.
+//
 // netbufferSize (the "buffersize" half of --netbuffer=blocksize,buffersize)
 // sets the bounded buffer's capacity; netbufferBlock is accepted for
 // CLI-format symmetry but not otherwise used -- BoundedBuffer has no fixed
@@ -78,10 +79,10 @@ func ParseByteSize(s string) (int, error) {
 // caller's own compression-savings reporting.
 //
 // Relay runs until src reaches EOF (returning nil) or a real error occurs.
-// On EOF it properly finalizes each active stage (closing the zstd encoder
-// so the peer's decoder sees a clean end-of-frame rather than an abrupt
+// On EOF it properly finalizes each active stage (closing the encoder so
+// the peer's decoder sees a clean end-of-stream rather than an abrupt
 // disconnect, and draining/closing the bounded buffer) before returning.
-func Relay(dst io.Writer, src io.Reader, compress bool, level int, netbufferBlock, netbufferSize string, wireCounter *uint64) error {
+func Relay(dst io.Writer, src io.Reader, compress bool, algo Algo, level int, netbufferBlock, netbufferSize string, wireCounter *uint64) error {
 	var effectiveDst io.Writer = dst
 	if wireCounter != nil {
 		effectiveDst = &CountingWriter{W: dst, Counter: wireCounter}
@@ -111,9 +112,9 @@ func Relay(dst io.Writer, src io.Reader, compress bool, level int, netbufferBloc
 
 	var relayErr error
 	if compress {
-		enc, err := NewEncoder(effectiveDst, level)
+		enc, err := NewEncoder(algo, effectiveDst, level)
 		if err != nil {
-			return fmt.Errorf("create zstd encoder: %w", err)
+			return fmt.Errorf("create %s encoder: %w", algo, err)
 		}
 		_, relayErr = CopyFlushing(enc, src)
 		if closeErr := enc.Close(); relayErr == nil {
@@ -138,13 +139,17 @@ func Relay(dst io.Writer, src io.Reader, compress bool, level int, netbufferBloc
 // from Relay's write side: buffering (if enabled) sits nearest src, and
 // decompression (if enabled) sits nearest dst.
 //
+// algo selects the compression format (see Algo); it's only consulted when
+// compress is true, and must match whatever Relay on the sending end used,
+// or decoding will fail.
+//
 // RelayFromWire runs until src reaches EOF (returning nil) or a real error
 // occurs. On EOF it closes the decoder (if any) and, if a buffer stage is
 // active, waits for its fill goroutine to finish -- the fill goroutine
 // itself closes the buffer once src is drained, so the decoder (or the
 // final io.Copy, if compression is off) sees a clean end rather than
 // hanging.
-func RelayFromWire(dst io.Writer, src io.Reader, compress bool, netbufferBlock, netbufferSize string, wireCounter *uint64) error {
+func RelayFromWire(dst io.Writer, src io.Reader, compress bool, algo Algo, netbufferBlock, netbufferSize string, wireCounter *uint64) error {
 	var effectiveSrc io.Reader = src
 	if wireCounter != nil {
 		effectiveSrc = &CountingReader{R: src, Counter: wireCounter}
@@ -173,19 +178,19 @@ func RelayFromWire(dst io.Writer, src io.Reader, compress bool, netbufferBlock, 
 	}
 
 	var decodedSrc io.Reader = effectiveSrc
-	var dec *zstd.Decoder
+	var closeDecoder func()
 	if compress {
-		var err error
-		dec, err = NewDecoder(effectiveSrc)
+		dec, closer, err := NewDecoder(algo, effectiveSrc)
 		if err != nil {
-			return fmt.Errorf("create zstd decoder: %w", err)
+			return fmt.Errorf("create %s decoder: %w", algo, err)
 		}
 		decodedSrc = dec
+		closeDecoder = closer
 	}
 
 	_, relayErr := io.Copy(dst, decodedSrc)
-	if dec != nil {
-		dec.Close()
+	if closeDecoder != nil {
+		closeDecoder()
 	}
 
 	if bufStage != nil {
