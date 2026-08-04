@@ -133,8 +133,10 @@ func ChangedExtentsTCP(ctx context.Context, host string, port int, exportName, c
 // CopyExtentsTCP copies extents from src to dst, returning the number of
 // bytes actually written even when it returns a non-nil error (best-effort,
 // reflecting whatever was copied before the failure), so callers can still
-// report partial progress (e.g. in metrics) on a failed sync.
-func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport string, dstHost string, dstPort int, extents []Extent) (writtenBytes uint64, err error) {
+// report partial progress (e.g. in metrics) on a failed sync. ioDepth is the
+// number of read/write pairs kept in flight simultaneously (see the
+// pipelining comment below); values less than 1 are clamped to 1.
+func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport string, dstHost string, dstPort int, extents []Extent, ioDepth int) (writtenBytes uint64, err error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -209,10 +211,13 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 	// on local/low-latency links the dominant per-chunk cost isn't network
 	// bandwidth, it's the round-trip itself (real disk I/O on both ends, NBD
 	// protocol framing) -- a synchronous Pread-then-Pwrite loop pays that
-	// cost twice, serially, per chunk. Keeping a small window of chunks
+	// cost twice, serially, per chunk. Keeping a window of ioDepth chunks
 	// in-flight lets a chunk's write overlap with the next chunk's read,
 	// hiding one side's latency behind the other's.
-	const pipelineDepth = 4
+	pipelineDepth := ioDepth
+	if pipelineDepth < 1 {
+		pipelineDepth = 1
+	}
 
 	const (
 		slotFree = iota

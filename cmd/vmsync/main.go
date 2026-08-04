@@ -82,6 +82,7 @@ func main() {
 		NetBuffer           string
 		BridgeHelperPath    string
 		UseSSH              bool
+		IODepth             int
 		PrometheusTextfile  string
 		ShowVersion         bool
 	}
@@ -112,6 +113,7 @@ func main() {
 	flag.StringVar(&cfg.NetBuffer, "netbuffer", "", "Buffer NBD bridge traffic through a bounded in-memory buffer to smooth throughput, formatted as <blocksize>,<buffersize> (e.g. 64k,512M). Runs natively on both ends (no external tool dependency). Independent of --compress -- usable alone or combined with it.")
 	flag.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/local/bin/vmsync-bridge-helper", "Remote path to the vmsync-bridge-helper binary, used when --compress/--netbuffer is set. Must already be deployed there by you (e.g. via scp) -- vmsync does not upload it.")
 	flag.BoolVar(&cfg.UseSSH, "use-ssh", false, "When --compress/--netbuffer is set, route the bridged NBD traffic through the existing SSH connection as an encrypted tunnel, instead of the default: vmsync-bridge-helper listening on all interfaces and the local relay connecting to it directly over plain TCP. The default (false) has NO encryption or authentication of its own for that traffic -- only appropriate when the network path between the hosts is already secured some other way (e.g. a VPN/WireGuard tunnel). When false, requires the bridge port range to be reachable directly between the two hosts (firewall/routing) -- vmsync does not verify this itself. No effect without --compress/--netbuffer.")
+	flag.IntVar(&cfg.IODepth, "io-depth", 8, "Number of NBD read/write pairs to keep in flight simultaneously during the disk copy, instead of waiting for each to fully complete before starting the next. Higher values can hide more per-chunk round-trip latency (real disk I/O plus NBD protocol overhead on both ends), at the cost of io-depth times the negotiated NBD block size in memory. Must be at least 1.")
 	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write sync metrics to this path in Prometheus textfile-collector format: per disk, source/target host, vm, disk size, transferred and compressed-transferred bytes, and duration; plus one overall success/failure state for the whole run. Written atomically (temp file + rename). Empty disables it (default).")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
@@ -140,6 +142,10 @@ func main() {
 			trace.Error("invalid netbuffer configuration", "error", err)
 			os.Exit(2)
 		}
+	}
+	if cfg.IODepth < 1 {
+		trace.Error("invalid io-depth configuration", "error", fmt.Errorf("-io-depth must be at least 1, got %d", cfg.IODepth))
+		os.Exit(2)
 	}
 
 	trace.SetDebug(cfg.Debug)
@@ -221,6 +227,7 @@ func run(cfg struct {
 	NetBuffer           string
 	BridgeHelperPath    string
 	UseSSH              bool
+	IODepth             int
 	PrometheusTextfile  string
 	ShowVersion         bool
 }) (runErr error) {
@@ -1019,7 +1026,7 @@ func run(cfg struct {
 		}
 
 		trace.Info("copy extents to remote target", "extents", len(extents), "path", targetPath, "disk_size", diskSize)
-		writtenBytes, err = nbdsync.CopyExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, effectiveTargetHost, effectiveTargetPort, extents)
+		writtenBytes, err = nbdsync.CopyExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, effectiveTargetHost, effectiveTargetPort, extents, cfg.IODepth)
 		if err != nil {
 			return err
 		}
