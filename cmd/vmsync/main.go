@@ -226,34 +226,49 @@ func run(cfg struct {
 	diskMetrics := make([]metrics.DiskMetric, 0)
 	var nbdHost, targetNBDHost string
 
-	if cfg.PrometheusTextfile != "" {
-		// Registered here, before anything that can fail (SSH setup,
-		// checkpoint/backup calls, per-disk syncs, ...), so a run that never
-		// gets anywhere near the disk loop still reports failure --
-		// otherwise a sync that dies during early setup would silently never
-		// touch the textfile at all, leaving monitoring blind to it (the
-		// exact gap that surfaced this: a failed target-side stat check
-		// before nbdHost/targetNBDHost were even computed produced no
-		// prometheus file whatsoever). nbdHost/targetNBDHost are computed
-		// further down and just plain-assigned (not re-declared) into these
-		// same variables, so this closure sees whatever value they hold --
-		// empty string if we failed before reaching that point, correct
-		// otherwise. Fires last, once runErr holds its final value --
-		// vmsync_sync_state reflects the whole run's outcome, not any single
-		// disk's, since a later step (checkpoint cleanup, metadata update,
-		// DefineDomain) can still fail after every disk has already synced
-		// successfully.
-		defer func() {
-			state := metrics.StateSuccess
-			if runErr != nil {
-				state = metrics.StateFailure
-			}
-			run := metrics.RunMetric{SourceHost: nbdHost, TargetHost: targetNBDHost, VM: cfg.SourceDomain, State: state, Timestamp: time.Now().Unix()}
-			if err := metrics.WriteTextfile(cfg.PrometheusTextfile, diskMetrics, run); err != nil {
-				trace.Warning("failed to write prometheus textfile", "path", cfg.PrometheusTextfile, "error", err)
-			}
-		}()
+	// writeMetricsTextfile is called from two places: the deferred call
+	// below (the normal return path, any outcome) and the signal handler
+	// further down (which calls os.Exit directly on a forced shutdown --
+	// os.Exit skips every deferred function unconditionally, by Go's own
+	// design, so that defer would otherwise never run at all on Ctrl+C/
+	// SIGTERM). The normal path only ever runs after wg.Wait() has already
+	// joined every per-disk goroutine, so reading diskMetrics/nbdHost/
+	// targetNBDHost there needs no lock -- but the signal handler
+	// deliberately does NOT wait for those goroutines (a wedged libnbd call
+	// can't be interrupted), so it can genuinely run concurrently with a
+	// syncDisk goroutine still appending to diskMetrics under metricsMu, or
+	// even before nbdHost/targetNBDHost are assigned at all. metricsMu (already
+	// used for the diskMetrics append) guards all three here so both call
+	// sites are race-free regardless of which one gets there first.
+	writeMetricsTextfile := func(state int) {
+		if cfg.PrometheusTextfile == "" {
+			return
+		}
+		metricsMu.Lock()
+		disksSnapshot := append([]metrics.DiskMetric(nil), diskMetrics...)
+		sourceHost, targetHost := nbdHost, targetNBDHost
+		metricsMu.Unlock()
+		run := metrics.RunMetric{SourceHost: sourceHost, TargetHost: targetHost, VM: cfg.SourceDomain, State: state, Timestamp: time.Now().Unix()}
+		if err := metrics.WriteTextfile(cfg.PrometheusTextfile, disksSnapshot, run); err != nil {
+			trace.Warning("failed to write prometheus textfile", "path", cfg.PrometheusTextfile, "error", err)
+		}
 	}
+	// Registered here, before anything that can fail (SSH setup, checkpoint/
+	// backup calls, per-disk syncs, ...), so a run that never gets anywhere
+	// near the disk loop still reports failure -- otherwise a sync that dies
+	// during early setup would silently never touch the textfile at all,
+	// leaving monitoring blind to it. Fires last, once runErr holds its
+	// final value -- vmsync_sync_state reflects the whole run's outcome, not
+	// any single disk's, since a later step (checkpoint cleanup, metadata
+	// update, DefineDomain) can still fail after every disk has already
+	// synced successfully.
+	defer func() {
+		state := metrics.StateSuccess
+		if runErr != nil {
+			state = metrics.StateFailure
+		}
+		writeMetricsTextfile(state)
+	}()
 
 	netbufferBlock, netbufferSize, err := nbdbridge.ParseNetBufferSpec(cfg.NetBuffer)
 	if err != nil {
@@ -468,6 +483,12 @@ func run(cfg struct {
 			// process could otherwise sit there forever despite a clean
 			// signal handler. Exit directly instead.
 			trace.Warning("cleanup complete, forcing process exit", "signal", sig.String())
+			// Mirrors the deferred metrics write further up in run() --
+			// duplicated here for the same reason as the checkpoint cleanup
+			// above: os.Exit below skips that defer entirely. An interrupted
+			// run is always recorded as a failure, regardless of how far the
+			// sync had gotten.
+			writeMetricsTextfile(metrics.StateFailure)
 			os.Exit(1)
 		case <-doneCh:
 			return
@@ -777,15 +798,23 @@ func run(cfg struct {
 	backupMu.Unlock()
 	defer abortBackup("cleanup")
 
-	nbdHost = cfg.SourceNBDHost
-	if nbdHost == "" {
-		nbdHost = util.ConnectHostFromBindOrURI(cfg.SourceNBDBind, cfg.SourceURI)
+	resolvedSourceHost := cfg.SourceNBDHost
+	if resolvedSourceHost == "" {
+		resolvedSourceHost = util.ConnectHostFromBindOrURI(cfg.SourceNBDBind, cfg.SourceURI)
 	}
+	resolvedTargetHost := cfg.TargetNBDHost
+	if resolvedTargetHost == "" {
+		resolvedTargetHost = util.ConnectHostFromBindOrURI(cfg.TargetNBDBind, cfg.TargetURI)
+	}
+	// Locked because the signal handler's writeMetricsTextfile call (on a
+	// separate goroutine) reads nbdHost/targetNBDHost too, and can fire
+	// concurrently with this assignment -- see writeMetricsTextfile's
+	// comment above.
+	metricsMu.Lock()
+	nbdHost = resolvedSourceHost
+	targetNBDHost = resolvedTargetHost
+	metricsMu.Unlock()
 	trace.Info("source nbd port in use", "side", "source", "kind", "nbd_export", "host", nbdHost, "port", cfg.SourceNBDPort)
-	targetNBDHost = cfg.TargetNBDHost
-	if targetNBDHost == "" {
-		targetNBDHost = util.ConnectHostFromBindOrURI(cfg.TargetNBDBind, cfg.TargetURI)
-	}
 
 	// Default to the direct, uncompressed path; overridden below when
 	// --compress/--netbuffer are set and the source is reachable via SSH.
