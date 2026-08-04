@@ -224,6 +224,36 @@ func run(cfg struct {
 	var started bool = false
 	var metricsMu sync.Mutex
 	diskMetrics := make([]metrics.DiskMetric, 0)
+	var nbdHost, targetNBDHost string
+
+	if cfg.PrometheusTextfile != "" {
+		// Registered here, before anything that can fail (SSH setup,
+		// checkpoint/backup calls, per-disk syncs, ...), so a run that never
+		// gets anywhere near the disk loop still reports failure --
+		// otherwise a sync that dies during early setup would silently never
+		// touch the textfile at all, leaving monitoring blind to it (the
+		// exact gap that surfaced this: a failed target-side stat check
+		// before nbdHost/targetNBDHost were even computed produced no
+		// prometheus file whatsoever). nbdHost/targetNBDHost are computed
+		// further down and just plain-assigned (not re-declared) into these
+		// same variables, so this closure sees whatever value they hold --
+		// empty string if we failed before reaching that point, correct
+		// otherwise. Fires last, once runErr holds its final value --
+		// vmsync_sync_state reflects the whole run's outcome, not any single
+		// disk's, since a later step (checkpoint cleanup, metadata update,
+		// DefineDomain) can still fail after every disk has already synced
+		// successfully.
+		defer func() {
+			state := metrics.StateSuccess
+			if runErr != nil {
+				state = metrics.StateFailure
+			}
+			run := metrics.RunMetric{SourceHost: nbdHost, TargetHost: targetNBDHost, VM: cfg.SourceDomain, State: state, Timestamp: time.Now().Unix()}
+			if err := metrics.WriteTextfile(cfg.PrometheusTextfile, diskMetrics, run); err != nil {
+				trace.Warning("failed to write prometheus textfile", "path", cfg.PrometheusTextfile, "error", err)
+			}
+		}()
+	}
 
 	netbufferBlock, netbufferSize, err := nbdbridge.ParseNetBufferSpec(cfg.NetBuffer)
 	if err != nil {
@@ -747,33 +777,14 @@ func run(cfg struct {
 	backupMu.Unlock()
 	defer abortBackup("cleanup")
 
-	nbdHost := cfg.SourceNBDHost
+	nbdHost = cfg.SourceNBDHost
 	if nbdHost == "" {
 		nbdHost = util.ConnectHostFromBindOrURI(cfg.SourceNBDBind, cfg.SourceURI)
 	}
 	trace.Info("source nbd port in use", "side", "source", "kind", "nbd_export", "host", nbdHost, "port", cfg.SourceNBDPort)
-	targetNBDHost := cfg.TargetNBDHost
+	targetNBDHost = cfg.TargetNBDHost
 	if targetNBDHost == "" {
 		targetNBDHost = util.ConnectHostFromBindOrURI(cfg.TargetNBDBind, cfg.TargetURI)
-	}
-
-	if cfg.PrometheusTextfile != "" {
-		// Registered here (rather than where the per-disk metrics are
-		// collected) so it fires last, once runErr holds its final value --
-		// vmsync_sync_state reflects the whole run's outcome, not any single
-		// disk's, since a later step (checkpoint cleanup, metadata update,
-		// DefineDomain) can still fail after every disk has already synced
-		// successfully.
-		defer func() {
-			state := metrics.StateSuccess
-			if runErr != nil {
-				state = metrics.StateFailure
-			}
-			run := metrics.RunMetric{SourceHost: nbdHost, TargetHost: targetNBDHost, VM: cfg.SourceDomain, State: state, Timestamp: time.Now().Unix()}
-			if err := metrics.WriteTextfile(cfg.PrometheusTextfile, diskMetrics, run); err != nil {
-				trace.Warning("failed to write prometheus textfile", "path", cfg.PrometheusTextfile, "error", err)
-			}
-		}()
 	}
 
 	// Default to the direct, uncompressed path; overridden below when
