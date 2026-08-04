@@ -33,6 +33,7 @@ import (
 
 	"vmsync/pkg/disk"
 	"vmsync/pkg/libvirtsync"
+	"vmsync/pkg/metrics"
 	"vmsync/pkg/nbdbridge"
 	"vmsync/pkg/nbdsync"
 	"vmsync/pkg/remotessh"
@@ -80,6 +81,7 @@ func main() {
 		CompressLevel       int
 		NetBuffer           string
 		BridgeHelperPath    string
+		PrometheusTextfile  string
 		ShowVersion         bool
 	}
 
@@ -108,6 +110,7 @@ func main() {
 	flag.IntVar(&cfg.CompressLevel, "compress-level", 3, "zstd compression level to use when --compress is set (1-19)")
 	flag.StringVar(&cfg.NetBuffer, "netbuffer", "", "Buffer NBD bridge traffic through a bounded in-memory buffer to smooth throughput, formatted as <blocksize>,<buffersize> (e.g. 64k,512M). Runs natively on both ends (no external tool dependency). Independent of --compress -- usable alone or combined with it.")
 	flag.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/local/bin/vmsync-bridge-helper", "Remote path to the vmsync-bridge-helper binary, used when --compress/--netbuffer is set. Must already be deployed there by you (e.g. via scp) -- vmsync does not upload it.")
+	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write per-disk sync metrics (source/target host, vm, disk, disk size, transferred bytes, duration, throughput, success/failure) to this path in Prometheus textfile-collector format. Written atomically (temp file + rename). Empty disables it (default).")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
@@ -195,6 +198,7 @@ func run(cfg struct {
 	CompressLevel       int
 	NetBuffer           string
 	BridgeHelperPath    string
+	PrometheusTextfile  string
 	ShowVersion         bool
 }) (runErr error) {
 	runStart := time.Now()
@@ -218,6 +222,8 @@ func run(cfg struct {
 	var parent string
 	var freezed bool = false
 	var started bool = false
+	var metricsMu sync.Mutex
+	diskMetrics := make([]metrics.DiskMetric, 0)
 
 	netbufferBlock, netbufferSize, err := nbdbridge.ParseNetBufferSpec(cfg.NetBuffer)
 	if err != nil {
@@ -788,8 +794,40 @@ func run(cfg struct {
 		cancel()
 		errCh <- err
 	}
-	syncDisk := func(i int, d disk.QcowDisk) error {
+	syncDisk := func(i int, d disk.QcowDisk) (err error) {
 		diskStart := time.Now()
+		var diskSize uint64
+		var writtenBytes uint64
+		if cfg.PrometheusTextfile != "" {
+			// Runs on every exit path (including early "return err"s further
+			// down), so each disk always gets a metric -- diskSize/writtenBytes
+			// simply stay at their zero value if the sync failed before
+			// reaching the step that would have set them.
+			defer func() {
+				state := metrics.StateSuccess
+				if err != nil {
+					state = metrics.StateFailure
+				}
+				elapsed := time.Since(diskStart).Seconds()
+				avgMiBPerSec := 0.0
+				if elapsed > 0 {
+					avgMiBPerSec = (float64(writtenBytes) / (1024.0 * 1024.0)) / elapsed
+				}
+				metricsMu.Lock()
+				diskMetrics = append(diskMetrics, metrics.DiskMetric{
+					SourceHost:       nbdHost,
+					TargetHost:       targetNBDHost,
+					VM:               cfg.SourceDomain,
+					Disk:             d.TargetDev,
+					DiskSizeBytes:    diskSize,
+					TransferredBytes: writtenBytes,
+					DurationSeconds:  elapsed,
+					AvgMiBPerSecond:  avgMiBPerSec,
+					State:            state,
+				})
+				metricsMu.Unlock()
+			}()
+		}
 		runTargetCommand := func(command, action string) error {
 			trace.Debug(command)
 			out, err := targetSSHClient.Run(ctx, command)
@@ -800,7 +838,9 @@ func run(cfg struct {
 		}
 
 		trace.Info("reading disk via libvirt backup NBD tcp export", "disk", d.TargetDev, "export", d.TargetDev)
-		extents, diskSize, dirty, err := nbdsync.ChangedExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, bitmapForRead, incrementalMode)
+		var extents []nbdsync.Extent
+		var dirty uint64
+		extents, diskSize, dirty, err = nbdsync.ChangedExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, bitmapForRead, incrementalMode)
 		if err != nil {
 			return err
 		}
@@ -888,7 +928,8 @@ func run(cfg struct {
 		}
 
 		trace.Info("copy extents to remote target", "extents", len(extents), "path", targetPath, "disk_size", diskSize)
-		if err := nbdsync.CopyExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, effectiveTargetHost, effectiveTargetPort, extents); err != nil {
+		writtenBytes, err = nbdsync.CopyExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, effectiveTargetHost, effectiveTargetPort, extents)
+		if err != nil {
 			return err
 		}
 
@@ -935,6 +976,12 @@ func run(cfg struct {
 	trace.Info("waiting for all processes to finish")
 	wg.Wait()
 	close(errCh)
+
+	if cfg.PrometheusTextfile != "" {
+		if err := metrics.WriteTextfile(cfg.PrometheusTextfile, diskMetrics); err != nil {
+			trace.Warning("failed to write prometheus textfile", "path", cfg.PrometheusTextfile, "error", err)
+		}
+	}
 
 	for err := range errCh {
 		if err != nil {

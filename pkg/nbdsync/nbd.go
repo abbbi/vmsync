@@ -130,33 +130,37 @@ func ChangedExtentsTCP(ctx context.Context, host string, port int, exportName, c
 	return out, size, dirty, nil
 }
 
-func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport string, dstHost string, dstPort int, extents []Extent) error {
+// CopyExtentsTCP copies extents from src to dst, returning the number of
+// bytes actually written even when it returns a non-nil error (best-effort,
+// reflecting whatever was copied before the failure), so callers can still
+// report partial progress (e.g. in metrics) on a failed sync.
+func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport string, dstHost string, dstPort int, extents []Extent) (writtenBytes uint64, err error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return 0, err
 	}
 	src, err := nbd.Create()
 	if err != nil {
-		return fmt.Errorf("create source nbd handle: %w", err)
+		return 0, fmt.Errorf("create source nbd handle: %w", err)
 	}
 	defer src.Close()
 
 	dst, err := nbd.Create()
 	if err != nil {
-		return fmt.Errorf("create target nbd handle: %w", err)
+		return 0, fmt.Errorf("create target nbd handle: %w", err)
 	}
 	defer dst.Close()
 
 	if srcExport != "" {
 		if err := src.SetExportName(srcExport); err != nil {
-			return fmt.Errorf("set source export name %s: %w", srcExport, err)
+			return 0, fmt.Errorf("set source export name %s: %w", srcExport, err)
 		}
 	}
 	if err := src.ConnectTcp(srcHost, strconv.Itoa(srcPort)); err != nil {
-		return fmt.Errorf("connect source nbd tcp %s:%d: %w", srcHost, srcPort, err)
+		return 0, fmt.Errorf("connect source nbd tcp %s:%d: %w", srcHost, srcPort, err)
 	}
 
 	if err := dst.ConnectTcp(dstHost, strconv.Itoa(dstPort)); err != nil {
-		return fmt.Errorf("connect target nbd tcp %s:%d: %w", dstHost, dstPort, err)
+		return 0, fmt.Errorf("connect target nbd tcp %s:%d: %w", dstHost, dstPort, err)
 	}
 
 	max_dst, _ := dst.GetBlockSize(nbd.SIZE_MAXIMUM)
@@ -167,7 +171,6 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 	trace.Debug("use nbd buffer", "size", buffer_size)
 
 	buf := make([]byte, buffer_size)
-	writtenBytes := uint64(0)
 	totalBytes := uint64(0)
 	for _, ex := range extents {
 		if ex.Dirty && ex.Length > 0 {
@@ -185,7 +188,7 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 		for remaining > 0 {
 			select {
 			case <-ctx.Done():
-				return fmt.Errorf("nbd copy cancelled at offset %d: %w", cur, ctx.Err())
+				return writtenBytes, fmt.Errorf("nbd copy cancelled at offset %d: %w", cur, ctx.Err())
 			default:
 			}
 
@@ -195,10 +198,10 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 			}
 			data := buf[:int(step)]
 			if err := src.Pread(data, cur, nil); err != nil {
-				return fmt.Errorf("source nbd pread offset=%d len=%d: %w", cur, step, err)
+				return writtenBytes, fmt.Errorf("source nbd pread offset=%d len=%d: %w", cur, step, err)
 			}
 			if err := dst.Pwrite(data, cur, nil); err != nil {
-				return fmt.Errorf("target nbd pwrite offset=%d len=%d: %w", cur, step, err)
+				return writtenBytes, fmt.Errorf("target nbd pwrite offset=%d len=%d: %w", cur, step, err)
 			}
 			cur += step
 			remaining -= step
@@ -221,7 +224,7 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 	}
 
 	if err := dst.Flush(nil); err != nil {
-		return fmt.Errorf("flush target nbd: %w", err)
+		return writtenBytes, fmt.Errorf("flush target nbd: %w", err)
 	}
 	elapsed := time.Since(start)
 	avgMibPerSec := 0.0
@@ -229,7 +232,7 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 		avgMibPerSec = (float64(writtenBytes) / (1024.0 * 1024.0)) / elapsed.Seconds()
 	}
 	trace.Info("nbd copy complete", "written_bytes", writtenBytes, "device", srcExport, "elapsed", elapsed.Round(time.Millisecond).String(), "avg_mib_per_sec", fmt.Sprintf("%.2f", avgMibPerSec))
-	return nil
+	return writtenBytes, nil
 }
 
 func WaitForTCPExport(host string, port int, timeout time.Duration) error {
