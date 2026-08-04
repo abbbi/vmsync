@@ -142,6 +142,26 @@ func main() {
 
 	trace.SetDebug(cfg.Debug)
 
+	// Scoped to the source domain, not source+target: the shared, non-
+	// reentrant resource two concurrent invocations would collide on first
+	// is the SOURCE domain's checkpoint chain (proven by a real collision:
+	// two processes both got "checkpoint already exists" creating the same
+	// checkpoint name at once), so that's what needs protecting regardless
+	// of which target either one is writing to. Acquired before any libvirt
+	// connection at all, and before -reinit-after-failures's own metadata
+	// read just below, so a losing invocation does the least possible work
+	// before backing off. Not a sync failure: exits 0, doesn't count toward
+	// -reinit-after-failures, and (since run() is never called) never
+	// touches -prometheus-textfile either -- it's a clean no-op skip, the
+	// same way the wrapper script's own lock already treats "another
+	// instance is already running".
+	lockFile, err := util.AcquireRunLock("/run/vmsync-locks", cfg.SourceDomain)
+	if err != nil {
+		trace.Info("another vmsync is already syncing this domain, skipping", "domain", cfg.SourceDomain, "error", err)
+		os.Exit(0)
+	}
+	defer lockFile.Close()
+
 	// Consecutive failure count lives in the target domain's own vmsync
 	// metadata (alongside last_checkpoint/last_sync_timestamp), not in local
 	// state -- so it survives being tracked from a different host and stays
