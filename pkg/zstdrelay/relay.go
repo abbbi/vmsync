@@ -69,7 +69,8 @@ func ParseByteSize(s string) (int, error) {
 // the two ends can never drift apart in behavior.
 //
 // algo selects the compression format (see Algo); it's only consulted when
-// compress is true.
+// compress is true. level's accepted values depend on algo -- see
+// NewEncoder.
 //
 // netbufferSize (the "buffersize" half of --netbuffer=blocksize,buffersize)
 // sets the bounded buffer's capacity; netbufferBlock is accepted for
@@ -82,7 +83,7 @@ func ParseByteSize(s string) (int, error) {
 // On EOF it properly finalizes each active stage (closing the encoder so
 // the peer's decoder sees a clean end-of-stream rather than an abrupt
 // disconnect, and draining/closing the bounded buffer) before returning.
-func Relay(dst io.Writer, src io.Reader, compress bool, algo Algo, level int, netbufferBlock, netbufferSize string, wireCounter *uint64) error {
+func Relay(dst io.Writer, src io.Reader, compress bool, algo Algo, level string, netbufferBlock, netbufferSize string, wireCounter *uint64) error {
 	var effectiveDst io.Writer = dst
 	if wireCounter != nil {
 		effectiveDst = &CountingWriter{W: dst, Counter: wireCounter}

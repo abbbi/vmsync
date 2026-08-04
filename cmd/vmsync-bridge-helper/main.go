@@ -45,7 +45,7 @@ func main() {
 	connectAddr := flag.String("connect", "", "real endpoint host:port to dial and forward plaintext traffic to/from, once per accepted connection (required)")
 	compress := flag.Bool("compress", false, "compress the wire-facing traffic")
 	algoFlag := flag.String("algo", "zstd", "compression format to use with -compress: \"zstd\" or \"s2\"")
-	level := flag.Int("level", 3, "zstd compression level (1-19), only used with -compress and -algo=zstd")
+	level := flag.String("level", "3", "compression level/mode, only used with -compress: a number 1-19 for -algo=zstd, or \"default\"/\"better\"/\"best\" for -algo=s2")
 	netbuffer := flag.String("netbuffer", "", "buffer wire-facing traffic through a bounded in-memory buffer, "+
 		"formatted as <blocksize>,<buffersize> (e.g. 64k,256M); empty disables it")
 	flag.Parse()
@@ -84,7 +84,7 @@ func main() {
 // handleConn on its own goroutine, indefinitely -- the same "listen, fork
 // per connection" role socat's "TCP-LISTEN:...,fork" used to play, now done
 // natively so the remote host no longer needs socat installed at all.
-func serve(listenAddr, connectAddr string, compress bool, algo zstdrelay.Algo, level int, netbufferBlock, netbufferSize string) error {
+func serve(listenAddr, connectAddr string, compress bool, algo zstdrelay.Algo, level string, netbufferBlock, netbufferSize string) error {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", listenAddr, err)
@@ -107,7 +107,7 @@ func serve(listenAddr, connectAddr string, compress bool, algo zstdrelay.Algo, l
 // the OS), all connections now share this one long-lived process, so an
 // unrecovered panic here would take down every other connection this helper
 // is currently serving, not just this one.
-func handleConn(conn net.Conn, connectAddr string, compress bool, algo zstdrelay.Algo, level int, netbufferBlock, netbufferSize string) {
+func handleConn(conn net.Conn, connectAddr string, compress bool, algo zstdrelay.Algo, level string, netbufferBlock, netbufferSize string) {
 	defer conn.Close()
 	defer func() {
 		if r := recover(); r != nil {

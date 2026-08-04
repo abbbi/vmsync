@@ -19,7 +19,6 @@ package nbdbridge
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 
 	"vmsync/pkg/util"
@@ -65,7 +64,15 @@ func BuildStartCommand(cfg Config, bridgePort, realPort int, pidFile, logFile st
 		if algo == "" {
 			algo = "zstd"
 		}
-		args = append(args, "-compress", "-algo", algo, "-level", strconv.Itoa(cfg.CompressLevel))
+		level := cfg.CompressLevel
+		if level == "" {
+			if algo == "s2" {
+				level = "default"
+			} else {
+				level = "3"
+			}
+		}
+		args = append(args, "-compress", "-algo", algo, "-level", level)
 	}
 	if cfg.NetBufferEnabled() {
 		args = append(args, "-netbuffer", cfg.NetBufferBlock+","+cfg.NetBufferSize)

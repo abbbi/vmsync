@@ -78,7 +78,7 @@ func main() {
 		Reinit              bool
 		ReinitAfterFailures int
 		Compress            bool
-		CompressLevel       int
+		CompressLevel       string
 		CompressAlgo        string
 		NetBuffer           string
 		BridgeHelperPath    string
@@ -110,8 +110,8 @@ func main() {
 	flag.BoolVar(&cfg.Reinit, "reinit", false, "Discard all vmsync checkpoints on the source and the existing target domain/disks, then perform a fresh full sync. Use to recover from a broken checkpoint chain (e.g. \"Bitmap already exists\" errors).")
 	flag.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "After this many consecutive sync failures (tracked in the target domain's vmsync metadata), automatically reinit (as with -reinit) instead of trying again the same way. 0 disables this (default).")
 	flag.BoolVar(&cfg.Compress, "compress", false, "Compress NBD traffic between hosts using zstd. Compression runs natively on both ends (no external tool dependency); the remote side requires vmsync-bridge-helper deployed at -bridge-helper-path. By default the bridged traffic goes directly between hosts, not through SSH -- see -use-ssh. Core sync behavior is unchanged when this is not set.")
-	flag.IntVar(&cfg.CompressLevel, "compress-level", 3, "zstd compression level to use when --compress is set (1-19)")
-	flag.StringVar(&cfg.CompressAlgo, "compress-algo", "zstd", "Compression format to use with --compress: \"zstd\" (better ratio) or \"s2\" (faster, lower ratio -- better when compression speed, not network bandwidth, is the bottleneck). --compress-level only applies to zstd.")
+	flag.StringVar(&cfg.CompressLevel, "compress-level", "3", "Compression level/mode to use when --compress is set. For --compress-algo=zstd (default): a number 1-19 (default 3). For --compress-algo=s2 (which has no numeric levels): one of \"default\" (fastest, s2's own default), \"better\", or \"best\" -- if --compress-level isn't set explicitly, s2 automatically uses \"default\" instead of zstd's \"3\".")
+	flag.StringVar(&cfg.CompressAlgo, "compress-algo", "zstd", "Compression format to use with --compress: \"zstd\" (better ratio) or \"s2\" (faster, lower ratio -- better when compression speed, not network bandwidth, is the bottleneck). See --compress-level for the accepted level/mode values for each.")
 	flag.StringVar(&cfg.NetBuffer, "netbuffer", "", "Buffer NBD bridge traffic through a bounded in-memory buffer to smooth throughput, formatted as <blocksize>,<buffersize> (e.g. 64k,512M). Runs natively on both ends (no external tool dependency). Independent of --compress -- usable alone or combined with it.")
 	flag.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/local/bin/vmsync-bridge-helper", "Remote path to the vmsync-bridge-helper binary, used when --compress/--netbuffer is set. Must already be deployed there by you (e.g. via scp) -- vmsync does not upload it.")
 	flag.BoolVar(&cfg.UseSSH, "use-ssh", false, "When --compress/--netbuffer is set, route the bridged NBD traffic through the existing SSH connection as an encrypted tunnel, instead of the default: vmsync-bridge-helper listening on all interfaces and the local relay connecting to it directly over plain TCP. The default (false) has NO encryption or authentication of its own for that traffic -- only appropriate when the network path between the hosts is already secured some other way (e.g. a VPN/WireGuard tunnel). When false, requires the bridge port range to be reachable directly between the two hosts (firewall/routing) -- vmsync does not verify this itself. No effect without --compress/--netbuffer.")
@@ -121,6 +121,17 @@ func main() {
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
 	flag.Parse()
+
+	// Tracks whether --compress-level was actually passed on the command
+	// line, as opposed to just carrying its zstd-oriented flag default
+	// ("3") -- needed below to swap in s2's own default ("default") instead
+	// when --compress-algo=s2 and the user didn't ask for a specific level.
+	compressLevelExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "compress-level" {
+			compressLevelExplicit = true
+		}
+	})
 
 	if cfg.ShowVersion {
 		trace.Info(fmt.Sprintf("vmsync Version: %s", VERSION))
@@ -134,12 +145,15 @@ func main() {
 		cfg.TargetDomain = cfg.SourceDomain
 	}
 	if cfg.Compress {
-		if err := nbdbridge.ValidateCompressLevel(cfg.CompressLevel); err != nil {
-			trace.Error("invalid compress configuration", "error", err)
-			os.Exit(2)
-		}
 		if err := nbdbridge.ValidateCompressAlgo(cfg.CompressAlgo); err != nil {
 			trace.Error("invalid compress algo configuration", "error", err)
+			os.Exit(2)
+		}
+		if !compressLevelExplicit && cfg.CompressAlgo == "s2" {
+			cfg.CompressLevel = "default"
+		}
+		if err := nbdbridge.ValidateCompressLevel(cfg.CompressAlgo, cfg.CompressLevel); err != nil {
+			trace.Error("invalid compress-level configuration", "error", err)
 			os.Exit(2)
 		}
 	}
@@ -229,7 +243,7 @@ func run(cfg struct {
 	Reinit              bool
 	ReinitAfterFailures int
 	Compress            bool
-	CompressLevel       int
+	CompressLevel       string
 	CompressAlgo        string
 	NetBuffer           string
 	BridgeHelperPath    string

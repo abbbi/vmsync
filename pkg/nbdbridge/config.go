@@ -20,6 +20,7 @@ package nbdbridge
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"vmsync/pkg/zstdrelay"
@@ -31,8 +32,11 @@ import (
 // options are used. --compress and --netbuffer are independent: either can be
 // used alone, or both together.
 type Config struct {
-	Compress       bool
-	CompressLevel  int
+	Compress bool
+	// CompressLevel's accepted values depend on CompressAlgo: a traditional
+	// numeric zstd level ("1"-"19") for "zstd", or one of "default"/
+	// "better"/"best" for "s2" -- see zstdrelay.NewEncoder.
+	CompressLevel  string
 	CompressAlgo   string // "zstd" (default) or "s2" -- see zstdrelay.Algo
 	NetBufferBlock string // e.g. "64k"; empty means netbuffer is disabled
 	NetBufferSize  string // e.g. "512M"
@@ -62,11 +66,29 @@ func (c Config) Enabled() bool {
 	return c.Compress || c.NetBufferEnabled()
 }
 
-// ValidateCompressLevel checks the --compress-level value is one zstd
-// accepts.
-func ValidateCompressLevel(level int) error {
-	if level < 1 || level > 19 {
-		return fmt.Errorf("--compress-level must be between 1 and 19, got %d", level)
+// ValidateCompressLevel checks the --compress-level value is valid for the
+// given --compress-algo: zstd takes a traditional numeric level ("1"-"19"),
+// while S2 has no numeric levels at all -- only "default" (fastest, S2's own
+// default), "better", or "best" (see zstdrelay.NewEncoder).
+func ValidateCompressLevel(algo, level string) error {
+	a, err := zstdrelay.ParseAlgo(algo)
+	if err != nil {
+		return err
+	}
+	if a == zstdrelay.AlgoS2 {
+		switch level {
+		case "default", "better", "best":
+			return nil
+		default:
+			return fmt.Errorf("--compress-level must be \"default\", \"better\", or \"best\" when --compress-algo=s2, got %q", level)
+		}
+	}
+	n, err := strconv.Atoi(level)
+	if err != nil {
+		return fmt.Errorf("--compress-level must be a number between 1 and 19 for --compress-algo=zstd, got %q", level)
+	}
+	if n < 1 || n > 19 {
+		return fmt.Errorf("--compress-level must be between 1 and 19, got %d", n)
 	}
 	return nil
 }

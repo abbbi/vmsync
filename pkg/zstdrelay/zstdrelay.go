@@ -33,6 +33,7 @@ package zstdrelay
 import (
 	"fmt"
 	"io"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -97,15 +98,32 @@ type flushWriter interface {
 // file. For zstd, concurrency=1 disables the library's internal
 // parallel-block goroutines (there to help bulk file throughput, not to
 // push small chunks out immediately), which is what makes Flush()'s
-// guarantees exact. level only applies to zstd -- S2 always runs in its
-// default (fastest) mode, since speed is the entire reason to choose it
-// over zstd (see Algo).
-func NewEncoder(algo Algo, w io.Writer, level int) (flushCloser, error) {
+// guarantees exact.
+//
+// level's accepted values depend on algo: for zstd it's a traditional
+// numeric level, "1"-"19"; S2 has no numeric levels at all, only three
+// discrete modes -- "default" (fastest, S2's own default), "better", or
+// "best" (slowest, closest to zstd's own ratio) -- selected via
+// s2.WriterBetterCompression()/s2.WriterBestCompression().
+func NewEncoder(algo Algo, w io.Writer, level string) (flushCloser, error) {
 	if algo == AlgoS2 {
-		return s2.NewWriter(w, s2.WriterConcurrency(1)), nil
+		switch level {
+		case "", "default":
+			return s2.NewWriter(w, s2.WriterConcurrency(1)), nil
+		case "better":
+			return s2.NewWriter(w, s2.WriterConcurrency(1), s2.WriterBetterCompression()), nil
+		case "best":
+			return s2.NewWriter(w, s2.WriterConcurrency(1), s2.WriterBestCompression()), nil
+		default:
+			return nil, fmt.Errorf("--compress-level must be \"default\", \"better\", or \"best\" for --compress-algo=s2, got %q", level)
+		}
+	}
+	n, err := strconv.Atoi(level)
+	if err != nil {
+		return nil, fmt.Errorf("invalid zstd --compress-level %q: %w", level, err)
 	}
 	return zstd.NewWriter(w,
-		zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)),
+		zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(n)),
 		zstd.WithEncoderConcurrency(1),
 	)
 }
