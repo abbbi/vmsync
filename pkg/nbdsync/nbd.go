@@ -170,15 +170,21 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 	buffer_size := min(max_dst, max_src)
 	trace.Debug("use nbd buffer", "size", buffer_size)
 
-	buf := make([]byte, buffer_size)
 	totalBytes := uint64(0)
 	for _, ex := range extents {
 		if ex.Dirty && ex.Length > 0 {
 			totalBytes += ex.Length
 		}
 	}
-	start := time.Now()
-	lastLog := start
+
+	// Flatten extents into a flat list of buffer_size-capped (offset, length)
+	// chunks up front, so the pipeline below runs over one simple sequence
+	// instead of juggling extent boundaries mid-flight.
+	type copyChunk struct {
+		offset uint64
+		length uint64
+	}
+	var chunks []copyChunk
 	for _, ex := range extents {
 		if !ex.Dirty || ex.Length == 0 {
 			continue
@@ -186,40 +192,180 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 		remaining := ex.Length
 		cur := ex.Offset
 		for remaining > 0 {
-			select {
-			case <-ctx.Done():
-				return writtenBytes, fmt.Errorf("nbd copy cancelled at offset %d: %w", cur, ctx.Err())
-			default:
-			}
-
-			step := uint64(len(buf))
+			step := buffer_size
 			if remaining < step {
 				step = remaining
 			}
-			data := buf[:int(step)]
-			if err := src.Pread(data, cur, nil); err != nil {
-				return writtenBytes, fmt.Errorf("source nbd pread offset=%d len=%d: %w", cur, step, err)
-			}
-			if err := dst.Pwrite(data, cur, nil); err != nil {
-				return writtenBytes, fmt.Errorf("target nbd pwrite offset=%d len=%d: %w", cur, step, err)
-			}
+			chunks = append(chunks, copyChunk{offset: cur, length: step})
 			cur += step
 			remaining -= step
-			writtenBytes += step
-			now := time.Now()
-			if now.Sub(lastLog) >= time.Second || writtenBytes == totalBytes {
-				elapsed := now.Sub(start).Seconds()
-				if elapsed <= 0 {
-					elapsed = 0.001
-				}
-				percent := 100.0
-				if totalBytes > 0 {
-					percent = (float64(writtenBytes) / float64(totalBytes)) * 100.0
-				}
-				mibPerSec := (float64(writtenBytes) / (1024.0 * 1024.0)) / elapsed
-				trace.Info(fmt.Sprintf("nbd: copy progress (%s)  %.2f%% (%d/%d bytes) %.2f MiB/s", srcExport, percent, writtenBytes, totalBytes, mibPerSec))
-				lastLog = now
+		}
+	}
+
+	start := time.Now()
+	lastLog := start
+
+	// Pipeline reads and writes instead of doing them strictly one at a time:
+	// on local/low-latency links the dominant per-chunk cost isn't network
+	// bandwidth, it's the round-trip itself (real disk I/O on both ends, NBD
+	// protocol framing) -- a synchronous Pread-then-Pwrite loop pays that
+	// cost twice, serially, per chunk. Keeping a small window of chunks
+	// in-flight lets a chunk's write overlap with the next chunk's read,
+	// hiding one side's latency behind the other's.
+	const pipelineDepth = 4
+
+	const (
+		slotFree = iota
+		slotReading
+		slotWriting
+	)
+	type slot struct {
+		state  int
+		buf    nbd.AioBuffer
+		offset uint64
+		length uint64
+		cookie uint64
+		opErr  int
+	}
+	slots := make([]slot, pipelineDepth)
+	defer func() {
+		// Catches any slot still holding an allocated buffer on an early
+		// (error) return -- slots freed via the normal completion path below
+		// are marked slotFree first, so this never double-frees one.
+		for i := range slots {
+			if slots[i].state != slotFree {
+				slots[i].buf.Free()
 			}
+		}
+	}()
+
+	nextChunk := 0
+	reading, writing := 0, 0
+
+	logProgress := func() {
+		now := time.Now()
+		if now.Sub(lastLog) < time.Second && writtenBytes != totalBytes {
+			return
+		}
+		elapsed := now.Sub(start).Seconds()
+		if elapsed <= 0 {
+			elapsed = 0.001
+		}
+		percent := 100.0
+		if totalBytes > 0 {
+			percent = (float64(writtenBytes) / float64(totalBytes)) * 100.0
+		}
+		mibPerSec := (float64(writtenBytes) / (1024.0 * 1024.0)) / elapsed
+		trace.Info(fmt.Sprintf("nbd: copy progress (%s)  %.2f%% (%d/%d bytes) %.2f MiB/s", srcExport, percent, writtenBytes, totalBytes, mibPerSec))
+		lastLog = now
+	}
+
+	for nextChunk < len(chunks) || reading > 0 || writing > 0 {
+		select {
+		case <-ctx.Done():
+			return writtenBytes, fmt.Errorf("nbd copy cancelled: %w", ctx.Err())
+		default:
+		}
+
+		// Fill any free slot with the next chunk's read.
+		for i := range slots {
+			if slots[i].state != slotFree || nextChunk >= len(chunks) {
+				continue
+			}
+			c := chunks[nextChunk]
+			nextChunk++
+			idx := i
+			slots[idx].buf = nbd.MakeAioBuffer(uint(c.length))
+			slots[idx].offset = c.offset
+			slots[idx].length = c.length
+			slots[idx].opErr = 0
+			cookie, err := src.AioPread(slots[idx].buf, c.offset, &nbd.AioPreadOptargs{
+				CompletionCallbackSet: true,
+				CompletionCallback: func(errp *int) int {
+					if errp != nil {
+						slots[idx].opErr = *errp
+					}
+					return 0
+				},
+			})
+			if err != nil {
+				slots[idx].buf.Free()
+				return writtenBytes, fmt.Errorf("source nbd aio_pread offset=%d len=%d: %w", c.offset, c.length, err)
+			}
+			slots[idx].cookie = cookie
+			slots[idx].state = slotReading
+			reading++
+		}
+
+		if reading > 0 {
+			if _, err := src.Poll(10); err != nil {
+				return writtenBytes, fmt.Errorf("source nbd poll: %w", err)
+			}
+		}
+		if writing > 0 {
+			if _, err := dst.Poll(10); err != nil {
+				return writtenBytes, fmt.Errorf("target nbd poll: %w", err)
+			}
+		}
+
+		// Reads that finished: check their result, then hand the same
+		// buffer straight to the target write (no Go-side copy needed).
+		for i := range slots {
+			if slots[i].state != slotReading {
+				continue
+			}
+			done, err := src.AioCommandCompleted(slots[i].cookie)
+			if err != nil {
+				return writtenBytes, fmt.Errorf("source nbd aio command check offset=%d: %w", slots[i].offset, err)
+			}
+			if !done {
+				continue
+			}
+			reading--
+			if slots[i].opErr != 0 {
+				return writtenBytes, fmt.Errorf("source nbd pread offset=%d len=%d: errno %d", slots[i].offset, slots[i].length, slots[i].opErr)
+			}
+			idx := i
+			slots[idx].opErr = 0
+			cookie, err := dst.AioPwrite(slots[idx].buf, slots[idx].offset, &nbd.AioPwriteOptargs{
+				CompletionCallbackSet: true,
+				CompletionCallback: func(errp *int) int {
+					if errp != nil {
+						slots[idx].opErr = *errp
+					}
+					return 0
+				},
+			})
+			if err != nil {
+				return writtenBytes, fmt.Errorf("target nbd aio_pwrite offset=%d len=%d: %w", slots[idx].offset, slots[idx].length, err)
+			}
+			slots[idx].cookie = cookie
+			slots[idx].state = slotWriting
+			writing++
+		}
+
+		// Writes that finished: the chunk is now durable-pending on the
+		// target (still needs the final dst.Flush below), free its buffer
+		// and count it.
+		for i := range slots {
+			if slots[i].state != slotWriting {
+				continue
+			}
+			done, err := dst.AioCommandCompleted(slots[i].cookie)
+			if err != nil {
+				return writtenBytes, fmt.Errorf("target nbd aio command check offset=%d: %w", slots[i].offset, err)
+			}
+			if !done {
+				continue
+			}
+			writing--
+			if slots[i].opErr != 0 {
+				return writtenBytes, fmt.Errorf("target nbd pwrite offset=%d len=%d: errno %d", slots[i].offset, slots[i].length, slots[i].opErr)
+			}
+			slots[i].buf.Free()
+			slots[i].state = slotFree
+			writtenBytes += slots[i].length
+			logProgress()
 		}
 	}
 
