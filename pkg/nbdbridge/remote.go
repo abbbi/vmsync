@@ -36,13 +36,13 @@ import (
 // daemon state, and isn't subject to that per-session isolation.
 const bridgeStateDir = "/run/vmsync-bridge"
 
-// StartRemote launches a backgrounded socat listener on client, forwarding
-// each accepted connection on 127.0.0.1:bridgePort to vmsync-bridge-helper
-// (cfg.HelperPath), which relays to the real NBD export already listening on
-// 127.0.0.1:realPort on the same host. It waits for the bridge process to
-// actually be running before returning, and returns a stop command the
-// caller should append to its own teardown list -- this function does not
-// manage the bridge's lifecycle itself beyond that.
+// StartRemote launches a backgrounded vmsync-bridge-helper (cfg.HelperPath)
+// on client, listening on 127.0.0.1:bridgePort and, per accepted connection,
+// relaying to the real NBD export already listening on 127.0.0.1:realPort on
+// the same host. It waits for the bridge process to actually be running
+// before returning, and returns a stop command the caller should append to
+// its own teardown list -- this function does not manage the bridge's
+// lifecycle itself beyond that.
 func StartRemote(ctx context.Context, client *remotessh.Client, bridgePort, realPort int, cfg Config) (stopCmd string, err error) {
 	if out, err := client.Run(ctx, "mkdir -p "+util.ShQuote(bridgeStateDir)); err != nil {
 		return "", fmt.Errorf("create bridge state dir %s: %w: %s", bridgeStateDir, err, out)
@@ -68,13 +68,13 @@ func StartRemote(ctx context.Context, client *remotessh.Client, bridgePort, real
 // that the process exists ("kill -0") or attempting a real TCP connection.
 //
 // A real TCP connect-and-close probe was used here originally and caused a
-// deadlock: socat's "fork" option treats ANY accepted connection as a real
-// one and immediately runs the full decompress/forward/compress pipeline for
-// it, including opening a genuine connection to the real NBD export --
-// which, by qemu-nbd's default --shared=1, only allows a single simultaneous
-// client. A disposable readiness probe occupied that one slot until its side
-// of the pipeline fully unwound, racing against (and usually losing to) the
-// real data connection that immediately followed it, wedging the whole sync.
+// deadlock: vmsync-bridge-helper's accept loop treats ANY accepted
+// connection as a real one and immediately dials the real NBD export for
+// it -- which, by qemu-nbd's default --shared=1, only allows a single
+// simultaneous client. A disposable readiness probe occupied that one slot
+// until its side of the relay fully unwound, racing against (and usually
+// losing to) the real data connection that immediately followed it, wedging
+// the whole sync.
 //
 // A "kill -0" liveness check was used after that, but only proves the
 // process exists, not that it has reached bind()/listen() yet -- under
@@ -82,8 +82,8 @@ func StartRemote(ctx context.Context, client *remotessh.Client, bridgePort, real
 // listener was actually up, getting connection-refused and tearing down the
 // client connection it was serving. Reading the socket table directly avoids
 // both problems: it's a passive read of kernel state, so it can never
-// trigger socat's fork machinery, and it only succeeds once the socket is
-// genuinely listening.
+// trigger the helper's accept-and-dial machinery, and it only succeeds once
+// the socket is genuinely listening.
 func waitForRemoteListening(ctx context.Context, client *remotessh.Client, bridgePort int, timeout time.Duration) error {
 	filter := fmt.Sprintf("( sport = :%d )", bridgePort)
 	check := "ss -Htln " + util.ShQuote(filter) + " | grep -q ."

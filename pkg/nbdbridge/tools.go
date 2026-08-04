@@ -41,10 +41,6 @@ func CheckRemote(ctx context.Context, client *remotessh.Client, cfg Config, host
 		return nil
 	}
 
-	if out, err := client.Run(ctx, "command -v socat"); err != nil {
-		return fmt.Errorf("nbd bridge requires the \"socat\" binary to be installed on %s: %w: %s", host, err, out)
-	}
-
 	if out, err := client.Run(ctx, "test -x "+util.ShQuote(cfg.HelperPath)); err != nil {
 		return fmt.Errorf("vmsync-bridge-helper not found (or not executable) at %s on %s: %w: %s\n"+
 			"build cmd/vmsync-bridge-helper and deploy it there yourself, or pass -bridge-helper-path "+
