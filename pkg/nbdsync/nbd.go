@@ -251,16 +251,6 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 		opErr  int
 	}
 	slots := make([]slot, pipelineDepth)
-	defer func() {
-		// Catches any slot still holding an allocated buffer on an early
-		// (error) return -- slots freed via the normal completion path below
-		// are marked slotFree first, so this never double-frees one.
-		for i := range slots {
-			if slots[i].state != slotFree {
-				slots[i].buf.Free()
-			}
-		}
-	}()
 
 	nextChunk := 0
 	reading, writing := 0, 0
@@ -283,10 +273,25 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 		lastLog = now
 	}
 
+	// copyErr carries an abort reason out of the loop below instead of
+	// returning directly from inside it, so every exit path -- normal
+	// completion or an aborted one -- flows through the drain step right
+	// after the loop before this function returns. That matters because
+	// libnbd requires a buffer passed to AioPread/AioPwrite to stay valid
+	// until its command is confirmed complete (AioCommandCompleted); on an
+	// early abort, other slots can still have genuinely in-flight commands,
+	// and freeing their buffers immediately (as an old version of this
+	// function did, relying on a deferred cleanup that ran before the
+	// connections were even closed) is a use-after-free race against
+	// whatever libnbd is still doing with that memory.
+	var copyErr error
+
+copyLoop:
 	for nextChunk < len(chunks) || reading > 0 || writing > 0 {
 		select {
 		case <-ctx.Done():
-			return writtenBytes, fmt.Errorf("nbd copy cancelled: %w", ctx.Err())
+			copyErr = fmt.Errorf("nbd copy cancelled: %w", ctx.Err())
+			break copyLoop
 		default:
 		}
 
@@ -312,8 +317,12 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 				},
 			})
 			if err != nil {
+				// Never actually issued -- libnbd never took ownership of
+				// this buffer, so freeing it immediately (rather than via
+				// the drain below) is safe.
 				slots[idx].buf.Free()
-				return writtenBytes, fmt.Errorf("source nbd aio_pread offset=%d len=%d: %w", c.offset, c.length, err)
+				copyErr = fmt.Errorf("source nbd aio_pread offset=%d len=%d: %w", c.offset, c.length, err)
+				break copyLoop
 			}
 			slots[idx].cookie = cookie
 			slots[idx].state = slotReading
@@ -322,12 +331,14 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 
 		if reading > 0 {
 			if _, err := src.Poll(10); err != nil {
-				return writtenBytes, fmt.Errorf("source nbd poll: %w", err)
+				copyErr = fmt.Errorf("source nbd poll: %w", err)
+				break copyLoop
 			}
 		}
 		if writing > 0 {
 			if _, err := dst.Poll(10); err != nil {
-				return writtenBytes, fmt.Errorf("target nbd poll: %w", err)
+				copyErr = fmt.Errorf("target nbd poll: %w", err)
+				break copyLoop
 			}
 		}
 
@@ -339,14 +350,20 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 			}
 			done, err := src.AioCommandCompleted(slots[i].cookie)
 			if err != nil {
-				return writtenBytes, fmt.Errorf("source nbd aio command check offset=%d: %w", slots[i].offset, err)
+				copyErr = fmt.Errorf("source nbd aio command check offset=%d: %w", slots[i].offset, err)
+				break copyLoop
 			}
 			if !done {
 				continue
 			}
 			reading--
 			if slots[i].opErr != 0 {
-				return writtenBytes, fmt.Errorf("source nbd pread offset=%d len=%d: errno %d", slots[i].offset, slots[i].length, slots[i].opErr)
+				// Confirmed complete (done == true) even though it failed,
+				// so per libnbd's contract the buffer is safe to free now.
+				slots[i].buf.Free()
+				slots[i].state = slotFree
+				copyErr = fmt.Errorf("source nbd pread offset=%d len=%d: errno %d", slots[i].offset, slots[i].length, slots[i].opErr)
+				break copyLoop
 			}
 			idx := i
 			slots[idx].opErr = 0
@@ -360,7 +377,14 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 				},
 			})
 			if err != nil {
-				return writtenBytes, fmt.Errorf("target nbd aio_pwrite offset=%d len=%d: %w", slots[idx].offset, slots[idx].length, err)
+				// The read into this buffer already completed (just
+				// confirmed above) and this write was never issued, so
+				// libnbd holds no reference to the buffer either way --
+				// freeing it now is safe.
+				slots[idx].buf.Free()
+				slots[idx].state = slotFree
+				copyErr = fmt.Errorf("target nbd aio_pwrite offset=%d len=%d: %w", slots[idx].offset, slots[idx].length, err)
+				break copyLoop
 			}
 			slots[idx].cookie = cookie
 			slots[idx].state = slotWriting
@@ -376,20 +400,79 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 			}
 			done, err := dst.AioCommandCompleted(slots[i].cookie)
 			if err != nil {
-				return writtenBytes, fmt.Errorf("target nbd aio command check offset=%d: %w", slots[i].offset, err)
+				copyErr = fmt.Errorf("target nbd aio command check offset=%d: %w", slots[i].offset, err)
+				break copyLoop
 			}
 			if !done {
 				continue
 			}
 			writing--
 			if slots[i].opErr != 0 {
-				return writtenBytes, fmt.Errorf("target nbd pwrite offset=%d len=%d: errno %d", slots[i].offset, slots[i].length, slots[i].opErr)
+				slots[i].buf.Free()
+				slots[i].state = slotFree
+				copyErr = fmt.Errorf("target nbd pwrite offset=%d len=%d: errno %d", slots[i].offset, slots[i].length, slots[i].opErr)
+				break copyLoop
 			}
 			slots[i].buf.Free()
 			slots[i].state = slotFree
 			writtenBytes += slots[i].length
 			logProgress()
 		}
+	}
+
+	// Wait for every slot the loop above left in flight (slotReading or
+	// slotWriting) to genuinely settle before touching its buffer -- this
+	// is what makes the early-abort paths above safe, since none of them
+	// free any OTHER slot's buffer themselves. Bounded so a truly dead
+	// connection (where neither Poll nor AioCommandCompleted ever errors,
+	// but nothing ever completes either) can't hang this function forever;
+	// hitting the deadline or a check error still frees the buffer, since
+	// by that point libnbd has either told us the command is over or its
+	// connection is unusable enough that waiting longer serves no purpose.
+	drainDeadline := time.Now().Add(30 * time.Second)
+	for {
+		pending := false
+		for i := range slots {
+			if slots[i].state == slotFree {
+				continue
+			}
+			h := src
+			if slots[i].state == slotWriting {
+				h = dst
+			}
+			done, derr := h.AioCommandCompleted(slots[i].cookie)
+			if derr != nil {
+				trace.Warning("nbd: could not confirm in-flight command completion during cleanup, freeing buffer anyway", "offset", slots[i].offset, "error", derr)
+				slots[i].buf.Free()
+				slots[i].state = slotFree
+				continue
+			}
+			if done {
+				slots[i].buf.Free()
+				slots[i].state = slotFree
+				continue
+			}
+			pending = true
+		}
+		if !pending {
+			break
+		}
+		if time.Now().After(drainDeadline) {
+			trace.Warning("nbd: timed out waiting for in-flight commands to settle during cleanup, freeing remaining buffers anyway")
+			for i := range slots {
+				if slots[i].state != slotFree {
+					slots[i].buf.Free()
+					slots[i].state = slotFree
+				}
+			}
+			break
+		}
+		src.Poll(10)
+		dst.Poll(10)
+	}
+
+	if copyErr != nil {
+		return writtenBytes, copyErr
 	}
 
 	if err := dst.Flush(nil); err != nil {
