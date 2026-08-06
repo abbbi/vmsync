@@ -205,7 +205,7 @@ func main() {
 		if err != nil {
 			trace.Warning("unable to check for existing external snapshots on source domain, proceeding with sync", "domain", cfg.SourceDomain, "error", err)
 		} else if snapCount > 0 {
-			trace.Info("external snapshot(s) exist on source domain and -ignore-external-snapshot is set, skipping sync", "domain", cfg.SourceDomain, "count", snapCount)
+			trace.Info("external snapshot(s) exist on source domain and -ignore-external-snapshot is set, skipping sync", "domain", cfg.SourceDomain, "snapshot count", snapCount)
 			os.Exit(0)
 		}
 	}
