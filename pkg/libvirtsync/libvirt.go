@@ -675,6 +675,21 @@ func StartPullBackupTCP(
 	return nil
 }
 
+// ExternalSnapshotCount returns how many external snapshots (as opposed to
+// internal, in-file ones) currently exist on dom -- the condition
+// IsCheckpointBlockedBySnapshot exists to react to after the fact. This is a
+// direct query (VIR_DOMAIN_SNAPSHOT_LIST_EXTERNAL), not an inference from a
+// failed call, so it's accurate on its own even on runs that never attempt
+// CreateCheckpoint at all -- used for the vmsync_external_snapshot_count
+// metric.
+func ExternalSnapshotCount(dom *libvirt.Domain) (int, error) {
+	n, err := dom.SnapshotNum(libvirt.DOMAIN_SNAPSHOT_LIST_EXTERNAL)
+	if err != nil {
+		return 0, fmt.Errorf("count external snapshots: %w", err)
+	}
+	return n, nil
+}
+
 // IsCheckpointBlockedBySnapshot reports whether err is libvirt's specific,
 // documented rejection of checkpoint creation while an external snapshot
 // exists on the domain: "the creation of checkpoints when external

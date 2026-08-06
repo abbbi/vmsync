@@ -67,6 +67,14 @@ type RunMetric struct {
 	// carry a reliable "last written" signal node_exporter exposes on its
 	// own, so vmsync has to report it itself.
 	Timestamp int64
+	// ExternalSnapshotCount is how many external disk snapshots were present
+	// on the source domain during this run (see
+	// libvirtsync.ExternalSnapshotCount). Libvirt refuses to create a new
+	// checkpoint while any exist, so a run can be syncing correctly (see
+	// libvirtsync.IsCheckpointBlockedBySnapshot's fallback) while its
+	// checkpoint chain sits stalled -- this metric is what explains that
+	// from the outside, purely diagnostic.
+	ExternalSnapshotCount int
 }
 
 // WriteTextfile renders disks and run in the Prometheus text exposition
@@ -120,6 +128,11 @@ func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 	fmt.Fprintln(&b, "# TYPE vmsync_last_run_timestamp_seconds gauge")
 	fmt.Fprintf(&b, "vmsync_last_run_timestamp_seconds{source_host=%q,target_host=%q,vm=%q} %d\n",
 		run.SourceHost, run.TargetHost, run.VM, run.Timestamp)
+
+	fmt.Fprintln(&b, "# HELP vmsync_external_snapshot_count Number of external disk snapshots existing on the source domain. Libvirt blocks new checkpoint creation while any exist; incremental syncs still succeed against the existing checkpoint, but the checkpoint chain won't advance until it's zero again.")
+	fmt.Fprintln(&b, "# TYPE vmsync_external_snapshot_count gauge")
+	fmt.Fprintf(&b, "vmsync_external_snapshot_count{source_host=%q,target_host=%q,vm=%q} %d\n",
+		run.SourceHost, run.TargetHost, run.VM, run.ExternalSnapshotCount)
 
 	return writeAtomic(path, b.String())
 }

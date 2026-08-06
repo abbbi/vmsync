@@ -284,6 +284,10 @@ func run(cfg struct {
 	var metricsMu sync.Mutex
 	diskMetrics := make([]metrics.DiskMetric, 0)
 	var nbdHost, targetNBDHost string
+	// externalSnapshotCount backs the vmsync_external_snapshot_count metric
+	// -- guarded by metricsMu like nbdHost/targetNBDHost above, since
+	// writeMetricsTextfile can run concurrently from the signal handler.
+	var externalSnapshotCount int
 
 	// writeMetricsTextfile is called from two places: the deferred call
 	// below (the normal return path, any outcome) and the signal handler
@@ -306,8 +310,9 @@ func run(cfg struct {
 		metricsMu.Lock()
 		disksSnapshot := append([]metrics.DiskMetric(nil), diskMetrics...)
 		sourceHost, targetHost := nbdHost, targetNBDHost
+		snapshotCount := externalSnapshotCount
 		metricsMu.Unlock()
-		run := metrics.RunMetric{SourceHost: sourceHost, TargetHost: targetHost, VM: cfg.SourceDomain, State: state, Timestamp: time.Now().Unix()}
+		run := metrics.RunMetric{SourceHost: sourceHost, TargetHost: targetHost, VM: cfg.SourceDomain, State: state, Timestamp: time.Now().Unix(), ExternalSnapshotCount: snapshotCount}
 		if err := metrics.WriteTextfile(cfg.PrometheusTextfile, disksSnapshot, run); err != nil {
 			trace.Warning("failed to write prometheus textfile", "path", cfg.PrometheusTextfile, "error", err)
 		}
@@ -802,6 +807,17 @@ func run(cfg struct {
 			}
 		}
 		trace.Info("creating incremental", "checkpoint", checkpointName, "parent", parent)
+	}
+
+	if snapCount, err := libvirtsync.ExternalSnapshotCount(srcDom); err != nil {
+		trace.Warning("unable to check for existing external snapshots on source domain", "error", err)
+	} else {
+		metricsMu.Lock()
+		externalSnapshotCount = snapCount
+		metricsMu.Unlock()
+		if snapCount > 0 {
+			trace.Info("external snapshot(s) detected on source domain", "vm", cfg.SourceDomain, "count", snapCount)
+		}
 	}
 
 	if srcState {
