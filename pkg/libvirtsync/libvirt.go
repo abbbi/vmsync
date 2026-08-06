@@ -766,13 +766,21 @@ func buildPullBackupXML(
 	return b.String()
 }
 
-func DomainRunning(dom *libvirt.Domain) (bool, error) {
-	tgtState, _, err := dom.GetState()
+// DomainActive reports whether dom is active in libvirt's own sense --
+// anything other than shut off, which includes paused/suspended domains,
+// not just ones actively executing. This is the right check both for
+// deciding whether a domain needs starting (Create()/CreateWithFlags() only
+// work on a shut-off domain -- calling them on an already-paused one fails
+// with "domain is already running", exactly the class of error this
+// replaces a check that used to miss) and for the safety checks that refuse
+// to touch a domain's disk files while it's active: a paused domain still
+// holds those files open exactly like a running one does, so treating it as
+// safe to delete/overwrite under -- as a naive "state == DOMAIN_RUNNING"
+// check would -- is a real risk, not just an inconvenience.
+func DomainActive(dom *libvirt.Domain) (bool, error) {
+	state, _, err := dom.GetState()
 	if err != nil {
-		return false, fmt.Errorf("unable to get get target domain state: %w", err)
+		return false, fmt.Errorf("unable to get domain state: %w", err)
 	}
-	if tgtState == libvirt.DOMAIN_RUNNING {
-		return true, nil
-	}
-	return false, nil
+	return state != libvirt.DOMAIN_SHUTOFF, nil
 }

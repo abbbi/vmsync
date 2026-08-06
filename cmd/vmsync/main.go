@@ -411,7 +411,7 @@ func run(cfg struct {
 	}
 	defer srcDom.Free()
 
-	if srcState, err = libvirtsync.DomainRunning(srcDom); err != nil {
+	if srcState, err = libvirtsync.DomainActive(srcDom); err != nil {
 		return err
 	}
 
@@ -742,7 +742,7 @@ func run(cfg struct {
 			if err != nil {
 				return fmt.Errorf("reinit: look up target domain %s: %w", cfg.TargetDomain, err)
 			}
-			running, runErr := libvirtsync.DomainRunning(tgtDom)
+			running, runErr := libvirtsync.DomainActive(tgtDom)
 			if runErr != nil {
 				tgtDom.Free()
 				return fmt.Errorf("reinit: check target domain state: %w", runErr)
@@ -804,7 +804,7 @@ func run(cfg struct {
 			return fmt.Errorf("Incremental sync attempted but target domain does not exist: domain=%s", cfg.TargetDomain)
 		}
 	} else {
-		if tgtState, err = libvirtsync.DomainRunning(tgtDom); err != nil {
+		if tgtState, err = libvirtsync.DomainActive(tgtDom); err != nil {
 			return err
 		}
 		if tgtState == true {
