@@ -710,7 +710,21 @@ func run(cfg struct {
 			return fmt.Errorf("reinit: delete existing checkpoints: %w", err)
 		}
 
-		if tgtDom, lookupErr := tgtMgr.LookupDomain(cfg.TargetDomain); lookupErr == nil {
+		// DomainExists (unlike a bare LookupDomain) distinguishes a genuine
+		// "no such domain" from any other lookup failure (auth, a transient
+		// connection hiccup, ...) -- treating those the same way used to
+		// silently skip the "refuse if running" guard just below and fall
+		// straight through to deleting the target's disk files, even when
+		// the domain in fact exists and is running.
+		exists, err := libvirtsync.DomainExists(tgtMgr.Conn, cfg.TargetDomain)
+		if err != nil {
+			return fmt.Errorf("reinit: check target domain existence: %w", err)
+		}
+		if exists {
+			tgtDom, err := tgtMgr.LookupDomain(cfg.TargetDomain)
+			if err != nil {
+				return fmt.Errorf("reinit: look up target domain %s: %w", cfg.TargetDomain, err)
+			}
 			running, runErr := libvirtsync.DomainRunning(tgtDom)
 			if runErr != nil {
 				tgtDom.Free()
