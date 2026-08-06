@@ -271,6 +271,14 @@ func run(cfg struct {
 	sourceStopCommands := make([]string, 0)
 	var checkpointName string
 	var parent string
+	// checkpointAdvanced is true once CreateCheckpoint below has actually
+	// created checkpointName in libvirt. It stays false for the rest of run()
+	// when checkpoint creation was skipped because an external snapshot
+	// blocked it (see IsCheckpointBlockedBySnapshot) -- in that case the sync
+	// still proceeds incrementally against the existing parent checkpoint,
+	// but nothing downstream (parent cleanup, checkpoint-on-failure cleanup,
+	// target metadata) should treat checkpointName as if it exists.
+	var checkpointAdvanced bool
 	var freezed bool = false
 	var started bool = false
 	var metricsMu sync.Mutex
@@ -509,7 +517,7 @@ func run(cfg struct {
 				// Mirrors the deferred checkpoint cleanup further down in
 				// run() -- duplicated here because that defer never gets a
 				// chance to run if we os.Exit below without waiting for it.
-				if checkpointName == "" {
+				if checkpointName == "" || !checkpointAdvanced {
 					return
 				}
 				if err := callWithTimeout("delete checkpoint", 5*time.Second, func() error {
@@ -808,13 +816,22 @@ func run(cfg struct {
 	}
 
 	if err := libvirtsync.CreateCheckpoint(srcDom, checkpointName, parent, qcowDisks); err != nil {
-		libvirtsync.ThawFs(srcDom, freezed)
-		return err
+		// A full sync (parent == "") has no earlier checkpoint to fall back
+		// on -- without a checkpoint at all there's no bitmap to establish a
+		// baseline for future incremental syncs, so that case still fails
+		// outright, same as any other CreateCheckpoint error.
+		if parent == "" || !libvirtsync.IsCheckpointBlockedBySnapshot(err) {
+			libvirtsync.ThawFs(srcDom, freezed)
+			return err
+		}
+		trace.Warning("checkpoint creation blocked by an existing external snapshot on the source domain; syncing incrementally against the existing checkpoint without advancing the checkpoint chain", "attempted_checkpoint", checkpointName, "parent", parent, "error", err)
+	} else {
+		checkpointAdvanced = true
 	}
 	libvirtsync.ThawFs(srcDom, freezed)
 
 	defer func() {
-		if runErr == nil {
+		if runErr == nil || !checkpointAdvanced {
 			return
 		}
 		if err := libvirtsync.DeleteCheckpointIfExists(srcDom, checkpointName); err != nil {
@@ -838,7 +855,11 @@ func run(cfg struct {
 		incrementalCheckpoint = parent
 		exportBitmap = parent
 		bitmapForRead = parent
-		trace.Info("starting incremental pull backup", "parent_checkpoint", parent, "new_checkpoint", checkpointName)
+		if checkpointAdvanced {
+			trace.Info("starting incremental pull backup", "parent_checkpoint", parent, "new_checkpoint", checkpointName)
+		} else {
+			trace.Info("starting incremental pull backup", "parent_checkpoint", parent, "new_checkpoint", "none (checkpoint chain not advancing this run)")
+		}
 	} else {
 		trace.Info("starting full pull backup (no incremental bitmap)")
 	}
@@ -1103,16 +1124,28 @@ func run(cfg struct {
 		}
 	}
 
-	if incrementalMode {
+	if incrementalMode && checkpointAdvanced {
 		trace.Info("sync successful cleaning up parent checkpoint", "parent", parent)
 		err := libvirtsync.DeleteCheckpointIfExists(srcDom, parent)
 		if err != nil {
 			return err
 		}
+	} else if incrementalMode {
+		trace.Info("checkpoint chain did not advance this run (external snapshot was blocking checkpoint creation); keeping existing checkpoint for next run", "checkpoint", parent)
+	}
+
+	// The checkpoint actually current on the source after this run: the
+	// newly-created one, or -- when checkpoint creation was skipped because
+	// an external snapshot blocked it -- the existing parent checkpoint that
+	// this run synced against instead, which is still the live one since it
+	// was deliberately not cleaned up above.
+	effectiveCheckpoint := checkpointName
+	if !checkpointAdvanced {
+		effectiveCheckpoint = parent
 	}
 	trace.Info("Adding metadata information")
 	var newXML string
-	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, checkpointName)
+	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint)
 	if err != nil {
 		trace.Warning("Unable to add metadata info", err)
 		newXML = srcXML

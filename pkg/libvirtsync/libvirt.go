@@ -675,6 +675,21 @@ func StartPullBackupTCP(
 	return nil
 }
 
+// IsCheckpointBlockedBySnapshot reports whether err is libvirt's specific,
+// documented rejection of checkpoint creation while an external snapshot
+// exists on the domain: "the creation of checkpoints when external
+// snapshots exist is currently forbidden" (see
+// https://libvirt.org/formatcheckpoint.html). Matched on the error text --
+// like StopBackup's own "no current job" check just below -- rather than a
+// dedicated error code, since libvirt reports this as a generic
+// invalid-operation error with no code of its own specific to this case.
+func IsCheckpointBlockedBySnapshot(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "snapshot")
+}
+
 func StopBackup(dom *libvirt.Domain) error {
 	if err := dom.AbortJob(); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "no current job") {
