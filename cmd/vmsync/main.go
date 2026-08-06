@@ -39,11 +39,10 @@ import (
 	"vmsync/pkg/remotessh"
 	"vmsync/pkg/trace"
 	"vmsync/pkg/util"
+	"vmsync/pkg/version"
 
 	"libvirt.org/go/libvirt"
 )
-
-const VERSION = "0.30"
 
 func main() {
 	if os.Getenv("PROFILE") == "development" {
@@ -136,7 +135,7 @@ func main() {
 	})
 
 	if cfg.ShowVersion {
-		trace.Info(fmt.Sprintf("vmsync Version: %s", VERSION))
+		trace.Info(fmt.Sprintf("vmsync Version: %s", version.Version))
 		os.Exit(0)
 	}
 	if cfg.SourceURI == "" || cfg.TargetURI == "" || cfg.SourceDomain == "" {
@@ -400,7 +399,7 @@ func run(cfg struct {
 		}
 	}
 
-	trace.Info(fmt.Sprintf("%s, Version: %s", os.Args, VERSION))
+	trace.Info(fmt.Sprintf("%s, Version: %s", os.Args, version.Version))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

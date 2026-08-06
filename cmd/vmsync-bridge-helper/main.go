@@ -37,6 +37,7 @@ import (
 	"strings"
 	"sync"
 
+	"vmsync/pkg/version"
 	"vmsync/pkg/zstdrelay"
 )
 
@@ -48,7 +49,14 @@ func main() {
 	level := flag.String("level", "3", "compression level/mode, only used with -compress: a number 1-19 for -algo=zstd, or \"default\"/\"better\"/\"best\" for -algo=s2")
 	netbuffer := flag.String("netbuffer", "", "buffer wire-facing traffic through a bounded in-memory buffer, "+
 		"formatted as <blocksize>,<buffersize> (e.g. 64k,256M); empty disables it")
+	showVersion := flag.Bool("v", false, "Show version and exit")
+	showVersionLong := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
+
+	if *showVersion || *showVersionLong {
+		fmt.Println(version.Version)
+		os.Exit(0)
+	}
 
 	if *listenAddr == "" {
 		fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -listen is required")

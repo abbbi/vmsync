@@ -20,9 +20,11 @@ package nbdbridge
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"vmsync/pkg/remotessh"
 	"vmsync/pkg/util"
+	"vmsync/pkg/version"
 )
 
 // CheckLocal verifies the tools this bridge needs on the machine running
@@ -45,6 +47,25 @@ func CheckRemote(ctx context.Context, client *remotessh.Client, cfg Config, host
 		return fmt.Errorf("vmsync-bridge-helper not found (or not executable) at %s on %s: %w: %s\n"+
 			"build cmd/vmsync-bridge-helper and deploy it there yourself, or pass -bridge-helper-path "+
 			"to point at wherever you've placed it", cfg.HelperPath, host, err, out)
+	}
+
+	// vmsync-bridge-helper is deployed to host manually, ahead of time, by
+	// the user -- vmsync never uploads it (see its own doc comment) -- so
+	// its version can silently drift from this vmsync binary's, with no
+	// natural point at which that would otherwise surface: an out-of-date
+	// helper still starts, still accepts connections, and any protocol or
+	// flag-handling difference between versions would only show up as a
+	// confusing failure (or worse, a silent one) deep inside a running
+	// sync. Check it up front, before any sync work starts, the same way
+	// the executability check above already does for a missing binary.
+	helperVersion, err := client.Run(ctx, util.ShQuote(cfg.HelperPath)+" -version")
+	if err != nil {
+		return fmt.Errorf("unable to determine vmsync-bridge-helper version at %s on %s: %w: %s", cfg.HelperPath, host, err, helperVersion)
+	}
+	helperVersion = strings.TrimSpace(helperVersion)
+	if helperVersion != version.Version {
+		return fmt.Errorf("vmsync-bridge-helper at %s on %s is version %q, but this vmsync is version %q -- "+
+			"rebuild and redeploy vmsync-bridge-helper so both match before syncing", cfg.HelperPath, host, helperVersion, version.Version)
 	}
 
 	// Bridging bypasses SSH tunneling for the bridged connection entirely by
