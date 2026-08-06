@@ -74,6 +74,24 @@ func Connect(uri string) (*Manager, error) {
 	return &Manager{Conn: conn, URI: uri}, nil
 }
 
+// ExternalSnapshotCountViaReconnect is ExternalSnapshotCount for a caller
+// that has no open connection to sourceURI yet -- used for the
+// -ignore-external-snapshot preflight check in cmd/vmsync, which runs before
+// run() ever opens its own source connection.
+func ExternalSnapshotCountViaReconnect(sourceURI, domainName string) (int, error) {
+	mgr, err := Connect(sourceURI)
+	if err != nil {
+		return 0, fmt.Errorf("reconnect source libvirt: %w", err)
+	}
+	defer mgr.Close()
+	dom, err := mgr.LookupDomain(domainName)
+	if err != nil {
+		return 0, fmt.Errorf("lookup domain %s on reconnect: %w", domainName, err)
+	}
+	defer dom.Free()
+	return ExternalSnapshotCount(dom)
+}
+
 func StopBackupViaReconnect(sourceURI, domainName string) error {
 	mgr, err := Connect(sourceURI)
 	if err != nil {

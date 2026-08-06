@@ -83,9 +83,10 @@ func main() {
 		NetBuffer           string
 		BridgeHelperPath    string
 		UseSSH              bool
-		IODepth             int
-		PrometheusTextfile  string
-		ShowVersion         bool
+		IODepth                int
+		PrometheusTextfile     string
+		IgnoreExternalSnapshot bool
+		ShowVersion            bool
 	}
 
 	flag.StringVar(&cfg.SourceURI, "source-uri", "", "libvirt source URI (example: qemu+ssh://src/system)")
@@ -117,6 +118,7 @@ func main() {
 	flag.BoolVar(&cfg.UseSSH, "use-ssh", false, "When --compress/--netbuffer is set, route the bridged NBD traffic through the existing SSH connection as an encrypted tunnel, instead of the default: vmsync-bridge-helper listening on all interfaces and the local relay connecting to it directly over plain TCP. The default (false) has NO encryption or authentication of its own for that traffic -- only appropriate when the network path between the hosts is already secured some other way (e.g. a VPN/WireGuard tunnel). When false, requires the bridge port range to be reachable directly between the two hosts (firewall/routing) -- vmsync does not verify this itself. No effect without --compress/--netbuffer.")
 	flag.IntVar(&cfg.IODepth, "io-depth", 8, "Number of NBD read/write pairs to keep in flight simultaneously during the disk copy, instead of waiting for each to fully complete before starting the next. Higher values can hide more per-chunk round-trip latency (real disk I/O plus NBD protocol overhead on both ends), at the cost of io-depth times the negotiated NBD block size in memory. Must be at least 1.")
 	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write sync metrics to this path in Prometheus textfile-collector format: per disk, source/target host, vm, disk size, transferred and compressed-transferred bytes, and duration; plus one overall success/failure state for the whole run. Written atomically (temp file + rename). Empty disables it (default).")
+	flag.BoolVar(&cfg.IgnoreExternalSnapshot, "ignore-external-snapshot", false, "If the source domain currently has any external disk snapshot, skip this run entirely -- no sync attempt, no -prometheus-textfile write, same clean no-op as losing the per-domain run lock. Default (false): sync anyway, incrementally against the existing checkpoint, since libvirt blocks creating a new one while a snapshot exists (see vmsync_external_snapshot_count for observability of that case instead).")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
@@ -190,6 +192,24 @@ func main() {
 	}
 	defer lockFile.Close()
 
+	// -ignore-external-snapshot's whole point is to skip cleanly, not just
+	// sync anyway -- so this has to happen before run() is ever called: its
+	// -prometheus-textfile defer is registered inside run(), and once that's
+	// registered, any return path (including a deliberate early one) writes
+	// a metrics record. Checked after the run lock (so only one process per
+	// domain pays for the extra libvirt round trip) but before everything
+	// else, so a skip here does the least possible work, same reasoning as
+	// the run-lock skip above.
+	if cfg.IgnoreExternalSnapshot {
+		snapCount, err := libvirtsync.ExternalSnapshotCountViaReconnect(cfg.SourceURI, cfg.SourceDomain)
+		if err != nil {
+			trace.Warning("unable to check for existing external snapshots on source domain, proceeding with sync", "domain", cfg.SourceDomain, "error", err)
+		} else if snapCount > 0 {
+			trace.Info("external snapshot(s) exist on source domain and -ignore-external-snapshot is set, skipping sync", "domain", cfg.SourceDomain, "count", snapCount)
+			os.Exit(0)
+		}
+	}
+
 	// Consecutive failure count lives in the target domain's own vmsync
 	// metadata (alongside last_checkpoint/last_sync_timestamp), not in local
 	// state -- so it survives being tracked from a different host and stays
@@ -250,6 +270,7 @@ func run(cfg struct {
 	UseSSH              bool
 	IODepth             int
 	PrometheusTextfile  string
+	IgnoreExternalSnapshot bool
 	ShowVersion         bool
 }) (runErr error) {
 	runStart := time.Now()
