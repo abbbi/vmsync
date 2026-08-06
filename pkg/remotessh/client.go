@@ -111,10 +111,40 @@ func Dial(cfg Config) (*Client, error) {
 	}
 
 	address := net.JoinHostPort(cfg.Address, fmt.Sprintf("%d", cfg.Port))
-	c, err := ssh.Dial("tcp", address, sshCfg)
+
+	// ssh.Dial's own Timeout field only bounds the initial TCP connect --
+	// the SSH handshake and authentication that follow it have no timeout
+	// of their own, a well-documented golang.org/x/crypto/ssh limitation
+	// (see golang/go issues #50046 and #51926: "Dial hangs in kexLoop
+	// indefinitely - ignoring ClientConfig.Timeout"). Against a host that
+	// accepts the TCP connection but never completes (or never finishes)
+	// the SSH protocol exchange -- observed directly as vmsync instances
+	// stuck forever against an unreachable remote -- ssh.Dial itself can
+	// hang past cfg.Timeout with no way to bound it from outside, since it
+	// takes no context either. Dial the TCP connection ourselves instead
+	// and put a deadline on it that covers the handshake, via the same two
+	// calls (NewClientConn + NewClient) ssh.Dial is implemented as -- then
+	// clear the deadline once the connection is up so it doesn't limit the
+	// connection's actual, ongoing lifetime afterward.
+	conn, err := net.DialTimeout("tcp", address, cfg.Timeout)
 	if err != nil {
 		return nil, fmt.Errorf("ssh dial %s: %w", address, err)
 	}
+	if err := conn.SetDeadline(time.Now().Add(cfg.Timeout)); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("ssh dial %s: set handshake deadline: %w", address, err)
+	}
+	sshConn, chans, reqs, err := ssh.NewClientConn(conn, address, sshCfg)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("ssh dial %s: %w", address, err)
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		sshConn.Close()
+		return nil, fmt.Errorf("ssh dial %s: clear handshake deadline: %w", address, err)
+	}
+
+	c := ssh.NewClient(sshConn, chans, reqs)
 	return &Client{cfg: cfg, client: c}, nil
 }
 
