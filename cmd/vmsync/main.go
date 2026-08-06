@@ -305,6 +305,22 @@ func run(cfg struct {
 	var metricsMu sync.Mutex
 	diskMetrics := make([]metrics.DiskMetric, 0)
 	var nbdHost, targetNBDHost string
+	// Resolved immediately (rather than deferred until the backup job
+	// actually starts, as this used to be) purely from cfg -- no network
+	// calls, nothing that depends on anything fallible happening first --
+	// so vmsync_sync_state's source_host/target_host labels are populated
+	// even when run() fails before ever reaching the backup job, instead of
+	// silently writing empty label values for the earliest-failing runs.
+	metricsMu.Lock()
+	nbdHost = cfg.SourceNBDHost
+	if nbdHost == "" {
+		nbdHost = util.ConnectHostFromBindOrURI(cfg.SourceNBDBind, cfg.SourceURI)
+	}
+	targetNBDHost = cfg.TargetNBDHost
+	if targetNBDHost == "" {
+		targetNBDHost = util.ConnectHostFromBindOrURI(cfg.TargetNBDBind, cfg.TargetURI)
+	}
+	metricsMu.Unlock()
 	// externalSnapshotCount backs the vmsync_external_snapshot_count metric
 	// -- guarded by metricsMu like nbdHost/targetNBDHost above, since
 	// writeMetricsTextfile can run concurrently from the signal handler.
@@ -940,22 +956,6 @@ func run(cfg struct {
 	backupMu.Unlock()
 	defer abortBackup("cleanup")
 
-	resolvedSourceHost := cfg.SourceNBDHost
-	if resolvedSourceHost == "" {
-		resolvedSourceHost = util.ConnectHostFromBindOrURI(cfg.SourceNBDBind, cfg.SourceURI)
-	}
-	resolvedTargetHost := cfg.TargetNBDHost
-	if resolvedTargetHost == "" {
-		resolvedTargetHost = util.ConnectHostFromBindOrURI(cfg.TargetNBDBind, cfg.TargetURI)
-	}
-	// Locked because the signal handler's writeMetricsTextfile call (on a
-	// separate goroutine) reads nbdHost/targetNBDHost too, and can fire
-	// concurrently with this assignment -- see writeMetricsTextfile's
-	// comment above.
-	metricsMu.Lock()
-	nbdHost = resolvedSourceHost
-	targetNBDHost = resolvedTargetHost
-	metricsMu.Unlock()
 	trace.Info("source nbd port in use", "side", "source", "kind", "nbd_export", "host", nbdHost, "port", cfg.SourceNBDPort)
 
 	// Default to the direct, uncompressed path; overridden below when
