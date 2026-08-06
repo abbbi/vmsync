@@ -29,6 +29,14 @@ import (
 	nbd "libguestfs.org/libnbd"
 )
 
+// defaultMaxBufferSize is the read/write chunk size CopyExtentsTCP falls
+// back to when neither NBD server advertises a maximum block size (see its
+// use below). 1MiB is a conservative, well-tested chunk size for block
+// copies -- large enough to avoid per-chunk overhead dominating, small
+// enough that even the default -io-depth (8 chunks in flight) stays at a
+// modest 8MiB of buffer memory.
+const defaultMaxBufferSize = 1024 * 1024
+
 type Extent struct {
 	Offset uint64
 	Length uint64
@@ -170,6 +178,16 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 	max_src, _ := src.GetBlockSize(nbd.SIZE_MAXIMUM)
 	trace.Debug("src block", "size", max_src)
 	buffer_size := min(max_dst, max_src)
+	if buffer_size == 0 {
+		// GetBlockSize(SIZE_MAXIMUM) legitimately returns 0 (no error) when
+		// a server doesn't advertise a maximum block size -- not a rare
+		// case, and one this file already anticipates for the *minimum*
+		// size in ChangedExtentsTCP above. Left unguarded here, a 0
+		// buffer_size makes the chunk-flattening loop below spin forever
+		// (step stays 0, so `remaining` and `cur` never advance) before a
+		// single byte is copied.
+		buffer_size = defaultMaxBufferSize
+	}
 	trace.Debug("use nbd buffer", "size", buffer_size)
 
 	totalBytes := uint64(0)
