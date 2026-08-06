@@ -657,19 +657,36 @@ func run(cfg struct {
 	}
 
 	for i, d := range qcowDisks {
-		var info disk.QemuImgInfo
+		var chain []disk.QemuImgInfo
 		if sourceNeedsSSH {
 			trace.Info("running remote qemu-img info", "disk", d.TargetDev, "path", d.Source)
-			info, err = disk.QemuImgInfoJSONRemote(ctx, sourceSSHClient, d.Source)
+			chain, err = disk.QemuImgInfoChainJSONRemote(ctx, sourceSSHClient, d.Source)
 		} else {
 			trace.Info("running local qemu-img info", "disk", d.TargetDev, "path", d.Source)
-			info, err = disk.QemuImgInfoJSON(d.Source)
+			chain, err = disk.QemuImgInfoChainJSON(d.Source)
 		}
 		if err != nil {
 			return err
 		}
+		info := chain[0]
 		qcowDisks[i].VirtualSize = info.VirtualSize
 		qcowDisks[i].ClusterSize = info.ClusterSize
+
+		// --backing-chain returns the chain ordered top (d.Source itself)
+		// to base; the last element is the disk's real, stable base file.
+		// d.Source is whatever the domain's disk currently points at, which
+		// is no longer that stable file once an external snapshot exists
+		// (virsh snapshot-create --disk-only redirects the domain to a new
+		// overlay named after the snapshot). Target-side paths are named
+		// after this base, not d.Source, so they keep matching the real
+		// target file that earlier (pre-snapshot) syncs already created
+		// under the original name.
+		rootPath := chain[len(chain)-1].Filename
+		if rootPath != d.Source {
+			trace.Info("resolved disk's backing chain to its base file (external snapshot detected)", "disk", d.TargetDev, "active", d.Source, "base", rootPath)
+		}
+		qcowDisks[i].RootSource = rootPath
+
 		trace.Info("disk info", "disk", d.TargetDev, "format", info.Format, "virtual_size", d.VirtualSize, "path", d.Source, "discard", d.DiscardMode)
 	}
 
@@ -743,7 +760,7 @@ func run(cfg struct {
 		}
 
 		for _, d := range qcowDisks {
-			reinitTargetPath := util.SetTargetPath(cfg.TargetDiskPath, d.Source)
+			reinitTargetPath := util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
 			trace.Info("reinit: removing target disk", "path", reinitTargetPath)
 			if out, err := targetSSHClient.Run(ctx, "rm -f "+util.ShQuote(reinitTargetPath)); err != nil {
 				return fmt.Errorf("reinit: remove target disk %s: %w: %s", reinitTargetPath, err, out)
@@ -764,7 +781,7 @@ func run(cfg struct {
 	if parent == "" {
 		// Preflight for full sync: fail before sync operations if target disk path exists.
 		for _, d := range qcowDisks {
-			targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.Source)
+			targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
 			trace.Info("Using target", "path", targetPath, "disk", d.TargetDev)
 			targetDir := path.Dir(targetPath)
 			if _, err := targetSSHClient.Run(ctx, "mkdir -p "+util.ShQuote(targetDir)); err != nil {
@@ -815,7 +832,7 @@ func run(cfg struct {
 			} else {
 				trace.Info("Target domain metadata", "timestamp", metadataEntryTimestamp)
 				for _, d := range qcowDisks {
-					targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.Source)
+					targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
 					out, err := targetSSHClient.Run(ctx, "stat -c '%Y' "+targetPath)
 					if err != nil {
 						return fmt.Errorf("%w: %s", err, out)
@@ -1039,7 +1056,7 @@ func run(cfg struct {
 		}
 
 		// Avoid datarace in this goroutine by declaring targetPath as local var instead of a shared one
-		targetPath := util.SetTargetPath(cfg.TargetDiskPath, d.Source)
+		targetPath := util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
 		createCmd := "qemu-img create -f qcow2 " + util.ShQuote(targetPath) + " -o cluster_size=" + fmt.Sprintf("%d", d.ClusterSize) + " " + fmt.Sprintf("%d", d.VirtualSize)
 		var targetPathInc string
 		if incrementalMode {
