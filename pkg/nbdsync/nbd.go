@@ -177,16 +177,25 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 	trace.Debug("dst block", "size", max_dst)
 	max_src, _ := src.GetBlockSize(nbd.SIZE_MAXIMUM)
 	trace.Debug("src block", "size", max_src)
+	// GetBlockSize(SIZE_MAXIMUM) legitimately returns 0 (no error) when a
+	// server doesn't advertise a maximum block size at all -- "unconstrained",
+	// not "the limit is 0 bytes". Naively taking min() of the two raw values
+	// lets an unconstrained side's 0 silently override a REAL, smaller
+	// constraint the other side actually advertised (min(65536, 0) == 0),
+	// discarding it entirely instead of respecting it -- and left unguarded
+	// altogether, a 0 buffer_size makes the chunk-flattening loop below spin
+	// forever (step stays 0, so `remaining` and `cur` never advance) before
+	// a single byte is copied. Only fall back to the default when *both*
+	// sides are unconstrained; a real constraint from whichever side has
+	// one must always win over the other side's "no constraint" sentinel.
 	buffer_size := min(max_dst, max_src)
-	if buffer_size == 0 {
-		// GetBlockSize(SIZE_MAXIMUM) legitimately returns 0 (no error) when
-		// a server doesn't advertise a maximum block size -- not a rare
-		// case, and one this file already anticipates for the *minimum*
-		// size in ChangedExtentsTCP above. Left unguarded here, a 0
-		// buffer_size makes the chunk-flattening loop below spin forever
-		// (step stays 0, so `remaining` and `cur` never advance) before a
-		// single byte is copied.
+	switch {
+	case max_dst == 0 && max_src == 0:
 		buffer_size = defaultMaxBufferSize
+	case max_dst == 0:
+		buffer_size = max_src
+	case max_src == 0:
+		buffer_size = max_dst
 	}
 	trace.Debug("use nbd buffer", "size", buffer_size)
 
