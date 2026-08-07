@@ -119,7 +119,7 @@ func main() {
 	flag.IntVar(&cfg.IODepth, "io-depth", 8, "Number of NBD read/write pairs to keep in flight simultaneously during the disk copy, instead of waiting for each to fully complete before starting the next. Higher values can hide more per-chunk round-trip latency (real disk I/O plus NBD protocol overhead on both ends), at the cost of io-depth times the negotiated NBD block size in memory. Must be at least 1.")
 	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write sync metrics to this path in Prometheus textfile-collector format: per disk, source/target host, vm, disk size, transferred and compressed-transferred bytes, and duration; plus one overall success/failure state for the whole run. Written atomically (temp file + rename). Empty disables it (default).")
 	flag.BoolVar(&cfg.IgnoreExternalSnapshot, "ignore-external-snapshot", false, "If the source domain currently has any external disk snapshot, skip this run entirely -- no sync attempt, no -prometheus-textfile write, same clean no-op as losing the per-domain run lock. Default (false): sync anyway, incrementally against the existing checkpoint, since libvirt blocks creating a new one while a snapshot exists (see vmsync_external_snapshot_count for observability of that case instead).")
-	flag.BoolVar(&cfg.Verify, "verify", false, "After syncing, suspend the source VM (if running), run a full qemu-img compare against the target for every disk, then resume it. This holds the VM suspended for meaningfully longer than a normal sync -- the whole compare, not just the copy -- so this is meant for periodic verification on its own schedule, not routine syncing. Fails the run if any disk doesn't match. The compare reads both sides over their own NBD exports (same as the disk copy itself), from wherever vmsync itself runs -- no additional reachability beyond what a plain sync without --compress/--netbuffer already requires, and does not tunnel through -use-ssh.")
+	flag.BoolVar(&cfg.Verify, "verify", false, "After syncing, suspend the source VM (if running), run a full qemu-img compare against the target for every disk, then resume it. This holds the VM suspended for meaningfully longer than a normal sync -- the whole compare, not just the copy -- so this is meant for periodic verification on its own schedule, not routine syncing. Fails the run if any disk doesn't match. The compare reads both sides over their own NBD exports (same as the disk copy itself), from wherever vmsync itself runs -- no additional reachability beyond what a plain sync without --compress/--netbuffer already requires. If --compress/--netbuffer are set, the target-side read of the compare automatically goes through its own vmsync-bridge-helper instance too (a full-image read benefits from this at least as much as the copy does), tunneled via -use-ssh under the same conditions the regular copy's bridge is.")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
@@ -1370,9 +1370,50 @@ func run(cfg struct {
 				return fmt.Errorf("verify: wait for read-only export %s:%d: %w", targetNBDHost, verifyPort, err)
 			}
 
+			// Default to the direct, unbridged path against the read-only
+			// export itself; overridden below when --compress/--netbuffer
+			// are set, so a full-image verify compare -- which reads the
+			// *entire* disk, not just the changed extents the regular copy
+			// does -- gets the same throughput help over a slow/high-latency
+			// link, instead of always being forced onto a raw, unbuffered
+			// connection regardless of what the rest of the sync uses.
+			verifyTargetHost := targetNBDHost
+			verifyTargetPort := verifyPort
+			var stopVerifyBridgeCmd string
+			if bridgeCfg.Enabled() {
+				// A fourth contiguous block, right after the real verify
+				// export range above ([TargetNBDPort+2N, +3N)): this is
+				// [TargetNBDPort+3N, +4N) -- never collides with the
+				// regular/bridge/verify ranges regardless of which
+				// combination of -compress/-netbuffer/-verify is active.
+				verifyBridgePort := verifyPort + len(qcowDisks)
+				var err error
+				stopVerifyBridgeCmd, err = nbdbridge.StartRemote(ctx, targetSSHClient, verifyBridgePort, verifyPort, bridgeCfg)
+				if err != nil {
+					return fmt.Errorf("start verify nbd bridge for %s: %w", d.TargetDev, err)
+				}
+				stopMu.Lock()
+				targetStopCommands = append(targetStopCommands, stopVerifyBridgeCmd)
+				stopMu.Unlock()
+				trace.Info("target nbd port in use", "side", "target", "kind", "verify_bridge_remote", "disk", d.TargetDev, "host", targetNBDHost, "port", verifyBridgePort)
+				verifyBridgeDialAddr := fmt.Sprintf("%s:%d", targetNBDHost, verifyBridgePort)
+				if cfg.UseSSH {
+					verifyBridgeDialAddr = fmt.Sprintf("127.0.0.1:%d", verifyBridgePort)
+				}
+				localPort, _, stopLocal, err := nbdbridge.StartLocal(ctx, targetSSHClient, verifyBridgeDialAddr, bridgeCfg)
+				if err != nil {
+					return fmt.Errorf("start local verify nbd bridge relay for %s: %w", d.TargetDev, err)
+				}
+				defer stopLocal()
+				verifyTargetHost = "127.0.0.1"
+				verifyTargetPort = localPort
+				trace.Info("target nbd port in use", "side", "target", "kind", "verify_bridge_local", "disk", d.TargetDev, "host", "127.0.0.1", "port", localPort)
+			}
+
 			// The source side is read through its own already-open libvirt
 			// backup NBD export (the same effectiveSourceHost/Port used for
-			// the real copy above), not d.RootSource as a local file --
+			// the real copy above -- already itself routed through a bridge
+			// when applicable), not d.RootSource as a local file --
 			// d.RootSource is only a real local path when vmsync itself
 			// runs on the source host, which isn't guaranteed (-source-uri
 			// can be qemu+ssh://, with vmsync running on a separate
@@ -1381,16 +1422,22 @@ func run(cfg struct {
 			// only the same source/target network reachability the disk
 			// copy itself already requires.
 			sourceNBDURL := fmt.Sprintf("nbd://%s:%d/%s", effectiveSourceHost, effectiveSourcePort, d.TargetDev)
-			nbdURL := fmt.Sprintf("nbd://%s:%d/", targetNBDHost, verifyPort)
+			nbdURL := fmt.Sprintf("nbd://%s:%d/", verifyTargetHost, verifyTargetPort)
 			trace.Info("verify: comparing source and target images", "disk", d.TargetDev, "source", sourceNBDURL, "target", targetPath)
 			compareErr := disk.CompareImages(sourceNBDURL, nbdURL)
 
-			// Best-effort: a read-only export left behind poses no write-lock
-			// or data-safety risk, and a stale one still bound to this exact
-			// (deterministic) port would simply make the next run's own start
-			// attempt fail loudly and obviously -- not worth failing this
-			// disk's result over a cleanup hiccup on top of an already-known
-			// compare outcome.
+			// Best-effort: a read-only export (or its bridge) left behind
+			// poses no write-lock or data-safety risk, and a stale one still
+			// bound to this exact (deterministic) port would simply make the
+			// next run's own start attempt fail loudly and obviously -- not
+			// worth failing this disk's result over a cleanup hiccup on top
+			// of an already-known compare outcome. Bridge stopped before the
+			// export it wraps, matching dependency order.
+			if stopVerifyBridgeCmd != "" {
+				if out, err := targetSSHClient.Run(ctx, stopVerifyBridgeCmd); err != nil {
+					trace.Warning("verify: failed to stop bridge helper", "disk", d.TargetDev, "error", err, "output", out)
+				}
+			}
 			if out, err := targetSSHClient.Run(ctx, stopVerifyCmd); err != nil {
 				trace.Warning("verify: failed to stop read-only export", "disk", d.TargetDev, "error", err, "output", out)
 			}
