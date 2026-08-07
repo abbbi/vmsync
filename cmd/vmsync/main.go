@@ -918,7 +918,7 @@ func run(cfg struct {
 				trace.Info("Target domain metadata", "timestamp", metadataEntryTimestamp)
 				for _, d := range qcowDisks {
 					targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
-					out, err := targetSSHClient.Run(ctx, "stat -c '%Y' "+targetPath)
+					out, err := targetSSHClient.Run(ctx, "stat -c '%Y' "+util.ShQuote(targetPath))
 					if err != nil {
 						return fmt.Errorf("%w: %s", err, out)
 					}
@@ -1136,7 +1136,7 @@ func run(cfg struct {
 			if incrementalMode {
 				targetPathInc = targetPath + "_" + bitmapForRead
 				trace.Info("Create temporary image", "disk", targetPathInc)
-				createCmd = "qemu-img create -f qcow2 -F qcow2  -o cluster_size=" + fmt.Sprintf("%d", d.ClusterSize) + " " + util.ShQuote(targetPathInc) + " -b " + targetPath + " " + fmt.Sprintf("%d", d.VirtualSize)
+				createCmd = "qemu-img create -f qcow2 -F qcow2  -o cluster_size=" + fmt.Sprintf("%d", d.ClusterSize) + " " + util.ShQuote(targetPathInc) + " -b " + util.ShQuote(targetPath) + " " + fmt.Sprintf("%d", d.VirtualSize)
 			}
 			if err := runTargetCommand(createCmd, fmt.Sprintf("create remote qcow2 %s", targetPathInc)); err != nil {
 				return err
@@ -1232,12 +1232,12 @@ func run(cfg struct {
 
 			if incrementalMode {
 				trace.Info("Committing changes to base", "image", targetPath)
-				commitCmd := "qemu-img commit -b " + targetPath + " " + targetPathInc
+				commitCmd := "qemu-img commit -b " + util.ShQuote(targetPath) + " " + util.ShQuote(targetPathInc)
 				if err := runTargetCommand(commitCmd, fmt.Sprintf("committing changes for %s", targetPathInc)); err != nil {
 					return err
 				}
 				trace.Info("Removing temporary", "image", targetPathInc)
-				if err := runTargetCommand("rm -f "+targetPathInc, fmt.Sprintf("removing target image %s", targetPathInc)); err != nil {
+				if err := runTargetCommand("rm -f "+util.ShQuote(targetPathInc), fmt.Sprintf("removing target image %s", targetPathInc)); err != nil {
 					return err
 				}
 			}
