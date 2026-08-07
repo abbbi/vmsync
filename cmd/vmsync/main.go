@@ -663,8 +663,13 @@ func run(cfg struct {
 		return err
 	}
 	if nvram != "" {
-		x, _ := util.RemotePathExists(ctx, targetSSHClient, nvram)
-		if !x {
+		x, err := util.RemotePathExists(ctx, targetSSHClient, nvram)
+		if err != nil {
+			// Advisory check only (see loader below too) -- inconclusive
+			// isn't the same as "doesn't exist" and must not be reported as
+			// such, but it also doesn't warrant failing the whole sync.
+			trace.Warning("could not check whether nvram file exists on target host", "path", nvram, "error", err)
+		} else if !x {
 			trace.Warning("nvram setting detected in vm config", "path", nvram, "but files do not exist on target host")
 		}
 	}
@@ -674,8 +679,10 @@ func run(cfg struct {
 		return lerr
 	}
 	if loader != "" {
-		x, _ := util.RemotePathExists(ctx, targetSSHClient, loader)
-		if !x {
+		x, err := util.RemotePathExists(ctx, targetSSHClient, loader)
+		if err != nil {
+			trace.Warning("could not check whether loader file exists on target host", "path", loader, "error", err)
+		} else if !x {
 			trace.Warning("loader setting detected in vm config", "path", loader, "but files do not exist on target host")
 		}
 	}
@@ -857,7 +864,15 @@ func run(cfg struct {
 			if _, err := targetSSHClient.Run(ctx, "mkdir -p "+util.ShQuote(targetDir)); err != nil {
 				return fmt.Errorf("create remote target dir %s: %w", targetDir, err)
 			}
-			exists, _ := util.RemotePathExists(ctx, targetSSHClient, targetPath)
+			exists, err := util.RemotePathExists(ctx, targetSSHClient, targetPath)
+			if err != nil {
+				// Unlike the advisory nvram/loader checks above, this one
+				// gates a destructive action (full sync overwriting
+				// whatever's already there) -- an inconclusive check must
+				// fail the run, not silently proceed as if the path were
+				// confirmed absent.
+				return fmt.Errorf("check target disk existence for %s: %w", targetPath, err)
+			}
 			if exists {
 				return fmt.Errorf("full sync requested but target disk already exists on target host: %s", targetPath)
 			}

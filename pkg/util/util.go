@@ -19,6 +19,7 @@ package util
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/url"
 	"path/filepath"
@@ -54,14 +55,34 @@ func ShQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
+// RemotePathExists reports whether p exists on the remote host. The check
+// runs as a POSIX shell if/else (`[ -e ]`) rather than relying on `stat`'s
+// own exit code, specifically so a successful SSH round-trip always exits 0
+// regardless of which branch it took -- that makes a non-nil error from
+// Run mean exclusively "the check itself couldn't be performed" (a
+// transient SSH failure, a permission problem, a wedged connection,
+// whatever), which must never be silently treated as "the path doesn't
+// exist": doing so previously undermined every safety check built on this
+// function, most importantly full sync's own guard against overwriting an
+// already-existing target disk.
 func RemotePathExists(ctx context.Context, runner interface {
 	Run(context.Context, string) (string, error)
 }, p string) (bool, error) {
-	_, err := runner.Run(ctx, "stat "+ShQuote(p))
+	const existsMarker = "VMSYNC_PATH_EXISTS"
+	const missingMarker = "VMSYNC_PATH_MISSING"
+	cmd := fmt.Sprintf("if [ -e %s ]; then echo %s; else echo %s; fi", ShQuote(p), existsMarker, missingMarker)
+	out, err := runner.Run(ctx, cmd)
 	if err != nil {
-		return false, nil
+		return false, fmt.Errorf("check remote path %s: %w", p, err)
 	}
-	return true, nil
+	switch strings.TrimSpace(out) {
+	case existsMarker:
+		return true, nil
+	case missingMarker:
+		return false, nil
+	default:
+		return false, fmt.Errorf("check remote path %s: unexpected output %q", p, out)
+	}
 }
 
 func SetTargetPath(targetDiskPath string, diskPath string) string {
