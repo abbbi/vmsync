@@ -1149,7 +1149,14 @@ func run(cfg struct {
 		// Avoid datarace in this goroutine by declaring targetPath as local var instead of a shared one
 		targetPath := util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
 
-		if dirty == 0 {
+		if dirty == 0 && incrementalMode {
+			// Only safe to skip entirely when a base already exists from an
+			// earlier full sync -- for a full sync (parent == ""), this is
+			// the only place the target file ever gets created at all. A
+			// disk with zero allocated extents (a freshly attached, never
+			// written-to data disk, or an unbooted template) would
+			// otherwise be silently left without a target file entirely,
+			// while the run still reports success.
 			trace.Info("No changed extents selected, skipping copy", "disk", d.TargetDev, "elapsed", time.Since(diskStart).Round(time.Millisecond).String())
 		} else {
 			createCmd := "qemu-img create -f qcow2 " + util.ShQuote(targetPath) + " -o cluster_size=" + fmt.Sprintf("%d", d.ClusterSize) + " " + fmt.Sprintf("%d", d.VirtualSize)
