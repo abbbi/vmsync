@@ -24,12 +24,12 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/kevinburke/ssh_config"
 	"github.com/skeema/knownhosts"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -62,21 +62,20 @@ func (c *Client) LoopbackSelfAddress() string {
 }
 
 // ConfigFromLibvirtURI builds a Config from a libvirt connection URI
-// (e.g. qemu+ssh://alias/system), consulting ~/.ssh/config (and
-// /etc/ssh/ssh_config, via ssh_config.Get own standard lookup) for
-// HostName/Port/User/IdentityFile overrides on the URI's host, the same way
-// a plain `ssh alias` would. This matters beyond convenience: if the
-// user's ~/.ssh/config redirects alias to a different HostName (a common
-// pattern -- a short/internal name in the Host block, a real IP or FQDN as
-// HostName), known_hosts records its entry under that resolved HostName,
-// not the alias. Without this, vmsync would dial and check known_hosts
-// under the literal alias from the URI, never matching the real entry --
-// observed directly as a spurious "knownhosts: key is unknown" against a
-// host `ssh alias` itself connects to and verifies without complaint.
-// Values already given explicitly (user, keyPath, port -- i.e. vmsync's own
-// -ssh-user/-ssh-key/-ssh-port flags) always take precedence over whatever
-// ~/.ssh/config says, mirroring how an explicit ssh command-line flag beats
-// its own config file.
+// (e.g. qemu+ssh://alias/system), consulting the real `ssh -G alias` output
+// (see resolveSSHConfig) for HostName/Port/User/IdentityFile overrides on
+// the URI's host, the same way a plain `ssh alias` would. This matters
+// beyond convenience: if the user's ~/.ssh/config redirects alias to a
+// different HostName (a common pattern -- a short/internal name in the
+// Host block, a real IP or FQDN as HostName), known_hosts records its entry
+// under that resolved HostName, not the alias. Without this, vmsync would
+// dial and check known_hosts under the literal alias from the URI, never
+// matching the real entry -- observed directly as a spurious "knownhosts:
+// key is unknown" against a host `ssh alias` itself connects to and
+// verifies without complaint. Values already given explicitly (user,
+// keyPath, port -- i.e. vmsync's own -ssh-user/-ssh-key/-ssh-port flags)
+// always take precedence over whatever ssh_config says, mirroring how an
+// explicit ssh command-line flag beats its own config file.
 func ConfigFromLibvirtURI(libvirtURI, user, keyPath, password, knownHostsPath string, port int, insecure bool, timeout time.Duration) (Config, error) {
 	u, err := url.Parse(libvirtURI)
 	if err != nil {
@@ -86,33 +85,26 @@ func ConfigFromLibvirtURI(libvirtURI, user, keyPath, password, knownHostsPath st
 		return Config{}, fmt.Errorf("libvirt uri has no host: %s", libvirtURI)
 	}
 	alias := u.Hostname()
+	sshConfig := resolveSSHConfig(alias)
 
-	// GetStrict (not the plain Get used everywhere else below) specifically
-	// so a parse error anywhere in ~/.ssh/config -- which would otherwise
-	// silently zero out EVERY lookup against it, indistinguishable from
-	// "no override configured for this host" -- gets surfaced instead of
-	// swallowed.
 	address := alias
-	hostname, hostErr := ssh_config.GetStrict(alias, "HostName")
-	if hostname != "" {
+	if hostname := sshConfig["hostname"]; hostname != "" {
 		address = hostname
 	}
-	home, homeErr := os.UserHomeDir()
-	trace.Debug("ssh_config host resolution", "alias", alias, "resolved_address", address, "home", home, "home_err", homeErr, "hostname_lookup_err", hostErr)
 
 	resolvedUser := user
 	if resolvedUser == "" && u.User != nil {
 		resolvedUser = u.User.Username()
 	}
 	if resolvedUser == "" {
-		resolvedUser = ssh_config.Get(alias, "User")
+		resolvedUser = sshConfig["user"]
 	}
 	if resolvedUser == "" {
 		resolvedUser = "root"
 	}
 
 	if port <= 0 {
-		if portStr := ssh_config.Get(alias, "Port"); portStr != "" {
+		if portStr := sshConfig["port"]; portStr != "" {
 			if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
 				port = p
 			}
@@ -124,7 +116,7 @@ func ConfigFromLibvirtURI(libvirtURI, user, keyPath, password, knownHostsPath st
 
 	resolvedKeyPath := keyPath
 	if resolvedKeyPath == "" {
-		if idFile := ssh_config.Get(alias, "IdentityFile"); idFile != "" {
+		if idFile := sshConfig["identityfile"]; idFile != "" {
 			resolvedKeyPath = expandHome(idFile)
 		}
 	}
@@ -132,6 +124,8 @@ func ConfigFromLibvirtURI(libvirtURI, user, keyPath, password, knownHostsPath st
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
+
+	trace.Debug("resolved ssh_config for host", "alias", alias, "address", address, "user", resolvedUser, "port", port, "key", resolvedKeyPath)
 
 	return Config{
 		Address:               address,
@@ -143,6 +137,47 @@ func ConfigFromLibvirtURI(libvirtURI, user, keyPath, password, knownHostsPath st
 		KnownHostsPath:        knownHostsPath,
 		Timeout:               timeout,
 	}, nil
+}
+
+// resolveSSHConfig shells out to the system's own `ssh -G alias` to get the
+// fully-resolved ssh_config for alias, keyed by lowercased directive name
+// (e.g. "hostname", "port", "user", "identityfile"). -G asks ssh to print
+// its configuration after evaluating every Host/Match block and Include
+// and exit -- no connection is made. This deliberately avoids
+// reimplementing ssh_config parsing in Go at all: it's a real, actively
+// evolving format (Match now has criteria like "canonical", "final",
+// "exec", ...), and every third-party parser checked while debugging this
+// (including the Go library tried here first) turned out to only support a
+// subset of it, silently breaking every lookup -- not just the specific
+// directive it choked on -- the moment a config used something outside
+// that subset. Shelling out to the real `ssh` binary sidesteps that
+// entirely: whatever this host's ssh already understands, this does too.
+// Returns an empty map if ssh isn't installed, alias has no effective
+// config, or -G fails for any reason -- every caller already has its own
+// fallback for a key not being present.
+func resolveSSHConfig(alias string) map[string]string {
+	out, err := exec.Command("ssh", "-G", alias).Output()
+	if err != nil {
+		trace.Debug("ssh -G lookup failed, using literal values only", "alias", alias, "error", err)
+		return nil
+	}
+	result := make(map[string]string, 8)
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		key, value, found := strings.Cut(line, " ")
+		if !found {
+			continue
+		}
+		key = strings.ToLower(key)
+		// First occurrence wins -- matters for identityfile, where ssh -G
+		// lists the user's own explicit IdentityFile directive(s) before
+		// its built-in default candidates (id_rsa, id_ed25519, ...), in
+		// the same order ssh itself would try them.
+		if _, exists := result[key]; !exists {
+			result[key] = value
+		}
+	}
+	return result
 }
 
 // expandHome resolves a leading "~" in an ssh_config IdentityFile value
