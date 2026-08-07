@@ -148,18 +148,22 @@ func QemuImgInfoChainJSONRemote(ctx context.Context, runner CommandRunner, path 
 	return chain, nil
 }
 
-// CompareImages runs qemu-img compare between localPath (a plain local file, read
-// directly -- always run on the same host localPath lives on) and remoteRef (any
-// qemu-img-recognized image reference, e.g. an "nbd://host:port/" URL). Returns nil
-// when the two are byte-for-byte identical; otherwise a descriptive error, with a
-// mismatch (qemu-img's own documented exit code 1, "images differ") distinguished from
-// a genuine failure to even perform the comparison (any other non-zero exit).
+// CompareImages runs qemu-img compare between refA and refB -- each any
+// qemu-img-recognized image reference (a local file path, or a network URL
+// such as "nbd://host:port/export"). It runs as a local subprocess wherever
+// this process itself executes; neither ref needs to be a local file on
+// this host, since qemu-img's own block layer dials network references
+// itself. Returns nil when the two are byte-for-byte identical; otherwise a
+// descriptive error, with a mismatch (qemu-img's own documented exit code
+// 1, "images differ") distinguished from a genuine failure to even perform
+// the comparison (any other non-zero exit).
 //
-// -U opens the image in shared mode: the caller's own use case is comparing a source
-// disk that may still be open by a suspended (not destroyed) qemu process, which would
-// otherwise refuse a second, exclusive-by-default open.
-func CompareImages(localPath, remoteRef string) error {
-	cmd := exec.Command("qemu-img", "compare", "-U", localPath, remoteRef)
+// -U opens the image in shared mode: the caller's own use case includes
+// comparing a source disk that may still be open by a suspended (not
+// destroyed) qemu process, which would otherwise refuse a second,
+// exclusive-by-default open. Harmless (a no-op) for a network reference.
+func CompareImages(refA, refB string) error {
+	cmd := exec.Command("qemu-img", "compare", "-U", refA, refB)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return nil
@@ -168,5 +172,5 @@ func CompareImages(localPath, remoteRef string) error {
 	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 		return fmt.Errorf("images differ: %s", strings.TrimSpace(string(out)))
 	}
-	return fmt.Errorf("qemu-img compare %s vs %s: %w: %s", localPath, remoteRef, err, strings.TrimSpace(string(out)))
+	return fmt.Errorf("qemu-img compare %s vs %s: %w: %s", refA, refB, err, strings.TrimSpace(string(out)))
 }

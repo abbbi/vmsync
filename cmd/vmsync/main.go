@@ -119,7 +119,7 @@ func main() {
 	flag.IntVar(&cfg.IODepth, "io-depth", 8, "Number of NBD read/write pairs to keep in flight simultaneously during the disk copy, instead of waiting for each to fully complete before starting the next. Higher values can hide more per-chunk round-trip latency (real disk I/O plus NBD protocol overhead on both ends), at the cost of io-depth times the negotiated NBD block size in memory. Must be at least 1.")
 	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write sync metrics to this path in Prometheus textfile-collector format: per disk, source/target host, vm, disk size, transferred and compressed-transferred bytes, and duration; plus one overall success/failure state for the whole run. Written atomically (temp file + rename). Empty disables it (default).")
 	flag.BoolVar(&cfg.IgnoreExternalSnapshot, "ignore-external-snapshot", false, "If the source domain currently has any external disk snapshot, skip this run entirely -- no sync attempt, no -prometheus-textfile write, same clean no-op as losing the per-domain run lock. Default (false): sync anyway, incrementally against the existing checkpoint, since libvirt blocks creating a new one while a snapshot exists (see vmsync_external_snapshot_count for observability of that case instead).")
-	flag.BoolVar(&cfg.Verify, "verify", false, "After syncing, suspend the source VM (if running), run a full qemu-img compare against the target for every disk, then resume it. This holds the VM suspended for meaningfully longer than a normal sync -- the whole compare, not just the copy -- so this is meant for periodic verification on its own schedule, not routine syncing. Fails the run if any disk doesn't match. Requires direct network reachability from the source host to the target's NBD port, same as a plain sync without --compress/--netbuffer -- does not tunnel through -use-ssh.")
+	flag.BoolVar(&cfg.Verify, "verify", false, "After syncing, suspend the source VM (if running), run a full qemu-img compare against the target for every disk, then resume it. This holds the VM suspended for meaningfully longer than a normal sync -- the whole compare, not just the copy -- so this is meant for periodic verification on its own schedule, not routine syncing. Fails the run if any disk doesn't match. The compare reads both sides over their own NBD exports (same as the disk copy itself), from wherever vmsync itself runs -- no additional reachability beyond what a plain sync without --compress/--netbuffer already requires, and does not tunnel through -use-ssh.")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
@@ -1300,9 +1300,20 @@ func run(cfg struct {
 				return fmt.Errorf("verify: wait for read-only export %s:%d: %w", targetNBDHost, verifyPort, err)
 			}
 
+			// The source side is read through its own already-open libvirt
+			// backup NBD export (the same effectiveSourceHost/Port used for
+			// the real copy above), not d.RootSource as a local file --
+			// d.RootSource is only a real local path when vmsync itself
+			// runs on the source host, which isn't guaranteed (-source-uri
+			// can be qemu+ssh://, with vmsync running on a separate
+			// orchestrator host). Using the export instead means this needs
+			// no assumption about which host any file actually lives on,
+			// only the same source/target network reachability the disk
+			// copy itself already requires.
+			sourceNBDURL := fmt.Sprintf("nbd://%s:%d/%s", effectiveSourceHost, effectiveSourcePort, d.TargetDev)
 			nbdURL := fmt.Sprintf("nbd://%s:%d/", targetNBDHost, verifyPort)
-			trace.Info("verify: comparing source and target images", "disk", d.TargetDev, "source", d.RootSource, "target", targetPath)
-			compareErr := disk.CompareImages(d.RootSource, nbdURL)
+			trace.Info("verify: comparing source and target images", "disk", d.TargetDev, "source", sourceNBDURL, "target", targetPath)
+			compareErr := disk.CompareImages(sourceNBDURL, nbdURL)
 
 			// Best-effort: a read-only export left behind poses no write-lock
 			// or data-safety risk, and a stale one still bound to this exact
