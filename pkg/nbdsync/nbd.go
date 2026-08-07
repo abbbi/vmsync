@@ -448,6 +448,19 @@ copyLoop:
 				continue
 			}
 			if done {
+				// A write slot confirmed complete here genuinely landed on
+				// the target -- the only reason its completion is being
+				// observed here instead of the main loop above is that
+				// copyLoop broke out (on some other slot's error) before
+				// this one's own turn came up, not that anything is wrong
+				// with this particular write. Credit it the same way the
+				// main loop does, or writtenBytes silently undercounts real
+				// progress on a failed sync, contradicting this function's
+				// own documented contract. A slotReading completion has
+				// nothing to credit -- its write was never even issued.
+				if slots[i].state == slotWriting && slots[i].opErr == 0 {
+					writtenBytes += slots[i].length
+				}
 				slots[i].buf.Free()
 				slots[i].state = slotFree
 				continue
