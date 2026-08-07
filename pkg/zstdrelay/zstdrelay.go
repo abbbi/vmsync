@@ -62,8 +62,8 @@ const (
 	AlgoS2 Algo = "s2"
 )
 
-// ParseAlgo validates a --compress-algo value, treating "" as AlgoZstd (the
-// default).
+// ParseAlgo validates vmsync's -compress=<value> flag value, treating "" as
+// AlgoZstd (the default).
 func ParseAlgo(s string) (Algo, error) {
 	switch Algo(s) {
 	case AlgoZstd, "":
@@ -71,7 +71,7 @@ func ParseAlgo(s string) (Algo, error) {
 	case AlgoS2:
 		return AlgoS2, nil
 	default:
-		return "", fmt.Errorf("--compress-algo must be \"zstd\" or \"s2\", got %q", s)
+		return "", fmt.Errorf("-compress must be \"zstd\" or \"s2\", got %q", s)
 	}
 }
 
@@ -115,7 +115,7 @@ func NewEncoder(algo Algo, w io.Writer, level string) (flushCloser, error) {
 		case "best":
 			return s2.NewWriter(w, s2.WriterConcurrency(1), s2.WriterBestCompression()), nil
 		default:
-			return nil, fmt.Errorf("--compress-level must be \"default\", \"better\", or \"best\" for --compress-algo=s2, got %q", level)
+			return nil, fmt.Errorf("--compress-level must be \"default\", \"better\", or \"best\" for -compress=s2, got %q", level)
 		}
 	}
 	n, err := strconv.Atoi(level)

@@ -67,9 +67,10 @@ func (c Config) Enabled() bool {
 }
 
 // ValidateCompressLevel checks the --compress-level value is valid for the
-// given --compress-algo: zstd takes a traditional numeric level ("1"-"19"),
-// while S2 has no numeric levels at all -- only "default" (fastest, S2's own
-// default), "better", or "best" (see zstdrelay.NewEncoder).
+// given compression algorithm (vmsync's -compress=zstd|s2 flag value): zstd
+// takes a traditional numeric level ("1"-"19"), while S2 has no numeric
+// levels at all -- only "default" (fastest, S2's own default), "better", or
+// "best" (see zstdrelay.NewEncoder).
 func ValidateCompressLevel(algo, level string) error {
 	a, err := zstdrelay.ParseAlgo(algo)
 	if err != nil {
@@ -80,12 +81,12 @@ func ValidateCompressLevel(algo, level string) error {
 		case "default", "better", "best":
 			return nil
 		default:
-			return fmt.Errorf("--compress-level must be \"default\", \"better\", or \"best\" when --compress-algo=s2, got %q", level)
+			return fmt.Errorf("--compress-level must be \"default\", \"better\", or \"best\" when -compress=s2, got %q", level)
 		}
 	}
 	n, err := strconv.Atoi(level)
 	if err != nil {
-		return fmt.Errorf("--compress-level must be a number between 1 and 19 for --compress-algo=zstd, got %q", level)
+		return fmt.Errorf("--compress-level must be a number between 1 and 19 for -compress=zstd, got %q", level)
 	}
 	if n < 1 || n > 19 {
 		return fmt.Errorf("--compress-level must be between 1 and 19, got %d", n)
@@ -93,7 +94,7 @@ func ValidateCompressLevel(algo, level string) error {
 	return nil
 }
 
-// ValidateCompressAlgo checks the --compress-algo value is one
+// ValidateCompressAlgo checks vmsync's -compress=<value> is one
 // pkg/zstdrelay recognizes.
 func ValidateCompressAlgo(algo string) error {
 	_, err := zstdrelay.ParseAlgo(algo)

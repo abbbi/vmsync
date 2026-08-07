@@ -44,6 +44,33 @@ import (
 	"libvirt.org/go/libvirt"
 )
 
+// optionalValueFlag implements flag.Value (plus the IsBoolFlag optimization)
+// for a string flag that also works bare -- "-name" alone resolves to
+// bareDefault, "-name=x" takes x literally, and "-name=false" (or simply
+// omitting the flag) disables it. Plain flag.StringVar can't do this: the
+// bare "-name" form (no "=value") is only accepted by the flag package for
+// a Value whose IsBoolFlag() returns true, which is otherwise reserved for
+// real bools -- this hijacks that same mechanism for a still-string-valued
+// flag with a sensible bare default.
+type optionalValueFlag struct {
+	value       string
+	bareDefault string
+}
+
+func (f *optionalValueFlag) String() string   { return f.value }
+func (f *optionalValueFlag) IsBoolFlag() bool { return true }
+func (f *optionalValueFlag) Set(s string) error {
+	switch s {
+	case "true":
+		f.value = f.bareDefault
+	case "false":
+		f.value = ""
+	default:
+		f.value = s
+	}
+	return nil
+}
+
 func main() {
 	if os.Getenv("PROFILE") == "development" {
 		host := "localhost:6060"
@@ -76,18 +103,15 @@ func main() {
 		Start               bool
 		Reinit              bool
 		ReinitAfterFailures int
-		Compress            bool
+		Compress            string
 		CompressLevel       string
-		CompressAlgo        string
 		NetBuffer           string
 		BridgeHelperPath    string
 		UseSSH              bool
 		IODepth                int
 		PrometheusTextfile     string
 		IgnoreExternalSnapshot bool
-		Verify                 bool
-		VerifyFast             bool
-		VerifyOnline           bool
+		Verify                 string
 		ShowVersion            bool
 	}
 
@@ -112,27 +136,28 @@ func main() {
 	flag.BoolVar(&cfg.Start, "start", false, "In case vm is in non-running state, start in paused mode to allow sync.")
 	flag.BoolVar(&cfg.Reinit, "reinit", false, "Discard all vmsync checkpoints on the source and the existing target domain/disks, then perform a fresh full sync. Use to recover from a broken checkpoint chain (e.g. \"Bitmap already exists\" errors).")
 	flag.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "After this many consecutive sync failures (tracked in the target domain's vmsync metadata), automatically reinit (as with -reinit) instead of trying again the same way. 0 disables this (default).")
-	flag.BoolVar(&cfg.Compress, "compress", false, "Compress NBD traffic between hosts using zstd. Compression runs natively on both ends (no external tool dependency); the remote side requires vmsync-bridge-helper deployed at -bridge-helper-path. By default the bridged traffic goes directly between hosts, not through SSH -- see -use-ssh. Core sync behavior is unchanged when this is not set.")
-	flag.StringVar(&cfg.CompressLevel, "compress-level", "3", "Compression level/mode to use when --compress is set. For --compress-algo=zstd (default): a number 1-19 (default 3). For --compress-algo=s2 (which has no numeric levels): one of \"default\" (fastest, s2's own default), \"better\", or \"best\" -- if --compress-level isn't set explicitly, s2 automatically uses \"default\" instead of zstd's \"3\".")
-	flag.StringVar(&cfg.CompressAlgo, "compress-algo", "zstd", "Compression format to use with --compress: \"zstd\" (better ratio) or \"s2\" (faster, lower ratio -- better when compression speed, not network bandwidth, is the bottleneck). See --compress-level for the accepted level/mode values for each.")
-	flag.StringVar(&cfg.NetBuffer, "netbuffer", "", "Buffer NBD bridge traffic through a bounded in-memory buffer to smooth throughput, formatted as <blocksize>,<buffersize> (e.g. 64k,512M). Runs natively on both ends (no external tool dependency). Independent of --compress -- usable alone or combined with it.")
+	compressArg := optionalValueFlag{bareDefault: "s2"}
+	netBufferArg := optionalValueFlag{bareDefault: "128k,1G"}
+	flag.Var(&compressArg, "compress", "Compress NBD traffic between hosts. Bare -compress (no value) defaults to \"s2\" (faster, lower ratio -- better when compression speed, not network bandwidth, is the bottleneck); pass -compress=zstd explicitly for zstd's better ratio at a higher CPU cost instead. Compression runs natively on both ends (no external tool dependency); the remote side requires vmsync-bridge-helper deployed at -bridge-helper-path. By default the bridged traffic goes directly between hosts, not through SSH -- see -use-ssh. Omitted disables compression; core sync behavior is unchanged. See -compress-level for the accepted level/mode values for whichever algorithm you pick.")
+	flag.StringVar(&cfg.CompressLevel, "compress-level", "3", "Compression level/mode to use when -compress is set. For -compress=zstd: a number 1-19 (default 3 when not set explicitly). For -compress=s2 (which has no numeric levels, including bare -compress, which defaults to s2): one of \"default\" (s2's own fastest mode), \"better\" (default here when not set explicitly), or \"best\".")
+	flag.Var(&netBufferArg, "netbuffer", "Buffer NBD bridge traffic through a bounded in-memory buffer to smooth throughput, formatted as <blocksize>,<buffersize> (e.g. 64k,512M). Bare -netbuffer (no value) defaults to \"128k,1G\". Runs natively on both ends (no external tool dependency). Independent of -compress -- usable alone or combined with it.")
 	flag.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/local/bin/vmsync-bridge-helper", "Remote path to the vmsync-bridge-helper binary, used when --compress/--netbuffer is set. Must already be deployed there by you (e.g. via scp) -- vmsync does not upload it.")
 	flag.BoolVar(&cfg.UseSSH, "use-ssh", false, "When --compress/--netbuffer is set, route the bridged NBD traffic through the existing SSH connection as an encrypted tunnel, instead of the default: vmsync-bridge-helper listening on all interfaces and the local relay connecting to it directly over plain TCP. The default (false) has NO encryption or authentication of its own for that traffic -- only appropriate when the network path between the hosts is already secured some other way (e.g. a VPN/WireGuard tunnel). When false, requires the bridge port range to be reachable directly between the two hosts (firewall/routing) -- vmsync does not verify this itself. No effect without --compress/--netbuffer.")
 	flag.IntVar(&cfg.IODepth, "io-depth", 8, "Number of NBD read/write pairs to keep in flight simultaneously during the disk copy, instead of waiting for each to fully complete before starting the next. Higher values can hide more per-chunk round-trip latency (real disk I/O plus NBD protocol overhead on both ends), at the cost of io-depth times the negotiated NBD block size in memory. Must be at least 1.")
 	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write sync metrics to this path in Prometheus textfile-collector format: per disk, source/target host, vm, disk size, transferred and compressed-transferred bytes, and duration; plus one overall success/failure state for the whole run. Written atomically (temp file + rename). Empty disables it (default).")
 	flag.BoolVar(&cfg.IgnoreExternalSnapshot, "ignore-external-snapshot", false, "If the source domain currently has any external disk snapshot, skip this run entirely -- no sync attempt, no -prometheus-textfile write, same clean no-op as losing the per-domain run lock. Default (false): sync anyway, incrementally against the existing checkpoint, since libvirt blocks creating a new one while a snapshot exists (see vmsync_external_snapshot_count for observability of that case instead).")
-	flag.BoolVar(&cfg.Verify, "verify", false, "After syncing, suspend the source VM (if running), run a full qemu-img compare against the target for every disk, then resume it. This holds the VM suspended for meaningfully longer than a normal sync -- the whole compare, not just the copy -- so this is meant for periodic verification on its own schedule, not routine syncing. Fails the run if any disk doesn't match. The compare reads both sides over their own NBD exports (same as the disk copy itself), from wherever vmsync itself runs -- no additional reachability beyond what a plain sync without --compress/--netbuffer already requires. If --compress/--netbuffer are set, the target-side read of the compare automatically goes through its own vmsync-bridge-helper instance too (a full-image read benefits from this at least as much as the copy does), tunneled via -use-ssh under the same conditions the regular copy's bridge is. See -verify-fast for actually getting a speedup out of that bridge.")
-	flag.BoolVar(&cfg.VerifyFast, "verify-fast", false, "When -verify is set, compare source and target using vmsync's own pipelined NBD reader (same -io-depth concurrency as the disk copy) instead of shelling out to qemu-img compare. qemu-img compare reads one 2MB chunk at a time, synchronously, on both images before advancing -- round-trip-latency-bound, not bandwidth-bound, so --compress/--netbuffer/--use-ssh give it no speedup. -verify-fast fixes that, which is what actually lets --compress/--netbuffer speed up the compare (and --use-ssh encrypt it) the same way they already do for the regular copy. Trade-off: unlike qemu-img compare, this always reads the full image on both sides -- it does not skip regions unallocated on both source and target, so it may transfer more data than qemu-img compare on a very sparse/thin-provisioned image despite completing faster overall on typical (mostly-allocated) disks. No effect without -verify.")
-	flag.BoolVar(&cfg.VerifyOnline, "verify-online", false, "Like -verify, but without suspending the source VM: creates a short-lived checkpoint when the compare begins, runs the full compare against the live disk (always via vmsync's own pipelined NBD reader, same as -verify-fast -- qemu-img compare has no equivalent here), then cross-references any mismatch against what the checkpoint's own bitmap shows the guest wrote during the compare -- a mismatch inside a touched region is discarded as inconclusive (the guest changed it after target's last sync, not corruption), only a mismatch outside every touched region fails the run. Trade-off versus -verify: never causes downtime, but a very write-heavy guest during a slow compare can leave large regions unverified this round rather than confirmed either way. Mutually exclusive with -verify.")
+	flag.StringVar(&cfg.Verify, "verify", "", "After syncing, verify target matches source for every disk. Three modes: \"compare\" suspends the source VM (if running) and shells out to qemu-img compare -- the original, simplest mode. \"fast\" also suspends, but compares via vmsync's own pipelined NBD reader instead (same -io-depth concurrency as the disk copy) -- qemu-img compare reads one 2MB chunk at a time, synchronously, so it can never benefit from -compress/-netbuffer/-use-ssh the way \"fast\" can. \"online\" never suspends the source: it opens a short-lived checkpoint when the compare begins, then cross-references any mismatch against what that checkpoint's own bitmap shows the guest wrote during the compare, discarding mismatches inside touched regions as inconclusive rather than failing on them -- trade-off: a heavily-written disk during a slow compare can leave large regions unverified this round instead of confirmed either way. Suspend modes hold the VM suspended for the whole compare, not just the copy, so any -verify mode is meant for periodic verification on its own schedule, not routine syncing. Fails the run if any disk doesn't match. Empty (default) disables verification.")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
 	flag.Parse()
+	cfg.Compress = compressArg.value
+	cfg.NetBuffer = netBufferArg.value
 
 	// Tracks whether --compress-level was actually passed on the command
 	// line, as opposed to just carrying its zstd-oriented flag default
 	// ("3") -- needed below to swap in s2's own default ("default") instead
-	// when --compress-algo=s2 and the user didn't ask for a specific level.
+	// when -compress=s2 and the user didn't ask for a specific level.
 	compressLevelExplicit := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "compress-level" {
@@ -151,15 +176,15 @@ func main() {
 	if cfg.TargetDomain == "" {
 		cfg.TargetDomain = cfg.SourceDomain
 	}
-	if cfg.Compress {
-		if err := nbdbridge.ValidateCompressAlgo(cfg.CompressAlgo); err != nil {
-			trace.Error("invalid compress algo configuration", "error", err)
+	if cfg.Compress != "" {
+		if err := nbdbridge.ValidateCompressAlgo(cfg.Compress); err != nil {
+			trace.Error("invalid compress configuration", "error", err)
 			os.Exit(2)
 		}
-		if !compressLevelExplicit && cfg.CompressAlgo == "s2" {
-			cfg.CompressLevel = "default"
+		if !compressLevelExplicit && cfg.Compress == "s2" {
+			cfg.CompressLevel = "better"
 		}
-		if err := nbdbridge.ValidateCompressLevel(cfg.CompressAlgo, cfg.CompressLevel); err != nil {
+		if err := nbdbridge.ValidateCompressLevel(cfg.Compress, cfg.CompressLevel); err != nil {
 			trace.Error("invalid compress-level configuration", "error", err)
 			os.Exit(2)
 		}
@@ -174,8 +199,10 @@ func main() {
 		trace.Error("invalid io-depth configuration", "error", fmt.Errorf("-io-depth must be at least 1, got %d", cfg.IODepth))
 		os.Exit(2)
 	}
-	if cfg.Verify && cfg.VerifyOnline {
-		trace.Error("invalid verify configuration", "error", fmt.Errorf("-verify and -verify-online are mutually exclusive -- -verify suspends the source VM, -verify-online explicitly must not"))
+	switch cfg.Verify {
+	case "", "compare", "fast", "online":
+	default:
+		trace.Error("invalid verify configuration", "error", fmt.Errorf("-verify must be \"compare\", \"fast\", or \"online\" (or omitted to disable verification), got %q", cfg.Verify))
 		os.Exit(2)
 	}
 
@@ -223,7 +250,19 @@ func main() {
 	// metadata (alongside last_checkpoint/last_sync_timestamp), not in local
 	// state -- so it survives being tracked from a different host and stays
 	// in one place with the rest of vmsync's bookkeeping.
-	if cfg.ReinitAfterFailures > 0 {
+	//
+	// Both sides of this are gated on !verifying: a -verify=* run's failure
+	// (a real mismatch, or just a transient hiccup during the compare step)
+	// says nothing about whether the *incremental sync mechanism itself* is
+	// broken, which is what -reinit-after-failures exists to auto-heal --
+	// folding it into the same counter risks auto-discarding the checkpoint
+	// chain in response to a genuine corruption finding instead of
+	// surfacing it for a human to look at, and -verify runs are meant to
+	// run on their own separate cadence from routine syncs anyway, so
+	// mixing their failure signal into this counter conflates two
+	// different schedules.
+	verifying := cfg.Verify != ""
+	if cfg.ReinitAfterFailures > 0 && !verifying {
 		failures, err := libvirtsync.ReadTargetFailureCount(cfg.TargetURI, cfg.TargetDomain)
 		if err != nil {
 			trace.Warning("unable to read failure count from target metadata", "error", err)
@@ -235,7 +274,7 @@ func main() {
 
 	if err := run(cfg); err != nil {
 		trace.Error("sync failed", "error", err)
-		if cfg.ReinitAfterFailures > 0 {
+		if cfg.ReinitAfterFailures > 0 && !verifying {
 			if count, rerr := libvirtsync.RecordTargetSyncFailure(cfg.TargetURI, cfg.TargetDomain); rerr != nil {
 				trace.Warning("failed to record sync failure in target metadata", "error", rerr)
 			} else {
@@ -249,7 +288,7 @@ func main() {
 }
 
 // overlapsAnyExtent reports whether m overlaps any dirty extent in touched
-// -- used by -verify-online to tell a real mismatch (outside anything the
+// -- used by -verify=online to tell a real mismatch (outside anything the
 // guest wrote during the compare window) from one that's merely
 // inconclusive (inside a region the guest touched, so the target simply
 // hasn't caught up with a write that happened during this compare, not
@@ -291,24 +330,29 @@ func run(cfg struct {
 	Start               bool
 	Reinit              bool
 	ReinitAfterFailures int
-	Compress            bool
+	Compress            string
 	CompressLevel       string
-	CompressAlgo        string
 	NetBuffer           string
 	BridgeHelperPath    string
 	UseSSH              bool
 	IODepth             int
 	PrometheusTextfile  string
 	IgnoreExternalSnapshot bool
-	Verify              bool
-	VerifyFast          bool
-	VerifyOnline        bool
+	Verify              string
 	ShowVersion         bool
 }) (runErr error) {
 	runStart := time.Now()
 	defer func() {
 		trace.Info("vmsync run finished", "elapsed", time.Since(runStart).Round(time.Millisecond).String(), "success", runErr == nil)
 	}()
+
+	// Resolved once, here, instead of re-deriving cfg.Verify's meaning at
+	// every consumer site: verifySuspends covers both suspend-based modes
+	// ("compare" and "fast"), verifyFast/verifyOnline each pick out their
+	// own single mode.
+	verifySuspends := cfg.Verify == "compare" || cfg.Verify == "fast"
+	verifyFast := cfg.Verify == "fast"
+	verifyOnline := cfg.Verify == "online"
 
 	var tgtState bool
 	var srcState bool
@@ -325,7 +369,7 @@ func run(cfg struct {
 	// checkpoint + its own short-lived backup job (see beginVerifyWindow,
 	// defined further down once qcowDisks/backupMu are in scope) the same
 	// way backupActive/abortOnce guard the regular backup job -- only ever
-	// meaningful when -verify-online actually reaches that step.
+	// meaningful when -verify=online actually reaches that step.
 	var verifyWindowMu sync.Mutex
 	var verifyWindowActive bool
 	var verifyWindowOnce sync.Once
@@ -438,7 +482,7 @@ func run(cfg struct {
 			// whole run via state/runErr as before -- this only changes
 			// whether the verification metrics are emitted at all, not
 			// what the overall run's own failure means.
-			VerificationRan:       (cfg.Verify || cfg.VerifyOnline) && attempted,
+			VerificationRan:       cfg.Verify != "" && attempted,
 			VerificationState:     state,
 			VerificationTimestamp: now,
 		}
@@ -473,9 +517,9 @@ func run(cfg struct {
 		return err
 	}
 	bridgeCfg := nbdbridge.Config{
-		Compress:       cfg.Compress,
+		Compress:       cfg.Compress != "",
 		CompressLevel:  cfg.CompressLevel,
-		CompressAlgo:   cfg.CompressAlgo,
+		CompressAlgo:   cfg.Compress,
 		NetBufferBlock: netbufferBlock,
 		NetBufferSize:  netbufferSize,
 		HelperPath:     cfg.BridgeHelperPath,
@@ -528,11 +572,11 @@ func run(cfg struct {
 		return err
 	}
 
-	// Unconditional, regardless of whether -verify-online is requested this
+	// Unconditional, regardless of whether -verify=online is requested this
 	// run: self-heals a verify-window checkpoint left behind by a prior
-	// -verify-online invocation that crashed (e.g. SIGKILL) before its own
+	// -verify=online invocation that crashed (e.g. SIGKILL) before its own
 	// cleanup ran. Cheap (one lookup, delete only if found), and safe to run
-	// even when -verify-online was never used -- AcquireRunLock already
+	// even when -verify=online was never used -- AcquireRunLock already
 	// rules out any concurrent-run hazard for this domain. See
 	// VerifyWindowCheckpointName's own doc comment for why this can never
 	// collide with or confuse the regular checkpoint chain.
@@ -568,7 +612,7 @@ func run(cfg struct {
 	// is already static and a running one's isn't. Suspend only when
 	// genuinely running; a domain already paused (including one -start just
 	// started, which starts it paused) needs no action of our own.
-	if cfg.Verify {
+	if verifySuspends {
 		state, _, err := srcDom.GetState()
 		if err != nil {
 			return fmt.Errorf("check source domain state for -verify: %w", err)
@@ -648,7 +692,7 @@ func run(cfg struct {
 	// abortBackup's shape exactly (sync.Once, callWithTimeout, reconnect-
 	// retry fallback), since it's the same kind of "must not leak this
 	// libvirt-side state past this run" concern. A no-op whenever
-	// verifyWindowActive was never set (i.e. -verify-online never reached
+	// verifyWindowActive was never set (i.e. -verify=online never reached
 	// that step this run, including whenever it's not requested at all).
 	cleanupVerifyWindow := func(trigger string) {
 		verifyWindowOnce.Do(func() {
@@ -678,7 +722,7 @@ func run(cfg struct {
 	}
 	// Registered right away: cleanupVerifyWindow itself checks
 	// verifyWindowActive at the time it actually runs, so this is a no-op
-	// for every run that never reaches (or doesn't use) -verify-online's
+	// for every run that never reaches (or doesn't use) -verify=online's
 	// beginVerifyWindow step further down, and the real backstop for one
 	// that does but fails or gets interrupted partway through.
 	defer cleanupVerifyWindow("cleanup")
@@ -1228,9 +1272,9 @@ func run(cfg struct {
 		trace.Info("source nbd port in use", "side", "source", "kind", "bridge_local", "host", "127.0.0.1", "port", localPort)
 	}
 
-	// verifyWindow carries what -verify-online's compare phase needs from
+	// verifyWindow carries what -verify=online's compare phase needs from
 	// beginVerifyWindow. checkpointName is empty for the plain -verify/
-	// -verify-fast path (runVerify uses that to tell the two modes apart);
+	// -verify=fast path (runVerify uses that to tell the two modes apart);
 	// non-empty means the compare should reconcile mismatches against that
 	// checkpoint's own dirty bitmap instead of failing on the first one.
 	type verifyWindow struct {
@@ -1238,7 +1282,7 @@ func run(cfg struct {
 		cleanup        func()
 	}
 
-	// beginVerifyWindow opens -verify-online's compare window: it stops the
+	// beginVerifyWindow opens -verify=online's compare window: it stops the
 	// regular sync's backup job, creates the ephemeral verify-window
 	// checkpoint, then starts a SECOND, short-lived backup job scoped to
 	// that checkpoint's bitmap. This second job is necessary, not
@@ -1315,7 +1359,7 @@ func run(cfg struct {
 	// recordDiskMetric appends one metrics.DiskMetric, exactly the
 	// computation syncDisk's own deferred metrics block always did -- shared
 	// so the single-phase path (duration = copy+verify combined, via
-	// syncDisk's defer) and -verify-online's two-phase path (duration =
+	// syncDisk's defer) and -verify=online's two-phase path (duration =
 	// copy only, recorded right after copyAndCommit -- see its own doc
 	// comment for why) don't each carry their own copy of it.
 	recordDiskMetric := func(d disk.QcowDisk, diskSize, writtenBytes uint64, targetBridgeCounters *nbdbridge.ByteCounters, duration time.Duration) {
@@ -1347,7 +1391,7 @@ func run(cfg struct {
 	}
 
 	// diskPhase1Result carries what runVerify needs from copyAndCommit.
-	// Under -verify-online, these two run as separate goroutine invocations
+	// Under -verify=online, these two run as separate goroutine invocations
 	// (see the two-phase fan-out below) with a whole-run barrier between
 	// them, so runVerify can no longer just read copyAndCommit's local
 	// variables via closure capture the way the single-phase syncDisk path
@@ -1518,10 +1562,10 @@ func run(cfg struct {
 		return res, nil
 	}
 
-	// runVerify is today's `if cfg.Verify` block, unchanged in behavior for
-	// its original caller (syncDisk, verify.checkpointName always "" there
-	// since -verify and -verify-online are mutually exclusive). Under
-	// -verify-online (verify.checkpointName != ""), the compare step
+	// runVerify is today's `if cfg.Verify != ""` block, unchanged in behavior
+	// for its original caller (syncDisk, verify.checkpointName always "" there
+	// since cfg.Verify can only ever hold one mode at a time). Under
+	// -verify=online (verify.checkpointName != ""), the compare step
 	// collects every mismatch instead of failing on the first one, then
 	// reconciles them against what the verify-window checkpoint's own
 	// bitmap shows the guest touched during the compare.
@@ -1610,7 +1654,7 @@ func run(cfg struct {
 		// orchestrator host). Using the export instead means this needs
 		// no assumption about which host any file actually lives on,
 		// only the same source/target network reachability the disk
-		// copy itself already requires. Still true under -verify-online:
+		// copy itself already requires. Still true under -verify=online:
 		// beginVerifyWindow's second backup job rebinds the exact same
 		// host:port, so effectiveSourceHost/Port need no change here.
 		sourceNBDURL := fmt.Sprintf("nbd://%s:%d/%s", effectiveSourceHost, effectiveSourcePort, d.TargetDev)
@@ -1644,8 +1688,8 @@ func run(cfg struct {
 				}
 			}
 		} else {
-			trace.Info("verify: comparing source and target images", "disk", d.TargetDev, "source", sourceNBDURL, "target", targetPath, "fast", cfg.VerifyFast)
-			if cfg.VerifyFast {
+			trace.Info("verify: comparing source and target images", "disk", d.TargetDev, "source", sourceNBDURL, "target", targetPath, "fast", verifyFast)
+			if verifyFast {
 				compareErr = nbdsync.CompareTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, cfg.IODepth)
 			} else {
 				compareErr = disk.CompareImages(sourceNBDURL, nbdURL)
@@ -1675,13 +1719,13 @@ func run(cfg struct {
 		return nil
 	}
 
-	// syncDisk is the single-phase path: copy+commit, then (if cfg.Verify)
+	// syncDisk is the single-phase path: copy+commit, then (if cfg.Verify != "")
 	// verify against the same already-open backup export, all in one
 	// goroutine per disk with zero cross-disk coordination -- exactly
-	// today's behavior, used whenever -verify-online is NOT set (including
-	// plain syncs and plain -verify/-verify-fast, which suspend instead of
+	// today's behavior, used whenever -verify=online is NOT set (including
+	// plain syncs and -verify=compare/-verify=fast, which suspend instead of
 	// using a barrier). verifyWindow{} (checkpointName == "") tells
-	// runVerify to use the original compare path, not -verify-online's.
+	// runVerify to use the original compare path, not -verify=online's.
 	syncDisk := func(i int, d disk.QcowDisk) (err error) {
 		diskStart := time.Now()
 		var res diskPhase1Result
@@ -1698,14 +1742,14 @@ func run(cfg struct {
 		if err != nil {
 			return err
 		}
-		if cfg.Verify {
+		if cfg.Verify != "" {
 			return runVerify(i, d, res, verifyWindow{})
 		}
 		trace.Info("disk sync complete", "disk", d.TargetDev, "elapsed", time.Since(diskStart).Round(time.Millisecond).String())
 		return nil
 	}
 
-	if !cfg.VerifyOnline {
+	if !verifyOnline {
 		for i, d := range qcowDisks {
 			i, d := i, d
 			wg.Add(1)
@@ -1720,7 +1764,7 @@ func run(cfg struct {
 		wg.Wait()
 		close(errCh)
 	} else {
-		// -verify-online: copy+commit for every disk first, then (once,
+		// -verify=online: copy+commit for every disk first, then (once,
 		// domain-wide, not per-disk) open the compare window, then compare
 		// every disk in parallel again. See beginVerifyWindow's own doc
 		// comment for why this needs a real barrier instead of just running

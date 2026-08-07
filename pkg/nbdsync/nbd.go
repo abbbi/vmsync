@@ -523,7 +523,7 @@ copyLoop:
 // b), pipelining ioDepth read pairs concurrently via libnbd's AIO API --
 // the same approach CopyExtentsTCP uses for the copy direction, ported to a
 // symmetric read/read/compare workload instead of read/write. This exists
-// because qemu-img compare (the tool this replaces for -verify -verify-fast)
+// because qemu-img compare (the tool this replaces for -verify=fast)
 // reads one chunk at a time, synchronously, on both images before advancing
 // -- round-trip-latency-bound, not bandwidth-bound, so it can never benefit
 // from vmsync's own compress/netbuffer bridge. Pipelining fixes that by
@@ -562,7 +562,7 @@ type MismatchRange struct {
 
 // CompareTCPCollect is CompareTCP, except it scans the entire image even
 // past the first mismatch, returning every mismatched range instead of
-// aborting on the first one. For -verify-online, where a lone mismatch is
+// aborting on the first one. For -verify=online, where a lone mismatch is
 // inconclusive on its own (the guest may have legitimately written there
 // during the compare) and must be cross-referenced against a dirty bitmap
 // afterward -- which needs every mismatch, not just the first. A genuine

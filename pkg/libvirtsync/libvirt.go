@@ -36,7 +36,7 @@ import (
 const CheckpointPrefix = "vmsync-cpt"
 
 // VerifyWindowCheckpointName names the ephemeral, throwaway checkpoint
-// -verify-online creates right when its compare window opens, to find out
+// -verify=online creates right when its compare window opens, to find out
 // afterward which regions the guest wrote to during the compare (see
 // CreateVerifyWindowCheckpoint). Deliberately NOT prefixed with
 // CheckpointPrefix+"-": ListManagedCheckpoints (and therefore
@@ -629,7 +629,7 @@ func CreateCheckpoint(dom *libvirt.Domain, checkpointName, parent string, diskTa
 }
 
 // CreateVerifyWindowCheckpoint creates the ephemeral, domain-wide checkpoint
-// -verify-online uses to detect (after the fact) which regions the guest
+// -verify=online uses to detect (after the fact) which regions the guest
 // wrote to during its compare window -- see VerifyWindowCheckpointName.
 // Standalone (parent=""): it has no lineage relationship to the regular
 // vmsync-cpt-NNNNNN chain, and since nothing ever nominates it as another
@@ -643,9 +643,9 @@ func CreateVerifyWindowCheckpoint(dom *libvirt.Domain, diskTargets []disk.QcowDi
 // DeleteVerifyWindowCheckpoint removes the ephemeral verify-window
 // checkpoint if it exists, tolerating the case where it doesn't (already
 // cleaned up, or never created this run). Called both defensively (self-
-// healing a prior crashed -verify-online run, unconditionally, regardless
-// of whether -verify-online is requested this run) and as real cleanup once
-// a -verify-online run's compare window closes.
+// healing a prior crashed -verify=online run, unconditionally, regardless
+// of whether -verify=online is requested this run) and as real cleanup once
+// a -verify=online run's compare window closes.
 func DeleteVerifyWindowCheckpoint(dom *libvirt.Domain) error {
 	return DeleteCheckpointIfExists(dom, VerifyWindowCheckpointName)
 }
