@@ -1,0 +1,9 @@
+[codespell]
+skip = .git,rust/target
+quiet-level = 3
+# Add project-specific false positives here as codespell actually finds them
+# (its dictionary occasionally flags legitimate technical terms/identifiers
+# as typos) -- this couldn't be pre-populated since codespell has never
+# actually been run against this repo; the first CI run is what will reveal
+# whether anything needs adding here. Example:
+# ignore-words-list = word1,word2
