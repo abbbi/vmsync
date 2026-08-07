@@ -33,6 +33,8 @@ import (
 	"github.com/skeema/knownhosts"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+
+	"vmsync/pkg/trace"
 )
 
 type Config struct {
@@ -89,6 +91,15 @@ func ConfigFromLibvirtURI(libvirtURI, user, keyPath, password, knownHostsPath st
 	if hostname := ssh_config.Get(alias, "HostName"); hostname != "" {
 		address = hostname
 	}
+	// Temporary diagnostic: ssh_config.Get silently returns "" on any
+	// lookup problem (parse error, wrong $HOME, file not found), so a
+	// no-op resolution here is otherwise indistinguishable from "no
+	// override configured for this host". home/homeErr uses the same
+	// resolution as this package's own known_hosts default path, for a
+	// direct comparison against what ssh_config's own (separate) home
+	// directory lookup found.
+	home, homeErr := os.UserHomeDir()
+	trace.Debug("ssh_config host resolution", "alias", alias, "resolved_address", address, "home", home, "home_err", homeErr)
 
 	resolvedUser := user
 	if resolvedUser == "" && u.User != nil {

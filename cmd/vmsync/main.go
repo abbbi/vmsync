@@ -790,6 +790,7 @@ func run(cfg struct {
 	if err != nil {
 		return err
 	}
+	trace.Debug("resolved target ssh connection", "user", targetSSHConfig.User, "host", targetSSHConfig.Address, "port", targetSSHConfig.Port, "key", targetSSHConfig.PrivateKeyPath)
 	targetSSHClient, err = remotessh.Dial(targetSSHConfig)
 	if err != nil {
 		return fmt.Errorf("connect ssh for target file/export execution: %w", err)
