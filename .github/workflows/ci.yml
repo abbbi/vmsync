@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      # Same package list Dockerfile.debian installs to build the real
+      # release binaries -- kept in sync deliberately, so this workflow
+      # exercises the same cgo dependencies (libnbd, libvirt) the actual
+      # vmsync binary needs, not a stripped-down approximation of them.
+      - name: Install system dependencies (cgo: libnbd, libvirt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc git libnbd-dev libvirt-dev libc6-dev
+
+      # Same Go version pinned in Dockerfile.debian's GO_VERSION build arg.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+
+      # This repo doesn't commit go.mod/go.sum (see Dockerfile.debian's own
+      # "go mod init vmsync && go mod tidy" step) -- bootstrap the module the
+      # same way here before anything else can build.
+      - name: Initialize Go module
+        run: go mod init vmsync && go mod tidy
+
+      # Builds every package under the module, including cmd/vmsync itself
+      # (cgo, needs libnbd-dev/libvirt-dev above) and the pure-Go
+      # cmd/vmsync-bridge-helper -- catches compile errors across the whole
+      # tree, not just the packages that happen to have tests.
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # ./... already recurses into tests/ (the black-box test package that
+      # exercises exported APIs like pkg/zstdrelay's, e.g. the netbuffer
+      # deadlock repro) alongside every package's own in-package tests.
+      - name: Test
+        run: go test ./... -v
+
+  codespell:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      # Picks up .codespellrc from the repo root automatically.
+      - name: Check spelling
+        uses: codespell-project/actions-codespell@v2
