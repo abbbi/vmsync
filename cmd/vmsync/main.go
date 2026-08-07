@@ -330,6 +330,19 @@ func run(cfg struct {
 	// -- guarded by metricsMu like nbdHost/targetNBDHost above, since
 	// writeMetricsTextfile can run concurrently from the signal handler.
 	var externalSnapshotCount int
+	// verificationAttempted is set once the -verify compare block is
+	// actually entered for at least one disk (see syncDisk below) --
+	// distinct from cfg.Verify, which is just "was -verify requested" and
+	// stays true even when the run fails before ever reaching that block
+	// (an early SSH/libvirt error, say). Without this, vmsync_verification_
+	// timestamp_seconds would get bumped to "now" on every such early
+	// failure, masking real staleness: a persistently failing run could
+	// look like it's verifying successfully-recently when no comparison
+	// has actually been attempted in a long time. Deliberately does NOT
+	// change how a run's overall failure is reported otherwise -- a
+	// mismatch, or any later unrelated failure after a passing compare,
+	// still fails the whole run via the existing state/runErr handling.
+	var verificationAttempted bool
 
 	// writeMetricsTextfile is called from two places: the deferred call
 	// below (the normal return path, any outcome) and the signal handler
@@ -353,6 +366,7 @@ func run(cfg struct {
 		disksSnapshot := append([]metrics.DiskMetric(nil), diskMetrics...)
 		sourceHost, targetHost := nbdHost, targetNBDHost
 		snapshotCount := externalSnapshotCount
+		attempted := verificationAttempted
 		metricsMu.Unlock()
 		now := time.Now().Unix()
 		run := metrics.RunMetric{
@@ -362,12 +376,17 @@ func run(cfg struct {
 			State:                 state,
 			Timestamp:             now,
 			ExternalSnapshotCount: snapshotCount,
-			// cfg.Verify is immutable for the whole run, safe to read from
-			// any goroutine without metricsMu. A -verify mismatch fails the
-			// whole run (see syncDisk's verify block), so state already
-			// correctly reflects verification's own outcome whenever
-			// cfg.Verify is set -- no separate tracking needed.
-			VerificationRan:       cfg.Verify,
+			// VerificationRan requires the compare block to have actually
+			// been entered this run (see verificationAttempted's own
+			// comment) -- cfg.Verify alone would stay true even for a run
+			// that failed before ever reaching it, which would otherwise
+			// bump VerificationTimestamp to "now" on every such failure and
+			// mask real staleness. A -verify mismatch, or any later
+			// unrelated failure after a passing compare, still fails the
+			// whole run via state/runErr as before -- this only changes
+			// whether the verification metrics are emitted at all, not
+			// what the overall run's own failure means.
+			VerificationRan:       cfg.Verify && attempted,
 			VerificationState:     state,
 			VerificationTimestamp: now,
 		}
@@ -1293,6 +1312,10 @@ func run(cfg struct {
 		}
 
 		if cfg.Verify {
+			metricsMu.Lock()
+			verificationAttempted = true
+			metricsMu.Unlock()
+
 			// Dedicated port range, distinct from both the regular
 			// [TargetNBDPort, +N) and bridge [+N, +2N) ranges above, so this
 			// never collides regardless of whether bridging is on, and
