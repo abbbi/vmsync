@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -48,6 +49,28 @@ func (b *ByteCounters) SentSnapshot() uint64 {
 // so far.
 func (b *ByteCounters) ReceivedSnapshot() uint64 {
 	return atomic.LoadUint64(&b.Received)
+}
+
+// recoverRelayPanic runs fn, converting any panic into a returned error
+// instead of letting it escape the calling goroutine. An unrecovered panic
+// in any goroutine terminates the entire vmsync process immediately,
+// bypassing every other goroutine's own deferred cleanup -- resuming a
+// source VM suspended for -verify, tearing down remote qemu-nbd exports,
+// the signal handler's shutdown path -- none of which are deferred in this
+// goroutine's own stack. A bug in one bridge connection must not be able to
+// take down more than that one connection. label identifies which relay
+// direction panicked in the logged stack trace, so it's diagnosable as a
+// real bug; it's logged immediately at Error level since the stack itself
+// would otherwise be lost by the time the returned error reaches its
+// caller's own logging.
+func recoverRelayPanic(label string, fn func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			trace.Error("recovered from panic in nbd bridge relay", "context", label, "panic", r, "stack", string(debug.Stack()))
+			err = fmt.Errorf("panic in %s: %v", label, r)
+		}
+	}()
+	return fn()
 }
 
 // StartLocal opens a local TCP listener that transparently compresses/buffers
@@ -97,7 +120,10 @@ func StartLocal(ctx context.Context, sshClient *remotessh.Client, remoteBridgeAd
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if relayErr := relayConnection(conn, sshClient, remoteBridgeAddr, cfg, counters); relayErr != nil {
+				relayErr := recoverRelayPanic("bridge connection relay", func() error {
+					return relayConnection(conn, sshClient, remoteBridgeAddr, cfg, counters)
+				})
+				if relayErr != nil {
 					trace.Warning("nbd bridge connection ended with error", "remote", remoteBridgeAddr, "error", relayErr)
 				}
 			}()
@@ -153,27 +179,31 @@ func relayConnection(conn net.Conn, sshClient *remotessh.Client, remoteBridgeAdd
 	// conn (plaintext, from the local NBD client) -> [compress+flush] -> [buffer] -> remote (wire, over SSH)
 	go func() {
 		defer relayWg.Done()
-		err := zstdrelay.Relay(remote, conn, cfg.Compress, algo, cfg.CompressLevel, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Sent)
-		// Half-close the SSH channel once we're done sending, mirroring what
-		// cmd/vmsync-bridge-helper does on its own outbound direction
-		// (tc.CloseWrite() after its stdin hits EOF). Without this, nothing
-		// ever signals "no more data" on remote: it's a long-lived SSH
-		// direct-tcpip channel, not a pipe that closes on process exit, so
-		// the remote helper's stdin never sees EOF, its matching relay
-		// goroutine blocks forever, its process never exits, and the whole
-		// bridge connection hangs even after the real NBD client has
-		// finished and closed -- observed directly via a SIGQUIT goroutine
-		// dump: the decoder on this same connection's inbound direction was
-		// blocked waiting on data that could now never arrive.
-		if wc, ok := remote.(interface{ CloseWrite() error }); ok {
-			wc.CloseWrite()
-		}
-		reportErr(err)
+		reportErr(recoverRelayPanic("outbound relay (conn -> remote)", func() error {
+			err := zstdrelay.Relay(remote, conn, cfg.Compress, algo, cfg.CompressLevel, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Sent)
+			// Half-close the SSH channel once we're done sending, mirroring what
+			// cmd/vmsync-bridge-helper does on its own outbound direction
+			// (tc.CloseWrite() after its stdin hits EOF). Without this, nothing
+			// ever signals "no more data" on remote: it's a long-lived SSH
+			// direct-tcpip channel, not a pipe that closes on process exit, so
+			// the remote helper's stdin never sees EOF, its matching relay
+			// goroutine blocks forever, its process never exits, and the whole
+			// bridge connection hangs even after the real NBD client has
+			// finished and closed -- observed directly via a SIGQUIT goroutine
+			// dump: the decoder on this same connection's inbound direction was
+			// blocked waiting on data that could now never arrive.
+			if wc, ok := remote.(interface{ CloseWrite() error }); ok {
+				wc.CloseWrite()
+			}
+			return err
+		}))
 	}()
 	// remote (wire, over SSH) -> [buffer] -> [decompress] -> conn (plaintext, to the local NBD client)
 	go func() {
 		defer relayWg.Done()
-		reportErr(zstdrelay.RelayFromWire(conn, remote, cfg.Compress, algo, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Received))
+		reportErr(recoverRelayPanic("inbound relay (remote -> conn)", func() error {
+			return zstdrelay.RelayFromWire(conn, remote, cfg.Compress, algo, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Received)
+		}))
 	}()
 	relayWg.Wait()
 

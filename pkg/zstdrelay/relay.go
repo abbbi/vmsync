@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package zstdrelay
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -106,6 +107,13 @@ func Relay(dst io.Writer, src io.Reader, compress bool, algo Algo, level string,
 		drainDone = make(chan error, 1)
 		go func() {
 			_, err := io.Copy(preBufferDst, bufStage)
+			// Close bufStage the moment draining stops, for any reason --
+			// not just the normal case where the producer below already
+			// closed it after src hit EOF. If dst itself failed instead,
+			// the producer would otherwise keep writing into a now
+			// permanently-undrained bufStage and block forever once it
+			// fills, since nothing else would ever close or read from it.
+			bufStage.Close()
 			drainDone <- err
 		}()
 		effectiveDst = bufStage
@@ -127,7 +135,13 @@ func Relay(dst io.Writer, src io.Reader, compress bool, algo Algo, level string,
 
 	if bufStage != nil {
 		bufStage.Close()
-		if drainErr := <-drainDone; relayErr == nil {
+		drainErr := <-drainDone
+		// relayErr coming back as exactly io.ErrClosedPipe means the
+		// producer above only failed because the drain goroutine's fix
+		// force-closed bufStage out from under it -- drainErr (dst's real
+		// failure) is the actual cause worth surfacing in that case, not
+		// the closed-pipe symptom it left behind.
+		if drainErr != nil && (relayErr == nil || errors.Is(relayErr, io.ErrClosedPipe)) {
 			relayErr = drainErr
 		}
 	}
@@ -195,6 +209,12 @@ func RelayFromWire(dst io.Writer, src io.Reader, compress bool, algo Algo, netbu
 	}
 
 	if bufStage != nil {
+		// Symmetric to Relay's own fix: if dst itself is why we stopped
+		// consuming, the fill goroutine (still pumping the wire into
+		// bufStage) would otherwise block forever in a full, now
+		// permanently-unconsumed BoundedBuffer.Write with no one left to
+		// ever read from it or close it.
+		bufStage.Close()
 		if fillErr := <-fillDone; relayErr == nil {
 			relayErr = fillErr
 		}
