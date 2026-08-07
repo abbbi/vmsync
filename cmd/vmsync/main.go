@@ -663,36 +663,7 @@ func run(cfg struct {
 		return fmt.Errorf("read source domain xml: %w", err)
 	}
 	trace.Info("discovered source domain", "domain", cfg.SourceDomain)
-  
-  nvram, err := libvirtsync.DetectNvram(srcXML)
-	if err != nil {
-		return err
-	}
-	if nvram != "" {
-		x, err := util.RemotePathExists(ctx, targetSSHClient, nvram)
-		if err != nil {
-			// Advisory check only (see loader below too) -- inconclusive
-			// isn't the same as "doesn't exist" and must not be reported as
-			// such, but it also doesn't warrant failing the whole sync.
-			trace.Warning("could not check whether nvram file exists on target host", "path", nvram, "error", err)
-		} else if !x {
-			trace.Warning("nvram setting detected in vm config", "path", nvram, "but files do not exist on target host")
-		}
-	}
 
-	loader, lerr := libvirtsync.DetectLoader(srcXML)
-	if lerr != nil {
-		return lerr
-	}
-	if loader != "" {
-		x, err := util.RemotePathExists(ctx, targetSSHClient, loader)
-		if err != nil {
-			trace.Warning("could not check whether loader file exists on target host", "path", loader, "error", err)
-		} else if !x {
-			trace.Warning("loader setting detected in vm config", "path", loader, "but files do not exist on target host")
-		}
-	}
-  
 	qcowDisks, err := disk.ParseQcowDisks(srcXML)
 	if err != nil {
 		return err
@@ -800,6 +771,40 @@ func run(cfg struct {
 	defer cleanupSourceBridge("cleanup")
 	if err := nbdbridge.CheckRemote(ctx, targetSSHClient, bridgeCfg, targetSSHConfig.Address); err != nil {
 		return err
+	}
+
+	// Moved here (was previously checked before targetSSHClient even
+	// existed, so util.RemotePathExists always failed with "ssh client is
+	// not connected" and this warning could never actually fire) -- this is
+	// the earliest point in run() where a check against the target host can
+	// succeed at all.
+	nvram, err := libvirtsync.DetectNvram(srcXML)
+	if err != nil {
+		return err
+	}
+	if nvram != "" {
+		x, err := util.RemotePathExists(ctx, targetSSHClient, nvram)
+		if err != nil {
+			// Advisory check only (see loader below too) -- inconclusive
+			// isn't the same as "doesn't exist" and must not be reported as
+			// such, but it also doesn't warrant failing the whole sync.
+			trace.Warning("could not check whether nvram file exists on target host", "path", nvram, "error", err)
+		} else if !x {
+			trace.Warning("nvram setting detected in vm config", "path", nvram, "but files do not exist on target host")
+		}
+	}
+
+	loader, lerr := libvirtsync.DetectLoader(srcXML)
+	if lerr != nil {
+		return lerr
+	}
+	if loader != "" {
+		x, err := util.RemotePathExists(ctx, targetSSHClient, loader)
+		if err != nil {
+			trace.Warning("could not check whether loader file exists on target host", "path", loader, "error", err)
+		} else if !x {
+			trace.Warning("loader setting detected in vm config", "path", loader, "but files do not exist on target host")
+		}
 	}
 
 	if cfg.Reinit {
