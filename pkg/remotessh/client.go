@@ -87,19 +87,18 @@ func ConfigFromLibvirtURI(libvirtURI, user, keyPath, password, knownHostsPath st
 	}
 	alias := u.Hostname()
 
+	// GetStrict (not the plain Get used everywhere else below) specifically
+	// so a parse error anywhere in ~/.ssh/config -- which would otherwise
+	// silently zero out EVERY lookup against it, indistinguishable from
+	// "no override configured for this host" -- gets surfaced instead of
+	// swallowed.
 	address := alias
-	if hostname := ssh_config.Get(alias, "HostName"); hostname != "" {
+	hostname, hostErr := ssh_config.GetStrict(alias, "HostName")
+	if hostname != "" {
 		address = hostname
 	}
-	// Temporary diagnostic: ssh_config.Get silently returns "" on any
-	// lookup problem (parse error, wrong $HOME, file not found), so a
-	// no-op resolution here is otherwise indistinguishable from "no
-	// override configured for this host". home/homeErr uses the same
-	// resolution as this package's own known_hosts default path, for a
-	// direct comparison against what ssh_config's own (separate) home
-	// directory lookup found.
 	home, homeErr := os.UserHomeDir()
-	trace.Debug("ssh_config host resolution", "alias", alias, "resolved_address", address, "home", home, "home_err", homeErr)
+	trace.Debug("ssh_config host resolution", "alias", alias, "resolved_address", address, "home", home, "home_err", homeErr, "hostname_lookup_err", hostErr)
 
 	resolvedUser := user
 	if resolvedUser == "" && u.User != nil {
