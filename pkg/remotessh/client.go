@@ -25,9 +25,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/kevinburke/ssh_config"
 	"github.com/skeema/knownhosts"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -57,6 +59,22 @@ func (c *Client) LoopbackSelfAddress() string {
 	return net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", c.cfg.Port))
 }
 
+// ConfigFromLibvirtURI builds a Config from a libvirt connection URI
+// (e.g. qemu+ssh://alias/system), consulting ~/.ssh/config (and
+// /etc/ssh/ssh_config, via ssh_config.Get's own standard lookup) for
+// HostName/Port/User/IdentityFile overrides on the URI's host, the same way
+// a plain `ssh alias` would. This matters beyond convenience: if the
+// user's ~/.ssh/config redirects alias to a different HostName (a common
+// pattern -- a short/internal name in the Host block, a real IP or FQDN as
+// HostName), known_hosts records its entry under that resolved HostName,
+// not the alias. Without this, vmsync would dial and check known_hosts
+// under the literal alias from the URI, never matching the real entry --
+// observed directly as a spurious "knownhosts: key is unknown" against a
+// host `ssh alias` itself connects to and verifies without complaint.
+// Values already given explicitly (user, keyPath, port -- i.e. vmsync's own
+// -ssh-user/-ssh-key/-ssh-port flags) always take precedence over whatever
+// ~/.ssh/config says, mirroring how an explicit ssh command-line flag beats
+// its own config file.
 func ConfigFromLibvirtURI(libvirtURI, user, keyPath, password, knownHostsPath string, port int, insecure bool, timeout time.Duration) (Config, error) {
 	u, err := url.Parse(libvirtURI)
 	if err != nil {
@@ -65,31 +83,73 @@ func ConfigFromLibvirtURI(libvirtURI, user, keyPath, password, knownHostsPath st
 	if u.Host == "" {
 		return Config{}, fmt.Errorf("libvirt uri has no host: %s", libvirtURI)
 	}
+	alias := u.Hostname()
+
+	address := alias
+	if hostname := ssh_config.Get(alias, "HostName"); hostname != "" {
+		address = hostname
+	}
 
 	resolvedUser := user
 	if resolvedUser == "" && u.User != nil {
 		resolvedUser = u.User.Username()
 	}
 	if resolvedUser == "" {
+		resolvedUser = ssh_config.Get(alias, "User")
+	}
+	if resolvedUser == "" {
 		resolvedUser = "root"
+	}
+
+	if port <= 0 {
+		if portStr := ssh_config.Get(alias, "Port"); portStr != "" {
+			if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+				port = p
+			}
+		}
 	}
 	if port <= 0 {
 		port = 22
 	}
+
+	resolvedKeyPath := keyPath
+	if resolvedKeyPath == "" {
+		if idFile := ssh_config.Get(alias, "IdentityFile"); idFile != "" {
+			resolvedKeyPath = expandHome(idFile)
+		}
+	}
+
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
 
 	return Config{
-		Address:               u.Hostname(),
+		Address:               address,
 		Port:                  port,
 		User:                  resolvedUser,
-		PrivateKeyPath:        keyPath,
+		PrivateKeyPath:        resolvedKeyPath,
 		Password:              password,
 		InsecureIgnoreHostKey: insecure,
 		KnownHostsPath:        knownHostsPath,
 		Timeout:               timeout,
 	}, nil
+}
+
+// expandHome resolves a leading "~" in an ssh_config IdentityFile value
+// (e.g. "~/.ssh/id_ed25519") -- Go's file APIs, unlike a shell, never do
+// this expansion themselves.
+func expandHome(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[2:])
 }
 
 func Dial(cfg Config) (*Client, error) {
