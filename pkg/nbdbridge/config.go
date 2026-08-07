@@ -119,5 +119,13 @@ func ParseNetBufferSpec(spec string) (block, size string, err error) {
 	if !netbufferSizeRe.MatchString(parts[1]) {
 		return "", "", fmt.Errorf("--netbuffer buffer size %q is invalid (expected a number optionally followed by b/k/m/g/t)", parts[1])
 	}
+	// A zero-byte buffer deadlocks BoundedBuffer.Write forever: it blocks
+	// while curBytes >= maxBytes, which is trivially true from the first
+	// byte when maxBytes is 0, and nothing can ever be dequeued to clear
+	// it. Reject it here so this is a normal startup error instead of a
+	// silent, permanent hang.
+	if bufBytes, err := zstdrelay.ParseByteSize(parts[1]); err == nil && bufBytes <= 0 {
+		return "", "", fmt.Errorf("wrong buffer size")
+	}
 	return parts[0], parts[1], nil
 }
