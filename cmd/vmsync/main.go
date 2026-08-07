@@ -1195,9 +1195,18 @@ func run(cfg struct {
 				return err
 			}
 
-			stopCmd := "kill -9 $(cat " + util.ShQuote(pidFile) + ")"
+			// || true baked in here (not just appended for the deferred/
+			// signal-handler cleanup registration below) so the inline stop
+			// call further down is equally tolerant -- kill -9 returning
+			// non-zero for any reason (process already exited, a pidfile
+			// race) must not abort syncDisk right after a successful copy:
+			// for incremental mode that would abandon the already-copied
+			// delta sitting in the temp overlay, unmerged and uncleaned,
+			// and report a fully successful transfer as a failure. Mirrors
+			// stopVerifyCmd's own pattern below.
+			stopCmd := "kill -9 $(cat " + util.ShQuote(pidFile) + ") || true"
 			stopMu.Lock()
-			targetStopCommands = append(targetStopCommands, stopCmd+" || true")
+			targetStopCommands = append(targetStopCommands, stopCmd)
 			stopMu.Unlock()
 
 			trace.Info("target nbd port in use", "side", "target", "kind", "nbd_export", "disk", d.TargetDev, "host", targetNBDHost, "port", targetPort)
