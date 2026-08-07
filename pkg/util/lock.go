@@ -25,6 +25,16 @@ import (
 	"syscall"
 )
 
+// safeKeyReplacer makes a lock key filesystem-safe reversibly (percent-
+// encoding style), rather than via lossy character substitution -- mapping
+// both "/" and " " to the same "_" would make two different keys (e.g.
+// "web server" and "web_server") sanitize to the identical lock filename,
+// causing spurious lock contention between two completely unrelated
+// domains. "%" is escaped first (to itself, doubled) specifically so a key
+// that already happens to contain a literal "%" can never collide with one
+// of these escape sequences appearing "naturally" in another key.
+var safeKeyReplacer = strings.NewReplacer("%", "%%", "/", "%2f", " ", "%20")
+
 // AcquireRunLock takes an exclusive, non-blocking advisory lock (flock)
 // scoped to key (e.g. the source domain name), so two vmsync invocations can
 // never run concurrently for the same key -- regardless of what launched
@@ -41,7 +51,7 @@ func AcquireRunLock(dir, key string) (*os.File, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("create lock dir %s: %w", dir, err)
 	}
-	safeKey := strings.NewReplacer("/", "_", " ", "_").Replace(key)
+	safeKey := safeKeyReplacer.Replace(key)
 	path := filepath.Join(dir, safeKey+".lock")
 
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
