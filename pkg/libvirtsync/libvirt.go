@@ -155,10 +155,21 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 	}
 	if exists {
 		trace.Info("Undefining domain on target system", "vm", targetDomainName)
-		d, _ := target.Conn.LookupDomainByName(targetDomainName)
-		if err := d.Undefine(); err != nil {
-			trace.Warning("Unable to undefine existing target domain, skipping redefine")
-			return nil
+		d, err := target.Conn.LookupDomainByName(targetDomainName)
+		if err != nil {
+			return fmt.Errorf("look up existing target domain %s for undefine: %w", targetDomainName, err)
+		}
+		defer d.Free()
+		// KEEP_NVRAM: vmsync never copies or manages a domain's NVRAM/
+		// varstore file itself (see DetectNvram -- it only checks the file
+		// already exists on the target and warns if not), so undefining
+		// here must not delete it out from under whatever provisioned it.
+		// Undefine() (no flags) unconditionally refuses to undefine any
+		// domain that has an NVRAM file present at all, which is exactly
+		// why this previously failed -- silently, since the error was
+		// swallowed -- for every UEFI/OVMF target domain.
+		if err := d.UndefineFlags(libvirt.DOMAIN_UNDEFINE_KEEP_NVRAM); err != nil {
+			return fmt.Errorf("undefine existing target domain %s: %w", targetDomainName, err)
 		}
 	}
 
