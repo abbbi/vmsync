@@ -15,7 +15,7 @@ jobs:
       # release binaries -- kept in sync deliberately, so this workflow
       # exercises the same cgo dependencies (libnbd, libvirt) the actual
       # vmsync binary needs, not a stripped-down approximation of them.
-      - name: Install system dependencies (cgo: libnbd, libvirt)
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc git libnbd-dev libvirt-dev libc6-dev
