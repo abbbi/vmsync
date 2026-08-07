@@ -108,6 +108,25 @@ func serve(listenAddr, connectAddr string, compress bool, algo zstdrelay.Algo, l
 	}
 }
 
+// recoverRelayPanic runs fn, converting any panic into a returned error
+// instead of letting it escape the calling goroutine. handleConn's own
+// recover() (below) only protects its own goroutine stack; it spawns two
+// more goroutines to do the actual bidirectional relay, and a panic on
+// either of those stacks is not caught by that outer recover -- an
+// unrecovered panic there would still crash this whole process and every
+// other connection it's currently serving, exactly the failure handleConn's
+// own recover was meant to prevent in the first place. label identifies
+// which direction panicked in the logged message, for diagnosability.
+func recoverRelayPanic(label string, fn func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: recovered from panic in %s: %v\n", label, r)
+			err = fmt.Errorf("panic in %s: %v", label, r)
+		}
+	}()
+	return fn()
+}
+
 // handleConn serves exactly one accepted connection: dial the real NBD
 // endpoint and relay bidirectionally until either side is done. It never
 // lets a panic escape -- unlike the old one-process-per-connection model
@@ -144,10 +163,13 @@ func handleConn(conn net.Conn, connectAddr string, compress bool, algo zstdrelay
 	// conn (wire, compressed/buffered client traffic) -> [buffer] -> [decompress] -> real (plaintext, to the real NBD server)
 	go func() {
 		defer wg.Done()
-		reportErr(zstdrelay.RelayFromWire(real, conn, compress, algo, netbufferBlock, netbufferSize, nil))
-		if tc, ok := real.(*net.TCPConn); ok {
-			tc.CloseWrite() // half-close: tell the real server we're done sending
-		}
+		reportErr(recoverRelayPanic("inbound relay (conn -> real)", func() error {
+			err := zstdrelay.RelayFromWire(real, conn, compress, algo, netbufferBlock, netbufferSize, nil)
+			if tc, ok := real.(*net.TCPConn); ok {
+				tc.CloseWrite() // half-close: tell the real server we're done sending
+			}
+			return err
+		}))
 	}()
 
 	// real (plaintext, from the real NBD server) -> [compress+flush] -> [buffer] -> conn (wire, back to the client)
@@ -162,10 +184,13 @@ func handleConn(conn net.Conn, connectAddr string, compress bool, algo zstdrelay
 	// diagnosed via a SIGQUIT goroutine dump on the opposite direction).
 	go func() {
 		defer wg.Done()
-		reportErr(zstdrelay.Relay(conn, real, compress, algo, level, netbufferBlock, netbufferSize, nil))
-		if tc, ok := conn.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
+		reportErr(recoverRelayPanic("outbound relay (real -> conn)", func() error {
+			err := zstdrelay.Relay(conn, real, compress, algo, level, netbufferBlock, netbufferSize, nil)
+			if tc, ok := conn.(*net.TCPConn); ok {
+				tc.CloseWrite()
+			}
+			return err
+		}))
 	}()
 
 	wg.Wait()
