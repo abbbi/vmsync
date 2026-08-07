@@ -28,9 +28,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/skeema/knownhosts"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
-	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 type Config struct {
@@ -93,7 +93,7 @@ func ConfigFromLibvirtURI(libvirtURI, user, keyPath, password, knownHostsPath st
 }
 
 func Dial(cfg Config) (*Client, error) {
-	hostKeyCallback, err := buildHostKeyCallback(cfg)
+	hostKeyCallback, hostKeyAlgorithms, err := buildHostKeyCallback(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -104,10 +104,16 @@ func Dial(cfg Config) (*Client, error) {
 	}
 
 	sshCfg := &ssh.ClientConfig{
-		User:            cfg.User,
-		Auth:            authMethods,
-		HostKeyCallback: hostKeyCallback,
-		Timeout:         cfg.Timeout,
+		User: cfg.User,
+		Auth: authMethods,
+		// Empty (not nil) for an as-yet-unknown host, or when
+		// InsecureIgnoreHostKey is set -- the ssh library falls back to its
+		// own default algorithm order in that case, same as before this
+		// fix; see buildHostKeyCallback's own comment for why this is set
+		// at all.
+		HostKeyAlgorithms: hostKeyAlgorithms,
+		HostKeyCallback:   hostKeyCallback,
+		Timeout:           cfg.Timeout,
 	}
 
 	address := net.JoinHostPort(cfg.Address, fmt.Sprintf("%d", cfg.Port))
@@ -265,21 +271,37 @@ func signerFromPath(path string) (ssh.Signer, error) {
 	return signer, nil
 }
 
-func buildHostKeyCallback(cfg Config) (ssh.HostKeyCallback, error) {
+// buildHostKeyCallback returns both the host key verification callback and
+// the host key algorithms to request during key exchange, sourced from the
+// same known_hosts data. Both are needed together because of a
+// well-documented gap in the plain golang.org/x/crypto/ssh/knownhosts
+// package (see golang/go#49631): left to its own defaults, the Go SSH
+// client's preferred host key algorithm order can differ from OpenSSH's, so
+// a server offering multiple host key types (RSA, ECDSA, ed25519 -- common)
+// may end up presenting a DIFFERENT, equally valid type than the one
+// actually recorded in known_hosts. The result is a spurious "knownhosts:
+// key is unknown" even though the host genuinely is trusted -- observed
+// directly against a host that a plain `ssh` connected to without any
+// complaint, using the exact same known_hosts file. github.com/skeema/knownhosts
+// wraps the same file/format but additionally exposes the algorithm(s)
+// actually recorded for a given host, letting the client request exactly
+// those up front instead of leaving the choice to chance.
+func buildHostKeyCallback(cfg Config) (ssh.HostKeyCallback, []string, error) {
 	if cfg.InsecureIgnoreHostKey {
-		return ssh.InsecureIgnoreHostKey(), nil
+		return ssh.InsecureIgnoreHostKey(), nil, nil
 	}
 	knownHostsPath := cfg.KnownHostsPath
 	if knownHostsPath == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return nil, fmt.Errorf("get user home for known_hosts: %w", err)
+			return nil, nil, fmt.Errorf("get user home for known_hosts: %w", err)
 		}
 		knownHostsPath = filepath.Join(home, ".ssh", "known_hosts")
 	}
-	cb, err := knownhosts.New(knownHostsPath)
+	db, err := knownhosts.NewDB(knownHostsPath)
 	if err != nil {
-		return nil, fmt.Errorf("load known_hosts %s: %w", knownHostsPath, err)
+		return nil, nil, fmt.Errorf("load known_hosts %s: %w", knownHostsPath, err)
 	}
-	return cb, nil
+	hostWithPort := net.JoinHostPort(cfg.Address, fmt.Sprintf("%d", cfg.Port))
+	return db.HostKeyCallback(), db.HostKeyAlgorithms(hostWithPort), nil
 }
