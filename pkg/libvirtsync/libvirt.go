@@ -148,7 +148,13 @@ func DomainExists(conn *libvirt.Connect, name string) (bool, error) {
 	return true, nil
 }
 
-func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML string, targetDiskPath string) error {
+// DefineDomain (re)defines targetDomainName on target from sourceDomainXML.
+// rootSourceByLiveSource maps each disk's live source path to its resolved
+// backing-chain root file (see disk.QcowDisk.RootSource) -- passed straight
+// through to replaceDomainDiskPath so the domain definition names disks the
+// same way the actual data copy does; pass nil/empty if targetDiskPath is
+// also empty (no disk-path rewriting requested at all).
+func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML string, targetDiskPath string, rootSourceByLiveSource map[string]string) error {
 	exists, err := DomainExists(target.Conn, targetDomainName)
 	if err != nil {
 		return fmt.Errorf("check target domain existence: %w", err)
@@ -181,7 +187,7 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 
 	// Keep source XML intact (including UUID) unless libvirt rejects duplicate UUID.
 	if targetDiskPath != "" {
-		updatedXML, err = replaceDomainDiskPath(updatedXML, targetDiskPath)
+		updatedXML, err = replaceDomainDiskPath(updatedXML, targetDiskPath, rootSourceByLiveSource)
 		if err != nil {
 			return fmt.Errorf("rewrite target domain xml: %w", err)
 		}
@@ -215,7 +221,20 @@ func ThawFs(srcDom *libvirt.Domain, freezed bool) {
 	}
 }
 
-func replaceDomainDiskPath(domainXML, targetDiskPath string) (string, error) {
+// replaceDomainDiskPath rewrites each non-ignored disk's <source file> to its
+// target-side path. rootSourceByLiveSource maps a disk's live Source path (as
+// currently written in domainXML) to its resolved backing-chain root file --
+// see disk.QcowDisk.RootSource's own doc comment for why this distinction
+// matters: the live Source can point at an external-snapshot overlay that
+// was never actually copied to the target under that name, while RootSource
+// is the stable base filename the sync's own data-copy path always uses.
+// Without this, the domain definition and the actual replicated file could
+// silently disagree on the disk's name the moment an external snapshot
+// exists. A disk missing from the map falls back to its own live Source --
+// shouldn't happen for anything ParseQcowDisks would also have picked up,
+// since both apply the same IgnoreDevice filter, but degrades safely rather
+// than panicking on a nil map lookup if it ever does.
+func replaceDomainDiskPath(domainXML, targetDiskPath string, rootSourceByLiveSource map[string]string) (string, error) {
 	domcfg := &libvirtxml.Domain{}
 	err := domcfg.Unmarshal(domainXML)
 	if err != nil {
@@ -232,7 +251,12 @@ func replaceDomainDiskPath(domainXML, targetDiskPath string) (string, error) {
 			continue
 		}
 
-		domcfg.Devices.Disks[i].Source.File.File = util.SetTargetPath(targetDiskPath, d.Source.File.File)
+		liveSource := d.Source.File.File
+		rootSource := liveSource
+		if resolved, ok := rootSourceByLiveSource[liveSource]; ok {
+			rootSource = resolved
+		}
+		domcfg.Devices.Disks[i].Source.File.File = util.SetTargetPath(targetDiskPath, rootSource)
 	}
 
 	changed, err := domcfg.Marshal()

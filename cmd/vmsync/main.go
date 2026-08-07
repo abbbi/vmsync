@@ -1383,7 +1383,17 @@ func run(cfg struct {
 		newXML = srcXML
 	}
 
-	if err := libvirtsync.DefineDomain(tgtMgr, cfg.TargetDomain, newXML, cfg.TargetDiskPath); err != nil {
+	// Maps each disk's live Source path to its resolved backing-chain root
+	// file, so DefineDomain names the disk in the target's domain XML the
+	// same way the actual data copy already does (see
+	// disk.QcowDisk.RootSource's own doc comment) -- otherwise, whenever an
+	// external snapshot exists, the domain definition and the real
+	// replicated file would silently disagree on the disk's name.
+	rootSourceByLiveSource := make(map[string]string, len(qcowDisks))
+	for _, d := range qcowDisks {
+		rootSourceByLiveSource[d.Source] = d.RootSource
+	}
+	if err := libvirtsync.DefineDomain(tgtMgr, cfg.TargetDomain, newXML, cfg.TargetDiskPath, rootSourceByLiveSource); err != nil {
 		return err
 	}
 
