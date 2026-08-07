@@ -234,27 +234,49 @@ func NewBoundedBuffer(maxBytes int) *BoundedBuffer {
 	return b
 }
 
-// Write enqueues a copy of p, blocking while the buffer is full. It never
-// partially writes: once it returns with a nil error, all of p has been
-// enqueued.
+// Write enqueues a copy of p, blocking while the buffer is full. From the
+// caller's perspective it never partially writes: once it returns with a
+// nil error, all of p has been enqueued. Internally, though, a single call
+// can be split across several bounded sub-writes -- each capped at however
+// much room is actually left -- rather than appending p in one shot
+// whenever the buffer merely isn't full *yet*. Without that, a single large
+// p (e.g. io.Copy's default 32KB internal buffer, used whenever compression
+// is off) could push curBytes well past maxBytes before the next Write call
+// ever sees the buffer as full, silently breaking the "at most maxBytes"
+// guarantee this type's own doc comment makes.
 func (b *BoundedBuffer) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for b.curBytes >= b.maxBytes && !b.closed {
-		b.notFull.Wait()
+	written := 0
+	for len(p) > 0 {
+		for b.curBytes >= b.maxBytes && !b.closed {
+			b.notFull.Wait()
+		}
+		if b.closed {
+			// written may be > 0 here: some earlier iteration of this same
+			// call could have already enqueued data before the buffer was
+			// closed out from under a later one. Reporting that accurately
+			// matters to callers like io.Copy, which accumulate whatever a
+			// Writer reports even alongside a non-nil error.
+			return written, io.ErrClosedPipe
+		}
+		room := b.maxBytes - b.curBytes
+		n := len(p)
+		if n > room {
+			n = room
+		}
+		cp := make([]byte, n)
+		copy(cp, p[:n])
+		b.chunks = append(b.chunks, cp)
+		b.curBytes += n
+		b.notEmpty.Signal()
+		p = p[n:]
+		written += n
 	}
-	if b.closed {
-		return 0, io.ErrClosedPipe
-	}
-	cp := make([]byte, len(p))
-	copy(cp, p)
-	b.chunks = append(b.chunks, cp)
-	b.curBytes += len(cp)
-	b.notEmpty.Signal()
-	return len(p), nil
+	return written, nil
 }
 
 // Read dequeues whatever is available, blocking while the buffer is empty
