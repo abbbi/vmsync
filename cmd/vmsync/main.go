@@ -964,7 +964,20 @@ func run(cfg struct {
 		}
 	}
 
-	if srcState {
+	// A fresh state check, not the srcState captured before this point --
+	// srcState comes from DomainActive (true for RUNNING and PAUSED alike),
+	// so it goes stale the moment -verify suspends a running domain above.
+	// FSFreeze needs the guest agent to actually service the request, which
+	// requires the vCPUs to be scheduled -- attempting it against a paused
+	// domain (whether paused by -verify just now, or already paused before
+	// this run started) always fails, and isn't a real degradation anyway:
+	// a paused domain's disk is already static, at least as consistent as
+	// a successful freeze would have made it.
+	freezeState, _, err := srcDom.GetState()
+	if err != nil {
+		return fmt.Errorf("check source domain state before filesystem freeze: %w", err)
+	}
+	if freezeState == libvirt.DOMAIN_RUNNING {
 		if err := srcDom.FSFreeze(nil, 0); err != nil {
 			trace.Warning("Filesystem freeze failed", "error", err)
 			fsFreezeFailed = true
