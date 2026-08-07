@@ -294,6 +294,20 @@ func run(cfg struct {
 	var stopMu sync.Mutex
 	targetStopCommands := make([]string, 0)
 	sourceStopCommands := make([]string, 0)
+	// checkpointMu guards checkpointName/checkpointAdvanced specifically
+	// against the signal handler's own goroutine (started further down),
+	// which reads both to decide whether there's a checkpoint to clean up
+	// on Ctrl+C/SIGTERM -- every other read/write of these two happens
+	// sequentially within run()'s own goroutine (checkpoint creation runs
+	// entirely before the per-disk goroutines are spawned, and the
+	// end-of-run reads happen after wg.Wait() has already joined them), so
+	// only the two writes below and the signal handler's read actually need
+	// it. Without this, a signal landing between CreateCheckpoint
+	// succeeding and checkpointAdvanced being set could make the handler
+	// observe a stale "not advanced", skip deleting a checkpoint that
+	// genuinely exists now, and leave it orphaned for the next run to trip
+	// over.
+	var checkpointMu sync.Mutex
 	var checkpointName string
 	var parent string
 	// checkpointAdvanced is true once CreateCheckpoint below has actually
@@ -635,21 +649,29 @@ func run(cfg struct {
 			go func() { defer cleanupWg.Done(); resumeSource(sig.String()) }()
 			go func() {
 				defer cleanupWg.Done()
+				// Snapshot both under checkpointMu, once, rather than
+				// reading each separately -- a signal landing between
+				// CreateCheckpoint succeeding and checkpointAdvanced being
+				// set must see either the fully-pre-checkpoint state or the
+				// fully-post-checkpoint state, never a stale mix of the two.
+				checkpointMu.Lock()
+				name, advanced := checkpointName, checkpointAdvanced
+				checkpointMu.Unlock()
 				// Mirrors the deferred checkpoint cleanup further down in
 				// run() -- duplicated here because that defer never gets a
 				// chance to run if we os.Exit below without waiting for it.
-				if checkpointName == "" || !checkpointAdvanced {
+				if name == "" || !advanced {
 					return
 				}
 				if err := callWithTimeout("delete checkpoint", 5*time.Second, func() error {
-					return libvirtsync.DeleteCheckpointIfExists(srcDom, checkpointName)
+					return libvirtsync.DeleteCheckpointIfExists(srcDom, name)
 				}); err != nil {
-					trace.Error("failed to delete checkpoint after interrupt", "checkpoint", checkpointName, "error", err)
-					if retryErr := libvirtsync.DeleteCheckpointViaReconnect(cfg.SourceURI, cfg.SourceDomain, checkpointName); retryErr != nil {
-						trace.Error("failed to delete checkpoint via reconnect after interrupt", "checkpoint", checkpointName, "error", retryErr)
+					trace.Error("failed to delete checkpoint after interrupt", "checkpoint", name, "error", err)
+					if retryErr := libvirtsync.DeleteCheckpointViaReconnect(cfg.SourceURI, cfg.SourceDomain, name); retryErr != nil {
+						trace.Error("failed to delete checkpoint via reconnect after interrupt", "checkpoint", name, "error", retryErr)
 					}
 				} else {
-					trace.Info("removed checkpoint after interrupt", "checkpoint", checkpointName)
+					trace.Info("removed checkpoint after interrupt", "checkpoint", name)
 				}
 			}()
 			cleanupWg.Wait()
@@ -881,7 +903,9 @@ func run(cfg struct {
 	if err != nil {
 		return err
 	}
+	checkpointMu.Lock()
 	checkpointName, parent, err = libvirtsync.NextCheckpointName(existing)
+	checkpointMu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -1031,7 +1055,9 @@ func run(cfg struct {
 		}
 		trace.Warning("checkpoint creation blocked by an existing external snapshot on the source domain; syncing incrementally against the existing checkpoint without advancing the checkpoint chain", "attempted_checkpoint", checkpointName, "parent", parent, "error", err)
 	} else {
+		checkpointMu.Lock()
 		checkpointAdvanced = true
+		checkpointMu.Unlock()
 	}
 	libvirtsync.ThawFs(srcDom, freezed)
 
