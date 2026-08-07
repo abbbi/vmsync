@@ -547,43 +547,76 @@ copyLoop:
 // CopyExtentsTCP for the same ioDepth (2 * ioDepth * negotiated buffer
 // size), which is why ioDepth isn't given a separate, larger default here.
 func CompareTCP(ctx context.Context, aHost string, aPort int, aExport string, bHost string, bPort int, ioDepth int) error {
+	_, err := compareTCP(ctx, aHost, aPort, aExport, bHost, bPort, ioDepth, false)
+	return err
+}
+
+// MismatchRange is a byte range where source and target bytes differed.
+// Deliberately distinct from Extent (which carries Dirty/allocation
+// semantics that don't apply here), so a caller can't accidentally conflate
+// a mismatch range with a ChangedExtentsTCP dirty-bitmap range.
+type MismatchRange struct {
+	Offset uint64
+	Length uint64
+}
+
+// CompareTCPCollect is CompareTCP, except it scans the entire image even
+// past the first mismatch, returning every mismatched range instead of
+// aborting on the first one. For -verify-online, where a lone mismatch is
+// inconclusive on its own (the guest may have legitimately written there
+// during the compare) and must be cross-referenced against a dirty bitmap
+// afterward -- which needs every mismatch, not just the first. A genuine
+// I/O/protocol error (never a data mismatch) still aborts immediately, same
+// as CompareTCP; mismatches reflects whatever was collected before such an
+// abort, mirroring CopyExtentsTCP's own "return partial progress on error"
+// contract.
+func CompareTCPCollect(ctx context.Context, aHost string, aPort int, aExport string, bHost string, bPort int, ioDepth int) ([]MismatchRange, error) {
+	return compareTCP(ctx, aHost, aPort, aExport, bHost, bPort, ioDepth, true)
+}
+
+// compareTCP is the shared implementation behind CompareTCP and
+// CompareTCPCollect. With collectMismatches false, it's byte-for-byte
+// CompareTCP's original behavior: the first mismatch aborts immediately and
+// is the sole error. With it true, mismatches are appended to the returned
+// slice and the scan continues to the end of the image.
+func compareTCP(ctx context.Context, aHost string, aPort int, aExport string, bHost string, bPort int, ioDepth int, collectMismatches bool) (mismatches []MismatchRange, err error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	a, err := nbd.Create()
 	if err != nil {
-		return fmt.Errorf("create source nbd handle: %w", err)
+		return nil, fmt.Errorf("create source nbd handle: %w", err)
 	}
 	defer a.Close()
 
 	b, err := nbd.Create()
 	if err != nil {
-		return fmt.Errorf("create target nbd handle: %w", err)
+		return nil, fmt.Errorf("create target nbd handle: %w", err)
 	}
 	defer b.Close()
 
 	if aExport != "" {
 		if err := a.SetExportName(aExport); err != nil {
-			return fmt.Errorf("set source export name %s: %w", aExport, err)
+			return nil, fmt.Errorf("set source export name %s: %w", aExport, err)
 		}
 	}
 	if err := a.ConnectTcp(aHost, strconv.Itoa(aPort)); err != nil {
-		return fmt.Errorf("connect source nbd tcp %s:%d: %w", aHost, aPort, err)
+		return nil, fmt.Errorf("connect source nbd tcp %s:%d: %w", aHost, aPort, err)
 	}
 	if err := b.ConnectTcp(bHost, strconv.Itoa(bPort)); err != nil {
-		return fmt.Errorf("connect target nbd tcp %s:%d: %w", bHost, bPort, err)
+		return nil, fmt.Errorf("connect target nbd tcp %s:%d: %w", bHost, bPort, err)
 	}
 
 	sizeA, err := a.GetSize()
 	if err != nil {
-		return fmt.Errorf("nbd get source size: %w", err)
+		return nil, fmt.Errorf("nbd get source size: %w", err)
 	}
 	sizeB, err := b.GetSize()
 	if err != nil {
-		return fmt.Errorf("nbd get target size: %w", err)
+		return nil, fmt.Errorf("nbd get target size: %w", err)
 	}
 	if sizeA != sizeB {
-		return fmt.Errorf("image size mismatch: source=%d target=%d", sizeA, sizeB)
+		return nil, fmt.Errorf("image size mismatch: source=%d target=%d", sizeA, sizeB)
 	}
 	size := sizeA
 
@@ -786,13 +819,17 @@ compareLoop:
 				continue
 			}
 			match := bytes.Equal(slots[i].bufA.Slice(), slots[i].bufB.Slice())
+			offset, length := slots[i].offset, slots[i].length
 			slots[i].bufA.Free()
 			slots[i].bufB.Free()
 			slots[i].stateA = sideIdle
 			slots[i].stateB = sideIdle
 			if !match {
-				compareErr = fmt.Errorf("images differ: mismatch in chunk at offset=%d length=%d", slots[i].offset, slots[i].length)
-				break compareLoop
+				if !collectMismatches {
+					compareErr = fmt.Errorf("images differ: mismatch in chunk at offset=%d length=%d", offset, length)
+					break compareLoop
+				}
+				mismatches = append(mismatches, MismatchRange{Offset: offset, Length: length})
 			}
 		}
 	}
@@ -872,11 +909,11 @@ compareLoop:
 	}
 
 	if compareErr != nil {
-		return compareErr
+		return mismatches, compareErr
 	}
 
-	trace.Info("nbd compare complete", "device", aExport, "bytes", size, "elapsed", time.Since(start).Round(time.Millisecond).String())
-	return nil
+	trace.Info("nbd compare complete", "device", aExport, "bytes", size, "mismatches", len(mismatches), "elapsed", time.Since(start).Round(time.Millisecond).String())
+	return mismatches, nil
 }
 
 func WaitForTCPExport(host string, port int, timeout time.Duration) error {
