@@ -551,22 +551,32 @@ func ListManagedCheckpoints(dom *libvirt.Domain) ([]Checkpoint, error) {
 
 	var out []Checkpoint
 	for _, c := range cpts {
-		name, err := c.GetName()
-		if err != nil {
-			continue
-		}
-		if !strings.HasPrefix(name, CheckpointPrefix+"-") {
-			continue
-		}
+		// ListAllCheckpoints returns every checkpoint on the domain, not
+		// just vmsync's own -- the prefix check below is what filters those
+		// out. Each entry's handle must be freed regardless of which path
+		// is taken, so this runs the per-checkpoint logic in its own
+		// closure with a single defer covering all of them, rather than
+		// needing a Free() call before every continue.
+		cp, ok := func() (Checkpoint, bool) {
+			defer c.Free()
+			name, err := c.GetName()
+			if err != nil {
+				return Checkpoint{}, false
+			}
+			if !strings.HasPrefix(name, CheckpointPrefix+"-") {
+				return Checkpoint{}, false
+			}
 
-		xmlDesc, err := c.GetXMLDesc(0)
-		if err != nil {
-			continue
-		}
+			xmlDesc, err := c.GetXMLDesc(0)
+			if err != nil {
+				return Checkpoint{}, false
+			}
 
-		cp := parseCheckpointXML(name, xmlDesc)
-		out = append(out, cp)
-		_ = c.Free()
+			return parseCheckpointXML(name, xmlDesc), true
+		}()
+		if ok {
+			out = append(out, cp)
+		}
 	}
 
 	sort.Slice(out, func(i, j int) bool {
