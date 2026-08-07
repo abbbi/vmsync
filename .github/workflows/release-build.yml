@@ -1,0 +1,40 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [rocky_93, rocky_101, debian_trixie, debian_unstable]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      # Not guaranteed present on every runner image, so install explicitly
+      # rather than depend on it.
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      # Builds inside a container matching the target OS (see Dockerfile /
+      # Dockerfile.debian), so the binary links against that OS's own glibc
+      # -- e.g. rocky_93 produces a glibc-2.34-linked binary, matching
+      # RHEL/Rocky 9.x's fleet-wide glibc version, rather than whatever this
+      # runner itself happens to ship.
+      - name: Build (make ${{ matrix.target }})
+        run: make ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: vmsync_*/
+          if-no-files-found: error
