@@ -902,17 +902,25 @@ func run(cfg struct {
 		}
 	} else {
 		if tgtState, err = libvirtsync.DomainActive(tgtDom); err != nil {
+			tgtDom.Free()
 			return err
 		}
 		if tgtState == true {
+			tgtDom.Free()
 			return fmt.Errorf("target domain %s is active require shutoff before sync", cfg.TargetDomain)
 		}
 		trace.Info("Target domain exists, parse metadata info")
 
 		tgtXML, err := tgtDom.GetXMLDesc(0)
 		if err != nil {
+			tgtDom.Free()
 			return fmt.Errorf("read source domain xml: %w", err)
 		}
+		// tgtDom itself isn't touched again past this point -- only tgtXML
+		// (the plain string already extracted from it) is used below -- so
+		// free it here rather than holding the target-side libvirt handle
+		// open for the rest of this (potentially long-running) sync.
+		tgtDom.Free()
 
 		metadataEntryCheckpoint, err = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastCheckpoint)
 		metadataEntryTimestamp, err = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastSync)
@@ -942,7 +950,6 @@ func run(cfg struct {
 				trace.Info("Successfully verified target file timestamps")
 			}
 		}
-		defer tgtDom.Free()
 	}
 
 	if parent == "" {
