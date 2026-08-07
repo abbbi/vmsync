@@ -27,11 +27,18 @@ import (
 	"strings"
 )
 
-// StateSuccess and StateFailure are the only two values RunMetric.State
-// takes -- there is no partial/degraded "warning" state in vmsync today.
+// StateSuccess, StateFailure, and StateFSFreezeFailed are the values
+// RunMetric.State takes. StateFSFreezeFailed is a degraded-but-not-failed
+// outcome: the sync itself completed, but the guest filesystem couldn't be
+// quiesced first (no/unresponsive guest agent, guest doesn't support it,
+// ...), so the resulting checkpoint is only crash-consistent, not
+// application-consistent -- worth alerting on separately from a clean
+// success, but not worth failing the whole run over, since vmsync already
+// tolerates a failed freeze and proceeds (see cmd/vmsync's own handling).
 const (
-	StateSuccess = 0
-	StateFailure = 1
+	StateSuccess        = 0
+	StateFailure        = 1
+	StateFSFreezeFailed = 2
 )
 
 // DiskMetric holds one disk's sync result, ready to be rendered into the
@@ -134,7 +141,7 @@ func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 			m.SourceHost, m.TargetHost, m.VM, m.Disk, m.DurationSeconds)
 	}
 
-	fmt.Fprintln(&b, "# HELP vmsync_sync_state Result of the last vmsync run as a whole (0=success, 1=failure).")
+	fmt.Fprintln(&b, "# HELP vmsync_sync_state Result of the last vmsync run as a whole (0=success, 1=failure, 2=succeeded but guest filesystem freeze failed -- checkpoint is only crash-consistent, not application-consistent).")
 	fmt.Fprintln(&b, "# TYPE vmsync_sync_state gauge")
 	fmt.Fprintf(&b, "vmsync_sync_state{source_host=%q,target_host=%q,vm=%q} %d\n",
 		run.SourceHost, run.TargetHost, run.VM, run.State)
@@ -154,7 +161,7 @@ func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 	// verified anything must not emit these at all, rather than a
 	// misleadingly-successful-looking 0.
 	if run.VerificationRan {
-		fmt.Fprintln(&b, "# HELP vmsync_verification_state Result of the last -verify run as a whole (0=success, 1=failure). Only present for runs that had -verify set.")
+		fmt.Fprintln(&b, "# HELP vmsync_verification_state Mirrors vmsync_sync_state for the same run (0=success, 1=failure, 2=succeeded but guest filesystem freeze failed). Only present for runs that had -verify set.")
 		fmt.Fprintln(&b, "# TYPE vmsync_verification_state gauge")
 		fmt.Fprintf(&b, "vmsync_verification_state{source_host=%q,target_host=%q,vm=%q} %d\n",
 			run.SourceHost, run.TargetHost, run.VM, run.VerificationState)

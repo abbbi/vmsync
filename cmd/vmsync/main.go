@@ -305,6 +305,7 @@ func run(cfg struct {
 	// target metadata) should treat checkpointName as if it exists.
 	var checkpointAdvanced bool
 	var freezed bool = false
+	var fsFreezeFailed bool = false
 	var started bool = false
 	var metricsMu sync.Mutex
 	diskMetrics := make([]metrics.DiskMetric, 0)
@@ -387,6 +388,11 @@ func run(cfg struct {
 		state := metrics.StateSuccess
 		if runErr != nil {
 			state = metrics.StateFailure
+		} else if fsFreezeFailed {
+			// A failed run (above) always takes priority over this -- a
+			// degraded-but-completed freeze is meaningfully less severe than
+			// the sync not having completed at all.
+			state = metrics.StateFSFreezeFailed
 		}
 		writeMetricsTextfile(state)
 	}()
@@ -960,6 +966,7 @@ func run(cfg struct {
 	if srcState {
 		if err := srcDom.FSFreeze(nil, 0); err != nil {
 			trace.Warning("Filesystem freeze failed", "error", err)
+			fsFreezeFailed = true
 		} else {
 			freezed = true
 			trace.Info("Successfully freezed file systems using guest agent")
