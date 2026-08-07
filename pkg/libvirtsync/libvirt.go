@@ -747,10 +747,11 @@ func ExternalSnapshotCount(dom *libvirt.Domain) (int, error) {
 // documented rejection of checkpoint creation while an external snapshot
 // exists on the domain: "the creation of checkpoints when external
 // snapshots exist is currently forbidden" (see
-// https://libvirt.org/formatcheckpoint.html). Matched on the error text --
-// like StopBackup's own "no current job" check just below -- rather than a
-// dedicated error code, since libvirt reports this as a generic
-// invalid-operation error with no code of its own specific to this case.
+// https://libvirt.org/formatcheckpoint.html). Matched on the error text
+// rather than a dedicated error code, since libvirt reports this as a
+// generic invalid-operation error with no code of its own specific to this
+// case -- unlike StopBackup just below, which has a structured alternative
+// available and uses that instead.
 func IsCheckpointBlockedBySnapshot(err error) bool {
 	if err == nil {
 		return false
@@ -758,11 +759,30 @@ func IsCheckpointBlockedBySnapshot(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "snapshot")
 }
 
+// StopBackup aborts any pull-backup job in progress on dom, tolerating the
+// case where none is running (already stopped, or never started -- e.g. the
+// retry-via-reconnect path after a primary stop that actually succeeded
+// server-side but timed out client-side). Checks GetJobInfo first rather
+// than relying solely on pattern-matching AbortJob's own error text: whether
+// there's currently no job at all is exposed as a stable, structured enum
+// (DomainJobType, verified directly against libvirt-go's own source), not a
+// message string whose exact wording can vary across libvirt versions --
+// which is exactly why the previous version of this function's text match
+// ("no current job") never actually matched libvirt's real message and this
+// short-circuit could never fire.
 func StopBackup(dom *libvirt.Domain) error {
+	if info, err := dom.GetJobInfo(); err == nil && info.Type == libvirt.DOMAIN_JOB_NONE {
+		return nil
+	}
 	if err := dom.AbortJob(); err != nil {
+		// Fallback for the rare case GetJobInfo above didn't catch it (e.g.
+		// it errored itself) -- kept, but not relied upon. If this still
+		// doesn't match in practice, the Debug log captures the real text
+		// so it can be fixed with actual data instead of another guess.
 		if strings.Contains(strings.ToLower(err.Error()), "no current job") {
 			return nil
 		}
+		trace.Debug("abort backup job failed", "error", err)
 		return fmt.Errorf("abort backup job: %w", err)
 	}
 	return nil
