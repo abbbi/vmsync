@@ -86,6 +86,7 @@ func main() {
 		PrometheusTextfile     string
 		IgnoreExternalSnapshot bool
 		Verify                 bool
+		VerifyFast             bool
 		ShowVersion            bool
 	}
 
@@ -119,7 +120,8 @@ func main() {
 	flag.IntVar(&cfg.IODepth, "io-depth", 8, "Number of NBD read/write pairs to keep in flight simultaneously during the disk copy, instead of waiting for each to fully complete before starting the next. Higher values can hide more per-chunk round-trip latency (real disk I/O plus NBD protocol overhead on both ends), at the cost of io-depth times the negotiated NBD block size in memory. Must be at least 1.")
 	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write sync metrics to this path in Prometheus textfile-collector format: per disk, source/target host, vm, disk size, transferred and compressed-transferred bytes, and duration; plus one overall success/failure state for the whole run. Written atomically (temp file + rename). Empty disables it (default).")
 	flag.BoolVar(&cfg.IgnoreExternalSnapshot, "ignore-external-snapshot", false, "If the source domain currently has any external disk snapshot, skip this run entirely -- no sync attempt, no -prometheus-textfile write, same clean no-op as losing the per-domain run lock. Default (false): sync anyway, incrementally against the existing checkpoint, since libvirt blocks creating a new one while a snapshot exists (see vmsync_external_snapshot_count for observability of that case instead).")
-	flag.BoolVar(&cfg.Verify, "verify", false, "After syncing, suspend the source VM (if running), run a full qemu-img compare against the target for every disk, then resume it. This holds the VM suspended for meaningfully longer than a normal sync -- the whole compare, not just the copy -- so this is meant for periodic verification on its own schedule, not routine syncing. Fails the run if any disk doesn't match. The compare reads both sides over their own NBD exports (same as the disk copy itself), from wherever vmsync itself runs -- no additional reachability beyond what a plain sync without --compress/--netbuffer already requires. If --compress/--netbuffer are set, the target-side read of the compare automatically goes through its own vmsync-bridge-helper instance too (a full-image read benefits from this at least as much as the copy does), tunneled via -use-ssh under the same conditions the regular copy's bridge is.")
+	flag.BoolVar(&cfg.Verify, "verify", false, "After syncing, suspend the source VM (if running), run a full qemu-img compare against the target for every disk, then resume it. This holds the VM suspended for meaningfully longer than a normal sync -- the whole compare, not just the copy -- so this is meant for periodic verification on its own schedule, not routine syncing. Fails the run if any disk doesn't match. The compare reads both sides over their own NBD exports (same as the disk copy itself), from wherever vmsync itself runs -- no additional reachability beyond what a plain sync without --compress/--netbuffer already requires. If --compress/--netbuffer are set, the target-side read of the compare automatically goes through its own vmsync-bridge-helper instance too (a full-image read benefits from this at least as much as the copy does), tunneled via -use-ssh under the same conditions the regular copy's bridge is. See -verify-fast for actually getting a speedup out of that bridge.")
+	flag.BoolVar(&cfg.VerifyFast, "verify-fast", false, "When -verify is set, compare source and target using vmsync's own pipelined NBD reader (same -io-depth concurrency as the disk copy) instead of shelling out to qemu-img compare. qemu-img compare reads one 2MB chunk at a time, synchronously, on both images before advancing -- round-trip-latency-bound, not bandwidth-bound, so --compress/--netbuffer/--use-ssh give it no speedup. -verify-fast fixes that, which is what actually lets --compress/--netbuffer speed up the compare (and --use-ssh encrypt it) the same way they already do for the regular copy. Trade-off: unlike qemu-img compare, this always reads the full image on both sides -- it does not skip regions unallocated on both source and target, so it may transfer more data than qemu-img compare on a very sparse/thin-provisioned image despite completing faster overall on typical (mostly-allocated) disks. No effect without -verify.")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
@@ -273,6 +275,7 @@ func run(cfg struct {
 	PrometheusTextfile  string
 	IgnoreExternalSnapshot bool
 	Verify              bool
+	VerifyFast          bool
 	ShowVersion         bool
 }) (runErr error) {
 	runStart := time.Now()
@@ -1423,8 +1426,13 @@ func run(cfg struct {
 			// copy itself already requires.
 			sourceNBDURL := fmt.Sprintf("nbd://%s:%d/%s", effectiveSourceHost, effectiveSourcePort, d.TargetDev)
 			nbdURL := fmt.Sprintf("nbd://%s:%d/", verifyTargetHost, verifyTargetPort)
-			trace.Info("verify: comparing source and target images", "disk", d.TargetDev, "source", sourceNBDURL, "target", targetPath)
-			compareErr := disk.CompareImages(sourceNBDURL, nbdURL)
+			trace.Info("verify: comparing source and target images", "disk", d.TargetDev, "source", sourceNBDURL, "target", targetPath, "fast", cfg.VerifyFast)
+			var compareErr error
+			if cfg.VerifyFast {
+				compareErr = nbdsync.CompareTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, cfg.IODepth)
+			} else {
+				compareErr = disk.CompareImages(sourceNBDURL, nbdURL)
+			}
 
 			// Best-effort: a read-only export (or its bridge) left behind
 			// poses no write-lock or data-safety risk, and a stale one still

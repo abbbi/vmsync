@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package nbdsync
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 
@@ -138,6 +139,39 @@ func ChangedExtentsTCP(ctx context.Context, host string, port int, exportName, c
 	return out, size, dirty, nil
 }
 
+// negotiateBufferSize picks the read/write chunk size to use between two
+// already-connected NBD handles, from each side's advertised maximum block
+// size (nbd.SIZE_MAXIMUM). GetBlockSize(SIZE_MAXIMUM) legitimately returns 0
+// (no error) when a server doesn't advertise a maximum block size at all --
+// "unconstrained", not "the limit is 0 bytes". Naively taking min() of the
+// two raw values lets an unconstrained side's 0 silently override a REAL,
+// smaller constraint the other side actually advertised (min(65536, 0) ==
+// 0), discarding it entirely instead of respecting it -- and left
+// unguarded altogether, a 0 buffer size makes a chunk-flattening loop spin
+// forever (step stays 0, so offsets never advance) before a single byte is
+// transferred. Only falls back to defaultMaxBufferSize when *both* sides
+// are unconstrained; a real constraint from whichever side has one always
+// wins over the other side's "no constraint" sentinel. roleA/roleB label
+// the trace output only (e.g. "src"/"dst" for a copy, "source"/"target" for
+// a compare).
+func negotiateBufferSize(a, b *nbd.Libnbd, roleA, roleB string) uint64 {
+	maxA, _ := a.GetBlockSize(nbd.SIZE_MAXIMUM)
+	trace.Debug(roleA+" block", "size", maxA)
+	maxB, _ := b.GetBlockSize(nbd.SIZE_MAXIMUM)
+	trace.Debug(roleB+" block", "size", maxB)
+	bufferSize := min(maxA, maxB)
+	switch {
+	case maxA == 0 && maxB == 0:
+		bufferSize = defaultMaxBufferSize
+	case maxA == 0:
+		bufferSize = maxB
+	case maxB == 0:
+		bufferSize = maxA
+	}
+	trace.Debug("use nbd buffer", "size", bufferSize)
+	return bufferSize
+}
+
 // CopyExtentsTCP copies extents from src to dst, returning the number of
 // bytes actually written even when it returns a non-nil error (best-effort,
 // reflecting whatever was copied before the failure), so callers can still
@@ -173,31 +207,7 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 		return 0, fmt.Errorf("connect target nbd tcp %s:%d: %w", dstHost, dstPort, err)
 	}
 
-	max_dst, _ := dst.GetBlockSize(nbd.SIZE_MAXIMUM)
-	trace.Debug("dst block", "size", max_dst)
-	max_src, _ := src.GetBlockSize(nbd.SIZE_MAXIMUM)
-	trace.Debug("src block", "size", max_src)
-	// GetBlockSize(SIZE_MAXIMUM) legitimately returns 0 (no error) when a
-	// server doesn't advertise a maximum block size at all -- "unconstrained",
-	// not "the limit is 0 bytes". Naively taking min() of the two raw values
-	// lets an unconstrained side's 0 silently override a REAL, smaller
-	// constraint the other side actually advertised (min(65536, 0) == 0),
-	// discarding it entirely instead of respecting it -- and left unguarded
-	// altogether, a 0 buffer_size makes the chunk-flattening loop below spin
-	// forever (step stays 0, so `remaining` and `cur` never advance) before
-	// a single byte is copied. Only fall back to the default when *both*
-	// sides are unconstrained; a real constraint from whichever side has
-	// one must always win over the other side's "no constraint" sentinel.
-	buffer_size := min(max_dst, max_src)
-	switch {
-	case max_dst == 0 && max_src == 0:
-		buffer_size = defaultMaxBufferSize
-	case max_dst == 0:
-		buffer_size = max_src
-	case max_src == 0:
-		buffer_size = max_dst
-	}
-	trace.Debug("use nbd buffer", "size", buffer_size)
+	buffer_size := negotiateBufferSize(src, dst, "src", "dst")
 
 	totalBytes := uint64(0)
 	for _, ex := range extents {
@@ -507,6 +517,366 @@ copyLoop:
 	}
 	trace.Info("nbd copy complete", "written_bytes", writtenBytes, "device", srcExport, "elapsed", elapsed.Round(time.Millisecond).String(), "avg_mib_per_sec", fmt.Sprintf("%.2f", avgMibPerSec))
 	return writtenBytes, nil
+}
+
+// CompareTCP does a full, byte-for-byte comparison of two NBD exports (a and
+// b), pipelining ioDepth read pairs concurrently via libnbd's AIO API --
+// the same approach CopyExtentsTCP uses for the copy direction, ported to a
+// symmetric read/read/compare workload instead of read/write. This exists
+// because qemu-img compare (the tool this replaces for -verify -verify-fast)
+// reads one chunk at a time, synchronously, on both images before advancing
+// -- round-trip-latency-bound, not bandwidth-bound, so it can never benefit
+// from vmsync's own compress/netbuffer bridge. Pipelining fixes that by
+// keeping the link busy with multiple outstanding reads, which is also what
+// then makes compression/buffering actually matter.
+//
+// Deliberately compares the *entire* [0, size) range, with no block-status-
+// based skipping of regions unallocated on both sides (unlike qemu-img
+// compare) -- correctness takes priority over matching that sparse-image
+// shortcut. Returns nil only if every byte matches; otherwise a descriptive
+// error, on the first mismatch this pipeline happens to detect -- under
+// pipelining, chunks can complete out of order, so the reported offset is
+// *a* mismatch, not necessarily the file's lowest-offset one.
+//
+// Unlike CopyExtentsTCP's single buffer per slot (a completed read's buffer
+// flows straight into the write that reuses it), each slot here holds two
+// independent buffers that must both be read before either can be freed --
+// whichever side finishes first has to hold its buffer open, unread by the
+// caller, until its pipeline partner also completes and the two can finally
+// be compared. That doubles the memory footprint per slot relative to
+// CopyExtentsTCP for the same ioDepth (2 * ioDepth * negotiated buffer
+// size), which is why ioDepth isn't given a separate, larger default here.
+func CompareTCP(ctx context.Context, aHost string, aPort int, aExport string, bHost string, bPort int, ioDepth int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	a, err := nbd.Create()
+	if err != nil {
+		return fmt.Errorf("create source nbd handle: %w", err)
+	}
+	defer a.Close()
+
+	b, err := nbd.Create()
+	if err != nil {
+		return fmt.Errorf("create target nbd handle: %w", err)
+	}
+	defer b.Close()
+
+	if aExport != "" {
+		if err := a.SetExportName(aExport); err != nil {
+			return fmt.Errorf("set source export name %s: %w", aExport, err)
+		}
+	}
+	if err := a.ConnectTcp(aHost, strconv.Itoa(aPort)); err != nil {
+		return fmt.Errorf("connect source nbd tcp %s:%d: %w", aHost, aPort, err)
+	}
+	if err := b.ConnectTcp(bHost, strconv.Itoa(bPort)); err != nil {
+		return fmt.Errorf("connect target nbd tcp %s:%d: %w", bHost, bPort, err)
+	}
+
+	sizeA, err := a.GetSize()
+	if err != nil {
+		return fmt.Errorf("nbd get source size: %w", err)
+	}
+	sizeB, err := b.GetSize()
+	if err != nil {
+		return fmt.Errorf("nbd get target size: %w", err)
+	}
+	if sizeA != sizeB {
+		return fmt.Errorf("image size mismatch: source=%d target=%d", sizeA, sizeB)
+	}
+	size := sizeA
+
+	bufferSize := negotiateBufferSize(a, b, "source", "target")
+
+	type compareChunk struct {
+		offset uint64
+		length uint64
+	}
+	var chunks []compareChunk
+	for offset := uint64(0); offset < size; {
+		step := bufferSize
+		if remain := size - offset; remain < step {
+			step = remain
+		}
+		chunks = append(chunks, compareChunk{offset: offset, length: step})
+		offset += step
+	}
+
+	pipelineDepth := ioDepth
+	if pipelineDepth < 1 {
+		pipelineDepth = 1
+	}
+
+	const (
+		sideIdle = iota
+		sidePending
+		sideReady
+	)
+	// Each side of a slot moves independently through idle -> pending ->
+	// ready: idle means no buffer is live; pending means an AIO read is in
+	// flight and the buffer must not be freed yet; ready means the read
+	// completed successfully and the buffer holds valid data, held open
+	// (not freed) until the *other* side of the same slot also reaches
+	// ready, at which point the two get compared and both freed together.
+	type slot struct {
+		offset, length uint64
+
+		bufA    nbd.AioBuffer
+		stateA  int
+		cookieA uint64
+		errA    int
+
+		bufB    nbd.AioBuffer
+		stateB  int
+		cookieB uint64
+		errB    int
+	}
+	slots := make([]slot, pipelineDepth)
+
+	nextChunk := 0
+	anyOutstanding := func() bool {
+		for i := range slots {
+			if slots[i].stateA != sideIdle || slots[i].stateB != sideIdle {
+				return true
+			}
+		}
+		return false
+	}
+
+	start := time.Now()
+	var compareErr error
+
+compareLoop:
+	for nextChunk < len(chunks) || anyOutstanding() {
+		select {
+		case <-ctx.Done():
+			compareErr = fmt.Errorf("nbd compare cancelled: %w", ctx.Err())
+			break compareLoop
+		default:
+		}
+
+		// Fill any fully-idle slot with the next chunk's paired reads.
+		for i := range slots {
+			if slots[i].stateA != sideIdle || slots[i].stateB != sideIdle || nextChunk >= len(chunks) {
+				continue
+			}
+			c := chunks[nextChunk]
+			nextChunk++
+			idx := i
+			slots[idx].offset = c.offset
+			slots[idx].length = c.length
+			slots[idx].errA = 0
+			slots[idx].errB = 0
+
+			slots[idx].bufA = nbd.MakeAioBuffer(uint(c.length))
+			cookieA, err := a.AioPread(slots[idx].bufA, c.offset, &nbd.AioPreadOptargs{
+				CompletionCallbackSet: true,
+				CompletionCallback: func(errp *int) int {
+					if errp != nil {
+						slots[idx].errA = *errp
+					}
+					return 0
+				},
+			})
+			if err != nil {
+				// Never actually issued -- libnbd never took ownership,
+				// safe to free immediately.
+				slots[idx].bufA.Free()
+				compareErr = fmt.Errorf("source nbd aio_pread offset=%d len=%d: %w", c.offset, c.length, err)
+				break compareLoop
+			}
+			slots[idx].cookieA = cookieA
+			slots[idx].stateA = sidePending
+
+			slots[idx].bufB = nbd.MakeAioBuffer(uint(c.length))
+			cookieB, err := b.AioPread(slots[idx].bufB, c.offset, &nbd.AioPreadOptargs{
+				CompletionCallbackSet: true,
+				CompletionCallback: func(errp *int) int {
+					if errp != nil {
+						slots[idx].errB = *errp
+					}
+					return 0
+				},
+			})
+			if err != nil {
+				// bufB was never handed to libnbd -- safe to free right
+				// away. bufA, though, is now genuinely in flight (issued
+				// just above): it must NOT be freed here, only once its own
+				// completion is confirmed, below or in the drain phase.
+				slots[idx].bufB.Free()
+				compareErr = fmt.Errorf("target nbd aio_pread offset=%d len=%d: %w", c.offset, c.length, err)
+				break compareLoop
+			}
+			slots[idx].cookieB = cookieB
+			slots[idx].stateB = sidePending
+		}
+
+		pendingA, pendingB := false, false
+		for i := range slots {
+			if slots[i].stateA == sidePending {
+				pendingA = true
+			}
+			if slots[i].stateB == sidePending {
+				pendingB = true
+			}
+		}
+		if pendingA {
+			if _, err := a.Poll(10); err != nil {
+				compareErr = fmt.Errorf("source nbd poll: %w", err)
+				break compareLoop
+			}
+		}
+		if pendingB {
+			if _, err := b.Poll(10); err != nil {
+				compareErr = fmt.Errorf("target nbd poll: %w", err)
+				break compareLoop
+			}
+		}
+
+		// Reads finished on the source side.
+		for i := range slots {
+			if slots[i].stateA != sidePending {
+				continue
+			}
+			done, err := a.AioCommandCompleted(slots[i].cookieA)
+			if err != nil {
+				compareErr = fmt.Errorf("source nbd aio command check offset=%d: %w", slots[i].offset, err)
+				break compareLoop
+			}
+			if !done {
+				continue
+			}
+			if slots[i].errA != 0 {
+				// Confirmed complete (done == true) even though it failed,
+				// so per libnbd's contract the buffer is safe to free now.
+				slots[i].bufA.Free()
+				slots[i].stateA = sideIdle
+				compareErr = fmt.Errorf("source nbd pread offset=%d len=%d: errno %d", slots[i].offset, slots[i].length, slots[i].errA)
+				break compareLoop
+			}
+			slots[i].stateA = sideReady
+		}
+
+		// Reads finished on the target side.
+		for i := range slots {
+			if slots[i].stateB != sidePending {
+				continue
+			}
+			done, err := b.AioCommandCompleted(slots[i].cookieB)
+			if err != nil {
+				compareErr = fmt.Errorf("target nbd aio command check offset=%d: %w", slots[i].offset, err)
+				break compareLoop
+			}
+			if !done {
+				continue
+			}
+			if slots[i].errB != 0 {
+				slots[i].bufB.Free()
+				slots[i].stateB = sideIdle
+				compareErr = fmt.Errorf("target nbd pread offset=%d len=%d: errno %d", slots[i].offset, slots[i].length, slots[i].errB)
+				break compareLoop
+			}
+			slots[i].stateB = sideReady
+		}
+
+		// Slots where both sides are now ready: compare and free.
+		for i := range slots {
+			if slots[i].stateA != sideReady || slots[i].stateB != sideReady {
+				continue
+			}
+			match := bytes.Equal(slots[i].bufA.Slice(), slots[i].bufB.Slice())
+			slots[i].bufA.Free()
+			slots[i].bufB.Free()
+			slots[i].stateA = sideIdle
+			slots[i].stateB = sideIdle
+			if !match {
+				compareErr = fmt.Errorf("images differ: mismatch in chunk at offset=%d length=%d", slots[i].offset, slots[i].length)
+				break compareLoop
+			}
+		}
+	}
+
+	// A side already confirmed complete and held for comparison (sideReady)
+	// when the loop above aborted never gets compared -- just cleaned up.
+	for i := range slots {
+		if slots[i].stateA == sideReady {
+			slots[i].bufA.Free()
+			slots[i].stateA = sideIdle
+		}
+		if slots[i].stateB == sideReady {
+			slots[i].bufB.Free()
+			slots[i].stateB = sideIdle
+		}
+	}
+
+	// Wait out whatever's still genuinely in flight (sidePending) before
+	// touching its buffer, same reasoning and bounded deadline as
+	// CopyExtentsTCP's own drain phase: libnbd requires a buffer passed to
+	// an AIO call to stay valid until AioCommandCompleted confirms it.
+	// Never compares here, and never overwrites an already-set compareErr
+	// with anything found during drain -- the first real error/mismatch
+	// found above always wins.
+	drainDeadline := time.Now().Add(30 * time.Second)
+	for {
+		pending := false
+		for i := range slots {
+			if slots[i].stateA == sidePending {
+				done, derr := a.AioCommandCompleted(slots[i].cookieA)
+				switch {
+				case derr != nil:
+					trace.Warning("nbd: could not confirm in-flight source command completion during cleanup, freeing buffer anyway", "offset", slots[i].offset, "error", derr)
+					slots[i].bufA.Free()
+					slots[i].stateA = sideIdle
+				case done:
+					slots[i].bufA.Free()
+					slots[i].stateA = sideIdle
+				default:
+					pending = true
+				}
+			}
+			if slots[i].stateB == sidePending {
+				done, derr := b.AioCommandCompleted(slots[i].cookieB)
+				switch {
+				case derr != nil:
+					trace.Warning("nbd: could not confirm in-flight target command completion during cleanup, freeing buffer anyway", "offset", slots[i].offset, "error", derr)
+					slots[i].bufB.Free()
+					slots[i].stateB = sideIdle
+				case done:
+					slots[i].bufB.Free()
+					slots[i].stateB = sideIdle
+				default:
+					pending = true
+				}
+			}
+		}
+		if !pending {
+			break
+		}
+		if time.Now().After(drainDeadline) {
+			trace.Warning("nbd: timed out waiting for in-flight compare commands to settle during cleanup, freeing remaining buffers anyway")
+			for i := range slots {
+				if slots[i].stateA != sideIdle {
+					slots[i].bufA.Free()
+					slots[i].stateA = sideIdle
+				}
+				if slots[i].stateB != sideIdle {
+					slots[i].bufB.Free()
+					slots[i].stateB = sideIdle
+				}
+			}
+			break
+		}
+		a.Poll(10)
+		b.Poll(10)
+	}
+
+	if compareErr != nil {
+		return compareErr
+	}
+
+	trace.Info("nbd compare complete", "device", aExport, "bytes", size, "elapsed", time.Since(start).Round(time.Millisecond).String())
+	return nil
 }
 
 func WaitForTCPExport(host string, port int, timeout time.Duration) error {
