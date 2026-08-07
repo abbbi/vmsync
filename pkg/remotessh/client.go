@@ -61,7 +61,7 @@ func (c *Client) LoopbackSelfAddress() string {
 
 // ConfigFromLibvirtURI builds a Config from a libvirt connection URI
 // (e.g. qemu+ssh://alias/system), consulting ~/.ssh/config (and
-// /etc/ssh/ssh_config, via ssh_config.Get's own standard lookup) for
+// /etc/ssh/ssh_config, via ssh_config.Get own standard lookup) for
 // HostName/Port/User/IdentityFile overrides on the URI's host, the same way
 // a plain `ssh alias` would. This matters beyond convenience: if the
 // user's ~/.ssh/config redirects alias to a different HostName (a common
