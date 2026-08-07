@@ -15,13 +15,14 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// This file is a standalone reproduction of a real, unfixed bug found during a
-// code review of the --netbuffer feature: Relay's drain goroutine and
-// RelayFromWire's main copy loop don't close the shared BoundedBuffer when the
-// *other* side of that direction fails while data is still flowing, so the
-// side still writing into the buffer blocks forever once it fills. It exists
-// to let this be checked empirically -- by actually running it and watching
-// it hang -- rather than trusted on code-reading alone.
+// This file is a regression test for a bug found during a code review of the
+// --netbuffer feature (now fixed in pkg/zstdrelay/relay.go): Relay's drain
+// goroutine and RelayFromWire's main copy loop didn't close the shared
+// BoundedBuffer when the *other* side of that direction failed while data
+// was still flowing, so the side still writing into the buffer blocked
+// forever once it filled. It exists to check this empirically -- by
+// actually running it -- rather than trusting code-reading alone, both for
+// the original bug and for the fix.
 //
 // This lives under tests/ rather than alongside pkg/zstdrelay as an
 // in-package _test.go file because it only exercises zstdrelay's exported
@@ -33,6 +34,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,46 +103,58 @@ func TestRelayHappyPath(t *testing.T) {
 	}
 }
 
-// TestRelayDeadlockOnDrainFailure reproduces the bug in Relay (the write
-// direction): when netbuffer is enabled, a background goroutine drains the
-// bounded buffer out to the real destination. If that destination write
-// fails, the drain goroutine exits WITHOUT closing the buffer. The producer
-// side (copying from src into the buffer, in Relay's own goroutine) has no
-// way to know the drain side is gone, and blocks forever in BoundedBuffer's
-// Write() the moment the now-undrained buffer fills -- so Relay() itself
-// never reaches the point where it would otherwise close the buffer on the
-// normal EOF path, and never returns.
+// TestRelayReturnsOnDrainFailure guards against the fixed bug in Relay (the
+// write direction): when netbuffer is enabled, a background goroutine drains
+// the bounded buffer out to the real destination. Before the fix, if that
+// destination write failed, the drain goroutine exited WITHOUT closing the
+// buffer -- the producer side (copying from src into the buffer, in Relay's
+// own goroutine) had no way to know the drain side was gone, and blocked
+// forever in BoundedBuffer's Write() the moment the now-undrained buffer
+// filled, so Relay() itself never returned. The fix closes the buffer from
+// the drain goroutine as soon as it stops draining, for any reason.
 //
 // A tiny 4096-byte buffer against an infinite source guarantees it fills
-// almost immediately, so if the bug is present this test times out in
-// seconds, not by chance -- not because the buffer merely hasn't filled yet.
-func TestRelayDeadlockOnDrainFailure(t *testing.T) {
-	_, returned := runWithDeadline(t, 5*time.Second, func() error {
+// almost immediately, so a regression here shows up as a prompt timeout,
+// not by chance -- not because the buffer merely hasn't filled yet.
+func TestRelayReturnsOnDrainFailure(t *testing.T) {
+	err, returned := runWithDeadline(t, 5*time.Second, func() error {
 		return zstdrelay.Relay(alwaysFailWriter{}, infiniteReader{}, false, zstdrelay.AlgoZstd, "", "64k", "4096", nil)
 	})
-	if returned {
-		t.Fatal("Relay returned promptly despite the destination failing -- the deadlock was NOT reproduced; either it's already fixed, or this repro needs adjusting to still match the current code")
+	if !returned {
+		t.Fatal("Relay did not return within 5s -- the drain-failure deadlock has regressed: the drain goroutine's write failure isn't closing the buffer, so the producer is stuck writing into a full, undrained buffer forever")
 	}
-	t.Log("confirmed: Relay did not return within 5s -- the drain goroutine's write failure never closed the buffer, so the producer is stuck writing into a full, undrained buffer forever (this goroutine remains leaked for the rest of this test binary's run, which is expected)")
+	if err == nil {
+		t.Fatal("Relay returned a nil error despite the destination failing every write")
+	}
+	if !strings.Contains(err.Error(), "simulated write failure") {
+		t.Fatalf("Relay returned %q, want it to surface the destination's real failure (\"simulated write failure\"), not a closed-pipe artifact left over from force-closing the buffer to unblock the producer", err)
+	}
 }
 
-// TestRelayFromWireDeadlockOnConsumerFailure reproduces the mirror-image bug
-// in RelayFromWire (the read direction): a background goroutine fills the
-// bounded buffer from the wire. RelayFromWire's own main loop drains that
-// buffer out to the real (local) destination. If THAT write fails,
-// RelayFromWire's main io.Copy returns immediately -- but nothing tells the
-// fill goroutine to stop, so it keeps reading from the (here, infinite) wire
-// and writing into the now-unconsumed buffer until it fills and blocks.
-// RelayFromWire then blocks forever itself, waiting on that fill goroutine's
-// completion channel, which will now never fire.
-func TestRelayFromWireDeadlockOnConsumerFailure(t *testing.T) {
-	_, returned := runWithDeadline(t, 5*time.Second, func() error {
+// TestRelayFromWireReturnsOnConsumerFailure guards against the fixed
+// mirror-image bug in RelayFromWire (the read direction): a background
+// goroutine fills the bounded buffer from the wire. RelayFromWire's own main
+// loop drains that buffer out to the real (local) destination. Before the
+// fix, if THAT write failed, RelayFromWire's main io.Copy returned
+// immediately, but nothing told the fill goroutine to stop -- it kept
+// reading from the (here, infinite) wire and writing into the now-unconsumed
+// buffer until it filled and blocked, and RelayFromWire then blocked forever
+// itself waiting on that fill goroutine's completion channel. The fix closes
+// the buffer from the main loop as soon as it stops consuming, for any
+// reason.
+func TestRelayFromWireReturnsOnConsumerFailure(t *testing.T) {
+	err, returned := runWithDeadline(t, 5*time.Second, func() error {
 		return zstdrelay.RelayFromWire(alwaysFailWriter{}, infiniteReader{}, false, zstdrelay.AlgoZstd, "64k", "4096", nil)
 	})
-	if returned {
-		t.Fatal("RelayFromWire returned promptly despite the destination failing -- the deadlock was NOT reproduced; either it's already fixed, or this repro needs adjusting to still match the current code")
+	if !returned {
+		t.Fatal("RelayFromWire did not return within 5s -- the consumer-failure deadlock has regressed: the fill goroutine is left pumping the wire into a full, unconsumed buffer forever")
 	}
-	t.Log("confirmed: RelayFromWire did not return within 5s -- the consumer's write failure never closed the buffer, so the fill goroutine (and RelayFromWire itself, waiting on it) are stuck forever (this goroutine remains leaked for the rest of this test binary's run, which is expected)")
+	if err == nil {
+		t.Fatal("RelayFromWire returned a nil error despite the destination failing every write")
+	}
+	if !strings.Contains(err.Error(), "simulated write failure") {
+		t.Fatalf("RelayFromWire returned %q, want it to surface the destination's real failure (\"simulated write failure\")", err)
+	}
 }
 
 var _ io.Writer = alwaysFailWriter{}
