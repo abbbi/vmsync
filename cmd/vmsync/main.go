@@ -85,6 +85,7 @@ func main() {
 		IODepth                int
 		PrometheusTextfile     string
 		IgnoreExternalSnapshot bool
+		Verify                 bool
 		ShowVersion            bool
 	}
 
@@ -118,6 +119,7 @@ func main() {
 	flag.IntVar(&cfg.IODepth, "io-depth", 8, "Number of NBD read/write pairs to keep in flight simultaneously during the disk copy, instead of waiting for each to fully complete before starting the next. Higher values can hide more per-chunk round-trip latency (real disk I/O plus NBD protocol overhead on both ends), at the cost of io-depth times the negotiated NBD block size in memory. Must be at least 1.")
 	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write sync metrics to this path in Prometheus textfile-collector format: per disk, source/target host, vm, disk size, transferred and compressed-transferred bytes, and duration; plus one overall success/failure state for the whole run. Written atomically (temp file + rename). Empty disables it (default).")
 	flag.BoolVar(&cfg.IgnoreExternalSnapshot, "ignore-external-snapshot", false, "If the source domain currently has any external disk snapshot, skip this run entirely -- no sync attempt, no -prometheus-textfile write, same clean no-op as losing the per-domain run lock. Default (false): sync anyway, incrementally against the existing checkpoint, since libvirt blocks creating a new one while a snapshot exists (see vmsync_external_snapshot_count for observability of that case instead).")
+	flag.BoolVar(&cfg.Verify, "verify", false, "After syncing, suspend the source VM (if running), run a full qemu-img compare against the target for every disk, then resume it. This holds the VM suspended for meaningfully longer than a normal sync -- the whole compare, not just the copy -- so this is meant for periodic verification on its own schedule, not routine syncing. Fails the run if any disk doesn't match. Requires direct network reachability from the source host to the target's NBD port, same as a plain sync without --compress/--netbuffer -- does not tunnel through -use-ssh.")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
@@ -270,6 +272,7 @@ func run(cfg struct {
 	IODepth             int
 	PrometheusTextfile  string
 	IgnoreExternalSnapshot bool
+	Verify              bool
 	ShowVersion         bool
 }) (runErr error) {
 	runStart := time.Now()
@@ -286,6 +289,8 @@ func run(cfg struct {
 	var backupActive bool = false
 	var targetCleanupOnce sync.Once
 	var sourceCleanupOnce sync.Once
+	var resumeOnce sync.Once
+	var suspendedForVerify bool
 	var stopMu sync.Mutex
 	targetStopCommands := make([]string, 0)
 	sourceStopCommands := make([]string, 0)
@@ -348,7 +353,23 @@ func run(cfg struct {
 		sourceHost, targetHost := nbdHost, targetNBDHost
 		snapshotCount := externalSnapshotCount
 		metricsMu.Unlock()
-		run := metrics.RunMetric{SourceHost: sourceHost, TargetHost: targetHost, VM: cfg.SourceDomain, State: state, Timestamp: time.Now().Unix(), ExternalSnapshotCount: snapshotCount}
+		now := time.Now().Unix()
+		run := metrics.RunMetric{
+			SourceHost:            sourceHost,
+			TargetHost:            targetHost,
+			VM:                    cfg.SourceDomain,
+			State:                 state,
+			Timestamp:             now,
+			ExternalSnapshotCount: snapshotCount,
+			// cfg.Verify is immutable for the whole run, safe to read from
+			// any goroutine without metricsMu. A -verify mismatch fails the
+			// whole run (see syncDisk's verify block), so state already
+			// correctly reflects verification's own outcome whenever
+			// cfg.Verify is set -- no separate tracking needed.
+			VerificationRan:       cfg.Verify,
+			VerificationState:     state,
+			VerificationTimestamp: now,
+		}
 		if err := metrics.WriteTextfile(cfg.PrometheusTextfile, disksSnapshot, run); err != nil {
 			trace.Warning("failed to write prometheus textfile", "path", cfg.PrometheusTextfile, "error", err)
 		}
@@ -452,6 +473,39 @@ func run(cfg struct {
 		}
 	}
 
+	// -verify's whole point is a byte-for-byte compare against a source that
+	// cannot change out from under it -- a domain that's merely active
+	// (DomainActive, used above) isn't enough, since a paused domain's disk
+	// is already static and a running one's isn't. Suspend only when
+	// genuinely running; a domain already paused (including one -start just
+	// started, which starts it paused) needs no action of our own.
+	if cfg.Verify {
+		state, _, err := srcDom.GetState()
+		if err != nil {
+			return fmt.Errorf("check source domain state for -verify: %w", err)
+		}
+		if state == libvirt.DOMAIN_RUNNING {
+			trace.Info("verify: suspending source VM for the duration of this sync", "vm", cfg.SourceDomain)
+			if err := srcDom.Suspend(); err != nil {
+				return fmt.Errorf("verify: suspend source domain %s: %w", cfg.SourceDomain, err)
+			}
+			suspendedForVerify = true
+		}
+	}
+	resumeSource := func(trigger string) {
+		resumeOnce.Do(func() {
+			if !suspendedForVerify {
+				return
+			}
+			if err := srcDom.Resume(); err != nil {
+				trace.Error("failed to resume source VM after -verify", "trigger", trigger, "error", err)
+			} else {
+				trace.Info("verify: resumed source VM", "trigger", trigger, "vm", cfg.SourceDomain)
+			}
+		})
+	}
+	defer resumeSource("cleanup")
+
 	// callWithTimeout runs a blocking libvirt/cgo call in its own goroutine
 	// and gives up waiting for it after timeout. libvirt calls have no
 	// built-in cancellation, so a genuinely stuck call still runs to
@@ -549,10 +603,11 @@ func run(cfg struct {
 			// concurrently -- worst-case wait is the slowest ONE of them,
 			// not their sum, before the process can actually exit.
 			var cleanupWg sync.WaitGroup
-			cleanupWg.Add(4)
+			cleanupWg.Add(5)
 			go func() { defer cleanupWg.Done(); abortBackup(sig.String()) }()
 			go func() { defer cleanupWg.Done(); cleanupTargetNBD(sig.String()) }()
 			go func() { defer cleanupWg.Done(); cleanupSourceBridge(sig.String()) }()
+			go func() { defer cleanupWg.Done(); resumeSource(sig.String()) }()
 			go func() {
 				defer cleanupWg.Done()
 				// Mirrors the deferred checkpoint cleanup further down in
@@ -1049,123 +1104,179 @@ func run(cfg struct {
 		if err != nil {
 			return err
 		}
-		if dirty == 0 {
-			trace.Info("No changed extents selected, skipping copy", "disk", d.TargetDev, "elapsed", time.Since(diskStart).Round(time.Millisecond).String())
-			return nil
-		}
 
+		// Computed unconditionally (not just on the dirty>0 path below): -verify
+		// needs to compare the whole image even on a run with nothing to copy,
+		// not just skip straight past it -- the point is catching drift
+		// unrelated to this run's own delta.
+		//
 		// Avoid datarace in this goroutine by declaring targetPath as local var instead of a shared one
 		targetPath := util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
-		createCmd := "qemu-img create -f qcow2 " + util.ShQuote(targetPath) + " -o cluster_size=" + fmt.Sprintf("%d", d.ClusterSize) + " " + fmt.Sprintf("%d", d.VirtualSize)
-		var targetPathInc string
-		if incrementalMode {
-			targetPathInc = targetPath + "_" + bitmapForRead
-			trace.Info("Create temporary image", "disk", targetPathInc)
-			createCmd = "qemu-img create -f qcow2 -F qcow2  -o cluster_size=" + fmt.Sprintf("%d", d.ClusterSize) + " " + util.ShQuote(targetPathInc) + " -b " + targetPath + " " + fmt.Sprintf("%d", d.VirtualSize)
-		}
-		if err := runTargetCommand(createCmd, fmt.Sprintf("create remote qcow2 %s", targetPathInc)); err != nil {
-			return err
-		}
 
-		targetPort := cfg.TargetNBDPort + i
-		pidFile := path.Join("/tmp", fmt.Sprintf("vmsync-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
-		startExportCmd := "qemu-nbd --fork --persistent"
-		if d.DiscardMode != "" {
-			startExportCmd = startExportCmd + " --discard=" + d.DiscardMode
-		}
-		startExportCmd = startExportCmd +
-			" --format=qcow2 --bind " +
-			util.ShQuote(cfg.TargetNBDBind) +
-			" --port " +
-			fmt.Sprintf("%d", targetPort) +
-			" --pid-file " +
-			util.ShQuote(pidFile) +
-			" "
-
-		if incrementalMode {
-			targetPathInc = targetPath + "_" + bitmapForRead
-			startExportCmd = startExportCmd + util.ShQuote(targetPathInc)
+		if dirty == 0 {
+			trace.Info("No changed extents selected, skipping copy", "disk", d.TargetDev, "elapsed", time.Since(diskStart).Round(time.Millisecond).String())
 		} else {
-			startExportCmd = startExportCmd + util.ShQuote(targetPath)
-		}
-		if err := runTargetCommand(startExportCmd, fmt.Sprintf("start target qemu-nbd for %s", targetPath)); err != nil {
-			return err
-		}
-
-		stopCmd := "kill -9 $(cat " + util.ShQuote(pidFile) + ")"
-		stopMu.Lock()
-		targetStopCommands = append(targetStopCommands, stopCmd+" || true")
-		stopMu.Unlock()
-
-		trace.Info("target nbd port in use", "side", "target", "kind", "nbd_export", "disk", d.TargetDev, "host", targetNBDHost, "port", targetPort)
-
-		// Default to the direct, uncompressed path; overridden below when
-		// --compress/--netbuffer are set (target SSH is always available).
-		effectiveTargetHost := targetNBDHost
-		effectiveTargetPort := targetPort
-		if bridgeCfg.Enabled() {
-			// All real qemu-nbd ports occupy [TargetNBDPort, TargetNBDPort+N),
-			// so the bridge ports lay out right after them, as one contiguous
-			// block [TargetNBDPort+N, TargetNBDPort+2N).
-			targetBridgePort := targetPort + len(qcowDisks)
-			bridgeStopCmd, err := nbdbridge.StartRemote(ctx, targetSSHClient, targetBridgePort, targetPort, bridgeCfg)
-			if err != nil {
-				return fmt.Errorf("start target nbd bridge for %s: %w", d.TargetDev, err)
+			createCmd := "qemu-img create -f qcow2 " + util.ShQuote(targetPath) + " -o cluster_size=" + fmt.Sprintf("%d", d.ClusterSize) + " " + fmt.Sprintf("%d", d.VirtualSize)
+			var targetPathInc string
+			if incrementalMode {
+				targetPathInc = targetPath + "_" + bitmapForRead
+				trace.Info("Create temporary image", "disk", targetPathInc)
+				createCmd = "qemu-img create -f qcow2 -F qcow2  -o cluster_size=" + fmt.Sprintf("%d", d.ClusterSize) + " " + util.ShQuote(targetPathInc) + " -b " + targetPath + " " + fmt.Sprintf("%d", d.VirtualSize)
 			}
+			if err := runTargetCommand(createCmd, fmt.Sprintf("create remote qcow2 %s", targetPathInc)); err != nil {
+				return err
+			}
+
+			targetPort := cfg.TargetNBDPort + i
+			pidFile := path.Join("/tmp", fmt.Sprintf("vmsync-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
+			startExportCmd := "qemu-nbd --fork --persistent"
+			if d.DiscardMode != "" {
+				startExportCmd = startExportCmd + " --discard=" + d.DiscardMode
+			}
+			startExportCmd = startExportCmd +
+				" --format=qcow2 --bind " +
+				util.ShQuote(cfg.TargetNBDBind) +
+				" --port " +
+				fmt.Sprintf("%d", targetPort) +
+				" --pid-file " +
+				util.ShQuote(pidFile) +
+				" "
+
+			if incrementalMode {
+				targetPathInc = targetPath + "_" + bitmapForRead
+				startExportCmd = startExportCmd + util.ShQuote(targetPathInc)
+			} else {
+				startExportCmd = startExportCmd + util.ShQuote(targetPath)
+			}
+			if err := runTargetCommand(startExportCmd, fmt.Sprintf("start target qemu-nbd for %s", targetPath)); err != nil {
+				return err
+			}
+
+			stopCmd := "kill -9 $(cat " + util.ShQuote(pidFile) + ")"
 			stopMu.Lock()
-			targetStopCommands = append(targetStopCommands, bridgeStopCmd)
+			targetStopCommands = append(targetStopCommands, stopCmd+" || true")
 			stopMu.Unlock()
-			trace.Info("target nbd port in use", "side", "target", "kind", "bridge_remote", "disk", d.TargetDev, "host", targetNBDHost, "port", targetBridgePort)
-			targetBridgeDialAddr := fmt.Sprintf("%s:%d", targetNBDHost, targetBridgePort)
-			if cfg.UseSSH {
-				targetBridgeDialAddr = fmt.Sprintf("127.0.0.1:%d", targetBridgePort)
+
+			trace.Info("target nbd port in use", "side", "target", "kind", "nbd_export", "disk", d.TargetDev, "host", targetNBDHost, "port", targetPort)
+
+			// Default to the direct, uncompressed path; overridden below when
+			// --compress/--netbuffer are set (target SSH is always available).
+			effectiveTargetHost := targetNBDHost
+			effectiveTargetPort := targetPort
+			if bridgeCfg.Enabled() {
+				// All real qemu-nbd ports occupy [TargetNBDPort, TargetNBDPort+N),
+				// so the bridge ports lay out right after them, as one contiguous
+				// block [TargetNBDPort+N, TargetNBDPort+2N).
+				targetBridgePort := targetPort + len(qcowDisks)
+				bridgeStopCmd, err := nbdbridge.StartRemote(ctx, targetSSHClient, targetBridgePort, targetPort, bridgeCfg)
+				if err != nil {
+					return fmt.Errorf("start target nbd bridge for %s: %w", d.TargetDev, err)
+				}
+				stopMu.Lock()
+				targetStopCommands = append(targetStopCommands, bridgeStopCmd)
+				stopMu.Unlock()
+				trace.Info("target nbd port in use", "side", "target", "kind", "bridge_remote", "disk", d.TargetDev, "host", targetNBDHost, "port", targetBridgePort)
+				targetBridgeDialAddr := fmt.Sprintf("%s:%d", targetNBDHost, targetBridgePort)
+				if cfg.UseSSH {
+					targetBridgeDialAddr = fmt.Sprintf("127.0.0.1:%d", targetBridgePort)
+				}
+				localPort, counters, stopLocal, err := nbdbridge.StartLocal(ctx, targetSSHClient, targetBridgeDialAddr, bridgeCfg)
+				if err != nil {
+					return fmt.Errorf("start local nbd bridge relay for %s: %w", d.TargetDev, err)
+				}
+				defer stopLocal()
+				effectiveTargetHost = "127.0.0.1"
+				effectiveTargetPort = localPort
+				targetBridgeCounters = counters
+				trace.Info("target nbd port in use", "side", "target", "kind", "bridge_local", "disk", d.TargetDev, "host", "127.0.0.1", "port", localPort)
+			} else {
+				if err := nbdsync.WaitForTCPExport(targetNBDHost, targetPort, 10*time.Second); err != nil {
+					return fmt.Errorf("wait for target nbd export %s:%d: %w", targetNBDHost, targetPort, err)
+				}
 			}
-			localPort, counters, stopLocal, err := nbdbridge.StartLocal(ctx, targetSSHClient, targetBridgeDialAddr, bridgeCfg)
+
+			trace.Info("copy extents to remote target", "extents", len(extents), "path", targetPath, "disk_size", diskSize)
+			writtenBytes, err = nbdsync.CopyExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, effectiveTargetHost, effectiveTargetPort, extents, cfg.IODepth)
 			if err != nil {
-				return fmt.Errorf("start local nbd bridge relay for %s: %w", d.TargetDev, err)
-			}
-			defer stopLocal()
-			effectiveTargetHost = "127.0.0.1"
-			effectiveTargetPort = localPort
-			targetBridgeCounters = counters
-			trace.Info("target nbd port in use", "side", "target", "kind", "bridge_local", "disk", d.TargetDev, "host", "127.0.0.1", "port", localPort)
-		} else {
-			if err := nbdsync.WaitForTCPExport(targetNBDHost, targetPort, 10*time.Second); err != nil {
-				return fmt.Errorf("wait for target nbd export %s:%d: %w", targetNBDHost, targetPort, err)
-			}
-		}
-
-		trace.Info("copy extents to remote target", "extents", len(extents), "path", targetPath, "disk_size", diskSize)
-		writtenBytes, err = nbdsync.CopyExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, effectiveTargetHost, effectiveTargetPort, extents, cfg.IODepth)
-		if err != nil {
-			return err
-		}
-
-		if targetBridgeCounters != nil {
-			logicalBytes := nbdbridge.SumLogicalDirtyBytes(extents)
-			trace.Info("target nbd bridge compression", "disk", d.TargetDev, "savings", nbdbridge.FormatSavings(logicalBytes, targetBridgeCounters.SentSnapshot()))
-		}
-		if sourceBridgeCounters != nil {
-			logicalBytes := nbdbridge.SumLogicalDirtyBytes(extents)
-			trace.Info("source nbd bridge compression", "disk", d.TargetDev, "savings", nbdbridge.FormatSavings(logicalBytes, sourceBridgeCounters.SentSnapshot()))
-		}
-
-		trace.Info("Stopping remote daemon", "device", d.TargetDev)
-		if err := runTargetCommand(stopCmd, fmt.Sprintf("stop qemu-nbd for %s", targetPath)); err != nil {
-			return err
-		}
-
-		if incrementalMode {
-			trace.Info("Committing changes to base", "image", targetPath)
-			commitCmd := "qemu-img commit -b " + targetPath + " " + targetPathInc
-			if err := runTargetCommand(commitCmd, fmt.Sprintf("committing changes for %s", targetPathInc)); err != nil {
 				return err
 			}
-			trace.Info("Removing temporary", "image", targetPathInc)
-			if err := runTargetCommand("rm -f "+targetPathInc, fmt.Sprintf("removing target image %s", targetPathInc)); err != nil {
+
+			if targetBridgeCounters != nil {
+				logicalBytes := nbdbridge.SumLogicalDirtyBytes(extents)
+				trace.Info("target nbd bridge compression", "disk", d.TargetDev, "savings", nbdbridge.FormatSavings(logicalBytes, targetBridgeCounters.SentSnapshot()))
+			}
+			if sourceBridgeCounters != nil {
+				logicalBytes := nbdbridge.SumLogicalDirtyBytes(extents)
+				trace.Info("source nbd bridge compression", "disk", d.TargetDev, "savings", nbdbridge.FormatSavings(logicalBytes, sourceBridgeCounters.SentSnapshot()))
+			}
+
+			trace.Info("Stopping remote daemon", "device", d.TargetDev)
+			if err := runTargetCommand(stopCmd, fmt.Sprintf("stop qemu-nbd for %s", targetPath)); err != nil {
 				return err
 			}
+
+			if incrementalMode {
+				trace.Info("Committing changes to base", "image", targetPath)
+				commitCmd := "qemu-img commit -b " + targetPath + " " + targetPathInc
+				if err := runTargetCommand(commitCmd, fmt.Sprintf("committing changes for %s", targetPathInc)); err != nil {
+					return err
+				}
+				trace.Info("Removing temporary", "image", targetPathInc)
+				if err := runTargetCommand("rm -f "+targetPathInc, fmt.Sprintf("removing target image %s", targetPathInc)); err != nil {
+					return err
+				}
+			}
 		}
+
+		if cfg.Verify {
+			// Dedicated port range, distinct from both the regular
+			// [TargetNBDPort, +N) and bridge [+N, +2N) ranges above, so this
+			// never collides regardless of whether bridging is on, and
+			// doesn't depend on the write export's port (already killed
+			// above, if it ever existed this run) having actually been
+			// released yet.
+			verifyPort := cfg.TargetNBDPort + 2*len(qcowDisks) + i
+			verifyPidFile := path.Join("/tmp", fmt.Sprintf("vmsync-verify-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
+			startVerifyCmd := "qemu-nbd --fork --persistent --read-only --format=qcow2 --bind " +
+				util.ShQuote(cfg.TargetNBDBind) +
+				" --port " +
+				fmt.Sprintf("%d", verifyPort) +
+				" --pid-file " +
+				util.ShQuote(verifyPidFile) +
+				" " +
+				util.ShQuote(targetPath)
+			if err := runTargetCommand(startVerifyCmd, fmt.Sprintf("start read-only verify export for %s", targetPath)); err != nil {
+				return err
+			}
+			stopVerifyCmd := "kill -9 $(cat " + util.ShQuote(verifyPidFile) + ") || true"
+			stopMu.Lock()
+			targetStopCommands = append(targetStopCommands, stopVerifyCmd)
+			stopMu.Unlock()
+
+			if err := nbdsync.WaitForTCPExport(targetNBDHost, verifyPort, 10*time.Second); err != nil {
+				return fmt.Errorf("verify: wait for read-only export %s:%d: %w", targetNBDHost, verifyPort, err)
+			}
+
+			nbdURL := fmt.Sprintf("nbd://%s:%d/", targetNBDHost, verifyPort)
+			trace.Info("verify: comparing source and target images", "disk", d.TargetDev, "source", d.RootSource, "target", targetPath)
+			compareErr := disk.CompareImages(d.RootSource, nbdURL)
+
+			// Best-effort: a read-only export left behind poses no write-lock
+			// or data-safety risk, and a stale one still bound to this exact
+			// (deterministic) port would simply make the next run's own start
+			// attempt fail loudly and obviously -- not worth failing this
+			// disk's result over a cleanup hiccup on top of an already-known
+			// compare outcome.
+			if out, err := targetSSHClient.Run(ctx, stopVerifyCmd); err != nil {
+				trace.Warning("verify: failed to stop read-only export", "disk", d.TargetDev, "error", err, "output", out)
+			}
+
+			if compareErr != nil {
+				return fmt.Errorf("verify: disk %s does not match: %w", d.TargetDev, compareErr)
+			}
+			trace.Info("verify: images match", "disk", d.TargetDev)
+		}
+
 		trace.Info("disk sync complete", "disk", d.TargetDev, "elapsed", time.Since(diskStart).Round(time.Millisecond).String())
 		return nil
 	}

@@ -20,6 +20,7 @@ package disk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -145,4 +146,27 @@ func QemuImgInfoChainJSONRemote(ctx context.Context, runner CommandRunner, path 
 		return nil, fmt.Errorf("qemu-img info --backing-chain for %s returned no images", path)
 	}
 	return chain, nil
+}
+
+// CompareImages runs qemu-img compare between localPath (a plain local file, read
+// directly -- always run on the same host localPath lives on) and remoteRef (any
+// qemu-img-recognized image reference, e.g. an "nbd://host:port/" URL). Returns nil
+// when the two are byte-for-byte identical; otherwise a descriptive error, with a
+// mismatch (qemu-img's own documented exit code 1, "images differ") distinguished from
+// a genuine failure to even perform the comparison (any other non-zero exit).
+//
+// -U opens the image in shared mode: the caller's own use case is comparing a source
+// disk that may still be open by a suspended (not destroyed) qemu process, which would
+// otherwise refuse a second, exclusive-by-default open.
+func CompareImages(localPath, remoteRef string) error {
+	cmd := exec.Command("qemu-img", "compare", "-U", localPath, remoteRef)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return fmt.Errorf("images differ: %s", strings.TrimSpace(string(out)))
+	}
+	return fmt.Errorf("qemu-img compare %s vs %s: %w: %s", localPath, remoteRef, err, strings.TrimSpace(string(out)))
 }

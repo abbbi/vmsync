@@ -75,6 +75,21 @@ type RunMetric struct {
 	// checkpoint chain sits stalled -- this metric is what explains that
 	// from the outside, purely diagnostic.
 	ExternalSnapshotCount int
+	// VerificationRan is true when this run had -verify set. It gates
+	// whether VerificationState/VerificationTimestamp are rendered at all --
+	// a run that never verified anything must not emit a bare
+	// vmsync_verification_state 0, which would be indistinguishable from
+	// "verified and passed."
+	VerificationRan bool
+	// VerificationState mirrors State: a -verify run fails as a whole (see
+	// cmd/vmsync's per-disk compare) on any mismatch, so this needs no
+	// tracking of its own beyond the overall run outcome.
+	VerificationState int
+	// VerificationTimestamp is the Unix time (seconds) this run's
+	// verification finished, success or failure -- same staleness-detection
+	// purpose as Timestamp, but specific to when a disk was last actually
+	// byte-compared against its source, not just synced.
+	VerificationTimestamp int64
 }
 
 // WriteTextfile renders disks and run in the Prometheus text exposition
@@ -133,6 +148,22 @@ func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 	fmt.Fprintln(&b, "# TYPE vmsync_external_snapshot_count gauge")
 	fmt.Fprintf(&b, "vmsync_external_snapshot_count{source_host=%q,target_host=%q,vm=%q} %d\n",
 		run.SourceHost, run.TargetHost, run.VM, run.ExternalSnapshotCount)
+
+	// Only emitted for a run that actually had -verify set -- see
+	// RunMetric.VerificationRan's own comment for why a run that never
+	// verified anything must not emit these at all, rather than a
+	// misleadingly-successful-looking 0.
+	if run.VerificationRan {
+		fmt.Fprintln(&b, "# HELP vmsync_verification_state Result of the last -verify run as a whole (0=success, 1=failure). Only present for runs that had -verify set.")
+		fmt.Fprintln(&b, "# TYPE vmsync_verification_state gauge")
+		fmt.Fprintf(&b, "vmsync_verification_state{source_host=%q,target_host=%q,vm=%q} %d\n",
+			run.SourceHost, run.TargetHost, run.VM, run.VerificationState)
+
+		fmt.Fprintln(&b, "# HELP vmsync_verification_timestamp_seconds Unix time (seconds) this vmsync run last performed -verify, success or failure. Only present for runs that had -verify set.")
+		fmt.Fprintln(&b, "# TYPE vmsync_verification_timestamp_seconds gauge")
+		fmt.Fprintf(&b, "vmsync_verification_timestamp_seconds{source_host=%q,target_host=%q,vm=%q} %d\n",
+			run.SourceHost, run.TargetHost, run.VM, run.VerificationTimestamp)
+	}
 
 	return writeAtomic(path, b.String())
 }
