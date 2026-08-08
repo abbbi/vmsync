@@ -1,0 +1,97 @@
+# vmsync benchmark harness configuration.
+#
+# Copy this file to bench.conf (untracked, see .gitignore in this
+# directory -- it will contain SSH connection details) and fill in your own
+# environment. bench.sh refuses to run for real until
+# I_UNDERSTAND_THIS_IS_DESTRUCTIVE is set to "yes" below.
+#
+# This is a plain shell file, sourced directly by bench.sh -- normal shell
+# quoting rules apply.
+
+# --- What to test ------------------------------------------------------
+
+# Path to the vmsync binary under test.
+VMSYNC_BIN=/usr/local/bin/vmsync
+
+# libvirt URIs, exactly as you'd pass to vmsync's own -source-uri/-target-uri.
+# -target-uri MUST be qemu+ssh:// (vmsync itself requires this).
+SOURCE_URI="qemu+ssh://root@source-host.example.org/system"
+TARGET_URI="qemu+ssh://root@target-host.example.org/system"
+
+# Bare hostnames (no scheme/user), used by the harness's OWN direct ssh
+# calls (qemu-io tampering) -- normally the same hosts as the URIs above.
+SOURCE_HOST=source-host.example.org
+TARGET_HOST=target-host.example.org
+
+# The VM to test. This harness syncs SOURCE_DOMAIN to TARGET_DOMAIN
+# repeatedly, deletes and recreates the target replica many times (-reinit),
+# and deliberately corrupts the target replica's disk during verify-mode
+# testing (always healed with a full resync immediately after). Use a
+# disposable/dedicated test VM -- never a real, in-use replication target.
+SOURCE_DOMAIN=vmsync-bench-vm
+TARGET_DOMAIN=vmsync-bench-vm
+
+# Recommended: always set this. Without it, target disk path resolution
+# depends on the source having no active external snapshot at sync time
+# (see pkg/util.SetTargetPath's own doc comment) -- setting this removes
+# that ambiguity entirely, and is required for this harness's own
+# virsh-dumpxml-based disk path lookup (used for tampering) to be reliable.
+TARGET_DISK_PATH=/data/vmsync-bench
+
+# --- SSH ---------------------------------------------------------------
+# Shared between vmsync's own -ssh-* flags and the harness's own direct ssh
+# calls to SOURCE_HOST/TARGET_HOST.
+
+SSH_USER=root
+SSH_KEY=/root/.ssh/id_vmsync_bench
+SSH_PORT=22
+SSH_KNOWN_HOSTS=""
+
+# --- vmsync flags that apply to every invocation ------------------------
+
+# Stage 1 (the transport matrix) always overrides -io-depth per
+# combination from scenarios.conf's own [iodepth] section -- this value is
+# only actually used as the fixed -io-depth for Stage 2 (verify+tamper)
+# and Stage 3 (reinit-after-failures), which don't vary it.
+IO_DEPTH=8
+BRIDGE_HELPER_PATH=""   # empty = vmsync's own default (/usr/local/bin/vmsync-bridge-helper)
+
+# --- Verify + tamper test ------------------------------------------------
+
+# Which disk (libvirt <target dev='...'>) to tamper for the -verify
+# correctness tests.
+TAMPER_DISK_DEV=vda
+
+# Byte offset and length to overwrite with a fixed 0xAA pattern via
+# `qemu-io -c "write -P 0xAA OFFSET LENGTH"`. Both accept qemu-io's own
+# suffixes (k/M/G). Pick an offset that's actually within the disk's
+# allocated, real data region (well inside a filesystem, not e.g. the very
+# first few KiB of an unpartitioned disk) so the write is a genuine,
+# detectable content change -- and, for -verify=online specifically (see
+# README.md's note on its reconciliation window), somewhere the running
+# guest is unlikely to legitimately rewrite during a short compare window,
+# to avoid an occasional false "not detected" from the online mode
+# correctly discarding an in-window guest write as inconclusive.
+TAMPER_OFFSET=104857600   # 100MiB in
+TAMPER_LENGTH=4096
+
+# --- reinit-after-failures test ------------------------------------------
+
+# How many induced failures to simulate before expecting a forced reinit.
+REINIT_AFTER_FAILURES_N=3
+
+# --- Output --------------------------------------------------------------
+
+RESULT_DIR=./results
+
+# --- Safety gate -----------------------------------------------------------
+# Must be "yes" to run anything for real. Use bench.sh --dry-run to see
+# what would run (every vmsync command line, no ssh/qemu-io/vmsync calls
+# actually made) without touching this.
+# While not modifying source VM, it will totally tamper with target VM,
+# perhaps keep open processes / port / file descriptors on source and target,
+# perhaps even nuke your whole source / target machines,
+# replicate itself into skynet and take over the world.
+# Only run this if you fully understand it's implications.
+
+I_UNDERSTAND_THIS_IS_DESTRUCTIVE=no
