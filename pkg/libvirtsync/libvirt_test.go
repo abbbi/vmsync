@@ -517,3 +517,88 @@ func TestNextCheckpointName(t *testing.T) {
 		}
 	})
 }
+
+func TestXMLElementNames(t *testing.T) {
+	t.Run("collects every distinct element name, ignoring namespace prefixes", func(t *testing.T) {
+		xmlStr := `<domain>
+  <name>testvm</name>
+  <devices>
+    <hostdev/>
+    <hostdev/>
+  </devices>
+  <qemu:commandline xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
+    <qemu:arg value="-foo"/>
+  </qemu:commandline>
+</domain>`
+		got := xmlElementNames(xmlStr)
+		want := []string{"domain", "name", "devices", "hostdev", "commandline", "arg"}
+		for _, name := range want {
+			if !got[name] {
+				t.Errorf("xmlElementNames(...) missing expected element %q, got %v", name, got)
+			}
+		}
+		// A repeated element (two <hostdev/>) must still only occupy one
+		// entry in the set -- this is a set of distinct names, not a count.
+		if len(got) != len(want) {
+			t.Errorf("xmlElementNames(...) = %v (%d distinct names), want exactly %d", got, len(got), len(want))
+		}
+	})
+
+	t.Run("malformed xml returns nil, not an empty set", func(t *testing.T) {
+		if got := xmlElementNames("not xml at all <<<"); got != nil {
+			t.Errorf("xmlElementNames(malformed) = %v, want nil", got)
+		}
+	})
+
+	t.Run("empty string returns an empty, non-nil set", func(t *testing.T) {
+		got := xmlElementNames("")
+		if got == nil {
+			t.Fatal("xmlElementNames(\"\") = nil, want a non-nil empty set (empty input parses fine, it just has no elements)")
+		}
+		if len(got) != 0 {
+			t.Errorf("xmlElementNames(\"\") = %v, want empty", got)
+		}
+	})
+}
+
+func TestMissingXMLElements(t *testing.T) {
+	t.Run("nothing missing when every element survives the rewrite", func(t *testing.T) {
+		original := `<domain><name>testvm</name><devices><disk/></devices></domain>`
+		rewritten := `<domain><name>renamed</name><devices><disk/></devices></domain>`
+		if got := missingXMLElements(original, rewritten); got != nil {
+			t.Errorf("missingXMLElements(...) = %v, want nil (nothing missing)", got)
+		}
+	})
+
+	t.Run("reports elements present in the original but dropped from the rewrite", func(t *testing.T) {
+		original := `<domain><devices><hostdev/><disk/></devices><tpm/></domain>`
+		rewritten := `<domain><devices><disk/></devices></domain>` // hostdev and tpm silently dropped
+		got := missingXMLElements(original, rewritten)
+		want := []string{"hostdev", "tpm"} // sorted
+		if len(got) != len(want) {
+			t.Fatalf("missingXMLElements(...) = %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("missingXMLElements(...)[%d] = %q, want %q (full result: %v)", i, got[i], want[i], got)
+			}
+		}
+	})
+
+	t.Run("an element gained (not lost) by the rewrite is not reported as missing", func(t *testing.T) {
+		original := `<domain><devices><disk/></devices></domain>`
+		rewritten := `<domain><devices><disk/></devices><metadata/></domain>`
+		if got := missingXMLElements(original, rewritten); got != nil {
+			t.Errorf("missingXMLElements(...) = %v, want nil -- a newly added element is not a loss", got)
+		}
+	})
+
+	t.Run("an unparseable original or rewrite yields no report rather than a false positive", func(t *testing.T) {
+		if got := missingXMLElements("not xml", `<domain/>`); got != nil {
+			t.Errorf("missingXMLElements(unparseable original, ...) = %v, want nil", got)
+		}
+		if got := missingXMLElements(`<domain><hostdev/></domain>`, "not xml"); got != nil {
+			t.Errorf("missingXMLElements(..., unparseable rewrite) = %v, want nil", got)
+		}
+	})
+}

@@ -20,6 +20,7 @@ package libvirtsync
 import (
 	"encoding/xml"
 	"fmt"
+	"io"
 	"regexp"
 	"sort"
 	"strconv"
@@ -239,6 +240,8 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 		}
 	}
 
+	warnIfXMLElementsDropped("DefineDomain", sourceDomainXML, updatedXML)
+
 	dom, err := target.Conn.DomainDefineXML(updatedXML)
 	if err != nil {
 		// Fallback for cloning into same target where another domain already uses the UUID.
@@ -351,6 +354,91 @@ func replaceDomainName(domainXML, name string) (string, error) {
 	return changed, nil
 }
 
+// xmlElementNames returns the set of distinct element tag names (local
+// name only -- "hostdev", "commandline", etc. -- namespace prefixes aren't
+// distinguished, since the same element can legitimately round-trip
+// through a different prefix with no actual loss) appearing anywhere in
+// domainXML. Returns nil if domainXML doesn't even parse as XML, rather
+// than produce a false "elements are missing" signal for something that
+// was never valid to begin with.
+func xmlElementNames(domainXML string) map[string]bool {
+	names := map[string]bool{}
+	dec := xml.NewDecoder(strings.NewReader(domainXML))
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil
+		}
+		if start, ok := tok.(xml.StartElement); ok {
+			names[start.Name.Local] = true
+		}
+	}
+	return names
+}
+
+// missingXMLElements returns the sorted list of distinct element names
+// present in original but absent from rewritten -- empty (nil) when
+// original doesn't parse, rewritten doesn't parse, or nothing is missing.
+// Split out from warnIfXMLElementsDropped below purely so this actual
+// comparison logic is directly testable without needing to capture log
+// output.
+func missingXMLElements(original, rewritten string) []string {
+	before := xmlElementNames(original)
+	if before == nil {
+		return nil
+	}
+	after := xmlElementNames(rewritten)
+	if after == nil {
+		return nil
+	}
+	var missing []string
+	for name := range before {
+		if !after[name] {
+			missing = append(missing, name)
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+// warnIfXMLElementsDropped logs a warning (tagged with context, e.g. a
+// function/call-site name) listing any element names missingXMLElements
+// finds went missing between original and rewritten.
+//
+// This exists because replaceDomainName, replaceDomainDiskPath, and
+// SetMetadataFields all go through a full libvirtxml.Domain
+// unmarshal-then-marshal round-trip rather than editing the XML text
+// surgically, despite their own doc comments' promise to "keep source XML
+// intact" -- any element that struct doesn't model (hostdev passthrough,
+// TPM/launchSecurity, <qemu:commandline>, and similar less-common domain
+// features) would otherwise be silently dropped on marshal with nothing to
+// indicate anything went wrong, possibly not discovered until whatever
+// that configuration was for turns out to be missing on a failed-over
+// target VM. A real, exhaustive fix would mean editing the XML text
+// surgically instead of round-tripping it through a typed struct at all --
+// a much larger, higher-risk change to the single most-used code path in
+// this tool (every disk's target definition, every sync) that isn't
+// something to take on without the ability to test it against a wide
+// range of real, complex domain definitions first.
+//
+// This check can't tell a genuine loss apart from a legitimate omission
+// (an empty or default-valued element the struct correctly normalizes
+// away on marshal), so it only warns rather than failing the sync outright
+// -- but it turns an otherwise completely invisible risk into something an
+// operator can actually notice and investigate the first time it would
+// matter for a real domain, instead of silent, permanent, possibly
+// never-discovered configuration loss.
+func warnIfXMLElementsDropped(context, original, rewritten string) {
+	missing := missingXMLElements(original, rewritten)
+	if len(missing) == 0 {
+		return
+	}
+	trace.Warning("domain xml elements present before this rewrite are missing afterward -- the domain-xml round-trip (unmarshal into a typed struct, then re-marshal) may have silently dropped configuration this tool doesn't model; verify the affected domain's definition still has everything you expect", "context", context, "missing_elements", strings.Join(missing, ", "))
+}
+
 // SetMetadataFields merges the given vmsync:field->value pairs into
 // domainXML's <metadata> block, preserving any existing vmsync fields not
 // mentioned in updates (and any unrelated, non-vmsync metadata some other
@@ -388,6 +476,7 @@ func SetMetadataFields(domainXML string, updates map[string]string) (string, err
 		return "", err
 	}
 
+	warnIfXMLElementsDropped("SetMetadataFields", domainXML, changed)
 	return changed, nil
 }
 
