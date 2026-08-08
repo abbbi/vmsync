@@ -168,11 +168,19 @@ func DomainExists(conn *libvirt.Connect, name string) (bool, error) {
 // through to replaceDomainDiskPath so the domain definition names disks the
 // same way the actual data copy does; pass nil/empty if targetDiskPath is
 // also empty (no disk-path rewriting requested at all).
+//
+// If targetDomainName already exists, it is undefined first (persistent
+// definitions can't be replaced in place) and its prior XML is kept in
+// memory so a subsequent failure to define the replacement -- a transient
+// libvirtd error, or the rewritten XML itself being rejected -- can restore
+// it instead of leaving the target permanently undefined.
 func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML string, targetDiskPath string, rootSourceByLiveSource map[string]string) error {
 	exists, err := DomainExists(target.Conn, targetDomainName)
 	if err != nil {
 		return fmt.Errorf("check target domain existence: %w", err)
 	}
+
+	var originalXML string
 	if exists {
 		trace.Info("Undefining domain on target system", "vm", targetDomainName)
 		d, err := target.Conn.LookupDomainByName(targetDomainName)
@@ -180,6 +188,13 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 			return fmt.Errorf("look up existing target domain %s for undefine: %w", targetDomainName, err)
 		}
 		defer d.Free()
+		// Captured before undefining -- see rollback below. Failing to even
+		// read it is treated as fatal rather than undefining a domain with
+		// no way back to its current definition.
+		originalXML, err = d.GetXMLDesc(0)
+		if err != nil {
+			return fmt.Errorf("read existing target domain %s xml before undefine: %w", targetDomainName, err)
+		}
 		// KEEP_NVRAM: vmsync never copies or manages a domain's NVRAM/
 		// varstore file itself (see DetectNvram -- it only checks the file
 		// already exists on the target and warns if not), so undefining
@@ -193,17 +208,34 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 		}
 	}
 
+	// rollback restores the target domain to its pre-undefine definition
+	// (best effort) whenever cause is about to make this function return
+	// without having left a valid replacement defined -- a no-op if the
+	// domain didn't already exist, since there's nothing to roll back to.
+	rollback := func(cause error) error {
+		if !exists {
+			return cause
+		}
+		restored, rbErr := target.Conn.DomainDefineXML(originalXML)
+		if rbErr != nil {
+			return fmt.Errorf("%w (also failed to restore target domain's previous definition: %v)", cause, rbErr)
+		}
+		restored.Free()
+		trace.Warning("restored target domain to its previous definition after redefine failure", "vm", targetDomainName, "cause", cause)
+		return cause
+	}
+
 	// Keep source XML intact (including UUID) unless libvirt rejects duplicate UUID.
 	updatedXML, err := replaceDomainName(sourceDomainXML, targetDomainName)
 	if err != nil {
-		return fmt.Errorf("rewrite target domain xml: %w", err)
+		return rollback(fmt.Errorf("rewrite target domain xml: %w", err))
 	}
 
 	// Keep source XML intact (including UUID) unless libvirt rejects duplicate UUID.
 	if targetDiskPath != "" {
 		updatedXML, err = replaceDomainDiskPath(updatedXML, targetDomainName, targetDiskPath, rootSourceByLiveSource)
 		if err != nil {
-			return fmt.Errorf("rewrite target domain xml: %w", err)
+			return rollback(fmt.Errorf("rewrite target domain xml: %w", err))
 		}
 	}
 
@@ -214,11 +246,11 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 			withoutUUID := stripDomainUUID(updatedXML)
 			dom, retryErr := target.Conn.DomainDefineXML(withoutUUID)
 			if retryErr != nil {
-				return fmt.Errorf("define target domain after uuid fallback: %w", retryErr)
+				return rollback(fmt.Errorf("define target domain after uuid fallback: %w", retryErr))
 			}
 			return dom.Free()
 		}
-		return fmt.Errorf("define target domain: %w", err)
+		return rollback(fmt.Errorf("define target domain: %w", err))
 	}
 	trace.Info("Redefined target vm with new configuration", "vm", targetDomainName)
 	return dom.Free()
