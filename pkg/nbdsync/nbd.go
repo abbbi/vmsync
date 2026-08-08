@@ -445,9 +445,9 @@ copyLoop:
 	// free any OTHER slot's buffer themselves. Bounded so a truly dead
 	// connection (where neither Poll nor AioCommandCompleted ever errors,
 	// but nothing ever completes either) can't hang this function forever;
-	// hitting the deadline or a check error still frees the buffer, since
-	// by that point libnbd has either told us the command is over or its
-	// connection is unusable enough that waiting longer serves no purpose.
+	// hitting a check error still frees the buffer, since libnbd itself
+	// told us the command is over. Hitting the deadline does NOT free the
+	// remaining buffers, though -- see the timeout branch below for why.
 	drainDeadline := time.Now().Add(30 * time.Second)
 	for {
 		pending := false
@@ -490,12 +490,21 @@ copyLoop:
 			break
 		}
 		if time.Now().After(drainDeadline) {
-			trace.Warning("nbd: timed out waiting for in-flight commands to settle during cleanup, freeing remaining buffers anyway")
+			// Do NOT free these buffers. Reaching the deadline means
+			// AioCommandCompleted never confirmed one way or the other --
+			// libnbd's C side may still consider this buffer live, still
+			// waiting on a connection that's very slow rather than
+			// genuinely dead. Freeing it here and having the command
+			// actually complete afterward would be a native use-after-free
+			// the moment libnbd writes the result into memory Go has
+			// already released. Abandoning (leaking) these few in-flight
+			// buffers is the safe tradeoff: this function is about to
+			// return a fatal error either way, ending the sync this
+			// connection belongs to, so the leak's lifetime is bounded by
+			// however much longer the process keeps running.
+			trace.Warning("nbd: timed out waiting for in-flight commands to settle during cleanup, abandoning remaining buffers without freeing them to avoid a use-after-free if they later complete")
 			for i := range slots {
-				if slots[i].state != slotFree {
-					slots[i].buf.Free()
-					slots[i].state = slotFree
-				}
+				slots[i].state = slotFree
 			}
 			break
 		}
@@ -850,10 +859,12 @@ compareLoop:
 	// Wait out whatever's still genuinely in flight (sidePending) before
 	// touching its buffer, same reasoning and bounded deadline as
 	// CopyExtentsTCP's own drain phase: libnbd requires a buffer passed to
-	// an AIO call to stay valid until AioCommandCompleted confirms it.
-	// Never compares here, and never overwrites an already-set compareErr
-	// with anything found during drain -- the first real error/mismatch
-	// found above always wins.
+	// an AIO call to stay valid until AioCommandCompleted confirms it, so
+	// hitting the deadline below does NOT free the remaining buffers --
+	// see CopyExtentsTCP's own timeout branch for why. Never compares
+	// here, and never overwrites an already-set compareErr with anything
+	// found during drain -- the first real error/mismatch found above
+	// always wins.
 	drainDeadline := time.Now().Add(30 * time.Second)
 	for {
 		pending := false
@@ -891,16 +902,17 @@ compareLoop:
 			break
 		}
 		if time.Now().After(drainDeadline) {
-			trace.Warning("nbd: timed out waiting for in-flight compare commands to settle during cleanup, freeing remaining buffers anyway")
+			// Do NOT free these buffers -- see CopyExtentsTCP's own
+			// timeout branch for why: a command AioCommandCompleted never
+			// confirmed one way or the other could still be genuinely
+			// in flight on a very slow (not dead) connection, and freeing
+			// its buffer now risks a native use-after-free if it later
+			// completes. Abandoning them is the safe tradeoff, bounded by
+			// this function returning a fatal error right after.
+			trace.Warning("nbd: timed out waiting for in-flight compare commands to settle during cleanup, abandoning remaining buffers without freeing them to avoid a use-after-free if they later complete")
 			for i := range slots {
-				if slots[i].stateA != sideIdle {
-					slots[i].bufA.Free()
-					slots[i].stateA = sideIdle
-				}
-				if slots[i].stateB != sideIdle {
-					slots[i].bufB.Free()
-					slots[i].stateB = sideIdle
-				}
+				slots[i].stateA = sideIdle
+				slots[i].stateB = sideIdle
 			}
 			break
 		}
