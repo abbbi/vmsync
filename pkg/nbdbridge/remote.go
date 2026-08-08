@@ -57,7 +57,7 @@ func StartRemote(ctx context.Context, client *remotessh.Client, bridgePort, real
 		return "", fmt.Errorf("start remote nbd bridge on port %d: %w: %s", bridgePort, err, out)
 	}
 
-	if err := waitForRemoteListening(ctx, client, bridgePort, 10*time.Second); err != nil {
+	if err := waitForRemoteListening(ctx, client, bridgePort, pidFile, 10*time.Second); err != nil {
 		return "", fmt.Errorf("remote nbd bridge on port %d did not start: %w", bridgePort, err)
 	}
 
@@ -65,8 +65,10 @@ func StartRemote(ctx context.Context, client *remotessh.Client, bridgePort, real
 }
 
 // waitForRemoteListening polls the remote host's own socket table (via "ss")
-// until bridgePort is actually in LISTEN state, rather than merely checking
-// that the process exists ("kill -0") or attempting a real TCP connection.
+// until bridgePort is actually in LISTEN state under pidFile's own PID,
+// rather than merely checking that the process exists ("kill -0"),
+// attempting a real TCP connection, or that *anything* is listening on the
+// port at all.
 //
 // A real TCP connect-and-close probe was used here originally and caused a
 // deadlock: vmsync-bridge-helper's accept loop treats ANY accepted
@@ -85,16 +87,28 @@ func StartRemote(ctx context.Context, client *remotessh.Client, bridgePort, real
 // both problems: it's a passive read of kernel state, so it can never
 // trigger the helper's accept-and-dial machinery, and it only succeeds once
 // the socket is genuinely listening.
-func waitForRemoteListening(ctx context.Context, client *remotessh.Client, bridgePort int, timeout time.Duration) error {
+//
+// Checking the port alone (without -p/pid) isn't enough either: an
+// uncleanly-killed prior run (OOM, host reboot, kill -9) can leave a stale
+// helper still listening on this same deterministically-computed port, or a
+// second, concurrent invocation for a different source domain can land on
+// it too (the run-lock is keyed only by source domain, not by port). If the
+// helper just started fails to bind because of that and exits immediately,
+// checking for "anything" listening would still see the stale/foreign
+// process and report success -- silently relaying this sync's traffic
+// through a helper wired up for an entirely different job's -connect
+// target. Matching pidFile's own PID against the socket's owning process
+// (ss -p) confirms it's genuinely this run's helper that's listening.
+func waitForRemoteListening(ctx context.Context, client *remotessh.Client, bridgePort int, pidFile string, timeout time.Duration) error {
 	filter := fmt.Sprintf("( sport = :%d )", bridgePort)
-	check := "ss -Htln " + util.ShQuote(filter) + " | grep -q ."
+	check := "ss -Htlnp " + util.ShQuote(filter) + " | grep -q \"pid=$(cat " + util.ShQuote(pidFile) + "),\""
 	deadline := time.Now().Add(timeout)
 	for {
 		if _, err := client.Run(ctx, check); err == nil {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("port %d is not listening after %s", bridgePort, timeout)
+			return fmt.Errorf("port %d is not listening under the helper process just started (pid file %s) after %s -- a different, stale process may already be holding this port", bridgePort, pidFile, timeout)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
