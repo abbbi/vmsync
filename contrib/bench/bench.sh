@@ -173,16 +173,19 @@ preflight() {
 
 # --- vmsync invocation -----------------------------------------------------
 
-# vmsync_common_args populates the global array VMSYNC_ARGS with the flags
-# every invocation always needs. Every call site appends its own
-# scenario-specific flags after this.
+# vmsync_common_args [IODEPTH_OVERRIDE] populates the global array
+# VMSYNC_ARGS with the flags every invocation always needs -- including
+# exactly ONE -io-depth: IODEPTH_OVERRIDE if given (Stage 1 passes its own
+# per-combination value), otherwise the fixed default from $CONF. Every
+# call site appends its own scenario-specific flags after this.
 vmsync_common_args() {
+	local iodepth="${1:-${IO_DEPTH:-8}}"
 	VMSYNC_ARGS=(
 		-source-uri "$SOURCE_URI"
 		-target-uri "$TARGET_URI"
 		-source-domain "$SOURCE_DOMAIN"
 		-target-domain "$TARGET_DOMAIN"
-		-io-depth "${IO_DEPTH:-8}"
+		-io-depth "$iodepth"
 	)
 	[ -n "${TARGET_DISK_PATH:-}" ] && VMSYNC_ARGS+=(-target-disk-path "$TARGET_DISK_PATH")
 	[ -n "${SSH_USER:-}" ] && VMSYNC_ARGS+=(-ssh-user "$SSH_USER")
@@ -213,8 +216,27 @@ run_vmsync() {
 	RUN_LOG="$log_file"
 	RUN_PROM="$prom_file"
 
-	vmsync_common_args
-	local args=("${VMSYNC_ARGS[@]}" -prometheus-textfile "$prom_file" "$@")
+	# Pull a "-io-depth VALUE" pair out of EXTRA_ARGS, if present (Stage 1
+	# passes its own per-combination value this way) -- vmsync_common_args
+	# is given it as an override so exactly ONE -io-depth ever ends up on
+	# the command line, instead of the fixed default AND the scenario's
+	# own value both landing on it back to back (harmless to vmsync itself,
+	# whose flag parser just lets the last one win, but it made every
+	# printed command line and results.csv entry needlessly confusing).
+	local -a extra=()
+	local iodepth_override=""
+	while [ $# -gt 0 ]; do
+		if [ "$1" = "-io-depth" ] && [ $# -ge 2 ]; then
+			iodepth_override="$2"
+			shift 2
+		else
+			extra+=("$1")
+			shift
+		fi
+	done
+
+	vmsync_common_args "$iodepth_override"
+	local args=("${VMSYNC_ARGS[@]}" -prometheus-textfile "$prom_file" "${extra[@]}")
 
 	log "-> $scenario/$phase"
 	log "   $VMSYNC_BIN ${args[*]}"
