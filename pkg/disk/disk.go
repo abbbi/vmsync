@@ -39,13 +39,23 @@ type QcowDisk struct {
 	VirtualSize int64
 	// RootSource is Source's qcow2 backing chain resolved down to its base
 	// file (no further backing file), or equal to Source itself when there
-	// is no backing chain. Source reflects the domain's *currently active*
-	// file, which stops being the disk's original file the moment an
-	// external snapshot exists (e.g. virsh snapshot-create --disk-only
-	// redirects the domain to a new overlay named after the snapshot).
-	// Target-side path naming must use RootSource, not Source, or every
-	// target-path lookup breaks against the real target file -- which was
-	// created under the pre-snapshot name during an earlier sync.
+	// is no backing chain. A multi-element chain has two, unrelated possible
+	// causes that this resolution deliberately treats the same way: an
+	// external snapshot (e.g. virsh snapshot-create --disk-only redirects
+	// the domain to a new overlay named after the snapshot, on top of the
+	// disk's original file) or a permanent qcow2 linked clone (the domain's
+	// disk has always had a backing file, e.g. a template shared by many
+	// VMs, unrelated to snapshots). Either way, Source reflects the
+	// domain's *currently active* file, and Target-side path naming must
+	// use RootSource, not Source, or every target-path lookup breaks
+	// against the real target file -- which was created under this same
+	// resolved name during an earlier sync, and stays stable across
+	// further snapshots since the chain's base file itself doesn't change
+	// as more overlays are stacked on top of it. Note that for a linked
+	// clone this resolves to the shared template's name, not the disk's
+	// own overlay -- SetTargetPath's vmName/targetDev prefixing is what
+	// keeps that from colliding with any other VM cloned from the same
+	// template.
 	RootSource string
 }
 
@@ -106,8 +116,10 @@ func shellEscape(s string) string {
 // via --backing-chain, returned top (path itself) to base, in that order. A
 // path with no backing file returns a single element. Used both for a
 // disk's regular size/format info (chain[0]) and to find its stable base
-// file when an external snapshot has redirected the domain to a new overlay
-// (chain's last element) -- see QcowDisk.RootSource.
+// file (chain's last element) -- either because an external snapshot has
+// redirected the domain to a new overlay, or because the disk is a
+// permanent qcow2 linked clone of a shared base image -- see
+// QcowDisk.RootSource.
 func QemuImgInfoChainJSON(path string) ([]QemuImgInfo, error) {
 	cmd := exec.Command("qemu-img", "info", "--force-share", "--backing-chain", "--output=json", path)
 	b, err := cmd.Output()

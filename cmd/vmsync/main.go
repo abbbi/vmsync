@@ -932,15 +932,18 @@ func run(cfg struct {
 		// --backing-chain returns the chain ordered top (d.Source itself)
 		// to base; the last element is the disk's real, stable base file.
 		// d.Source is whatever the domain's disk currently points at, which
-		// is no longer that stable file once an external snapshot exists
-		// (virsh snapshot-create --disk-only redirects the domain to a new
-		// overlay named after the snapshot). Target-side paths are named
-		// after this base, not d.Source, so they keep matching the real
-		// target file that earlier (pre-snapshot) syncs already created
-		// under the original name.
+		// differs from that stable base both when an external snapshot
+		// exists (virsh snapshot-create --disk-only redirects the domain to
+		// a new overlay named after the snapshot) and, unrelated to
+		// snapshots, when the disk is a permanent qcow2 linked clone of a
+		// shared base image -- this resolution can't tell the two apart
+		// (see QcowDisk.RootSource), so the log below doesn't assert which
+		// one it is. Target-side paths are named after this base, not
+		// d.Source, so they keep matching the real target file that
+		// earlier syncs already created under the same resolved name.
 		rootPath := chain[len(chain)-1].Filename
 		if rootPath != d.Source {
-			trace.Info("resolved disk's backing chain to its base file (external snapshot detected)", "disk", d.TargetDev, "active", d.Source, "base", rootPath)
+			trace.Info("disk has a backing file chain, resolved target-side naming to its base (external snapshot or linked clone)", "disk", d.TargetDev, "active", d.Source, "base", rootPath)
 		}
 		qcowDisks[i].RootSource = rootPath
 
