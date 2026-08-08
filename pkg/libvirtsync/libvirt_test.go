@@ -125,28 +125,47 @@ func TestReplaceDomainDiskPath(t *testing.T) {
 		rootMap := map[string]string{
 			"/var/lib/libvirt/images/testvm.snap1": "/var/lib/libvirt/images/testvm.qcow2",
 		}
-		out, err := replaceDomainDiskPath(xmlStr, "/mnt/target", rootMap)
+		out, err := replaceDomainDiskPath(xmlStr, "testvm", "/mnt/target", rootMap)
 		if err != nil {
 			t.Fatalf("replaceDomainDiskPath() error = %v", err)
 		}
-		if !strings.Contains(out, `file="/mnt/target/testvm.qcow2"`) {
-			t.Errorf("expected rewritten path using mapped root source, got: %s", out)
+		if !strings.Contains(out, `file="/mnt/target/testvm-vda-testvm.qcow2"`) {
+			t.Errorf("expected rewritten path using mapped root source, prefixed with vm name and target dev, got: %s", out)
 		}
 	})
 
 	t.Run("disk missing from a nil map falls back to its own live source, without panicking", func(t *testing.T) {
 		xmlStr := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/testvm.qcow2")
-		out, err := replaceDomainDiskPath(xmlStr, "/mnt/target", nil)
+		out, err := replaceDomainDiskPath(xmlStr, "testvm", "/mnt/target", nil)
 		if err != nil {
 			t.Fatalf("replaceDomainDiskPath() error = %v", err)
 		}
-		if !strings.Contains(out, `file="/mnt/target/testvm.qcow2"`) {
-			t.Errorf("expected fallback to live source's own basename, got: %s", out)
+		if !strings.Contains(out, `file="/mnt/target/testvm-vda-testvm.qcow2"`) {
+			t.Errorf("expected fallback to live source's own basename, prefixed with vm name and target dev, got: %s", out)
+		}
+	})
+
+	t.Run("two vms sharing a basename resolve to distinct target paths", func(t *testing.T) {
+		xmlStr := minimalDomainXML("vm1", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/vm1/disk.qcow2")
+		out1, err := replaceDomainDiskPath(xmlStr, "vm1", "/mnt/target", nil)
+		if err != nil {
+			t.Fatalf("replaceDomainDiskPath() error = %v", err)
+		}
+		xmlStr2 := minimalDomainXML("vm2", "22345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/vm2/disk.qcow2")
+		out2, err := replaceDomainDiskPath(xmlStr2, "vm2", "/mnt/target", nil)
+		if err != nil {
+			t.Fatalf("replaceDomainDiskPath() error = %v", err)
+		}
+		if strings.Contains(out1, `file="/mnt/target/disk.qcow2"`) || strings.Contains(out2, `file="/mnt/target/disk.qcow2"`) {
+			t.Fatalf("target path must not be the bare, colliding basename: vm1=%s vm2=%s", out1, out2)
+		}
+		if !strings.Contains(out1, `file="/mnt/target/vm1-vda-disk.qcow2"`) || !strings.Contains(out2, `file="/mnt/target/vm2-vda-disk.qcow2"`) {
+			t.Errorf("expected distinct vm-name-prefixed target paths, got vm1=%s vm2=%s", out1, out2)
 		}
 	})
 
 	t.Run("malformed xml returns an error", func(t *testing.T) {
-		if _, err := replaceDomainDiskPath("not xml at all <<<", "/mnt/target", nil); err == nil {
+		if _, err := replaceDomainDiskPath("not xml at all <<<", "testvm", "/mnt/target", nil); err == nil {
 			t.Fatal("expected an error for malformed domain xml")
 		}
 	})

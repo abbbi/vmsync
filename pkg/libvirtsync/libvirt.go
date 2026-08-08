@@ -201,7 +201,7 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 
 	// Keep source XML intact (including UUID) unless libvirt rejects duplicate UUID.
 	if targetDiskPath != "" {
-		updatedXML, err = replaceDomainDiskPath(updatedXML, targetDiskPath, rootSourceByLiveSource)
+		updatedXML, err = replaceDomainDiskPath(updatedXML, targetDomainName, targetDiskPath, rootSourceByLiveSource)
 		if err != nil {
 			return fmt.Errorf("rewrite target domain xml: %w", err)
 		}
@@ -248,7 +248,7 @@ func ThawFs(srcDom *libvirt.Domain, freezed bool) {
 // shouldn't happen for anything ParseQcowDisks would also have picked up,
 // since both apply the same IgnoreDevice filter, but degrades safely rather
 // than panicking on a nil map lookup if it ever does.
-func replaceDomainDiskPath(domainXML, targetDiskPath string, rootSourceByLiveSource map[string]string) (string, error) {
+func replaceDomainDiskPath(domainXML, vmName, targetDiskPath string, rootSourceByLiveSource map[string]string) (string, error) {
 	domcfg := &libvirtxml.Domain{}
 	err := domcfg.Unmarshal(domainXML)
 	if err != nil {
@@ -270,7 +270,11 @@ func replaceDomainDiskPath(domainXML, targetDiskPath string, rootSourceByLiveSou
 		if resolved, ok := rootSourceByLiveSource[liveSource]; ok {
 			rootSource = resolved
 		}
-		domcfg.Devices.Disks[i].Source.File.File = util.SetTargetPath(targetDiskPath, rootSource)
+		targetDev := ""
+		if d.Target != nil {
+			targetDev = d.Target.Dev
+		}
+		domcfg.Devices.Disks[i].Source.File.File = util.SetTargetPath(targetDiskPath, vmName, targetDev, rootSource)
 	}
 
 	changed, err := domcfg.Marshal()
