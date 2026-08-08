@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -41,14 +42,64 @@ import (
 	"vmsync/pkg/zstdrelay"
 )
 
+// optionalValueFlag implements flag.Value (plus the IsBoolFlag optimization)
+// for a string flag that also works bare -- "-name" alone resolves to
+// bareDefault, "-name=x" takes x literally, and "-name=false" (or simply
+// omitting the flag) disables it. Duplicated from cmd/vmsync/main.go rather
+// than shared -- for the same reason recoverRelayPanic below has its own
+// copy instead of importing pkg/nbdbridge's: cmd/vmsync is package main (not
+// importable at all), and pkg/nbdbridge would pull in its pkg/remotessh (SSH
+// client) dependency, which this otherwise minimal, dependency-light binary
+// deliberately avoids.
+type optionalValueFlag struct {
+	value       string
+	bareDefault string
+}
+
+func (f *optionalValueFlag) String() string   { return f.value }
+func (f *optionalValueFlag) IsBoolFlag() bool { return true }
+func (f *optionalValueFlag) Set(s string) error {
+	switch s {
+	case "true":
+		f.value = f.bareDefault
+	case "false":
+		f.value = ""
+	default:
+		f.value = s
+	}
+	return nil
+}
+
+// validateCompressLevel checks level is valid for algo. Duplicated from
+// pkg/nbdbridge.ValidateCompressLevel rather than imported, for the same
+// dependency-avoidance reason optionalValueFlag above is duplicated.
+func validateCompressLevel(algo zstdrelay.Algo, level string) error {
+	if algo == zstdrelay.AlgoS2 {
+		switch level {
+		case "default", "better", "best":
+			return nil
+		default:
+			return fmt.Errorf("-compress-level must be \"default\", \"better\", or \"best\" when -compress=s2, got %q", level)
+		}
+	}
+	n, err := strconv.Atoi(level)
+	if err != nil {
+		return fmt.Errorf("-compress-level must be a number between 1 and 19 for -compress=zstd, got %q", level)
+	}
+	if n < 1 || n > 19 {
+		return fmt.Errorf("-compress-level must be between 1 and 19, got %d", n)
+	}
+	return nil
+}
+
 func main() {
 	listenAddr := flag.String("listen", "", "local host:port to listen on for bridged connections (required)")
 	connectAddr := flag.String("connect", "", "real endpoint host:port to dial and forward plaintext traffic to/from, once per accepted connection (required)")
-	compress := flag.Bool("compress", false, "compress the wire-facing traffic")
-	algoFlag := flag.String("algo", "zstd", "compression format to use with -compress: \"zstd\" or \"s2\"")
-	level := flag.String("level", "3", "compression level/mode, only used with -compress: a number 1-19 for -algo=zstd, or \"default\"/\"better\"/\"best\" for -algo=s2")
-	netbuffer := flag.String("netbuffer", "", "buffer wire-facing traffic through a bounded in-memory buffer, "+
-		"formatted as <blocksize>,<buffersize> (e.g. 64k,256M); empty disables it")
+	compressArg := optionalValueFlag{bareDefault: "s2"}
+	netBufferArg := optionalValueFlag{bareDefault: "128k,1G"}
+	flag.Var(&compressArg, "compress", "Same syntax as vmsync")
+	level := flag.String("compress-level", "3", "Same syntax as vmsync")
+	flag.Var(&netBufferArg, "netbuffer", "Same syntax as vmsync")
 	showVersion := flag.Bool("v", false, "Show version and exit")
 	showVersionLong := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
@@ -66,23 +117,43 @@ func main() {
 		fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -connect is required")
 		os.Exit(2)
 	}
-	algo, err := zstdrelay.ParseAlgo(*algoFlag)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
-		os.Exit(2)
+
+	compressLevelExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "compress-level" {
+			compressLevelExplicit = true
+		}
+	})
+
+	compress := compressArg.value != ""
+	var algo zstdrelay.Algo
+	if compress {
+		var err error
+		algo, err = zstdrelay.ParseAlgo(compressArg.value)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
+			os.Exit(2)
+		}
+		if !compressLevelExplicit && algo == zstdrelay.AlgoS2 {
+			*level = "better"
+		}
+		if err := validateCompressLevel(algo, *level); err != nil {
+			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
+			os.Exit(2)
+		}
 	}
 
 	var netbufferBlock, netbufferSize string
-	if *netbuffer != "" {
-		parts := strings.SplitN(*netbuffer, ",", 2)
+	if netBufferArg.value != "" {
+		parts := strings.SplitN(netBufferArg.value, ",", 2)
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: -netbuffer must be of the form <blocksize>,<buffersize>, got %q\n", *netbuffer)
+			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: -netbuffer must be of the form <blocksize>,<buffersize>, got %q\n", netBufferArg.value)
 			os.Exit(2)
 		}
 		netbufferBlock, netbufferSize = parts[0], parts[1]
 	}
 
-	if err := serve(*listenAddr, *connectAddr, *compress, algo, *level, netbufferBlock, netbufferSize); err != nil {
+	if err := serve(*listenAddr, *connectAddr, compress, algo, *level, netbufferBlock, netbufferSize); err != nil {
 		fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
 		os.Exit(1)
 	}

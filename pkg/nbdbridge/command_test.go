@@ -61,13 +61,13 @@ func TestBuildStartCommand(t *testing.T) {
 				"-connect",
 				"127.0.0.1:10809",
 			},
-			notWant: []string{"-compress", "-algo", "-level", "-netbuffer"},
+			notWant: []string{"-compress", "-netbuffer"},
 		},
 		{
 			name: "compress zstd with explicit level",
 			cfg:  Config{HelperPath: helperPath, Compress: true, CompressAlgo: "zstd", CompressLevel: "7"},
 			want: []string{
-				"-compress", "-algo", "zstd", "-level", "7",
+				"-compress=zstd", "-compress-level", "7",
 			},
 			notWant: []string{"-netbuffer"},
 		},
@@ -75,7 +75,7 @@ func TestBuildStartCommand(t *testing.T) {
 			name: "compress s2 with explicit level",
 			cfg:  Config{HelperPath: helperPath, Compress: true, CompressAlgo: "s2", CompressLevel: "better"},
 			want: []string{
-				"-compress", "-algo", "s2", "-level", "better",
+				"-compress=s2", "-compress-level", "better",
 			},
 			notWant: []string{"-netbuffer"},
 		},
@@ -86,7 +86,7 @@ func TestBuildStartCommand(t *testing.T) {
 			name: "compress with empty algo defaults to zstd",
 			cfg:  Config{HelperPath: helperPath, Compress: true, CompressAlgo: "", CompressLevel: "9"},
 			want: []string{
-				"-compress", "-algo", "zstd", "-level", "9",
+				"-compress=zstd", "-compress-level", "9",
 			},
 		},
 		{
@@ -96,35 +96,36 @@ func TestBuildStartCommand(t *testing.T) {
 			name: "compress with empty level defaults to 3 for zstd",
 			cfg:  Config{HelperPath: helperPath, Compress: true, CompressAlgo: "zstd", CompressLevel: ""},
 			want: []string{
-				"-compress", "-algo", "zstd", "-level", "3",
+				"-compress=zstd", "-compress-level", "3",
 			},
 		},
 		{
 			// Same fallback, but the empty-algo default of "zstd" feeds
 			// into the empty-level default too, ending up at "3" rather
-			// than s2's "default".
+			// than s2's "better".
 			name: "compress with both empty defaults to zstd level 3",
 			cfg:  Config{HelperPath: helperPath, Compress: true, CompressAlgo: "", CompressLevel: ""},
 			want: []string{
-				"-compress", "-algo", "zstd", "-level", "3",
+				"-compress=zstd", "-compress-level", "3",
 			},
 		},
 		{
 			// BuildStartCommand's own fallback: an empty CompressLevel
-			// defaults to "default" when the algo is s2.
-			name: "compress s2 with empty level defaults to default",
+			// defaults to "better" when the algo is s2, matching
+			// cmd/vmsync's own -compress-level auto-default policy.
+			name: "compress s2 with empty level defaults to better",
 			cfg:  Config{HelperPath: helperPath, Compress: true, CompressAlgo: "s2", CompressLevel: ""},
 			want: []string{
-				"-compress", "-algo", "s2", "-level", "default",
+				"-compress=s2", "-compress-level", "better",
 			},
 		},
 		{
 			name: "netbuffer only",
 			cfg:  Config{HelperPath: helperPath, NetBufferBlock: "64k", NetBufferSize: "512M"},
 			want: []string{
-				"-netbuffer", "64k,512M",
+				"-netbuffer=64k,512M",
 			},
-			notWant: []string{"-compress", "-algo", "-level"},
+			notWant: []string{"-compress"},
 		},
 		{
 			name: "compress and netbuffer together",
@@ -133,7 +134,7 @@ func TestBuildStartCommand(t *testing.T) {
 				NetBufferBlock: "64k", NetBufferSize: "512M",
 			},
 			want: []string{
-				"-compress", "-algo", "zstd", "-level", "5", "-netbuffer", "64k,512M",
+				"-compress=zstd", "-compress-level", "5", "-netbuffer=64k,512M",
 			},
 		},
 	}

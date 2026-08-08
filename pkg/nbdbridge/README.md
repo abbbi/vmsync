@@ -128,7 +128,7 @@ Example with vmsync --compress --netbuffer=64k,1G (default: direct, no -use-ssh)
  │ │ outbound (to target):       │    │                    │  │ vmsync-bridge-helper                          │     │
  │ │  conn → [compress+flush]    │    │  plain TCP, direct  │  │   -listen 0.0.0.0:<bridgePort0>              │     │
  │ │  → [netbuffer]              │    │  (default; add      │  │   -connect 127.0.0.1:<targetPort>            │     │
- │ │  → net.Dial() ──────────────┼────┼── -use-ssh to ──────┼──┤    -compress -level N -netbuffer <b>,<s>     │     │
+ │ │  → net.Dial() ──────────────┼────┼── -use-ssh to ──────┼──┤    -compress=algo -compress-level N          │     │
  │ │                             │    │  tunnel this over   │  │  (single persistent process; each accepted   │     │
  │ │ inbound (from target):      │    │  SSH instead)        │  │   connection gets its own goroutine, dials   │     │
  │ │  Dial() → [netbuffer]       │    │                    │  │   <targetPort> itself, and relays both       │     │

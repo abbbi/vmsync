@@ -67,15 +67,27 @@ func BuildStartCommand(cfg Config, bridgePort, realPort int, pidFile, logFile st
 		level := cfg.CompressLevel
 		if level == "" {
 			if algo == "s2" {
-				level = "default"
+				level = "better"
 			} else {
 				level = "3"
 			}
 		}
-		args = append(args, "-compress", "-algo", algo, "-level", level)
+		// vmsync-bridge-helper's -compress is an "optional value" flag,
+		// same shape as vmsync's own -compress (bare -compress defaults to
+		// s2). Like any such flag, an explicit value MUST be given via
+		// "-compress=value" -- never as a separate "-compress value"
+		// argument pair: the flag package's bool-flag optimization that
+		// lets it work bare also means a following space-separated
+		// argument is never consumed as its value, silently becoming an
+		// unrelated positional argument instead (which vmsync-bridge-helper
+		// now rejects outright via its own flag.NArg() check -- getting
+		// this wrong here would make every compressed sync fail).
+		args = append(args, "-compress="+algo, "-compress-level", level)
 	}
 	if cfg.NetBufferEnabled() {
-		args = append(args, "-netbuffer", cfg.NetBufferBlock+","+cfg.NetBufferSize)
+		// Same "=" requirement as -compress above, and for the same reason
+		// (-netbuffer is also an optional-value flag on the helper side).
+		args = append(args, "-netbuffer="+cfg.NetBufferBlock+","+cfg.NetBufferSize)
 	}
 	helperCmd := quoteArgs(args...)
 
