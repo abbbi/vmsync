@@ -1935,8 +1935,22 @@ func run(cfg struct {
 	var newXML string
 	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint)
 	if err != nil {
-		trace.Warning("Unable to add metadata info", err)
-		newXML = srcXML
+		// UpdateSyncMetadata is a pure in-memory XML transformation -- no
+		// network or libvirt call involved -- so a failure here is almost
+		// certainly a real bug (e.g. srcXML failing to parse), not a
+		// transient environmental hiccup. Silently falling back to the
+		// unmodified srcXML (as this used to do) would define the target
+		// with NO updated checkpoint/timestamp/failure_count metadata at
+		// all, quietly disabling the metadata-vs-file-timestamp consistency
+		// check (see the read of these same fields further up) for every
+		// future run -- exactly the "target file changed out-of-band
+		// between syncs" detection this metadata exists for -- with only an
+		// easy-to-miss warning log to ever reveal it happened. Data copying
+		// already succeeded by this point (dataCopySucceeded is already
+		// true), so failing here does not risk the checkpoint-delete-on-
+		// failure cleanup discarding a valid checkpoint -- see its own
+		// doc comment.
+		return fmt.Errorf("update sync metadata (checkpoint=%s): %w", effectiveCheckpoint, err)
 	}
 
 	// Maps each disk's live Source path to its resolved backing-chain root
