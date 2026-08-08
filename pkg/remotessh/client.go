@@ -203,9 +203,16 @@ func Dial(cfg Config) (*Client, error) {
 		return nil, err
 	}
 
-	authMethods, err := buildAuthMethods(cfg)
+	authMethods, agentConn, err := buildAuthMethods(cfg)
 	if err != nil {
 		return nil, err
+	}
+	// Only needed for the handshake below (ssh.NewClientConn invokes the
+	// agent callback synchronously during auth, not afterward) -- close it
+	// once Dial returns either way, rather than leaking it for the life of
+	// the process the way this connection previously was.
+	if agentConn != nil {
+		defer agentConn.Close()
 	}
 
 	sshCfg := &ssh.ClientConfig{
@@ -244,6 +251,19 @@ func Dial(cfg Config) (*Client, error) {
 	if err := conn.SetDeadline(time.Now().Add(cfg.Timeout)); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("ssh dial %s: set handshake deadline: %w", address, err)
+	}
+	// A PublicKeysCallback auth method (SSH_AUTH_SOCK) is invoked
+	// synchronously during the handshake below, but over agentConn -- a
+	// wholly separate file descriptor to a local ssh-agent that conn's own
+	// deadline above has no effect on. A stale or unresponsive agent (e.g.
+	// a forwarded socket left over from an ended session) would otherwise
+	// block the handshake indefinitely, defeating the point of bounding it
+	// at all. Give it the same deadline window as the handshake itself.
+	if agentConn != nil {
+		if err := agentConn.SetDeadline(time.Now().Add(cfg.Timeout)); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("ssh dial %s: set ssh-agent deadline: %w", address, err)
+		}
 	}
 	sshConn, chans, reqs, err := ssh.NewClientConn(conn, address, sshCfg)
 	if err != nil {
@@ -337,12 +357,18 @@ func (c *Client) Run(ctx context.Context, command string) (string, error) {
 	}
 }
 
-func buildAuthMethods(cfg Config) ([]ssh.AuthMethod, error) {
+// buildAuthMethods also returns the raw connection to a local ssh-agent
+// (SSH_AUTH_SOCK), when one of the returned methods uses it, so the caller
+// can bound how long the handshake is allowed to wait on it -- see the
+// comment where Dial sets its deadline for why that matters. nil when no
+// agent method was added.
+func buildAuthMethods(cfg Config) ([]ssh.AuthMethod, net.Conn, error) {
 	var methods []ssh.AuthMethod
+	var agentConn net.Conn
 	if cfg.PrivateKeyPath != "" {
 		signer, err := signerFromPath(cfg.PrivateKeyPath)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		methods = append(methods, ssh.PublicKeys(signer))
 	}
@@ -350,6 +376,7 @@ func buildAuthMethods(cfg Config) ([]ssh.AuthMethod, error) {
 	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
 		conn, err := net.Dial("unix", sock)
 		if err == nil {
+			agentConn = conn
 			methods = append(methods, ssh.PublicKeysCallback(agent.NewClient(conn).Signers))
 		}
 	}
@@ -359,9 +386,9 @@ func buildAuthMethods(cfg Config) ([]ssh.AuthMethod, error) {
 	}
 
 	if len(methods) == 0 {
-		return nil, errors.New("no ssh auth method available: provide --ssh-key, --ssh-password, or SSH_AUTH_SOCK")
+		return nil, nil, errors.New("no ssh auth method available: provide --ssh-key, --ssh-password, or SSH_AUTH_SOCK")
 	}
-	return methods, nil
+	return methods, agentConn, nil
 }
 
 func signerFromPath(path string) (ssh.Signer, error) {

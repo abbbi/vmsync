@@ -22,6 +22,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -181,7 +182,57 @@ func TestBuildAuthMethodsNoMethodsAvailable(t *testing.T) {
 	// function makes (os.Getenv(...) != ""), and t.Setenv restores the
 	// original value automatically once the test finishes.
 	t.Setenv("SSH_AUTH_SOCK", "")
-	if _, err := buildAuthMethods(Config{}); err == nil {
+	if _, _, err := buildAuthMethods(Config{}); err == nil {
 		t.Fatal("expected an error when no key, password, or SSH agent is configured")
+	}
+}
+
+// TestBuildAuthMethodsReturnsAgentConn pins down the return value Dial
+// depends on to bound the ssh-agent handshake with its own deadline (see
+// Dial's comment on agentConn) -- it must be the same raw connection
+// PublicKeysCallback was built from, not nil, whenever SSH_AUTH_SOCK
+// resolves to a real socket. The fake listener here doesn't need to speak
+// the real ssh-agent wire protocol; this only exercises the plumbing, not
+// an actual agent round trip (real agent conversations are exercised, if at
+// all, only through a live Dial -- out of scope here, same as Dial itself).
+func TestBuildAuthMethodsReturnsAgentConn(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "agent.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen on fake agent socket: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	t.Setenv("SSH_AUTH_SOCK", sockPath)
+	methods, agentConn, err := buildAuthMethods(Config{})
+	if err != nil {
+		t.Fatalf("buildAuthMethods() error = %v", err)
+	}
+	if len(methods) != 1 {
+		t.Fatalf("expected exactly one auth method from the agent socket, got %d", len(methods))
+	}
+	if agentConn == nil {
+		t.Fatal("expected the raw agent connection back so Dial can bound its deadline, got nil")
+	}
+	agentConn.Close()
+}
+
+func TestBuildAuthMethodsNoAgentConnWithoutSSHAuthSock(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "")
+	_, agentConn, err := buildAuthMethods(Config{Password: "x"})
+	if err != nil {
+		t.Fatalf("buildAuthMethods() error = %v", err)
+	}
+	if agentConn != nil {
+		t.Fatal("expected a nil agent connection when SSH_AUTH_SOCK is unset")
 	}
 }
