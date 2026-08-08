@@ -436,6 +436,19 @@ func ReadTargetFailureCount(targetURI, targetDomain string) (int, error) {
 // failure_count in its domain metadata (leaving the rest of its definition
 // untouched) and returns the new count. A target domain that doesn't exist
 // yet has nothing to record against and is treated as a no-op.
+//
+// The run-lock (pkg/util/lock.go) is keyed only by source domain, so it
+// gives this function no protection at all against a concurrent writer of
+// the *target* domain -- another vmsync invocation misconfigured to point
+// at the same target, or any external tool (virsh define, another
+// orchestration layer) redefining it. libvirt's domain-definition API has
+// no atomic compare-and-swap primitive to close that race outright, so
+// instead this re-reads the domain's XML immediately before writing and
+// refuses to proceed if it no longer matches what the increment above was
+// actually computed from -- narrowing the window from this whole
+// function's read-then-write span down to a single extra round-trip, and
+// turning what would otherwise be a silent, last-write-wins clobber into a
+// loud, diagnosable error.
 func RecordTargetSyncFailure(targetURI, targetDomain string) (int, error) {
 	mgr, err := Connect(targetURI)
 	if err != nil {
@@ -468,6 +481,15 @@ func RecordTargetSyncFailure(targetURI, targetDomain string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("update failure_count metadata: %w", err)
 	}
+
+	latestXML, err := dom.GetXMLDesc(0)
+	if err != nil {
+		return 0, fmt.Errorf("re-read target domain xml before write: %w", err)
+	}
+	if latestXML != domXML {
+		return 0, fmt.Errorf("target domain %s was redefined concurrently by something else while recording this failure; refusing to overwrite it -- check whether another vmsync invocation or an external tool is also managing this domain", targetDomain)
+	}
+
 	newDom, err := mgr.Conn.DomainDefineXML(updatedXML)
 	if err != nil {
 		return 0, fmt.Errorf("redefine target domain with updated failure_count: %w", err)
