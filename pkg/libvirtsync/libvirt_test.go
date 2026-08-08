@@ -106,8 +106,11 @@ func TestIsCheckpointBlockedBySnapshot(t *testing.T) {
 		want bool
 	}{
 		{"nil error", nil, false},
-		{"message mentions snapshot lowercase", errors.New("operation invalid: the creation of checkpoints when external snapshots exist is currently forbidden"), true},
-		{"message mentions SNAPSHOT uppercase", errors.New("SNAPSHOT exists"), true},
+		{"libvirt's actual documented message, lowercase", errors.New("operation invalid: the creation of checkpoints when external snapshots exist is currently forbidden"), true},
+		{"same message, uppercase", errors.New("OPERATION INVALID: THE CREATION OF CHECKPOINTS WHEN EXTERNAL SNAPSHOTS EXIST IS CURRENTLY FORBIDDEN"), true},
+		{"singular \"external snapshot\" phrasing still matches", errors.New("checkpoint creation blocked: an external snapshot is present"), true},
+		{"mentions snapshot but not checkpoint must not match", errors.New("SNAPSHOT exists"), false},
+		{"mentions checkpoint but not snapshot must not match", errors.New("checkpoint already exists with that name"), false},
 		{"unrelated error", errors.New("connection refused"), false},
 	}
 	for _, tc := range cases {

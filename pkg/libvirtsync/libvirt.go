@@ -834,11 +834,26 @@ func ExternalSnapshotCount(dom *libvirt.Domain) (int, error) {
 // generic invalid-operation error with no code of its own specific to this
 // case -- unlike StopBackup just below, which has a structured alternative
 // available and uses that instead.
+//
+// Requires both "checkpoint" and "external snapshot" to appear, rather than
+// just the single generic word "snapshot" (this function's own previous
+// implementation) -- libvirt/qemu use that word pervasively for entirely
+// unrelated conditions, any of which would otherwise get misclassified as
+// this specific, tolerated case. The caller only tolerates a true result by
+// proceeding with an incremental sync against a checkpoint whose validity
+// was never actually re-established this run (see its own comment) -- a
+// false positive here is the dangerous direction, so requiring both terms
+// together, closely matching libvirt's actual documented wording, is worth
+// the (much smaller) risk of a false negative on some future, differently
+// worded version of this same message; that failure mode is safe by
+// comparison; it just falls back to failing the run outright, same as any
+// other unrecognized CreateCheckpoint error.
 func IsCheckpointBlockedBySnapshot(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "snapshot")
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "checkpoint") && strings.Contains(msg, "external snapshot")
 }
 
 // StopBackup aborts any pull-backup job in progress on dom, tolerating the
