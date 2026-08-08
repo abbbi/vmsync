@@ -676,8 +676,11 @@ func run(cfg struct {
 			if !suspendedForVerify {
 				return
 			}
-			if err := srcDom.Resume(); err != nil {
-				trace.Error("failed to resume source VM after -verify", "trigger", trigger, "error", err)
+			resumeErr := callWithTimeout("resume source vm", 5*time.Second, func() error {
+				return srcDom.Resume()
+			})
+			if resumeErr != nil {
+				trace.Error("failed to resume source VM after -verify", "trigger", trigger, "error", resumeErr)
 			} else {
 				trace.Info("verify: resumed source VM", "trigger", trigger, "vm", cfg.SourceDomain)
 			}
