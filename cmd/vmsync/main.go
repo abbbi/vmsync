@@ -446,6 +446,20 @@ func run(cfg struct {
 	// but nothing downstream (parent cleanup, checkpoint-on-failure cleanup,
 	// target metadata) should treat checkpointName as if it exists.
 	var checkpointAdvanced bool
+	// dataCopySucceeded is set (under checkpointMu, alongside checkpointName/
+	// checkpointAdvanced above) once every disk has actually finished
+	// copying (and verifying, if requested) without error -- specifically
+	// BEFORE the purely post-copy bookkeeping steps that follow (deleting
+	// the now-superseded parent checkpoint, redefining the target domain).
+	// Both the deferred checkpoint-delete-on-failure cleanup further down
+	// and the signal handler's own mirrored copy of it must check this: a
+	// failure in one of those bookkeeping steps still makes runErr non-nil,
+	// but the checkpoint just created correctly reflects data that DID
+	// finish copying successfully, and deleting it anyway would discard a
+	// perfectly good incremental baseline, forcing a needless full resync
+	// next run over what was, in the ways that actually matter, a
+	// successful sync.
+	var dataCopySucceeded bool
 	var freezed bool = false
 	var fsFreezeFailed bool = false
 	var started bool = false
@@ -839,18 +853,24 @@ func run(cfg struct {
 			go func() { defer cleanupWg.Done(); resumeSource(sig.String()) }()
 			go func() {
 				defer cleanupWg.Done()
-				// Snapshot both under checkpointMu, once, rather than
+				// Snapshot all three under checkpointMu, once, rather than
 				// reading each separately -- a signal landing between
 				// CreateCheckpoint succeeding and checkpointAdvanced being
 				// set must see either the fully-pre-checkpoint state or the
 				// fully-post-checkpoint state, never a stale mix of the two.
 				checkpointMu.Lock()
-				name, advanced := checkpointName, checkpointAdvanced
+				name, advanced, copySucceeded := checkpointName, checkpointAdvanced, dataCopySucceeded
 				checkpointMu.Unlock()
 				// Mirrors the deferred checkpoint cleanup further down in
 				// run() -- duplicated here because that defer never gets a
 				// chance to run if we os.Exit below without waiting for it.
-				if name == "" || !advanced {
+				// copySucceeded matters here too: a signal landing after the
+				// copy itself finished but before run() has returned (e.g.
+				// during parent-checkpoint cleanup or target domain
+				// redefinition) must not discard a checkpoint that correctly
+				// reflects data which did finish copying -- see
+				// dataCopySucceeded's own doc comment.
+				if name == "" || !advanced || copySucceeded {
 					return
 				}
 				if err := callWithTimeout("delete checkpoint", 5*time.Second, func() error {
@@ -1255,7 +1275,7 @@ func run(cfg struct {
 	libvirtsync.ThawFs(srcDom, freezed)
 
 	defer func() {
-		if runErr == nil || !checkpointAdvanced {
+		if runErr == nil || !checkpointAdvanced || dataCopySucceeded {
 			return
 		}
 		if err := libvirtsync.DeleteCheckpointIfExists(srcDom, checkpointName); err != nil {
@@ -1881,6 +1901,16 @@ func run(cfg struct {
 			return err
 		}
 	}
+
+	// Every disk finished copying (and verifying, if requested) without
+	// error at this point -- from here on, only post-copy bookkeeping
+	// remains (parent-checkpoint cleanup, target domain redefinition). See
+	// dataCopySucceeded's own doc comment for why the checkpoint-delete-on-
+	// failure cleanup below (and its signal-handler-side mirror) must not
+	// treat a failure in one of those steps the same as a failed copy.
+	checkpointMu.Lock()
+	dataCopySucceeded = true
+	checkpointMu.Unlock()
 
 	if incrementalMode && checkpointAdvanced {
 		trace.Info("sync successful cleaning up parent checkpoint", "parent", parent)
