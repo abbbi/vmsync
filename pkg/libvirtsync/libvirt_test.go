@@ -574,12 +574,12 @@ func TestMissingXMLElements(t *testing.T) {
 		}
 	})
 
-	t.Run("an unparseable original or rewrite yields no report rather than a false positive", func(t *testing.T) {
+	t.Run("an unparsable original or rewrite yields no report rather than a false positive", func(t *testing.T) {
 		if got := missingXMLElements("not xml", `<domain/>`); got != nil {
-			t.Errorf("missingXMLElements(unparseable original, ...) = %v, want nil", got)
+			t.Errorf("missingXMLElements(unparsable original, ...) = %v, want nil", got)
 		}
 		if got := missingXMLElements(`<domain><hostdev/></domain>`, "not xml"); got != nil {
-			t.Errorf("missingXMLElements(..., unparseable rewrite) = %v, want nil", got)
+			t.Errorf("missingXMLElements(..., unparsable rewrite) = %v, want nil", got)
 		}
 	})
 }
