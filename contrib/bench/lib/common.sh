@@ -108,11 +108,42 @@ domain_exists() {
 	return 1
 }
 
+# virsh_err_is_not_found -- true if $VIRSH_ERR (as just set by
+# domain_exists/dom_state) looks like libvirt's own "no such domain"
+# error rather than some other failure (bad URI, auth, connection
+# refused, ...). virsh ALWAYS writes something to stderr on any failure,
+# so a bare "VIRSH_ERR is non-empty" check can never tell "doesn't exist"
+# apart from a real connection problem -- this matches virsh's own two
+# standard wordings for a missing domain ("failed to get domain 'X'" from
+# dominfo/domstate's own CLI wrapper, "Domain not found: no domain with
+# matching name/uuid 'X'" from libvirt's underlying error) so a genuine
+# connection/auth failure still gets reported loudly instead of being
+# silently treated as "just hasn't been synced yet".
+virsh_err_is_not_found() {
+	printf '%s' "$VIRSH_ERR" | grep -qiE "failed to get domain|domain not found|no domain with matching (name|uuid)"
+}
+
 require_dom_shutoff() {
 	local uri="$1" domain="$2" label="$3"
 	local state
 	state="$(dom_state "$uri" "$domain")" || die "cannot query state of $label domain '$domain' via $uri${VIRSH_ERR:+: $VIRSH_ERR}"
 	[ "$state" = "shutoff" ] || die "$label domain '$domain' is '$state', expected 'shut off' -- refusing to continue. This harness never starts the target VM itself; see README.md."
+}
+
+# require_dom_shutoff_or_absent: like require_dom_shutoff, but a target
+# that doesn't exist at all is fine too -- vmsync's own -reinit undefines
+# the target domain early and only redefines it once the full disk copy
+# finishes (see DefineDomain in cmd/vmsync/main.go), so an interrupted or
+# still-first-ever run legitimately leaves it in exactly that state, and
+# the next full sync recreates it from scratch. A genuine query failure
+# (bad URI, auth, connection) is NOT the same thing and still dies loudly.
+require_dom_shutoff_or_absent() {
+	local uri="$1" domain="$2" label="$3"
+	if domain_exists "$uri" "$domain"; then
+		require_dom_shutoff "$uri" "$domain" "$label"
+	elif ! virsh_err_is_not_found; then
+		die "cannot query $label domain '$domain' via $uri: $VIRSH_ERR"
+	fi
 }
 
 # require_dom_running: the external-snapshot lifecycle test (Stage 4) needs

@@ -164,8 +164,8 @@ preflight() {
 	domain_exists "$SOURCE_URI" "$SOURCE_DOMAIN" || die "source domain '$SOURCE_DOMAIN' not found via $SOURCE_URI${VIRSH_ERR:+: $VIRSH_ERR}"
 	if domain_exists "$TARGET_URI" "$TARGET_DOMAIN"; then
 		require_dom_shutoff "$TARGET_URI" "$TARGET_DOMAIN" "target"
-	elif [ -n "$VIRSH_ERR" ]; then
-		warn "could not query target domain '$TARGET_DOMAIN' via $TARGET_URI: $VIRSH_ERR (if it just hasn't been synced yet, this is expected and harmless)"
+	elif ! virsh_err_is_not_found; then
+		warn "could not query target domain '$TARGET_DOMAIN' via $TARGET_URI: $VIRSH_ERR"
 	fi
 	[ -n "$TARGET_DISK_PATH" ] || warn "TARGET_DISK_PATH is empty -- target disk path resolution (used for tampering) is only reliable when the source has no active external snapshot. Recommended: always set TARGET_DISK_PATH in $CONF."
 	log "preflight OK"
@@ -405,7 +405,7 @@ stage_matrix() {
 					log "--- [$n/$total] scenario: $name (compress=$compress netbuffer=$netbuf use_ssh=$use_ssh iodepth=$iodepth) ---"
 
 					if [ "$DRY_RUN" != yes ]; then
-						require_dom_shutoff "$TARGET_URI" "$TARGET_DOMAIN" "target"
+						require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
 					fi
 
 					# -reinit establishes a clean, fully-timed full-sync
@@ -438,7 +438,7 @@ stage_verify_tamper() {
 	log "=== Stage 2: -verify modes with deliberate target-side tampering ==="
 
 	if [ "$DRY_RUN" != yes ]; then
-		require_dom_shutoff "$TARGET_URI" "$TARGET_DOMAIN" "target"
+		require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
 	fi
 
 	# A known-clean baseline under the plain, no-bridge transport -- verify
@@ -554,7 +554,7 @@ stage_external_snapshot() {
 	log "=== Stage 4: external snapshot lifecycle (sync while a snapshot exists, then after it's removed) ==="
 
 	if [ "$DRY_RUN" != yes ]; then
-		require_dom_shutoff "$TARGET_URI" "$TARGET_DOMAIN" "target"
+		require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
 		require_dom_running "$SOURCE_URI" "$SOURCE_DOMAIN" "source"
 	fi
 
