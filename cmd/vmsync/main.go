@@ -307,6 +307,37 @@ func overlapsAnyExtent(m nbdsync.MismatchRange, touched []nbdsync.Extent) bool {
 	return false
 }
 
+// callWithTimeout runs a blocking libvirt/cgo call in its own goroutine and
+// gives up waiting for it after timeout. libvirt calls have no built-in
+// cancellation, so a genuinely stuck call still runs to completion in the
+// background (and its goroutine/OS thread with it) -- but the *caller* (the
+// signal handler) is no longer blocked by it, so the rest of cleanup can
+// still proceed instead of requiring a SIGKILL.
+func callWithTimeout(name string, timeout time.Duration, fn func() error) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- fn()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("%s timed out after %s", name, timeout)
+	}
+}
+
+// verificationRan reports whether this run's metrics should include the
+// vmsync_verification_state/vmsync_verification_timestamp_seconds series --
+// true only when verification was both requested (verify != "") and
+// actually reached the compare block (attempted), not merely requested.
+// Kept as a standalone function (rather than inlined at its one call site
+// in writeMetricsTextfile) specifically so this exact guarantee -- a plain
+// sync or -reinit run, or a -verify run that failed before comparing
+// anything, must never emit verification metrics -- is directly testable.
+func verificationRan(verify string, attempted bool) bool {
+	return verify != "" && attempted
+}
+
 func run(cfg struct {
 	SourceURI      string
 	TargetURI      string
@@ -482,7 +513,7 @@ func run(cfg struct {
 			// whole run via state/runErr as before -- this only changes
 			// whether the verification metrics are emitted at all, not
 			// what the overall run's own failure means.
-			VerificationRan:       cfg.Verify != "" && attempted,
+			VerificationRan:       verificationRan(cfg.Verify, attempted),
 			VerificationState:     state,
 			VerificationTimestamp: now,
 		}
@@ -638,25 +669,6 @@ func run(cfg struct {
 		})
 	}
 	defer resumeSource("cleanup")
-
-	// callWithTimeout runs a blocking libvirt/cgo call in its own goroutine
-	// and gives up waiting for it after timeout. libvirt calls have no
-	// built-in cancellation, so a genuinely stuck call still runs to
-	// completion in the background (and its goroutine/OS thread with it) --
-	// but the *caller* (the signal handler) is no longer blocked by it, so
-	// the rest of cleanup can still proceed instead of requiring a SIGKILL.
-	callWithTimeout := func(name string, timeout time.Duration, fn func() error) error {
-		done := make(chan error, 1)
-		go func() {
-			done <- fn()
-		}()
-		select {
-		case err := <-done:
-			return err
-		case <-time.After(timeout):
-			return fmt.Errorf("%s timed out after %s", name, timeout)
-		}
-	}
 
 	abortBackup := func(trigger string) {
 		abortOnce.Do(func() {
