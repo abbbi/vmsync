@@ -27,4 +27,4 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // point of checking.
 package version
 
-const Version = "0.30-2026080801-beta"
+const Version = "0.30-2026080802-beta"
