@@ -51,11 +51,7 @@ type QcowDisk struct {
 	// against the real target file -- which was created under this same
 	// resolved name during an earlier sync, and stays stable across
 	// further snapshots since the chain's base file itself doesn't change
-	// as more overlays are stacked on top of it. Note that for a linked
-	// clone this resolves to the shared template's name, not the disk's
-	// own overlay -- SetTargetPath's vmName/targetDev prefixing is what
-	// keeps that from colliding with any other VM cloned from the same
-	// template.
+	// as more overlays are stacked on top of it.
 	RootSource string
 }
 

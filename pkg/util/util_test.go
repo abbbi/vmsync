@@ -112,21 +112,17 @@ func TestSetTargetPath(t *testing.T) {
 	cases := []struct {
 		name           string
 		targetDiskPath string
-		vmName         string
-		targetDev      string
 		diskPath       string
 		want           string
 	}{
-		{"empty target path returns disk path unchanged", "", "vm1", "vda", "/var/lib/libvirt/images/disk.qcow2", "/var/lib/libvirt/images/disk.qcow2"},
-		{"target path joins with vm/dev-prefixed basename", "/mnt/target", "vm1", "vda", "/var/lib/libvirt/images/disk.qcow2", "/mnt/target/vm1-vda-disk.qcow2"},
-		{"target path with trailing slash still joins cleanly", "/mnt/target/", "vm1", "vda", "/some/dir/disk.qcow2", "/mnt/target/vm1-vda-disk.qcow2"},
-		{"different vm names never collide on same basename", "/mnt/target", "vm2", "vda", "/var/lib/libvirt/images/disk.qcow2", "/mnt/target/vm2-vda-disk.qcow2"},
-		{"different target devs on same vm never collide on same basename", "/mnt/target", "vm1", "vdb", "/var/lib/libvirt/images/disk.qcow2", "/mnt/target/vm1-vdb-disk.qcow2"},
+		{"empty target path returns disk path unchanged", "", "/var/lib/libvirt/images/disk.qcow2", "/var/lib/libvirt/images/disk.qcow2"},
+		{"target path joins with disk basename", "/mnt/target", "/var/lib/libvirt/images/disk.qcow2", "/mnt/target/disk.qcow2"},
+		{"target path with trailing slash still joins cleanly", "/mnt/target/", "/some/dir/disk.qcow2", "/mnt/target/disk.qcow2"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := SetTargetPath(tc.targetDiskPath, tc.vmName, tc.targetDev, tc.diskPath); got != tc.want {
-				t.Errorf("SetTargetPath(%q, %q, %q, %q) = %q, want %q", tc.targetDiskPath, tc.vmName, tc.targetDev, tc.diskPath, got, tc.want)
+			if got := SetTargetPath(tc.targetDiskPath, tc.diskPath); got != tc.want {
+				t.Errorf("SetTargetPath(%q, %q) = %q, want %q", tc.targetDiskPath, tc.diskPath, got, tc.want)
 			}
 		})
 	}

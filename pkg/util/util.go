@@ -85,21 +85,15 @@ func RemotePathExists(ctx context.Context, runner interface {
 	}
 }
 
-// SetTargetPath computes the on-disk path a disk is synced to on the target
-// host. When targetDiskPath is set, the basename alone is not enough to keep
-// two disks apart -- storage layouts that give every VM's disk the same
-// filename inside a per-VM directory (e.g. OpenStack Nova's
-// instances/<uuid>/disk) or qcow2 linked clones sharing a template's
-// basename would otherwise collide on the identical target file. vmName and
-// targetDev (the domain name and its <target dev='vda'/>) are prefixed onto
-// the basename to keep every disk of every domain unique under a shared
-// targetDiskPath.
-func SetTargetPath(targetDiskPath, vmName, targetDev, diskPath string) string {
-	if targetDiskPath == "" {
-		return diskPath
+func SetTargetPath(targetDiskPath string, diskPath string) string {
+	var targetPath string
+	if targetDiskPath != "" {
+		targetPath = filepath.Join(targetDiskPath, filepath.Base(diskPath))
+	} else {
+		targetPath = diskPath
 	}
-	base := fmt.Sprintf("%s-%s-%s", vmName, targetDev, filepath.Base(diskPath))
-	return filepath.Join(targetDiskPath, base)
+
+	return targetPath
 }
 
 func IgnoreDevice(d libvirtxml.DomainDisk) bool {

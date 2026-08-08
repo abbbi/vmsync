@@ -1058,7 +1058,7 @@ func run(cfg struct {
 		}
 
 		for _, d := range qcowDisks {
-			reinitTargetPath := util.SetTargetPath(cfg.TargetDiskPath, cfg.TargetDomain, d.TargetDev, d.RootSource)
+			reinitTargetPath := util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
 			trace.Info("reinit: removing target disk", "path", reinitTargetPath)
 			if out, err := targetSSHClient.Run(ctx, "rm -f "+util.ShQuote(reinitTargetPath)); err != nil {
 				return fmt.Errorf("reinit: remove target disk %s: %w: %s", reinitTargetPath, err, out)
@@ -1081,7 +1081,7 @@ func run(cfg struct {
 	if parent == "" {
 		// Preflight for full sync: fail before sync operations if target disk path exists.
 		for _, d := range qcowDisks {
-			targetPath = util.SetTargetPath(cfg.TargetDiskPath, cfg.TargetDomain, d.TargetDev, d.RootSource)
+			targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
 			trace.Info("Using target", "path", targetPath, "disk", d.TargetDev)
 			targetDir := path.Dir(targetPath)
 			if _, err := targetSSHClient.Run(ctx, "mkdir -p "+util.ShQuote(targetDir)); err != nil {
@@ -1148,7 +1148,7 @@ func run(cfg struct {
 			} else {
 				trace.Info("Target domain metadata", "timestamp", metadataEntryTimestamp)
 				for _, d := range qcowDisks {
-					targetPath = util.SetTargetPath(cfg.TargetDiskPath, cfg.TargetDomain, d.TargetDev, d.RootSource)
+					targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
 					out, err := targetSSHClient.Run(ctx, "stat -c '%Y' "+util.ShQuote(targetPath))
 					if err != nil {
 						return fmt.Errorf("%w: %s", err, out)
@@ -1457,7 +1457,7 @@ func run(cfg struct {
 		// unrelated to this run's own delta.
 		//
 		// Avoid datarace in this goroutine by declaring targetPath as local var instead of a shared one
-		targetPath := util.SetTargetPath(cfg.TargetDiskPath, cfg.TargetDomain, d.TargetDev, d.RootSource)
+		targetPath := util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
 		res.targetPath = targetPath
 
 		if dirty == 0 && incrementalMode {
