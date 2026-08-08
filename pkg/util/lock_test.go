@@ -169,6 +169,115 @@ func TestAcquireRunLock_DistinctKeysDoNotCollide(t *testing.T) {
 	}
 }
 
+func TestLockRefersToCurrentPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("relies on POSIX unlink-keeps-open-fds-valid semantics; lock.go itself is Unix-only")
+	}
+
+	t.Run("true for a freshly opened file still linked at its own path", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "test.lock")
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+		if err != nil {
+			t.Fatalf("OpenFile() error = %v", err)
+		}
+		defer f.Close()
+
+		if !lockRefersToCurrentPath(f, path) {
+			t.Error("lockRefersToCurrentPath() = false for a file still linked at its own path, want true")
+		}
+	})
+
+	t.Run("false once path is deleted out from under the open fd", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "test.lock")
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+		if err != nil {
+			t.Fatalf("OpenFile() error = %v", err)
+		}
+		defer f.Close()
+
+		// POSIX unlink semantics: removing path doesn't invalidate the
+		// already-open fd (it keeps referring to the now-orphaned inode),
+		// it just makes path itself stop resolving to anything.
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("Remove() error = %v", err)
+		}
+
+		if lockRefersToCurrentPath(f, path) {
+			t.Error("lockRefersToCurrentPath() = true for an fd whose path no longer exists, want false")
+		}
+	})
+
+	t.Run("false once path is replaced by a different file", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "test.lock")
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+		if err != nil {
+			t.Fatalf("OpenFile() error = %v", err)
+		}
+		defer f.Close()
+
+		// Simulates exactly the race AcquireRunLock's retry loop exists
+		// for: something else (a tmpfiles.d rule, another process's own
+		// cleanup) deletes and recreates the lock file at the same path
+		// while f -- opened (and, in the real caller, already flock'd)
+		// against the ORIGINAL inode -- is still open. f now refers to an
+		// orphaned inode nothing else will ever contend for.
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("Remove() error = %v", err)
+		}
+		if err := os.WriteFile(path, nil, 0644); err != nil {
+			t.Fatalf("recreate lock file at %s: %v", path, err)
+		}
+
+		if lockRefersToCurrentPath(f, path) {
+			t.Error("lockRefersToCurrentPath() = true for an fd whose path was replaced by a different file, want false")
+		}
+	})
+}
+
+// TestAcquireRunLock_IgnoresStaleOrphanedLock proves the end-to-end
+// behavior lockRefersToCurrentPath's retry loop exists for: a lock held on
+// an orphaned inode (path already deleted and recreated out from under it)
+// must never block, corrupt, or otherwise interfere with a fresh
+// acquisition against the current file at that path.
+func TestAcquireRunLock_IgnoresStaleOrphanedLock(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("relies on POSIX unlink-keeps-open-fds-valid semantics; lock.go itself is Unix-only")
+	}
+
+	dir := t.TempDir()
+	key := "some-domain"
+	path := filepath.Join(dir, safeKeyReplacer.Replace(key)+".lock")
+
+	stale, err := AcquireRunLock(dir, key)
+	if err != nil {
+		t.Fatalf("first AcquireRunLock() error = %v, want nil", err)
+	}
+	defer stale.Close() // keep the orphaned fd (and its now-worthless flock) alive for the whole test
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if err := os.WriteFile(path, nil, 0644); err != nil {
+		t.Fatalf("recreate lock file at %s: %v", path, err)
+	}
+
+	fresh, err := AcquireRunLock(dir, key)
+	if err != nil {
+		t.Fatalf("AcquireRunLock() against the replaced file error = %v, want nil (a stale orphaned lock must not block this)", err)
+	}
+	defer fresh.Close()
+
+	if lockRefersToCurrentPath(stale, path) {
+		t.Error("the stale handle unexpectedly still refers to the current path -- test setup did not actually orphan it")
+	}
+	if !lockRefersToCurrentPath(fresh, path) {
+		t.Error("AcquireRunLock() returned a file that does not refer to the current path")
+	}
+}
+
 func TestSafeKeyReplacer(t *testing.T) {
 	tests := []struct {
 		name string
