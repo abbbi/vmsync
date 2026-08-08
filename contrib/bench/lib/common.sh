@@ -147,7 +147,7 @@ disk_source_path() {
 prom_sum() {
 	local file="$1" metric="$2"
 	[ -f "$file" ] || { printf '0\n'; return; }
-	awk -v m="^${metric}\\{" '$0 ~ m { s += $NF } END { printf "%d\n", s+0 }' "$file"
+	awk -v m="^${metric}{" '$0 ~ m { s += $NF } END { printf "%d\n", s+0 }' "$file"
 }
 
 # --- result recording --------------------------------------------------------
