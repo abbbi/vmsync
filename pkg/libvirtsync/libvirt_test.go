@@ -575,10 +575,16 @@ func TestMissingXMLElements(t *testing.T) {
 	})
 
 	t.Run("an unparsable original or rewrite yields no report rather than a false positive", func(t *testing.T) {
-		if got := missingXMLElements("not xml", `<domain/>`); got != nil {
+		// "not xml" alone (no "<" at all) is NOT enough to exercise this --
+		// encoding/xml's tokenizer is lenient about plain character data
+		// with no markup, and happily reports it as zero elements rather
+		// than erroring, which xmlElementNames treats the same as a
+		// genuinely empty document (not a parse failure). "<<<" is what
+		// actually breaks tag syntax and triggers a real decode error.
+		if got := missingXMLElements("not xml at all <<<", `<domain/>`); got != nil {
 			t.Errorf("missingXMLElements(unparsable original, ...) = %v, want nil", got)
 		}
-		if got := missingXMLElements(`<domain><hostdev/></domain>`, "not xml"); got != nil {
+		if got := missingXMLElements(`<domain><hostdev/></domain>`, "not xml at all <<<"); got != nil {
 			t.Errorf("missingXMLElements(..., unparsable rewrite) = %v, want nil", got)
 		}
 	})
