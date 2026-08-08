@@ -109,6 +109,18 @@ func main() {
 		os.Exit(0)
 	}
 
+	// See the identical check (and its comment) in cmd/vmsync/main.go: a
+	// flag.Var flag whose Value implements IsBoolFlag (-compress and
+	// -netbuffer, here) never consumes a following space-separated argument
+	// as its value, so a mistaken "-compress zstd" leaves "zstd" as a
+	// positional argument, which stops flag parsing right there and
+	// silently drops every flag after it. This binary takes no positional
+	// arguments at all, so any leftover ones are unambiguously a mistake.
+	if flag.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: unexpected extra argument(s) %v -- if you meant to pass a value to -compress or -netbuffer, use -compress=value / -netbuffer=value (with an \"=\"), not a space\n", flag.Args())
+		os.Exit(2)
+	}
+
 	if *listenAddr == "" {
 		fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -listen is required")
 		os.Exit(2)

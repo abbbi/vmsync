@@ -154,6 +154,21 @@ func main() {
 	cfg.Compress = compressArg.value
 	cfg.NetBuffer = netBufferArg.value
 
+	// A flag.Var flag whose Value implements IsBoolFlag (both -compress and
+	// -netbuffer, here) never consumes a following space-separated argument
+	// as its value -- only "-flag=value" does that (see the flag package's
+	// own documented behavior). Passing one anyway (e.g. "-compress zstd")
+	// leaves "zstd" as an ordinary positional argument, which stops flag
+	// parsing right there and silently drops every flag typed after it --
+	// including, for example, a trailing -verify=online. vmsync takes no
+	// positional arguments at all, so any leftover ones are unambiguously a
+	// mistake -- fail loudly instead of silently ignoring whatever came
+	// after them.
+	if flag.NArg() > 0 {
+		trace.Error("invalid command line", "error", fmt.Errorf("unexpected extra argument(s) %v -- if you meant to pass a value to -compress or -netbuffer, use -compress=value / -netbuffer=value (with an \"=\"), not a space", flag.Args()))
+		os.Exit(2)
+	}
+
 	// Tracks whether --compress-level was actually passed on the command
 	// line, as opposed to just carrying its zstd-oriented flag default
 	// ("3") -- needed below to swap in s2's own default ("better") instead
