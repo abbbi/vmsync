@@ -72,21 +72,41 @@ virsh_uri() {
 	virsh -c "$uri" "$@"
 }
 
+# dom_state/domain_exists both leave virsh's own stderr text (if any) in
+# $VIRSH_ERR on failure -- e.g. "-source-uri has the wrong scheme" and "the
+# domain genuinely doesn't exist" and "SSH auth failed" all used to look
+# identically like a bare "not found"/"cannot query state" with nothing
+# else to go on. Callers that die/warn on failure should fold
+# ${VIRSH_ERR:+: $VIRSH_ERR} into their own message.
+
 # dom_state URI DOMAIN -> "running", "shut off", etc (whitespace collapsed).
 dom_state() {
 	local uri="$1" domain="$2"
-	virsh_uri "$uri" domstate "$domain" 2>/dev/null | tr -d '[:space:]'
+	local out
+	if out="$(virsh_uri "$uri" domstate "$domain" 2>&1)"; then
+		VIRSH_ERR=""
+		printf '%s' "$out" | tr -d '[:space:]'
+		return 0
+	fi
+	VIRSH_ERR="$out"
+	return 1
 }
 
 domain_exists() {
 	local uri="$1" domain="$2"
-	virsh_uri "$uri" dominfo "$domain" >/dev/null 2>&1
+	local out
+	if out="$(virsh_uri "$uri" dominfo "$domain" 2>&1 >/dev/null)"; then
+		VIRSH_ERR=""
+		return 0
+	fi
+	VIRSH_ERR="$out"
+	return 1
 }
 
 require_dom_shutoff() {
 	local uri="$1" domain="$2" label="$3"
 	local state
-	state="$(dom_state "$uri" "$domain")" || die "cannot query state of $label domain '$domain' via $uri"
+	state="$(dom_state "$uri" "$domain")" || die "cannot query state of $label domain '$domain' via $uri${VIRSH_ERR:+: $VIRSH_ERR}"
 	[ "$state" = "shutoff" ] || die "$label domain '$domain' is '$state', expected 'shut off' -- refusing to continue. This harness never starts the target VM itself; see README.md."
 }
 
@@ -100,7 +120,7 @@ require_dom_shutoff() {
 require_dom_running() {
 	local uri="$1" domain="$2" label="$3"
 	local state
-	state="$(dom_state "$uri" "$domain")" || die "cannot query state of $label domain '$domain' via $uri"
+	state="$(dom_state "$uri" "$domain")" || die "cannot query state of $label domain '$domain' via $uri${VIRSH_ERR:+: $VIRSH_ERR}"
 	[ "$state" = "running" ] || die "$label domain '$domain' is '$state', expected 'running' for the external-snapshot lifecycle test -- see README.md's Stage 4 section."
 }
 
