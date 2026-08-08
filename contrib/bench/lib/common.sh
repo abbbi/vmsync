@@ -66,10 +66,15 @@ maybe_ssh_cmd() {
 
 # virsh_uri URI ARGS... - runs virsh against a libvirt URI (source or
 # target), reusing libvirt's own qemu+ssh:// transport instead of a second,
-# separate ssh hop.
+# separate ssh hop. Forces LC_ALL=C: virsh translates its own output via
+# gettext (e.g. domstate prints "shut off"/"running" in English, but
+# "fermé"/"en cours d'exécution" etc. under a French locale), and every
+# exact-string comparison in this harness (dom_state's callers) assumes
+# the untranslated English vocabulary -- this only affects virsh's own
+# argv/output, not the operator's shell.
 virsh_uri() {
 	local uri="$1"; shift
-	virsh -c "$uri" "$@"
+	LC_ALL=C virsh -c "$uri" "$@"
 }
 
 # dom_state/domain_exists both leave virsh's own stderr text (if any) in
