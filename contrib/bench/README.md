@@ -161,6 +161,13 @@ tests) — it can leave the source domain's own disk chain inconsistent,
 and the harness stops immediately with instructions to inspect it by hand
 via `virsh blockjob` before doing anything else.
 
+If `bench.sh` runs directly on the source hypervisor itself (`SOURCE_URI`
+pointing at a local `qemu:///system`, say), set `SOURCE_LOCAL=yes` in
+`bench.conf` — this makes the one direct shell-out Stage 4 does against
+`SOURCE_HOST` (removing the leftover overlay file after `blockcommit`)
+run locally instead of over SSH, so no SSH access to the source host is
+needed at all in that setup.
+
 ## Files
 
 - `bench.sh` — the driver.

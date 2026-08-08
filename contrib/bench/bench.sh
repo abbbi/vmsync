@@ -112,6 +112,7 @@ source "$CONF"
 : "${TAMPER_OFFSET:?set in $CONF}"
 : "${TAMPER_LENGTH:?set in $CONF}"
 : "${RESULT_DIR:?set in $CONF}"
+SOURCE_LOCAL="${SOURCE_LOCAL:-yes}"
 
 if [ "$DRY_RUN" != yes ]; then
 	[ "${I_UNDERSTAND_THIS_IS_DESTRUCTIVE:-no}" = yes ] \
@@ -577,7 +578,7 @@ stage_external_snapshot() {
 		virsh_uri "$SOURCE_URI" snapshot-delete --domain "$SOURCE_DOMAIN" --snapshotname "$snap_name" --metadata \
 			|| warn "removing snapshot metadata for '$snap_name' failed -- the disk merge itself (blockcommit) already succeeded, so this is just stale bookkeeping, but check 'virsh -c $SOURCE_URI snapshot-list --domain $SOURCE_DOMAIN'"
 		if [ -n "$overlay_path" ]; then
-			ssh_host_cmd "$SOURCE_HOST" rm -f "$overlay_path" \
+			maybe_ssh_cmd "$SOURCE_LOCAL" "$SOURCE_HOST" rm -f "$overlay_path" \
 				|| warn "could not remove the now-unused overlay file $overlay_path on $SOURCE_HOST -- harmless (blockcommit --pivot already stopped referencing it) but worth cleaning up by hand"
 		fi
 	fi

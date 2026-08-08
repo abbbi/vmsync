@@ -47,6 +47,23 @@ ssh_host_cmd() {
 	ssh "${opts[@]}" "${SSH_USER}@${host}" "$@"
 }
 
+# maybe_ssh_cmd IS_LOCAL HOST CMD... - runs CMD directly on this machine
+# when IS_LOCAL is "yes" (bench.sh is itself running on HOST), otherwise
+# via ssh_host_cmd HOST CMD... as usual. Most of this harness's real work
+# already goes over libvirt's own qemu(+ssh):// URI transport (SOURCE_URI/
+# TARGET_URI), which is transport-agnostic on its own -- this only matters
+# for the handful of call sites that shell out directly on a specific host
+# (e.g. removing a leftover snapshot overlay file), which otherwise assume
+# that host is always remote and reachable over SSH.
+maybe_ssh_cmd() {
+	local is_local="$1" host="$2"; shift 2
+	if [ "$is_local" = yes ]; then
+		"$@"
+	else
+		ssh_host_cmd "$host" "$@"
+	fi
+}
+
 # virsh_uri URI ARGS... - runs virsh against a libvirt URI (source or
 # target), reusing libvirt's own qemu+ssh:// transport instead of a second,
 # separate ssh hop.
