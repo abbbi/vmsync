@@ -323,3 +323,66 @@ func TestStartLocalDroppedRemoteDoesNotWedgeBridge(t *testing.T) {
 		t.Fatal(checkErr)
 	}
 }
+
+// TestStartLocalDroppedRemoteUnblocksIdleClient reproduces the more
+// realistic failure mode TestStartLocalDroppedRemoteDoesNotWedgeBridge above
+// does not cover: a local NBD client that goes idle -- blocked waiting on a
+// reply to a command it already sent, not actively sending anything new --
+// at the moment the remote leg dies. Before relayConnection's inbound
+// goroutine (remote -> conn) half-closed conn once its own source (remote)
+// errored, nothing ever told a client in this state that the transport was
+// gone, so its blocking read would never return. Unlike the test above, this
+// one never writes to conn again after the drop -- only reads -- so it can
+// only pass if the bridge itself notices and propagates the failure, not the
+// client prompting it by sending more data.
+func TestStartLocalDroppedRemoteUnblocksIdleClient(t *testing.T) {
+	ln, accepted := newFakeRemoteListener(t)
+	defer ln.Close()
+
+	localPort, _, stop, err := StartLocal(context.Background(), nil, ln.Addr().String(), Config{})
+	if err != nil {
+		t.Fatalf("StartLocal: %v", err)
+	}
+	defer stop()
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
+	if err != nil {
+		t.Fatalf("dial local bridge port %d: %v", localPort, err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("request before the drop")); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+
+	var remoteConn net.Conn
+	select {
+	case remoteConn = <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fake remote never saw a connection from the relay")
+	}
+
+	buf := make([]byte, 64)
+	remoteConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := remoteConn.Read(buf); err != nil {
+		t.Fatalf("fake remote did not see the relayed bytes before the drop: %v", err)
+	}
+
+	// Simulate an abrupt WAN interruption, exactly like the test above --
+	// but the local side never writes again afterward: it just sits there
+	// reading, the way a real NBD client would while waiting on a reply to
+	// a command it already sent.
+	remoteConn.Close()
+
+	readErr, returned := runWithDeadline(t, 8*time.Second, func() error {
+		readBuf := make([]byte, 64)
+		_, rerr := conn.Read(readBuf)
+		return rerr
+	})
+	if !returned {
+		t.Fatal("an idle local client's blocked read was never unblocked after its remote leg was dropped -- the inbound relay goroutine must half-close conn once its own source (remote) errors")
+	}
+	if readErr == nil {
+		t.Fatal("expected the idle client's read to fail once the remote leg was dropped, got a nil error")
+	}
+}

@@ -202,7 +202,24 @@ func relayConnection(conn net.Conn, sshClient *remotessh.Client, remoteBridgeAdd
 	go func() {
 		defer relayWg.Done()
 		reportErr(recoverRelayPanic("inbound relay (remote -> conn)", func() error {
-			return zstdrelay.RelayFromWire(conn, remote, cfg.Compress, algo, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Received)
+			err := zstdrelay.RelayFromWire(conn, remote, cfg.Compress, algo, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Received)
+			// Half-close conn once remote is done sending, mirroring the
+			// outbound goroutine's own remote.CloseWrite() above (and
+			// cmd/vmsync-bridge-helper's matching inbound leg). Without
+			// this, a remote that dies while the local NBD client is idle
+			// -- blocked waiting on replies to commands it already sent,
+			// not actively sending -- never sees that its transport is
+			// gone: RelayFromWire returns here since its source (remote)
+			// hit EOF, but conn is never closed, so the client keeps
+			// waiting on replies that can now never arrive, never sends
+			// anything new either, and the outbound goroutine (still
+			// reading conn for the client's next command) blocks forever
+			// right alongside it -- wedging relayWg.Wait() and every
+			// deferred stop() that depends on it.
+			if wc, ok := conn.(interface{ CloseWrite() error }); ok {
+				wc.CloseWrite()
+			}
+			return err
 		}))
 	}()
 	relayWg.Wait()
