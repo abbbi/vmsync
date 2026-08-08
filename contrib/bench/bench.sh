@@ -39,6 +39,19 @@ DRY_RUN=no
 ONLY_PATTERN=""
 STAGES="matrix,verify,reinit,snapshot"
 
+# INTERRUPTED: vmsync catches SIGINT/SIGTERM itself (cleanup, then a plain
+# os.Exit(1) -- see cmd/vmsync/main.go's own signal handling), so a Ctrl+C
+# that lands while a vmsync child is running exits *normally* as far as
+# bash is concerned; the usual "child died from an uncaught signal"
+# propagation never fires, and this script would otherwise just log that
+# one combination as failed and move on to the next of however many
+# hundred are queued. Trapping the signal here and checking the flag right
+# after every run_vmsync call (its one common chokepoint) makes Ctrl+C
+# actually stop the whole harness -- after finishing the report for
+# whatever already ran, not silently mid-write.
+INTERRUPTED=no
+trap 'INTERRUPTED=yes' INT TERM
+
 usage() {
 	cat <<'EOF'
 Usage: bench.sh [options]
@@ -221,6 +234,13 @@ run_vmsync() {
 	set -e
 	end="$(now_epoch)"
 	RUN_WALL_SECONDS="$(elapsed_seconds "$start" "$end")"
+
+	if [ "$INTERRUPTED" = yes ]; then
+		warn "interrupted (Ctrl+C/SIGTERM) during $scenario/$phase -- stopping the whole run now rather than queuing further combinations"
+		results_row "$CSV" "$scenario" "$phase" "$RUN_RC" "$RUN_WALL_SECONDS" "" "" "" "" "INTERRUPTED (Ctrl+C/SIGTERM)"
+		generate_report
+		exit 130
+	fi
 
 	local transferred compressed disk_bytes mode
 	transferred="$(prom_sum "$prom_file" vmsync_transferred_bytes)"
