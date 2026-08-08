@@ -724,6 +724,23 @@ func run(cfg struct {
 	// libvirt-side state past this run" concern. A no-op whenever
 	// verifyWindowActive was never set (i.e. -verify=online never reached
 	// that step this run, including whenever it's not requested at all).
+	//
+	// abortBackup and cleanupVerifyWindow both stop the SAME underlying
+	// backup job (beginVerifyWindow reuses backupActive/backupMu across the
+	// handoff from the regular job to the verify-window one -- see its own
+	// comment), and both run concurrently from the signal handler's
+	// parallel cleanup goroutines. This claims responsibility for that stop
+	// through backupActive/backupMu exactly like abortBackup already does,
+	// rather than calling StopBackup unconditionally: whichever of the two
+	// closures flips backupActive false first is the one that actually
+	// calls it and logs about it, and the other -- seeing it already false
+	// -- skips both. StopBackup's own GetJobInfo-based idempotency would
+	// have made a redundant second call harmless regardless, but this
+	// avoids the redundant call (and the confusing "stopping libvirt
+	// backup job" log line that would come with it) entirely, instead of
+	// relying on that as the only safety net. The checkpoint deletion below
+	// is unconditional either way -- it's this closure's own, unique
+	// responsibility, regardless of which closure happened to stop the job.
 	cleanupVerifyWindow := func(trigger string) {
 		verifyWindowOnce.Do(func() {
 			verifyWindowMu.Lock()
@@ -733,12 +750,20 @@ func run(cfg struct {
 				return
 			}
 			trace.Info("removing verify-online window checkpoint", "trigger", trigger)
-			stopErr := callWithTimeout("stop verify-window backup job", 5*time.Second, func() error {
-				return libvirtsync.StopBackup(srcDom)
-			})
-			if stopErr != nil {
-				trace.Error("failed to stop verify-window backup job", "trigger", trigger, "error", stopErr)
+
+			backupMu.Lock()
+			shouldStop := backupActive
+			backupActive = false
+			backupMu.Unlock()
+			if shouldStop {
+				stopErr := callWithTimeout("stop verify-window backup job", 5*time.Second, func() error {
+					return libvirtsync.StopBackup(srcDom)
+				})
+				if stopErr != nil {
+					trace.Error("failed to stop verify-window backup job", "trigger", trigger, "error", stopErr)
+				}
 			}
+
 			delErr := callWithTimeout("delete verify-window checkpoint", 5*time.Second, func() error {
 				return libvirtsync.DeleteVerifyWindowCheckpoint(srcDom)
 			})
