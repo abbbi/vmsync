@@ -1076,6 +1076,25 @@ func run(cfg struct {
 		// silently skip the "refuse if running" guard just below and fall
 		// straight through to deleting the target's disk files, even when
 		// the domain in fact exists and is running.
+		//
+		// Deliberately NOT undefining the target domain here (this used to
+		// call tgtDom.Undefine() right after this check): that left the
+		// target undefined for the entire disk-copy duration below -- often
+		// the longest part of the whole run -- so any interruption during
+		// that window (SIGINT/SIGTERM, a killed process, a network drop)
+		// left the target permanently undefined until some later run
+		// happened to complete a full sync all the way through. The target
+		// domain's definition is now left completely untouched by -reinit;
+		// DefineDomain (at the very end, only after the copy has fully
+		// succeeded) is the only place that ever undefines/redefines it,
+		// and it already does so with its own rollback-to-original-XML
+		// safety net (see its own doc comment) -- undefining early here
+		// just threw that rollback target away before it could ever be
+		// used. As a side effect, this also drops the one remaining
+		// plain Undefine() call in this file: it never passed
+		// DOMAIN_UNDEFINE_KEEP_NVRAM the way DefineDomain's own undefine
+		// does, so -reinit against any UEFI/OVMF target domain was likely
+		// already failing outright at this step.
 		exists, err := libvirtsync.DomainExists(tgtMgr.Conn, cfg.TargetDomain)
 		if err != nil {
 			return fmt.Errorf("reinit: check target domain existence: %w", err)
@@ -1086,20 +1105,13 @@ func run(cfg struct {
 				return fmt.Errorf("reinit: look up target domain %s: %w", cfg.TargetDomain, err)
 			}
 			running, runErr := libvirtsync.DomainActive(tgtDom)
+			tgtDom.Free()
 			if runErr != nil {
-				tgtDom.Free()
 				return fmt.Errorf("reinit: check target domain state: %w", runErr)
 			}
 			if running {
-				tgtDom.Free()
 				return fmt.Errorf("reinit: target domain %s is running, shut it down before reinitializing", cfg.TargetDomain)
 			}
-			if err := tgtDom.Undefine(); err != nil {
-				tgtDom.Free()
-				return fmt.Errorf("reinit: undefine target domain %s: %w", cfg.TargetDomain, err)
-			}
-			tgtDom.Free()
-			trace.Info("reinit: undefined existing target domain", "vm", cfg.TargetDomain)
 		}
 
 		for _, d := range qcowDisks {
@@ -1165,45 +1177,61 @@ func run(cfg struct {
 			tgtDom.Free()
 			return fmt.Errorf("target domain %s is active require shutoff before sync", cfg.TargetDomain)
 		}
-		trace.Info("Target domain exists, parse metadata info")
 
-		tgtXML, err := tgtDom.GetXMLDesc(0)
-		if err != nil {
+		if cfg.Reinit {
+			// -reinit already discarded the target's previous state
+			// above (its trace.Warning says as much) and removed its
+			// disk file -- the metadata/timestamp continuity check
+			// below stats that same file and would now fail every
+			// single -reinit run for a domain that predates it (the
+			// file it's looking for is gone by design), not just flag a
+			// real out-of-band change. Nothing here is skipped that
+			// -reinit wasn't already meant to bypass; the domain
+			// definition itself (unlike before) is simply left alone
+			// until DefineDomain redefines it once the copy succeeds.
 			tgtDom.Free()
-			return fmt.Errorf("read source domain xml: %w", err)
-		}
-		// tgtDom itself isn't touched again past this point -- only tgtXML
-		// (the plain string already extracted from it) is used below -- so
-		// free it here rather than holding the target-side libvirt handle
-		// open for the rest of this (potentially long-running) sync.
-		tgtDom.Free()
-
-		metadataEntryCheckpoint, err = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastCheckpoint)
-		metadataEntryTimestamp, err = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastSync)
-		if err != nil {
-			trace.Warning("unable to parse target domain metadata entry")
 		} else {
-			if metadataEntryCheckpoint == "" {
-				trace.Warning("empty target domain metadata entry, cannot verify checkpoint chain")
-			} else {
-				trace.Info("Target domain metadata", "checkpoint", metadataEntryCheckpoint)
-			}
-			if metadataEntryTimestamp == "" {
-				trace.Warning("empty target domain metadata entry, cannot verify timestamp")
-			} else {
-				trace.Info("Target domain metadata", "timestamp", metadataEntryTimestamp)
-				for _, d := range qcowDisks {
-					targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
-					out, err := targetSSHClient.Run(ctx, "stat -c '%Y' "+util.ShQuote(targetPath))
-					if err != nil {
-						return fmt.Errorf("%w: %s", err, out)
-					}
-					if out > metadataEntryTimestamp {
-						return fmt.Errorf("Target file on system is newer (%s)  than last sync timestamp: %s: file on target has been changed between syncs", out, targetPath)
+			trace.Info("Target domain exists, parse metadata info")
 
-					}
+			tgtXML, err := tgtDom.GetXMLDesc(0)
+			if err != nil {
+				tgtDom.Free()
+				return fmt.Errorf("read source domain xml: %w", err)
+			}
+			// tgtDom itself isn't touched again past this point -- only
+			// tgtXML (the plain string already extracted from it) is
+			// used below -- so free it here rather than holding the
+			// target-side libvirt handle open for the rest of this
+			// (potentially long-running) sync.
+			tgtDom.Free()
+
+			metadataEntryCheckpoint, err = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastCheckpoint)
+			metadataEntryTimestamp, err = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastSync)
+			if err != nil {
+				trace.Warning("unable to parse target domain metadata entry")
+			} else {
+				if metadataEntryCheckpoint == "" {
+					trace.Warning("empty target domain metadata entry, cannot verify checkpoint chain")
+				} else {
+					trace.Info("Target domain metadata", "checkpoint", metadataEntryCheckpoint)
 				}
-				trace.Info("Successfully verified target file timestamps")
+				if metadataEntryTimestamp == "" {
+					trace.Warning("empty target domain metadata entry, cannot verify timestamp")
+				} else {
+					trace.Info("Target domain metadata", "timestamp", metadataEntryTimestamp)
+					for _, d := range qcowDisks {
+						targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
+						out, err := targetSSHClient.Run(ctx, "stat -c '%Y' "+util.ShQuote(targetPath))
+						if err != nil {
+							return fmt.Errorf("%w: %s", err, out)
+						}
+						if out > metadataEntryTimestamp {
+							return fmt.Errorf("Target file on system is newer (%s)  than last sync timestamp: %s: file on target has been changed between syncs", out, targetPath)
+
+						}
+					}
+					trace.Info("Successfully verified target file timestamps")
+				}
 			}
 		}
 	}
