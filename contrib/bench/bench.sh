@@ -67,12 +67,9 @@ Options:
                            (no ssh/qemu-io/vmsync calls actually made)
   -h, --help              this text
 
-Stage 3 (reinit) and, to a lesser extent, Stage 2 (verify) and Stage 4
-(snapshot) assume Stage 1 has already run at least once for this target
-domain (they need an existing checkpoint chain to distinguish
-"incremental" from "forced full resync"). Running --stages=reinit in
-isolation against a target that has never been synced before will not
-actually test anything meaningful -- see README.md. Stage 4 additionally
+Stages 2, 3, and 4 each start with their own baseline -reinit full sync,
+so none of them actually require Stage 1 (or any prior sync) to have run
+first -- each is safe to run standalone via --stages. Stage 4 additionally
 requires the SOURCE domain to be running.
 EOF
 }
@@ -505,6 +502,19 @@ stage_reinit_after_failures() {
 	log "=== Stage 3: -reinit-after-failures ==="
 	local n="${REINIT_AFTER_FAILURES_N:-3}"
 	local bogus_source="${SOURCE_DOMAIN}-vmsync-bench-nonexistent"
+
+	# Own baseline first, same as Stage 2/4 -- RecordTargetSyncFailure is a
+	# documented no-op against a target domain that doesn't exist yet ("has
+	# nothing to record against"), so without this, running Stage 3 before
+	# Stage 1 ever created the target (e.g. --stages reinit in isolation)
+	# induces N failures that never actually persist: failure_count stays 0
+	# forever and -reinit-after-failures never trips. This doesn't rely on
+	# Stage 1 having run at all, so Stage 3 is self-sufficient like the
+	# other stages.
+	run_vmsync reinit-after-failures baseline -reinit
+	if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
+		die "baseline full sync for reinit-after-failures testing failed (see $RUN_LOG) -- aborting stage 3"
+	fi
 
 	log "inducing $n consecutive failures against the real target (bogus -source-domain; target and its disk are never touched by these)"
 	local i
