@@ -398,6 +398,76 @@ func TestNegotiateBufferSizeReturnsPositiveValue(t *testing.T) {
 	}
 }
 
+// TestNextExtentScanOffset is a pure-function regression test for the bug
+// this was extracted to fix: ChangedExtentsTCP used to advance its scan
+// offset by the REQUESTED chunk size regardless of what the server's
+// BLOCK_STATUS reply actually described, silently dropping any sub-range
+// a server declined to describe (NBD_CMD_BLOCK_STATUS explicitly permits
+// replying with less than requested) and re-describing/duplicating any
+// sub-range a final extent overran into. Needs no qemu-nbd at all, unlike
+// the rest of this file -- see nbd.go's own doc comment on this function.
+func TestNextExtentScanOffset(t *testing.T) {
+	cases := []struct {
+		name                                            string
+		requestedOffset, requestedChunk, describedEnd   uint64
+		wantOffset                                      uint64
+		wantErr                                         bool
+	}{
+		{
+			name:            "server described the full requested range",
+			requestedOffset: 1000,
+			requestedChunk:  500,
+			describedEnd:    1500,
+			wantOffset:      1500,
+		},
+		{
+			name:            "server described less than requested -- must not skip the remainder",
+			requestedOffset: 1000,
+			requestedChunk:  500,
+			describedEnd:    1200,
+			wantOffset:      1200,
+		},
+		{
+			name:            "final extent overran the requested range -- must not re-describe it",
+			requestedOffset: 1000,
+			requestedChunk:  500,
+			describedEnd:    1800,
+			wantOffset:      1800,
+		},
+		{
+			name:            "server described nothing at all -- must error, not silently skip or spin",
+			requestedOffset: 1000,
+			requestedChunk:  500,
+			describedEnd:    1000,
+			wantErr:         true,
+		},
+		{
+			name:            "describedEnd behind the request entirely -- must error",
+			requestedOffset: 1000,
+			requestedChunk:  500,
+			describedEnd:    900,
+			wantErr:         true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := nextExtentScanOffset(c.requestedOffset, c.requestedChunk, c.describedEnd)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("nextExtentScanOffset(%d, %d, %d) = (%d, nil), want an error", c.requestedOffset, c.requestedChunk, c.describedEnd, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("nextExtentScanOffset(%d, %d, %d) unexpected error: %v", c.requestedOffset, c.requestedChunk, c.describedEnd, err)
+			}
+			if got != c.wantOffset {
+				t.Fatalf("nextExtentScanOffset(%d, %d, %d) = %d, want %d", c.requestedOffset, c.requestedChunk, c.describedEnd, got, c.wantOffset)
+			}
+		})
+	}
+}
+
 // TestChangedExtentsTCPDetectsAllocatedRegion covers the plain
 // base:allocation (non-incremental) path -- see this file's own
 // top-of-file comment for why the incremental qemu:dirty-bitmap: path

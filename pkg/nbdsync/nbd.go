@@ -102,6 +102,17 @@ func ChangedExtentsTCP(ctx context.Context, host string, port int, exportName, c
 			chunk = remain
 		}
 
+		// describedEnd tracks how far the server's reply actually covered --
+		// NBD_CMD_BLOCK_STATUS replies are explicitly allowed to describe
+		// less than the requested range (e.g. a server-side limit on how
+		// many extents fit in one reply), or for the final extent to run
+		// past it. Advancing the scan by the raw requested chunk size
+		// regardless (as this used to do) either silently drops whatever
+		// sub-range the server declined to describe -- those bytes are
+		// never re-queried and never copied, with the run still reporting
+		// success -- or, in the overrun case, re-queries and duplicates a
+		// sub-range already covered. See nextExtentScanOffset below.
+		describedEnd := offset
 		err = h.BlockStatus(chunk, offset, func(meta string, offs uint64, entries []uint32, cbErr *int) int {
 			if cbErr != nil && *cbErr != 0 {
 				return -1
@@ -124,12 +135,18 @@ func ChangedExtentsTCP(ctx context.Context, host string, port int, exportName, c
 				out = append(out, Extent{Offset: offs, Length: uint64(length), Dirty: data})
 				offs += uint64(length)
 			}
+			if offs > describedEnd {
+				describedEnd = offs
+			}
 			return 0
 		}, nil)
 		if err != nil {
 			return nil, 0, 0, fmt.Errorf("block status failed at %d: %w", offset, err)
 		}
-		offset += chunk
+		offset, err = nextExtentScanOffset(offset, chunk, describedEnd)
+		if err != nil {
+			return nil, 0, 0, err
+		}
 		if offset-lastProgress >= 1024*1024*1024 || offset == uint64(size) {
 			trace.Debug("nbd extent scan progress", "export", exportName, "offset", offset, "size", size)
 			lastProgress = offset
@@ -137,6 +154,21 @@ func ChangedExtentsTCP(ctx context.Context, host string, port int, exportName, c
 	}
 	trace.Info("nbd extent scan complete", "export", exportName, "extents", len(out), "selected", dirty)
 	return out, size, dirty, nil
+}
+
+// nextExtentScanOffset decides the next BLOCK_STATUS query offset after a
+// call that requested [requestedOffset, requestedOffset+requestedChunk) and
+// whose reply actually covered up to describedEnd. describedEnd <=
+// requestedOffset means the reply covered nothing at all (matched no
+// context, or reported zero extents) -- reported as an error rather than
+// silently continuing, which would otherwise either spin forever (if the
+// offset never advances) or, with a blind requestedChunk advance, skip an
+// arbitrary amount of the disk without anyone ever knowing.
+func nextExtentScanOffset(requestedOffset, requestedChunk, describedEnd uint64) (uint64, error) {
+	if describedEnd <= requestedOffset {
+		return 0, fmt.Errorf("nbd block status made no progress at offset %d (requested %d bytes, server described none)", requestedOffset, requestedChunk)
+	}
+	return describedEnd, nil
 }
 
 // negotiateBufferSize picks the read/write chunk size to use between two
