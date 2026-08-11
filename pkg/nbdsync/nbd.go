@@ -123,12 +123,7 @@ func ChangedExtentsTCP(ctx context.Context, host string, port int, exportName, c
 			for i := 0; i+1 < len(entries); i += 2 {
 				length := entries[i]
 				flags := entries[i+1]
-				data := (flags & 1) != 0
-				if !incremental {
-					// Full mode with base:allocation context:
-					// 0=allocated,1=hole,2=zero,3=hole+zero
-					data = flags == 0 || flags == 2
-				}
+				data := isDirtyExtent(flags, incremental)
 				if data {
 					dirty++
 				}
@@ -154,6 +149,24 @@ func ChangedExtentsTCP(ctx context.Context, host string, port int, exportName, c
 	}
 	trace.Info("nbd extent scan complete", "export", exportName, "extents", len(out), "selected", dirty)
 	return out, size, dirty, nil
+}
+
+// isDirtyExtent reports whether an NBD status flags value represents data
+// that needs to be copied/compared. For the incremental (qemu:dirty-bitmap:)
+// context, bit 0 (NBD_STATE_DIRTY) SET means "changed since the checkpoint".
+// For the full (base:allocation) context, bit 0 (NBD_STATE_HOLE) CLEAR means
+// "allocated, not a hole" -- tested as a mask against just that one bit,
+// per the NBD spec's requirement that clients ignore status bits they don't
+// recognize, rather than enumerating the full set of currently-known flag
+// combinations (0=allocated, 1=hole, 2=allocated+zero, 3=hole+zero) and
+// treating anything outside that set as skippable, which would silently
+// drop real data behind any future or non-qemu server that ever sets an
+// additional status bit on an otherwise-allocated, non-hole extent.
+func isDirtyExtent(flags uint32, incremental bool) bool {
+	if incremental {
+		return flags&1 != 0
+	}
+	return flags&1 == 0
 }
 
 // nextExtentScanOffset decides the next BLOCK_STATUS query offset after a

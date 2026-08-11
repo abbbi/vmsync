@@ -468,6 +468,39 @@ func TestNextExtentScanOffset(t *testing.T) {
 	}
 }
 
+// TestIsDirtyExtent is a pure-function regression test for the bug this
+// was extracted to fix: the full-mode (base:allocation) decision used to
+// enumerate the exact currently-known flag combinations (0, 1, 2, 3)
+// instead of masking just the hole bit, so any additional status bit a
+// future or non-qemu NBD server ever set on an otherwise-allocated extent
+// would silently turn it into a skipped one. Needs no qemu-nbd at all.
+func TestIsDirtyExtent(t *testing.T) {
+	cases := []struct {
+		name        string
+		flags       uint32
+		incremental bool
+		want        bool
+	}{
+		{"full: allocated, non-zero -> dirty", 0, false, true},
+		{"full: hole -> not dirty", 1, false, false},
+		{"full: allocated, zero-flagged -> dirty", 2, false, true},
+		{"full: hole+zero -> not dirty", 3, false, false},
+		{"full: unrecognized extra bit on an allocated extent -> still dirty", 4, false, true},
+		{"full: unrecognized extra bit combined with the hole bit -> still not dirty", 5, false, false},
+		{"incremental: dirty bit set -> dirty", 1, true, true},
+		{"incremental: dirty bit clear -> not dirty", 0, true, false},
+		{"incremental: unrecognized extra bit, dirty bit set -> still dirty", 3, true, true},
+		{"incremental: unrecognized extra bit, dirty bit clear -> still not dirty", 2, true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isDirtyExtent(c.flags, c.incremental); got != c.want {
+				t.Fatalf("isDirtyExtent(%d, incremental=%v) = %v, want %v", c.flags, c.incremental, got, c.want)
+			}
+		})
+	}
+}
+
 // TestChangedExtentsTCPDetectsAllocatedRegion covers the plain
 // base:allocation (non-incremental) path -- see this file's own
 // top-of-file comment for why the incremental qemu:dirty-bitmap: path
