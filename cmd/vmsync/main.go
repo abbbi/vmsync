@@ -460,6 +460,23 @@ func run(cfg struct {
 	// next run over what was, in the ways that actually matter, a
 	// successful sync.
 	var dataCopySucceeded bool
+	// copyCommitted is closed at the exact same moment dataCopySucceeded is
+	// set to true, below. A single snapshot read of dataCopySucceeded (as
+	// the signal handler's checkpoint-delete goroutine used to rely on
+	// exclusively) is not enough on its own to decide whether to delete the
+	// checkpoint: run()'s goroutine keeps executing independently of the
+	// signal handler regardless of what signal arrived, so a signal landing
+	// in the handful of Go statements between the disk-copy loop exiting
+	// and dataCopySucceeded actually being flipped to true would be read as
+	// "copy not done", and the handler would delete a checkpoint that, a
+	// moment later, run() commits to (deletes the parent checkpoint,
+	// writes this one's name into target metadata) -- permanently
+	// destroying the incremental chain with no recovery short of a full
+	// resync. Waiting on this channel (with a short bounded timeout as a
+	// fallback for the case where the copy is genuinely still running) lets
+	// the handler react to the actual transition instead of a stale
+	// snapshot of it.
+	copyCommitted := make(chan struct{})
 	var freezed bool = false
 	var fsFreezeFailed bool = false
 	var started bool = false
@@ -861,6 +878,24 @@ func run(cfg struct {
 				checkpointMu.Lock()
 				name, advanced, copySucceeded := checkpointName, checkpointAdvanced, dataCopySucceeded
 				checkpointMu.Unlock()
+				// A snapshot showing copySucceeded=false is not trustworthy
+				// on its own: run()'s goroutine keeps executing regardless of
+				// this signal, and might be a handful of Go statements away
+				// from flipping it to true (see copyCommitted's own doc
+				// comment for exactly why). Wait briefly for that transition
+				// to actually happen before concluding the copy is still
+				// genuinely in progress -- if it's still running for real
+				// (the common case for an interrupt during a multi-hour
+				// sync), copyCommitted won't close for a long time and this
+				// just waits out the timeout once, unnoticeably, before
+				// proceeding to delete as before.
+				if advanced && !copySucceeded {
+					select {
+					case <-copyCommitted:
+						copySucceeded = true
+					case <-time.After(200 * time.Millisecond):
+					}
+				}
 				// Mirrors the deferred checkpoint cleanup further down in
 				// run() -- duplicated here because that defer never gets a
 				// chance to run if we os.Exit below without waiting for it.
@@ -1939,6 +1974,7 @@ func run(cfg struct {
 	checkpointMu.Lock()
 	dataCopySucceeded = true
 	checkpointMu.Unlock()
+	close(copyCommitted)
 
 	if incrementalMode && checkpointAdvanced {
 		trace.Info("sync successful cleaning up parent checkpoint", "parent", parent)
