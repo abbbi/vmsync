@@ -20,6 +20,7 @@ package util
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -112,6 +113,33 @@ func TestAcquireRunLock_SecondAcquireFailsWhileHeld(t *testing.T) {
 	if f2 != nil {
 		f2.Close()
 		t.Fatalf("second AcquireRunLock() returned non-nil *os.File = %v, want nil", f2)
+	}
+	if !errors.Is(err2, ErrLockHeld) {
+		t.Fatalf("second AcquireRunLock() error = %v, want it to wrap ErrLockHeld -- callers rely on errors.Is to distinguish real contention from every other failure mode", err2)
+	}
+}
+
+// TestAcquireRunLock_NonContentionFailureDoesNotWrapErrLockHeld proves the
+// distinction the fix for the main.go call site depends on: a failure that
+// has nothing to do with another process holding the lock must not be
+// mistaken for contention. A plain file where a directory is expected
+// makes os.MkdirAll fail deterministically and portably, without needing
+// real permission manipulation (which behaves differently across CI
+// environments, especially when running as root).
+func TestAcquireRunLock_NonContentionFailureDoesNotWrapErrLockHeld(t *testing.T) {
+	parent := t.TempDir()
+	blockingFile := filepath.Join(parent, "not-a-directory")
+	if err := os.WriteFile(blockingFile, []byte("x"), 0644); err != nil {
+		t.Fatalf("create blocking file: %v", err)
+	}
+	dir := filepath.Join(blockingFile, "locks")
+
+	_, err := AcquireRunLock(dir, "some-domain")
+	if err == nil {
+		t.Fatal("AcquireRunLock() with a file where the lock directory should be = nil error, want non-nil")
+	}
+	if errors.Is(err, ErrLockHeld) {
+		t.Fatalf("AcquireRunLock() error = %v wraps ErrLockHeld, want it not to -- this failure has nothing to do with another process holding the lock", err)
 	}
 }
 

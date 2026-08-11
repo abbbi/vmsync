@@ -18,12 +18,25 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package util
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 )
+
+// ErrLockHeld indicates AcquireRunLock failed specifically because another
+// process already holds the lock -- the one, genuinely expected outcome
+// when two invocations for the same key legitimately overlap. Callers
+// must distinguish this (via errors.Is) from every other failure this
+// function can return -- can't create the lock directory, can't open the
+// lock file, or the lock file kept being replaced out from under repeated
+// attempts -- all of which mean something is actually broken (permissions,
+// a read-only filesystem, a tmpfiles.d rule fighting the lock directory)
+// and must not be silently treated the same as "another instance is
+// running, nothing to do here".
+var ErrLockHeld = errors.New("lock already held by another process")
 
 // safeKeyReplacer makes a lock key filesystem-safe reversibly (percent-
 // encoding style), rather than via lossy character substitution -- mapping
@@ -78,7 +91,7 @@ func AcquireRunLock(dir, key string) (*os.File, error) {
 		}
 		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 			f.Close()
-			return nil, fmt.Errorf("another vmsync is already running for %q (lock %s held): %w", key, path, err)
+			return nil, fmt.Errorf("another vmsync is already running for %q (lock %s held): %w (%v)", key, path, ErrLockHeld, err)
 		}
 
 		if lockRefersToCurrentPath(f, path) {

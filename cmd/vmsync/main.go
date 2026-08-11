@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -231,15 +232,29 @@ func main() {
 	// of which target either one is writing to. Acquired before any libvirt
 	// connection at all, and before -reinit-after-failures's own metadata
 	// read just below, so a losing invocation does the least possible work
-	// before backing off. Not a sync failure: exits 0, doesn't count toward
-	// -reinit-after-failures, and (since run() is never called) never
-	// touches -prometheus-textfile either -- it's a clean no-op skip, the
-	// same way the wrapper script's own lock already treats "another
-	// instance is already running".
+	// before backing off. Genuine contention (util.ErrLockHeld, i.e.
+	// another vmsync really is running for this domain) is not a sync
+	// failure: exits 0, doesn't count toward -reinit-after-failures, and
+	// (since run() is never called) never touches -prometheus-textfile
+	// either -- a clean no-op skip, the same way the wrapper script's own
+	// lock already treats "another instance is already running". Any
+	// OTHER error (can't create/open the lock file -- e.g. a read-only or
+	// permission-denied /run, or the lock file being repeatedly replaced
+	// out from under acquisition attempts) means something is actually
+	// broken, not that a peer is running: treating that the same way used
+	// to silently and permanently stop replication for this domain, since
+	// run() is never called, so -prometheus-textfile is never touched and
+	// vmsync_sync_state keeps reporting whatever the last successful run
+	// left behind -- with the process itself still reporting a clean exit
+	// 0 and a log line claiming the benign case.
 	lockFile, err := util.AcquireRunLock("/run/vmsync-locks", cfg.SourceDomain)
 	if err != nil {
-		trace.Info("another vmsync is already syncing this domain, skipping", "domain", cfg.SourceDomain, "error", err)
-		os.Exit(0)
+		if errors.Is(err, util.ErrLockHeld) {
+			trace.Info("another vmsync is already syncing this domain, skipping", "domain", cfg.SourceDomain, "error", err)
+			os.Exit(0)
+		}
+		trace.Error("failed to acquire run lock for domain -- this is not lock contention, something is actually broken (permissions, a read-only lock directory, or the lock file being repeatedly replaced)", "domain", cfg.SourceDomain, "error", err)
+		os.Exit(1)
 	}
 	defer lockFile.Close()
 
