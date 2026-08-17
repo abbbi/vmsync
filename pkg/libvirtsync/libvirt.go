@@ -577,11 +577,7 @@ func SetMetadataFields(domainXML string, updates map[string]string, removeFields
 
 	current := map[string]string{}
 	if domcfg.Metadata != nil {
-		for _, field := range metadataFieldOrder {
-			if v := parseMetadataValue(domcfg.Metadata.XML, field); v != "" {
-				current[field] = v
-			}
-		}
+		current = allMetadataFields(domcfg.Metadata.XML)
 	}
 	for field, value := range updates {
 		current[field] = value
@@ -897,21 +893,40 @@ func ParseMetadataField(domainXML string, field string) (string, error) {
 }
 
 // buildMetadataEntry renders a full <vmsync:vmsync> block from the given
-// field values, in the fixed order defined by metadataFieldOrder. Fields
-// absent from the map are simply omitted.
+// field values: known fields (metadataFieldOrder) first, in that fixed
+// order, for the stable/readable output every domain vmsync itself writes
+// gets -- then any OTHER field present in fields that metadataFieldOrder
+// doesn't know about (see allMetadataFields' own doc comment for how such
+// a field would get in here at all), sorted alphabetically so that
+// unrecognized-field ordering is still deterministic across runs rather
+// than depending on Go's randomized map iteration. Fields absent from the
+// map are simply omitted.
 func buildMetadataEntry(fields map[string]string) string {
 	var b strings.Builder
 	b.WriteString(metadataStart)
-	for _, field := range metadataFieldOrder {
-		value, ok := fields[field]
-		if !ok {
-			continue
-		}
+	written := make(map[string]bool, len(fields))
+	writeField := func(field, value string) {
 		b.WriteString("\n  <vmsync:")
 		b.WriteString(field)
 		b.WriteString(" id=\"")
 		_ = xml.EscapeText(&b, []byte(value))
 		b.WriteString("\"/>")
+		written[field] = true
+	}
+	for _, field := range metadataFieldOrder {
+		if value, ok := fields[field]; ok {
+			writeField(field, value)
+		}
+	}
+	extra := make([]string, 0, len(fields)-len(written))
+	for field := range fields {
+		if !written[field] {
+			extra = append(extra, field)
+		}
+	}
+	sort.Strings(extra)
+	for _, field := range extra {
+		writeField(field, fields[field])
 	}
 	b.WriteString("\n")
 	b.WriteString(metadataEnd)
@@ -937,6 +952,40 @@ func parseMetadataValue(metadataXML string, field string) string {
 		}
 
 		return ""
+	}
+}
+
+// allMetadataFields returns every vmsync:field->id-attribute-value pair
+// actually present in metadataXML, not just the ones metadataFieldOrder
+// happens to enumerate. SetMetadataFields uses this (rather than looking
+// up each known field individually, as it used to) specifically so a field
+// outside that list -- written by a newer or older vmsync version sharing
+// the same target, say, or simply added to metadataFieldOrder after this
+// build was compiled -- survives a metadata update instead of silently
+// disappearing the moment anything else touches this domain's metadata:
+// SetMetadataFields's own doc comment already promises "preserving any
+// existing vmsync fields not mentioned in updates or removeFields...
+// untouched", a guarantee the old known-fields-only read broke for
+// anything not on that list. The wrapping <vmsync:vmsync> element itself
+// is excluded -- it's the container, not a field.
+func allMetadataFields(metadataXML string) map[string]string {
+	fields := map[string]string{}
+	decoder := xml.NewDecoder(strings.NewReader("<metadata>" + metadataXML + "</metadata>"))
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return fields
+		}
+		start, ok := token.(xml.StartElement)
+		if !ok || start.Name.Space != metadataNamespace || start.Name.Local == "vmsync" {
+			continue
+		}
+		for _, attr := range start.Attr {
+			if attr.Name.Local == "id" {
+				fields[start.Name.Local] = attr.Value
+				break
+			}
+		}
 	}
 }
 

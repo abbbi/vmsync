@@ -512,6 +512,42 @@ func TestSetMetadataFieldsAndParseMetadata(t *testing.T) {
 		}
 	})
 
+	t.Run("an unrecognized vmsync field survives untouched by a later update", func(t *testing.T) {
+		// Simulates a field written by a different vmsync version (older or
+		// newer) than this build, which metadataFieldOrder doesn't
+		// enumerate -- SetMetadataFields's own updates map has no
+		// restriction to the named MetadataField* constants, so this is a
+		// realistic way to create one via the real, public API rather than
+		// hand-crafting raw XML.
+		withUnknown, err := SetMetadataFields(base, map[string]string{
+			MetadataFieldLastCheckpoint: "vmsync-cpt-000001",
+			"some_future_field":         "value-from-a-different-version",
+		})
+		if err != nil {
+			t.Fatalf("SetMetadataFields() error = %v", err)
+		}
+		// A later update touching a completely different, known field must
+		// not silently drop the unrecognized one -- this is the exact
+		// regression: SetMetadataFields used to only ever read back fields
+		// in metadataFieldOrder, so anything else vanished the moment
+		// metadata was next written, contradicting its own doc comment's
+		// "preserving any existing vmsync fields not mentioned in updates
+		// or removeFields... untouched".
+		updated, err := SetMetadataFields(withUnknown, map[string]string{
+			MetadataFieldFailureCount: "1",
+		})
+		if err != nil {
+			t.Fatalf("SetMetadataFields() second call error = %v", err)
+		}
+		v, err := ParseMetadataField(updated, "some_future_field")
+		if err != nil {
+			t.Fatalf("ParseMetadataField() error = %v", err)
+		}
+		if v != "value-from-a-different-version" {
+			t.Errorf("unrecognized field = %q, want %q -- SetMetadataFields dropped a field it doesn't itself enumerate", v, "value-from-a-different-version")
+		}
+	})
+
 	t.Run("no metadata block returns empty string, no error", func(t *testing.T) {
 		v, err := ParseMetadataField(base, MetadataFieldLastCheckpoint)
 		if err != nil {
@@ -549,10 +585,73 @@ func TestBuildMetadataEntry(t *testing.T) {
 	}
 }
 
+// TestBuildMetadataEntryUnknownFields covers the write-side half of the fix
+// for the metadata writer silently dropping fields outside
+// metadataFieldOrder: a field it doesn't itself enumerate must still be
+// emitted (after every known field, sorted alphabetically among
+// themselves so their own relative order is deterministic too), not
+// silently omitted the way it used to be even if allMetadataFields had
+// correctly read it back into the map in the first place.
+func TestBuildMetadataEntryUnknownFields(t *testing.T) {
+	entry := buildMetadataEntry(map[string]string{
+		MetadataFieldFailureCount: "3",
+		"zzz_unknown":             "z-value",
+		"aaa_unknown":             "a-value",
+	})
+	idxFailure := strings.Index(entry, "vmsync:"+MetadataFieldFailureCount)
+	idxAAA := strings.Index(entry, "vmsync:aaa_unknown")
+	idxZZZ := strings.Index(entry, "vmsync:zzz_unknown")
+	if idxFailure == -1 || idxAAA == -1 || idxZZZ == -1 {
+		t.Fatalf("expected all three fields present, got: %s", entry)
+	}
+	if idxFailure > idxAAA || idxFailure > idxZZZ {
+		t.Errorf("expected the known field (failure_count) before any unknown ones, got: %s", entry)
+	}
+	if idxAAA > idxZZZ {
+		t.Errorf("expected unknown fields sorted alphabetically among themselves (aaa_unknown before zzz_unknown), got: %s", entry)
+	}
+	if !strings.Contains(entry, `id="a-value"`) || !strings.Contains(entry, `id="z-value"`) {
+		t.Errorf("expected both unknown fields' values present, got: %s", entry)
+	}
+}
+
 func TestParseMetadataValueMissingField(t *testing.T) {
 	entry := buildMetadataEntry(map[string]string{MetadataFieldLastCheckpoint: "vmsync-cpt-000001"})
 	if v := parseMetadataValue(entry, MetadataFieldFailureCount); v != "" {
 		t.Errorf("parseMetadataValue() for an absent field = %q, want empty", v)
+	}
+}
+
+// TestAllMetadataFields is the read-side regression pin for the metadata
+// writer's own fix: every field actually present in a <vmsync:vmsync>
+// block must come back, including ones metadataFieldOrder doesn't
+// enumerate -- not just the known ones parseMetadataValue looks up one at
+// a time.
+func TestAllMetadataFields(t *testing.T) {
+	entry := buildMetadataEntry(map[string]string{
+		MetadataFieldLastCheckpoint: "vmsync-cpt-000001",
+		MetadataFieldFailureCount:   "3",
+		"some_future_field":         "future-value",
+	})
+	got := allMetadataFields(entry)
+	want := map[string]string{
+		MetadataFieldLastCheckpoint: "vmsync-cpt-000001",
+		MetadataFieldFailureCount:   "3",
+		"some_future_field":         "future-value",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("allMetadataFields() = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("allMetadataFields()[%q] = %q, want %q (full result: %v)", k, got[k], v, got)
+		}
+	}
+}
+
+func TestAllMetadataFieldsNoBlock(t *testing.T) {
+	if got := allMetadataFields(""); len(got) != 0 {
+		t.Errorf("allMetadataFields(\"\") = %v, want empty", got)
 	}
 }
 
