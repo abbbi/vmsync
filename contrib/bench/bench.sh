@@ -748,6 +748,24 @@ stage_define_domain_uuid_collision() {
         target_uuid_before="$(domain_uuid "$TARGET_URI" "$TARGET_DOMAIN")" || die "could not read target domain UUID via $TARGET_URI: $VIRSH_ERR"
         [ "$target_uuid_before" = "$src_uuid" ] || warn "target UUID ($target_uuid_before) doesn't match source UUID ($src_uuid) right after a fresh -reinit baseline -- unexpected, but continuing"
 
+        # The target replica ($TARGET_DOMAIN) itself is still defined at this
+        # point, holding $src_uuid -- that's the baseline sync's own normal,
+        # correct behavior. Defining the throwaway domain below with that
+        # same UUID would collide with $TARGET_DOMAIN itself (not some
+        # unrelated stray domain), since libvirt never allows two domains on
+        # the same host to share a UUID. Undefining $TARGET_DOMAIN first
+        # frees the UUID for the throwaway domain to claim instead, so the
+        # later "trigger" run's own DefineDomain -- which finds no existing
+        # $TARGET_DOMAIN to undefine, and goes straight to redefining it with
+        # $src_uuid -- collides against the throwaway domain exactly the way
+        # a real, independent stray domain squatting on the UUID would.
+        # --keep-nvram matches DefineDomain's own DOMAIN_UNDEFINE_KEEP_NVRAM
+        # (see libvirt.go) so this doesn't delete a UEFI/OVMF target's real
+        # varstore file.
+        log "undefining target domain '$TARGET_DOMAIN' to free its uuid for the throwaway collision domain"
+        virsh_uri "$TARGET_URI" undefine "$TARGET_DOMAIN" --keep-nvram >/dev/null \
+                || die "could not undefine target domain '$TARGET_DOMAIN' to free its uuid for the collision test -- aborting stage 5a"
+
         local collision_name="vmsync-bench-uuid-collision-$$"
         log "defining throwaway domain '$collision_name' on target reusing source UUID $src_uuid"
         printf '%s\n' \
