@@ -271,6 +271,37 @@ func TestUnverifiableCheckpointMetadataError(t *testing.T) {
 	}
 }
 
+// TestCheckpointChainConsistent covers unverifiableCheckpointMetadataError's
+// companion guard: once the target's last_checkpoint metadata has actually
+// been read and parsed fine, it must still name the SAME checkpoint this
+// run computed as its expected parent from the source's own chain, or an
+// incremental sync would apply this run's delta on top of the wrong base
+// -- producing a target that looks fine (the run reports success) but
+// silently reflects a mixed, incorrect history. Before this function was
+// extracted, this exact comparison lived inline in run() with nothing to
+// call directly, making it the one checkpoint-chain guard in this file
+// with no test coverage at all.
+func TestCheckpointChainConsistent(t *testing.T) {
+	cases := []struct {
+		name                   string
+		metadataEntryCheckpoint string
+		parent                 string
+		want                   bool
+	}{
+		{name: "matches -- the common case on every normal incremental sync", metadataEntryCheckpoint: "vmsync-cpt-000042", parent: "vmsync-cpt-000042", want: true},
+		{name: "mismatch -- target's own metadata disagrees with the expected parent", metadataEntryCheckpoint: "vmsync-cpt-000041", parent: "vmsync-cpt-000042", want: false},
+		{name: "empty metadata -- unverifiableCheckpointMetadataError's own responsibility, not a mismatch here", metadataEntryCheckpoint: "", parent: "vmsync-cpt-000042", want: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := checkpointChainConsistent(tc.metadataEntryCheckpoint, tc.parent); got != tc.want {
+				t.Errorf("checkpointChainConsistent(%q, %q) = %v, want %v", tc.metadataEntryCheckpoint, tc.parent, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRefuseReinitIfTargetRunning covers the one guard standing between a
 // normal -reinit and an unconditional `rm -f` running against a target
 // disk qemu still has open: this is the exact regression class flagged as

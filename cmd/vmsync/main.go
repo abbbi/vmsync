@@ -400,6 +400,36 @@ func unverifiableCheckpointMetadataError(targetDomain, parent string, checkpoint
 	return fmt.Errorf("incremental sync attempted but target domain %s has no verifiable last_checkpoint metadata (%s; parent checkpoint expected: %s) -- if this target was manually redefined, restored from an old XML, or is otherwise missing vmsync's own metadata, its on-disk state cannot be trusted as a base for an incremental copy; run -reinit to establish a fresh baseline", targetDomain, reason, parent)
 }
 
+// checkpointChainConsistent is unverifiableCheckpointMetadataError's
+// companion guard, for the case that function's own doc comment doesn't
+// cover: the target's last_checkpoint metadata was read and parsed fine,
+// but names a DIFFERENT checkpoint than parent -- the checkpoint this run
+// actually computed as the expected parent from the SOURCE's own
+// checkpoint chain (NextCheckpointName, above in run()). That mismatch
+// means the two disagree about what the target's on-disk data actually
+// represents: the target thinks it's at checkpoint X, but the source's
+// chain expects to be incrementing from Y. Proceeding anyway would apply
+// this run's delta on top of the wrong base, producing a target that
+// looks internally consistent (the sync itself reports success) but is
+// silently wrong -- exactly the class of failure this whole metadata
+// check exists to catch, and, before this function existed, the one guard
+// in this file with no test coverage of its own: unlike
+// unverifiableCheckpointMetadataError right above, it was inline in run()
+// with nothing to call directly.
+//
+// metadataEntryCheckpoint == "" (empty or unparseable) is reported as
+// consistent here -- not because there's nothing to worry about, but
+// because that case is already unverifiableCheckpointMetadataError's own
+// responsibility (called separately, earlier, against the same field) --
+// this function's only job is judging an actual disagreement between two
+// non-empty values.
+func checkpointChainConsistent(metadataEntryCheckpoint, parent string) bool {
+	if metadataEntryCheckpoint == "" {
+		return true
+	}
+	return metadataEntryCheckpoint == parent
+}
+
 // refuseReinitIfTargetRunning decides whether -reinit must abort before
 // touching the target's disk files, given whether the target domain
 // exists and (if it does) whether it's currently running. A target that
@@ -1527,12 +1557,11 @@ func run(cfg struct {
 	if parent == "" {
 		trace.Info("created initial", "checkpoint", checkpointName)
 	} else {
+		if !checkpointChainConsistent(metadataEntryCheckpoint, parent) {
+			return fmt.Errorf("checkpoint inconsistency detected: target VM definition lists [%s] as parent checkpoint, but parent checkpoint defined is [%s]", metadataEntryCheckpoint, parent)
+		}
 		if metadataEntryCheckpoint != "" {
-			if metadataEntryCheckpoint != parent {
-				return fmt.Errorf("checkpoint inconsistency detected: target VM definition lists [%s] as parent checkpoint, but parent checkpoint defined is [%s]", metadataEntryCheckpoint, parent)
-			} else {
-				trace.Info("Successfully verified checkpoint chain")
-			}
+			trace.Info("Successfully verified checkpoint chain")
 		}
 		trace.Info("creating incremental", "checkpoint", checkpointName, "parent", parent)
 	}
