@@ -106,3 +106,24 @@ func BuildStopCommand(pidFile, logFile string) string {
 	return fmt.Sprintf("kill -9 -$(cat %s) || true; rm -f %s %s",
 		util.ShQuote(pidFile), util.ShQuote(pidFile), util.ShQuote(logFile))
 }
+
+// BuildReadinessCheckCommand returns a shell command that succeeds (exit 0)
+// only when bridgePort is genuinely in LISTEN state under the PID recorded
+// in pidFile -- see waitForRemoteListening's own doc comment
+// (pkg/nbdbridge/remote.go) for the full reasoning behind checking this
+// specific thing (not bare process liveness, not a real connect probe, not
+// "anything" listening on the port). Extracted into its own pure function,
+// alongside this file's other shell-command builders, specifically so this
+// exact string -- easy to get subtly wrong given the nested quoting a nested
+// $(cat ...) substitution requires -- has direct test coverage instead of
+// being an untested, inline part of a polling loop that only a live SSH
+// connection could ever exercise.
+//
+// The trailing comma in "pid=$(cat ...)," is deliberate, not decorative: ss's
+// own output always follows a listening socket's pid with a comma before the
+// next field (e.g. "pid=12345,fd=3"), so matching through the comma is what
+// stops pid 123 from ever falsely matching a real pid of 1234 or 12345.
+func BuildReadinessCheckCommand(bridgePort int, pidFile string) string {
+	filter := fmt.Sprintf("( sport = :%d )", bridgePort)
+	return "ss -Htlnp " + util.ShQuote(filter) + " | grep -q \"pid=$(cat " + util.ShQuote(pidFile) + "),\""
+}

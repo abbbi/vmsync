@@ -136,8 +136,7 @@ func killOrphanedRemoteBridge(ctx context.Context, client *remotessh.Client, pid
 // target. Matching pidFile's own PID against the socket's owning process
 // (ss -p) confirms it's genuinely this run's helper that's listening.
 func waitForRemoteListening(ctx context.Context, client *remotessh.Client, bridgePort int, pidFile string, timeout time.Duration) error {
-	filter := fmt.Sprintf("( sport = :%d )", bridgePort)
-	check := "ss -Htlnp " + util.ShQuote(filter) + " | grep -q \"pid=$(cat " + util.ShQuote(pidFile) + "),\""
+	check := BuildReadinessCheckCommand(bridgePort, pidFile)
 	deadline := time.Now().Add(timeout)
 	for {
 		if _, err := client.Run(ctx, check); err == nil {

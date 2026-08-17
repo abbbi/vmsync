@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package nbdbridge
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -226,6 +227,56 @@ func TestBuildStopCommand(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("BuildStopCommand(%q, %q) = %q, missing expected substring %q", pidFile, logFile, got, want)
 		}
+	}
+}
+
+// TestBuildReadinessCheckCommand pins down the exact shell string
+// waitForRemoteListening polls with -- previously built inline, with no
+// direct test coverage at all, despite mixing single- and double-quoting
+// (a nested $(cat '...') substitution inside a double-quoted grep pattern)
+// that's easy to get subtly wrong on a future edit.
+func TestBuildReadinessCheckCommand(t *testing.T) {
+	tests := []struct {
+		name       string
+		bridgePort int
+		pidFile    string
+	}{
+		{"typical port and pidfile", 20200, "/run/vmsync-bridge/vmsync-bridge-20200.pid"},
+		{"different port", 30301, "/run/vmsync-bridge/vmsync-bridge-30301.pid"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := BuildReadinessCheckCommand(tt.bridgePort, tt.pidFile)
+
+			assertContainsAll(t, got,
+				"ss -Htlnp",
+				util.ShQuote(fmt.Sprintf("( sport = :%d )", tt.bridgePort)),
+				"| grep -q",
+				"$(cat "+util.ShQuote(tt.pidFile)+")",
+				// The trailing comma is what disambiguates pid 123 from a
+				// same-prefixed pid like 1234 or 12345 in ss's own output
+				// (see BuildReadinessCheckCommand's own doc comment) --
+				// losing it silently would be exactly the kind of subtle
+				// regression this test exists to catch.
+				"),\"",
+			)
+		})
+	}
+}
+
+// TestBuildReadinessCheckCommandQuotesPidFileSafely confirms a pidFile
+// containing a shell metacharacter (a single quote) still produces a
+// syntactically safe command -- pidFile is always a deterministic path this
+// package itself constructs in practice (see bridgeStateDir in remote.go),
+// never user-controlled, but the nested quoting here is exactly the kind of
+// thing worth pinning down explicitly rather than trusting by inspection.
+func TestBuildReadinessCheckCommandQuotesPidFileSafely(t *testing.T) {
+	const pidFile = "/run/vmsync-bridge/vm's-bridge.pid"
+	got := BuildReadinessCheckCommand(20200, pidFile)
+
+	wantCat := "$(cat " + util.ShQuote(pidFile) + ")"
+	if !strings.Contains(got, wantCat) {
+		t.Errorf("BuildReadinessCheckCommand(20200, %q) = %q, missing safely-quoted %q", pidFile, got, wantCat)
 	}
 }
 
