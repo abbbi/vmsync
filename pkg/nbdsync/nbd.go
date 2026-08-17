@@ -38,6 +38,33 @@ import (
 // modest 8MiB of buffer memory.
 const defaultMaxBufferSize = 1024 * 1024
 
+// maxNegotiatedBufferSize hard-caps whatever negotiateBufferSize would
+// otherwise pick from a server's advertised maximum block size. Without
+// this, a misconfigured or buggy remote NBD server -- inherently the
+// untrusted side of a connection vmsync can reach over SSH to a separate
+// host it doesn't control -- advertising an unrealistically large maximum
+// block size would make every one of ioDepth's AIO buffers allocate at
+// that size: a cgo call into libnbd's native allocator, not Go's own, so a
+// failure there (malloc returning NULL, or the OS's OOM-killer stepping in
+// once the process actually touches that much memory) aborts the whole
+// process immediately, mid-sync, with no Go-level panic/recover able to
+// catch it and no chance to clean up. 32MiB comfortably covers every real
+// qemu-nbd maximum block size seen in practice while keeping ioDepth *
+// bufferSize's worst case bounded to a sane figure (256MiB at the default
+// -io-depth of 8) regardless of what any server, well-behaved or not,
+// claims to support.
+const maxNegotiatedBufferSize = 32 * 1024 * 1024
+
+// clampBufferSize caps size at limit, leaving it unchanged when it's
+// already within bounds. Extracted from negotiateBufferSize purely so this
+// specific safety cap is directly testable without a live NBD connection.
+func clampBufferSize(size, limit uint64) uint64 {
+	if size > limit {
+		return limit
+	}
+	return size
+}
+
 // noProgressTimeout bounds how long CopyExtentsTCP's and compareTCP's AIO
 // pipelines will run without a single read or write completing anywhere
 // before concluding the connection is stuck rather than merely slow. A
@@ -219,9 +246,12 @@ func nextExtentScanOffset(requestedOffset, requestedChunk, describedEnd uint64) 
 // forever (step stays 0, so offsets never advance) before a single byte is
 // transferred. Only falls back to defaultMaxBufferSize when *both* sides
 // are unconstrained; a real constraint from whichever side has one always
-// wins over the other side's "no constraint" sentinel. roleA/roleB label
-// the trace output only (e.g. "src"/"dst" for a copy, "source"/"target" for
-// a compare).
+// wins over the other side's "no constraint" sentinel. The result is then
+// run through clampBufferSize -- see maxNegotiatedBufferSize's own doc
+// comment for why an advertised constraint is trusted to shrink the
+// buffer but never to grow it past that cap. roleA/roleB label the trace
+// output only (e.g. "src"/"dst" for a copy, "source"/"target" for a
+// compare).
 func negotiateBufferSize(a, b *nbd.Libnbd, roleA, roleB string) uint64 {
 	maxA, _ := a.GetBlockSize(nbd.SIZE_MAXIMUM)
 	trace.Debug(roleA+" block", "size", maxA)
@@ -236,6 +266,7 @@ func negotiateBufferSize(a, b *nbd.Libnbd, roleA, roleB string) uint64 {
 	case maxB == 0:
 		bufferSize = maxA
 	}
+	bufferSize = clampBufferSize(bufferSize, maxNegotiatedBufferSize)
 	trace.Debug("use nbd buffer", "size", bufferSize)
 	return bufferSize
 }

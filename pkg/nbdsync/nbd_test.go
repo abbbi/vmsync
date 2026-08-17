@@ -693,8 +693,42 @@ func TestNegotiateBufferSizeReturnsPositiveValue(t *testing.T) {
 		t.Fatalf("connect target nbd handle: %v", err)
 	}
 
-	if got := negotiateBufferSize(a, b, "test-a", "test-b"); got == 0 {
+	got := negotiateBufferSize(a, b, "test-a", "test-b")
+	if got == 0 {
 		t.Fatal("negotiateBufferSize returned 0 against two live NBD connections -- this would spin a chunking loop forever without transferring a single byte")
+	}
+	if got > maxNegotiatedBufferSize {
+		t.Fatalf("negotiateBufferSize returned %d, which exceeds maxNegotiatedBufferSize (%d) -- the cap is not actually being applied on the real code path", got, maxNegotiatedBufferSize)
+	}
+}
+
+// TestClampBufferSize is a pure-function regression test for the fix this
+// was extracted to make possible: negotiateBufferSize used to trust
+// whatever a remote NBD server's advertised maximum block size worked out
+// to, with no ceiling -- letting a misconfigured or buggy server drive an
+// oversized native (cgo) AIO buffer allocation that could abort the whole
+// process under memory pressure instead of failing cleanly. Needs no
+// qemu-nbd at all.
+func TestClampBufferSize(t *testing.T) {
+	cases := []struct {
+		name  string
+		size  uint64
+		limit uint64
+		want  uint64
+	}{
+		{name: "well under the limit -- unchanged", size: 1024, limit: maxNegotiatedBufferSize, want: 1024},
+		{name: "exactly at the limit -- unchanged", size: maxNegotiatedBufferSize, limit: maxNegotiatedBufferSize, want: maxNegotiatedBufferSize},
+		{name: "just over the limit -- capped", size: maxNegotiatedBufferSize + 1, limit: maxNegotiatedBufferSize, want: maxNegotiatedBufferSize},
+		{name: "wildly over the limit -- capped, not zeroed or wrapped", size: 4 * 1024 * 1024 * 1024, limit: maxNegotiatedBufferSize, want: maxNegotiatedBufferSize},
+		{name: "zero size -- stays zero, never raised to the limit", size: 0, limit: maxNegotiatedBufferSize, want: 0},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := clampBufferSize(c.size, c.limit); got != c.want {
+				t.Errorf("clampBufferSize(%d, %d) = %d, want %d", c.size, c.limit, got, c.want)
+			}
+		})
 	}
 }
 
