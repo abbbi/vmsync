@@ -19,6 +19,7 @@ package libvirtsync
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -202,6 +203,14 @@ func TestBuildPullBackupXML(t *testing.T) {
 }
 
 func TestIsCheckpointBlockedBySnapshot(t *testing.T) {
+	// CreateCheckpoint's real, exact wrapping shape ("create checkpoint %s:
+	// %w") -- used below to build the same shape of error this function
+	// actually receives at its only real call site, rather than only ever
+	// testing bare, unwrapped errors nothing in production ever produces.
+	wrapAsCreateCheckpointErr := func(inner error) error {
+		return fmt.Errorf("create checkpoint %s: %w", "vmsync-cpt-000002", inner)
+	}
+
 	cases := []struct {
 		name string
 		err  error
@@ -214,6 +223,29 @@ func TestIsCheckpointBlockedBySnapshot(t *testing.T) {
 		{"mentions snapshot but not checkpoint must not match", errors.New("SNAPSHOT exists"), false},
 		{"mentions checkpoint but not snapshot must not match", errors.New("checkpoint already exists with that name"), false},
 		{"unrelated error", errors.New("connection refused"), false},
+		// Regression coverage for the "second condition is vacuous at the
+		// real call site" bug: CreateCheckpoint always wraps its real
+		// failure behind a "create checkpoint %s: %w" prefix, so the outer,
+		// still-wrapped error ALWAYS contains "checkpoint" regardless of
+		// what actually failed underneath -- checking it directly (instead
+		// of unwrapping first) would make the "requires both terms" guard
+		// degrade to just "contains external snapshot", misclassifying any
+		// unrelated inner failure that happens to mention it too.
+		{
+			"wrapped libvirt message still matches once unwrapped",
+			wrapAsCreateCheckpointErr(errors.New("operation invalid: the creation of checkpoints when external snapshots exist is currently forbidden")),
+			true,
+		},
+		{
+			"wrapped UNRELATED inner error mentioning \"external snapshot\" must not match, even though the outer wrap text contains \"checkpoint\"",
+			wrapAsCreateCheckpointErr(errors.New("cannot resize disk while an external snapshot exists")),
+			false,
+		},
+		{
+			"wrapped inner error unrelated to snapshots at all must not match",
+			wrapAsCreateCheckpointErr(errors.New("permission denied")),
+			false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

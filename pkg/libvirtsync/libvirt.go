@@ -19,6 +19,7 @@ package libvirtsync
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
@@ -1342,6 +1343,16 @@ func ExternalSnapshotCount(dom *libvirt.Domain) (int, error) {
 // case -- unlike StopBackup just below, which has a structured alternative
 // available and uses that instead.
 //
+// Unwraps err fully before checking it: err is CreateCheckpoint's own
+// returned error, which always wraps the real libvirt failure behind a
+// "create checkpoint %s: %w" prefix (see CreateCheckpoint) -- so err.Error()
+// itself always contains "checkpoint" regardless of what actually failed,
+// which would silently defeat the whole point of requiring both terms
+// below. Checking the innermost, fully-unwrapped error instead means
+// "checkpoint" only matches when libvirt's own message is genuinely about
+// checkpoints, restoring the real disambiguation this function is supposed
+// to provide at its only real call site.
+//
 // Requires both "checkpoint" and "external snapshot" to appear, rather than
 // just the single generic word "snapshot" (this function's own previous
 // implementation) -- libvirt/qemu use that word pervasively for entirely
@@ -1358,6 +1369,13 @@ func ExternalSnapshotCount(dom *libvirt.Domain) (int, error) {
 func IsCheckpointBlockedBySnapshot(err error) bool {
 	if err == nil {
 		return false
+	}
+	for {
+		unwrapped := errors.Unwrap(err)
+		if unwrapped == nil {
+			break
+		}
+		err = unwrapped
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "checkpoint") && strings.Contains(msg, "external snapshot")
