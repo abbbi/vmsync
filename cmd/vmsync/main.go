@@ -1053,11 +1053,12 @@ func run(cfg struct {
 	// rather than calling StopBackup unconditionally: whichever of the two
 	// closures flips backupActive false first is the one that actually
 	// calls it and logs about it, and the other -- seeing it already false
-	// -- skips both. StopBackup's own GetJobInfo-based idempotency would
-	// have made a redundant second call harmless regardless, but this
-	// avoids the redundant call (and the confusing "stopping libvirt
-	// backup job" log line that would come with it) entirely, instead of
-	// relying on that as the only safety net. The checkpoint deletion below
+	// -- skips both. StopBackup's own job-stats-based check would have
+	// made a redundant second call a harmless no-op regardless (when no
+	// job or the same backup job is still running), but this avoids the
+	// redundant call (and the confusing "stopping libvirt backup job" log
+	// line that would come with it) entirely, instead of relying on that
+	// as the only safety net. The checkpoint deletion below
 	// is unconditional either way -- it's this closure's own, unique
 	// responsibility, regardless of which closure happened to stop the job.
 	cleanupVerifyWindow := func(trigger string) {
@@ -1859,7 +1860,7 @@ func run(cfg struct {
 	// orphaning a running backup job and its exposed NBD export with
 	// nothing left to ever stop it -- indefinitely, and blocking any
 	// future backup/checkpoint attempt against this domain until an
-	// operator intervenes by hand. StopBackup's own GetJobInfo-based check
+	// operator intervenes by hand. StopBackup's own job-stats-based check
 	// already makes it a safe, harmless no-op when the job never actually
 	// started, so there's no real cost to arming this pessimistically
 	// before knowing whether the call will even succeed.
