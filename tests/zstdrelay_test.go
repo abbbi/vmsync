@@ -581,6 +581,85 @@ func TestCopyFlushing(t *testing.T) {
 	})
 }
 
+// TestEncoderDecoderRoundTripMultiFrame closes the one gap neither
+// TestEncoderDecoderRoundTrip above nor TestRelayCompressRoundTrip below
+// actually cover: a stream with more than one internal Flush boundary
+// before Close. TestEncoderDecoderRoundTrip never calls Flush at all
+// (single Write then Close), and TestRelayCompressRoundTrip's payload
+// (9200 bytes) is smaller than CopyFlushing's own 32KB read buffer, so
+// despite going through the real CopyFlushing path it's still read and
+// flushed in exactly one pass -- effectively single-frame either way. In
+// production, CopyFlushing (what Relay actually uses) flushes after every
+// nonzero Read from its source, and any real sync moves far more than
+// 32KB, so a real compressed stream always has many such boundaries
+// before the encoder is finally closed once at the very end -- the one
+// shape nothing before this test ever produced or decoded.
+//
+// Drives a real encoder through CopyFlushing against chunkReader (already
+// used by TestCopyFlushing above, against a fake writer -- reused here
+// against a real one) to force 20 separate Write+Flush cycles, then
+// confirms the decoder reconstructs the exact original content across
+// however many internal boundaries that produced.
+func TestEncoderDecoderRoundTripMultiFrame(t *testing.T) {
+	cases := []struct {
+		name  string
+		algo  zstdrelay.Algo
+		level string
+	}{
+		{"zstd", zstdrelay.AlgoZstd, "3"},
+		{"s2", zstdrelay.AlgoS2, "better"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// Each chunk is uniform but distinct from its neighbors (all
+			// bytes = i), so a chunk landing out of order, dropped, or
+			// corrupted at a frame boundary shows up unmistakably rather
+			// than blending into its neighbors.
+			const chunkCount = 20
+			const chunkSize = 500
+			chunks := make([][]byte, chunkCount)
+			var want []byte
+			for i := range chunks {
+				chunks[i] = bytes.Repeat([]byte{byte(i)}, chunkSize)
+				want = append(want, chunks[i]...)
+			}
+			src := &chunkReader{chunks: chunks}
+
+			var compressed bytes.Buffer
+			enc, err := zstdrelay.NewEncoder(tc.algo, &compressed, tc.level)
+			if err != nil {
+				t.Fatalf("NewEncoder(%s): %v", tc.name, err)
+			}
+			written, err := zstdrelay.CopyFlushing(enc, src)
+			if err != nil {
+				t.Fatalf("CopyFlushing: %v", err)
+			}
+			if written != int64(len(want)) {
+				t.Fatalf("CopyFlushing reported written=%d, want %d", written, len(want))
+			}
+			if err := enc.Close(); err != nil {
+				t.Fatalf("encoder Close: %v", err)
+			}
+
+			dec, closeDec, err := zstdrelay.NewDecoder(tc.algo, bytes.NewReader(compressed.Bytes()))
+			if err != nil {
+				t.Fatalf("NewDecoder(%s): %v", tc.name, err)
+			}
+			defer closeDec()
+
+			decoded, err := io.ReadAll(dec)
+			if err != nil {
+				t.Fatalf("decoder ReadAll: %v", err)
+			}
+			if !bytes.Equal(decoded, want) {
+				t.Fatalf("multi-frame round trip mismatch for %s: got %d bytes, want %d bytes", tc.name, len(decoded), len(want))
+			}
+		})
+	}
+}
+
 // TestRelayCompressRoundTrip sends a known payload through Relay with
 // compression enabled (no netbuffer stage) into an in-memory buffer standing
 // in for the wire, then feeds that same wire buffer through RelayFromWire,
