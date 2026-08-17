@@ -814,7 +814,10 @@ func run(cfg struct {
 				// indefinitely, with production traffic to it stopped, until
 				// an operator notices and resumes it by hand.
 				trace.Error("resume source vm failed on primary connection", "trigger", trigger, "error", resumeErr)
-				if retryErr := libvirtsync.ResumeDomainViaReconnect(cfg.SourceURI, cfg.SourceDomain); retryErr != nil {
+				retryErr := callWithTimeout("resume source vm via reconnect", 5*time.Second, func() error {
+					return libvirtsync.ResumeDomainViaReconnect(cfg.SourceURI, cfg.SourceDomain)
+				})
+				if retryErr != nil {
 					trace.Error("resume source vm retry via reconnect also failed", "trigger", trigger, "error", retryErr)
 				} else {
 					trace.Info("verify: resumed source VM via reconnect", "trigger", trigger, "vm", cfg.SourceDomain)
@@ -854,7 +857,10 @@ func run(cfg struct {
 				})
 				if stopErr != nil {
 					trace.Error("stop backup job failed on primary connection", "trigger", trigger, "error", stopErr)
-					if retryErr := libvirtsync.StopBackupViaReconnect(cfg.SourceURI, cfg.SourceDomain); retryErr != nil {
+					retryErr := callWithTimeout("stop backup job via reconnect", 5*time.Second, func() error {
+						return libvirtsync.StopBackupViaReconnect(cfg.SourceURI, cfg.SourceDomain)
+					})
+					if retryErr != nil {
 						trace.Error("stop backup retry via reconnect also failed", "trigger", trigger, "error", retryErr)
 					}
 				}
@@ -921,7 +927,10 @@ func run(cfg struct {
 			})
 			if delErr != nil {
 				trace.Error("failed to delete verify-window checkpoint on primary connection", "trigger", trigger, "error", delErr)
-				if retryErr := libvirtsync.DeleteCheckpointViaReconnect(cfg.SourceURI, cfg.SourceDomain, libvirtsync.VerifyWindowCheckpointName); retryErr != nil {
+				retryErr := callWithTimeout("delete verify-window checkpoint via reconnect", 5*time.Second, func() error {
+					return libvirtsync.DeleteCheckpointViaReconnect(cfg.SourceURI, cfg.SourceDomain, libvirtsync.VerifyWindowCheckpointName)
+				})
+				if retryErr != nil {
 					trace.Error("failed to delete verify-window checkpoint via reconnect", "trigger", trigger, "error", retryErr)
 				}
 			}
@@ -1067,7 +1076,10 @@ func run(cfg struct {
 				return libvirtsync.DeleteCheckpointIfExists(srcDom, name)
 			}); err != nil {
 				trace.Error("failed to delete checkpoint", "trigger", trigger, "checkpoint", name, "error", err)
-				if retryErr := libvirtsync.DeleteCheckpointViaReconnect(cfg.SourceURI, cfg.SourceDomain, name); retryErr != nil {
+				retryErr := callWithTimeout("delete checkpoint via reconnect", 5*time.Second, func() error {
+					return libvirtsync.DeleteCheckpointViaReconnect(cfg.SourceURI, cfg.SourceDomain, name)
+				})
+				if retryErr != nil {
 					trace.Error("failed to delete checkpoint via reconnect", "trigger", trigger, "checkpoint", name, "error", retryErr)
 				} else {
 					trace.Info("removed checkpoint via reconnect path", "trigger", trigger, "checkpoint", name)
@@ -1087,6 +1099,25 @@ func run(cfg struct {
 		select {
 		case sig := <-sigCh:
 			trace.Info("received signal", "signal", sig.String())
+			// A second signal arriving while the cleanup below is still
+			// running (each of its reconnect fallbacks is now bounded, but
+			// "bounded" still means up to ~10s each, run in parallel below
+			// -- not instant) used to be silently swallowed: this goroutine
+			// had already left its own select on sigCh and gone on to run
+			// cleanup inline, never coming back to read sigCh again, so an
+			// operator's second Ctrl+C/SIGTERM -- a completely reasonable
+			// reaction to a process that looks stuck -- did nothing at all,
+			// leaving kill -9 from another terminal as the only way to
+			// actually force an exit (skipping this cleanup entirely,
+			// instead of just skipping the wait for it). This watcher gives
+			// a second signal real effect: an immediate, unconditional
+			// exit, same as a determined operator would reach for anyway.
+			go func() {
+				if sig2, ok := <-sigCh; ok {
+					trace.Warning("received second signal during cleanup, forcing immediate exit without waiting for it to finish", "signal", sig2.String())
+					os.Exit(1)
+				}
+			}()
 			// These touch independent connections (source libvirt, target
 			// SSH) with no dependency on each other, so run them
 			// concurrently -- worst-case wait is the slowest ONE of them,
