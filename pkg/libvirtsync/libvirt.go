@@ -230,10 +230,44 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 		defer d.Free()
 		// Captured before undefining -- see rollback below. Failing to even
 		// read it is treated as fatal rather than undefining a domain with
-		// no way back to its current definition.
-		originalXML, err = d.GetXMLDesc(0)
+		// no way back to its current definition. DOMAIN_XML_INACTIVE
+		// explicitly requests the persistent, offline definition rather
+		// than whatever the live domain would report if it happened to be
+		// running at this exact moment (see the state re-check just
+		// below) -- flags=0 returns the LIVE definition in that case,
+		// which can include ephemeral runtime-only elements (actual PCI
+		// addresses assigned at boot, live CPU/NUMA pinning) that don't
+		// belong in, and may not even be valid as, the persistent
+		// definition rollback would later try to restore via
+		// DomainDefineXML.
+		originalXML, err = d.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
 		if err != nil {
 			return fmt.Errorf("read existing target domain %s xml before undefine: %w", targetDomainName, err)
+		}
+		// Re-checked here, immediately before undefining, rather than
+		// trusting an EARLIER check made by DefineDomain's own caller (in
+		// cmd/vmsync/main.go, run() checks the target is shut off once,
+		// near the very start): DefineDomain runs at the very end of a
+		// sync, potentially hours later for a large disk, and nothing
+		// stops an operator or another tool from starting the target in
+		// the meantime. Undefining -- then this function's own redefine
+		// further down replacing -- a domain's persistent definition while
+		// qemu still has it running is exactly the same hazard
+		// refuseReinitIfTargetRunning (cmd/vmsync/main.go) exists to
+		// prevent for -reinit's own disk-file removal. Checked after
+		// capturing originalXML above (that capture is valid regardless of
+		// the domain's run state) and as close as possible to the actual
+		// UndefineFlags call below, to keep the unavoidable TOCTOU window
+		// between this check and that call as small as it can be. Nothing
+		// has been undefined yet at this point, so a plain error return
+		// here needs no rollback -- the domain's existing definition is
+		// still completely untouched.
+		active, err := DomainActive(d)
+		if err != nil {
+			return fmt.Errorf("check target domain %s state before undefine: %w", targetDomainName, err)
+		}
+		if active {
+			return fmt.Errorf("target domain %s is running, refusing to undefine/redefine its persistent definition while active -- shut it down before syncing", targetDomainName)
 		}
 		// KEEP_NVRAM: vmsync never copies or manages a domain's NVRAM/
 		// varstore file itself (see DetectNvram -- it only checks the file
