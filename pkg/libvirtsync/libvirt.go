@@ -147,6 +147,29 @@ func DeleteCheckpointViaReconnect(sourceURI, domainName, checkpointName string) 
 	return DeleteCheckpointIfExists(dom, checkpointName)
 }
 
+// ResumeDomainViaReconnect is the resume-source-VM counterpart to
+// StopBackupViaReconnect/DeleteCheckpointViaReconnect above, for exactly the
+// same reason: a primary-connection failure (a wedged/stale connection
+// after a long-running sync, a transient network blip) must not be the
+// difference between a suspended-for-verify production source resuming or
+// staying paused indefinitely -- of everything the interrupt-cleanup path
+// touches, a paused production source is the single most availability-
+// critical thing left unresumed, more so than a leftover backup job or
+// checkpoint.
+func ResumeDomainViaReconnect(sourceURI, domainName string) error {
+	mgr, err := Connect(sourceURI)
+	if err != nil {
+		return fmt.Errorf("reconnect source libvirt: %w", err)
+	}
+	defer mgr.Close()
+	dom, err := mgr.LookupDomain(domainName)
+	if err != nil {
+		return fmt.Errorf("lookup domain %s on reconnect: %w", domainName, err)
+	}
+	defer dom.Free()
+	return dom.Resume()
+}
+
 func (m *Manager) Close() error {
 	if m == nil || m.Conn == nil {
 		return nil

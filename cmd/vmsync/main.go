@@ -804,7 +804,21 @@ func run(cfg struct {
 				return srcDom.Resume()
 			})
 			if resumeErr != nil {
-				trace.Error("failed to resume source VM after -verify", "trigger", trigger, "error", resumeErr)
+				// Unlike abortBackup/cleanupVerifyWindow/the checkpoint
+				// cleanup, this used to have no reconnect fallback at all --
+				// despite being the most availability-critical of the four:
+				// a leftover backup job or checkpoint is an annoyance the
+				// next run can clean up or route around, but a source stuck
+				// paused (because the primary connection happened to be
+				// wedged/stale at exactly the wrong moment) stays paused
+				// indefinitely, with production traffic to it stopped, until
+				// an operator notices and resumes it by hand.
+				trace.Error("resume source vm failed on primary connection", "trigger", trigger, "error", resumeErr)
+				if retryErr := libvirtsync.ResumeDomainViaReconnect(cfg.SourceURI, cfg.SourceDomain); retryErr != nil {
+					trace.Error("resume source vm retry via reconnect also failed", "trigger", trigger, "error", retryErr)
+				} else {
+					trace.Info("verify: resumed source VM via reconnect", "trigger", trigger, "vm", cfg.SourceDomain)
+				}
 			} else {
 				trace.Info("verify: resumed source VM", "trigger", trigger, "vm", cfg.SourceDomain)
 			}
