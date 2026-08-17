@@ -278,6 +278,111 @@ func TestBoundedBuffer(t *testing.T) {
 		}
 	})
 
+	t.Run("a chunk read via several smaller reads is returned in order, one piece at a time", func(t *testing.T) {
+		b := zstdrelay.NewBoundedBuffer(16)
+		data := []byte("hello world") // 11 bytes, enqueued as a single chunk
+
+		if _, err := b.Write(data); err != nil {
+			t.Fatalf("Write returned error: %v", err)
+		}
+
+		// Read it back 3 bytes at a time -- deliberately smaller than the
+		// enqueued chunk, so the first Read can only satisfy part of it.
+		// Read's own doc comment says the remainder gets put back at the
+		// front of the queue (b.chunks[0] = chunk[n:]) rather than being
+		// dropped or the whole chunk being reported consumed regardless of
+		// how much of it the caller's buffer could actually hold -- nothing
+		// before this test ever called Read with a buffer smaller than a
+		// pending chunk, so that specific line was never exercised.
+		var got []byte
+		reads := 0
+		out := make([]byte, 3)
+		for len(got) < len(data) {
+			err, returned := runWithDeadline(t, 5*time.Second, func() error {
+				var rerr error
+				var n int
+				n, rerr = b.Read(out)
+				got = append(got, out[:n]...)
+				return rerr
+			})
+			if !returned {
+				t.Fatalf("Read blocked instead of returning the chunk's remaining bytes (got %d/%d so far)", len(got), len(data))
+			}
+			if err != nil {
+				t.Fatalf("Read returned error: %v", err)
+			}
+			reads++
+			if reads > len(data) {
+				t.Fatalf("Read called %d times without ever draining %d bytes -- possible infinite loop from a Read that returns 0 bytes and no error", reads, len(data))
+			}
+		}
+		if reads < 2 {
+			t.Fatalf("drained the chunk in %d read(s) with a 3-byte buffer against an 11-byte chunk -- this test isn't actually exercising the partial-read path", reads)
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("reassembled partial reads = %q, want %q", got, data)
+		}
+	})
+
+	t.Run("a single Write larger than capacity is split across multiple chunks and drained correctly by a concurrent reader", func(t *testing.T) {
+		b := zstdrelay.NewBoundedBuffer(8)
+		data := make([]byte, 30) // well over 3x maxBytes
+		for i := range data {
+			data[i] = byte(i)
+		}
+
+		// This single Write call cannot complete on its own: after its
+		// first bounded sub-write fills the buffer (see Write's own doc
+		// comment on splitting one call into several bounded sub-writes),
+		// it blocks until a reader drains enough room for the next
+		// sub-write, and so on -- exercising the "overflow" half of this
+		// test's own name: what happens when one Write call's payload
+		// doesn't fit in a single pass, not just when it doesn't fit in
+		// the buffer at all (already covered by the blocks-until-read test
+		// above, using data no larger than maxBytes itself).
+		writeErrCh := make(chan error, 1)
+		go func() {
+			_, err := b.Write(data)
+			writeErrCh <- err
+		}()
+
+		var got []byte
+		out := make([]byte, 5) // another size that doesn't evenly divide maxBytes or len(data)
+		readErrCh := make(chan error, 1)
+		go func() {
+			for len(got) < len(data) {
+				n, err := b.Read(out)
+				got = append(got, out[:n]...)
+				if err != nil {
+					readErrCh <- err
+					return
+				}
+			}
+			readErrCh <- nil
+		}()
+
+		select {
+		case err := <-writeErrCh:
+			if err != nil {
+				t.Fatalf("Write returned error: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Write of data far exceeding capacity did not complete within 5s of a reader draining it -- possible regression in the blocking/wakeup logic for a multi-chunk Write")
+		}
+		select {
+		case err := <-readErrCh:
+			if err != nil {
+				t.Fatalf("reader goroutine returned error: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("reader goroutine did not finish draining within 5s of Write completing")
+		}
+
+		if !bytes.Equal(got, data) {
+			t.Fatalf("data received across a multi-chunk overflowing Write does not match what was sent (len got=%d, want=%d)", len(got), len(data))
+		}
+	})
+
 	t.Run("write after close returns ErrClosedPipe", func(t *testing.T) {
 		b := zstdrelay.NewBoundedBuffer(8)
 		if err := b.Close(); err != nil {
