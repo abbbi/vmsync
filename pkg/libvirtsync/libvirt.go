@@ -1147,9 +1147,9 @@ func CreateCheckpoint(dom *libvirt.Domain, checkpointName, parent string, diskTa
 // wrote to during its compare window -- see VerifyWindowCheckpointName.
 // Standalone (parent=""): it has no lineage relationship to the regular
 // vmsync-cpt-NNNNNN chain, and since nothing ever nominates it as another
-// checkpoint's parent, it can never have children either -- so
-// DeleteCheckpointIfExists's "children must be deleted before their parent"
-// constraint never applies to it; it's always safe to delete on its own.
+// checkpoint's parent, it can never have children either -- not that this
+// matters for deletion order anyway (see checkpointDeletionOrder's own doc
+// comment): it's always safe to delete on its own regardless.
 func CreateVerifyWindowCheckpoint(dom *libvirt.Domain, diskTargets []disk.QcowDisk) error {
 	return CreateCheckpoint(dom, VerifyWindowCheckpointName, "", diskTargets)
 }
@@ -1271,17 +1271,29 @@ func DeleteAllManagedCheckpoints(dom *libvirt.Domain) error {
 }
 
 // checkpointDeletionOrder returns existing's checkpoint names in the order
-// DeleteAllManagedCheckpoints must delete them: newest-first. A checkpoint
-// with children still attached to it cannot be deleted (its bitmap can
-// only be merged into a child on delete, never discarded while a child
-// still references it), so children must always go before their parent --
-// and since ListManagedCheckpoints sorts its result oldest-first, that's
-// simply the reverse of what it returns. Kept as a standalone, pure
-// function (taking and returning plain data, not a live domain handle)
-// specifically so this exact ordering is directly testable: reversing it
-// by mistake would permanently wedge the one recovery path -reinit
-// provides for a broken checkpoint chain, since every deletion after the
-// first would then fail against a checkpoint that still has a child.
+// DeleteAllManagedCheckpoints deletes them: newest-first (the reverse of
+// ListManagedCheckpoints' own oldest-first result).
+//
+// This is NOT because a checkpoint with children refuses to delete --
+// unlike a disk *snapshot* (where a child depends on its parent as a
+// backing file, so the parent can't go away until that data is committed
+// forward into the child), virDomainCheckpointDelete's own documented
+// behavior is the opposite direction and has no such restriction at all:
+// deleting a checkpoint merges the dirty-tracking region it owns into its
+// OWN PARENT (not a child), and succeeds unconditionally regardless of
+// whether the checkpoint being deleted has children -- an earlier version
+// of this comment had the mechanism and the restriction both backwards,
+// describing snapshot semantics instead of checkpoint semantics.
+//
+// Newest-first is kept anyway, not because it's required by the documented
+// behavior above, but because it costs nothing here: DeleteAllManagedCheckpoints
+// discards the entire chain regardless of order (this is -reinit's full
+// recovery path, not selective pruning), so there's no reason to depend on
+// every targeted libvirt/QEMU version continuing to allow arbitrary-order
+// bulk deletion identically, when deleting leaf-to-root is unconditionally
+// safe on every version instead. Kept as a standalone, pure function
+// (taking and returning plain data, not a live domain handle) so this
+// ordering choice stays directly testable regardless of why it's made.
 func checkpointDeletionOrder(existing []Checkpoint) []string {
 	order := make([]string, len(existing))
 	for i, c := range existing {

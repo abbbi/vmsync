@@ -939,12 +939,14 @@ func TestNextCheckpointName(t *testing.T) {
 	})
 }
 
-// TestCheckpointDeletionOrder covers the invariant DeleteAllManagedCheckpoints
-// depends on but never itself exercised without a live domain: a checkpoint
-// with children attached can't be deleted, so deletion order must be
-// newest-first -- the reverse of ListManagedCheckpoints' own oldest-first
-// contract. Reversing this by mistake would permanently wedge -reinit's one
-// recovery path for a broken checkpoint chain.
+// TestCheckpointDeletionOrder covers the ordering DeleteAllManagedCheckpoints
+// depends on but never itself exercises without a live domain: newest-first,
+// the reverse of ListManagedCheckpoints' own oldest-first contract -- see
+// checkpointDeletionOrder's own doc comment for why this is kept even though
+// it isn't required by virDomainCheckpointDelete's documented behavior.
+// Reversing this by mistake would still be worth catching even so: it costs
+// nothing to keep deleting leaf-to-root, and this test is what would notice
+// if that ordering ever silently flipped.
 func TestCheckpointDeletionOrder(t *testing.T) {
 	t.Run("empty input produces no deletions", func(t *testing.T) {
 		got := checkpointDeletionOrder(nil)
@@ -970,7 +972,7 @@ func TestCheckpointDeletionOrder(t *testing.T) {
 		got := checkpointDeletionOrder(existing)
 		want := []string{"vmsync-cpt-000003", "vmsync-cpt-000002", "vmsync-cpt-000001"}
 		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("checkpointDeletionOrder() = %v, want %v (newest-first, so children are always deleted before their parent)", got, want)
+			t.Fatalf("checkpointDeletionOrder() = %v, want %v (newest-first, leaf-to-root)", got, want)
 		}
 	})
 }
