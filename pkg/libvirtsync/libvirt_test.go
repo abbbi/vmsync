@@ -202,6 +202,58 @@ func TestBuildPullBackupXML(t *testing.T) {
 	})
 }
 
+func TestIsUUIDCollisionError(t *testing.T) {
+	const uuid = "84b40009-eb1f-4bc5-94ac-b9bbc12c4b3f"
+	domainXML := minimalDomainXML("testvm", uuid, "/var/lib/libvirt/images/x.qcow2")
+
+	cases := []struct {
+		name      string
+		err       error
+		domainXML string
+		want      bool
+	}{
+		{"nil error", nil, domainXML, false},
+		{"not a libvirt.Error at all", errors.New("domain already defined with uuid " + uuid), domainXML, false},
+		{
+			"correct code, english message containing the uuid",
+			libvirt.Error{Code: libvirt.ERR_OPERATION_FAILED, Message: "domain 'testvm' is already defined with uuid " + uuid},
+			domainXML, true,
+		},
+		{
+			// The exact regression this function exists to fix: a
+			// French-locale libvirtd reporting this same condition in
+			// French, which the old English-substring match could never
+			// recognize regardless of wrapping.
+			"correct code, french message containing the uuid",
+			libvirt.Error{Code: libvirt.ERR_OPERATION_FAILED, Message: "opération échouée : Le domaine 'testvm' est déjà défini avec l'uuid " + uuid},
+			domainXML, true,
+		},
+		{
+			"correct code but message references a different uuid entirely",
+			libvirt.Error{Code: libvirt.ERR_OPERATION_FAILED, Message: "domain 'testvm' is already defined with uuid 00000000-0000-0000-0000-000000000000"},
+			domainXML, false,
+		},
+		{
+			"uuid present but wrong error code -- not specific enough on its own",
+			libvirt.Error{Code: libvirt.ERR_OPERATION_INVALID, Message: "domain 'testvm' is already defined with uuid " + uuid},
+			domainXML, false,
+		},
+		{
+			"malformed domainXML has no uuid to check against",
+			libvirt.Error{Code: libvirt.ERR_OPERATION_FAILED, Message: "domain 'testvm' is already defined with uuid " + uuid},
+			"not xml at all",
+			false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isUUIDCollisionError(tc.err, tc.domainXML); got != tc.want {
+				t.Errorf("isUUIDCollisionError(%v, ...) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIsCheckpointBlockedBySnapshot(t *testing.T) {
 	// CreateCheckpoint's real, exact wrapping shape ("create checkpoint %s:
 	// %w") -- used below to build the same shape of error this function

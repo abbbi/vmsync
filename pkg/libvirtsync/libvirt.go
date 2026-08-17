@@ -199,6 +199,38 @@ func DomainExists(conn *libvirt.Connect, name string) (bool, error) {
 	return true, nil
 }
 
+// isUUIDCollisionError reports whether err is libvirt's specific rejection
+// of a DomainDefineXML call because another domain already registered on
+// the same host uses domainXML's own UUID: virDomainObjListAddLocked (see
+// libvirt's own src/conf/virdomainobjlist.c) reports this as
+// VIR_ERR_OPERATION_FAILED with the message "domain '%s' is already defined
+// with uuid %s" -- confirmed directly against libvirt's current source
+// rather than guessed.
+//
+// Checked via the error's structured Code plus domainXML's own UUID
+// appearing in the message, rather than matching the English phrase
+// "already defined with uuid": libvirt's error messages are translated via
+// gettext based on the process's own locale (LC_ALL/LANG/LANGUAGE), so a
+// plain English substring match silently never fires on a non-English
+// system -- observed directly against a French-locale libvirtd, where this
+// exact error read "... est déjà défini avec l'uuid ...". Code alone isn't
+// specific enough on its own (VIR_ERR_OPERATION_FAILED is used broadly
+// across libvirt for unrelated failures too), but combined with the UUID
+// itself -- never translated, since it's substituted data, not prose --
+// genuinely pins this down to the same specific condition regardless of
+// locale.
+func isUUIDCollisionError(err error, domainXML string) bool {
+	lvErr, ok := err.(libvirt.Error)
+	if !ok || lvErr.Code != libvirt.ERR_OPERATION_FAILED {
+		return false
+	}
+	domcfg := &libvirtxml.Domain{}
+	if unmarshalErr := domcfg.Unmarshal(domainXML); unmarshalErr != nil || domcfg.UUID == "" {
+		return false
+	}
+	return strings.Contains(strings.ToLower(lvErr.Message), strings.ToLower(domcfg.UUID))
+}
+
 // DefineDomain (re)defines targetDomainName on target from sourceDomainXML.
 // rootSourceByLiveSource maps each disk's live source path to its resolved
 // backing-chain root file (see disk.QcowDisk.RootSource) -- passed straight
@@ -318,7 +350,7 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 	dom, err := target.Conn.DomainDefineXML(updatedXML)
 	if err != nil {
 		// Fallback for cloning into same target where another domain already uses the UUID.
-		if strings.Contains(strings.ToLower(err.Error()), "already defined with uuid") {
+		if isUUIDCollisionError(err, updatedXML) {
 			// Logged as a Warning, not Info: this isn't a routine step --
 			// it means something ELSE on the target host currently claims
 			// the source's own UUID, and the consequence is significant
