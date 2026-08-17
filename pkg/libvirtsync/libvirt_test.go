@@ -47,6 +47,105 @@ func minimalDomainXML(name, uuid, sourcePath string) string {
 </domain>`
 }
 
+// richDomainXML builds a far more feature-rich domain definition than
+// minimalDomainXML: multiple disks (one with its own backingStore, one
+// plain, plus a cdrom that must be correctly ignored), a network
+// interface, a hostdev PCI passthrough device, a TPM, a qemu:commandline
+// block, graphics/video/controller devices, CPU/features/clock elements,
+// a UEFI loader/nvram pair, and a pre-existing non-vmsync metadata entry
+// from some other tool. minimalDomainXML is deliberately the smallest
+// thing that satisfies util.IgnoreDevice and exercises each function's
+// own logic -- exactly why it can never catch the risk
+// warnIfXMLElementsDropped's own doc comment describes: replaceDomainName,
+// replaceDomainDiskPath, and SetMetadataFields all round-trip through
+// libvirtxml.Domain's typed struct (unmarshal, mutate, marshal), and any
+// element that struct doesn't model would be silently dropped with
+// nothing in minimalDomainXML-based tests ever able to notice, since
+// there'd be nothing there to lose in the first place. This fixture gives
+// the round-trip something real to actually lose.
+func richDomainXML(name, uuid, disk1Path, disk2Path string) string {
+	return `<domain type="kvm" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
+  <name>` + name + `</name>
+  <uuid>` + uuid + `</uuid>
+  <memory unit="KiB">4194304</memory>
+  <currentMemory unit="KiB">4194304</currentMemory>
+  <vcpu placement="static">4</vcpu>
+  <os>
+    <type arch="x86_64" machine="pc-q35-6.2">hvm</type>
+    <loader readonly="yes" type="pflash">/usr/share/OVMF/OVMF_CODE.fd</loader>
+    <nvram>/var/lib/libvirt/qemu/nvram/testvm_VARS.fd</nvram>
+    <boot dev="hd"/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <vmport state="off"/>
+  </features>
+  <cpu mode="host-passthrough" check="none" migratable="on"/>
+  <clock offset="utc">
+    <timer name="rtc" tickpolicy="catchup"/>
+    <timer name="pit" tickpolicy="delay"/>
+    <timer name="hpet" present="no"/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2" discard="unmap"/>
+      <source file="` + disk1Path + `"/>
+      <backingStore type="file" index="1">
+        <format type="qcow2"/>
+        <source file="/var/lib/libvirt/images/base.qcow2"/>
+        <backingStore/>
+      </backingStore>
+      <target dev="vda" bus="virtio"/>
+      <address type="pci" domain="0x0000" bus="0x04" slot="0x00" function="0x0"/>
+    </disk>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2"/>
+      <source file="` + disk2Path + `"/>
+      <target dev="vdb" bus="virtio"/>
+    </disk>
+    <disk type="file" device="cdrom">
+      <driver name="qemu" type="raw"/>
+      <target dev="sda" bus="sata"/>
+      <readonly/>
+    </disk>
+    <controller type="usb" index="0" model="qemu-xhci"/>
+    <controller type="pci" index="0" model="pcie-root"/>
+    <interface type="network">
+      <mac address="52:54:00:12:34:56"/>
+      <source network="default"/>
+      <model type="virtio"/>
+    </interface>
+    <hostdev mode="subsystem" type="pci" managed="yes">
+      <source>
+        <address domain="0x0000" bus="0x01" slot="0x00" function="0x0"/>
+      </source>
+    </hostdev>
+    <tpm model="tpm-crb">
+      <backend type="emulator" version="2.0"/>
+    </tpm>
+    <graphics type="vnc" port="-1" autoport="yes" listen="0.0.0.0"/>
+    <video>
+      <model type="virtio" heads="1" primary="yes"/>
+    </video>
+    <memballoon model="virtio"/>
+  </devices>
+  <qemu:commandline>
+    <qemu:arg value="-machine"/>
+    <qemu:arg value="kernel_irqchip=on"/>
+  </qemu:commandline>
+  <metadata>
+    <someother:tool xmlns:someother="http://example.org/someother/1.0">
+      <someother:field>keep-me</someother:field>
+    </someother:tool>
+  </metadata>
+</domain>`
+}
+
 func TestBuildPullBackupXML(t *testing.T) {
 	disks := []disk.QcowDisk{{TargetDev: "vda"}, {TargetDev: "vdb"}}
 
@@ -889,4 +988,79 @@ func TestMissingXMLElements(t *testing.T) {
 			}
 		}
 	})
+}
+
+// The three tests below drive replaceDomainName/replaceDomainDiskPath/
+// SetMetadataFields against richDomainXML instead of minimalDomainXML --
+// see richDomainXML's own doc comment for why minimalDomainXML can never
+// exercise the exact risk warnIfXMLElementsDropped exists to catch. Each
+// uses missingXMLElements itself (already independently tested above) as
+// the oracle: rather than hand-asserting that some specific element like
+// <hostdev> or <qemu:commandline> individually survives -- which would
+// just be re-implementing a worse version of that same check -- these
+// assert on its actual verdict for a real function run against a real,
+// complex fixture. If libvirtxml's vendored version genuinely fails to
+// round-trip something these fixtures include, these tests will fail and
+// name exactly what -- which is the point: that's a real, previously
+// invisible configuration-loss bug minimalDomainXML-based tests could
+// never have surfaced, not a false alarm to silence.
+
+func TestReplaceDomainNamePreservesRichConfiguration(t *testing.T) {
+	xmlStr := richDomainXML("sourcevm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/vda.qcow2", "/var/lib/libvirt/images/vdb.qcow2")
+	out, err := replaceDomainName(xmlStr, "targetvm")
+	if err != nil {
+		t.Fatalf("replaceDomainName() error = %v", err)
+	}
+	if !strings.Contains(out, "<name>targetvm</name>") {
+		t.Errorf("expected new name in output, got: %s", out)
+	}
+	if missing := missingXMLElements(xmlStr, out); len(missing) != 0 {
+		t.Errorf("replaceDomainName() against a feature-rich domain dropped element(s) %v -- the unmarshal/marshal round trip lost real configuration; full output: %s", missing, out)
+	}
+}
+
+func TestReplaceDomainDiskPathPreservesRichConfiguration(t *testing.T) {
+	xmlStr := richDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/vda.qcow2", "/var/lib/libvirt/images/vdb.qcow2")
+	out, err := replaceDomainDiskPath(xmlStr, "/mnt/target", nil)
+	if err != nil {
+		t.Fatalf("replaceDomainDiskPath() error = %v", err)
+	}
+	if !strings.Contains(out, `file="/mnt/target/vda.qcow2"`) {
+		t.Errorf("expected first disk rewritten to /mnt/target/vda.qcow2, got: %s", out)
+	}
+	if !strings.Contains(out, `file="/mnt/target/vdb.qcow2"`) {
+		t.Errorf("expected second disk rewritten to /mnt/target/vdb.qcow2, got: %s", out)
+	}
+	// backingStore is the ONE element this function deliberately drops (see
+	// its own doc comment) -- everything else in this fixture (hostdev,
+	// tpm, qemu:commandline, network interface, graphics/video/
+	// controllers, the ignored cdrom, CPU/features/clock, UEFI loader/
+	// nvram) must still be there.
+	missing := missingXMLElements(xmlStr, out)
+	want := []string{"backingStore"}
+	if len(missing) != len(want) || (len(missing) > 0 && missing[0] != want[0]) {
+		t.Errorf("replaceDomainDiskPath() against a feature-rich domain = missing %v, want exactly %v -- full output: %s", missing, want, out)
+	}
+}
+
+func TestSetMetadataFieldsPreservesRichConfiguration(t *testing.T) {
+	xmlStr := richDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/vda.qcow2", "/var/lib/libvirt/images/vdb.qcow2")
+	out, err := SetMetadataFields(xmlStr, map[string]string{
+		MetadataFieldLastCheckpoint: "vmsync-cpt-000001",
+	})
+	if err != nil {
+		t.Fatalf("SetMetadataFields() error = %v", err)
+	}
+	if !strings.Contains(out, "vmsync-cpt-000001") {
+		t.Errorf("expected new vmsync metadata field in output, got: %s", out)
+	}
+	if !strings.Contains(out, "keep-me") {
+		t.Errorf("expected pre-existing non-vmsync metadata from another tool to survive untouched, got: %s", out)
+	}
+	// SetMetadataFields never touches disks at all, so unlike
+	// replaceDomainDiskPath's own test above, backingStore should survive
+	// here too -- nothing in this fixture should be lost.
+	if missing := missingXMLElements(xmlStr, out); len(missing) != 0 {
+		t.Errorf("SetMetadataFields() against a feature-rich domain dropped element(s) %v -- the unmarshal/marshal round trip lost real configuration; full output: %s", missing, out)
+	}
 }
