@@ -4,7 +4,7 @@
 # Written in 2026 by Orsiris de Jong <ozy@netpower.fr> for vmsync by Michael Ablassmeier <abi@grinser.de>
 
 
-#SCRIPT_BUILD=2026080801
+#SCRIPT_BUILD=2026081701
 LOG_FILE=/var/log/vmsync_parallel
 TARGET_VM_PATH=/vm_data
 VMSYNC=/usr/local/bin/vmsync
@@ -172,7 +172,7 @@ replicate() {
         fi
         if [ "${NETBUFFER}" != "" ]; then
                 bridging_enabled=true
-                opts="${opts} -netbuffer ${NETBUFFER}"
+                opts="${opts} -netbuffer=${NETBUFFER}"
         fi
         if [ "${REINIT_AFTER_FAILURES}" -gt 0 ]; then
                 opts="${opts} -reinit-after-failures ${REINIT_AFTER_FAILURES}"
