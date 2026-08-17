@@ -1,18 +1,49 @@
 Version 0.30
 -----------
-
- * Implement optional zstd compression for WAN links
- * Implement optional mbuffer for non constant IO over WAN links
+ * Implement a lock mecanism to avoid concurrent runs on the same VM
+ * Implement optional prometheus metrics via -prometheus-textfile
+ * Implement an optional remote bridge helper binary to help with
+ compression/buffering
+ * Implement optional compression for WAN links via -compress=zstd|s2
+ (defaults to s2). Additional -compress-level=default|better|best for s2
+ (defaults to better) and levels 1-19 for zstd can be configured
+ * Implement optional network buffering for non constant IO over WAN links
+ via -netbuffer=<blocksize>,<buffersize> (defaults to 128k,1G)
+ * Implement optional SSH-passthru to deal natively with encryption via
+ -use-ssh
+ * Implement an option to bypass VMs with existing external snapshots
+ with -ignore-external-snapshot
  * #3, #9: Implement --reinit command to start replication from scratch
- * Implement --reinit-after-failures=N to automate restarts from scratch 
- * #10: Fix domains with multiple disks had a race condition on tests
+ * Implement --reinit-after-failures=N to automate restarts from scratch
+ * Implement a verification mode with -verify=compare|fast|online:
+ "compare" uses qemu-img compare implementation and suspends the
+ source VM (if running), "fast" can be used with compression and buffering,
+ and reimplements qemu-img compare functionality. "online" keeps source
+ running and compares everything except the clusters that have been written
+ since last replica.
+ * Cleanup old target vmsync metadata in source libvirt definition when
+  replication is reversed
+ * Fix: Allow to sync suspended domains 
+ * #10: Fix domains with multiple disks had a race condition
  * Fix target disk path changes would only be kept for last disk
  for domains with multiple disks
  * Fix checking for nvram is done before client SSH initialization
  * Fix fetching Libvirt version
  * Fix possible crash if disks / driver section is absent
- * #10: Fix CTRL+C didn't stop nbd server
+ * #10: Fix CTRL+C didn't stop nbd server on target side
+ * Fix sync process would corrupt data when external snapshot exists (sync
+ differential  is now relative to last checkpoint without external snapshot)
+ * Fix SSH connection to target could hang (no timeout)
+ * Fix SSH hanshake would fail with knownhosts: key is unknown
+ unless -ssh-insecure-host-key is used (added ~/.ssh/config parsing) 
+ * Fix possible target paths failure (quote target paths in command calls)
  * Harden checkpoint numbering verification
+ * Misc: Add codespell
+ * Misc: Add basic CI for validation
+ * Misc: Added unit tests for bridge relay, buffering, libvirt calls and prom metrics
+ * Misc: Implement a full real-life test harness that also serves as benchmark tool
+ * Misc: Added a vmsync parallel runner script
+ * Misc: Generally harden execution checks
 
 Version 0.27
 -----------
