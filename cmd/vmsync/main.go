@@ -1541,13 +1541,28 @@ func run(cfg struct {
 		trace.Info("starting full pull backup (no incremental bitmap)")
 	}
 
-	if err := libvirtsync.StartPullBackupTCP(srcDom, incrementalCheckpoint, exportBitmap, cfg.SourceNBDBind, cfg.SourceNBDPort, qcowDisks); err != nil {
-		return err
-	}
+	// backupActive is set -- and the cleanup defer armed -- BEFORE calling
+	// StartPullBackupTCP, not after it returns: libvirt's RPC can already
+	// have created the backup job (and opened its NBD TCP export) on the
+	// server side before the client-side call itself returns to us,
+	// especially over a remote connection where the response can be
+	// delayed or lost in transit after the server already acted on the
+	// request. A signal landing while still blocked inside this call would
+	// otherwise see backupActive still false and skip cleanup entirely,
+	// orphaning a running backup job and its exposed NBD export with
+	// nothing left to ever stop it -- indefinitely, and blocking any
+	// future backup/checkpoint attempt against this domain until an
+	// operator intervenes by hand. StopBackup's own GetJobInfo-based check
+	// already makes it a safe, harmless no-op when the job never actually
+	// started, so there's no real cost to arming this pessimistically
+	// before knowing whether the call will even succeed.
 	backupMu.Lock()
 	backupActive = true
 	backupMu.Unlock()
 	defer abortBackup("cleanup")
+	if err := libvirtsync.StartPullBackupTCP(srcDom, incrementalCheckpoint, exportBitmap, cfg.SourceNBDBind, cfg.SourceNBDPort, qcowDisks); err != nil {
+		return err
+	}
 
 	trace.Info("source nbd port in use", "side", "source", "kind", "nbd_export", "host", nbdHost, "port", cfg.SourceNBDPort)
 
@@ -1632,13 +1647,23 @@ func run(cfg struct {
 		verifyWindowActive = true
 		verifyWindowMu.Unlock()
 
+		// backupActive is set BEFORE calling StartPullBackupTCP for the same
+		// reason as the main backup job's own start above: the RPC can
+		// create the job and open its NBD export server-side before the
+		// client-side call returns, and a signal landing while still
+		// blocked inside it must still see backupActive=true so
+		// cleanupVerifyWindow's own shouldStop check actually attempts to
+		// stop the job, instead of only deleting the verify-window
+		// checkpoint and leaving a real, running backup job (and its NBD
+		// export) orphaned.
+		backupMu.Lock()
+		backupActive = true
+		backupMu.Unlock()
+
 		if err := libvirtsync.StartPullBackupTCP(srcDom, libvirtsync.VerifyWindowCheckpointName, libvirtsync.VerifyWindowCheckpointName, cfg.SourceNBDBind, cfg.SourceNBDPort, qcowDisks); err != nil {
 			cleanupVerifyWindow("verify window setup failed")
 			return verifyWindow{}, fmt.Errorf("start verify-window backup job: %w", err)
 		}
-		backupMu.Lock()
-		backupActive = true
-		backupMu.Unlock()
 
 		return verifyWindow{
 			checkpointName: libvirtsync.VerifyWindowCheckpointName,
