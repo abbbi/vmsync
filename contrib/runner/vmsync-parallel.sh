@@ -165,7 +165,7 @@ replicate() {
         bridging_enabled=false
         if [ "${COMPRESS_ALGO}" == "zstd" ] || [ "${COMPRESS_ALGO}" == "s2" ]; then
                 bridging_enabled=true
-                opts="${opts} --compress=${COMPRESS_ALGO}"
+                opts="${opts} -compress=${COMPRESS_ALGO}"
                 if [ -n "${COMPRESS_LEVEL}" ]; then
                         opts="${opts} -compress-level ${COMPRESS_LEVEL}"
                 fi
