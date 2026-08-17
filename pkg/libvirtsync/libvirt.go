@@ -670,7 +670,13 @@ func RecordReplicaTarget(mgr *Manager, sourceDomainName, targetHost, targetDomai
 
 // ReadTargetFailureCount reconnects to the target and returns the
 // failure_count currently recorded in its domain metadata. Returns 0 (no
-// error) if the target domain doesn't exist yet or has no such field.
+// error) if the target domain genuinely doesn't exist yet (ERR_NO_DOMAIN)
+// or exists but has no such field -- any other lookup error (a transient
+// connection blip, a permissions problem, libvirtd being temporarily
+// unreachable) is a real failure and must not be conflated with "doesn't
+// exist," or -reinit-after-failures's threshold comparison silently sees 0
+// instead of the real count on every call that happens to race a transient
+// error.
 func ReadTargetFailureCount(targetURI, targetDomain string) (int, error) {
 	mgr, err := Connect(targetURI)
 	if err != nil {
@@ -680,7 +686,10 @@ func ReadTargetFailureCount(targetURI, targetDomain string) (int, error) {
 
 	dom, err := mgr.Conn.LookupDomainByName(targetDomain)
 	if err != nil {
-		return 0, nil
+		if lvErr, ok := err.(libvirt.Error); ok && lvErr.Code == libvirt.ERR_NO_DOMAIN {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("look up target domain %s: %w", targetDomain, err)
 	}
 	defer dom.Free()
 
@@ -701,8 +710,13 @@ func ReadTargetFailureCount(targetURI, targetDomain string) (int, error) {
 
 // RecordTargetSyncFailure reconnects to the target, increments
 // failure_count in its domain metadata (leaving the rest of its definition
-// untouched) and returns the new count. A target domain that doesn't exist
-// yet has nothing to record against and is treated as a no-op.
+// untouched) and returns the new count. A target domain that genuinely
+// doesn't exist yet (ERR_NO_DOMAIN) has nothing to record against and is
+// treated as a no-op -- but any other lookup error is a real failure and
+// must be propagated, not swallowed the same way: silently no-op'ing this
+// increment on a transient connection blip means a real, consecutive sync
+// failure never gets counted, which can keep -reinit-after-failures from
+// ever tripping its threshold at all.
 //
 // The run-lock (pkg/util/lock.go) is keyed only by source domain, so it
 // gives this function no protection at all against a concurrent writer of
@@ -725,7 +739,10 @@ func RecordTargetSyncFailure(targetURI, targetDomain string) (int, error) {
 
 	dom, err := mgr.Conn.LookupDomainByName(targetDomain)
 	if err != nil {
-		return 0, nil
+		if lvErr, ok := err.(libvirt.Error); ok && lvErr.Code == libvirt.ERR_NO_DOMAIN {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("look up target domain %s: %w", targetDomain, err)
 	}
 	defer dom.Free()
 
