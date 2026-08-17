@@ -882,6 +882,20 @@ func stripDomainUUID(domainXML string) string {
 	return changed
 }
 
+// ListManagedCheckpoints lists dom's vmsync-managed checkpoints. Callers
+// (NextCheckpointName's chain-parent selection, DeleteAllManagedCheckpoints'
+// -reinit cleanup) act on the assumption that this list is complete -- a
+// silently incomplete one is worse than an error: NextCheckpointName could
+// pick a stale parent or a name that collides with a checkpoint it never
+// saw, and -reinit could leave a real vmsync checkpoint behind while
+// believing it wiped the chain clean. So any lookup failure on an entry
+// this can't positively rule out as one of vmsync's own aborts the whole
+// listing instead of just skipping that entry -- a checkpoint whose name
+// can't even be read might still be one of ours, and one whose name
+// matches the vmsync prefix but whose XML can't be read definitely is.
+// Only a successfully-read name that doesn't match the prefix is a
+// legitimate, silent skip (some other tool's checkpoint on the same
+// domain).
 func ListManagedCheckpoints(dom *libvirt.Domain) ([]Checkpoint, error) {
 	cpts, err := dom.ListAllCheckpoints(0)
 	if err != nil {
@@ -889,33 +903,43 @@ func ListManagedCheckpoints(dom *libvirt.Domain) ([]Checkpoint, error) {
 	}
 
 	var out []Checkpoint
+	var lookupErr error
 	for _, c := range cpts {
 		// ListAllCheckpoints returns every checkpoint on the domain, not
 		// just vmsync's own -- the prefix check below is what filters those
 		// out. Each entry's handle must be freed regardless of which path
 		// is taken, so this runs the per-checkpoint logic in its own
 		// closure with a single defer covering all of them, rather than
-		// needing a Free() call before every continue.
-		cp, ok := func() (Checkpoint, bool) {
+		// needing a Free() call before every continue. The range loop
+		// itself always runs to completion, even once a failure has been
+		// recorded, so every remaining handle still gets freed -- only the
+		// final return value is affected.
+		cp, ok, err := func() (Checkpoint, bool, error) {
 			defer c.Free()
 			name, err := c.GetName()
 			if err != nil {
-				return Checkpoint{}, false
+				return Checkpoint{}, false, fmt.Errorf("get checkpoint name: %w", err)
 			}
 			if !strings.HasPrefix(name, CheckpointPrefix+"-") {
-				return Checkpoint{}, false
+				return Checkpoint{}, false, nil
 			}
 
 			xmlDesc, err := c.GetXMLDesc(0)
 			if err != nil {
-				return Checkpoint{}, false
+				return Checkpoint{}, false, fmt.Errorf("get xml for checkpoint %s: %w", name, err)
 			}
 
-			return parseCheckpointXML(name, xmlDesc), true
+			return parseCheckpointXML(name, xmlDesc), true, nil
 		}()
+		if err != nil && lookupErr == nil {
+			lookupErr = err
+		}
 		if ok {
 			out = append(out, cp)
 		}
+	}
+	if lookupErr != nil {
+		return nil, fmt.Errorf("list checkpoints: incomplete listing, at least one entry could not be read: %w", lookupErr)
 	}
 
 	sort.Slice(out, func(i, j int) bool {
