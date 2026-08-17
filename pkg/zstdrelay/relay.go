@@ -130,7 +130,20 @@ func Relay(dst io.Writer, src io.Reader, compress bool, algo Algo, level string,
 			relayErr = closeErr
 		}
 	} else {
-		_, relayErr = io.Copy(effectiveDst, src)
+		// src is wrapped to hide any io.WriterTo it implements -- a real
+		// *net.TCPConn does -- from io.Copy's own fast-path detection.
+		// Without this, whenever src reaches this call as a raw, unwrapped
+		// net.Conn (true exactly when both compress and netbuffer are off,
+		// the plain pass-through relay direction), io.Copy calls
+		// src.WriteTo(effectiveDst) instead of running its normal
+		// read-then-effectiveDst.Write loop -- bypassing CountingWriter's
+		// byte counting (confirmed: ByteCounters.Sent stayed 0 for exactly
+		// this one combination, real TCP round-trip test in
+		// pkg/nbdbridge, even though the relay itself still worked
+		// correctly and every byte still arrived). The compress and
+		// netbuffer branches above never hand a raw net.Conn directly to a
+		// copy call this way, so they were never affected.
+		_, relayErr = io.Copy(effectiveDst, struct{ io.Reader }{src})
 	}
 
 	if bufStage != nil {

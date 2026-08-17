@@ -43,6 +43,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -707,6 +708,70 @@ func TestRelayCompressRoundTrip(t *testing.T) {
 				t.Fatalf("round trip mismatch for %s: got %d bytes, want %d bytes", tc.name, final.Len(), len(payload))
 			}
 		})
+	}
+}
+
+// TestRelayCountsWireBytesOverRealTCPConn is a regression test for a bug
+// where Relay's plain (compress=false, no netbuffer) pass-through direction
+// silently failed to count bytes into wireCounter whenever src was a real
+// *net.TCPConn: io.Copy's own io.WriterTo/io.ReaderFrom fast-path detection
+// noticed *net.TCPConn implements io.WriterTo and called src.WriteTo(dst)
+// instead of running its usual read-then-dst.Write loop -- bypassing
+// CountingWriter's Write method (and its atomic counter increment) entirely,
+// even though the relayed bytes themselves still arrived correctly. A
+// bytes.Buffer/bytes.Reader-based test (like TestRelayCompressRoundTrip
+// above) can never catch this: neither implements the same fast-path
+// interface a real net.Conn does, which is exactly why this surfaced first
+// in pkg/nbdbridge's own real-TCP round-trip test, not here.
+func TestRelayCountsWireBytesOverRealTCPConn(t *testing.T) {
+	payload := []byte(strings.Repeat("nbd bridge relay payload data ", 200))
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	go func() {
+		client.Write(payload)
+		client.Close()
+	}()
+
+	src := <-accepted
+	defer src.Close()
+
+	var wire bytes.Buffer
+	var sent uint64
+	relayErr, returned := runWithDeadline(t, 5*time.Second, func() error {
+		return zstdrelay.Relay(&wire, src, false, zstdrelay.AlgoZstd, "", "", "", &sent)
+	})
+	if !returned {
+		t.Fatal("Relay did not return within 5s")
+	}
+	if relayErr != nil {
+		t.Fatalf("Relay returned error: %v", relayErr)
+	}
+
+	if !bytes.Equal(wire.Bytes(), payload) {
+		t.Fatalf("relayed bytes mismatch: got %d bytes, want %d bytes", wire.Len(), len(payload))
+	}
+	if sent == 0 {
+		t.Fatal("wireCounter stayed 0 despite relaying real traffic over a genuine net.Conn source -- io.Copy bypassed CountingWriter via src's io.WriterTo fast path")
+	}
+	if sent != uint64(len(payload)) {
+		t.Errorf("wireCounter = %d, want %d (exact payload length)", sent, len(payload))
 	}
 }
 
