@@ -1031,15 +1031,31 @@ func TestReplaceDomainDiskPathPreservesRichConfiguration(t *testing.T) {
 	if !strings.Contains(out, `file="/mnt/target/vdb.qcow2"`) {
 		t.Errorf("expected second disk rewritten to /mnt/target/vdb.qcow2, got: %s", out)
 	}
-	// backingStore is the ONE element this function deliberately drops (see
-	// its own doc comment) -- everything else in this fixture (hostdev,
-	// tpm, qemu:commandline, network interface, graphics/video/
-	// controllers, the ignored cdrom, CPU/features/clock, UEFI loader/
-	// nvram) must still be there.
+	// backingStore is the element this function deliberately drops (see its
+	// own doc comment); format goes with it as an unavoidable side effect,
+	// not a separate loss -- <format type="qcow2"/> in this fixture exists
+	// only nested inside that backingStore (a disk's own format is a
+	// <driver type="qcow2"> attribute, not this element; <format> is
+	// specifically a backingStore/mirror-job convention), so once
+	// backingStore is gone, "format" has nowhere left to appear as an
+	// element name either. Everything else in this fixture (hostdev, tpm,
+	// qemu:commandline, network interface, graphics/video/controllers, the
+	// ignored cdrom, CPU/features/clock, UEFI loader/nvram) must still be
+	// there. intentionallyDroppedXMLElements deliberately does NOT also
+	// suppress "format" itself (see its own doc comment) -- broadening
+	// that denylist risks masking a genuinely dropped <format> in some
+	// unrelated context, so this expected-missing list, not production
+	// code, is what accounts for it here.
 	missing := missingXMLElements(xmlStr, out)
-	want := []string{"backingStore"}
-	if len(missing) != len(want) || (len(missing) > 0 && missing[0] != want[0]) {
-		t.Errorf("replaceDomainDiskPath() against a feature-rich domain = missing %v, want exactly %v -- full output: %s", missing, want, out)
+	want := []string{"backingStore", "format"}
+	if len(missing) != len(want) {
+		t.Fatalf("replaceDomainDiskPath() against a feature-rich domain = missing %v, want exactly %v -- full output: %s", missing, want, out)
+	}
+	for i := range want {
+		if missing[i] != want[i] {
+			t.Errorf("replaceDomainDiskPath() against a feature-rich domain = missing %v, want exactly %v -- full output: %s", missing, want, out)
+			break
+		}
 	}
 }
 
