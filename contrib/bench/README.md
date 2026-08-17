@@ -22,10 +22,14 @@ again after it's removed) -- not just that the flags are accepted.
   with a full `-reinit` resync immediately after. A script bug, a killed
   SSH session, or an interrupted run partway through Stage 2 could leave
   the target replica genuinely corrupted until the next successful sync.
-- It deliberately induces sync failures (via a nonexistent `-source-domain`)
-  to test `-reinit-after-failures`. These fail fast at domain lookup and
-  never touch the target, but they do write to the target domain's
-  `vmsync:failure_count` metadata field.
+- It deliberately removes the target domain's own `<vmsync:vmsync>`
+  metadata block (`virsh metadata ... --remove --config`) to induce
+  genuine, repeatable checkpoint-chain-inconsistency failures for
+  `-reinit-after-failures` testing. This is real target-side state churn,
+  not a no-op -- the stage's own final successful trigger run overwrites
+  it with fresh, consistent metadata, but an interrupted run partway
+  through could leave the target's metadata missing until the next
+  successful sync.
 - Stage 4 creates a real, live external disk-only snapshot on the
   **source** domain (`virsh snapshot-create-as ... --disk-only --atomic`),
   then removes it with a live `blockcommit --active --pivot`. This is the
@@ -139,15 +143,20 @@ the guest is unlikely to be actively rewriting, to keep this rare; the
 harness logs a specific warning distinguishing this from an actual
 detection bug when it happens.
 
-**Stage 3 (`-reinit-after-failures`)** induces failures safely: it passes
-a deliberately nonexistent `-source-domain` (while keeping the real,
-correct `-target-domain`), which fails immediately at domain lookup before
-touching anything else, while still correctly incrementing the target's
-real failure counter (recorded against the domain name, not the source).
-No network connectivity is broken and no real sync is attempted N times —
-this was a deliberate choice over e.g. temporarily pointing at a wrong SSH
-port, to avoid any risk of leaving real connectivity settings in a broken
-state on your infrastructure.
+**Stage 3 (`-reinit-after-failures`)** first runs its own baseline full
+sync, then removes the target domain's own `<vmsync:vmsync>` metadata
+block (`virsh metadata ... --remove --config`) to induce `N` genuine,
+repeatable incremental-sync failures -- the same
+`unverifiableCheckpointMetadataError` a real target would hit if it were
+manually redefined, restored from an old XML, or otherwise lost vmsync's
+own bookkeeping (see `pkg/libvirtsync`/`cmd/vmsync/main.go`). The source
+domain is never touched and stays real throughout -- this is a deliberate
+choice over e.g. pointing at a nonexistent source domain, since a missing
+source says nothing about whether the incremental-sync trust mechanism
+itself is working. After `N` induced failures, a final run with
+`-reinit-after-failures=N` is expected to force a full resync instead of
+the incremental one it would otherwise attempt, which also overwrites the
+target's metadata with a fresh, consistent value.
 
 **Stage 4 (external snapshot lifecycle)** confirms sync+verify keep
 working correctly across the one scenario vmsync itself has special-cased
