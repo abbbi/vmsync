@@ -303,7 +303,8 @@ func shouldRewriteDiskPaths(targetDiskPath string, rootSourceByLiveSource map[st
 }
 
 // replaceDomainDiskPath rewrites each non-ignored disk's <source file> to its
-// target-side path. rootSourceByLiveSource maps a disk's live Source path (as
+// target-side path, and clears any <backingStore> the live domain XML
+// carried for it. rootSourceByLiveSource maps a disk's live Source path (as
 // currently written in domainXML) to its resolved backing-chain root file --
 // see disk.QcowDisk.RootSource's own doc comment for why this distinction
 // matters: the live Source can point at an external-snapshot overlay that
@@ -315,6 +316,21 @@ func shouldRewriteDiskPaths(targetDiskPath string, rootSourceByLiveSource map[st
 // shouldn't happen for anything ParseQcowDisks would also have picked up,
 // since both apply the same IgnoreDevice filter, but degrades safely rather
 // than panicking on a nil map lookup if it ever does.
+//
+// Clearing BackingStore is required for the same reason, not an unrelated
+// cleanup: whatever the live domain XML's backing chain says (an external
+// snapshot's parent, or a permanent linked clone's shared base image) names
+// a file on the *source* host, which vmsync never copies over -- only the
+// resolved root file itself is copied, and always as a complete, standalone
+// image: cmd/vmsync's main.go creates the target file flat for a full sync,
+// and for an incremental sync commits the temporary delta overlay straight
+// into that same root file with `qemu-img commit` before deleting the
+// overlay, so by the time this runs the target's on-disk file never depends
+// on any backing file at all. Left as copied verbatim from the source XML,
+// a stale <backingStore> would describe a chain that either doesn't exist
+// on the target host or doesn't match its actual (backing-file-free) disk
+// -- something libvirt/qemu can refuse to start the domain over, or worse,
+// misinterpret.
 func replaceDomainDiskPath(domainXML, targetDiskPath string, rootSourceByLiveSource map[string]string) (string, error) {
 	domcfg := &libvirtxml.Domain{}
 	err := domcfg.Unmarshal(domainXML)
@@ -338,6 +354,7 @@ func replaceDomainDiskPath(domainXML, targetDiskPath string, rootSourceByLiveSou
 			rootSource = resolved
 		}
 		domcfg.Devices.Disks[i].Source.File.File = util.SetTargetPath(targetDiskPath, rootSource)
+		domcfg.Devices.Disks[i].BackingStore = nil
 	}
 
 	changed, err := domcfg.Marshal()
@@ -407,6 +424,21 @@ func xmlElementNames(domainXML string) map[string]bool {
 	return names
 }
 
+// intentionallyDroppedXMLElements lists element names missingXMLElements
+// must never report, because this package removes them itself, on purpose,
+// every time they're present -- not an accidental casualty of the
+// unmarshal/marshal round-trip warnIfXMLElementsDropped exists to catch.
+// Currently just backingStore: replaceDomainDiskPath clears it on every
+// disk it touches (see that function's own doc comment for why), so it
+// would otherwise be reported as "dropped" on literally every sync of a
+// domain with an external snapshot or a permanent linked clone -- a
+// guaranteed, permanent false positive on every such run, unlike the rare,
+// genuinely-worth-a-look struct-modeling gaps this warning is meant to
+// surface.
+var intentionallyDroppedXMLElements = map[string]bool{
+	"backingStore": true,
+}
+
 // missingXMLElements returns the sorted list of distinct element names
 // present in original but absent from rewritten -- empty (nil) when
 // original doesn't parse, rewritten doesn't parse, or nothing is missing.
@@ -424,6 +456,9 @@ func missingXMLElements(original, rewritten string) []string {
 	}
 	var missing []string
 	for name := range before {
+		if intentionallyDroppedXMLElements[name] {
+			continue
+		}
 		if !after[name] {
 			missing = append(missing, name)
 		}

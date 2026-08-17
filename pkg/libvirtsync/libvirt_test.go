@@ -194,6 +194,82 @@ func TestReplaceDomainDiskPath(t *testing.T) {
 		}
 	})
 
+	// Regression pin for the bug where a stale <backingStore> -- describing
+	// either an external snapshot's parent or a permanent linked clone's
+	// shared base image, either way a file that lives on the *source* host
+	// -- survived verbatim into the target's own domain definition, even
+	// though the target's actual file is always a complete, standalone
+	// image with no backing dependency (see this function's own doc
+	// comment for why). A domain with a live <backingStore> is exactly what
+	// ParseQcowDisks/disk.QcowDisk.RootSource resolve down through, so this
+	// is the realistic shape, not a synthetic one.
+	t.Run("backingStore is cleared even when the disk's path also gets rewritten", func(t *testing.T) {
+		xmlStr := `<domain type="kvm">
+  <name>testvm</name>
+  <uuid>12345678-1234-1234-1234-123456789abc</uuid>
+  <devices>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2"/>
+      <source file="/var/lib/libvirt/images/testvm.snap1"/>
+      <backingStore type="file" index="1">
+        <format type="qcow2"/>
+        <source file="/var/lib/libvirt/images/testvm.qcow2"/>
+        <backingStore/>
+      </backingStore>
+      <target dev="vda" bus="virtio"/>
+    </disk>
+  </devices>
+</domain>`
+		rootMap := map[string]string{
+			"/var/lib/libvirt/images/testvm.snap1": "/var/lib/libvirt/images/testvm.qcow2",
+		}
+		out, err := replaceDomainDiskPath(xmlStr, "/mnt/target", rootMap)
+		if err != nil {
+			t.Fatalf("replaceDomainDiskPath() error = %v", err)
+		}
+		if !strings.Contains(out, `file="/mnt/target/testvm.qcow2"`) {
+			t.Errorf("expected rewritten path using mapped root source, got: %s", out)
+		}
+		if strings.Contains(out, "backingStore") {
+			t.Errorf("expected <backingStore> to be cleared entirely, got: %s", out)
+		}
+		if strings.Contains(out, "testvm.snap1") {
+			t.Errorf("expected the stale source-host live path to be gone entirely, got: %s", out)
+		}
+	})
+
+	// Same regression, but with no path relocation requested at all -- the
+	// exact combination the DefineDomain-level fix for shouldRewriteDiskPaths
+	// now guarantees reaches this function.
+	t.Run("backingStore is cleared even with an empty targetDiskPath", func(t *testing.T) {
+		xmlStr := `<domain type="kvm">
+  <name>testvm</name>
+  <uuid>12345678-1234-1234-1234-123456789abc</uuid>
+  <devices>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2"/>
+      <source file="/var/lib/libvirt/images/testvm.snap1"/>
+      <backingStore type="file" index="1">
+        <format type="qcow2"/>
+        <source file="/var/lib/libvirt/images/testvm.qcow2"/>
+        <backingStore/>
+      </backingStore>
+      <target dev="vda" bus="virtio"/>
+    </disk>
+  </devices>
+</domain>`
+		rootMap := map[string]string{
+			"/var/lib/libvirt/images/testvm.snap1": "/var/lib/libvirt/images/testvm.qcow2",
+		}
+		out, err := replaceDomainDiskPath(xmlStr, "", rootMap)
+		if err != nil {
+			t.Fatalf("replaceDomainDiskPath() error = %v", err)
+		}
+		if strings.Contains(out, "backingStore") {
+			t.Errorf("expected <backingStore> to be cleared entirely, got: %s", out)
+		}
+	})
+
 	// Regression pin for the DefineDomain bug this function's own caller had:
 	// an empty targetDiskPath (no relocation requested) must NOT be treated
 	// as "skip the rewrite" -- an external-snapshot source's live path still
@@ -790,6 +866,27 @@ func TestMissingXMLElements(t *testing.T) {
 		}
 		if got := missingXMLElements(`<domain><hostdev/></domain>`, "not xml at all <<<"); got != nil {
 			t.Errorf("missingXMLElements(..., unparsable rewrite) = %v, want nil", got)
+		}
+	})
+
+	// Regression pin: backingStore is cleared by replaceDomainDiskPath on
+	// purpose, every time it's present -- it must never show up as a
+	// "dropped" element, or every sync of a domain with an external
+	// snapshot or linked clone would log a permanent false-positive
+	// warning. A genuinely unrelated dropped element in the same document
+	// must still be reported, so this isn't just suppressing everything.
+	t.Run("backingStore is never reported as dropped, but an unrelated dropped element still is", func(t *testing.T) {
+		original := `<domain><devices><disk><backingStore/></disk><hostdev/></devices></domain>`
+		rewritten := `<domain><devices><disk/></devices></domain>`
+		got := missingXMLElements(original, rewritten)
+		want := []string{"hostdev"}
+		if len(got) != len(want) {
+			t.Fatalf("missingXMLElements(...) = %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("missingXMLElements(...)[%d] = %q, want %q (full result: %v)", i, got[i], want[i], got)
+			}
 		}
 	})
 }
