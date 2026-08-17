@@ -19,12 +19,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc git libnbd-dev libvirt-dev libc6-dev
+          # dnf install -y gcc git libnbd-devel libvirt-devel glibc-devel
 
       # Same Go version pinned in Dockerfile.debian's GO_VERSION build arg.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.25.0'
+          # dnf install golanc
 
       # This repo doesn't commit go.mod/go.sum (see Dockerfile.debian's own
       # "go mod init vmsync && go mod tidy" step) -- bootstrap the module the
