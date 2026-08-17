@@ -930,6 +930,15 @@ func TestWaitForTCPExportTimesOutWhenNothingListening(t *testing.T) {
 	if elapsed > 5*time.Second {
 		t.Fatalf("WaitForTCPExport took %s to give up on a 500ms timeout -- looks hung rather than just imprecise", elapsed)
 	}
+	// Regression pin: this used to always return a generic "nbd export not
+	// ready on host:port" message, discarding the real connection failure
+	// (here, a TCP-level refusal, since nothing is listening) every single
+	// iteration. "refused" is what a real connection attempt against a
+	// closed port actually produces -- if this ever regresses back to the
+	// generic message, this substring stops appearing.
+	if !strings.Contains(strings.ToLower(err.Error()), "refused") {
+		t.Errorf("WaitForTCPExport error = %q, want it to mention the real underlying connection failure (e.g. \"connection refused\"), not just a generic \"not ready\" message", err)
+	}
 }
 
 // The three tests below need no real NBD server at all: ChangedExtentsTCP,

@@ -1106,6 +1106,7 @@ compareLoop:
 
 func WaitForTCPExport(host string, port int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	var lastErr error
 	for {
 		h, err := nbd.Create()
 		if err == nil {
@@ -1115,8 +1116,9 @@ func WaitForTCPExport(host string, port int, timeout time.Duration) error {
 				return nil
 			}
 		}
+		lastErr = err
 		if time.Now().After(deadline) {
-			return fmt.Errorf("nbd export not ready on %s:%d", host, port)
+			return fmt.Errorf("nbd export not ready on %s:%d after %s: %w", host, port, timeout, lastErr)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
