@@ -97,6 +97,20 @@ dom_state() {
 	return 1
 }
 
+# domain_uuid URI DOMAIN -> the domain's UUID (whitespace collapsed), or
+# empty + non-zero exit on failure (see dom_state's own VIRSH_ERR comment).
+domain_uuid() {
+	local uri="$1" domain="$2"
+	local out
+	if out="$(virsh_uri "$uri" domuuid "$domain" 2>&1)"; then
+		VIRSH_ERR=""
+		printf '%s' "$out" | tr -d '[:space:]'
+		return 0
+	fi
+	VIRSH_ERR="$out"
+	return 1
+}
+
 domain_exists() {
 	local uri="$1" domain="$2"
 	local out
@@ -131,12 +145,14 @@ require_dom_shutoff() {
 }
 
 # require_dom_shutoff_or_absent: like require_dom_shutoff, but a target
-# that doesn't exist at all is fine too -- vmsync's own -reinit undefines
-# the target domain early and only redefines it once the full disk copy
-# finishes (see DefineDomain in cmd/vmsync/main.go), so an interrupted or
-# still-first-ever run legitimately leaves it in exactly that state, and
-# the next full sync recreates it from scratch. A genuine query failure
-# (bad URI, auth, connection) is NOT the same thing and still dies loudly.
+# that doesn't exist at all is fine too -- DefineDomain (libvirtsync) is the
+# only place that ever undefines/redefines the target, and it only does so
+# once the full disk copy has already succeeded (-reinit itself deliberately
+# leaves the target's own definition untouched; see cmd/vmsync/main.go's
+# -reinit block for why), so a still-first-ever run, or one interrupted
+# before that final step, legitimately leaves the target undefined, and the
+# next full sync defines it from scratch. A genuine query failure (bad URI,
+# auth, connection) is NOT the same thing and still dies loudly.
 require_dom_shutoff_or_absent() {
 	local uri="$1" domain="$2" label="$3"
 	if domain_exists "$uri" "$domain"; then

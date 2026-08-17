@@ -34,6 +34,13 @@ again after it's removed) -- not just that the flags are accepted.
 - **The target domain must be shut off for the entire run, and stays that
   way throughout.** The harness never starts it. This is also what makes
   tampering it safe — nothing else has the file open at the time.
+- Stage 5b (opt-in, not run by default — see below) temporarily inserts an
+  `iptables` rule on the **target host itself** to force a real
+  `DomainDefineXML` failure. It's self-removing and this script also tries
+  an explicit cleanup afterward as a backstop, but it's the one stage that
+  touches host-level networking rather than just the VM/replica — only
+  enable it against the same disposable test host everything else here
+  already requires.
 
 **Point this at a disposable, dedicated test VM.** Never at a real,
 in-use replication pair. `bench.sh` refuses to run for real (as opposed to
@@ -68,15 +75,22 @@ vmsync itself to work at all).
 ./bench.sh --only 'compress-zstd-*'   # Stage 1 only, matching scenarios
 ./bench.sh --stages verify    # just the verify+tamper tests
 ./bench.sh --stages snapshot  # just the external-snapshot lifecycle test
+./bench.sh --stages matrix,verify,reinit,snapshot,define  # + Stage 5, opt-in
 ```
 
-Stage 2, Stage 3, and Stage 4 all assume Stage 1 (or some prior successful
-sync) has already established a checkpoint chain for this target domain —
-that's what makes "did this do a full sync or an incremental one" a
-meaningful, observable distinction in their pass/fail checks. Running
-`--stages=reinit` against a target that's never been synced before won't
-actually test anything (the very first sync of any domain is always full,
-whether or not `-reinit-after-failures` had anything to do with it).
+Stage 2, Stage 3, and Stage 4 each run their own baseline `-reinit` full
+sync before anything else, so none of them actually depend on Stage 1(or
+any prior sync) having run first — each is safe to run standalone via
+`--stages`. This matters for more than just the "full vs incremental"
+distinction in their own pass/fail checks: Stage 3 specifically needs a
+target domain that already exists, since `-reinit-after-failures`'s
+counter lives in the target's own domain metadata and vmsync treats
+recording a failure against a target that doesn't exist yet as a no-op
+(nothing to record against) — without its own baseline, every induced
+failure in `--stages=reinit` run in isolation would silently fail to
+persist, and the counter would never reach its threshold. Stage 5 is the
+same way (its own baseline first) but is never included by the default
+`--stages` value — see its own section below and pass it explicitly.
 
 Results land in `results/<run-id>/`: `results.csv` (machine-readable),
 `report.md` (the human-readable summary, also printed at the end),
@@ -160,6 +174,38 @@ as fatal rather than merely healed and retried (unlike Stage 2's tamper
 tests) — it can leave the source domain's own disk chain inconsistent,
 and the harness stops immediately with instructions to inspect it by hand
 via `virsh blockjob` before doing anything else.
+
+**Stage 5 (`DefineDomain` redefine/rollback, opt-in — pass `--stages
+...,define` explicitly)** exercises `libvirtsync.DefineDomain`, the sole
+place vmsync ever undefines or redefines the target domain (a fix earlier
+in this project's own life removed `-reinit`'s own early undefine
+specifically so this function's capture-XML/undefine/redefine/
+rollback-on-failure sequence would be the only thing relied on) — and,
+before this stage existed, nothing exercised it end to end. Two sub-tests:
+
+- **5a** defines a throwaway domain on the target that deliberately reuses
+  the source domain's UUID, then runs a real sync — this reliably
+  reproduces libvirt's own "already defined with uuid" error and forces
+  vmsync's documented stripped-UUID retry to actually run, checked by
+  confirming the target's UUID changed (proof the retry executed) and the
+  sync still succeeded overall. The throwaway domain is undefined again
+  afterward either way.
+- **5b** is a best-effort timing race, not a hard pass/fail: it starts a
+  real `-reinit` sync in the background, watches its log for the
+  "Undefining domain on target system" line `DefineDomain` logs right
+  before the real work starts, and the instant it appears, briefly
+  disrupts the target's own SSH reachability (an `iptables REJECT` rule,
+  self-removing) to try to make the actual redefine call fail. If the
+  disruption lands, it checks that the sync failed **and** that the
+  target's domain definition (`virsh dumpxml`) is byte-identical to what
+  it was before the run — i.e. that rollback genuinely restored it rather
+  than leaving the target undefined or partially redefined. Because this
+  races a live, variable-duration copy with no way to synchronize on the
+  exact right instant from outside the vmsync process, missing the window
+  entirely is common and reported as a SKIP, never a FAIL — only a landed
+  disruption proves anything either way. `DEFINE_ROLLBACK_WAIT_SECONDS` in
+  `bench.conf` caps how long it waits for the marker before giving up on
+  that attempt.
 
 If `bench.sh` runs directly on the source hypervisor itself (`SOURCE_URI`
 pointing at a local `qemu:///system`, say), set `SOURCE_LOCAL=yes` in

@@ -93,6 +93,15 @@ TAMPER_LENGTH=4096
 # How many induced failures to simulate before expecting a forced reinit.
 REINIT_AFTER_FAILURES_N=3
 
+# --- DefineDomain rollback test (Stage 5b, opt-in via --stages ...,define) --
+
+# How long (seconds) Stage 5b will wait for a full sync to reach the point
+# where DefineDomain starts undefining the target before giving up on
+# timing its disruption for that run (scored as a SKIP, not a FAIL, if this
+# elapses first). Raise this if your test VM's disk is large enough that a
+# full -reinit sync legitimately takes longer than the default.
+DEFINE_ROLLBACK_WAIT_SECONDS=300
+
 # --- Output --------------------------------------------------------------
 
 RESULT_DIR=./results
