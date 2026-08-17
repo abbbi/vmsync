@@ -144,6 +144,35 @@ func TestRecoverRelayPanicPassesThroughNormalReturns(t *testing.T) {
 	}
 }
 
+// bridgeConfigCombos returns the config matrix every StartLocal-driven test
+// in this file drives its scenario across: no compress/no netbuffer, each
+// supported compress algo alone, netbuffer alone, and both together --
+// relayConnection wires cfg.Compress and cfg.NetBufferEnabled into the exact
+// same Relay/RelayFromWire calls for both directions of every connection, so
+// a test using only the plain "neither enabled" config never exercises the
+// compression or buffering stages at all. netBufferSize is left to the
+// caller: a happy-path test can use a comfortably large capacity, but a test
+// that needs the buffer to reliably fill within a bounded time (see the two
+// dropped-remote tests below) needs a deliberately small one instead.
+func bridgeConfigCombos(netBufferSize string) []struct {
+	name string
+	cfg  Config
+} {
+	return []struct {
+		name string
+		cfg  Config
+	}{
+		{"no compress, no netbuffer", Config{}},
+		{"compress zstd", Config{Compress: true, CompressAlgo: "zstd", CompressLevel: "3"}},
+		{"compress s2 better", Config{Compress: true, CompressAlgo: "s2", CompressLevel: "better"}},
+		{"netbuffer only", Config{NetBufferBlock: "64k", NetBufferSize: netBufferSize}},
+		{"compress and netbuffer together", Config{
+			Compress: true, CompressAlgo: "zstd", CompressLevel: "3",
+			NetBufferBlock: "64k", NetBufferSize: netBufferSize,
+		}},
+	}
+}
+
 // TestStartLocalRelaysBytesRoundTrip dials the local bridge port StartLocal
 // opens, as if it were the local NBD client, and checks that bytes written
 // there make it all the way to a fake "remote" and back unchanged -- across
@@ -153,21 +182,7 @@ func TestRecoverRelayPanicPassesThroughNormalReturns(t *testing.T) {
 // cfg.UseSSH is true, so this is a safe, SSH-free way to exercise the real
 // TCP relay end to end over loopback.
 func TestStartLocalRelaysBytesRoundTrip(t *testing.T) {
-	tests := []struct {
-		name string
-		cfg  Config
-	}{
-		{"no compress, no netbuffer", Config{}},
-		{"compress zstd", Config{Compress: true, CompressAlgo: "zstd", CompressLevel: "3"}},
-		{"compress s2 better", Config{Compress: true, CompressAlgo: "s2", CompressLevel: "better"}},
-		{"netbuffer only", Config{NetBufferBlock: "64k", NetBufferSize: "1M"}},
-		{"compress and netbuffer together", Config{
-			Compress: true, CompressAlgo: "zstd", CompressLevel: "3",
-			NetBufferBlock: "64k", NetBufferSize: "1M",
-		}},
-	}
-
-	for _, tt := range tests {
+	for _, tt := range bridgeConfigCombos("1M") {
 		t.Run(tt.name, func(t *testing.T) {
 			ln, accepted := newFakeRemoteListener(t)
 			defer ln.Close()
@@ -262,65 +277,83 @@ func TestStartLocalStopClosesTheLocalListener(t *testing.T) {
 // next time it tries to use it. The test loop below keeps feeding the local
 // side until an operation on it fails, which is what "the relay noticed and
 // tore the connection down" looks like from a client's vantage point.
+//
+// Driven across every compress/netbuffer combo (see bridgeConfigCombos), not
+// just the plain pass-through config: two real deadlocks
+// (tests/netbuffer_deadlock_test.go's TestRelayReturnsOnDrainFailure and
+// TestRelayFromWireReturnsOnConsumerFailure) shipped specifically because a
+// netbuffer drain/fill goroutine failed to close its BoundedBuffer when the
+// OTHER side of the same relay direction errored -- a bug the plain
+// "neither enabled" config can never exercise, since that path is a bare
+// io.Copy with no buffer to leak, and the zstdrelay-level regression tests
+// for those two bugs never go through this package's own relayConnection
+// wiring at all. netBufferSize is deliberately small (4096, matching those
+// same zstdrelay-level tests' own reasoning) so the buffer reliably fills
+// within this test's own write loop instead of a regression only showing up
+// once the buffer happens to fill by chance.
 func TestStartLocalDroppedRemoteDoesNotWedgeBridge(t *testing.T) {
-	ln, accepted := newFakeRemoteListener(t)
-	defer ln.Close()
+	for _, tt := range bridgeConfigCombos("4096") {
+		t.Run(tt.name, func(t *testing.T) {
+			ln, accepted := newFakeRemoteListener(t)
+			defer ln.Close()
 
-	localPort, _, stop, err := StartLocal(context.Background(), nil, ln.Addr().String(), Config{})
-	if err != nil {
-		t.Fatalf("StartLocal: %v", err)
-	}
-	defer stop()
-
-	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
-	if err != nil {
-		t.Fatalf("dial local bridge port %d: %v", localPort, err)
-	}
-	defer conn.Close()
-
-	if _, err := conn.Write([]byte("hello before the drop")); err != nil {
-		t.Fatalf("initial write: %v", err)
-	}
-
-	var remoteConn net.Conn
-	select {
-	case remoteConn = <-accepted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("fake remote never saw a connection from the relay")
-	}
-
-	buf := make([]byte, 64)
-	remoteConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, err := remoteConn.Read(buf); err != nil {
-		t.Fatalf("fake remote did not see the relayed bytes before the drop: %v", err)
-	}
-
-	// Simulate an abrupt WAN interruption: the remote side vanishes with no
-	// clean shutdown of its own.
-	remoteConn.Close()
-
-	checkErr, returned := runWithDeadline(t, 8*time.Second, func() error {
-		deadline := time.Now().Add(3 * time.Second)
-		for time.Now().Before(deadline) {
-			if _, werr := conn.Write([]byte("keep going after the drop\n")); werr != nil {
-				return nil // the write itself failing already proves the bridge noticed
+			localPort, _, stop, err := StartLocal(context.Background(), nil, ln.Addr().String(), tt.cfg)
+			if err != nil {
+				t.Fatalf("StartLocal: %v", err)
 			}
-			readBuf := make([]byte, 64)
-			conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-			if _, rerr := conn.Read(readBuf); rerr != nil {
-				if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
-					continue // no data yet -- keep pushing until the relay reacts
+			defer stop()
+
+			conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
+			if err != nil {
+				t.Fatalf("dial local bridge port %d: %v", localPort, err)
+			}
+			defer conn.Close()
+
+			if _, err := conn.Write([]byte("hello before the drop")); err != nil {
+				t.Fatalf("initial write: %v", err)
+			}
+
+			var remoteConn net.Conn
+			select {
+			case remoteConn = <-accepted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("fake remote never saw a connection from the relay")
+			}
+
+			buf := make([]byte, 64)
+			remoteConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := remoteConn.Read(buf); err != nil {
+				t.Fatalf("fake remote did not see the relayed bytes before the drop: %v", err)
+			}
+
+			// Simulate an abrupt WAN interruption: the remote side vanishes with no
+			// clean shutdown of its own.
+			remoteConn.Close()
+
+			checkErr, returned := runWithDeadline(t, 8*time.Second, func() error {
+				deadline := time.Now().Add(3 * time.Second)
+				for time.Now().Before(deadline) {
+					if _, werr := conn.Write([]byte("keep going after the drop\n")); werr != nil {
+						return nil // the write itself failing already proves the bridge noticed
+					}
+					readBuf := make([]byte, 64)
+					conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+					if _, rerr := conn.Read(readBuf); rerr != nil {
+						if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
+							continue // no data yet -- keep pushing until the relay reacts
+						}
+						return nil // any non-timeout read error also proves it noticed
+					}
 				}
-				return nil // any non-timeout read error also proves it noticed
+				return errors.New("the local bridge connection never errored out after its remote leg was dropped")
+			})
+			if !returned {
+				t.Fatal("checking for the dropped-remote error did not complete within its own deadline")
 			}
-		}
-		return errors.New("the local bridge connection never errored out after its remote leg was dropped")
-	})
-	if !returned {
-		t.Fatal("checking for the dropped-remote error did not complete within its own deadline")
-	}
-	if checkErr != nil {
-		t.Fatal(checkErr)
+			if checkErr != nil {
+				t.Fatal(checkErr)
+			}
+		})
 	}
 }
 
@@ -335,54 +368,65 @@ func TestStartLocalDroppedRemoteDoesNotWedgeBridge(t *testing.T) {
 // one never writes to conn again after the drop -- only reads -- so it can
 // only pass if the bridge itself notices and propagates the failure, not the
 // client prompting it by sending more data.
+//
+// Driven across every compress/netbuffer combo for the same reason as the
+// test above: with netbuffer enabled, the inbound direction has its own
+// fill goroutine (reading remote's now-dead wire) and a separate main loop
+// draining into conn, and the half-close-on-failure behavior this test
+// pins down must still fire promptly with that extra buffering stage in the
+// middle, not just on the bare pass-through path the plain config exercises.
 func TestStartLocalDroppedRemoteUnblocksIdleClient(t *testing.T) {
-	ln, accepted := newFakeRemoteListener(t)
-	defer ln.Close()
+	for _, tt := range bridgeConfigCombos("4096") {
+		t.Run(tt.name, func(t *testing.T) {
+			ln, accepted := newFakeRemoteListener(t)
+			defer ln.Close()
 
-	localPort, _, stop, err := StartLocal(context.Background(), nil, ln.Addr().String(), Config{})
-	if err != nil {
-		t.Fatalf("StartLocal: %v", err)
-	}
-	defer stop()
+			localPort, _, stop, err := StartLocal(context.Background(), nil, ln.Addr().String(), tt.cfg)
+			if err != nil {
+				t.Fatalf("StartLocal: %v", err)
+			}
+			defer stop()
 
-	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
-	if err != nil {
-		t.Fatalf("dial local bridge port %d: %v", localPort, err)
-	}
-	defer conn.Close()
+			conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
+			if err != nil {
+				t.Fatalf("dial local bridge port %d: %v", localPort, err)
+			}
+			defer conn.Close()
 
-	if _, err := conn.Write([]byte("request before the drop")); err != nil {
-		t.Fatalf("initial write: %v", err)
-	}
+			if _, err := conn.Write([]byte("request before the drop")); err != nil {
+				t.Fatalf("initial write: %v", err)
+			}
 
-	var remoteConn net.Conn
-	select {
-	case remoteConn = <-accepted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("fake remote never saw a connection from the relay")
-	}
+			var remoteConn net.Conn
+			select {
+			case remoteConn = <-accepted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("fake remote never saw a connection from the relay")
+			}
 
-	buf := make([]byte, 64)
-	remoteConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, err := remoteConn.Read(buf); err != nil {
-		t.Fatalf("fake remote did not see the relayed bytes before the drop: %v", err)
-	}
+			buf := make([]byte, 64)
+			remoteConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := remoteConn.Read(buf); err != nil {
+				t.Fatalf("fake remote did not see the relayed bytes before the drop: %v", err)
+			}
 
-	// Simulate an abrupt WAN interruption, exactly like the test above --
-	// but the local side never writes again afterward: it just sits there
-	// reading, the way a real NBD client would while waiting on a reply to
-	// a command it already sent.
-	remoteConn.Close()
+			// Simulate an abrupt WAN interruption, exactly like the test above --
+			// but the local side never writes again afterward: it just sits there
+			// reading, the way a real NBD client would while waiting on a reply to
+			// a command it already sent.
+			remoteConn.Close()
 
-	readErr, returned := runWithDeadline(t, 8*time.Second, func() error {
-		readBuf := make([]byte, 64)
-		_, rerr := conn.Read(readBuf)
-		return rerr
-	})
-	if !returned {
-		t.Fatal("an idle local client's blocked read was never unblocked after its remote leg was dropped -- the inbound relay goroutine must half-close conn once its own source (remote) errors")
-	}
-	if readErr == nil {
-		t.Fatal("expected the idle client's read to fail once the remote leg was dropped, got a nil error")
+			readErr, returned := runWithDeadline(t, 8*time.Second, func() error {
+				readBuf := make([]byte, 64)
+				_, rerr := conn.Read(readBuf)
+				return rerr
+			})
+			if !returned {
+				t.Fatal("an idle local client's blocked read was never unblocked after its remote leg was dropped -- the inbound relay goroutine must half-close conn once its own source (remote) errors")
+			}
+			if readErr == nil {
+				t.Fatal("expected the idle client's read to fail once the remote leg was dropped, got a nil error")
+			}
+		})
 	}
 }
