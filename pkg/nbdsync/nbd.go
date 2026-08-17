@@ -614,6 +614,52 @@ type MismatchRange struct {
 	Length uint64
 }
 
+// mismatchScanGranularity is the sub-block size diffSubRanges scans at once a
+// whole AIO chunk (up to tens of MiB) has already been found to differ
+// somewhere. It operates purely on in-memory buffers already read into RAM,
+// not on new NBD requests, so no protocol-level block-alignment requirement
+// applies here -- unlike the request-size chosen elsewhere in this file,
+// this value only trades comparison precision against CPU time and can be
+// any value.
+const mismatchScanGranularity = 4096
+
+// diffSubRanges scans two equal-length buffers in mismatchScanGranularity
+// chunks and returns the precise sub-ranges (relative to baseOffset) where
+// they actually differ, merging adjacent differing chunks into a single
+// range. Without this, compareTCP would have to report a mismatch anywhere
+// inside a buffer as spanning the buffer's *entire* AIO chunk -- and
+// -verify=online's dirty-bitmap reconciliation (overlapsAnyExtent) discards
+// a whole MismatchRange if it overlaps a guest write anywhere in it, so an
+// unrelated write next to real corruption elsewhere in the same wide chunk
+// would silently hide that corruption. Called only after a whole-buffer
+// bytes.Equal has already confirmed a difference exists, so the returned
+// slice is never empty for well-formed equal-length inputs.
+func diffSubRanges(baseOffset uint64, a, b []byte, granularity uint64) []MismatchRange {
+	var out []MismatchRange
+	n := uint64(len(a))
+	var runStart uint64
+	inRun := false
+	for pos := uint64(0); pos < n; pos += granularity {
+		end := pos + granularity
+		if end > n {
+			end = n
+		}
+		if !bytes.Equal(a[pos:end], b[pos:end]) {
+			if !inRun {
+				runStart = pos
+				inRun = true
+			}
+		} else if inRun {
+			out = append(out, MismatchRange{Offset: baseOffset + runStart, Length: pos - runStart})
+			inRun = false
+		}
+	}
+	if inRun {
+		out = append(out, MismatchRange{Offset: baseOffset + runStart, Length: n - runStart})
+	}
+	return out
+}
+
 // CompareTCPCollect is CompareTCP, except it scans the entire image even
 // past the first mismatch, returning every mismatched range instead of
 // aborting on the first one. For -verify=online, where a lone mismatch is
@@ -872,18 +918,35 @@ compareLoop:
 			if slots[i].stateA != sideReady || slots[i].stateB != sideReady {
 				continue
 			}
-			match := bytes.Equal(slots[i].bufA.Slice(), slots[i].bufB.Slice())
+			bufSliceA := slots[i].bufA.Slice()
+			bufSliceB := slots[i].bufB.Slice()
+			match := bytes.Equal(bufSliceA, bufSliceB)
 			offset, length := slots[i].offset, slots[i].length
+			var subRanges []MismatchRange
+			if !match {
+				// Precise sub-ranges must be computed before Free() --
+				// bufSliceA/bufSliceB become invalid once the underlying AIO
+				// buffers are released.
+				subRanges = diffSubRanges(offset, bufSliceA, bufSliceB, mismatchScanGranularity)
+				if len(subRanges) == 0 {
+					// Defensive: should be unreachable given match == false,
+					// but silently reporting nothing for a confirmed
+					// mismatch would be exactly the bug this is fixing, so
+					// fall back to the whole chunk rather than drop it.
+					subRanges = []MismatchRange{{Offset: offset, Length: length}}
+				}
+			}
 			slots[i].bufA.Free()
 			slots[i].bufB.Free()
 			slots[i].stateA = sideIdle
 			slots[i].stateB = sideIdle
 			if !match {
 				if !collectMismatches {
-					compareErr = fmt.Errorf("images differ: mismatch in chunk at offset=%d length=%d", offset, length)
+					first := subRanges[0]
+					compareErr = fmt.Errorf("images differ: mismatch at offset=%d length=%d (within chunk offset=%d length=%d)", first.Offset, first.Length, offset, length)
 					break compareLoop
 				}
-				mismatches = append(mismatches, MismatchRange{Offset: offset, Length: length})
+				mismatches = append(mismatches, subRanges...)
 			}
 		}
 	}

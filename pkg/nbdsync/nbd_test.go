@@ -361,6 +361,94 @@ func TestCompareTCPCollectFindsAllMismatches(t *testing.T) {
 	}
 }
 
+// TestDiffSubRanges is a pure-function regression test for the bug this was
+// extracted to fix: compareTCP used to report any mismatch inside an AIO
+// chunk as spanning the chunk's entire offset/length, which -verify=online's
+// dirty-bitmap reconciliation (overlapsAnyExtent) would then discard
+// wholesale if a guest write touched the chunk anywhere -- silently hiding
+// real corruption elsewhere in the same wide chunk. Needs no qemu-nbd at
+// all.
+func TestDiffSubRanges(t *testing.T) {
+	const g = 4 // small granularity so cases stay readable
+
+	cases := []struct {
+		name       string
+		baseOffset uint64
+		a, b       []byte
+		want       []MismatchRange
+	}{
+		{
+			name:       "no difference",
+			baseOffset: 100,
+			a:          []byte{1, 2, 3, 4, 5, 6, 7, 8},
+			b:          []byte{1, 2, 3, 4, 5, 6, 7, 8},
+			want:       nil,
+		},
+		{
+			name:       "single differing sub-block in the middle",
+			baseOffset: 100,
+			a:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+			b:          []byte{1, 2, 3, 4, 0, 6, 7, 8, 9, 10, 11, 12},
+			want:       []MismatchRange{{Offset: 104, Length: 4}},
+		},
+		{
+			name:       "multiple non-adjacent differing sub-blocks stay separate",
+			baseOffset: 0,
+			a:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+			b:          []byte{0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0},
+			want: []MismatchRange{
+				{Offset: 0, Length: 4},
+				{Offset: 8, Length: 4},
+			},
+		},
+		{
+			// One byte differs inside each of two adjacent sub-blocks --
+			// diffSubRanges must merge them into a single range spanning
+			// both blocks rather than reporting two separate ones.
+			name:       "contiguous differing run spanning multiple sub-blocks merges into one range",
+			baseOffset: 0,
+			a:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+			b:          []byte{1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 0, 12},
+			want:       []MismatchRange{{Offset: 4, Length: 8}},
+		},
+		{
+			name:       "difference at the very start of the buffer",
+			baseOffset: 0,
+			a:          []byte{1, 2, 3, 4, 5, 6, 7, 8},
+			b:          []byte{0, 2, 3, 4, 5, 6, 7, 8},
+			want:       []MismatchRange{{Offset: 0, Length: 4}},
+		},
+		{
+			name:       "difference at the very end of the buffer",
+			baseOffset: 0,
+			a:          []byte{1, 2, 3, 4, 5, 6, 7, 8},
+			b:          []byte{1, 2, 3, 4, 5, 6, 7, 0},
+			want:       []MismatchRange{{Offset: 4, Length: 4}},
+		},
+		{
+			name:       "buffer length not evenly divisible by granularity -- final partial sub-block",
+			baseOffset: 0,
+			a:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+			b:          []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 0},
+			want:       []MismatchRange{{Offset: 8, Length: 2}},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := diffSubRanges(c.baseOffset, c.a, c.b, g)
+			if len(got) != len(c.want) {
+				t.Fatalf("diffSubRanges(...) = %v, want %v", got, c.want)
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Fatalf("diffSubRanges(...) = %v, want %v", got, c.want)
+				}
+			}
+		})
+	}
+}
+
 // TestNegotiateBufferSizeReturnsPositiveValue exercises negotiateBufferSize
 // directly (it's unexported, hence this test living in-package) against two
 // real, connected NBD handles. See this file's own top-of-file comment for
