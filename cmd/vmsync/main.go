@@ -943,38 +943,72 @@ func run(cfg struct {
 	// that does but fails or gets interrupted partway through.
 	defer cleanupVerifyWindow("cleanup")
 
-	cleanupTargetNBD := func(trigger string) {
-		targetCleanupOnce.Do(func() {
+	// pollStopCommands repeatedly drains newly-appended entries from a
+	// stop-command list instead of taking one instant snapshot -- per-disk
+	// workers run in parallel and each only registers its own remote
+	// process's stop command once that process has actually started, which
+	// can happen at any point during the run. A single snapshot taken the
+	// moment an interrupt arrives would silently miss any command
+	// registered a moment later by a worker that was still mid-startup (or
+	// hadn't reached that step yet for a slower disk), leaving that
+	// specific remote qemu-nbd/bridge process running forever with nothing
+	// left to ever stop it. Polling for entries new since the last check,
+	// for up to maxWait but giving up early once two consecutive checks
+	// find nothing new, catches stragglers without either missing them or
+	// waiting the full duration on the common case of nothing left to
+	// clean up. Runs everything found in reverse registration order within
+	// each batch, matching the original teardown-in-reverse-of-setup
+	// intent (e.g. stop a bridge helper before the export it wraps).
+	pollStopCommands := func(list *[]string, maxWait time.Duration, run func(cmd string)) {
+		processed := 0
+		deadline := time.Now().Add(maxWait)
+		quietRounds := 0
+		for {
 			stopMu.Lock()
-			stopCommands := append([]string(nil), targetStopCommands...)
+			pending := append([]string(nil), (*list)[processed:]...)
+			processed = len(*list)
 			stopMu.Unlock()
-			if targetSSHClient == nil || len(stopCommands) == 0 {
+
+			if len(pending) == 0 {
+				quietRounds++
+			} else {
+				quietRounds = 0
+			}
+			for i := len(pending) - 1; i >= 0; i-- {
+				run(pending[i])
+			}
+			if quietRounds >= 2 || time.Now().After(deadline) {
 				return
 			}
-			cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer ccancel()
-		for i := len(stopCommands) - 1; i >= 0; i-- {
-				if out, err := targetSSHClient.Run(cctx, stopCommands[i]); err != nil {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	cleanupTargetNBD := func(trigger string) {
+		targetCleanupOnce.Do(func() {
+			if targetSSHClient == nil {
+				return
+			}
+			pollStopCommands(&targetStopCommands, 5*time.Second, func(cmd string) {
+				cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer ccancel()
+				if out, err := targetSSHClient.Run(cctx, cmd); err != nil {
 					trace.Error("failed to stop target qemu-nbd export", "trigger", trigger, "error", err, "output", out)
 				}
-			}
+			})
 		})
 	}
 	cleanupSourceBridge := func(trigger string) {
 		sourceCleanupOnce.Do(func() {
-			stopMu.Lock()
-			stopCommands := append([]string(nil), sourceStopCommands...)
-			stopMu.Unlock()
-			if sourceSSHClient == nil || len(stopCommands) == 0 {
+			if sourceSSHClient == nil {
 				return
 			}
-			cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer ccancel()
-			for i := len(stopCommands) - 1; i >= 0; i-- {
-				if out, err := sourceSSHClient.Run(cctx, stopCommands[i]); err != nil {
+			pollStopCommands(&sourceStopCommands, 5*time.Second, func(cmd string) {
+				cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer ccancel()
+				if out, err := sourceSSHClient.Run(cctx, cmd); err != nil {
 					trace.Error("failed to stop source nbd bridge", "trigger", trigger, "error", err, "output", out)
 				}
-			}
+			})
 		})
 	}
 	// thawSource is the interrupt-cleanup counterpart to the filesystem
