@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"vmsync/pkg/remotessh"
+	"vmsync/pkg/trace"
 	"vmsync/pkg/util"
 )
 
@@ -44,6 +45,18 @@ const bridgeStateDir = "/run/vmsync-bridge"
 // actually be running before returning, and returns a stop command the
 // caller should append to its own teardown list -- this function does not
 // manage the bridge's lifecycle itself beyond that.
+//
+// A caller only ever gets one of two outcomes: a confirmed-running bridge
+// plus the stop command to register, or a non-nil error with nothing left
+// running on client. Once the start command has been issued, any failure
+// path (the SSH call itself failing, or the process never reaching
+// listening state) kills and cleans up whatever was just started before
+// returning -- see killOrphanedRemoteBridge. Without that, a slow or wedged
+// helper failing its readiness check would leave the actual backgrounded
+// process running on the remote host indefinitely: the empty stopCmd this
+// returns alongside an error was never something any caller could act on,
+// since the whole point of a stop command is to name the pidFile/logFile a
+// caller doesn't otherwise know.
 func StartRemote(ctx context.Context, client *remotessh.Client, bridgePort, realPort int, cfg Config) (stopCmd string, err error) {
 	if out, err := client.Run(ctx, "mkdir -p "+util.ShQuote(bridgeStateDir)); err != nil {
 		return "", fmt.Errorf("create bridge state dir %s: %w: %s", bridgeStateDir, err, out)
@@ -54,14 +67,37 @@ func StartRemote(ctx context.Context, client *remotessh.Client, bridgePort, real
 
 	startCmd := BuildStartCommand(cfg, bridgePort, realPort, pidFile, logFile)
 	if out, err := client.Run(ctx, startCmd); err != nil {
+		// The backgrounded helper may or may not have actually forked before
+		// the SSH call itself failed -- ambiguous, but killOrphanedRemoteBridge
+		// is safe to run either way (see its own doc comment).
+		killOrphanedRemoteBridge(ctx, client, pidFile, logFile, bridgePort)
 		return "", fmt.Errorf("start remote nbd bridge on port %d: %w: %s", bridgePort, err, out)
 	}
 
 	if err := waitForRemoteListening(ctx, client, bridgePort, pidFile, 10*time.Second); err != nil {
+		killOrphanedRemoteBridge(ctx, client, pidFile, logFile, bridgePort)
 		return "", fmt.Errorf("remote nbd bridge on port %d did not start: %w", bridgePort, err)
 	}
 
 	return BuildStopCommand(pidFile, logFile), nil
+}
+
+// killOrphanedRemoteBridge best-effort kills and removes the bookkeeping
+// files for the helper process StartRemote just tried to start, for any of
+// its failure paths after the start command was issued. Reuses
+// BuildStopCommand verbatim -- the same command a successful start would
+// have handed back to the caller to run later -- rather than a separate,
+// parallel cleanup implementation: its "kill ... || true" and "rm -f" are
+// already tolerant of pidFile never having been written at all (e.g. the
+// start command's SSH channel failed before the backgrounded process could
+// even fork), so it's safe to run unconditionally on any of these paths.
+// Only logs its own failure rather than returning it: the error that
+// triggered this cleanup is what the caller needs to see, and a failed
+// best-effort cleanup attempt must not shadow it.
+func killOrphanedRemoteBridge(ctx context.Context, client *remotessh.Client, pidFile, logFile string, bridgePort int) {
+	if out, err := client.Run(ctx, BuildStopCommand(pidFile, logFile)); err != nil {
+		trace.Warning("failed to clean up remote nbd bridge helper after a failed start -- it may still be running on the remote host", "port", bridgePort, "error", err, "output", out)
+	}
 }
 
 // waitForRemoteListening polls the remote host's own socket table (via "ss")
