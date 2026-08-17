@@ -38,6 +38,29 @@ import (
 // modest 8MiB of buffer memory.
 const defaultMaxBufferSize = 1024 * 1024
 
+// noProgressTimeout bounds how long CopyExtentsTCP's and compareTCP's AIO
+// pipelines will run without a single read or write completing anywhere
+// before concluding the connection is stuck rather than merely slow. A
+// half-open TCP connection -- the remote end vanished without a FIN/RST,
+// e.g. behind a NAT/firewall that silently dropped the mapping, or after a
+// hard network partition -- leaves every in-flight command pending forever:
+// Poll never errors and AioCommandCompleted never returns done, so nothing
+// in either pipeline would otherwise ever notice. Left unbounded, this
+// spins the calling goroutine forever while holding the source's
+// block-copy backup job open, blocking any future checkpoint or reinit
+// against that domain until the process is killed by hand. 120s is
+// generous enough to tolerate one genuinely slow chunk (even a full
+// negotiated buffer over a heavily-compressed, high-latency link) without
+// tripping on legitimate slowness.
+const noProgressTimeout = 120 * time.Second
+
+// stalled reports whether more than timeout has elapsed since lastProgress.
+// Extracted so the exact boundary (>= timeout, not >) is directly testable
+// without needing a real, artificially-stuck NBD connection.
+func stalled(lastProgress, now time.Time, timeout time.Duration) bool {
+	return now.Sub(lastProgress) >= timeout
+}
+
 type Extent struct {
 	Offset uint64
 	Length uint64
@@ -288,6 +311,7 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 
 	start := time.Now()
 	lastLog := start
+	lastProgress := start
 
 	// Pipeline reads and writes instead of doing them strictly one at a time:
 	// on local/low-latency links the dominant per-chunk cost isn't network
@@ -358,6 +382,10 @@ copyLoop:
 			break copyLoop
 		default:
 		}
+		if stalled(lastProgress, time.Now(), noProgressTimeout) {
+			copyErr = fmt.Errorf("nbd copy stalled: no read or write completed in over %s -- source or target connection may be half-open", noProgressTimeout)
+			break copyLoop
+		}
 
 		// Fill any free slot with the next chunk's read.
 		for i := range slots {
@@ -420,6 +448,7 @@ copyLoop:
 			if !done {
 				continue
 			}
+			lastProgress = time.Now()
 			reading--
 			if slots[i].opErr != 0 {
 				// Confirmed complete (done == true) even though it failed,
@@ -470,6 +499,7 @@ copyLoop:
 			if !done {
 				continue
 			}
+			lastProgress = time.Now()
 			writing--
 			if slots[i].opErr != 0 {
 				slots[i].buf.Free()
@@ -778,6 +808,7 @@ func compareTCP(ctx context.Context, aHost string, aPort int, aExport string, bH
 	}
 
 	start := time.Now()
+	lastProgress := start
 	var compareErr error
 
 compareLoop:
@@ -787,6 +818,10 @@ compareLoop:
 			compareErr = fmt.Errorf("nbd compare cancelled: %w", ctx.Err())
 			break compareLoop
 		default:
+		}
+		if stalled(lastProgress, time.Now(), noProgressTimeout) {
+			compareErr = fmt.Errorf("nbd compare stalled: no read completed in over %s -- source or target connection may be half-open", noProgressTimeout)
+			break compareLoop
 		}
 
 		// Fill any fully-idle slot with the next chunk's paired reads.
@@ -880,6 +915,7 @@ compareLoop:
 			if !done {
 				continue
 			}
+			lastProgress = time.Now()
 			if slots[i].errA != 0 {
 				// Confirmed complete (done == true) even though it failed,
 				// so per libnbd's contract the buffer is safe to free now.
@@ -904,6 +940,7 @@ compareLoop:
 			if !done {
 				continue
 			}
+			lastProgress = time.Now()
 			if slots[i].errB != 0 {
 				slots[i].bufB.Free()
 				slots[i].stateB = sideIdle

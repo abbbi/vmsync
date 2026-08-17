@@ -449,6 +449,67 @@ func TestDiffSubRanges(t *testing.T) {
 	}
 }
 
+// TestStalled is a pure-function regression test for the bug this was
+// extracted to fix: CopyExtentsTCP's and compareTCP's AIO pipelines only
+// ever checked ctx.Done() between iterations, so a half-open TCP connection
+// -- one where the OS-level socket stays open but the remote end never
+// sends or acknowledges anything again -- left Poll returning cleanly on
+// every 10ms timeout and AioCommandCompleted never confirming a command
+// either way, spinning the loop forever with no error for anything to
+// observe. Needs no qemu-nbd, and deliberately avoids a real 120-second
+// sleep by driving the pure time comparison directly.
+func TestStalled(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	const timeout = 120 * time.Second
+
+	cases := []struct {
+		name         string
+		lastProgress time.Time
+		now          time.Time
+		want         bool
+	}{
+		{
+			name:         "well within the timeout",
+			lastProgress: base,
+			now:          base.Add(1 * time.Second),
+			want:         false,
+		},
+		{
+			name:         "just under the timeout",
+			lastProgress: base,
+			now:          base.Add(timeout - time.Millisecond),
+			want:         false,
+		},
+		{
+			name:         "exactly at the timeout counts as stalled",
+			lastProgress: base,
+			now:          base.Add(timeout),
+			want:         true,
+		},
+		{
+			name:         "well past the timeout",
+			lastProgress: base,
+			now:          base.Add(timeout + time.Hour),
+			want:         true,
+		},
+		{
+			name:         "no time elapsed at all -- fresh progress",
+			lastProgress: base,
+			now:          base,
+			want:         false,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := stalled(c.lastProgress, c.now, timeout)
+			if got != c.want {
+				t.Fatalf("stalled(lastProgress, now, %s) = %v, want %v", timeout, got, c.want)
+			}
+		})
+	}
+}
+
 // TestNegotiateBufferSizeReturnsPositiveValue exercises negotiateBufferSize
 // directly (it's unexported, hence this test living in-package) against two
 // real, connected NBD handles. See this file's own top-of-file comment for
