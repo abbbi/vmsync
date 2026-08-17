@@ -337,6 +337,19 @@ func overlapsAnyExtent(m nbdsync.MismatchRange, touched []nbdsync.Extent) bool {
 	return false
 }
 
+// ErrCallTimedOut distinguishes callWithTimeout giving up on its own
+// deadline from fn itself returning a real error. Only the former leaves
+// fn's goroutine still potentially running in the background (see
+// callWithTimeout's own doc comment) -- a caller also holding a
+// *libvirt.Domain/*libvirt.Connect handle fn operated on must treat
+// errors.Is(err, ErrCallTimedOut) as "this handle may still be in use by
+// an abandoned goroutine" and avoid ever Free()/Close()-ing it afterward,
+// or risk a native use-after-free the moment that goroutine's cgo call
+// eventually does return and touches memory Go has already released. A
+// real error from fn carries no such risk: fn already returned, so its
+// goroutine is already exiting on its own.
+var ErrCallTimedOut = errors.New("underlying goroutine abandoned, may still be running")
+
 // callWithTimeout runs a blocking libvirt/cgo call in its own goroutine and
 // gives up waiting for it after timeout. libvirt calls have no built-in
 // cancellation, so a genuinely stuck call still runs to completion in the
@@ -352,7 +365,7 @@ func callWithTimeout(name string, timeout time.Duration, fn func() error) error 
 	case err := <-done:
 		return err
 	case <-time.After(timeout):
-		return fmt.Errorf("%s timed out after %s", name, timeout)
+		return fmt.Errorf("%s timed out after %s (%w)", name, timeout, ErrCallTimedOut)
 	}
 }
 
@@ -366,6 +379,30 @@ func callWithTimeout(name string, timeout time.Duration, fn func() error) error 
 // anything, must never emit verification metrics -- is directly testable.
 func verificationRan(verify string, attempted bool) bool {
 	return verify != "" && attempted
+}
+
+// finalRunState decides what outcome writeMetricsTextfile should report,
+// given everything run() (or the signal handler, on its behalf) knows by
+// the time it's ready to write. wasInterrupted forcing StateFailure --
+// ahead of and regardless of runErr/fsFreezeFailed -- is what makes
+// run()'s own deferred metrics write and the signal handler's own direct
+// one (metrics.StateFailure, right before os.Exit) compute the IDENTICAL
+// result whenever a signal arrives: run()'s goroutine keeps executing
+// independently of any signal, so it's not guaranteed to be skipped just
+// because a signal handler is heading for os.Exit, and the two calls can
+// genuinely race on writing the same textfile. Making them agree removes
+// the race's only consequence (which one wins no longer matters, since
+// both would write the same thing) instead of trying to prevent the race
+// itself. An interrupted run must never be able to report success, no
+// matter which write lands last.
+func finalRunState(runErr error, wasInterrupted, fsFreezeFailed bool) int {
+	if runErr != nil || wasInterrupted {
+		return metrics.StateFailure
+	}
+	if fsFreezeFailed {
+		return metrics.StateFSFreezeFailed
+	}
+	return metrics.StateSuccess
 }
 
 // unverifiableCheckpointMetadataError decides whether an unreadable or
@@ -504,6 +541,54 @@ func run(cfg struct {
 	var srcState bool
 	var targetSSHClient *remotessh.Client
 	var sourceSSHClient *remotessh.Client
+	// interruptedMu/interrupted close a race between the signal handler's
+	// own metrics write (always metrics.StateFailure, right before
+	// os.Exit) and run()'s own deferred one (whatever runErr/fsFreezeFailed
+	// say once run() actually returns): run()'s goroutine keeps executing
+	// independently of any signal, so it's not guaranteed to be skipped
+	// just because a signal handler is heading for os.Exit -- the two can
+	// genuinely race, each computing a DIFFERENT state and writing the
+	// prometheus textfile at roughly the same time, with whichever finishes
+	// last winning nondeterministically. Rather than trying to make only
+	// one of them actually write (a real ordering constraint, harder to get
+	// right here since the two computations are otherwise independent),
+	// the signal handler sets this the moment it receives a signal, and
+	// run()'s own deferred write checks it: once true, run()'s own write
+	// ALSO reports failure regardless of runErr, so if they do race, both
+	// end up writing the identical outcome -- an interrupted run must never
+	// be able to report success, no matter which write happens to land
+	// last.
+	var interruptedMu sync.Mutex
+	var interrupted bool
+	// srcDomMu/srcDomMaybeInUse track whether any callWithTimeout call
+	// touching srcDom directly has ever timed out (see ErrCallTimedOut's
+	// own doc comment) -- meaning its goroutine might still be inside a
+	// cgo call using srcDom when this function is otherwise ready to
+	// Free() it. Checked at srcDom's own deferred Free() below: skipping
+	// that call and leaking the handle for the remainder of this (already
+	// exiting) process's short lifetime is the safe tradeoff, matching the
+	// same abandon-rather-than-risk-a-native-use-after-free precedent
+	// pkg/nbdsync's own AIO drain-timeout path already established for
+	// stuck in-flight buffers.
+	var srcDomMu sync.Mutex
+	var srcDomMaybeInUse bool
+	// defineDomainMu/defineDomainInFlight fence libvirtsync.DefineDomain's
+	// own undefine-then-redefine window (near the very end of run(), once
+	// the copy has already succeeded) against the signal handler's
+	// unconditional os.Exit: this session's own -reinit fix already
+	// narrowed that window down to two sequential libvirt calls with
+	// nothing in between (down from spanning the entire, much longer copy
+	// phase before), but a signal landing in the gap between them is still
+	// possible in principle, and DefineDomain's own rollback machinery
+	// (restoring the target's prior definition) only ever triggers on a
+	// SYNCHRONOUS error one of its own steps returns -- an external
+	// os.Exit gives it no chance to run at all, leaving the target
+	// genuinely undefined with nothing having ever attempted to restore
+	// it. Set true immediately before the call, false immediately after
+	// (success or failure) -- the signal handler checks this, right before
+	// its own os.Exit, and waits briefly for it to clear first.
+	var defineDomainMu sync.Mutex
+	var defineDomainInFlight bool
 	var abortOnce sync.Once
 	var backupMu sync.Mutex
 	var backupActive bool = false
@@ -700,16 +785,10 @@ func run(cfg struct {
 	// update, DefineDomain) can still fail after every disk has already
 	// synced successfully.
 	defer func() {
-		state := metrics.StateSuccess
-		if runErr != nil {
-			state = metrics.StateFailure
-		} else if fsFreezeFailed {
-			// A failed run (above) always takes priority over this -- a
-			// degraded-but-completed freeze is meaningfully less severe than
-			// the sync not having completed at all.
-			state = metrics.StateFSFreezeFailed
-		}
-		writeMetricsTextfile(state)
+		interruptedMu.Lock()
+		wasInterrupted := interrupted
+		interruptedMu.Unlock()
+		writeMetricsTextfile(finalRunState(runErr, wasInterrupted, fsFreezeFailed))
 	}()
 
 	netbufferBlock, netbufferSize, err := nbdbridge.ParseNetBufferSpec(cfg.NetBuffer)
@@ -766,7 +845,37 @@ func run(cfg struct {
 	if err != nil {
 		return err
 	}
-	defer srcDom.Free()
+	// Conditional, not a bare defer srcDom.Free(): see srcDomMu/
+	// srcDomMaybeInUse's own doc comment above. Every signal-handler
+	// cleanup closure below that calls callWithTimeout directly on srcDom
+	// goes through callOnSrcDom instead, specifically so a timeout there
+	// is reflected here before this ever runs.
+	defer func() {
+		srcDomMu.Lock()
+		maybeInUse := srcDomMaybeInUse
+		srcDomMu.Unlock()
+		if maybeInUse {
+			trace.Warning("a prior call against the source domain handle timed out and its goroutine was abandoned -- leaking the handle instead of calling Free() on it, to avoid a native use-after-free if that goroutine is still running")
+			return
+		}
+		srcDom.Free()
+	}()
+	// callOnSrcDom wraps callWithTimeout for the cleanup calls below that
+	// touch srcDom directly (as opposed to the "via reconnect" fallbacks,
+	// which open their own separate, self-contained connection and so
+	// don't put srcDom itself at risk): a timeout here means srcDom may
+	// still be in use by an abandoned goroutine, recorded via
+	// srcDomMaybeInUse so the deferred Free() above knows to leak rather
+	// than risk a native use-after-free.
+	callOnSrcDom := func(name string, fn func() error) error {
+		err := callWithTimeout(name, 5*time.Second, fn)
+		if errors.Is(err, ErrCallTimedOut) {
+			srcDomMu.Lock()
+			srcDomMaybeInUse = true
+			srcDomMu.Unlock()
+		}
+		return err
+	}
 
 	if srcState, err = libvirtsync.DomainActive(srcDom); err != nil {
 		return err
@@ -830,7 +939,7 @@ func run(cfg struct {
 			if !suspendedForVerify {
 				return
 			}
-			resumeErr := callWithTimeout("resume source vm", 5*time.Second, func() error {
+			resumeErr := callOnSrcDom("resume source vm", func() error {
 				return srcDom.Resume()
 			})
 			if resumeErr != nil {
@@ -882,7 +991,7 @@ func run(cfg struct {
 			backupMu.Unlock()
 			if wasActive {
 				trace.Info("stopping libvirt backup job", "trigger", trigger)
-				stopErr := callWithTimeout("abort backup job", 5*time.Second, func() error {
+				stopErr := callOnSrcDom("abort backup job", func() error {
 					return libvirtsync.StopBackup(srcDom)
 				})
 				if stopErr != nil {
@@ -897,7 +1006,7 @@ func run(cfg struct {
 			}
 			if started {
 				trace.Info("destroying vm as it was started by sync process")
-				if destroyErr := callWithTimeout("destroy vm", 5*time.Second, func() error {
+				if destroyErr := callOnSrcDom("destroy vm", func() error {
 					return srcDom.Destroy()
 				}); destroyErr != nil {
 					trace.Error("destroy vm timed out or failed", "trigger", trigger, "error", destroyErr)
@@ -944,7 +1053,7 @@ func run(cfg struct {
 			backupActive = false
 			backupMu.Unlock()
 			if shouldStop {
-				stopErr := callWithTimeout("stop verify-window backup job", 5*time.Second, func() error {
+				stopErr := callOnSrcDom("stop verify-window backup job", func() error {
 					return libvirtsync.StopBackup(srcDom)
 				})
 				if stopErr != nil {
@@ -952,7 +1061,7 @@ func run(cfg struct {
 				}
 			}
 
-			delErr := callWithTimeout("delete verify-window checkpoint", 5*time.Second, func() error {
+			delErr := callOnSrcDom("delete verify-window checkpoint", func() error {
 				return libvirtsync.DeleteVerifyWindowCheckpoint(srcDom)
 			})
 			if delErr != nil {
@@ -986,9 +1095,23 @@ func run(cfg struct {
 	// for up to maxWait but giving up early once two consecutive checks
 	// find nothing new, catches stragglers without either missing them or
 	// waiting the full duration on the common case of nothing left to
-	// clean up. Runs everything found in reverse registration order within
-	// each batch, matching the original teardown-in-reverse-of-setup
-	// intent (e.g. stop a bridge helper before the export it wraps).
+	// clean up.
+	//
+	// Runs everything found in REGISTRATION order within each batch, not
+	// reverse: for each disk, the qemu-nbd export holding that disk's own
+	// write lock is registered first, its bridge helper (if any) second --
+	// registration order attempts the lock-holder first, reverse order
+	// would attempt it last. Each command already gets its own independent
+	// timeout below (a slow or hung one no longer eats into a shared
+	// budget the way one pre-existing bytes-shared context used to), but
+	// they still run one at a time, in sequence, within a batch -- if
+	// something cuts this short regardless (an operator's second Ctrl+C
+	// forcing an immediate exit, say), attempting the disk-lock holder
+	// first means it's the one most likely to have actually been reached,
+	// not the bridge helper sitting in front of it. A stray bridge helper
+	// left running is a harmless orphaned network listener; a stray
+	// qemu-nbd export left running holds the disk file open, blocking a
+	// future -reinit's rm -f or the next sync's own attempt to reopen it.
 	pollStopCommands := func(list *[]string, maxWait time.Duration, run func(cmd string)) {
 		processed := 0
 		deadline := time.Now().Add(maxWait)
@@ -1004,8 +1127,8 @@ func run(cfg struct {
 			} else {
 				quietRounds = 0
 			}
-			for i := len(pending) - 1; i >= 0; i-- {
-				run(pending[i])
+			for _, cmd := range pending {
+				run(cmd)
 			}
 			if quietRounds >= 2 || time.Now().After(deadline) {
 				return
@@ -1068,7 +1191,7 @@ func run(cfg struct {
 				return
 			}
 			trace.Info("thawing source filesystem", "trigger", trigger)
-			if err := callWithTimeout("thaw source filesystem", 5*time.Second, func() error {
+			if err := callOnSrcDom("thaw source filesystem", func() error {
 				libvirtsync.ThawFs(srcDom, true)
 				return nil
 			}); err != nil {
@@ -1136,7 +1259,7 @@ func run(cfg struct {
 			if name == "" || !advanced || copySucceeded {
 				return
 			}
-			if err := callWithTimeout("delete checkpoint", 5*time.Second, func() error {
+			if err := callOnSrcDom("delete checkpoint", func() error {
 				return libvirtsync.DeleteCheckpointIfExists(srcDom, name)
 			}); err != nil {
 				trace.Error("failed to delete checkpoint", "trigger", trigger, "checkpoint", name, "error", err)
@@ -1163,6 +1286,9 @@ func run(cfg struct {
 		select {
 		case sig := <-sigCh:
 			trace.Info("received signal", "signal", sig.String())
+			interruptedMu.Lock()
+			interrupted = true
+			interruptedMu.Unlock()
 			// A second signal arriving while the cleanup below is still
 			// running (each of its reconnect fallbacks is now bounded, but
 			// "bounded" still means up to ~10s each, run in parallel below
@@ -1197,6 +1323,31 @@ func run(cfg struct {
 			go func() { defer cleanupWg.Done(); cleanupOrphanedCheckpoint(sig.String()) }()
 			cleanupWg.Wait()
 			cancel()
+
+			// Give DefineDomain's own undefine-then-redefine window (see
+			// defineDomainInFlight's own doc comment for why it's narrow
+			// but not zero) a brief, bounded chance to finish on its own
+			// before force-exiting through it -- its own rollback
+			// machinery already handles a synchronous failure correctly,
+			// but only os.Exit landing *outside* this window lets it ever
+			// run at all. Two sequential libvirt RPCs finish in a small
+			// fraction of this budget in the overwhelmingly common case,
+			// so this adds negligible delay to a normal interrupt; it
+			// exists entirely for the rare case where a signal happens to
+			// land inside the window.
+			defineDomainWaitDeadline := time.Now().Add(2 * time.Second)
+			for {
+				defineDomainMu.Lock()
+				inFlight := defineDomainInFlight
+				defineDomainMu.Unlock()
+				if !inFlight || time.Now().After(defineDomainWaitDeadline) {
+					if inFlight {
+						trace.Warning("timed out waiting for the target domain redefine to finish before exiting -- its own definition may be left in an inconsistent state; verify it by hand (virsh dumpxml) before trusting this target", "signal", sig.String())
+					}
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
 
 			// Everything externally visible (backup job, target bridge/
 			// qemu-nbd, checkpoint) is now torn down above. Don't wait for
@@ -2364,8 +2515,15 @@ func run(cfg struct {
 	for _, d := range qcowDisks {
 		rootSourceByLiveSource[d.Source] = d.RootSource
 	}
-	if err := libvirtsync.DefineDomain(tgtMgr, cfg.TargetDomain, newXML, cfg.TargetDiskPath, rootSourceByLiveSource); err != nil {
-		return err
+	defineDomainMu.Lock()
+	defineDomainInFlight = true
+	defineDomainMu.Unlock()
+	defineErr := libvirtsync.DefineDomain(tgtMgr, cfg.TargetDomain, newXML, cfg.TargetDiskPath, rootSourceByLiveSource)
+	defineDomainMu.Lock()
+	defineDomainInFlight = false
+	defineDomainMu.Unlock()
+	if defineErr != nil {
+		return defineErr
 	}
 
 	// Records this source<->target relationship on the SOURCE's own

@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"vmsync/pkg/metrics"
 	"vmsync/pkg/nbdsync"
 )
 
@@ -179,6 +180,9 @@ func TestCallWithTimeout(t *testing.T) {
 		if err != wantErr {
 			t.Fatalf("callWithTimeout returned %v, want the exact sentinel error %v", err, wantErr)
 		}
+		if errors.Is(err, ErrCallTimedOut) {
+			t.Fatal("errors.Is(err, ErrCallTimedOut) = true for a fast, real failure -- fn already returned, its goroutine isn't abandoned, callers must not treat this the same as a timeout")
+		}
 	})
 
 	t.Run("a call that outlives the timeout is given up on promptly", func(t *testing.T) {
@@ -196,6 +200,9 @@ func TestCallWithTimeout(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "timed out after") {
 			t.Fatalf("error = %q, want it to contain %q", err.Error(), "timed out after")
+		}
+		if !errors.Is(err, ErrCallTimedOut) {
+			t.Fatalf("errors.Is(err, ErrCallTimedOut) = false for %q, want true -- callers rely on this to know fn's goroutine may still be running", err)
 		}
 		// callWithTimeout must not wait for the orphaned goroutine to finish
 		// its full sleep -- it should give up right around timeout, well
@@ -232,6 +239,39 @@ func TestVerificationRan(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("verificationRan(%q, %v) = %v, want %v", tc.verify, tc.attempted, got, tc.want)
 		}
+	}
+}
+
+// TestFinalRunState covers the exact guarantee this was extracted to make
+// testable and enforceable: an interrupted run must report failure no
+// matter what runErr/fsFreezeFailed say, because run()'s own deferred
+// metrics write and the signal handler's own direct one (always
+// metrics.StateFailure) can genuinely race on writing the same textfile --
+// making both computations agree, via wasInterrupted, removes the race's
+// only consequence instead of trying to prevent the race itself.
+func TestFinalRunState(t *testing.T) {
+	boom := errors.New("boom")
+	cases := []struct {
+		name           string
+		runErr         error
+		wasInterrupted bool
+		fsFreezeFailed bool
+		want           int
+	}{
+		{name: "clean success", runErr: nil, wasInterrupted: false, fsFreezeFailed: false, want: metrics.StateSuccess},
+		{name: "runErr alone -> failure", runErr: boom, wasInterrupted: false, fsFreezeFailed: false, want: metrics.StateFailure},
+		{name: "interrupted alone, runErr nil -> still failure", runErr: nil, wasInterrupted: true, fsFreezeFailed: false, want: metrics.StateFailure},
+		{name: "interrupted takes priority over a completed freeze", runErr: nil, wasInterrupted: true, fsFreezeFailed: true, want: metrics.StateFailure},
+		{name: "runErr takes priority over a completed freeze", runErr: boom, wasInterrupted: false, fsFreezeFailed: true, want: metrics.StateFailure},
+		{name: "fsFreezeFailed alone -> degraded, not full failure", runErr: nil, wasInterrupted: false, fsFreezeFailed: true, want: metrics.StateFSFreezeFailed},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := finalRunState(tc.runErr, tc.wasInterrupted, tc.fsFreezeFailed); got != tc.want {
+				t.Errorf("finalRunState(runErr=%v, wasInterrupted=%v, fsFreezeFailed=%v) = %v, want %v", tc.runErr, tc.wasInterrupted, tc.fsFreezeFailed, got, tc.want)
+			}
+		})
 	}
 }
 
