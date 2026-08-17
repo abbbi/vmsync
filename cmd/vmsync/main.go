@@ -1458,7 +1458,7 @@ func run(cfg struct {
 		// one it is. Target-side paths are named after this base, not
 		// d.Source, so they keep matching the real target file that
 		// earlier syncs already created under the same resolved name.
-		rootPath := chain[len(chain)-1].Filename
+		rootPath := disk.ResolveRootSource(chain, d.Source)
 		if rootPath != d.Source {
 			trace.Info("disk has a backing file chain, resolved target-side naming to its base (external snapshot or linked clone)", "disk", d.TargetDev, "active", d.Source, "base", rootPath)
 		}

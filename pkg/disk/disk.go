@@ -156,6 +156,28 @@ func QemuImgInfoChainJSONRemote(ctx context.Context, runner CommandRunner, path 
 	return chain, nil
 }
 
+// ResolveRootSource walks chain -- as returned by QemuImgInfoChainJSON or
+// QemuImgInfoChainJSONRemote, ordered top (the disk's current, active file)
+// to base -- down to its last element, the stable base file a backing chain
+// eventually bottoms out at, and returns its Filename. This is exactly
+// QcowDisk.RootSource's own value: see that field's doc comment for why
+// target-side paths must be named after this base rather than source (the
+// disk's current, active file), and why a chain longer than one element
+// doesn't by itself distinguish an external snapshot from a permanent qcow2
+// linked clone -- both look identical from here.
+//
+// Falls back to source, unchanged, if chain is empty -- defensive only: the
+// real callers above always get a non-empty chain or a non-nil error from
+// qemu-img itself (see QemuImgInfoChainJSON's own doc comment), so this
+// should never actually trigger, but avoids an index-out-of-range panic
+// rather than assume that invariant holds for every future caller too.
+func ResolveRootSource(chain []QemuImgInfo, source string) string {
+	if len(chain) == 0 {
+		return source
+	}
+	return chain[len(chain)-1].Filename
+}
+
 // CompareImages runs qemu-img compare between refA and refB -- each any
 // qemu-img-recognized image reference (a local file path, or a network URL
 // such as "nbd://host:port/export"). It runs as a local subprocess wherever
