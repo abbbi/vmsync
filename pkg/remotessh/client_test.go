@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -71,6 +72,168 @@ func TestExpandHome(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := expandHome(tc.in); got != tc.want {
 				t.Errorf("expandHome(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveSSHConnectionParams covers ConfigFromLibvirtURI's actual
+// precedence rules -- host/user/port/keyPath/timeout -- directly, with a
+// synthetic sshConfig map standing in for whatever `ssh -G <alias>` would
+// have resolved. This is the logic that decides where every SSH-executed
+// command actually runs (and therefore, for example, what host -reinit's
+// own disk-deletion command targets), split out from ConfigFromLibvirtURI
+// specifically so it doesn't need a real `ssh` binary or a real
+// ~/.ssh/config to test.
+func TestResolveSSHConnectionParams(t *testing.T) {
+	cases := []struct {
+		name       string
+		uriHost    string
+		uriUser    string
+		user       string
+		keyPath    string
+		port       int
+		timeout    time.Duration
+		sshConfig  map[string]string
+		wantAddr   string
+		wantUser   string
+		wantKey    string
+		wantPort   int
+		wantTimeout time.Duration
+	}{
+		{
+			name:        "nothing set anywhere falls back to uri host, root, port 22, no key, 10s timeout",
+			uriHost:     "target.example.com",
+			sshConfig:   map[string]string{},
+			wantAddr:    "target.example.com",
+			wantUser:    "root",
+			wantKey:     "",
+			wantPort:    22,
+			wantTimeout: 10 * time.Second,
+		},
+		{
+			name:      "ssh_config hostname overrides the uri's own host",
+			uriHost:   "alias",
+			sshConfig: map[string]string{"hostname": "10.0.0.5"},
+			wantAddr:  "10.0.0.5",
+			wantUser:  "root",
+			wantPort:  22,
+		},
+		{
+			name:      "uri-embedded user is used when no explicit user is given",
+			uriHost:   "target.example.com",
+			uriUser:   "libvirt-user",
+			sshConfig: map[string]string{},
+			wantAddr:  "target.example.com",
+			wantUser:  "libvirt-user",
+			wantPort:  22,
+		},
+		{
+			name:      "ssh_config user is used when neither explicit nor uri user is set",
+			uriHost:   "alias",
+			sshConfig: map[string]string{"user": "cfguser"},
+			wantAddr:  "alias",
+			wantUser:  "cfguser",
+			wantPort:  22,
+		},
+		{
+			name:      "explicit user wins over both uri user and ssh_config user",
+			uriHost:   "alias",
+			uriUser:   "uriuser",
+			user:      "explicituser",
+			sshConfig: map[string]string{"user": "cfguser"},
+			wantAddr:  "alias",
+			wantUser:  "explicituser",
+			wantPort:  22,
+		},
+		{
+			name:      "explicit port wins over ssh_config port",
+			uriHost:   "alias",
+			port:      2222,
+			sshConfig: map[string]string{"port": "3333"},
+			wantAddr:  "alias",
+			wantUser:  "root",
+			wantPort:  2222,
+		},
+		{
+			name:      "ssh_config port is used when no explicit port is given",
+			uriHost:   "alias",
+			sshConfig: map[string]string{"port": "3333"},
+			wantAddr:  "alias",
+			wantUser:  "root",
+			wantPort:  3333,
+		},
+		{
+			name:      "an invalid ssh_config port falls back to 22 rather than propagating garbage",
+			uriHost:   "alias",
+			sshConfig: map[string]string{"port": "not-a-number"},
+			wantAddr:  "alias",
+			wantUser:  "root",
+			wantPort:  22,
+		},
+		{
+			name:      "a zero or negative ssh_config port falls back to 22",
+			uriHost:   "alias",
+			sshConfig: map[string]string{"port": "0"},
+			wantAddr:  "alias",
+			wantUser:  "root",
+			wantPort:  22,
+		},
+		{
+			name:      "explicit key path wins over ssh_config identityfile",
+			uriHost:   "alias",
+			keyPath:   "/explicit/id_rsa",
+			sshConfig: map[string]string{"identityfile": "/cfg/id_rsa"},
+			wantAddr:  "alias",
+			wantUser:  "root",
+			wantKey:   "/explicit/id_rsa",
+			wantPort:  22,
+		},
+		{
+			// An absolute path, so expandHome (already covered by its own
+			// test) is a no-op here -- this is only pinning down that
+			// ConfigFromLibvirtURI's own resolution reaches for
+			// ssh_config's identityfile at all, not re-testing expandHome.
+			name:      "ssh_config identityfile is used when no explicit key path is given",
+			uriHost:   "alias",
+			sshConfig: map[string]string{"identityfile": "/cfg/id_rsa"},
+			wantAddr:  "alias",
+			wantUser:  "root",
+			wantKey:   "/cfg/id_rsa",
+			wantPort:  22,
+		},
+		{
+			name:        "explicit timeout wins over the 10s default",
+			uriHost:     "alias",
+			timeout:     30 * time.Second,
+			sshConfig:   map[string]string{},
+			wantAddr:    "alias",
+			wantUser:    "root",
+			wantPort:    22,
+			wantTimeout: 30 * time.Second,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			wantTimeout := tc.wantTimeout
+			if wantTimeout == 0 {
+				wantTimeout = 10 * time.Second
+			}
+			addr, user, keyPath, port, timeout := resolveSSHConnectionParams(tc.uriHost, tc.uriUser, tc.user, tc.keyPath, tc.port, tc.timeout, tc.sshConfig)
+			if addr != tc.wantAddr {
+				t.Errorf("address = %q, want %q", addr, tc.wantAddr)
+			}
+			if user != tc.wantUser {
+				t.Errorf("user = %q, want %q", user, tc.wantUser)
+			}
+			if keyPath != tc.wantKey {
+				t.Errorf("keyPath = %q, want %q", keyPath, tc.wantKey)
+			}
+			if port != tc.wantPort {
+				t.Errorf("port = %d, want %d", port, tc.wantPort)
+			}
+			if timeout != wantTimeout {
+				t.Errorf("timeout = %s, want %s", timeout, wantTimeout)
 			}
 		})
 	}

@@ -87,14 +87,49 @@ func ConfigFromLibvirtURI(libvirtURI, user, keyPath, password, knownHostsPath st
 	alias := u.Hostname()
 	sshConfig := resolveSSHConfig(alias)
 
-	address := alias
+	uriUser := ""
+	if u.User != nil {
+		uriUser = u.User.Username()
+	}
+
+	address, resolvedUser, resolvedKeyPath, resolvedPort, resolvedTimeout := resolveSSHConnectionParams(alias, uriUser, user, keyPath, port, timeout, sshConfig)
+
+	trace.Debug("resolved ssh_config for host", "alias", alias, "address", address, "user", resolvedUser, "port", resolvedPort, "key", resolvedKeyPath)
+
+	return Config{
+		Address:               address,
+		Port:                  resolvedPort,
+		User:                  resolvedUser,
+		PrivateKeyPath:        resolvedKeyPath,
+		Password:              password,
+		InsecureIgnoreHostKey: insecure,
+		KnownHostsPath:        knownHostsPath,
+		Timeout:               resolvedTimeout,
+	}, nil
+}
+
+// resolveSSHConnectionParams decides the final address/user/keyPath/port/
+// timeout ConfigFromLibvirtURI uses -- the exact precedence that governs
+// where every SSH-executed command actually runs (and therefore, for
+// example, what host -reinit's own disk-deletion command targets). Inputs:
+// uriHost/uriUser come from the libvirt URI itself; user/keyPath/port/
+// timeout are vmsync's own explicit CLI-flag overrides (-ssh-user/-ssh-key/
+// -ssh-port/-ssh-timeout), which always win when set, regardless of source;
+// sshConfig is `ssh -G <alias>`'s own resolved output (see resolveSSHConfig)
+// for whatever an explicit flag didn't already decide.
+//
+// Split out from ConfigFromLibvirtURI specifically so this precedence is
+// directly testable with a synthetic sshConfig map, without needing a real
+// `ssh` binary or a real ~/.ssh/config the way resolveSSHConfig itself does.
+func resolveSSHConnectionParams(uriHost, uriUser, user, keyPath string, port int, timeout time.Duration, sshConfig map[string]string) (address, resolvedUser, resolvedKeyPath string, resolvedPort int, resolvedTimeout time.Duration) {
+	address = uriHost
 	if hostname := sshConfig["hostname"]; hostname != "" {
 		address = hostname
 	}
 
-	resolvedUser := user
-	if resolvedUser == "" && u.User != nil {
-		resolvedUser = u.User.Username()
+	resolvedUser = user
+	if resolvedUser == "" {
+		resolvedUser = uriUser
 	}
 	if resolvedUser == "" {
 		resolvedUser = sshConfig["user"]
@@ -103,40 +138,31 @@ func ConfigFromLibvirtURI(libvirtURI, user, keyPath, password, knownHostsPath st
 		resolvedUser = "root"
 	}
 
-	if port <= 0 {
+	resolvedPort = port
+	if resolvedPort <= 0 {
 		if portStr := sshConfig["port"]; portStr != "" {
 			if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
-				port = p
+				resolvedPort = p
 			}
 		}
 	}
-	if port <= 0 {
-		port = 22
+	if resolvedPort <= 0 {
+		resolvedPort = 22
 	}
 
-	resolvedKeyPath := keyPath
+	resolvedKeyPath = keyPath
 	if resolvedKeyPath == "" {
 		if idFile := sshConfig["identityfile"]; idFile != "" {
 			resolvedKeyPath = expandHome(idFile)
 		}
 	}
 
-	if timeout <= 0 {
-		timeout = 10 * time.Second
+	resolvedTimeout = timeout
+	if resolvedTimeout <= 0 {
+		resolvedTimeout = 10 * time.Second
 	}
 
-	trace.Debug("resolved ssh_config for host", "alias", alias, "address", address, "user", resolvedUser, "port", port, "key", resolvedKeyPath)
-
-	return Config{
-		Address:               address,
-		Port:                  port,
-		User:                  resolvedUser,
-		PrivateKeyPath:        resolvedKeyPath,
-		Password:              password,
-		InsecureIgnoreHostKey: insecure,
-		KnownHostsPath:        knownHostsPath,
-		Timeout:               timeout,
-	}, nil
+	return address, resolvedUser, resolvedKeyPath, resolvedPort, resolvedTimeout
 }
 
 // resolveSSHConfig shells out to the system's own `ssh -G alias` to get the
