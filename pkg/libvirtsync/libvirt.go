@@ -318,11 +318,23 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 	if err != nil {
 		// Fallback for cloning into same target where another domain already uses the UUID.
 		if strings.Contains(strings.ToLower(err.Error()), "already defined with uuid") {
+			// Logged as a Warning, not Info: this isn't a routine step --
+			// it means something ELSE on the target host currently claims
+			// the source's own UUID, and the consequence is significant
+			// and easy to miss otherwise: the target domain gets a brand
+			// new, randomly-assigned UUID (stripDomainUUID leaves none for
+			// libvirt to preserve), silently, on every single run this
+			// keeps happening. Anything tracking the target by UUID (an
+			// inventory system, another tool, an operator's own notes)
+			// would see it change out from under them with nothing in the
+			// logs to explain why, until now.
+			trace.Warning("target domain redefine hit a UUID collision with another domain on the target host; stripping the UUID and letting libvirt assign a new random one for this domain instead -- if this keeps happening on every run, something else on the target (a stray clone, a leftover throwaway domain) is claiming the source's UUID and should be investigated", "vm", targetDomainName, "error", err)
 			withoutUUID := stripDomainUUID(updatedXML)
 			dom, retryErr := target.Conn.DomainDefineXML(withoutUUID)
 			if retryErr != nil {
 				return rollback(fmt.Errorf("define target domain after uuid fallback: %w", retryErr))
 			}
+			trace.Info("Redefined target vm with new configuration (uuid-collision fallback: new random uuid assigned)", "vm", targetDomainName)
 			return dom.Free()
 		}
 		return rollback(fmt.Errorf("define target domain: %w", err))
