@@ -58,6 +58,16 @@ const (
 	MetadataFieldLastCheckpoint = "last_checkpoint"
 	MetadataFieldLastSync       = "last_sync_timestamp"
 	MetadataFieldFailureCount   = "failure_count"
+	// MetadataFieldReplicaSource is written on the TARGET: "<host>:<domain>"
+	// of the source it's currently being replicated from.
+	MetadataFieldReplicaSource = "replica_source"
+	// MetadataFieldReplicaTargets is written on the SOURCE: a comma-
+	// separated, deduplicated, ever-growing list of "<host>:<domain>"
+	// entries for every distinct target this source has ever been
+	// replicated to (a source can fan out to more than one target, unlike
+	// a target, which only ever has the one source it was last defined
+	// from).
+	MetadataFieldReplicaTargets = "replica_targets"
 )
 
 // metadataFieldOrder fixes the field order vmsync writes its own metadata
@@ -66,6 +76,8 @@ var metadataFieldOrder = []string{
 	MetadataFieldLastCheckpoint,
 	MetadataFieldLastSync,
 	MetadataFieldFailureCount,
+	MetadataFieldReplicaSource,
+	MetadataFieldReplicaTargets,
 }
 
 var vmsyncBlockRe = regexp.MustCompile(`(?s)<vmsync:vmsync[^>]*>.*?</vmsync:vmsync>`)
@@ -437,9 +449,14 @@ func warnIfXMLElementsDropped(context, original, rewritten string) {
 
 // SetMetadataFields merges the given vmsync:field->value pairs into
 // domainXML's <metadata> block, preserving any existing vmsync fields not
-// mentioned in updates (and any unrelated, non-vmsync metadata some other
-// tool may have added) untouched.
-func SetMetadataFields(domainXML string, updates map[string]string) (string, error) {
+// mentioned in updates or removeFields (and any unrelated, non-vmsync
+// metadata some other tool may have added) untouched. Fields named in
+// removeFields are dropped entirely -- winning over updates if a field
+// somehow appears in both -- used to strip metadata that's become
+// semantically meaningless for a domain's current role (e.g. a target's
+// last_checkpoint/failure_count once that domain becomes a replication
+// SOURCE instead, which has no checkpoint chain of its own to report).
+func SetMetadataFields(domainXML string, updates map[string]string, removeFields ...string) (string, error) {
 	domcfg := &libvirtxml.Domain{}
 	err := domcfg.Unmarshal(domainXML)
 	if err != nil {
@@ -456,6 +473,9 @@ func SetMetadataFields(domainXML string, updates map[string]string) (string, err
 	}
 	for field, value := range updates {
 		current[field] = value
+	}
+	for _, field := range removeFields {
+		delete(current, field)
 	}
 	entry := buildMetadataEntry(current)
 
@@ -476,14 +496,121 @@ func SetMetadataFields(domainXML string, updates map[string]string) (string, err
 	return changed, nil
 }
 
-// UpdateSyncMetadata records a fresh checkpoint/timestamp and resets
-// failure_count to 0; called once a sync completes successfully.
-func UpdateSyncMetadata(domainXML string, checkpoint string) (string, error) {
+// UpdateSyncMetadata records a fresh checkpoint/timestamp, resets
+// failure_count to 0, and records sourceHost:sourceDomain as this
+// (target) domain's current replica_source -- called on the TARGET's new
+// definition once a sync completes successfully.
+func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain string) (string, error) {
 	return SetMetadataFields(domainXML, map[string]string{
 		MetadataFieldLastCheckpoint: checkpoint,
 		MetadataFieldLastSync:       strconv.FormatInt(time.Now().Unix(), 10),
 		MetadataFieldFailureCount:   "0",
+		MetadataFieldReplicaSource:  ReplicaEntry(sourceHost, sourceDomain),
 	})
+}
+
+// ReplicaEntry formats a host+domain pair the same way on both sides of a
+// replica_source/replica_targets metadata field, so the two are directly
+// comparable (e.g. by replicaListContains) and consistently readable by a
+// human or external tooling inspecting either domain's XML by hand.
+func ReplicaEntry(host, domain string) string {
+	return host + ":" + domain
+}
+
+// replicaListContains reports whether entry is already present in a
+// comma-separated replica_targets-style list. Pure and side-effect-free
+// so the exact dedup logic RecordReplicaTarget depends on is directly
+// testable without a live domain.
+func replicaListContains(list, entry string) bool {
+	if list == "" {
+		return false
+	}
+	for _, e := range strings.Split(list, ",") {
+		if e == entry {
+			return true
+		}
+	}
+	return false
+}
+
+// appendReplicaTarget adds entry to a comma-separated replica_targets-style
+// list, returning list unchanged if entry is already present -- so
+// repeated syncs to the same target never grow the list, only a genuinely
+// new distinct target does.
+func appendReplicaTarget(list, entry string) string {
+	if list == "" {
+		return entry
+	}
+	if replicaListContains(list, entry) {
+		return list
+	}
+	return list + "," + entry
+}
+
+// RecordReplicaTarget updates the SOURCE domain's own persistent
+// definition (sourceDomainName, looked up on mgr) to add targetHost:
+// targetDomain to its replica_targets metadata list (deduplicated -- a
+// repeat sync to the same target is a no-op), and strips
+// last_checkpoint/last_sync_timestamp/failure_count from it if present:
+// those three fields describe a domain's state as a replication TARGET,
+// and are meaningless -- and actively misleading to a human or external
+// tool reading this domain's XML -- once it's acting as a SOURCE instead,
+// which this call establishes it as. This is the one place vmsync ever
+// writes to the source's own definition; unlike DefineDomain, it never
+// undefines anything first, since it's the exact same domain (same name,
+// same UUID) being patched in place -- DomainDefineXML updates a
+// persistent definition that already matches by UUID directly, the same
+// safe, already-established pattern RecordTargetSyncFailure uses to patch
+// a live target's failure_count.
+func RecordReplicaTarget(mgr *Manager, sourceDomainName, targetHost, targetDomain string) error {
+	dom, err := mgr.Conn.LookupDomainByName(sourceDomainName)
+	if err != nil {
+		return fmt.Errorf("look up source domain %s to record replica target: %w", sourceDomainName, err)
+	}
+	defer dom.Free()
+
+	domXML, err := dom.GetXMLDesc(0)
+	if err != nil {
+		return fmt.Errorf("read source domain %s xml: %w", sourceDomainName, err)
+	}
+
+	entry := ReplicaEntry(targetHost, targetDomain)
+	existing, _ := ParseMetadata(domXML, MetadataFieldReplicaTargets)
+	updatedList := appendReplicaTarget(existing, entry)
+
+	staleFieldPresent := false
+	for _, field := range []string{MetadataFieldLastCheckpoint, MetadataFieldLastSync, MetadataFieldFailureCount} {
+		if v, _ := ParseMetadata(domXML, field); v != "" {
+			staleFieldPresent = true
+			break
+		}
+	}
+	if updatedList == existing && !staleFieldPresent {
+		// This target is already recorded and there's no stale
+		// target-role metadata left to strip -- checked BEFORE calling
+		// SetMetadataFields specifically to skip both its XML round-trip
+		// and the redefine below once steady state is reached, rather
+		// than comparing the round-tripped XML against the original
+		// afterward (a full libvirtxml unmarshal-then-marshal cycle
+		// essentially never reproduces its input byte-for-byte, even when
+		// nothing semantic changed, so that comparison would never
+		// actually skip anything).
+		return nil
+	}
+
+	updatedXML, err := SetMetadataFields(domXML, map[string]string{
+		MetadataFieldReplicaTargets: updatedList,
+	}, MetadataFieldLastCheckpoint, MetadataFieldLastSync, MetadataFieldFailureCount)
+	if err != nil {
+		return fmt.Errorf("update replica_targets metadata: %w", err)
+	}
+
+	newDom, err := mgr.Conn.DomainDefineXML(updatedXML)
+	if err != nil {
+		return fmt.Errorf("redefine source domain %s with updated replica_targets metadata: %w", sourceDomainName, err)
+	}
+	defer newDom.Free()
+	return nil
 }
 
 // ReadTargetFailureCount reconnects to the target and returns the

@@ -323,7 +323,7 @@ func TestParseMetadataValueMissingField(t *testing.T) {
 func TestUpdateSyncMetadata(t *testing.T) {
 	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
 	before := time.Now().Unix()
-	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005")
+	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "source-host.example.org", "sourcevm")
 	after := time.Now().Unix()
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
@@ -349,6 +349,112 @@ func TestUpdateSyncMetadata(t *testing.T) {
 	}
 	if ts < before || ts > after {
 		t.Errorf("last_sync_timestamp = %d, want between %d and %d", ts, before, after)
+	}
+
+	replicaSource, err := ParseMetadataField(out, MetadataFieldReplicaSource)
+	if err != nil || replicaSource != "source-host.example.org:sourcevm" {
+		t.Errorf("replica_source = %q, err=%v, want source-host.example.org:sourcevm", replicaSource, err)
+	}
+}
+
+func TestSetMetadataFieldsRemoveFields(t *testing.T) {
+	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
+
+	withTargetRole, err := SetMetadataFields(base, map[string]string{
+		MetadataFieldLastCheckpoint: "vmsync-cpt-000001",
+		MetadataFieldLastSync:       "1700000000",
+		MetadataFieldFailureCount:   "1",
+	})
+	if err != nil {
+		t.Fatalf("SetMetadataFields() error = %v", err)
+	}
+
+	t.Run("removeFields drops the named fields even with no updates", func(t *testing.T) {
+		out, err := SetMetadataFields(withTargetRole, nil, MetadataFieldLastCheckpoint, MetadataFieldLastSync, MetadataFieldFailureCount)
+		if err != nil {
+			t.Fatalf("SetMetadataFields() error = %v", err)
+		}
+		for _, field := range []string{MetadataFieldLastCheckpoint, MetadataFieldLastSync, MetadataFieldFailureCount} {
+			if v, _ := ParseMetadataField(out, field); v != "" {
+				t.Errorf("%s = %q after removal, want empty", field, v)
+			}
+		}
+	})
+
+	t.Run("removeFields wins over updates naming the same field", func(t *testing.T) {
+		out, err := SetMetadataFields(withTargetRole, map[string]string{
+			MetadataFieldLastCheckpoint: "vmsync-cpt-000002",
+		}, MetadataFieldLastCheckpoint)
+		if err != nil {
+			t.Fatalf("SetMetadataFields() error = %v", err)
+		}
+		if v, _ := ParseMetadataField(out, MetadataFieldLastCheckpoint); v != "" {
+			t.Errorf("last_checkpoint = %q, want empty (removeFields must win over updates)", v)
+		}
+	})
+
+	t.Run("fields not named in removeFields are preserved", func(t *testing.T) {
+		out, err := SetMetadataFields(withTargetRole, nil, MetadataFieldLastCheckpoint)
+		if err != nil {
+			t.Fatalf("SetMetadataFields() error = %v", err)
+		}
+		if v, _ := ParseMetadataField(out, MetadataFieldFailureCount); v != "1" {
+			t.Errorf("failure_count = %q, want 1 (untouched by removing a different field)", v)
+		}
+	})
+}
+
+// TestReplicaListContains and TestAppendReplicaTarget cover the pure
+// list-manipulation logic RecordReplicaTarget depends on for deduplication
+// -- directly testable without a live domain, unlike RecordReplicaTarget
+// itself.
+func TestReplicaListContains(t *testing.T) {
+	cases := []struct {
+		list  string
+		entry string
+		want  bool
+	}{
+		{list: "", entry: "target1.example.org:vm01", want: false},
+		{list: "target1.example.org:vm01", entry: "target1.example.org:vm01", want: true},
+		{list: "target1.example.org:vm01", entry: "target2.example.org:vm01", want: false},
+		{list: "target1.example.org:vm01,target2.example.org:vm01", entry: "target2.example.org:vm01", want: true},
+		{list: "target1.example.org:vm01,target2.example.org:vm01", entry: "target3.example.org:vm01", want: false},
+	}
+	for _, c := range cases {
+		if got := replicaListContains(c.list, c.entry); got != c.want {
+			t.Errorf("replicaListContains(%q, %q) = %v, want %v", c.list, c.entry, got, c.want)
+		}
+	}
+}
+
+func TestAppendReplicaTarget(t *testing.T) {
+	t.Run("empty list becomes just the new entry", func(t *testing.T) {
+		got := appendReplicaTarget("", "target1.example.org:vm01")
+		if got != "target1.example.org:vm01" {
+			t.Errorf("appendReplicaTarget(\"\", entry) = %q, want target1.example.org:vm01", got)
+		}
+	})
+
+	t.Run("a genuinely new entry is appended", func(t *testing.T) {
+		got := appendReplicaTarget("target1.example.org:vm01", "target2.example.org:vm01")
+		want := "target1.example.org:vm01,target2.example.org:vm01"
+		if got != want {
+			t.Errorf("appendReplicaTarget() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("re-appending an already-present entry does not duplicate or grow the list", func(t *testing.T) {
+		list := "target1.example.org:vm01,target2.example.org:vm01"
+		got := appendReplicaTarget(list, "target2.example.org:vm01")
+		if got != list {
+			t.Errorf("appendReplicaTarget() = %q, want unchanged %q (repeat sync to the same target must not grow the list)", got, list)
+		}
+	})
+}
+
+func TestReplicaEntry(t *testing.T) {
+	if got := ReplicaEntry("host.example.org", "myvm"); got != "host.example.org:myvm" {
+		t.Errorf("ReplicaEntry() = %q, want host.example.org:myvm", got)
 	}
 }
 

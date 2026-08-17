@@ -2074,7 +2074,7 @@ func run(cfg struct {
 	}
 	trace.Info("Adding metadata information")
 	var newXML string
-	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint)
+	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint, util.HostFromURIOrLocal(cfg.SourceURI), cfg.SourceDomain)
 	if err != nil {
 		// UpdateSyncMetadata is a pure in-memory XML transformation -- no
 		// network or libvirt call involved -- so a failure here is almost
@@ -2106,6 +2106,22 @@ func run(cfg struct {
 	}
 	if err := libvirtsync.DefineDomain(tgtMgr, cfg.TargetDomain, newXML, cfg.TargetDiskPath, rootSourceByLiveSource); err != nil {
 		return err
+	}
+
+	// Records this source<->target relationship on the SOURCE's own
+	// definition (replica_targets, deduplicated) and strips any stale
+	// target-role metadata (last_checkpoint/last_sync_timestamp/
+	// failure_count) it might still be carrying from an earlier life as
+	// somebody else's replication target -- e.g. after inverting
+	// replication direction between a pair of domains. Deliberately
+	// non-fatal: the actual replication above already fully succeeded by
+	// this point, and this is discoverability bookkeeping on the source,
+	// not something vmsync's own correctness checks ever read back --
+	// unlike replica_source on the target (set via UpdateSyncMetadata
+	// above), which shares this same non-fatal treatment for the same
+	// reason.
+	if err := libvirtsync.RecordReplicaTarget(srcMgr, cfg.SourceDomain, util.HostFromURIOrLocal(cfg.TargetURI), cfg.TargetDomain); err != nil {
+		trace.Warning("failed to record replica_targets metadata on source domain", "domain", cfg.SourceDomain, "error", err)
 	}
 
 	return nil
