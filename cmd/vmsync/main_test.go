@@ -270,3 +270,35 @@ func TestUnverifiableCheckpointMetadataError(t *testing.T) {
 		})
 	}
 }
+
+// TestRefuseReinitIfTargetRunning covers the one guard standing between a
+// normal -reinit and an unconditional `rm -f` running against a target
+// disk qemu still has open: this is the exact regression class flagged as
+// untested -- inverting or short-circuiting this check would let -reinit
+// delete a running target's disk file out from under it, silently
+// reverting the replica to nothing the next time that domain shuts down.
+func TestRefuseReinitIfTargetRunning(t *testing.T) {
+	cases := []struct {
+		name    string
+		exists  bool
+		running bool
+		wantErr bool
+	}{
+		{name: "target doesn't exist at all -- nothing to protect", exists: false, running: false, wantErr: false},
+		{name: "target doesn't exist, running is meaningless/stale -- still fine", exists: false, running: true, wantErr: false},
+		{name: "target exists, shut off -- exactly what -reinit expects", exists: true, running: false, wantErr: false},
+		{name: "target exists and is running -- must refuse", exists: true, running: true, wantErr: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := refuseReinitIfTargetRunning("test-domain", tc.exists, tc.running)
+			if tc.wantErr && err == nil {
+				t.Fatalf("refuseReinitIfTargetRunning(exists=%v, running=%v) = nil, want a non-nil error", tc.exists, tc.running)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("refuseReinitIfTargetRunning(exists=%v, running=%v) = %v, want nil", tc.exists, tc.running, err)
+			}
+		})
+	}
+}

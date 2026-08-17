@@ -400,6 +400,29 @@ func unverifiableCheckpointMetadataError(targetDomain, parent string, checkpoint
 	return fmt.Errorf("incremental sync attempted but target domain %s has no verifiable last_checkpoint metadata (%s; parent checkpoint expected: %s) -- if this target was manually redefined, restored from an old XML, or is otherwise missing vmsync's own metadata, its on-disk state cannot be trusted as a base for an incremental copy; run -reinit to establish a fresh baseline", targetDomain, reason, parent)
 }
 
+// refuseReinitIfTargetRunning decides whether -reinit must abort before
+// touching the target's disk files, given whether the target domain
+// exists and (if it does) whether it's currently running. A target that
+// doesn't exist at all has nothing running to protect, and one that
+// exists but is shut off is exactly the state -reinit expects -- only
+// "exists AND running" must refuse: -reinit's very next step is an
+// unconditional `rm -f` of the target's disk files, and doing that while
+// qemu still has one open leaves the running domain serving off an
+// unlinked inode, with the replica silently reverting to nothing the next
+// time that domain happens to shut down -- discovered only at a real
+// disaster recovery attempt, with the run itself having reported success.
+// Kept as a standalone, pure function (taking plain bools, not live
+// libvirt handles, which have no interface seam to fake them behind) so
+// this exact guard is directly testable: inverting or short-circuiting it
+// in some future refactor is the one thing standing between a normal
+// -reinit and silently corrupting a live target replica.
+func refuseReinitIfTargetRunning(targetDomain string, exists, running bool) error {
+	if exists && running {
+		return fmt.Errorf("reinit: target domain %s is running, shut it down before reinitializing", targetDomain)
+	}
+	return nil
+}
+
 func run(cfg struct {
 	SourceURI      string
 	TargetURI      string
@@ -1181,19 +1204,20 @@ func run(cfg struct {
 		if err != nil {
 			return fmt.Errorf("reinit: check target domain existence: %w", err)
 		}
+		running := false
 		if exists {
 			tgtDom, err := tgtMgr.LookupDomain(cfg.TargetDomain)
 			if err != nil {
 				return fmt.Errorf("reinit: look up target domain %s: %w", cfg.TargetDomain, err)
 			}
-			running, runErr := libvirtsync.DomainActive(tgtDom)
+			running, err = libvirtsync.DomainActive(tgtDom)
 			tgtDom.Free()
-			if runErr != nil {
-				return fmt.Errorf("reinit: check target domain state: %w", runErr)
+			if err != nil {
+				return fmt.Errorf("reinit: check target domain state: %w", err)
 			}
-			if running {
-				return fmt.Errorf("reinit: target domain %s is running, shut it down before reinitializing", cfg.TargetDomain)
-			}
+		}
+		if err := refuseReinitIfTargetRunning(cfg.TargetDomain, exists, running); err != nil {
+			return err
 		}
 
 		for _, d := range qcowDisks {
