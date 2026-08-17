@@ -330,7 +330,10 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 			// would see it change out from under them with nothing in the
 			// logs to explain why, until now.
 			trace.Warning("target domain redefine hit a UUID collision with another domain on the target host; stripping the UUID and letting libvirt assign a new random one for this domain instead -- if this keeps happening on every run, something else on the target (a stray clone, a leftover throwaway domain) is claiming the source's UUID and should be investigated", "vm", targetDomainName, "error", err)
-			withoutUUID := stripDomainUUID(updatedXML)
+			withoutUUID, stripErr := stripDomainUUID(updatedXML)
+			if stripErr != nil {
+				return rollback(fmt.Errorf("strip uuid from target domain xml for uuid-collision fallback: %w", stripErr))
+			}
 			dom, retryErr := target.Conn.DomainDefineXML(withoutUUID)
 			if retryErr != nil {
 				return rollback(fmt.Errorf("define target domain after uuid fallback: %w", retryErr))
@@ -1032,20 +1035,28 @@ func allMetadataFields(metadataXML string) map[string]string {
 	}
 }
 
-func stripDomainUUID(domainXML string) string {
+// stripDomainUUID returns domainXML with its <uuid> element removed, so a
+// subsequent DomainDefineXML lets libvirt assign a fresh, random one instead
+// of colliding with the one already in use elsewhere on the target (see
+// this function's only call site, DefineDomain's UUID-collision fallback).
+// Returns the real Unmarshal/Marshal error on failure rather than silently
+// returning an empty string: a caller that fed that empty string straight
+// into DomainDefineXML would see a generic, misleading "empty/malformed
+// XML" failure from libvirt with no indication the actual problem was here,
+// not there.
+func stripDomainUUID(domainXML string) (string, error) {
 	domcfg := &libvirtxml.Domain{}
-	err := domcfg.Unmarshal(domainXML)
-	if err != nil {
-		return ""
+	if err := domcfg.Unmarshal(domainXML); err != nil {
+		return "", fmt.Errorf("parse domain xml to strip uuid: %w", err)
 	}
 
 	domcfg.UUID = ""
 	changed, err := domcfg.Marshal()
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("re-marshal domain xml after stripping uuid: %w", err)
 	}
 
-	return changed
+	return changed, nil
 }
 
 // ListManagedCheckpoints lists dom's vmsync-managed checkpoints. Callers

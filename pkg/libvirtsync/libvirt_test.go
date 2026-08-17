@@ -826,7 +826,10 @@ func TestReplicaEntry(t *testing.T) {
 func TestStripDomainUUID(t *testing.T) {
 	t.Run("removes the uuid element", func(t *testing.T) {
 		xmlStr := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
-		out := stripDomainUUID(xmlStr)
+		out, err := stripDomainUUID(xmlStr)
+		if err != nil {
+			t.Fatalf("stripDomainUUID() error = %v, want nil for valid xml", err)
+		}
 		if out == "" {
 			t.Fatal("stripDomainUUID() returned an empty string for valid xml")
 		}
@@ -835,9 +838,18 @@ func TestStripDomainUUID(t *testing.T) {
 		}
 	})
 
-	t.Run("malformed xml returns an empty string, not an error", func(t *testing.T) {
-		if out := stripDomainUUID("not xml at all"); out != "" {
-			t.Errorf("expected an empty string for malformed xml, got: %q", out)
+	// Regression pin: this used to silently return "" on malformed input,
+	// discarding the real parse error entirely -- a caller feeding that
+	// empty string straight into DomainDefineXML would see a generic,
+	// misleading "empty/malformed XML" failure from libvirt with nothing
+	// pointing back at the actual problem being here, not there.
+	t.Run("malformed xml returns the real error, not a silently empty string", func(t *testing.T) {
+		out, err := stripDomainUUID("not xml at all")
+		if err == nil {
+			t.Fatal("stripDomainUUID(malformed) returned a nil error, want the real parse failure")
+		}
+		if out != "" {
+			t.Errorf("stripDomainUUID(malformed) = %q, want empty string alongside the error", out)
 		}
 	})
 }
