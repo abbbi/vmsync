@@ -62,9 +62,11 @@ Options:
   --only PATTERN          only run Stage 1 scenarios whose name matches
                            PATTERN (a bash glob, e.g. "compress-zstd-*")
   --stages LIST           comma-separated subset of: matrix,verify,reinit,
-                           snapshot,define (default: matrix,verify,reinit,
-                           snapshot, in that order -- define is opt-in, see
-                           below)
+                           snapshot,define -- runs in whichever order LIST
+                           gives them, not a fixed canonical order (default:
+                           matrix,verify,reinit,snapshot, which just happens
+                           to already be written in that order; define is
+                           opt-in, see below)
   --dry-run               print every vmsync command line; touch nothing
                            (no ssh/qemu-io/vmsync calls actually made)
   -h, --help              this text
