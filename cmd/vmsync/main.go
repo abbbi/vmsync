@@ -828,21 +828,35 @@ func run(cfg struct {
 
 	abortBackup := func(trigger string) {
 		abortOnce.Do(func() {
+			// wasActive gates only the backup-stop logic immediately below,
+			// not the whole closure -- this used to be an early return
+			// ("if !backupActive { unlock; return }"), which, being inside
+			// abortOnce.Do, didn't just skip the backup-stop step for this
+			// one call: it consumed abortOnce for good, permanently
+			// skipping the unrelated "destroy the VM this run itself
+			// started" step further down too, for the rest of the process's
+			// lifetime. A signal landing before the backup job ever starts
+			// (backupActive still false) but after a -start'd VM is already
+			// running would hit exactly that: abortBackup "runs" once,
+			// finds no backup to stop, returns immediately, and the started
+			// VM is never destroyed -- leaking a running VM the operator
+			// never asked to keep. These two cleanup duties are unrelated
+			// and must not be able to suppress each other just because they
+			// happen to share one Once-guarded closure.
 			backupMu.Lock()
-			if !backupActive {
-				backupMu.Unlock()
-				return
-			}
+			wasActive := backupActive
 			backupActive = false
 			backupMu.Unlock()
-			trace.Info("stopping libvirt backup job", "trigger", trigger)
-			stopErr := callWithTimeout("abort backup job", 5*time.Second, func() error {
-				return libvirtsync.StopBackup(srcDom)
-			})
-			if stopErr != nil {
-				trace.Error("stop backup job failed on primary connection", "trigger", trigger, "error", stopErr)
-				if retryErr := libvirtsync.StopBackupViaReconnect(cfg.SourceURI, cfg.SourceDomain); retryErr != nil {
-					trace.Error("stop backup retry via reconnect also failed", "trigger", trigger, "error", retryErr)
+			if wasActive {
+				trace.Info("stopping libvirt backup job", "trigger", trigger)
+				stopErr := callWithTimeout("abort backup job", 5*time.Second, func() error {
+					return libvirtsync.StopBackup(srcDom)
+				})
+				if stopErr != nil {
+					trace.Error("stop backup job failed on primary connection", "trigger", trigger, "error", stopErr)
+					if retryErr := libvirtsync.StopBackupViaReconnect(cfg.SourceURI, cfg.SourceDomain); retryErr != nil {
+						trace.Error("stop backup retry via reconnect also failed", "trigger", trigger, "error", retryErr)
+					}
 				}
 			}
 			if started {
