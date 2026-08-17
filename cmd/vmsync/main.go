@@ -757,6 +757,13 @@ func run(cfg struct {
 			State:                 state,
 			Timestamp:             now,
 			ExternalSnapshotCount: snapshotCount,
+			// trace's own counters, not metricsMu-guarded state -- they're
+			// already safe for concurrent reads on their own (atomics), and
+			// reflect the whole process's lifetime by the time any call to
+			// writeMetricsTextfile (run()'s own deferred one, or the signal
+			// handler's) reads them here.
+			WarningCount: trace.WarningCount(),
+			ErrorCount:   trace.ErrorCount(),
 			// VerificationRan requires the compare block to have actually
 			// been entered this run (see verificationAttempted's own
 			// comment) -- cfg.Verify alone would stay true even for a run

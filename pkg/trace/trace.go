@@ -27,6 +27,8 @@ import (
 
 var (
 	debugEnabled atomic.Bool
+	warningCount atomic.Uint64
+	errorCount   atomic.Uint64
 )
 
 func init() {
@@ -43,11 +45,27 @@ func Info(msg string, args ...any) {
 }
 
 func Warning(msg string, args ...any) {
+	warningCount.Add(1)
 	logWithLevel("WARNING", msg, args...)
 }
 
 func Error(msg string, args ...any) {
+	errorCount.Add(1)
 	logWithLevel("ERROR", msg, args...)
+}
+
+// WarningCount returns how many times Warning has been called so far in
+// this process's lifetime. vmsync is a one-shot CLI invocation, not a
+// long-running daemon, so there is deliberately no reset: each process
+// starts fresh at 0, and by the time cmd/vmsync reads this to build its
+// own end-of-run Prometheus textfile, it reflects the whole run.
+func WarningCount() uint64 {
+	return warningCount.Load()
+}
+
+// ErrorCount is WarningCount's counterpart for Error.
+func ErrorCount() uint64 {
+	return errorCount.Load()
 }
 
 func Debug(msg string, args ...any) {

@@ -91,7 +91,51 @@ func TestWriteTextfileNoVerification(t *testing.T) {
 			if !strings.Contains(content, wantSnapshotCount) {
 				t.Errorf("content missing %q\ngot:\n%s", wantSnapshotCount, content)
 			}
+
+			wantWarningCount := `vmsync_warning_count{source_host="src.example.com",target_host="tgt.example.com",vm="vm1"} 0`
+			if !strings.Contains(content, wantWarningCount) {
+				t.Errorf("content missing %q\ngot:\n%s", wantWarningCount, content)
+			}
+
+			wantErrorCount := `vmsync_error_count{source_host="src.example.com",target_host="tgt.example.com",vm="vm1"} 0`
+			if !strings.Contains(content, wantErrorCount) {
+				t.Errorf("content missing %q\ngot:\n%s", wantErrorCount, content)
+			}
 		})
+	}
+}
+
+// TestWriteTextfileWarningErrorCounts confirms WarningCount/ErrorCount are
+// rendered with their exact values, independent of VerificationRan/State --
+// these mirror ExternalSnapshotCount as always-on run-level metrics (see
+// RunMetric.WarningCount's own comment for why they're tracked separately
+// from State).
+func TestWriteTextfileWarningErrorCounts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metrics.prom")
+	run := metrics.RunMetric{
+		SourceHost:   "src.example.com",
+		TargetHost:   "tgt.example.com",
+		VM:           "vm1",
+		State:        metrics.StateSuccess,
+		Timestamp:    1700000000,
+		WarningCount: 3,
+		ErrorCount:   5,
+	}
+
+	if err := metrics.WriteTextfile(path, nil, run); err != nil {
+		t.Fatalf("WriteTextfile returned unexpected error: %v", err)
+	}
+
+	content := readMetricsFile(t, path)
+
+	wantWarning := `vmsync_warning_count{source_host="src.example.com",target_host="tgt.example.com",vm="vm1"} 3`
+	if !strings.Contains(content, wantWarning) {
+		t.Errorf("content missing %q\ngot:\n%s", wantWarning, content)
+	}
+
+	wantError := `vmsync_error_count{source_host="src.example.com",target_host="tgt.example.com",vm="vm1"} 5`
+	if !strings.Contains(content, wantError) {
+		t.Errorf("content missing %q\ngot:\n%s", wantError, content)
 	}
 }
 

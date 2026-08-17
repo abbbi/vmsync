@@ -82,6 +82,16 @@ type RunMetric struct {
 	// checkpoint chain sits stalled -- this metric is what explains that
 	// from the outside, purely diagnostic.
 	ExternalSnapshotCount int
+	// WarningCount/ErrorCount are how many trace.Warning/trace.Error calls
+	// this run made (from trace.WarningCount()/trace.ErrorCount()) -- a
+	// coarse, always-available "did anything degrade along the way" signal
+	// to alert on, independent of and finer-grained than State: a run can
+	// finish as StateSuccess while still having logged, then transparently
+	// recovered from, one or more warnings (a reconnect fallback kicking
+	// in, a self-heal cleaning up leftover state from a prior crash, ...)
+	// that State alone would never surface.
+	WarningCount uint64
+	ErrorCount   uint64
 	// VerificationRan is true when this run had -verify set. It gates
 	// whether VerificationState/VerificationTimestamp are rendered at all --
 	// a run that never verified anything must not emit a bare
@@ -155,6 +165,16 @@ func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 	fmt.Fprintln(&b, "# TYPE vmsync_external_snapshot_count gauge")
 	fmt.Fprintf(&b, "vmsync_external_snapshot_count{source_host=%q,target_host=%q,vm=%q} %d\n",
 		run.SourceHost, run.TargetHost, run.VM, run.ExternalSnapshotCount)
+
+	fmt.Fprintln(&b, "# HELP vmsync_warning_count Number of WARNING-level log lines emitted during this run.")
+	fmt.Fprintln(&b, "# TYPE vmsync_warning_count gauge")
+	fmt.Fprintf(&b, "vmsync_warning_count{source_host=%q,target_host=%q,vm=%q} %d\n",
+		run.SourceHost, run.TargetHost, run.VM, run.WarningCount)
+
+	fmt.Fprintln(&b, "# HELP vmsync_error_count Number of ERROR-level log lines emitted during this run.")
+	fmt.Fprintln(&b, "# TYPE vmsync_error_count gauge")
+	fmt.Fprintf(&b, "vmsync_error_count{source_host=%q,target_host=%q,vm=%q} %d\n",
+		run.SourceHost, run.TargetHost, run.VM, run.ErrorCount)
 
 	// Only emitted for a run that actually had -verify set -- see
 	// RunMetric.VerificationRan's own comment for why a run that never
