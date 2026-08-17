@@ -179,8 +179,12 @@ func DomainExists(conn *libvirt.Connect, name string) (bool, error) {
 // rootSourceByLiveSource maps each disk's live source path to its resolved
 // backing-chain root file (see disk.QcowDisk.RootSource) -- passed straight
 // through to replaceDomainDiskPath so the domain definition names disks the
-// same way the actual data copy does; pass nil/empty if targetDiskPath is
-// also empty (no disk-path rewriting requested at all).
+// same way the actual data copy does. This runs independently of
+// targetDiskPath (which only controls relocation to a different directory):
+// pass nil/empty only when every disk's live source is already the correct
+// target-side name (no external snapshot/linked clone in play for any
+// disk) -- targetDiskPath being empty is not by itself a reason to pass an
+// empty map too.
 //
 // If targetDomainName already exists, it is undefined first (persistent
 // definitions can't be replaced in place) and its prior XML is kept in
@@ -244,8 +248,7 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 		return rollback(fmt.Errorf("rewrite target domain xml: %w", err))
 	}
 
-	// Keep source XML intact (including UUID) unless libvirt rejects duplicate UUID.
-	if targetDiskPath != "" {
+	if shouldRewriteDiskPaths(targetDiskPath, rootSourceByLiveSource) {
 		updatedXML, err = replaceDomainDiskPath(updatedXML, targetDiskPath, rootSourceByLiveSource)
 		if err != nil {
 			return rollback(fmt.Errorf("rewrite target domain xml: %w", err))
@@ -280,6 +283,23 @@ func ThawFs(srcDom *libvirt.Domain, freezed bool) {
 	} else {
 		trace.Info("Successfully thawed file systems using guest agent")
 	}
+}
+
+// shouldRewriteDiskPaths decides whether DefineDomain needs to run
+// replaceDomainDiskPath at all: either there's a relocation to apply
+// (targetDiskPath set) or a live-source-to-root-source substitution to
+// apply (rootSourceByLiveSource non-empty). Gating this on targetDiskPath
+// alone -- the previous behavior -- skipped the whole rewrite, root-source
+// substitution included, for the common case of no -target-disk-path. That
+// was exactly wrong for an external-snapshot/linked-clone source: its live
+// Source (an overlay vmsync's data copy never writes to under that name)
+// would then survive unchanged into the target's own definition, pointing
+// at a file that doesn't exist on the target at all. SetTargetPath's own
+// empty-targetDiskPath branch already returns rootSource verbatim, so
+// running this with targetDiskPath == "" is exactly the "keep the same
+// path, just rename to root" case, not a no-op to be skipped.
+func shouldRewriteDiskPaths(targetDiskPath string, rootSourceByLiveSource map[string]string) bool {
+	return targetDiskPath != "" || len(rootSourceByLiveSource) > 0
 }
 
 // replaceDomainDiskPath rewrites each non-ignored disk's <source file> to its

@@ -123,6 +123,45 @@ func TestIsCheckpointBlockedBySnapshot(t *testing.T) {
 	}
 }
 
+// TestShouldRewriteDiskPaths is a pure-function regression test for the bug
+// this was extracted to fix: DefineDomain used to gate the entire disk-path
+// rewrite on targetDiskPath alone, so an external-snapshot source with no
+// -target-disk-path set (targetDiskPath == "", rootSourceByLiveSource
+// populated with a real live-to-root mapping) silently skipped the rewrite
+// and left the target definition pointing at a file that was never copied.
+func TestShouldRewriteDiskPaths(t *testing.T) {
+	cases := []struct {
+		name                   string
+		targetDiskPath         string
+		rootSourceByLiveSource map[string]string
+		want                   bool
+	}{
+		{name: "both empty -- nothing to rewrite", targetDiskPath: "", rootSourceByLiveSource: nil, want: false},
+		{name: "targetDiskPath set, no root map -- relocation only", targetDiskPath: "/mnt/target", rootSourceByLiveSource: nil, want: true},
+		{
+			name:                   "targetDiskPath empty but root map populated -- the exact external-snapshot regression",
+			targetDiskPath:         "",
+			rootSourceByLiveSource: map[string]string{"/images/vm.snap1": "/images/vm.qcow2"},
+			want:                   true,
+		},
+		{
+			name:                   "both set",
+			targetDiskPath:         "/mnt/target",
+			rootSourceByLiveSource: map[string]string{"/images/vm.snap1": "/images/vm.qcow2"},
+			want:                   true,
+		},
+		{name: "empty (non-nil) root map behaves like nil", targetDiskPath: "", rootSourceByLiveSource: map[string]string{}, want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldRewriteDiskPaths(tc.targetDiskPath, tc.rootSourceByLiveSource); got != tc.want {
+				t.Errorf("shouldRewriteDiskPaths(%q, %v) = %v, want %v", tc.targetDiskPath, tc.rootSourceByLiveSource, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestReplaceDomainDiskPath(t *testing.T) {
 	t.Run("disk in rootSource map gets rewritten using the mapped root source", func(t *testing.T) {
 		xmlStr := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/testvm.snap1")
@@ -152,6 +191,28 @@ func TestReplaceDomainDiskPath(t *testing.T) {
 	t.Run("malformed xml returns an error", func(t *testing.T) {
 		if _, err := replaceDomainDiskPath("not xml at all <<<", "/mnt/target", nil); err == nil {
 			t.Fatal("expected an error for malformed domain xml")
+		}
+	})
+
+	// Regression pin for the DefineDomain bug this function's own caller had:
+	// an empty targetDiskPath (no relocation requested) must NOT be treated
+	// as "skip the rewrite" -- an external-snapshot source's live path still
+	// needs to become its root path even when staying in the same
+	// directory, since that root path is what the data copy actually wrote.
+	t.Run("empty targetDiskPath still substitutes the mapped root source, without relocating", func(t *testing.T) {
+		xmlStr := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/testvm.snap1")
+		rootMap := map[string]string{
+			"/var/lib/libvirt/images/testvm.snap1": "/var/lib/libvirt/images/testvm.qcow2",
+		}
+		out, err := replaceDomainDiskPath(xmlStr, "", rootMap)
+		if err != nil {
+			t.Fatalf("replaceDomainDiskPath() error = %v", err)
+		}
+		if !strings.Contains(out, `file="/var/lib/libvirt/images/testvm.qcow2"`) {
+			t.Errorf("expected the live snapshot path rewritten to its mapped root source in the same directory, got: %s", out)
+		}
+		if strings.Contains(out, "testvm.snap1") {
+			t.Errorf("expected the stale live snapshot path to be gone entirely, got: %s", out)
 		}
 	})
 }
