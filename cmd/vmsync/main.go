@@ -368,6 +368,38 @@ func verificationRan(verify string, attempted bool) bool {
 	return verify != "" && attempted
 }
 
+// unverifiableCheckpointMetadataError decides whether an unreadable or
+// empty last_checkpoint field in the target domain's own metadata must
+// abort the run, given the parent checkpoint (per the SOURCE's own
+// checkpoint chain) this sync is about to proceed against. Returns nil
+// when there's nothing to abort on -- either the metadata was read fine,
+// or this is a full sync (parent == "") with no earlier checkpoint to
+// verify against in the first place, so an unreadable field is merely
+// advisory.
+//
+// For an incremental sync (parent != ""), this metadata is the ONLY thing
+// standing between "the target really is at the checkpoint the source
+// thinks it's incrementing from" and "silently apply a partial delta onto
+// a target that might be at a completely different point in history" --
+// treating it as advisory there (as this function replaces) produces an
+// internally-consistent-looking but silently corrupt (mixed-history)
+// target file, with the run still reporting success. Kept as a standalone
+// function (mirroring verificationRan just above) specifically so this
+// exact guarantee is directly testable without a live libvirt domain.
+func unverifiableCheckpointMetadataError(targetDomain, parent string, checkpointParseErr error, metadataEntryCheckpoint string) error {
+	if checkpointParseErr == nil && metadataEntryCheckpoint != "" {
+		return nil
+	}
+	if parent == "" {
+		return nil
+	}
+	reason := "the last_checkpoint metadata field is empty"
+	if checkpointParseErr != nil {
+		reason = fmt.Sprintf("its metadata could not be parsed: %v", checkpointParseErr)
+	}
+	return fmt.Errorf("incremental sync attempted but target domain %s has no verifiable last_checkpoint metadata (%s; parent checkpoint expected: %s) -- if this target was manually redefined, restored from an old XML, or is otherwise missing vmsync's own metadata, its on-disk state cannot be trusted as a base for an incremental copy; run -reinit to establish a fresh baseline", targetDomain, reason, parent)
+}
+
 func run(cfg struct {
 	SourceURI      string
 	TargetURI      string
@@ -1255,33 +1287,39 @@ func run(cfg struct {
 			// (potentially long-running) sync.
 			tgtDom.Free()
 
-			metadataEntryCheckpoint, err = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastCheckpoint)
-			metadataEntryTimestamp, err = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastSync)
-			if err != nil {
-				trace.Warning("unable to parse target domain metadata entry")
+			// Two separate error variables -- not the shared err used
+			// elsewhere in this function -- specifically because the second
+			// ParseMetadata call used to overwrite the first call's err
+			// before it was ever checked, silently discarding a genuine
+			// parse failure on the checkpoint field whenever the timestamp
+			// field happened to parse fine (or vice versa).
+			var checkpointParseErr, timestampParseErr error
+			metadataEntryCheckpoint, checkpointParseErr = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastCheckpoint)
+			metadataEntryTimestamp, timestampParseErr = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastSync)
+			if checkpointParseErr != nil || metadataEntryCheckpoint == "" {
+				if err := unverifiableCheckpointMetadataError(cfg.TargetDomain, parent, checkpointParseErr, metadataEntryCheckpoint); err != nil {
+					return err
+				}
+				trace.Warning("empty or unparseable target domain metadata entry, cannot verify checkpoint chain", "error", checkpointParseErr)
 			} else {
-				if metadataEntryCheckpoint == "" {
-					trace.Warning("empty target domain metadata entry, cannot verify checkpoint chain")
-				} else {
-					trace.Info("Target domain metadata", "checkpoint", metadataEntryCheckpoint)
-				}
-				if metadataEntryTimestamp == "" {
-					trace.Warning("empty target domain metadata entry, cannot verify timestamp")
-				} else {
-					trace.Info("Target domain metadata", "timestamp", metadataEntryTimestamp)
-					for _, d := range qcowDisks {
-						targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
-						out, err := targetSSHClient.Run(ctx, "stat -c '%Y' "+util.ShQuote(targetPath))
-						if err != nil {
-							return fmt.Errorf("%w: %s", err, out)
-						}
-						if out > metadataEntryTimestamp {
-							return fmt.Errorf("Target file on system is newer (%s)  than last sync timestamp: %s: file on target has been changed between syncs", out, targetPath)
-
-						}
+				trace.Info("Target domain metadata", "checkpoint", metadataEntryCheckpoint)
+			}
+			if timestampParseErr != nil || metadataEntryTimestamp == "" {
+				trace.Warning("empty or unparseable target domain metadata entry, cannot verify timestamp", "error", timestampParseErr)
+			} else {
+				trace.Info("Target domain metadata", "timestamp", metadataEntryTimestamp)
+				for _, d := range qcowDisks {
+					targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
+					out, err := targetSSHClient.Run(ctx, "stat -c '%Y' "+util.ShQuote(targetPath))
+					if err != nil {
+						return fmt.Errorf("%w: %s", err, out)
 					}
-					trace.Info("Successfully verified target file timestamps")
+					if out > metadataEntryTimestamp {
+						return fmt.Errorf("Target file on system is newer (%s)  than last sync timestamp: %s: file on target has been changed between syncs", out, targetPath)
+
+					}
 				}
+				trace.Info("Successfully verified target file timestamps")
 			}
 		}
 	}

@@ -234,3 +234,39 @@ func TestVerificationRan(t *testing.T) {
 		}
 	}
 }
+
+// TestUnverifiableCheckpointMetadataError covers the exact guarantee this
+// was extracted to make testable: an incremental sync (parent != "") must
+// abort when the target's own last_checkpoint metadata can't be trusted,
+// while a full sync (parent == "") -- which has no earlier checkpoint to
+// verify against in the first place -- must never abort on this, no matter
+// how broken that metadata is.
+func TestUnverifiableCheckpointMetadataError(t *testing.T) {
+	parseErr := errors.New("xml: malformed metadata element")
+
+	cases := []struct {
+		name              string
+		parent            string
+		checkpointErr     error
+		metadataCheckpoint string
+		wantErr           bool
+	}{
+		{name: "incremental, metadata read fine -> no error", parent: "vmsync-cpt-000042", checkpointErr: nil, metadataCheckpoint: "vmsync-cpt-000042", wantErr: false},
+		{name: "incremental, empty metadata -> must abort", parent: "vmsync-cpt-000042", checkpointErr: nil, metadataCheckpoint: "", wantErr: true},
+		{name: "incremental, unparseable metadata -> must abort", parent: "vmsync-cpt-000042", checkpointErr: parseErr, metadataCheckpoint: "", wantErr: true},
+		{name: "full sync, empty metadata -> advisory only", parent: "", checkpointErr: nil, metadataCheckpoint: "", wantErr: false},
+		{name: "full sync, unparseable metadata -> advisory only", parent: "", checkpointErr: parseErr, metadataCheckpoint: "", wantErr: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := unverifiableCheckpointMetadataError("test-domain", tc.parent, tc.checkpointErr, tc.metadataCheckpoint)
+			if tc.wantErr && err == nil {
+				t.Fatalf("unverifiableCheckpointMetadataError(parent=%q) = nil, want a non-nil error", tc.parent)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unverifiableCheckpointMetadataError(parent=%q) = %v, want nil", tc.parent, err)
+			}
+		})
+	}
+}
