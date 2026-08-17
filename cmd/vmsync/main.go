@@ -539,6 +539,21 @@ func run(cfg struct {
 
 	var tgtState bool
 	var srcState bool
+	// sshClientMu guards sourceSSHClient/targetSSHClient against the same
+	// kind of cross-goroutine race checkpointMu/backupMu/etc. below guard
+	// their own state against: the signal handler's watcher goroutine is
+	// spawned (see sigCh below) well before either client is actually
+	// dialed further down in run()'s own body, so cleanupSourceBridge/
+	// cleanupTargetNBD (defined below, run from that goroutine) could
+	// otherwise read these two pointers while run() is concurrently
+	// writing them -- a genuine, race-detector-visible data race, even
+	// though a signal landing in that exact narrow window is rare and,
+	// when it does happen, the closures' own nil-check already does the
+	// right thing (there's nothing to clean up yet). Real regardless of
+	// how benign the likely outcome is, so it gets the same treatment as
+	// every other shared piece of state here rather than being left as
+	// the one unsynchronized pair.
+	var sshClientMu sync.Mutex
 	var targetSSHClient *remotessh.Client
 	var sourceSSHClient *remotessh.Client
 	// interruptedMu/interrupted close a race between the signal handler's
@@ -1145,13 +1160,16 @@ func run(cfg struct {
 	}
 	cleanupTargetNBD := func(trigger string) {
 		targetCleanupOnce.Do(func() {
-			if targetSSHClient == nil {
+			sshClientMu.Lock()
+			client := targetSSHClient
+			sshClientMu.Unlock()
+			if client == nil {
 				return
 			}
 			pollStopCommands(&targetStopCommands, 5*time.Second, func(cmd string) {
 				cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer ccancel()
-				if out, err := targetSSHClient.Run(cctx, cmd); err != nil {
+				if out, err := client.Run(cctx, cmd); err != nil {
 					trace.Error("failed to stop target qemu-nbd export", "trigger", trigger, "error", err, "output", out)
 				}
 			})
@@ -1159,13 +1177,16 @@ func run(cfg struct {
 	}
 	cleanupSourceBridge := func(trigger string) {
 		sourceCleanupOnce.Do(func() {
-			if sourceSSHClient == nil {
+			sshClientMu.Lock()
+			client := sourceSSHClient
+			sshClientMu.Unlock()
+			if client == nil {
 				return
 			}
 			pollStopCommands(&sourceStopCommands, 5*time.Second, func(cmd string) {
 				cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer ccancel()
-				if out, err := sourceSSHClient.Run(cctx, cmd); err != nil {
+				if out, err := client.Run(cctx, cmd); err != nil {
 					trace.Error("failed to stop source nbd bridge", "trigger", trigger, "error", err, "output", out)
 				}
 			})
@@ -1418,10 +1439,13 @@ func run(cfg struct {
 			return err
 		}
 		trace.Info("source URI uses SSH; qemu-img info will run remotely", "user", sourceSSHConfig.User, "host", sourceSSHConfig.Address, "port", sourceSSHConfig.Port)
-		sourceSSHClient, err = remotessh.Dial(sourceSSHConfig)
-		if err != nil {
-			return fmt.Errorf("connect ssh for source qemu-img execution: %w", err)
+		sourceClient, dialErr := remotessh.Dial(sourceSSHConfig)
+		if dialErr != nil {
+			return fmt.Errorf("connect ssh for source qemu-img execution: %w", dialErr)
 		}
+		sshClientMu.Lock()
+		sourceSSHClient = sourceClient
+		sshClientMu.Unlock()
 		defer sourceSSHClient.Close()
 		if err := nbdbridge.CheckRemote(ctx, sourceSSHClient, bridgeCfg, sourceSSHConfig.Address); err != nil {
 			return err
@@ -1485,10 +1509,13 @@ func run(cfg struct {
 		return err
 	}
 	trace.Debug("resolved target ssh connection", "user", targetSSHConfig.User, "host", targetSSHConfig.Address, "port", targetSSHConfig.Port, "key", targetSSHConfig.PrivateKeyPath)
-	targetSSHClient, err = remotessh.Dial(targetSSHConfig)
-	if err != nil {
-		return fmt.Errorf("connect ssh for target file/export execution: %w", err)
+	targetClient, dialErr := remotessh.Dial(targetSSHConfig)
+	if dialErr != nil {
+		return fmt.Errorf("connect ssh for target file/export execution: %w", dialErr)
 	}
+	sshClientMu.Lock()
+	targetSSHClient = targetClient
+	sshClientMu.Unlock()
 	defer targetSSHClient.Close()
 	defer cleanupTargetNBD("cleanup")
 	defer cleanupSourceBridge("cleanup")
