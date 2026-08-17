@@ -232,6 +232,25 @@ func TestStartLocalRelaysBytesRoundTrip(t *testing.T) {
 			if got := counters.ReceivedSnapshot(); got == 0 {
 				t.Error("ByteCounters.Received stayed 0 despite relaying real traffic")
 			}
+
+			// A non-zero counter alone can't tell a working compressor
+			// apart from one that silently passes bytes through unchanged
+			// (e.g. a broken algo/level wiring that falls back to a no-op
+			// writer) -- both would still report non-zero counts. payload
+			// is a 200x repeated string, about as compressible as real
+			// data gets, so an actual encoder must bring the wire byte
+			// count well below its plaintext size; echoLoop reflects the
+			// outbound direction's own compressed bytes straight back (see
+			// its own doc comment), so the inbound direction's count is
+			// held to the same bar.
+			if tt.cfg.Compress {
+				if got := counters.SentSnapshot(); got >= uint64(len(payload)) {
+					t.Errorf("ByteCounters.Sent = %d, want less than the uncompressed payload size %d -- compression does not appear to have reduced anything", got, len(payload))
+				}
+				if got := counters.ReceivedSnapshot(); got >= uint64(len(payload)) {
+					t.Errorf("ByteCounters.Received = %d, want less than the uncompressed payload size %d -- compression does not appear to have reduced anything", got, len(payload))
+				}
+			}
 		})
 	}
 }
