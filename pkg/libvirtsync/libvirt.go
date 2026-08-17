@@ -381,10 +381,14 @@ func shouldRewriteDiskPaths(targetDiskPath string, rootSourceByLiveSource map[st
 // is the stable base filename the sync's own data-copy path always uses.
 // Without this, the domain definition and the actual replicated file could
 // silently disagree on the disk's name the moment an external snapshot
-// exists. A disk missing from the map falls back to its own live Source --
-// shouldn't happen for anything ParseQcowDisks would also have picked up,
-// since both apply the same IgnoreDevice filter, but degrades safely rather
-// than panicking on a nil map lookup if it ever does.
+// exists. A disk missing from the map is a hard error, not a fallback to its
+// own live Source: shouldn't happen for anything ParseQcowDisks would also
+// have picked up, since both apply the same IgnoreDevice filter, but if it
+// ever does, silently writing the live Source into the target's persistent
+// definition would be exactly the bug this function exists to prevent --
+// the live Source can be an external-snapshot overlay never copied to the
+// target under that name, so returning an error here beats corrupting the
+// target definition without a trace of why.
 //
 // Clearing BackingStore is required for the same reason, not an unrelated
 // cleanup: whatever the live domain XML's backing chain says (an external
@@ -418,9 +422,16 @@ func replaceDomainDiskPath(domainXML, targetDiskPath string, rootSourceByLiveSou
 		}
 
 		liveSource := d.Source.File.File
-		rootSource := liveSource
-		if resolved, ok := rootSourceByLiveSource[liveSource]; ok {
-			rootSource = resolved
+		rootSource, ok := rootSourceByLiveSource[liveSource]
+		if !ok {
+			// ParseQcowDisks and this domain's own live XML disagree on which
+			// disks exist -- exactly the "shouldn't happen" case above, but
+			// having actually happened. liveSource may be an external-snapshot
+			// overlay that was never copied to the target under that name (see
+			// this function's own doc comment), so writing it into the
+			// target's persistent definition here would silently point the
+			// domain at a nonexistent or wrong disk file. Fail loud instead.
+			return "", fmt.Errorf("disk %s: no resolved root source available, refusing to write its live path into the target's persistent definition", liveSource)
 		}
 		domcfg.Devices.Disks[i].Source.File.File = util.SetTargetPath(targetDiskPath, rootSource)
 		domcfg.Devices.Disks[i].BackingStore = nil

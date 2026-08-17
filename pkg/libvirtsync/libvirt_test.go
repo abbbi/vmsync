@@ -276,14 +276,10 @@ func TestReplaceDomainDiskPath(t *testing.T) {
 		}
 	})
 
-	t.Run("disk missing from a nil map falls back to its own live source, without panicking", func(t *testing.T) {
+	t.Run("disk missing from a nil map is a hard error, not a silent fallback to its live source", func(t *testing.T) {
 		xmlStr := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/testvm.qcow2")
-		out, err := replaceDomainDiskPath(xmlStr, "/mnt/target", nil)
-		if err != nil {
-			t.Fatalf("replaceDomainDiskPath() error = %v", err)
-		}
-		if !strings.Contains(out, `file="/mnt/target/testvm.qcow2"`) {
-			t.Errorf("expected fallback to live source's own basename, got: %s", out)
+		if _, err := replaceDomainDiskPath(xmlStr, "/mnt/target", nil); err == nil {
+			t.Fatal("expected an error for a disk missing from rootSourceByLiveSource, got nil")
 		}
 	})
 
@@ -1120,7 +1116,11 @@ func TestReplaceDomainNamePreservesRichConfiguration(t *testing.T) {
 
 func TestReplaceDomainDiskPathPreservesRichConfiguration(t *testing.T) {
 	xmlStr := richDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/vda.qcow2", "/var/lib/libvirt/images/vdb.qcow2")
-	out, err := replaceDomainDiskPath(xmlStr, "/mnt/target", nil)
+	rootMap := map[string]string{
+		"/var/lib/libvirt/images/vda.qcow2": "/var/lib/libvirt/images/vda.qcow2",
+		"/var/lib/libvirt/images/vdb.qcow2": "/var/lib/libvirt/images/vdb.qcow2",
+	}
+	out, err := replaceDomainDiskPath(xmlStr, "/mnt/target", rootMap)
 	if err != nil {
 		t.Fatalf("replaceDomainDiskPath() error = %v", err)
 	}
