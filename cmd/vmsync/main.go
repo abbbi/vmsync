@@ -547,7 +547,19 @@ func run(cfg struct {
 	// the handler react to the actual transition instead of a stale
 	// snapshot of it.
 	copyCommitted := make(chan struct{})
+	// freezeMu guards freezed against the signal handler's own goroutine
+	// (thawSource, defined further down), exactly like checkpointMu guards
+	// checkpointName/checkpointAdvanced above and for the same reason: a
+	// signal landing between FSFreeze succeeding (freezed set true) and
+	// FSThaw actually running a few statements later must be able to see
+	// that the guest is frozen right now, not a stale pre-freeze snapshot
+	// -- otherwise the interrupt-cleanup path skips thawing entirely and
+	// the production guest's filesystem stays frozen indefinitely, with no
+	// recovery short of an operator noticing and running virsh
+	// domfsthaw/fsfreeze-thaw by hand.
+	var freezeMu sync.Mutex
 	var freezed bool = false
+	var thawOnce sync.Once
 	var fsFreezeFailed bool = false
 	var started bool = false
 	var metricsMu sync.Mutex
@@ -917,6 +929,41 @@ func run(cfg struct {
 			}
 		})
 	}
+	// thawSource is the interrupt-cleanup counterpart to the filesystem
+	// freeze taken further down, immediately before checkpoint creation.
+	// Without this, a signal landing in that window -- freeze succeeded,
+	// checkpoint creation still in flight -- had no cleanup step that even
+	// knew the guest was frozen, let alone one that thawed it: none of
+	// abortBackup/cleanupVerifyWindow/cleanupTargetNBD/cleanupSourceBridge/
+	// resumeSource touch the filesystem-freeze state at all. The result was
+	// a production guest left frozen indefinitely (until an operator
+	// happens to notice and runs virsh fsfreeze-thaw by hand), for
+	// something the guest agent itself has no timeout to recover from on
+	// its own. thawOnce guards actual execution; freezeMu guards the
+	// cross-goroutine read of freezed itself (see its own declaration).
+	// Clearing freezed under the same lock right away means whichever of
+	// the two triggers -- run()'s own normal-path calls further down, or
+	// this closure firing from the signal handler -- gets there first is
+	// also the only one that logs/acts, avoiding a confusing redundant
+	// thaw attempt if both happen to race.
+	thawSource := func(trigger string) {
+		thawOnce.Do(func() {
+			freezeMu.Lock()
+			wasFrozen := freezed
+			freezed = false
+			freezeMu.Unlock()
+			if !wasFrozen {
+				return
+			}
+			trace.Info("thawing source filesystem", "trigger", trigger)
+			if err := callWithTimeout("thaw source filesystem", 5*time.Second, func() error {
+				libvirtsync.ThawFs(srcDom, true)
+				return nil
+			}); err != nil {
+				trace.Error("thaw source filesystem timed out", "trigger", trigger, "error", err)
+			}
+		})
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	doneCh := make(chan struct{})
@@ -932,12 +979,13 @@ func run(cfg struct {
 			// concurrently -- worst-case wait is the slowest ONE of them,
 			// not their sum, before the process can actually exit.
 			var cleanupWg sync.WaitGroup
-			cleanupWg.Add(6)
+			cleanupWg.Add(7)
 			go func() { defer cleanupWg.Done(); abortBackup(sig.String()) }()
 			go func() { defer cleanupWg.Done(); cleanupVerifyWindow(sig.String()) }()
 			go func() { defer cleanupWg.Done(); cleanupTargetNBD(sig.String()) }()
 			go func() { defer cleanupWg.Done(); cleanupSourceBridge(sig.String()) }()
 			go func() { defer cleanupWg.Done(); resumeSource(sig.String()) }()
+			go func() { defer cleanupWg.Done(); thawSource(sig.String()) }()
 			go func() {
 				defer cleanupWg.Done()
 				// Snapshot all three under checkpointMu, once, rather than
@@ -1390,7 +1438,17 @@ func run(cfg struct {
 			trace.Warning("Filesystem freeze failed", "error", err)
 			fsFreezeFailed = true
 		} else {
+			freezeMu.Lock()
 			freezed = true
+			freezeMu.Unlock()
+			// Registered right here, not up where thawSource itself is
+			// declared -- same reasoning as abortBackup's own defer being
+			// registered at the point the backup job actually starts: the
+			// hazard (a frozen guest filesystem) exists starting exactly
+			// now, and thawSource's own thawOnce/freezeMu-guarded check
+			// already makes this safe to also call explicitly below and
+			// from the signal handler without double-thawing.
+			defer thawSource("cleanup")
 			trace.Info("Successfully freezed file systems using guest agent")
 		}
 	} else {
@@ -1403,7 +1461,7 @@ func run(cfg struct {
 		// baseline for future incremental syncs, so that case still fails
 		// outright, same as any other CreateCheckpoint error.
 		if parent == "" || !libvirtsync.IsCheckpointBlockedBySnapshot(err) {
-			libvirtsync.ThawFs(srcDom, freezed)
+			thawSource("checkpoint creation failed")
 			return err
 		}
 		trace.Warning("checkpoint creation blocked by an existing external snapshot on the source domain; syncing incrementally against the existing checkpoint without advancing the checkpoint chain", "attempted_checkpoint", checkpointName, "parent", parent, "error", err)
@@ -1412,7 +1470,7 @@ func run(cfg struct {
 		checkpointAdvanced = true
 		checkpointMu.Unlock()
 	}
-	libvirtsync.ThawFs(srcDom, freezed)
+	thawSource("checkpoint creation complete")
 
 	defer func() {
 		if runErr == nil || !checkpointAdvanced || dataCopySucceeded {
