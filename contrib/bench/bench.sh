@@ -220,8 +220,8 @@ vmsync_common_args() {
 # scenarios (verify+tamper) expect one. Callers decide what a given exit
 # code means for their own scenario.
 run_vmsync() {
-        local scenario="$1" phase="$2" lifetime="$3"
-        shift 3
+        local scenario="$1" phase="$2"
+        shift 2
         local prom_file="$RUN_DIR/prom/${scenario}.${phase}.prom"
         local log_file="$RUN_DIR/logs/${scenario}.${phase}.log"
         RUN_LOG="$log_file"
@@ -261,29 +261,8 @@ vmsync_common_args "$iodepth_override"
         local start end
         start="$(now_epoch)"
         set +e
-        if [ "${lifetime}" -gt 0 ]; then
-                start_lifetime="$(date +%s)"
-                log "I have been tasked to stop my run after $lifetime seconds"
-                "$VMSYNC_BIN" "${args[@]}" >"$log_file" 2>&1 &
-                RUN_PID=$!
-                while true; do
-                    end_lifetime="$(date +%s)"
-                    if ! kill -0 $RUN_PID > /dev/null 2>&1; then
-                        wait $RUN_PID
-                        RUN_RC=$?
-                        break
-                    elif [ "$((end_lifetime-start_lifetime))" -ge "${lifetime}" ]; then
-                        log "Now killing current run"
-                        kill -SIGTERM ${RUN_PID}
-                        [ $? -ne 0 ] && log "Failed to kill current run"
-                    fi
-                    sleep .5
-                done
-        else
-                log "Standard vmsync run"
-                "$VMSYNC_BIN" "${args[@]}" >"$log_file" 2>&1
-                RUN_RC=$?
-        fi
+        "$VMSYNC_BIN" "${args[@]}" >"$log_file" 2>&1
+        RUN_RC=$?
         set -e
         end="$(now_epoch)"
         RUN_WALL_SECONDS="$(elapsed_seconds "$start" "$end")"
@@ -444,7 +423,7 @@ stage_matrix() {
                                         # baseline for this combination (deletes any prior
                                         # target replica first -- see DefineDomain/reinit's own
                                         # undefine-then-resync behavior in cmd/vmsync/main.go).
-                                        run_vmsync "$name" full 0 -reinit "${SCEN_ARGS[@]}"
+                                        run_vmsync "$name" full -reinit "${SCEN_ARGS[@]}"
                                         if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
                                                 warn "full sync failed for scenario '$name' (see $RUN_LOG) -- skipping its incremental step"
                                                 continue
@@ -456,7 +435,7 @@ stage_matrix() {
                                         # since the full sync above rather than fabricating
                                         # synthetic writes -- see README.md's "What this does
                                         # and does not control" section.
-                                        run_vmsync "$name" incremental 0 "${SCEN_ARGS[@]}"
+                                        run_vmsync "$name" incremental "${SCEN_ARGS[@]}"
                                 done
                         done
                 done
@@ -477,7 +456,7 @@ stage_verify_tamper() {
         # correctness shouldn't depend on which transport carried the
         # preceding sync, and holding it fixed makes the three modes below
         # directly comparable to each other.
-        run_vmsync verify-baseline full 0 -reinit
+        run_vmsync verify-baseline full -reinit
         if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
                 die "baseline full sync for verify testing failed (see $RUN_LOG) -- aborting stage 2"
         fi
@@ -504,7 +483,7 @@ stage_verify_tamper() {
                                 || die "failed to inject test corruption into $target_path on $TARGET_HOST -- refusing to continue this sub-test"
                 fi
 
-                run_vmsync "verify-${mode}" tamper 0 "-verify=$mode"
+                run_vmsync "verify-${mode}" tamper "-verify=$mode"
 
                 if [ "$DRY_RUN" = yes ]; then
                         :
@@ -523,7 +502,7 @@ stage_verify_tamper() {
                 # the offset we just tampered with on the target -- only -reinit
                 # (which re-copies everything) is guaranteed to overwrite it.
                 log "   healing target with a full resync (-reinit)"
-                run_vmsync "verify-${mode}" heal 0 -reinit
+                run_vmsync "verify-${mode}" heal -reinit
                 if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
                         die "heal-after-tamper resync for -verify=$mode did not succeed (see $RUN_LOG) -- STOP and inspect $target_path by hand before trusting this target replica or continuing"
                 fi
@@ -532,6 +511,11 @@ stage_verify_tamper() {
 }
 
 # --- Stage 3: -reinit-after-failures -----------------------------------------
+
+# Must match libvirtsync's own metadataNamespace constant (pkg/libvirtsync/
+# libvirt.go) -- this is the <vmsync:vmsync xmlns:vmsync="..."> block's own
+# namespace URI, not a libvirt connection URI.
+VMSYNC_METADATA_URI="http://vmsync.org/xmlns/libvirt/domain/1.0"
 
 stage_reinit_after_failures() {
         log "=== Stage 3: -reinit-after-failures ==="
@@ -545,25 +529,42 @@ stage_reinit_after_failures() {
         # forever and -reinit-after-failures never trips. This doesn't rely on
         # Stage 1 having run at all, so Stage 3 is self-sufficient like the
         # other stages.
-        run_vmsync reinit-after-failures baseline 0 -reinit -compress
+        run_vmsync reinit-after-failures baseline -reinit -compress
         if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
                 die "baseline full sync for reinit-after-failures testing failed (see $RUN_LOG) -- aborting stage 3"
+        fi
+
+        # Induce N genuine, repeatable incremental-sync failures by removing
+        # the target's own vmsync metadata (last_checkpoint included) -- this
+        # is the real-world scenario -reinit-after-failures exists to auto-heal
+        # (see main.go's own unverifiableCheckpointMetadataError: "if this
+        # target was manually redefined, restored from an old XML, or is
+        # otherwise missing vmsync's own metadata, its on-disk state cannot be
+        # trusted as a base for an incremental copy"), not an artificial
+        # "source domain doesn't exist" failure that says nothing about
+        # whether the incremental sync mechanism itself is broken. The source
+        # domain stays real and untouched throughout -- only the target's own
+        # bookkeeping is removed. A failed run never calls UpdateSyncMetadata,
+        # so this corruption persists across every induced attempt below,
+        # until the final -reinit trigger run overwrites it with a fresh,
+        # consistent value.
+        if [ "$DRY_RUN" != yes ]; then
+                log "removing target vmsync metadata to induce $n genuine checkpoint-chain-inconsistency failures"
+                virsh_uri "$TARGET_URI" metadata "$TARGET_DOMAIN" --uri "$VMSYNC_METADATA_URI" --remove --config \
+                        || die "could not remove target vmsync metadata for reinit-after-failures testing -- aborting stage 3"
         fi
 
         log "inducing $n consecutive failures against the real target"
         local i
         for i in $(seq 1 "$n"); do
-                set +e
-                log "Running consecutive run $i"
-                run_vmsync reinit-after-failures "induce-$i" 5 -source-domain "${SOURCE_DOMAIN}" -compress "-reinit-after-failures=$n" 2>&1
-                set -e
+                run_vmsync reinit-after-failures "induce-$i" -compress "-reinit-after-failures=$n"
                 if [ "$RUN_RC" = 0 ] && [ "$DRY_RUN" != yes ]; then
                         warn "induced-failure run #$i unexpectedly succeeded (exit=0) -- check $RUN_LOG, this test's assumptions may not hold in your environment"
                 fi
         done
 
         log "running a real, correct sync with -reinit-after-failures=$n -- expecting it to force a full resync instead of the incremental one it would otherwise do"
-        run_vmsync reinit-after-failures trigger 0 -source-domain "${SOURCE_DOMAIN}" -compress "-reinit-after-failures=$n"
+        run_vmsync reinit-after-failures trigger -compress "-reinit-after-failures=$n"
 
         if [ "$DRY_RUN" = yes ]; then
                 :
@@ -612,7 +613,7 @@ stage_external_snapshot() {
         # comment next to that check). Without this baseline, a first-ever sync
         # of this domain would hit that fatal path instead of the tolerant one
         # this stage exists to test.
-        run_vmsync ext-snapshot baseline 0 -reinit
+        run_vmsync ext-snapshot baseline -reinit
         if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
                 die "baseline full sync for external-snapshot testing failed (see $RUN_LOG) -- aborting stage 4"
         fi
@@ -637,7 +638,7 @@ stage_external_snapshot() {
         fi
 
         log "--- syncing while the external snapshot exists (expect: checkpoint creation tolerantly blocked, sync+verify still succeed) ---"
-        run_vmsync ext-snapshot during-snapshot 0 -verify=fast
+        run_vmsync ext-snapshot during-snapshot -verify=fast
         if [ "$DRY_RUN" != yes ]; then
                 if [ "$RUN_RC" != 0 ]; then
                         warn "FAIL: sync+verify while an external snapshot existed did not succeed (exit=$RUN_RC) -- see $RUN_LOG"
@@ -673,7 +674,7 @@ stage_external_snapshot() {
         fi
 
         log "--- syncing again after the external snapshot is gone (expect: checkpoint chain resumes advancing) ---"
-        run_vmsync ext-snapshot after-snapshot 0 -verify=fast
+        run_vmsync ext-snapshot after-snapshot -verify=fast
         if [ "$DRY_RUN" != yes ]; then
                 if [ "$RUN_RC" != 0 ]; then
                         warn "FAIL: sync+verify after removing the external snapshot did not succeed (exit=$RUN_RC) -- see $RUN_LOG"
@@ -733,13 +734,13 @@ stage_define_domain_uuid_collision() {
                 require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
         fi
 
-        run_vmsync define-uuid-collision baseline 0 -reinit
+        run_vmsync define-uuid-collision baseline -reinit
         if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
                 die "baseline full sync for DefineDomain uuid-collision testing failed (see $RUN_LOG) -- aborting stage 5a"
         fi
 
         if [ "$DRY_RUN" = yes ]; then
-                run_vmsync define-uuid-collision trigger 0 -reinit
+                run_vmsync define-uuid-collision trigger -reinit
                 return 0
         fi
 
@@ -779,7 +780,7 @@ stage_define_domain_uuid_collision() {
                 | virsh_uri "$TARGET_URI" define /dev/stdin >/dev/null \
                 || die "failed to define throwaway uuid-collision domain '$collision_name' on target -- aborting stage 5a"
 
-        run_vmsync define-uuid-collision trigger 0 -reinit
+        run_vmsync define-uuid-collision trigger -reinit
 
         local pass=yes reason="" target_uuid_after=""
         if [ "$RUN_RC" != 0 ]; then
@@ -813,14 +814,14 @@ stage_define_domain_rollback() {
 
         if [ "$DRY_RUN" = yes ]; then
                 log "   (dry run: nothing to time or disrupt)"
-                run_vmsync define-rollback baseline 0 -reinit
-                run_vmsync define-rollback trigger 0 -reinit
+                run_vmsync define-rollback baseline -reinit
+                run_vmsync define-rollback trigger -reinit
                 return 0
         fi
 
         require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
 
-        run_vmsync define-rollback baseline 0 -reinit
+        run_vmsync define-rollback baseline -reinit
         if [ "$RUN_RC" != 0 ]; then
                 die "baseline full sync for DefineDomain rollback testing failed (see $RUN_LOG) -- aborting stage 5b"
         fi
