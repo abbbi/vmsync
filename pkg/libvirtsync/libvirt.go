@@ -1351,10 +1351,39 @@ func IsCheckpointBlockedBySnapshot(err error) bool {
 	return strings.Contains(msg, "checkpoint") && strings.Contains(msg, "external snapshot")
 }
 
+// domainJobOperationNames maps the subset of libvirt's job-operation
+// constants StopBackup cares about to short, human-readable names for its
+// refusal error/log -- libvirt-go's DomainJobOperationType has no String()
+// of its own.
+var domainJobOperationNames = map[libvirt.DomainJobOperationType]string{
+	libvirt.DOMAIN_JOB_OPERATION_UNKNOWN:         "unknown",
+	libvirt.DOMAIN_JOB_OPERATION_START:           "start",
+	libvirt.DOMAIN_JOB_OPERATION_SAVE:            "save",
+	libvirt.DOMAIN_JOB_OPERATION_RESTORE:         "restore",
+	libvirt.DOMAIN_JOB_OPERATION_MIGRATION_IN:    "migration (incoming)",
+	libvirt.DOMAIN_JOB_OPERATION_MIGRATION_OUT:   "migration (outgoing)",
+	libvirt.DOMAIN_JOB_OPERATION_SNAPSHOT:        "snapshot",
+	libvirt.DOMAIN_JOB_OPERATION_SNAPSHOT_REVERT: "snapshot revert",
+	libvirt.DOMAIN_JOB_OPERATION_DUMP:            "dump",
+	libvirt.DOMAIN_JOB_OPERATION_BACKUP:          "backup",
+	libvirt.DOMAIN_JOB_OPERATION_SNAPSHOT_DELETE: "snapshot delete",
+}
+
+// domainJobOperationName returns op's human-readable name, or a numeric
+// fallback for anything not in domainJobOperationNames -- forward-compatible
+// with a libvirt-go release that adds new operation constants this list
+// hasn't been updated for yet, rather than panicking or printing nothing.
+func domainJobOperationName(op libvirt.DomainJobOperationType) string {
+	if name, ok := domainJobOperationNames[op]; ok {
+		return name
+	}
+	return fmt.Sprintf("operation type %d", int(op))
+}
+
 // StopBackup aborts any pull-backup job in progress on dom, tolerating the
 // case where none is running (already stopped, or never started -- e.g. the
 // retry-via-reconnect path after a primary stop that actually succeeded
-// server-side but timed out client-side). Checks GetJobInfo first rather
+// server-side but timed out client-side). Checks GetJobStats first rather
 // than relying solely on pattern-matching AbortJob's own error text: whether
 // there's currently no job at all is exposed as a stable, structured enum
 // (DomainJobType, verified directly against libvirt-go's own source), not a
@@ -1362,15 +1391,49 @@ func IsCheckpointBlockedBySnapshot(err error) bool {
 // which is exactly why the previous version of this function's text match
 // ("no current job") never actually matched libvirt's real message and this
 // short-circuit could never fire.
+//
+// libvirt allows only one asynchronous job (migration, save, dump, backup,
+// ...) on a domain at a time, and AbortJob aborts whatever that current job
+// happens to be -- it has no notion of "vmsync's own" job. Calling it
+// without checking which job is actually running would silently abort
+// someone else's operation the moment one is active on the same domain when
+// this runs: an operator-initiated live migration, save, or dump started
+// after vmsync's own backup job already finished (or on a reconnect retry
+// after the primary connection went stale) would just stop, with AbortJob
+// itself reporting success and nothing here noticing anything went wrong.
+// GetJobStats reports which operation the current job actually is
+// (OperationSet/Operation, populated from libvirt's VIR_DOMAIN_JOB_OPERATION
+// typed parameter on a new enough libvirt/QEMU driver pair) -- when that's
+// known and isn't DOMAIN_JOB_OPERATION_BACKUP, this refuses to touch it at
+// all rather than risk aborting it. An older libvirt that doesn't report
+// VIR_DOMAIN_JOB_OPERATION leaves OperationSet false, in which case this
+// falls back to the previous, coarser behavior (abort whatever's running) --
+// having no operation information at all is not itself evidence that
+// vmsync doesn't own the job, just that this libvirt can't say either way.
 func StopBackup(dom *libvirt.Domain) error {
-	if info, err := dom.GetJobInfo(); err == nil && info.Type == libvirt.DOMAIN_JOB_NONE {
-		return nil
+	info, err := dom.GetJobStats(0)
+	if err != nil {
+		// GetJobStats can fail against a driver/connection that doesn't
+		// support it; fall back to the plain job-existence check rather
+		// than treating a stats-query failure as license to abort blindly.
+		info, err = dom.GetJobInfo()
+	}
+	if err == nil {
+		if info.Type == libvirt.DOMAIN_JOB_NONE {
+			return nil
+		}
+		if info.OperationSet && info.Operation != libvirt.DOMAIN_JOB_OPERATION_BACKUP {
+			opName := domainJobOperationName(info.Operation)
+			trace.Warning("refusing to abort the domain's current job -- it is not vmsync's own backup job", "operation", opName)
+			return fmt.Errorf("refusing to abort domain job: current job is %s, not the backup job vmsync started -- aborting it would interrupt an unrelated operation instead", opName)
+		}
 	}
 	if err := dom.AbortJob(); err != nil {
-		// Fallback for the rare case GetJobInfo above didn't catch it (e.g.
-		// it errored itself) -- kept, but not relied upon. If this still
-		// doesn't match in practice, the Debug log captures the real text
-		// so it can be fixed with actual data instead of another guess.
+		// Fallback for the rare case GetJobStats/GetJobInfo above didn't
+		// catch it (e.g. it errored itself) -- kept, but not relied upon. If
+		// this still doesn't match in practice, the Debug log captures the
+		// real text so it can be fixed with actual data instead of another
+		// guess.
 		if strings.Contains(strings.ToLower(err.Error()), "no current job") {
 			return nil
 		}

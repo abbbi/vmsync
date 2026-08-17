@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"vmsync/pkg/disk"
+
+	"libvirt.org/go/libvirt"
 )
 
 // minimalDomainXML builds the smallest domain XML that survives
@@ -1204,4 +1206,37 @@ func TestSetMetadataFieldsPreservesRichConfiguration(t *testing.T) {
 	if missing := missingXMLElements(xmlStr, out); len(missing) != 0 {
 		t.Errorf("SetMetadataFields() against a feature-rich domain dropped element(s) %v -- the unmarshal/marshal round trip lost real configuration; full output: %s", missing, out)
 	}
+}
+
+// TestDomainJobOperationName is the only part of StopBackup's new
+// job-identity check that's directly testable without a live *libvirt.Domain
+// (StopBackup itself needs a real GetJobStats/GetJobInfo/AbortJob call and
+// stays out of scope for unit tests, same as every other live-libvirt
+// function in this package).
+func TestDomainJobOperationName(t *testing.T) {
+	cases := []struct {
+		op   libvirt.DomainJobOperationType
+		want string
+	}{
+		{libvirt.DOMAIN_JOB_OPERATION_BACKUP, "backup"},
+		{libvirt.DOMAIN_JOB_OPERATION_MIGRATION_OUT, "migration (outgoing)"},
+		{libvirt.DOMAIN_JOB_OPERATION_MIGRATION_IN, "migration (incoming)"},
+		{libvirt.DOMAIN_JOB_OPERATION_SAVE, "save"},
+		{libvirt.DOMAIN_JOB_OPERATION_UNKNOWN, "unknown"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.want, func(t *testing.T) {
+			if got := domainJobOperationName(tc.op); got != tc.want {
+				t.Errorf("domainJobOperationName(%v) = %q, want %q", tc.op, got, tc.want)
+			}
+		})
+	}
+
+	t.Run("an operation constant not in the map falls back to a numeric name instead of panicking or going blank", func(t *testing.T) {
+		unmapped := libvirt.DomainJobOperationType(999)
+		want := "operation type 999"
+		if got := domainJobOperationName(unmapped); got != want {
+			t.Errorf("domainJobOperationName(999) = %q, want %q", got, want)
+		}
+	})
 }
