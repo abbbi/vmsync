@@ -1031,23 +1031,28 @@ func TestReplaceDomainDiskPathPreservesRichConfiguration(t *testing.T) {
 	if !strings.Contains(out, `file="/mnt/target/vdb.qcow2"`) {
 		t.Errorf("expected second disk rewritten to /mnt/target/vdb.qcow2, got: %s", out)
 	}
-	// backingStore is the element this function deliberately drops (see its
-	// own doc comment); format goes with it as an unavoidable side effect,
-	// not a separate loss -- <format type="qcow2"/> in this fixture exists
-	// only nested inside that backingStore (a disk's own format is a
-	// <driver type="qcow2"> attribute, not this element; <format> is
-	// specifically a backingStore/mirror-job convention), so once
-	// backingStore is gone, "format" has nowhere left to appear as an
-	// element name either. Everything else in this fixture (hostdev, tpm,
+	// backingStore itself is the element this function deliberately drops
+	// (see its own doc comment) -- but it will never show up in missing
+	// below, because missingXMLElements already suppresses it globally via
+	// intentionallyDroppedXMLElements (added specifically so a real sync of
+	// any domain with a backing chain doesn't log a permanent false-positive
+	// "dropped configuration" warning on every run). "format" is the
+	// visible side effect that denylist does NOT cover: <format
+	// type="qcow2"/> in this fixture exists only nested inside that
+	// backingStore (a disk's own format is a <driver type="qcow2">
+	// attribute, not this element; <format> is specifically a
+	// backingStore/mirror-job convention), so once backingStore is gone,
+	// "format" has nowhere left to appear as an element name either.
+	// intentionallyDroppedXMLElements deliberately does NOT also suppress
+	// "format" itself (see its own doc comment) -- broadening that denylist
+	// risks masking a genuinely dropped <format> in some unrelated context
+	// -- so this expected-missing list, not production code, is what
+	// accounts for it here. Everything else in this fixture (hostdev, tpm,
 	// qemu:commandline, network interface, graphics/video/controllers, the
 	// ignored cdrom, CPU/features/clock, UEFI loader/nvram) must still be
-	// there. intentionallyDroppedXMLElements deliberately does NOT also
-	// suppress "format" itself (see its own doc comment) -- broadening
-	// that denylist risks masking a genuinely dropped <format> in some
-	// unrelated context, so this expected-missing list, not production
-	// code, is what accounts for it here.
+	// there.
 	missing := missingXMLElements(xmlStr, out)
-	want := []string{"backingStore", "format"}
+	want := []string{"format"}
 	if len(missing) != len(want) {
 		t.Fatalf("replaceDomainDiskPath() against a feature-rich domain = missing %v, want exactly %v -- full output: %s", missing, want, out)
 	}
