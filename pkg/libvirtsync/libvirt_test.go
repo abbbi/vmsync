@@ -19,6 +19,7 @@ package libvirtsync
 
 import (
 	"errors"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -495,6 +496,42 @@ func TestNextCheckpointName(t *testing.T) {
 		existing := []Checkpoint{{Name: "some-other-checkpoint"}}
 		if _, _, err := NextCheckpointName(existing); err == nil {
 			t.Fatal("expected an error when the latest checkpoint name has no numeric suffix")
+		}
+	})
+}
+
+// TestCheckpointDeletionOrder covers the invariant DeleteAllManagedCheckpoints
+// depends on but never itself exercised without a live domain: a checkpoint
+// with children attached can't be deleted, so deletion order must be
+// newest-first -- the reverse of ListManagedCheckpoints' own oldest-first
+// contract. Reversing this by mistake would permanently wedge -reinit's one
+// recovery path for a broken checkpoint chain.
+func TestCheckpointDeletionOrder(t *testing.T) {
+	t.Run("empty input produces no deletions", func(t *testing.T) {
+		got := checkpointDeletionOrder(nil)
+		if len(got) != 0 {
+			t.Fatalf("checkpointDeletionOrder(nil) = %v, want empty", got)
+		}
+	})
+
+	t.Run("single checkpoint", func(t *testing.T) {
+		got := checkpointDeletionOrder([]Checkpoint{{Name: "vmsync-cpt-000001"}})
+		want := []string{"vmsync-cpt-000001"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("checkpointDeletionOrder() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("multiple checkpoints delete newest-first, reversing the oldest-first input", func(t *testing.T) {
+		existing := []Checkpoint{
+			{Name: "vmsync-cpt-000001"},
+			{Name: "vmsync-cpt-000002"},
+			{Name: "vmsync-cpt-000003"},
+		}
+		got := checkpointDeletionOrder(existing)
+		want := []string{"vmsync-cpt-000003", "vmsync-cpt-000002", "vmsync-cpt-000001"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("checkpointDeletionOrder() = %v, want %v (newest-first, so children are always deleted before their parent)", got, want)
 		}
 	})
 }

@@ -891,15 +891,32 @@ func DeleteAllManagedCheckpoints(dom *libvirt.Domain) error {
 	if err != nil {
 		return err
 	}
-	// Newest-to-oldest: a checkpoint with children still attached to it
-	// cannot be deleted, so always remove children before their parent.
-	// ListManagedCheckpoints sorts oldest-first.
-	for i := len(existing) - 1; i >= 0; i-- {
-		if err := DeleteCheckpointIfExists(dom, existing[i].Name); err != nil {
-			return fmt.Errorf("delete checkpoint %s: %w", existing[i].Name, err)
+	for _, name := range checkpointDeletionOrder(existing) {
+		if err := DeleteCheckpointIfExists(dom, name); err != nil {
+			return fmt.Errorf("delete checkpoint %s: %w", name, err)
 		}
 	}
 	return nil
+}
+
+// checkpointDeletionOrder returns existing's checkpoint names in the order
+// DeleteAllManagedCheckpoints must delete them: newest-first. A checkpoint
+// with children still attached to it cannot be deleted (its bitmap can
+// only be merged into a child on delete, never discarded while a child
+// still references it), so children must always go before their parent --
+// and since ListManagedCheckpoints sorts its result oldest-first, that's
+// simply the reverse of what it returns. Kept as a standalone, pure
+// function (taking and returning plain data, not a live domain handle)
+// specifically so this exact ordering is directly testable: reversing it
+// by mistake would permanently wedge the one recovery path -reinit
+// provides for a broken checkpoint chain, since every deletion after the
+// first would then fail against a checkpoint that still has a child.
+func checkpointDeletionOrder(existing []Checkpoint) []string {
+	order := make([]string, len(existing))
+	for i, c := range existing {
+		order[len(existing)-1-i] = c.Name
+	}
+	return order
 }
 
 func StartPullBackupTCP(
