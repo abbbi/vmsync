@@ -253,9 +253,9 @@ func TestUnverifiableCheckpointMetadataError(t *testing.T) {
 	}{
 		{name: "incremental, metadata read fine -> no error", parent: "vmsync-cpt-000042", checkpointErr: nil, metadataCheckpoint: "vmsync-cpt-000042", wantErr: false},
 		{name: "incremental, empty metadata -> must abort", parent: "vmsync-cpt-000042", checkpointErr: nil, metadataCheckpoint: "", wantErr: true},
-		{name: "incremental, unparseable metadata -> must abort", parent: "vmsync-cpt-000042", checkpointErr: parseErr, metadataCheckpoint: "", wantErr: true},
+		{name: "incremental, unparsable metadata -> must abort", parent: "vmsync-cpt-000042", checkpointErr: parseErr, metadataCheckpoint: "", wantErr: true},
 		{name: "full sync, empty metadata -> advisory only", parent: "", checkpointErr: nil, metadataCheckpoint: "", wantErr: false},
-		{name: "full sync, unparseable metadata -> advisory only", parent: "", checkpointErr: parseErr, metadataCheckpoint: "", wantErr: false},
+		{name: "full sync, unparsable metadata -> advisory only", parent: "", checkpointErr: parseErr, metadataCheckpoint: "", wantErr: false},
 	}
 
 	for _, tc := range cases {

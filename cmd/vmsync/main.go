@@ -1324,12 +1324,12 @@ func run(cfg struct {
 				if err := unverifiableCheckpointMetadataError(cfg.TargetDomain, parent, checkpointParseErr, metadataEntryCheckpoint); err != nil {
 					return err
 				}
-				trace.Warning("empty or unparseable target domain metadata entry, cannot verify checkpoint chain", "error", checkpointParseErr)
+				trace.Warning("empty or unparsable target domain metadata entry, cannot verify checkpoint chain", "error", checkpointParseErr)
 			} else {
 				trace.Info("Target domain metadata", "checkpoint", metadataEntryCheckpoint)
 			}
 			if timestampParseErr != nil || metadataEntryTimestamp == "" {
-				trace.Warning("empty or unparseable target domain metadata entry, cannot verify timestamp", "error", timestampParseErr)
+				trace.Warning("empty or unparsable target domain metadata entry, cannot verify timestamp", "error", timestampParseErr)
 			} else {
 				trace.Info("Target domain metadata", "timestamp", metadataEntryTimestamp)
 				for _, d := range qcowDisks {
