@@ -417,7 +417,7 @@ func unverifiableCheckpointMetadataError(targetDomain, parent string, checkpoint
 // unverifiableCheckpointMetadataError right above, it was inline in run()
 // with nothing to call directly.
 //
-// metadataEntryCheckpoint == "" (empty or unparseable) is reported as
+// metadataEntryCheckpoint == "" (empty or unparsable) is reported as
 // consistent here -- not because there's nothing to worry about, but
 // because that case is already unverifiableCheckpointMetadataError's own
 // responsibility (called separately, earlier, against the same field) --
