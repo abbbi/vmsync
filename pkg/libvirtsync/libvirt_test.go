@@ -1158,23 +1158,31 @@ func TestReplaceDomainDiskPathPreservesRichConfiguration(t *testing.T) {
 	// below, because missingXMLElements already suppresses it globally via
 	// intentionallyDroppedXMLElements (added specifically so a real sync of
 	// any domain with a backing chain doesn't log a permanent false-positive
-	// "dropped configuration" warning on every run). "format" is the
-	// visible side effect that denylist does NOT cover: <format
-	// type="qcow2"/> in this fixture exists only nested inside that
-	// backingStore (a disk's own format is a <driver type="qcow2">
-	// attribute, not this element; <format> is specifically a
-	// backingStore/mirror-job convention), so once backingStore is gone,
-	// "format" has nowhere left to appear as an element name either.
-	// intentionallyDroppedXMLElements deliberately does NOT also suppress
-	// "format" itself (see its own doc comment) -- broadening that denylist
-	// risks masking a genuinely dropped <format> in some unrelated context
-	// -- so this expected-missing list, not production code, is what
-	// accounts for it here. Everything else in this fixture (hostdev, tpm,
-	// qemu:commandline, network interface, graphics/video/controllers, the
-	// ignored cdrom, CPU/features/clock, UEFI loader/nvram) must still be
-	// there.
+	// "dropped configuration" warning on every run). "format" and "source"
+	// are the visible side effects that denylist does NOT cover: this
+	// fixture's cleared backingStore nests exactly one <format type="qcow2"/>
+	// and one <source file=".../base.qcow2"/> (the backing file's own
+	// source, distinct from disk1's own top-level <source>, which survives,
+	// rewritten) -- a disk's own format is a <driver type="qcow2">
+	// attribute, not this element, and <format> is specifically a
+	// backingStore/mirror-job convention -- so once backingStore is gone,
+	// both have nowhere left to appear as that one instance. missingXMLElements
+	// compares occurrence counts (see its own doc comment), not mere
+	// presence, specifically so a repeated element losing one instance is
+	// still caught even though other same-named elements survive elsewhere
+	// in the document -- "source" still exists four times over in the
+	// rewritten output (both disks' own, the interface's, the hostdev's),
+	// so a presence-only check would never have surfaced this one instance
+	// going missing at all. intentionallyDroppedXMLElements deliberately
+	// does NOT also suppress "format"/"source" themselves (see its own doc
+	// comment) -- broadening that denylist risks masking a genuinely
+	// dropped instance of either in some unrelated context -- so this
+	// expected-missing list, not production code, is what accounts for it
+	// here. Everything else in this fixture (hostdev, tpm, qemu:commandline,
+	// network interface, graphics/video/controllers, the ignored cdrom,
+	// CPU/features/clock, UEFI loader/nvram) must still be there.
 	missing := missingXMLElements(xmlStr, out)
-	want := []string{"format"}
+	want := []string{"format", "source"}
 	if len(missing) != len(want) {
 		t.Fatalf("replaceDomainDiskPath() against a feature-rich domain = missing %v, want exactly %v -- full output: %s", missing, want, out)
 	}
