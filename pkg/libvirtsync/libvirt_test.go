@@ -973,8 +973,8 @@ func TestCheckpointDeletionOrder(t *testing.T) {
 	})
 }
 
-func TestXMLElementNames(t *testing.T) {
-	t.Run("collects every distinct element name, ignoring namespace prefixes", func(t *testing.T) {
+func TestXMLElementCounts(t *testing.T) {
+	t.Run("collects every distinct element name with its occurrence count, ignoring namespace prefixes", func(t *testing.T) {
 		xmlStr := `<domain>
   <name>testvm</name>
   <devices>
@@ -985,33 +985,31 @@ func TestXMLElementNames(t *testing.T) {
     <qemu:arg value="-foo"/>
   </qemu:commandline>
 </domain>`
-		got := xmlElementNames(xmlStr)
-		want := []string{"domain", "name", "devices", "hostdev", "commandline", "arg"}
-		for _, name := range want {
-			if !got[name] {
-				t.Errorf("xmlElementNames(...) missing expected element %q, got %v", name, got)
+		got := xmlElementCounts(xmlStr)
+		want := map[string]int{"domain": 1, "name": 1, "devices": 1, "hostdev": 2, "commandline": 1, "arg": 1}
+		for name, count := range want {
+			if got[name] != count {
+				t.Errorf("xmlElementCounts(...)[%q] = %d, want %d (full result: %v)", name, got[name], count, got)
 			}
 		}
-		// A repeated element (two <hostdev/>) must still only occupy one
-		// entry in the set -- this is a set of distinct names, not a count.
 		if len(got) != len(want) {
-			t.Errorf("xmlElementNames(...) = %v (%d distinct names), want exactly %d", got, len(got), len(want))
+			t.Errorf("xmlElementCounts(...) = %v (%d distinct names), want exactly %d", got, len(got), len(want))
 		}
 	})
 
-	t.Run("malformed xml returns nil, not an empty set", func(t *testing.T) {
-		if got := xmlElementNames("not xml at all <<<"); got != nil {
-			t.Errorf("xmlElementNames(malformed) = %v, want nil", got)
+	t.Run("malformed xml returns nil, not an empty map", func(t *testing.T) {
+		if got := xmlElementCounts("not xml at all <<<"); got != nil {
+			t.Errorf("xmlElementCounts(malformed) = %v, want nil", got)
 		}
 	})
 
-	t.Run("empty string returns an empty, non-nil set", func(t *testing.T) {
-		got := xmlElementNames("")
+	t.Run("empty string returns an empty, non-nil map", func(t *testing.T) {
+		got := xmlElementCounts("")
 		if got == nil {
-			t.Fatal("xmlElementNames(\"\") = nil, want a non-nil empty set (empty input parses fine, it just has no elements)")
+			t.Fatal("xmlElementCounts(\"\") = nil, want a non-nil empty map (empty input parses fine, it just has no elements)")
 		}
 		if len(got) != 0 {
-			t.Errorf("xmlElementNames(\"\") = %v, want empty", got)
+			t.Errorf("xmlElementCounts(\"\") = %v, want empty", got)
 		}
 	})
 }
@@ -1048,11 +1046,34 @@ func TestMissingXMLElements(t *testing.T) {
 		}
 	})
 
+	// This is the instance-count case a pure present/absent name comparison
+	// can't see: "disk" is still present in rewritten (one instance
+	// survives), but a second instance was silently dropped -- e.g. one of
+	// several disks vanishing from the domain definition entirely, while a
+	// same-named sibling remains and would otherwise mask the loss.
+	t.Run("a repeated element losing one of several instances is still reported, even though the name survives", func(t *testing.T) {
+		original := `<domain><devices><disk id="a"/><disk id="b"/><disk id="c"/></devices></domain>`
+		rewritten := `<domain><devices><disk id="a"/><disk id="b"/></devices></domain>`
+		got := missingXMLElements(original, rewritten)
+		want := []string{"disk"}
+		if len(got) != len(want) || got[0] != want[0] {
+			t.Errorf("missingXMLElements(...) = %v, want %v -- losing one of three <disk> instances must be reported", got, want)
+		}
+	})
+
+	t.Run("a repeated element keeping the same count across the rewrite is not reported", func(t *testing.T) {
+		original := `<domain><devices><disk id="a"/><disk id="b"/></devices></domain>`
+		rewritten := `<domain><devices><disk id="a"/><disk id="renamed-b"/></devices></domain>`
+		if got := missingXMLElements(original, rewritten); got != nil {
+			t.Errorf("missingXMLElements(...) = %v, want nil -- the count of \"disk\" elements is unchanged", got)
+		}
+	})
+
 	t.Run("an unparsable original or rewrite yields no report rather than a false positive", func(t *testing.T) {
 		// "not xml" alone (no "<" at all) is NOT enough to exercise this --
 		// encoding/xml's tokenizer is lenient about plain character data
 		// with no markup, and happily reports it as zero elements rather
-		// than erroring, which xmlElementNames treats the same as a
+		// than erroring, which xmlElementCounts treats the same as a
 		// genuinely empty document (not a parse failure). "<<<" is what
 		// actually breaks tag syntax and triggers a real decode error.
 		if got := missingXMLElements("not xml at all <<<", `<domain/>`); got != nil {

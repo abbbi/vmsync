@@ -479,15 +479,19 @@ func replaceDomainName(domainXML, name string) (string, error) {
 	return changed, nil
 }
 
-// xmlElementNames returns the set of distinct element tag names (local
-// name only -- "hostdev", "commandline", etc. -- namespace prefixes aren't
-// distinguished, since the same element can legitimately round-trip
-// through a different prefix with no actual loss) appearing anywhere in
-// domainXML. Returns nil if domainXML doesn't even parse as XML, rather
-// than produce a false "elements are missing" signal for something that
-// was never valid to begin with.
-func xmlElementNames(domainXML string) map[string]bool {
-	names := map[string]bool{}
+// xmlElementCounts returns, for each distinct element tag name (local name
+// only -- "hostdev", "commandline", etc. -- namespace prefixes aren't
+// distinguished, since the same element can legitimately round-trip through
+// a different prefix with no actual loss) appearing anywhere in domainXML,
+// how many times it occurs. Counting rather than just recording presence is
+// what lets missingXMLElements notice a repeated element (multiple <disk>,
+// <interface>, <hostdev>, ...) losing one or more instances even when at
+// least one same-named sibling survives elsewhere in the document. Returns
+// nil if domainXML doesn't even parse as XML, rather than produce a false
+// "elements are missing" signal for something that was never valid to
+// begin with.
+func xmlElementCounts(domainXML string) map[string]int {
+	counts := map[string]int{}
 	dec := xml.NewDecoder(strings.NewReader(domainXML))
 	for {
 		tok, err := dec.Token()
@@ -498,10 +502,10 @@ func xmlElementNames(domainXML string) map[string]bool {
 			return nil
 		}
 		if start, ok := tok.(xml.StartElement); ok {
-			names[start.Name.Local] = true
+			counts[start.Name.Local]++
 		}
 	}
-	return names
+	return counts
 }
 
 // intentionallyDroppedXMLElements lists element names missingXMLElements
@@ -520,26 +524,31 @@ var intentionallyDroppedXMLElements = map[string]bool{
 }
 
 // missingXMLElements returns the sorted list of distinct element names
-// present in original but absent from rewritten -- empty (nil) when
-// original doesn't parse, rewritten doesn't parse, or nothing is missing.
-// Split out from warnIfXMLElementsDropped below purely so this actual
-// comparison logic is directly testable without needing to capture log
-// output.
+// whose occurrence count in rewritten is lower than in original -- catching
+// both a name disappearing entirely (count drops to 0) and a repeated
+// element (multiple <disk>, <interface>, <hostdev>, ...) losing one or more
+// instances while same-named siblings survive elsewhere in the document.
+// Empty (nil) when original doesn't parse, rewritten doesn't parse, or
+// nothing is missing. This still can't see attribute-level loss within an
+// instance that survives (a <disk> keeping its tag but losing an attribute,
+// say) -- only that an instance of a given tag name went away. Split out
+// from warnIfXMLElementsDropped below purely so this actual comparison
+// logic is directly testable without needing to capture log output.
 func missingXMLElements(original, rewritten string) []string {
-	before := xmlElementNames(original)
+	before := xmlElementCounts(original)
 	if before == nil {
 		return nil
 	}
-	after := xmlElementNames(rewritten)
+	after := xmlElementCounts(rewritten)
 	if after == nil {
 		return nil
 	}
 	var missing []string
-	for name := range before {
+	for name, beforeCount := range before {
 		if intentionallyDroppedXMLElements[name] {
 			continue
 		}
-		if !after[name] {
+		if after[name] < beforeCount {
 			missing = append(missing, name)
 		}
 	}
@@ -574,6 +583,16 @@ func missingXMLElements(original, rewritten string) []string {
 // operator can actually notice and investigate the first time it would
 // matter for a real domain, instead of silent, permanent, possibly
 // never-discovered configuration loss.
+//
+// missingXMLElements compares element occurrence counts, not full element
+// content, so it also can't see a surviving instance quietly losing an
+// attribute (a <disk> keeping its tag but dropping a driver/cache setting,
+// say) -- only that an instance of some element name went missing entirely.
+// That narrower class of loss is real but is much harder to check for
+// without false-positiving on libvirt's own legitimate attribute
+// normalization on marshal (auto-assigned addresses, inserted defaults, and
+// the like), so it's a known, accepted gap rather than something this
+// function attempts.
 func warnIfXMLElementsDropped(context, original, rewritten string) {
 	missing := missingXMLElements(original, rewritten)
 	if len(missing) == 0 {
