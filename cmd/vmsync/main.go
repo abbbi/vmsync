@@ -1913,7 +1913,22 @@ func run(cfg struct {
 		// delta sitting in the temp overlay, unmerged and uncleaned,
 		// and report a fully successful transfer as a failure. Mirrors
 		// stopVerifyCmd's own pattern in runVerify.
-		stopCmd := "kill -9 $(cat " + util.ShQuote(pidFile) + ") || true"
+		//
+		// The trailing rm -f matters beyond tidiness: this same command
+		// string stays registered in targetStopCommands for the
+		// interrupt-cleanup path even after the inline call below already
+		// runs it normally, so it can be replayed a second time if a
+		// signal lands later in this run. Without removing the pidfile,
+		// that replay would `cat` the same now-stale file and could
+		// SIGKILL whatever unrelated process the OS has since reused that
+		// PID for -- kill -9 succeeds against any valid PID, recycled or
+		// not, so || true can't catch or prevent that. Once the pidfile is
+		// gone, a replay's $(cat ...) expands to nothing, kill -9 with no
+		// PID argument targets nothing, and rm -f on an already-missing
+		// file is a no-op -- the whole replay becomes harmless instead of
+		// dangerous. Matches nbdbridge.BuildStopCommand's own identical
+		// kill-then-remove pattern for the bridge helper's pidfile.
+		stopCmd := "kill -9 $(cat " + util.ShQuote(pidFile) + ") || true; rm -f " + util.ShQuote(pidFile)
 		stopMu.Lock()
 		targetStopCommands = append(targetStopCommands, stopCmd)
 		stopMu.Unlock()
@@ -2024,7 +2039,12 @@ func run(cfg struct {
 		if err := runTargetCommand(startVerifyCmd, fmt.Sprintf("start read-only verify export for %s", targetPath)); err != nil {
 			return err
 		}
-		stopVerifyCmd := "kill -9 $(cat " + util.ShQuote(verifyPidFile) + ") || true"
+		// Same rm -f-after-kill reasoning as stopCmd in copyAndCommit above:
+		// this string is also replayable from the interrupt-cleanup path
+		// after the inline call further down already runs it normally, and
+		// without removing the pidfile that replay could SIGKILL whatever
+		// unrelated process the OS has since reused the old PID for.
+		stopVerifyCmd := "kill -9 $(cat " + util.ShQuote(verifyPidFile) + ") || true; rm -f " + util.ShQuote(verifyPidFile)
 		stopMu.Lock()
 		targetStopCommands = append(targetStopCommands, stopVerifyCmd)
 		stopMu.Unlock()
