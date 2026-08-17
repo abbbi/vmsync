@@ -54,6 +54,16 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //     qcow2 image with an actual persistent bitmap attached via `qemu-img
 //     bitmap --add` and a matching `qemu-nbd -B`, a meaningfully bigger
 //     setup than the plain base:allocation case covered here.
+//   - compareTCP's own buffer-free-on-AIO-error branches specifically (as
+//     opposed to CopyExtentsTCP's, which the tests below do cover): unlike
+//     CopyExtentsTCP, compareTCP takes no caller-supplied extents and
+//     requires both sides to already report the same size before it ever
+//     builds a chunk, so there's no way to construct an in-bounds-looking
+//     request that actually reads past either side's real end the way
+//     CopyExtentsTCP's tests do -- the only way to make one of its AIO
+//     reads genuinely fail would be a real dropped connection or a
+//     corrupted export, the same "meaningfully more involved to get
+//     non-flaky" class of test already excluded above.
 package nbdsync
 
 import (
@@ -274,6 +284,147 @@ func TestCopyExtentsTCPSkipsNonDirtyExtents(t *testing.T) {
 	}
 	if !bytes.Equal(got[chunkSize:], srcContent[chunkSize:]) {
 		t.Error("the dirty extent was not correctly copied to the target")
+	}
+}
+
+// TestCopyExtentsTCPReusesSlotsAcrossManyChunks specifically forces AIO
+// slot recycling -- something none of this file's other CopyExtentsTCP
+// tests do, since they all use a single extent no bigger than a handful of
+// MiB against ioDepth=4, and negotiateBufferSize's real, environment-
+// dependent result could plausibly be that size or larger, meaning every
+// chunk gets its own never-reused slot. This uses four separate,
+// non-overlapping, individually tiny (256KiB) extents instead of one big
+// one: CopyExtentsTCP's own chunk-flattening loop turns each extent
+// smaller than the negotiated buffer size into exactly one chunk
+// regardless of what that size actually is (see its own per-extent
+// "remaining > 0" loop), so this reliably produces 4 chunks contending for
+// only 2 slots without this test needing to know or control the real
+// negotiated buffer size at all. Verifies both that each region's own
+// content survives correctly (a slot whose state doesn't get fully reset
+// between reuses could hand a later chunk stale data from an earlier one)
+// and that the untouched gaps between extents stay untouched (a slot
+// reused with the wrong offset bookkeeping could write correct bytes to
+// the wrong place instead).
+func TestCopyExtentsTCPReusesSlotsAcrossManyChunks(t *testing.T) {
+	requireQemuNBD(t)
+	dir := t.TempDir()
+
+	const fileSize = 2 * 1024 * 1024
+	const extentSize = 256 * 1024
+	srcContent := patternBytes(fileSize)
+	srcPath := writeRawFile(t, dir, "src.raw", srcContent)
+	dstPath := writeRawFile(t, dir, "dst.raw", make([]byte, fileSize))
+
+	srcPort := qemuNBDExport(t, srcPath)
+	dstPort := qemuNBDExport(t, dstPath)
+
+	extents := []Extent{
+		{Offset: 0, Length: extentSize, Dirty: true},
+		{Offset: 512 * 1024, Length: extentSize, Dirty: true},
+		{Offset: 1024 * 1024, Length: extentSize, Dirty: true},
+		{Offset: 1536 * 1024, Length: extentSize, Dirty: true},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// ioDepth=2 against 4 chunks guarantees every slot is reused at least
+	// once -- the exact path this test exists to exercise.
+	written, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, extents, 2)
+	if err != nil {
+		t.Fatalf("CopyExtentsTCP: %v", err)
+	}
+	if written != uint64(len(extents)*extentSize) {
+		t.Fatalf("CopyExtentsTCP wrote %d bytes, want %d", written, len(extents)*extentSize)
+	}
+
+	got, err := os.ReadFile(dstPath)
+	if err != nil {
+		t.Fatalf("read back destination file: %v", err)
+	}
+	for _, ex := range extents {
+		want := srcContent[ex.Offset : ex.Offset+ex.Length]
+		gotRange := got[ex.Offset : ex.Offset+ex.Length]
+		if !bytes.Equal(want, gotRange) {
+			t.Errorf("extent at offset %d: content differs after a slot-reusing copy -- a reused slot likely handed this chunk stale or corrupted data", ex.Offset)
+		}
+	}
+	// The gap between the first and second extent (256KiB..512KiB) was
+	// never marked dirty -- it must still be exactly zero.
+	gap := got[extentSize : 512*1024]
+	if !bytes.Equal(gap, make([]byte, len(gap))) {
+		t.Error("the untouched gap between extents was modified -- a reused slot likely wrote to the wrong offset")
+	}
+}
+
+// TestCopyExtentsTCPFreesBufferOnSourceReadError exercises the "confirmed
+// complete but failed" branch in the reads-finished loop -- reached only
+// when an AIO read command completes with a nonzero errno, distinct from
+// every other test in this file, which either succeeds outright or (for
+// CompareTCP) finds a data mismatch, neither of which frees a buffer on a
+// genuine AIO command error. An extent that runs past the end of the
+// source export is a real, deterministic NBD protocol error (not a
+// simulated one), without needing to kill a process mid-transfer -- see
+// this file's own top-of-file comment for why that harder scenario is
+// deliberately left uncovered.
+func TestCopyExtentsTCPFreesBufferOnSourceReadError(t *testing.T) {
+	requireQemuNBD(t)
+	dir := t.TempDir()
+
+	const size = 1024 * 1024
+	srcPath := writeRawFile(t, dir, "src.raw", patternBytes(size))
+	dstPath := writeRawFile(t, dir, "dst.raw", make([]byte, size))
+
+	srcPort := qemuNBDExport(t, srcPath)
+	dstPort := qemuNBDExport(t, dstPath)
+
+	// Starts 100 bytes before the end of the export and reads 10000 bytes
+	// -- comfortably past size, and far smaller than any buffer size
+	// negotiateBufferSize could plausibly negotiate, so this always ends
+	// up as a single out-of-bounds chunk rather than being split.
+	extents := []Extent{{Offset: uint64(size) - 100, Length: 10000, Dirty: true}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, extents, 4)
+	if err == nil {
+		t.Fatal("CopyExtentsTCP with an out-of-bounds source read returned nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "pread") {
+		t.Errorf("error = %q, want it to mention the failed pread", err.Error())
+	}
+}
+
+// TestCopyExtentsTCPFreesBufferOnTargetWriteError isolates the "writes
+// that finished" loop's own opErr branch specifically -- distinct from the
+// source-read-error test above, which never reaches the write side at
+// all. The target export is deliberately smaller than the source, so
+// every chunk's read (always within the source's own bounds) succeeds,
+// but writing that same range back out eventually crosses the target's
+// smaller size and fails there instead -- regardless of exactly where
+// negotiateBufferSize happens to draw chunk boundaries, some chunk's
+// write must cross that size difference.
+func TestCopyExtentsTCPFreesBufferOnTargetWriteError(t *testing.T) {
+	requireQemuNBD(t)
+	dir := t.TempDir()
+
+	const srcSize = 1024 * 1024
+	const dstSize = 512 * 1024
+	srcPath := writeRawFile(t, dir, "src.raw", patternBytes(srcSize))
+	dstPath := writeRawFile(t, dir, "dst.raw", make([]byte, dstSize))
+
+	srcPort := qemuNBDExport(t, srcPath)
+	dstPort := qemuNBDExport(t, dstPath)
+
+	extents := []Extent{{Offset: 0, Length: srcSize, Dirty: true}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, extents, 4)
+	if err == nil {
+		t.Fatal("CopyExtentsTCP writing past a smaller target's end returned nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "pwrite") {
+		t.Errorf("error = %q, want it to mention the failed pwrite", err.Error())
 	}
 }
 
