@@ -35,9 +35,9 @@ import (
 	"net"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 
+	"vmsync/pkg/netbuffer"
 	"vmsync/pkg/version"
 	"vmsync/pkg/zstdrelay"
 )
@@ -155,14 +155,10 @@ func main() {
 		}
 	}
 
-	var netbufferBlock, netbufferSize string
-	if netBufferArg.value != "" {
-		parts := strings.SplitN(netBufferArg.value, ",", 2)
-		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: -netbuffer must be of the form <blocksize>,<buffersize>, got %q\n", netBufferArg.value)
-			os.Exit(2)
-		}
-		netbufferBlock, netbufferSize = parts[0], parts[1]
+	netbufferBlock, netbufferSize, err := netbuffer.ParseSpec(netBufferArg.value)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
+		os.Exit(2)
 	}
 
 	if err := serve(*listenAddr, *connectAddr, compress, algo, *level, netbufferBlock, netbufferSize); err != nil {

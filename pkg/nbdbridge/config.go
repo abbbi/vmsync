@@ -19,10 +19,9 @@ package nbdbridge
 
 import (
 	"fmt"
-	"regexp"
 	"strconv"
-	"strings"
 
+	"vmsync/pkg/netbuffer"
 	"vmsync/pkg/zstdrelay"
 )
 
@@ -101,32 +100,13 @@ func ValidateCompressAlgo(algo string) error {
 	return err
 }
 
-var netbufferSizeRe = regexp.MustCompile(`(?i)^[0-9]+[bkmgt]?$`)
-
 // ParseNetBufferSpec parses a --netbuffer value of the form
 // "<blocksize>,<buffersize>" into its two block-size/limit-size arguments.
-// An empty spec is valid and means netbuffer is disabled.
+// An empty spec is valid and means netbuffer is disabled. Thin wrapper
+// around pkg/netbuffer.ParseSpec -- the actual logic lives there so
+// cmd/vmsync-bridge-helper can share it directly, without importing this
+// package (and therefore pkg/remotessh, its SSH client dependency, which
+// that otherwise minimal, standalone binary avoids on purpose).
 func ParseNetBufferSpec(spec string) (block, size string, err error) {
-	if spec == "" {
-		return "", "", nil
-	}
-	parts := strings.SplitN(spec, ",", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", fmt.Errorf("--netbuffer must be of the form <blocksize>,<buffersize> (e.g. 64k,512M), got %q", spec)
-	}
-	if !netbufferSizeRe.MatchString(parts[0]) {
-		return "", "", fmt.Errorf("--netbuffer block size %q is invalid (expected a number optionally followed by b/k/m/g/t)", parts[0])
-	}
-	if !netbufferSizeRe.MatchString(parts[1]) {
-		return "", "", fmt.Errorf("--netbuffer buffer size %q is invalid (expected a number optionally followed by b/k/m/g/t)", parts[1])
-	}
-	// A zero-byte buffer deadlocks BoundedBuffer.Write forever: it blocks
-	// while curBytes >= maxBytes, which is trivially true from the first
-	// byte when maxBytes is 0, and nothing can ever be dequeued to clear
-	// it. Reject it here so this is a normal startup error instead of a
-	// silent, permanent hang.
-	if bufBytes, err := zstdrelay.ParseByteSize(parts[1]); err == nil && bufBytes <= 0 {
-		return "", "", fmt.Errorf("wrong buffer size")
-	}
-	return parts[0], parts[1], nil
+	return netbuffer.ParseSpec(spec)
 }
