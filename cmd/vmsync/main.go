@@ -492,20 +492,31 @@ func run(cfg struct {
 	var stopMu sync.Mutex
 	targetStopCommands := make([]string, 0)
 	sourceStopCommands := make([]string, 0)
-	// checkpointMu guards checkpointName/checkpointAdvanced specifically
-	// against the signal handler's own goroutine (started further down),
-	// which reads both to decide whether there's a checkpoint to clean up
-	// on Ctrl+C/SIGTERM -- every other read/write of these two happens
-	// sequentially within run()'s own goroutine (checkpoint creation runs
-	// entirely before the per-disk goroutines are spawned, and the
-	// end-of-run reads happen after wg.Wait() has already joined them), so
-	// only the two writes below and the signal handler's read actually need
-	// it. Without this, a signal landing between CreateCheckpoint
-	// succeeding and checkpointAdvanced being set could make the handler
-	// observe a stale "not advanced", skip deleting a checkpoint that
-	// genuinely exists now, and leave it orphaned for the next run to trip
-	// over.
+	// checkpointMu guards checkpointName/checkpointAdvanced against
+	// concurrent access from outside run()'s own goroutine -- specifically
+	// cleanupOrphanedCheckpoint (defined further down), which decides
+	// whether there's a checkpoint to clean up and is called from both
+	// run()'s own deferred cleanup AND the signal handler's goroutine.
+	// Every other read/write of these two happens sequentially within
+	// run()'s own goroutine (checkpoint creation runs entirely before the
+	// per-disk goroutines are spawned, and the end-of-run reads happen
+	// after wg.Wait() has already joined them), so only the two writes
+	// below and cleanupOrphanedCheckpoint's own read actually need it.
+	// checkpointCleanupOnce guards cleanupOrphanedCheckpoint's actual
+	// execution to exactly once regardless of which of its two callers
+	// gets there first -- see that closure's own doc comment for why this
+	// used to be two separate, duplicated pieces of logic instead of one,
+	// and why that duplication was itself the bug: run()'s own goroutine
+	// keeps executing independently of any signal, so its own deferred
+	// cleanup is not guaranteed to be skipped just because the signal
+	// handler is heading for os.Exit -- the two can genuinely run
+	// concurrently, and a signal landing between CreateCheckpoint
+	// succeeding and checkpointAdvanced being set could make an unguarded
+	// reader observe a stale "not advanced", skip deleting a checkpoint
+	// that genuinely exists now, and leave it orphaned for the next run to
+	// trip over.
 	var checkpointMu sync.Mutex
+	var checkpointCleanupOnce sync.Once
 	var checkpointName string
 	var parent string
 	// checkpointAdvanced is true once CreateCheckpoint below has actually
@@ -965,6 +976,80 @@ func run(cfg struct {
 		})
 	}
 
+	// cleanupOrphanedCheckpoint deletes checkpointName if, and only if, it
+	// was actually created this run (checkpointAdvanced) but the data copy
+	// it's meant to be the baseline for never finished (!dataCopySucceeded)
+	// -- otherwise a failed or interrupted run leaves behind a checkpoint
+	// the next run would wrongly trust as a valid incremental baseline.
+	//
+	// This used to be two separate, hand-duplicated pieces of logic: one
+	// here as a defer in run()'s own flow, another inline in the signal
+	// handler's goroutine below, on the reasoning that "os.Exit skips
+	// defers, so only one of them ever actually runs." That reasoning does
+	// not hold: os.Exit only skips run()'s defer if it fires *before*
+	// run() returns, but nothing stops run()'s own goroutine from
+	// returning on its own (noticing ctx cancellation, or a resource the
+	// signal handler already tore down failing an in-flight call) while
+	// the signal handler's goroutine is still mid-cleanup, heading for its
+	// own os.Exit. In that overlap, both used to read
+	// checkpointName/checkpointAdvanced/dataCopySucceeded independently --
+	// one of them without checkpointMu at all -- and could reach different
+	// conclusions about the exact same checkpoint from a torn or stale
+	// read, including the read that decides *not* to delete when deletion
+	// was actually warranted: precisely the "orphaned checkpoint" outcome
+	// the old comment on the signal-handler copy dismissed as prevented.
+	//
+	// Unifying into one checkpointCleanupOnce-guarded closure, callable
+	// from both places, closes this off completely instead of narrowing
+	// the window: whichever caller gets here first is the only one that
+	// actually evaluates anything.
+	cleanupOrphanedCheckpoint := func(trigger string) {
+		checkpointCleanupOnce.Do(func() {
+			// Snapshot all three under checkpointMu, once, rather than
+			// reading each separately -- a signal (or run()'s own defer)
+			// landing between CreateCheckpoint succeeding and
+			// checkpointAdvanced being set must see either the
+			// fully-pre-checkpoint state or the fully-post-checkpoint
+			// state, never a stale mix of the two.
+			checkpointMu.Lock()
+			name, advanced, copySucceeded := checkpointName, checkpointAdvanced, dataCopySucceeded
+			checkpointMu.Unlock()
+			// A snapshot showing copySucceeded=false is not trustworthy on
+			// its own when called from the signal handler: run()'s
+			// goroutine keeps executing regardless of the signal, and
+			// might be a handful of Go statements away from flipping it to
+			// true (see copyCommitted's own doc comment for exactly why).
+			// Wait briefly for that transition before concluding the copy
+			// is still genuinely in progress. Called from run()'s own
+			// defer, run() has already fully returned by this point, so
+			// dataCopySucceeded is already final and copyCommitted (if the
+			// copy did succeed) is already closed -- this is then an
+			// instant, harmless no-op rather than a real wait.
+			if advanced && !copySucceeded {
+				select {
+				case <-copyCommitted:
+					copySucceeded = true
+				case <-time.After(200 * time.Millisecond):
+				}
+			}
+			if name == "" || !advanced || copySucceeded {
+				return
+			}
+			if err := callWithTimeout("delete checkpoint", 5*time.Second, func() error {
+				return libvirtsync.DeleteCheckpointIfExists(srcDom, name)
+			}); err != nil {
+				trace.Error("failed to delete checkpoint", "trigger", trigger, "checkpoint", name, "error", err)
+				if retryErr := libvirtsync.DeleteCheckpointViaReconnect(cfg.SourceURI, cfg.SourceDomain, name); retryErr != nil {
+					trace.Error("failed to delete checkpoint via reconnect", "trigger", trigger, "checkpoint", name, "error", retryErr)
+				} else {
+					trace.Info("removed checkpoint via reconnect path", "trigger", trigger, "checkpoint", name)
+				}
+			} else {
+				trace.Info("removed checkpoint", "trigger", trigger, "checkpoint", name)
+			}
+		})
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	doneCh := make(chan struct{})
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -986,57 +1071,7 @@ func run(cfg struct {
 			go func() { defer cleanupWg.Done(); cleanupSourceBridge(sig.String()) }()
 			go func() { defer cleanupWg.Done(); resumeSource(sig.String()) }()
 			go func() { defer cleanupWg.Done(); thawSource(sig.String()) }()
-			go func() {
-				defer cleanupWg.Done()
-				// Snapshot all three under checkpointMu, once, rather than
-				// reading each separately -- a signal landing between
-				// CreateCheckpoint succeeding and checkpointAdvanced being
-				// set must see either the fully-pre-checkpoint state or the
-				// fully-post-checkpoint state, never a stale mix of the two.
-				checkpointMu.Lock()
-				name, advanced, copySucceeded := checkpointName, checkpointAdvanced, dataCopySucceeded
-				checkpointMu.Unlock()
-				// A snapshot showing copySucceeded=false is not trustworthy
-				// on its own: run()'s goroutine keeps executing regardless of
-				// this signal, and might be a handful of Go statements away
-				// from flipping it to true (see copyCommitted's own doc
-				// comment for exactly why). Wait briefly for that transition
-				// to actually happen before concluding the copy is still
-				// genuinely in progress -- if it's still running for real
-				// (the common case for an interrupt during a multi-hour
-				// sync), copyCommitted won't close for a long time and this
-				// just waits out the timeout once, unnoticeably, before
-				// proceeding to delete as before.
-				if advanced && !copySucceeded {
-					select {
-					case <-copyCommitted:
-						copySucceeded = true
-					case <-time.After(200 * time.Millisecond):
-					}
-				}
-				// Mirrors the deferred checkpoint cleanup further down in
-				// run() -- duplicated here because that defer never gets a
-				// chance to run if we os.Exit below without waiting for it.
-				// copySucceeded matters here too: a signal landing after the
-				// copy itself finished but before run() has returned (e.g.
-				// during parent-checkpoint cleanup or target domain
-				// redefinition) must not discard a checkpoint that correctly
-				// reflects data which did finish copying -- see
-				// dataCopySucceeded's own doc comment.
-				if name == "" || !advanced || copySucceeded {
-					return
-				}
-				if err := callWithTimeout("delete checkpoint", 5*time.Second, func() error {
-					return libvirtsync.DeleteCheckpointIfExists(srcDom, name)
-				}); err != nil {
-					trace.Error("failed to delete checkpoint after interrupt", "checkpoint", name, "error", err)
-					if retryErr := libvirtsync.DeleteCheckpointViaReconnect(cfg.SourceURI, cfg.SourceDomain, name); retryErr != nil {
-						trace.Error("failed to delete checkpoint via reconnect after interrupt", "checkpoint", name, "error", retryErr)
-					}
-				} else {
-					trace.Info("removed checkpoint after interrupt", "checkpoint", name)
-				}
-			}()
+			go func() { defer cleanupWg.Done(); cleanupOrphanedCheckpoint(sig.String()) }()
 			cleanupWg.Wait()
 			cancel()
 
@@ -1472,19 +1507,19 @@ func run(cfg struct {
 	}
 	thawSource("checkpoint creation complete")
 
+	// runErr is checked here, at the call site, rather than inside
+	// cleanupOrphanedCheckpoint itself: runErr is only meaningful once
+	// run() has actually returned (it's this function's own named return
+	// value), which is exactly when this defer fires -- unlike the signal
+	// handler's call to the same closure, which happens mid-flight, before
+	// run() has returned at all, and unconditionally wants this checked
+	// (being interrupted is inherently not a success). See
+	// cleanupOrphanedCheckpoint's own doc comment for why this is now a
+	// single shared closure instead of two independently-racing copies of
+	// the same logic.
 	defer func() {
-		if runErr == nil || !checkpointAdvanced || dataCopySucceeded {
-			return
-		}
-		if err := libvirtsync.DeleteCheckpointIfExists(srcDom, checkpointName); err != nil {
-			trace.Error("failed to delete checkpoint after sync error on primary connection", "checkpoint", checkpointName, "error", err)
-			if retryErr := libvirtsync.DeleteCheckpointViaReconnect(cfg.SourceURI, cfg.SourceDomain, checkpointName); retryErr != nil {
-				trace.Error("failed to delete checkpoint via reconnect", "checkpoint", checkpointName, "error", retryErr)
-			} else {
-				trace.Info("removed checkpoint after sync failure (reconnect path)", "checkpoint", checkpointName)
-			}
-		} else {
-			trace.Info("removed checkpoint after sync failure", "checkpoint", checkpointName)
+		if runErr != nil {
+			cleanupOrphanedCheckpoint("sync failed")
 		}
 	}()
 
