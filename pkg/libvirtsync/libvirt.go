@@ -674,6 +674,14 @@ func warnIfXMLElementsDropped(context, original, rewritten string) {
 	trace.Warning("domain xml elements present before this rewrite are missing afterward -- the domain-xml round-trip (unmarshal into a typed struct, then re-marshal) may have silently dropped configuration this tool doesn't model; verify the affected domain's definition still has everything you expect", "context", context, "missing_elements", strings.Join(missing, ", "))
 }
 
+// metadataFieldNameRe is the set of field names SetMetadataFields accepts
+// from a caller. Deliberately narrower than what XML itself permits in an
+// element name: every field vmsync writes is lowercase ASCII with
+// underscores (see metadataFieldOrder), so there is nothing to gain from
+// accepting the full Unicode NCName grammar, and a conservative pattern is
+// far easier to be confident is safe.
+var metadataFieldNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]*$`)
+
 // SetMetadataFields merges the given vmsync:field->value pairs into
 // domainXML's <metadata> block, preserving any existing vmsync fields not
 // mentioned in updates or removeFields (and any unrelated, non-vmsync
@@ -683,7 +691,36 @@ func warnIfXMLElementsDropped(context, original, rewritten string) {
 // semantically meaningless for a domain's current role (e.g. a target's
 // last_checkpoint/failure_count once that domain becomes a replication
 // SOURCE instead, which has no checkpoint chain of its own to report).
+//
+// A field name in updates that isn't a safe XML element name is rejected
+// here rather than written out. buildMetadataEntry interpolates field names
+// straight into the tag it emits ("<vmsync:" + field), and unlike the
+// values -- which go through xml.EscapeText -- an element NAME has no
+// escaping available: a name containing a space, '>', '/' or a leading
+// digit simply cannot be expressed, and would produce malformed XML that
+// the Marshal below (or DomainDefineXML further downstream) rejects with a
+// confusing parse error pointing at the whole domain document rather than
+// at the offending key. This used to be structurally impossible, because
+// buildMetadataEntry only ever emitted names from the fixed
+// metadataFieldOrder list and silently dropped anything else; that changed
+// when it started emitting unrecognized fields too, so that
+// SetMetadataFields could keep its promise to preserve fields it doesn't
+// know about. This check is what the fixed list used to provide for free.
+//
+// Only caller-supplied names are checked. Names recovered from the domain's
+// existing metadata by allMetadataFields are already valid XML element
+// names by construction -- they came from a parsed document, and
+// xml.StartElement.Name.Local can't even carry the namespace colon --
+// so validating those too would risk rejecting, and thereby destroying,
+// metadata written by a newer vmsync that this build is supposed to
+// preserve untouched.
 func SetMetadataFields(domainXML string, updates map[string]string, removeFields ...string) (string, error) {
+	for field := range updates {
+		if !metadataFieldNameRe.MatchString(field) {
+			return "", fmt.Errorf("invalid vmsync metadata field name %q: must start with a letter or underscore and contain only letters, digits, '_', '.' or '-'", field)
+		}
+	}
+
 	domcfg := &libvirtxml.Domain{}
 	err := domcfg.Unmarshal(domainXML)
 	if err != nil {

@@ -821,6 +821,74 @@ func TestSetMetadataFieldsRemoveFields(t *testing.T) {
 	})
 }
 
+// TestSetMetadataFieldsRejectsUnsafeFieldNames pins the validation that
+// stands in for what the fixed metadataFieldOrder list used to provide for
+// free: buildMetadataEntry interpolates a field name straight into the tag
+// it emits ("<vmsync:" + field), and an element NAME -- unlike a value --
+// has no escaping available, so an unsafe name can only ever produce
+// malformed XML. Before buildMetadataEntry started emitting unrecognized
+// fields (so SetMetadataFields could keep its promise to preserve fields it
+// doesn't know about), such a name was silently dropped and could never
+// reach the output at all.
+//
+// Every real caller passes a metadataField* constant, so this is a guard
+// against future misuse rather than a live bug -- the point is that it fails
+// loudly, at the offending key, instead of surfacing as a confusing parse
+// error against the whole domain document from Marshal or DomainDefineXML.
+func TestSetMetadataFieldsRejectsUnsafeFieldNames(t *testing.T) {
+	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
+
+	for _, field := range []string{
+		"has space",
+		"angle>bracket",
+		"slash/name",
+		"1leading_digit",
+		"quote\"name",
+		"ns:colon",
+		"",
+	} {
+		t.Run(fmt.Sprintf("rejects %q", field), func(t *testing.T) {
+			out, err := SetMetadataFields(base, map[string]string{field: "value"})
+			if err == nil {
+				t.Fatalf("SetMetadataFields() with field name %q returned no error -- full output: %s", field, out)
+			}
+			if !strings.Contains(err.Error(), field) {
+				t.Errorf("error %q does not name the offending field %q", err.Error(), field)
+			}
+			if out != "" {
+				t.Errorf("SetMetadataFields() returned XML alongside its error, want an empty string: %s", out)
+			}
+		})
+	}
+
+	t.Run("accepts the field-name shapes vmsync itself uses", func(t *testing.T) {
+		for _, field := range metadataFieldOrder {
+			if _, err := SetMetadataFields(base, map[string]string{field: "value"}); err != nil {
+				t.Errorf("SetMetadataFields() rejected its own field name %q: %v", field, err)
+			}
+		}
+	})
+
+	// The validation deliberately covers only caller-supplied names. A field
+	// already present in the domain's metadata came from a parsed document,
+	// so it is a valid XML element name by construction -- validating those
+	// too would risk rejecting, and thereby destroying, metadata written by a
+	// newer vmsync that this build is meant to preserve untouched.
+	t.Run("an unrecognized field already in the metadata survives an unrelated update", func(t *testing.T) {
+		seeded, err := SetMetadataFields(base, map[string]string{"field_from_a_newer_vmsync": "keep-me"})
+		if err != nil {
+			t.Fatalf("seeding SetMetadataFields() error = %v", err)
+		}
+		out, err := SetMetadataFields(seeded, map[string]string{MetadataFieldFailureCount: "2"})
+		if err != nil {
+			t.Fatalf("SetMetadataFields() error = %v", err)
+		}
+		if v, _ := ParseMetadataField(out, "field_from_a_newer_vmsync"); v != "keep-me" {
+			t.Errorf("field_from_a_newer_vmsync = %q after an unrelated update, want %q", v, "keep-me")
+		}
+	})
+}
+
 // TestReplicaListContains and TestAppendReplicaTarget cover the pure
 // list-manipulation logic RecordReplicaTarget depends on for deduplication
 // -- directly testable without a live domain, unlike RecordReplicaTarget
