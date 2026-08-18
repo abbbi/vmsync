@@ -26,6 +26,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path"
 	"strings"
@@ -38,6 +39,7 @@ import (
 	"vmsync/pkg/metrics"
 	"vmsync/pkg/nbdbridge"
 	"vmsync/pkg/nbdsync"
+	"vmsync/pkg/portalloc"
 	"vmsync/pkg/remotessh"
 	"vmsync/pkg/trace"
 	"vmsync/pkg/util"
@@ -95,11 +97,20 @@ type syncConfig struct {
 	TargetDomain   string
 	TargetDiskPath string
 	SourceNBDHost  string
-	SourceNBDPort  int
 	SourceNBDBind  string
 	TargetNBDHost  string
-	TargetNBDPort  int
 	TargetNBDBind  string
+
+	// SourceNBDPortSpec/TargetNBDPortSpec hold the raw -source-nbd-port /
+	// -target-nbd-port flag values, which accept a fixed port, a range, or
+	// "auto" (see portalloc.ParseSpec). SourceNBDPort/TargetNBDPort are the
+	// resolved base ports, filled in by run() once the disk count and
+	// bridge/verify settings are known -- every other port in the run is
+	// derived from them by offset.
+	SourceNBDPortSpec string
+	TargetNBDPortSpec string
+	SourceNBDPort     int
+	TargetNBDPort     int
 
 	SSHUser       string
 	SSHKey        string
@@ -147,10 +158,10 @@ func main() {
 	flag.StringVar(&cfg.TargetDomain, "target-domain", "", "target domain name (defaults to --source-domain)")
 	flag.StringVar(&cfg.TargetDiskPath, "target-disk-path", "", "target disk path for changed location")
 	flag.StringVar(&cfg.SourceNBDBind, "source-nbd-bind", "0.0.0.0", "source bind address for libvirt backup NBD TCP export")
-	flag.IntVar(&cfg.SourceNBDPort, "source-nbd-port", 10809, "source TCP port for libvirt backup NBD export")
+	flag.StringVar(&cfg.SourceNBDPortSpec, "source-nbd-port", "10809", fmt.Sprintf("Source TCP port for the libvirt backup NBD export. A fixed port (10809), a range to pick a free block from (%d-%d), or \"auto\" for the default range %d-%d. A run needs 1 port here, or 2 when -compress/-netbuffer is set", portalloc.DefaultSourceAutoLow, portalloc.DefaultSourceAutoHigh, portalloc.DefaultSourceAutoLow, portalloc.DefaultSourceAutoHigh))
 	flag.StringVar(&cfg.SourceNBDHost, "source-nbd-host", "", "source host to connect for NBD reads (defaults from --source-uri)")
 	flag.StringVar(&cfg.TargetNBDBind, "target-nbd-bind", "0.0.0.0", "target bind address for qemu-nbd TCP export")
-	flag.IntVar(&cfg.TargetNBDPort, "target-nbd-port", 20809, "target base TCP port for qemu-nbd exports")
+	flag.StringVar(&cfg.TargetNBDPortSpec, "target-nbd-port", "20809", fmt.Sprintf("Target base TCP port for the qemu-nbd exports. A fixed port (20809), a range to pick a free block from (%d-%d), or \"auto\" for the default range %d-%d. A run needs N consecutive ports for N disks, 2N with -compress/-netbuffer, 3N with -verify, 4N with both", portalloc.DefaultTargetAutoLow, portalloc.DefaultTargetAutoHigh, portalloc.DefaultTargetAutoLow, portalloc.DefaultTargetAutoHigh))
 	flag.StringVar(&cfg.TargetNBDHost, "target-nbd-host", "", "target host to connect for NBD writes (defaults from --target-uri)")
 	flag.StringVar(&cfg.SSHUser, "ssh-user", "", "ssh user for remote command execution (defaults from URI user, then ~/.ssh/config's User, then root)")
 	flag.StringVar(&cfg.SSHKey, "ssh-key", "", "private key path for ssh authentication (defaults from ~/.ssh/config's IdentityFile)")
@@ -294,6 +305,19 @@ func main() {
 	}
 	if cfg.IODepth < 1 {
 		trace.Error("invalid io-depth configuration", "error", fmt.Errorf("-io-depth must be at least 1, got %d", cfg.IODepth))
+		os.Exit(2)
+	}
+	// Parsed here purely to reject a malformed value before doing any work;
+	// the result is discarded and re-parsed in run(), where the disk count
+	// needed to actually choose a port is finally known. Re-parsing is a
+	// string split -- cheaper than threading a parsed type through the CLI
+	// config, which is meant to hold plain flag values.
+	if _, err := portalloc.ParseSpec(cfg.SourceNBDPortSpec, portalloc.DefaultSourceAutoLow, portalloc.DefaultSourceAutoHigh); err != nil {
+		trace.Error("invalid source-nbd-port configuration", "error", err)
+		os.Exit(2)
+	}
+	if _, err := portalloc.ParseSpec(cfg.TargetNBDPortSpec, portalloc.DefaultTargetAutoLow, portalloc.DefaultTargetAutoHigh); err != nil {
+		trace.Error("invalid target-nbd-port configuration", "error", err)
 		os.Exit(2)
 	}
 	switch cfg.Verify {
@@ -557,6 +581,63 @@ func checkpointChainConsistent(metadataEntryCheckpoint, parent string) bool {
 		return true
 	}
 	return metadataEntryCheckpoint == parent
+}
+
+// listeningPorts asks a host which TCP ports are currently in LISTEN state,
+// running portalloc.ListeningCommand over SSH or locally depending on
+// remote. The same "ss" dependency the bridge's own readiness check already
+// relies on (see nbdbridge.BuildReadinessCheckCommand), so this adds no new
+// requirement to either host.
+func listeningPorts(ctx context.Context, remote bool, client *remotessh.Client) (map[int]bool, error) {
+	if remote {
+		out, err := client.Run(ctx, portalloc.ListeningCommand)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w: %s", portalloc.ListeningCommand, err, out)
+		}
+		return portalloc.ParseListening(out), nil
+	}
+	out, err := exec.CommandContext(ctx, "sh", "-c", portalloc.ListeningCommand).Output()
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", portalloc.ListeningCommand, err)
+	}
+	return portalloc.ParseListening(string(out)), nil
+}
+
+// targetPortsNeeded returns how many consecutive ports a run occupies on
+// the TARGET host, given its disk count and which optional stages are on.
+//
+// The layout is four contiguous blocks of N, each present or not, but
+// always at the same offset -- copyAndCommit puts the qemu-nbd exports at
+// [T, T+N) and their bridges at [T+N, T+2N); runVerify puts the read-only
+// verify exports at [T+2N, T+3N) and their bridges at [T+3N, T+4N). The
+// verify block sits at +2N whether or not bridging is on, so verification
+// alone still reserves through 3N with the second block left idle. That is
+// deliberate in the existing code (it keeps the verify export's port
+// independent of the write export's, which has just been killed and may not
+// have released yet), and this function must mirror it exactly or a run
+// will bind outside the range it reserved.
+func targetPortsNeeded(disks int, bridging, verifying bool) int {
+	switch {
+	case verifying && bridging:
+		return 4 * disks
+	case verifying:
+		return 3 * disks
+	case bridging:
+		return 2 * disks
+	default:
+		return disks
+	}
+}
+
+// sourcePortsNeeded returns how many consecutive ports a run occupies on
+// the SOURCE host: the libvirt backup NBD export, plus its bridge helper at
+// +1 when compression or buffering is on. The verify phase reuses the same
+// source export rather than opening another.
+func sourcePortsNeeded(bridging bool) int {
+	if bridging {
+		return 2
+	}
+	return 1
 }
 
 // refuseReinitIfTargetRunning decides whether -reinit must abort before
@@ -1623,6 +1704,60 @@ func run(cfg syncConfig) (runErr error) {
 	defer targetSSHClient.Close()
 	defer cleanupTargetNBD("cleanup")
 	defer cleanupSourceBridge("cleanup")
+
+	// Resolve the two base ports now: both SSH clients are up, the disk
+	// count is known, and nothing has bound anything yet. Every other port
+	// this run uses is derived from these two by offset, so this is the
+	// only place a choice is made.
+	//
+	// A fixed spec short-circuits without probing at all -- the operator
+	// named a port, and second-guessing it here would only produce a worse
+	// version of the bind error that follows.
+	{
+		bridging := bridgeCfg.Enabled()
+		srcNeed := sourcePortsNeeded(bridging)
+		tgtNeed := targetPortsNeeded(len(qcowDisks), bridging, cfg.Verify != "")
+		// Skewed per target domain so two syncs of different vms into the
+		// same target host tend to land on different blocks; see
+		// portalloc.SelectBase.
+		skew := portalloc.Skew(cfg.TargetDomain)
+
+		srcSpec, err := portalloc.ParseSpec(cfg.SourceNBDPortSpec, portalloc.DefaultSourceAutoLow, portalloc.DefaultSourceAutoHigh)
+		if err != nil {
+			return fmt.Errorf("source-nbd-port: %w", err)
+		}
+		srcUsed := map[int]bool{}
+		if !srcSpec.IsFixed() {
+			srcUsed, err = listeningPorts(ctx, sourceNeedsSSH, sourceSSHClient)
+			if err != nil {
+				return fmt.Errorf("list listening ports on the source host to choose -source-nbd-port: %w", err)
+			}
+		}
+		cfg.SourceNBDPort, err = portalloc.SelectBase(srcUsed, srcSpec, srcNeed, skew)
+		if err != nil {
+			return fmt.Errorf("source-nbd-port: %w", err)
+		}
+
+		tgtSpec, err := portalloc.ParseSpec(cfg.TargetNBDPortSpec, portalloc.DefaultTargetAutoLow, portalloc.DefaultTargetAutoHigh)
+		if err != nil {
+			return fmt.Errorf("target-nbd-port: %w", err)
+		}
+		tgtUsed := map[int]bool{}
+		if !tgtSpec.IsFixed() {
+			tgtUsed, err = listeningPorts(ctx, true, targetSSHClient)
+			if err != nil {
+				return fmt.Errorf("list listening ports on the target host to choose -target-nbd-port: %w", err)
+			}
+		}
+		cfg.TargetNBDPort, err = portalloc.SelectBase(tgtUsed, tgtSpec, tgtNeed, skew)
+		if err != nil {
+			return fmt.Errorf("target-nbd-port: %w", err)
+		}
+
+		trace.Info("resolved nbd port layout",
+			"source_spec", srcSpec.String(), "source_base", cfg.SourceNBDPort, "source_ports", srcNeed,
+			"target_spec", tgtSpec.String(), "target_base", cfg.TargetNBDPort, "target_ports", tgtNeed)
+	}
 	if err := nbdbridge.CheckRemote(ctx, targetSSHClient, bridgeCfg, targetSSHConfig.Address); err != nil {
 		return err
 	}

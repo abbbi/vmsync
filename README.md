@@ -37,6 +37,44 @@ The current operation workflow is:
         -ssh-user root                          # user for all ssh related
 ```
 
+# NBD ports
+
+Every port a run uses is derived from two base ports. `-source-nbd-port`
+and `-target-nbd-port` each accept three forms:
+
+```bash
+vmsync -target-nbd-port 20809          # fixed base port
+vmsync -target-nbd-port 20000-20100    # pick a free block inside this range
+vmsync -target-nbd-port auto           # pick inside the default range
+```
+
+With a range or `auto`, vmsync asks the host which ports are listening and
+takes a free contiguous block. Without it, two syncs running at once both
+try the fixed default and one fails to bind — so a range is what makes
+concurrent syncs to the same host work.
+
+How many ports a run occupies, for `N` disks:
+
+| side | plain | `-compress`/`-netbuffer` | `-verify` | both |
+| --- | --- | --- | --- | --- |
+| target | `N` | `2N` | `3N` | `4N` |
+| source | 1 | 2 | 1 | 2 |
+
+Size ranges from the largest VM you replicate, not the average — a 4-disk
+VM with compression and verification needs 16 consecutive target ports.
+vmsync refuses to start, naming the shortfall, rather than binding outside
+the range you gave it.
+
+The search starts at an offset derived from the target domain name, so
+different VMs replicating into the same host tend to pick different blocks,
+while a given VM lands on the same ports run after run as long as the
+host's occupancy is unchanged — which keeps firewall logs and packet
+captures meaningful.
+
+Passing a fixed port keeps the previous behaviour exactly, including
+skipping the probe entirely: use it where firewall rules are pinned to
+specific ports.
+
 # Replication roles and failover
 
 Each VM can carry a persistent `replication_role` in its own vmsync

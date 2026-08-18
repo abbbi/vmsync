@@ -373,3 +373,64 @@ func TestRefuseReinitIfTargetRunning(t *testing.T) {
 		})
 	}
 }
+
+// TestTargetPortsNeeded pins the reservation against the offsets the rest
+// of this file actually binds at. The two must agree exactly: reserve too
+// few and a run binds outside the range it was allocated, colliding with
+// whatever else the operator put there; reserve too many and a range that
+// should fit is rejected.
+//
+// The layout is four blocks of N at fixed offsets -- exports [T, +N),
+// their bridges [+N, +2N), verify exports [+2N, +3N), verify bridges
+// [+3N, +4N). The verify block sits at +2N whether or not bridging is on
+// (see runVerify's own comment for why it must not depend on the write
+// export's port), so verification alone still reserves through 3N with the
+// bridge block left idle.
+func TestTargetPortsNeeded(t *testing.T) {
+	cases := []struct {
+		name     string
+		disks    int
+		bridging bool
+		verify   bool
+		want     int
+	}{
+		{name: "plain sync, one disk", disks: 1, want: 1},
+		{name: "plain sync, three disks", disks: 3, want: 3},
+		{name: "bridged sync reserves the bridge block too", disks: 3, bridging: true, want: 6},
+		{name: "verify without bridging still reaches +3N", disks: 3, verify: true, want: 9},
+		{name: "verify with bridging reserves all four blocks", disks: 3, bridging: true, verify: true, want: 12},
+		{name: "single disk, everything on", disks: 1, bridging: true, verify: true, want: 4},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := targetPortsNeeded(tc.disks, tc.bridging, tc.verify); got != tc.want {
+				t.Errorf("targetPortsNeeded(%d, bridging=%v, verifying=%v) = %d, want %d",
+					tc.disks, tc.bridging, tc.verify, got, tc.want)
+			}
+		})
+	}
+
+	// The highest offset any code path binds at is base+4N-1, so the
+	// reservation for a fully-enabled run must cover exactly that and no
+	// more -- a direct restatement of the invariant, independent of the
+	// table above.
+	const disks = 4
+	need := targetPortsNeeded(disks, true, true)
+	highestBound := 4*disks - 1
+	if need != highestBound+1 {
+		t.Errorf("targetPortsNeeded(%d, true, true) = %d, but the highest offset bound is base+%d, so %d ports are required",
+			disks, need, highestBound, highestBound+1)
+	}
+}
+
+func TestSourcePortsNeeded(t *testing.T) {
+	// The source side is the libvirt backup export, plus its bridge helper
+	// at +1 only when compression or buffering is on. The verify phase
+	// reuses the same export rather than opening a second one.
+	if got := sourcePortsNeeded(false); got != 1 {
+		t.Errorf("sourcePortsNeeded(false) = %d, want 1", got)
+	}
+	if got := sourcePortsNeeded(true); got != 2 {
+		t.Errorf("sourcePortsNeeded(true) = %d, want 2 (export plus its bridge at +1)", got)
+	}
+}
