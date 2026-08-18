@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -113,6 +114,7 @@ func main() {
 		PrometheusTextfile     string
 		IgnoreExternalSnapshot bool
 		Verify                 string
+		UpdateRole             string
 		ShowVersion            bool
 	}
 
@@ -148,6 +150,7 @@ func main() {
 	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write sync metrics to this path in Prometheus textfile-collector format. Name should be something like /var/lib/node_exporter/textfile_collector/vmsync_[vmname].prom")
 	flag.BoolVar(&cfg.IgnoreExternalSnapshot, "ignore-external-snapshot", false, "If the source domain currently has any external disk snapshot, skip this run entirely")
 	flag.StringVar(&cfg.Verify, "verify", "", "After syncing, verify target matches source for every disk. Accepts compare|fast|online. See documentation for details. (compare|fast suspend the source domain, online does not)")
+	flag.StringVar(&cfg.UpdateRole, "update-role", "", "Set the replication role recorded in a domain's own vmsync metadata, then exit without syncing anything. Accepts "+strings.Join(libvirtsync.ValidRoles, "|")+" (\"none\" clears it). The domain is addressed with -target-uri/-target-domain regardless of which direction it currently replicates in. vmsync refuses to sync INTO a domain whose role is anything other than \"target\" or unset -- this is what stops a scheduled sync from overwriting a domain that was failed over to and then shut down for maintenance")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
@@ -185,6 +188,61 @@ func main() {
 		trace.Info(fmt.Sprintf("vmsync Version: %s", version.Version))
 		os.Exit(0)
 	}
+	// -update-role is a mode, not a modifier: it changes one metadata field
+	// on one domain and exits, syncing nothing. Handled before the
+	// source-side argument check below, and before every sync-specific
+	// validation, because none of it applies -- there is no compression,
+	// no netbuffer, no NBD transport and no checkpoint involved, no source
+	// domain is read (so -source-uri/-source-domain aren't required at
+	// all), and in particular there is no requirement that the URI be
+	// qemu+ssh://: that constraint exists for the data path, which this
+	// never touches, so a purely local qemu:///system domain can have its
+	// role set too.
+	//
+	// It deliberately does NOT take the run lock either. The lock is keyed
+	// by SOURCE domain and exists to serialize checkpoint-chain
+	// mutations, which this doesn't perform -- and blocking behind an
+	// in-flight sync would be actively wrong here, since marking a domain
+	// promoted or paused is exactly what an operator needs to be able to
+	// do WHILE a misdirected sync is running. SetReplicationRole's own
+	// re-read-before-write guard is what protects the field itself from a
+	// concurrent writer.
+	if cfg.UpdateRole != "" {
+		// Validated before connecting, so a typo costs an immediate,
+		// readable error rather than a libvirt round trip first.
+		if err := libvirtsync.ValidateRole(cfg.UpdateRole); err != nil {
+			trace.Error("invalid update-role configuration", "error", err)
+			os.Exit(2)
+		}
+		roleDomain := cfg.TargetDomain
+		if roleDomain == "" {
+			roleDomain = cfg.SourceDomain
+		}
+		if cfg.TargetURI == "" || roleDomain == "" {
+			trace.Error("invalid update-role configuration", "error", fmt.Errorf("-update-role needs -target-uri and -target-domain (or -source-domain) naming the domain whose role to set"))
+			os.Exit(2)
+		}
+		mgr, err := libvirtsync.Connect(cfg.TargetURI)
+		if err != nil {
+			trace.Error("update-role: connect to libvirt", "uri", cfg.TargetURI, "error", err)
+			os.Exit(1)
+		}
+		defer mgr.Close()
+		previous, err := libvirtsync.SetReplicationRole(mgr, roleDomain, cfg.UpdateRole)
+		if err != nil {
+			trace.Error("update-role: set replication role", "vm", roleDomain, "role", cfg.UpdateRole, "error", err)
+			os.Exit(1)
+		}
+		displayRole := func(r string) string {
+			if r == "" || r == libvirtsync.RoleNone {
+				return "(none)"
+			}
+			return r
+		}
+		trace.Info("replication role updated", "vm", roleDomain, "uri", cfg.TargetURI, "from", displayRole(previous), "to", displayRole(cfg.UpdateRole))
+		os.Exit(0)
+	}
+
 	if cfg.SourceURI == "" || cfg.TargetURI == "" || cfg.SourceDomain == "" {
 		flag.Usage()
 		os.Exit(2)
@@ -898,6 +956,25 @@ func run(cfg struct {
 	defer tgtMgr.Close()
 	tgtLibvirtVersion, _ := tgtMgr.Conn.GetVersion()
 	trace.Info("Connected to target libvirt", "version", tgtLibvirtVersion)
+
+	// Checked here, as early as the target connection allows and well
+	// before -reinit's own disk removal (or anything else that writes to
+	// the target), because this is the guard that has to hold when the
+	// runtime-state ones cannot: a domain promoted by a failover and then
+	// shut down for maintenance looks exactly like an ordinary idle target
+	// to refuseReinitIfTargetRunning and to DefineDomain's active re-check.
+	// See MetadataFieldReplicationRole and TargetRoleAllowsSync for the
+	// full reasoning, including why an absent role is permitted.
+	targetRole, err := libvirtsync.ReadReplicationRole(tgtMgr, cfg.TargetDomain)
+	if err != nil {
+		return fmt.Errorf("read target domain replication role: %w", err)
+	}
+	if err := libvirtsync.TargetRoleAllowsSync(targetRole); err != nil {
+		return fmt.Errorf("refusing to sync into %s: %w", cfg.TargetDomain, err)
+	}
+	if targetRole != "" {
+		trace.Debug("target replication role permits this sync", "vm", cfg.TargetDomain, "role", targetRole)
+	}
 
 	srcDom, err := srcMgr.LookupDomain(cfg.SourceDomain)
 	if err != nil {

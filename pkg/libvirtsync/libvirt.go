@@ -69,11 +69,64 @@ const (
 	// a target, which only ever has the one source it was last defined
 	// from).
 	MetadataFieldReplicaTargets = "replica_targets"
+	// MetadataFieldReplicationRole records what a domain currently IS in a
+	// replication pair, persistently, independent of whether it happens to
+	// be running at this instant. It exists to close a split-brain window
+	// that runtime-state checks alone cannot: vmsync already refuses to
+	// overwrite a target that is currently running (see
+	// refuseReinitIfTargetRunning and DefineDomain's own active re-check),
+	// but a domain that was failed over to, and then shut down for ten
+	// minutes of maintenance, passes every one of those guards. The next
+	// scheduled sync from the old source would then overwrite live data
+	// with a stale replica -- and if -reinit-after-failures had been
+	// climbing during the failover, what fires is not an incremental sync
+	// but a full reinit, which removes the target's disks first.
+	//
+	// Enforced by vmsync itself rather than by whatever schedules it: cron
+	// jobs, an operator running the binary by hand, and any future UI all
+	// go through the same check, so the interlock cannot be bypassed by
+	// simply not using the thing that knows about it.
+	MetadataFieldReplicationRole = "replication_role"
 )
+
+// Replication roles, as stored in MetadataFieldReplicationRole. An empty or
+// absent value is deliberately NOT one of these: it means "no role
+// recorded", which every pre-existing deployment has, and which
+// TargetRoleAllowsSync treats as permission to proceed. Roles are opt-in;
+// vmsync never assigns one on its own (see TargetRoleAllowsSync's own doc
+// comment for why).
+const (
+	// RoleSource marks a domain as the SOURCE of a replication pair.
+	// Syncing INTO it is refused: that means something has the direction
+	// backwards, which would overwrite the live original with its replica.
+	RoleSource = "source"
+	// RoleTarget marks a domain as a replication TARGET -- the normal,
+	// permitted state for the receiving side of a sync.
+	RoleTarget = "target"
+	// RolePromoted marks a domain that WAS a target and has since been
+	// promoted to serve live (a failover happened). Syncing into it is
+	// refused regardless of whether it is running right now: that is the
+	// whole point, since a promoted domain shut down for maintenance is
+	// precisely the case runtime checks miss.
+	RolePromoted = "promoted"
+	// RolePaused marks a domain whose replication is administratively
+	// suspended -- for maintenance, an investigation, or a migration in
+	// progress. Refused like the others, but says "deliberately stopped"
+	// rather than "direction is wrong" or "this is live now".
+	RolePaused = "paused"
+	// RoleNone is not a stored value: it is the argument that CLEARS the
+	// field, returning a domain to the no-role-recorded state.
+	RoleNone = "none"
+)
+
+// ValidRoles lists the values SetReplicationRole accepts, in the order a
+// CLI help message should present them.
+var ValidRoles = []string{RoleSource, RoleTarget, RolePromoted, RolePaused, RoleNone}
 
 // metadataFieldOrder fixes the field order vmsync writes its own metadata
 // entries in, purely for stable/readable XML output.
 var metadataFieldOrder = []string{
+	MetadataFieldReplicationRole,
 	MetadataFieldLastCheckpoint,
 	MetadataFieldLastSync,
 	MetadataFieldFailureCount,
@@ -911,6 +964,154 @@ func ReadTargetFailureCount(targetURI, targetDomain string) (int, error) {
 		return 0, nil
 	}
 	return count, nil
+}
+
+// TargetRoleAllowsSync reports whether a domain carrying the given
+// replication_role may be written to as a sync target, returning a nil
+// error when it may and an explanatory one when it may not.
+//
+// An empty role means no role has ever been recorded and is ALLOWED. This
+// is deliberate and load-bearing: every domain in every deployment that
+// predates this field has no role, and failing closed on them would break
+// replication everywhere the moment this version is installed. Roles are
+// opt-in, and vmsync never assigns one on its own -- an automatic "stamp
+// target on whatever I just synced into" would be convenient, but it would
+// also mean a single misdirected invocation permanently marks the wrong
+// domain, and it would fight an operator who deliberately set something
+// else. Setting a role is an explicit administrative act (-update-role).
+//
+// An UNRECOGNIZED role is refused rather than ignored. A role this build
+// doesn't know is most likely one a newer vmsync wrote, and treating it as
+// "no opinion" would silently discard exactly the protection it was set to
+// provide. Failing closed on an unknown value is the safe direction: it
+// costs a clear error and a version upgrade, where the alternative costs
+// data.
+//
+// Kept as a standalone, pure function so this decision is directly
+// testable without a live libvirt connection -- it is the single point
+// standing between a scheduled sync and overwriting a promoted, live
+// domain, so it is worth being able to assert exhaustively.
+func TargetRoleAllowsSync(role string) error {
+	switch role {
+	case "", RoleTarget:
+		return nil
+	case RoleSource:
+		return fmt.Errorf("target domain is marked replication_role=%q, meaning it is the SOURCE of a replication pair -- syncing into it would overwrite the original with its own replica; check that -source-uri/-target-uri are not reversed, or run -update-role=%s if the direction has genuinely changed", RoleSource, RoleTarget)
+	case RolePromoted:
+		return fmt.Errorf("target domain is marked replication_role=%q, meaning it was failed over to and is now serving live -- refusing to overwrite it with a replica from the old source, whether or not it happens to be running at this moment; run -update-role=%s to deliberately turn it back into a replication target (its current disk contents will be discarded)", RolePromoted, RoleTarget)
+	case RolePaused:
+		return fmt.Errorf("target domain is marked replication_role=%q, so replication into it is administratively suspended -- run -update-role=%s to resume", RolePaused, RoleTarget)
+	default:
+		return fmt.Errorf("target domain has an unrecognized replication_role=%q -- refusing to sync into a domain whose role this vmsync build does not understand (it was most likely written by a newer version; upgrade, or run -update-role=%s to override)", role, RoleTarget)
+	}
+}
+
+// ValidateRole reports whether role is one a caller may ask
+// SetReplicationRole to store. Shared by the -update-role flag's own
+// pre-flight check and by SetReplicationRole itself, so the CLI can reject
+// a typo without a libvirt round trip while the accepted set stays defined
+// in exactly one place. Note that "" is NOT accepted here: clearing the
+// field is spelled RoleNone, so that an empty flag value (i.e. -update-role
+// never passed at all) can never be mistaken for a request to clear.
+func ValidateRole(role string) error {
+	switch role {
+	case RoleSource, RoleTarget, RolePromoted, RolePaused, RoleNone:
+		return nil
+	default:
+		return fmt.Errorf("invalid replication role %q: must be one of %s", role, strings.Join(ValidRoles, ", "))
+	}
+}
+
+// ReadReplicationRole returns the replication_role recorded on a domain, or
+// "" when the domain has no role recorded. A domain that does not exist at
+// all is likewise reported as "" with a nil error: a target that hasn't
+// been created yet cannot have been promoted, so it has nothing to protect
+// and the first full sync must be free to create it.
+func ReadReplicationRole(mgr *Manager, domainName string) (string, error) {
+	dom, err := mgr.Conn.LookupDomainByName(domainName)
+	if err != nil {
+		if lvErr, ok := err.(libvirt.Error); ok && lvErr.Code == libvirt.ERR_NO_DOMAIN {
+			return "", nil
+		}
+		return "", fmt.Errorf("look up domain %s to read its replication role: %w", domainName, err)
+	}
+	defer dom.Free()
+
+	// DOMAIN_XML_INACTIVE for the same reason DefineDomain uses it: the
+	// role lives in the persistent definition, and reading the live one
+	// would mix in runtime-only elements irrelevant here.
+	domXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
+	if err != nil {
+		return "", fmt.Errorf("read domain %s xml to get its replication role: %w", domainName, err)
+	}
+	role, err := ParseMetadata(domXML, MetadataFieldReplicationRole)
+	if err != nil {
+		return "", nil
+	}
+	return role, nil
+}
+
+// SetReplicationRole records role as domainName's replication_role,
+// leaving the rest of its definition untouched. role must be one of
+// ValidRoles; RoleNone removes the field entirely rather than storing the
+// literal string "none", returning the domain to the no-role-recorded
+// state TargetRoleAllowsSync treats as permission to proceed.
+//
+// Returns the role that was previously recorded ("" if none), so a caller
+// can report the transition rather than just the destination.
+//
+// Uses the same read-modify-re-read-write shape as RecordTargetSyncFailure,
+// and for the same reason: libvirt's domain-definition API has no atomic
+// compare-and-swap, so this re-reads the domain's XML immediately before
+// writing and refuses if it changed underneath -- narrowing the window in
+// which a concurrent `virsh define`, another orchestration layer, or a
+// second vmsync could have its write silently discarded. That matters more
+// here than for a failure counter: losing a promoted marker is exactly the
+// failure this whole field exists to prevent.
+func SetReplicationRole(mgr *Manager, domainName, role string) (previous string, err error) {
+	if err := ValidateRole(role); err != nil {
+		return "", err
+	}
+
+	dom, err := mgr.Conn.LookupDomainByName(domainName)
+	if err != nil {
+		return "", fmt.Errorf("look up domain %s to set its replication role: %w", domainName, err)
+	}
+	defer dom.Free()
+
+	domXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
+	if err != nil {
+		return "", fmt.Errorf("read domain %s xml: %w", domainName, err)
+	}
+	previous, _ = ParseMetadata(domXML, MetadataFieldReplicationRole)
+
+	var updatedXML string
+	if role == RoleNone {
+		updatedXML, err = SetMetadataFields(domXML, nil, MetadataFieldReplicationRole)
+	} else {
+		updatedXML, err = SetMetadataFields(domXML, map[string]string{
+			MetadataFieldReplicationRole: role,
+		})
+	}
+	if err != nil {
+		return "", fmt.Errorf("update replication_role metadata: %w", err)
+	}
+
+	latestXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
+	if err != nil {
+		return "", fmt.Errorf("re-read domain %s xml before write: %w", domainName, err)
+	}
+	if latestXML != domXML {
+		return "", fmt.Errorf("domain %s was redefined concurrently by something else while setting its replication role; refusing to overwrite it -- check whether another vmsync invocation or an external tool is also managing this domain", domainName)
+	}
+
+	newDom, err := mgr.Conn.DomainDefineXML(updatedXML)
+	if err != nil {
+		return "", fmt.Errorf("redefine domain %s with updated replication_role: %w", domainName, err)
+	}
+	defer newDom.Free()
+
+	return previous, nil
 }
 
 // RecordTargetSyncFailure reconnects to the target, increments

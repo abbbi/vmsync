@@ -821,6 +821,104 @@ func TestSetMetadataFieldsRemoveFields(t *testing.T) {
 	})
 }
 
+// TestTargetRoleAllowsSync is the exhaustive check on the single predicate
+// standing between a scheduled sync and overwriting a domain that was
+// failed over to. Both directions matter: refusing too much breaks every
+// existing deployment (none of which has a role recorded), and refusing too
+// little is how live data gets replaced by a stale replica.
+func TestTargetRoleAllowsSync(t *testing.T) {
+	allowed := []struct {
+		role string
+		why  string
+	}{
+		{"", "no role recorded -- every deployment predating this field, and the default state of any new target"},
+		{RoleTarget, "explicitly marked as a replication target, the normal permitted state"},
+	}
+	for _, tc := range allowed {
+		t.Run("allows "+tc.role, func(t *testing.T) {
+			if err := TargetRoleAllowsSync(tc.role); err != nil {
+				t.Errorf("TargetRoleAllowsSync(%q) = %v, want nil (%s)", tc.role, err, tc.why)
+			}
+		})
+	}
+
+	refused := []struct {
+		role string
+		why  string
+	}{
+		{RoleSource, "direction reversed -- syncing in would overwrite the original with its own replica"},
+		{RolePromoted, "failed over to and serving live, whether or not it is running right now"},
+		{RolePaused, "replication administratively suspended"},
+		{"role-from-a-newer-vmsync", "unrecognized roles must fail closed, not be silently ignored"},
+		{"TARGET", "role matching is exact -- a differently-cased value is not the target role"},
+	}
+	for _, tc := range refused {
+		t.Run("refuses "+tc.role, func(t *testing.T) {
+			err := TargetRoleAllowsSync(tc.role)
+			if err == nil {
+				t.Fatalf("TargetRoleAllowsSync(%q) = nil, want an error (%s)", tc.role, tc.why)
+			}
+			// The operator's way out has to be in the message: this fires
+			// from a cron job whose only output is a log line.
+			if !strings.Contains(err.Error(), "-update-role") {
+				t.Errorf("TargetRoleAllowsSync(%q) error %q does not tell the operator how to override it", tc.role, err.Error())
+			}
+			if !strings.Contains(err.Error(), tc.role) {
+				t.Errorf("TargetRoleAllowsSync(%q) error %q does not name the role it refused", tc.role, err.Error())
+			}
+		})
+	}
+}
+
+func TestValidateRole(t *testing.T) {
+	for _, role := range ValidRoles {
+		if err := ValidateRole(role); err != nil {
+			t.Errorf("ValidateRole(%q) = %v, want nil -- every value in ValidRoles must be accepted", role, err)
+		}
+	}
+	// "" is deliberately rejected: clearing is spelled RoleNone, so an
+	// unset -update-role flag can never be mistaken for "clear the field".
+	for _, role := range []string{"", "Target", "unknown", "target "} {
+		if err := ValidateRole(role); err == nil {
+			t.Errorf("ValidateRole(%q) = nil, want an error", role)
+		}
+	}
+}
+
+// TestReplicationRoleRoundTripsThroughMetadata checks the field behaves
+// like every other vmsync metadata field through the real read/write path
+// -- including that clearing it leaves the OTHER fields intact, which is
+// what makes -update-role=none safe to run on a live replication pair.
+func TestReplicationRoleRoundTripsThroughMetadata(t *testing.T) {
+	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
+
+	withRole, err := SetMetadataFields(base, map[string]string{
+		MetadataFieldReplicationRole: RolePromoted,
+		MetadataFieldLastCheckpoint:  "vmsync-cpt-000007",
+		MetadataFieldFailureCount:    "0",
+	})
+	if err != nil {
+		t.Fatalf("SetMetadataFields() error = %v", err)
+	}
+	if got, _ := ParseMetadataField(withRole, MetadataFieldReplicationRole); got != RolePromoted {
+		t.Fatalf("replication_role = %q, want %q", got, RolePromoted)
+	}
+
+	cleared, err := SetMetadataFields(withRole, nil, MetadataFieldReplicationRole)
+	if err != nil {
+		t.Fatalf("SetMetadataFields() error = %v", err)
+	}
+	if got, _ := ParseMetadataField(cleared, MetadataFieldReplicationRole); got != "" {
+		t.Errorf("replication_role = %q after clearing, want empty", got)
+	}
+	if got, _ := ParseMetadataField(cleared, MetadataFieldLastCheckpoint); got != "vmsync-cpt-000007" {
+		t.Errorf("last_checkpoint = %q after clearing the role, want it untouched", got)
+	}
+	if err := TargetRoleAllowsSync(""); err != nil {
+		t.Errorf("a cleared role must return the domain to the permitted state, got %v", err)
+	}
+}
+
 // TestSetMetadataFieldsRejectsUnsafeFieldNames pins the validation that
 // stands in for what the fixed metadataFieldOrder list used to provide for
 // free: buildMetadataEntry interpolates a field name straight into the tag

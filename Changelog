@@ -1,5 +1,7 @@
 Version 0.30
 -----------
+ * Implement persistent replication roles in order to avoid clobbering
+ existing VMs
  * Implement a lock mechanism to avoid concurrent runs on the same VM
  * Implement optional prometheus metrics via -prometheus-textfile
  * Implement an optional remote bridge helper binary to help with

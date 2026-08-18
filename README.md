@@ -37,6 +37,47 @@ The current operation workflow is:
         -ssh-user root                          # user for all ssh related
 ```
 
+# Replication roles and failover
+
+Each VM can carry a persistent `replication_role` in its own vmsync
+metadata. vmsync **refuses to sync into any domain whose role is not
+`target`**:
+
+| role | syncing into it | meaning |
+| --- | --- | --- |
+| *(unset)* | allowed | no role recorded — the state of every VM that predates this feature |
+| `target` | allowed | normal receiving side of a replication pair |
+| `source` | refused | direction is reversed; syncing in would overwrite the original with its own replica |
+| `promoted` | refused | failed over to, now serving live |
+| `paused` | refused | replication administratively suspended |
+
+Set it with `-update-role`, which changes only that one field and exits
+without syncing anything:
+
+```bash
+vmsync -target-uri qemu+ssh://hostB/system -target-domain myvm -update-role promoted
+```
+
+Roles are opt-in. vmsync never assigns one by itself, so nothing changes
+for an existing setup until you set one.
+
+**Why this matters.** vmsync already refuses to overwrite a target that is
+*currently running*. That is not enough on its own: a VM you failed over
+to, and then shut down for ten minutes of maintenance, looks exactly like
+an ordinary idle target. The next scheduled sync from the old source would
+overwrite live data with a stale replica — and if `-reinit-after-failures`
+had been counting up during the failover, what fires is not an incremental
+sync but a full reinit, which removes the target's disks first. Marking the
+promoted VM `promoted` makes the refusal permanent and independent of
+whether it happens to be powered on.
+
+The check lives in vmsync itself, not in whatever schedules it, so cron
+jobs, manual invocations and any external tooling are all bound by it.
+
+A role this build does not recognize is also refused, on the assumption it
+was written by a newer version — failing closed costs an error message,
+failing open would cost data.
+
 # Limitations
 
  * Both source and target libvirt host should run on the same libvirt/qemu
