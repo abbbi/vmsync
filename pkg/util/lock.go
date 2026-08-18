@@ -76,12 +76,22 @@ var safeKeyReplacer = strings.NewReplacer("%", "%%", "/", "%2f", " ", "%20")
 // entire held lifetime) the same kind of replacement happening to path
 // *after* a successful return from this function, while the lock is still
 // being held for an in-progress sync.
+// RunLockPath is where the lock for a given key lives.
+//
+// Exported and shared so that a lock taken locally and the same lock taken
+// over SSH cannot disagree about the path. They must name the identical
+// file: vmsync runs on the source host for a sync and on the target host
+// for a promotion, so the two paths meeting is the only thing that makes
+// those mutually exclusive.
+func RunLockPath(dir, key string) string {
+	return filepath.Join(dir, safeKeyReplacer.Replace(key)+".lock")
+}
+
 func AcquireRunLock(dir, key string) (*os.File, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("create lock dir %s: %w", dir, err)
 	}
-	safeKey := safeKeyReplacer.Replace(key)
-	path := filepath.Join(dir, safeKey+".lock")
+	path := RunLockPath(dir, key)
 
 	const maxAttempts = 10
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
