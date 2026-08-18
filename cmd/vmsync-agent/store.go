@@ -1,5 +1,5 @@
 /*
-	Copyright (C) 2026  Michael Ablassmeier <abi@grinser.de>
+	Copyright (C) 2026  Orsiris de Jong <ozy@netpower.fr>
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -57,10 +57,33 @@ type CachedConfig struct {
 	Config        UIConfig `json:"config"`
 }
 
-// UIConfig is the configuration the UI hands out. Phase 1 carries no
-// executable instruction at all -- the agent reports and does nothing else
-// -- so this holds only what shapes reporting. Schedules and operations
-// arrive in later phases.
+// ScheduleEntry is one VM the UI wants this agent to sync, and how.
+//
+// Note what is NOT here: no flag names, no command line, no credentials.
+// The UI describes intent; the agent decides how that is spelled (see
+// SyncProfile.CommandArgs) and supplies the credentials from its own local
+// configuration.
+type ScheduleEntry struct {
+	VM              string `json:"vm"`
+	IntervalSeconds int    `json:"interval_seconds"`
+	// Enabled false keeps an entry visible in the UI while stopping it from
+	// running -- distinct from deleting it, and distinct again from
+	// -update-role=paused, which is enforced by vmsync itself and survives
+	// the UI being unreachable.
+	Enabled bool        `json:"enabled"`
+	Profile SyncProfile `json:"profile"`
+	// TargetHost pins which target to sync to when a source fans out to
+	// more than one. Empty means "the only one", and an entry with an empty
+	// TargetHost against a multi-target source is refused rather than
+	// guessed at.
+	TargetHost string `json:"target_host,omitempty"`
+}
+
+// UIConfig is the configuration the UI hands out.
+//
+// Phases 1 and 2 carried no executable instruction at all. Phase 3 adds
+// Schedule, which is the first thing here the agent acts on -- and the
+// reason SyncProfile validates every field before a command is built.
 type UIConfig struct {
 	// ReportIntervalSeconds is how often to send an inventory report.
 	ReportIntervalSeconds int `json:"report_interval_seconds"`
@@ -72,6 +95,17 @@ type UIConfig struct {
 	// used only to judge staleness. A domain absent from this map has an
 	// unknown cadence and is not judged on freshness at all.
 	CadenceSeconds map[string]int `json:"cadence_seconds,omitempty"`
+
+	// Schedule is what this agent should sync, and how often.
+	Schedule []ScheduleEntry `json:"schedule,omitempty"`
+	// MaxConcurrentSyncs caps how many run at once on this host. Zero means
+	// the agent's own default; the agent also clamps this, since a UI is a
+	// separately-versioned program whose answers are input to validate.
+	MaxConcurrentSyncs int `json:"max_concurrent_syncs,omitempty"`
+	// TargetHostBudget caps concurrent syncs INTO a given target host. No
+	// single agent can see that four others are writing to the same target,
+	// so this is the one limit only the UI can compute.
+	TargetHostBudget map[string]int `json:"target_host_budget,omitempty"`
 }
 
 // DefaultUIConfig is what the agent runs with before it has ever reached

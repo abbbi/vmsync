@@ -1,5 +1,5 @@
 /*
-	Copyright (C) 2026  Michael Ablassmeier <abi@grinser.de>
+	Copyright (C) 2026  Orsiris de Jong <ozy@netpower.fr>
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -150,6 +150,9 @@ type Report struct {
 	// running on stale instructions -- the expected state during a
 	// partition, and something an operator needs to see rather than guess.
 	ConfigAgeSeconds int64 `json:"config_age_seconds"`
+	// Syncs are recent scheduled-run outcomes, so an operator can see what
+	// happened without reading a journal on the host. Bounded by the agent.
+	Syncs []SyncResult `json:"syncs,omitempty"`
 }
 
 // ReportDomain is one domain's state as the agent found it. Defined here

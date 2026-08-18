@@ -1,5 +1,5 @@
 /*
-	Copyright (C) 2026  Michael Ablassmeier <abi@grinser.de>
+	Copyright (C) 2026  Orsiris de Jong <ozy@netpower.fr>
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -18,12 +18,19 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // vmsync-agent runs on every hypervisor and reports what that host knows
 // about its own replication state to the control-plane UI.
 //
-// This is phase 1 of the control plane and it is READ-ONLY BY
-// CONSTRUCTION: there is no code path here that starts a sync, changes a
-// replication role, or touches a domain in any way. The configuration the
-// UI hands out (see UIConfig) carries no executable instruction to ignore
-// -- scheduling and operations arrive in later phases. That is what makes
-// this safe to install on production hypervisors before the rest exists.
+// Through phase 2 this binary was read-only by construction. Phase 3 adds
+// scheduling: it now runs vmsync for the VMs the UI's schedule names. What
+// it still cannot do is change a replication role or touch a domain
+// directly -- and vmsync's own replication_role check remains the backstop
+// under all of it, refusing to overwrite a promoted or paused target no
+// matter what any schedule says.
+//
+// The schedule is typed data, never a command line. The agent owns the flag
+// vocabulary (see SyncProfile.CommandArgs), validates every field before
+// building anything, supplies credentials from its own local configuration,
+// and executes via exec.Command with no shell -- so there is nothing for a
+// compromised UI to inject into. Install with -no-schedule to keep a host
+// read-only until you are ready for it to run syncs.
 //
 // The agent dials out and never listens, so a hypervisor needs no inbound
 // port. It caches the UI's configuration on disk and keeps running from
@@ -61,6 +68,20 @@ type agentConfig struct {
 	Once        bool
 	Debug       bool
 	ShowVersion bool
+
+	// Everything below is local host configuration used when running a
+	// scheduled sync. None of it comes from the UI: how to reach another
+	// hypervisor, and which binary to run, is the host's own business, and a
+	// UI compromise must not be able to redirect either.
+	VmsyncPath       string
+	BridgeHelperPath string
+	TargetURIPattern string
+	PrometheusDir    string
+	SSHUser          string
+	SSHKey           string
+	SSHPort          int
+	SSHKnownHosts    string
+	NoSchedule       bool
 }
 
 func main() {
@@ -72,6 +93,15 @@ func main() {
 	flag.StringVar(&cfg.LibvirtURI, "libvirt-uri", "qemu:///system", "Local libvirt URI to inventory. You should not need to change this: the agent reports the host it runs on")
 	flag.StringVar(&cfg.Hostname, "hostname", "", "Name to report as. Defaults to the system hostname")
 	flag.DurationVar(&cfg.HTTPTimeout, "http-timeout", 2*time.Minute, "Timeout for a single UI request. Must exceed the UI's long-poll hold time, or every config poll ends in a client-side timeout")
+	flag.StringVar(&cfg.VmsyncPath, "vmsync-path", "/usr/local/bin/vmsync", "Path to the vmsync binary this agent runs for scheduled syncs")
+	flag.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "", "Passed through to vmsync as -bridge-helper-path when set")
+	flag.StringVar(&cfg.TargetURIPattern, "target-uri-pattern", "qemu+ssh://%s/system", "How to build a target libvirt URI from a replica target's hostname. %s is the hostname recorded in the VM's own replica_targets metadata")
+	flag.StringVar(&cfg.PrometheusDir, "prometheus-dir", "", "When set, scheduled syncs write <dir>/vmsync_<vm>.prom, keeping the existing metrics pipeline working for agent-driven runs")
+	flag.StringVar(&cfg.SSHUser, "ssh-user", "", "SSH user for reaching target hosts, passed through to vmsync")
+	flag.StringVar(&cfg.SSHKey, "ssh-key", "", "SSH private key for reaching target hosts, passed through to vmsync")
+	flag.IntVar(&cfg.SSHPort, "ssh-port", 0, "SSH port for reaching target hosts (0 leaves vmsync's own default)")
+	flag.StringVar(&cfg.SSHKnownHosts, "ssh-known-hosts", "", "known_hosts file passed through to vmsync")
+	flag.BoolVar(&cfg.NoSchedule, "no-schedule", false, "Report only; ignore any schedule the UI sends. Turns this back into a phase-1 read-only agent, which is the safe way to install it on a host before you are ready for it to run syncs")
 	flag.BoolVar(&cfg.Once, "once", false, "Report once and exit, instead of running as a daemon. For verifying a new install")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
@@ -148,14 +178,27 @@ func run(cfg agentConfig) error {
 		return reportOnce(ctx, client, cfg, cached)
 	}
 
-	// Two independent loops sharing the cached configuration. Reporting is
+	// Three independent loops sharing the cached configuration. Reporting is
 	// on a timer; polling blocks in a long poll and returns as soon as the
 	// UI has something to say, so an operator's change lands in seconds
-	// without the agent accepting inbound connections.
+	// without the agent accepting inbound connections; the scheduler runs
+	// whatever the cached configuration says, including while the UI is
+	// unreachable.
 	state := &sharedState{cached: cached}
 	var wg sync.WaitGroup
+
+	var sched *Scheduler
+	if !cfg.NoSchedule {
+		sched = NewScheduler(cfg, state)
+		wg.Add(1)
+		go func() { defer wg.Done(); sched.Run(ctx) }()
+		trace.Info("scheduler running", "vmsync", cfg.VmsyncPath, "target_uri_pattern", cfg.TargetURIPattern)
+	} else {
+		trace.Info("scheduling disabled by -no-schedule; this agent will report and nothing else")
+	}
+
 	wg.Add(2)
-	go func() { defer wg.Done(); reportLoop(ctx, client, cfg, state) }()
+	go func() { defer wg.Done(); reportLoop(ctx, client, cfg, state, sched) }()
 	go func() { defer wg.Done(); pollLoop(ctx, client, store, state) }()
 	wg.Wait()
 	return nil
@@ -218,7 +261,7 @@ func ensureEnrolled(ctx context.Context, client *Client, store Store, cfg agentC
 }
 
 func reportOnce(ctx context.Context, client *Client, cfg agentConfig, cached CachedConfig) error {
-	report, err := buildReport(cfg, cached)
+	report, err := buildReport(cfg, cached, nil)
 	if err != nil {
 		return err
 	}
@@ -229,10 +272,10 @@ func reportOnce(ctx context.Context, client *Client, cfg agentConfig, cached Cac
 	return nil
 }
 
-func reportLoop(ctx context.Context, client *Client, cfg agentConfig, state *sharedState) {
+func reportLoop(ctx context.Context, client *Client, cfg agentConfig, state *sharedState, sched *Scheduler) {
 	for {
 		cached := state.get()
-		report, err := buildReport(cfg, cached)
+		report, err := buildReport(cfg, cached, sched)
 		if err != nil {
 			// A libvirt failure is worth logging loudly but is not fatal:
 			// libvirtd restarts, and an agent that exited would then need
@@ -319,7 +362,7 @@ func pollLoop(ctx context.Context, client *Client, store Store, state *sharedSta
 }
 
 // buildReport inventories the local host and assesses every domain.
-func buildReport(cfg agentConfig, cached CachedConfig) (Report, error) {
+func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler) (Report, error) {
 	mgr, err := libvirtsync.Connect(cfg.LibvirtURI)
 	if err != nil {
 		return Report{}, fmt.Errorf("connect to %s: %w", cfg.LibvirtURI, err)
@@ -345,6 +388,9 @@ func buildReport(cfg agentConfig, cached CachedConfig) (Report, error) {
 		// Never confirmed with the UI at all -- distinct from "confirmed a
 		// moment ago", which 0 would otherwise mean.
 		report.ConfigAgeSeconds = -1
+	}
+	if sched != nil {
+		report.Syncs = sched.Results()
 	}
 
 	for _, d := range domains {
