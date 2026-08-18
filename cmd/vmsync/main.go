@@ -29,6 +29,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -75,6 +76,33 @@ func (f *optionalValueFlag) Set(s string) error {
 	return nil
 }
 
+// runLockDir holds both run locks: the source-side one taken in main(), and
+// the target-side one taken in run() over SSH. The same directory on
+// whichever host the lock belongs to.
+const runLockDir = "/run/vmsync-locks"
+
+// targetLockTimeout bounds acquiring the target-side lock. Short on purpose:
+// it is a single SSH round trip, and a contended lock answers immediately.
+// Anything slower is a sick host, and waiting longer to discover that only
+// delays a run which is going to fail anyway.
+const targetLockTimeout = 30 * time.Second
+
+// targetLockKey namespaces the target-side lock so it cannot collide with
+// the source-side lock of a same-named domain. Both live in runLockDir, and
+// a domain that is replicated onto a host which also replicates it onward
+// would otherwise contend with itself.
+func targetLockKey(targetDomain string) string { return "target-" + targetDomain }
+
+// Accepted values for -replaced-disk-action.
+const (
+	replacedDiskDelete = "delete"
+	replacedDiskRename = "rename"
+	// replacedDiskSuffix precedes the unix timestamp on a renamed-aside disk.
+	// Distinctive enough to find with a glob when reclaiming space later,
+	// and clearly vmsync's doing rather than something a human left behind.
+	replacedDiskSuffix = ".vmsync-replaced-"
+)
+
 // syncConfig is every value the CLI accepts, parsed once in main() and
 // passed to run() by value.
 //
@@ -91,8 +119,19 @@ func (f *optionalValueFlag) Set(s string) error {
 // entirely in main(), which exits before run() is called. They live here
 // anyway because this type is the CLI surface, not run()'s parameter list.
 type syncConfig struct {
-	SourceURI      string
-	TargetURI      string
+	// ReplacedDiskAction selects what happens to a target disk file that is
+	// about to be discarded and rebuilt: replacedDiskRename (the default) or
+	// replacedDiskDelete. See the switch in run()'s reinit block for why
+	// this is the operator's decision rather than vmsync's.
+	//
+	// Named for what it governs -- a disk being replaced -- rather than for
+	// -reinit, both because a name a character away from an existing flag
+	// invites passing the wrong one, and because the discard-and-rebuild
+	// step is not conceptually tied to that one flag.
+	ReplacedDiskAction string
+
+	SourceURI string
+	TargetURI string
 	SourceDomain   string
 	TargetDomain   string
 	TargetDiskPath string
@@ -172,6 +211,7 @@ func main() {
 	flag.IntVar(&cfg.SSHTimeoutSec, "ssh-timeout-sec", 10, "ssh connection timeout in seconds")
 	flag.BoolVar(&cfg.Start, "start", false, "In case vm is in non-running state, start in paused mode to allow sync")
 	flag.BoolVar(&cfg.Reinit, "reinit", false, "Delete VM on target and restart a full sync process")
+	flag.StringVar(&cfg.ReplacedDiskAction, "replaced-disk-action", replacedDiskRename, fmt.Sprintf("What to do with a target disk file that is about to be discarded and rebuilt (currently only -reinit does this): %q renames it to <path>%s<unixtime> so its contents survive, %q removes it. Defaults to %q: the target of a reinit may be a former primary whose disks still hold everything written after the last successful sync, and that is unrecoverable once deleted. Renaming needs room for both copies, and the aside files are never reaped automatically", replacedDiskRename, replacedDiskSuffix, replacedDiskDelete, replacedDiskRename))
 	flag.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "Reinit automatically after N failures (disabled by default). Count is held on target XML")
 	compressArg := optionalValueFlag{bareDefault: "s2"}
 	netBufferArg := optionalValueFlag{bareDefault: "128k,1G"}
@@ -284,6 +324,16 @@ func main() {
 	if cfg.TargetDomain == "" {
 		cfg.TargetDomain = cfg.SourceDomain
 	}
+	// Validated whether or not -reinit was passed, so a typo is caught at
+	// the point it is written rather than lying dormant until the day a
+	// -reinit-after-failures threshold trips and silently falls back to
+	// deleting disks the operator meant to keep.
+	switch cfg.ReplacedDiskAction {
+	case replacedDiskDelete, replacedDiskRename:
+	default:
+		trace.Error("invalid -replaced-disk-action", "error", fmt.Errorf("-replaced-disk-action must be %q or %q, not %q", replacedDiskRename, replacedDiskDelete, cfg.ReplacedDiskAction))
+		os.Exit(2)
+	}
 	if cfg.Compress != "" {
 		if err := nbdbridge.ValidateCompressAlgo(cfg.Compress); err != nil {
 			trace.Error("invalid compress configuration", "error", err)
@@ -352,7 +402,7 @@ func main() {
 	// vmsync_sync_state keeps reporting whatever the last successful run
 	// left behind -- with the process itself still reporting a clean exit
 	// 0 and a log line claiming the benign case.
-	lockFile, err := util.AcquireRunLock("/run/vmsync-locks", cfg.SourceDomain)
+	lockFile, err := util.AcquireRunLock(runLockDir, cfg.SourceDomain)
 	if err != nil {
 		if errors.Is(err, util.ErrLockHeld) {
 			trace.Info("another vmsync is already syncing this domain, skipping", "domain", cfg.SourceDomain, "error", err)
@@ -1702,6 +1752,30 @@ func run(cfg syncConfig) (runErr error) {
 	targetSSHClient = targetClient
 	sshClientMu.Unlock()
 	defer targetSSHClient.Close()
+
+	// Take the TARGET-side run lock before anything touches the target.
+	//
+	// The lock in main() is on the SOURCE host, keyed by the source domain,
+	// and protects the source's checkpoint chain. It says nothing whatsoever
+	// about the target, and two different sources replicating into one
+	// target -- or a sync and a promotion -- are exactly the collisions it
+	// cannot see. This one is keyed by the TARGET domain and lives on the
+	// target host, so every operation that writes that domain excludes every
+	// other one, wherever it was started from.
+	//
+	// Held by a remote process blocking on its stdin, so it is released by
+	// this SSH connection closing -- which covers a clean exit, a SIGKILL,
+	// and the network dropping alike. Nothing to expire, and no stale lock
+	// to clear by hand afterwards.
+	targetLockCtx, cancelTargetLock := context.WithTimeout(ctx, targetLockTimeout)
+	targetLock, lockErr := util.AcquireRemoteRunLock(targetLockCtx, targetSSHClient, runLockDir, targetLockKey(cfg.TargetDomain))
+	cancelTargetLock()
+	if lockErr != nil {
+		return fmt.Errorf("target %s on %s: %w", cfg.TargetDomain, util.HostFromURIOrLocal(cfg.TargetURI), lockErr)
+	}
+	defer targetLock.Close()
+	trace.Debug("holding the target-side run lock", "vm", cfg.TargetDomain, "host", util.HostFromURIOrLocal(cfg.TargetURI))
+
 	defer cleanupTargetNBD("cleanup")
 	defer cleanupSourceBridge("cleanup")
 
@@ -1850,11 +1924,44 @@ func run(cfg syncConfig) (runErr error) {
 			return err
 		}
 
+		// What happens to the existing target disks is the operator's call,
+		// not vmsync's, because the two answers differ in what they risk.
+		//
+		// Deleting is right for an ordinary reinit, where the target holds a
+		// stale replica nobody wants. It is emphatically NOT right after a
+		// failover: the domain being reinitialised is then the old primary,
+		// and its disks hold the only copy of everything written between the
+		// last successful sync and the moment it went down -- precisely the
+		// data the failover accepted losing.
+		//
+		// The default is therefore "rename", which changes what a bare
+		// -reinit has historically done. Chosen deliberately: the two
+		// mistakes are not symmetric. Defaulting to delete costs an
+		// unrecoverable loss the one time it is wrong; defaulting to rename
+		// costs disk space and a stale file to clean up, and says so loudly
+		// in the log every time. Nothing reaps the aside files -- they are
+		// deliberately somebody's decision, not a background job's.
 		for _, d := range qcowDisks {
 			reinitTargetPath := util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
-			trace.Info("reinit: removing target disk", "path", reinitTargetPath)
-			if out, err := targetSSHClient.Run(ctx, "rm -f "+util.ShQuote(reinitTargetPath)); err != nil {
-				return fmt.Errorf("reinit: remove target disk %s: %w: %s", reinitTargetPath, err, out)
+			var cmd string
+			switch cfg.ReplacedDiskAction {
+			case replacedDiskRename:
+				// Suffix, not a different directory: a sibling path is on the
+				// same filesystem, so the rename is atomic and cannot fail
+				// part-way or silently copy gigabytes.
+				aside := reinitTargetPath + replacedDiskSuffix + strconv.FormatInt(time.Now().Unix(), 10)
+				trace.Warning("reinit: renaming target disk aside instead of deleting it",
+					"path", reinitTargetPath, "renamed_to", aside)
+				// -n so an existing file at the destination is never
+				// clobbered; the run fails instead of destroying a previous
+				// set that was itself kept deliberately.
+				cmd = "mv -n " + util.ShQuote(reinitTargetPath) + " " + util.ShQuote(aside)
+			default:
+				trace.Info("reinit: removing target disk", "path", reinitTargetPath)
+				cmd = "rm -f " + util.ShQuote(reinitTargetPath)
+			}
+			if out, err := targetSSHClient.Run(ctx, cmd); err != nil {
+				return fmt.Errorf("reinit: %s target disk %s: %w: %s", cfg.ReplacedDiskAction, reinitTargetPath, err, out)
 			}
 		}
 		trace.Info("reinit complete, proceeding with full sync")
@@ -2756,9 +2863,39 @@ func run(cfg syncConfig) (runErr error) {
 	if !checkpointAdvanced {
 		effectiveCheckpoint = parent
 	}
+	// Re-read the target's role and re-check it here, immediately before the
+	// redefine, rather than trusting the read at the top of run().
+	//
+	// That earlier check is a preflight: it answers "may this sync start".
+	// This one answers "is it still permitted to land", and the two are not
+	// the same question, because everything between them takes minutes to
+	// hours. A domain promoted during that window still reads `target` at
+	// the preflight, and DefineDomain below replaces the target's whole
+	// persistent definition -- so without this check a failover performed
+	// mid-sync is silently reverted at the end of it, by a run that reports
+	// success, leaving a live promoted domain marked as an ordinary replica
+	// for the next scheduled sync to overwrite.
+	//
+	// Deliberately fatal rather than a warning. Data has already been
+	// written to the target's disks by this point and that cannot be undone
+	// here, but refusing to redefine the domain leaves the promotion intact
+	// and the operator's decision standing, which is the part that matters.
+	currentTargetRole, roleErr := libvirtsync.ReadReplicationRole(tgtMgr, cfg.TargetDomain)
+	if roleErr != nil {
+		return fmt.Errorf("re-read target domain replication role before redefining it: %w", roleErr)
+	}
+	if err := libvirtsync.TargetRoleAllowsSync(currentTargetRole); err != nil {
+		return fmt.Errorf("refusing to redefine %s: its replication role changed to %q while this sync was running: %w",
+			cfg.TargetDomain, currentTargetRole, err)
+	}
+	if currentTargetRole != targetRole {
+		trace.Warning("target replication role changed during this sync but still permits it",
+			"vm", cfg.TargetDomain, "from", targetRole, "to", currentTargetRole)
+	}
+
 	trace.Info("Adding metadata information")
 	var newXML string
-	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint, util.HostFromURIOrLocal(cfg.SourceURI), cfg.SourceDomain)
+	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint, util.HostFromURIOrLocal(cfg.SourceURI), cfg.SourceDomain, currentTargetRole)
 	if err != nil {
 		// UpdateSyncMetadata is a pure in-memory XML transformation -- no
 		// network or libvirt call involved -- so a failure here is almost
