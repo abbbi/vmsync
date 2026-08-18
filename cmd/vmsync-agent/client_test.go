@@ -22,6 +22,8 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -278,6 +280,11 @@ func TestNewClientRefusesPlaintextAndTrustsAGivenCA(t *testing.T) {
 		// The other half of the assertion above: verification is genuinely
 		// happening, rather than the bundle being decorative.
 		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		// The rejected handshake is the point of this test, so silence the
+		// server's own log of it -- an alarming "tls: bad certificate" line
+		// in an otherwise passing run sends someone hunting for a problem
+		// that is actually the assertion succeeding.
+		srv.Config.ErrorLog = log.New(io.Discard, "", 0)
 		defer srv.Close()
 
 		c, err := NewClient(srv.URL, "", 5*time.Second)

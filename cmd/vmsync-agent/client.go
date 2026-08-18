@@ -124,7 +124,7 @@ func (c *Client) Enrol(ctx context.Context, hostname, enrolmentToken, agentVersi
 		Hostname:       hostname,
 		EnrolmentToken: enrolmentToken,
 		AgentVersion:   agentVersion,
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		return Credentials{}, err
 	}
@@ -173,7 +173,7 @@ type ReportDomain struct {
 
 // SendReport uploads an inventory report.
 func (c *Client) SendReport(ctx context.Context, r Report) error {
-	_, err := c.do(ctx, http.MethodPost, c.agentURL("report"), c.Creds.Token, r, nil)
+	_, err := c.do(ctx, http.MethodPost, c.agentURL("report"), c.Creds.Token, r, nil, nil)
 	return err
 }
 
@@ -192,7 +192,7 @@ func (c *Client) PollConfig(ctx context.Context, etag string, wait time.Duration
 	}
 
 	var newETag string
-	body, err := c.do(ctx, http.MethodGet, u, c.Creds.Token, nil, func(resp *http.Response) {
+	body, err := c.do(ctx, http.MethodGet, u, c.Creds.Token, nil, headers, func(resp *http.Response) {
 		newETag = resp.Header.Get("ETag")
 	})
 	if err != nil {
@@ -212,7 +212,7 @@ func (c *Client) agentURL(suffix string) string {
 // do performs one request, translating HTTP status into the errors above.
 // inspect, when non-nil, is called with the response before its body is
 // consumed, for headers the caller needs.
-func (c *Client) do(ctx context.Context, method, u, token string, payload any, inspect func(*http.Response)) ([]byte, error) {
+func (c *Client) do(ctx context.Context, method, u, token string, payload any, headers map[string]string, inspect func(*http.Response)) ([]byte, error) {
 	var reader io.Reader
 	if payload != nil {
 		encoded, err := json.Marshal(payload)
@@ -233,6 +233,9 @@ func (c *Client) do(ctx context.Context, method, u, token string, payload any, i
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	req.Header.Set("Accept", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
