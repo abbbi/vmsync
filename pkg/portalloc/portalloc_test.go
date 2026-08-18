@@ -91,7 +91,7 @@ func TestParseSpec(t *testing.T) {
 
 func TestSelectBaseFixedSpecIsReturnedUnchecked(t *testing.T) {
 	// A fixed port is the operator's explicit instruction. Reporting it as
-	// busy here would only pre-empt, less precisely, the bind error that
+	// busy here would only preempt, less precisely, the bind error that
 	// follows -- and would break every existing deployment whose port is
 	// legitimately still held by a previous run's export that is about to
 	// be replaced.
