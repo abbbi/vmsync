@@ -20,6 +20,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 )
@@ -73,7 +74,7 @@ func TestCacheFallsBackToDefaultsBeforeTheUIIsEverReached(t *testing.T) {
 	if ok {
 		t.Error("LoadCache() reported ok on a fresh agent that has never polled")
 	}
-	if got.Config != DefaultUIConfig() {
+	if !reflect.DeepEqual(got.Config, DefaultUIConfig()) {
 		t.Errorf("LoadCache() = %+v, want the defaults so a never-enrolled agent still runs", got.Config)
 	}
 }
@@ -97,7 +98,7 @@ func TestCacheRoundTripAndNormalizesOnRead(t *testing.T) {
 	if got.ETag != `"v9"` || got.FetchedAtUnix != 1_800_000_000 {
 		t.Errorf("LoadCache() = %+v, want the etag and timestamp preserved", got)
 	}
-	if got.Config != DefaultUIConfig() {
+	if !reflect.DeepEqual(got.Config, DefaultUIConfig()) {
 		t.Errorf("LoadCache() config = %+v, want zero values normalized to the defaults", got.Config)
 	}
 }
