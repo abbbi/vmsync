@@ -70,12 +70,12 @@ func StartRemote(ctx context.Context, client *remotessh.Client, bridgePort, real
 		// The backgrounded helper may or may not have actually forked before
 		// the SSH call itself failed -- ambiguous, but killOrphanedRemoteBridge
 		// is safe to run either way (see its own doc comment).
-		killOrphanedRemoteBridge(ctx, client, pidFile, logFile, bridgePort)
+		killOrphanedRemoteBridge(client, pidFile, logFile, bridgePort)
 		return "", fmt.Errorf("start remote nbd bridge on port %d: %w: %s", bridgePort, err, out)
 	}
 
 	if err := waitForRemoteListening(ctx, client, bridgePort, pidFile, 10*time.Second); err != nil {
-		killOrphanedRemoteBridge(ctx, client, pidFile, logFile, bridgePort)
+		killOrphanedRemoteBridge(client, pidFile, logFile, bridgePort)
 		return "", fmt.Errorf("remote nbd bridge on port %d did not start: %w", bridgePort, err)
 	}
 
@@ -94,7 +94,22 @@ func StartRemote(ctx context.Context, client *remotessh.Client, bridgePort, real
 // Only logs its own failure rather than returning it: the error that
 // triggered this cleanup is what the caller needs to see, and a failed
 // best-effort cleanup attempt must not shadow it.
-func killOrphanedRemoteBridge(ctx context.Context, client *remotessh.Client, pidFile, logFile string, bridgePort int) {
+//
+// Deliberately takes no context and builds its own instead of accepting
+// StartRemote's: the single most likely reason StartRemote failed at all is
+// that very context being cancelled (the signal handler cancelling it on
+// Ctrl+C/SIGTERM, or its own deadline elapsing), and every probe inside
+// waitForRemoteListening failing for that reason is precisely what drives it
+// into the timeout path below. Reusing a cancelled context here would make
+// client.Run return instantly without ever reaching the remote host, so the
+// orphaned helper this function exists to kill would survive exactly the
+// scenario it was written for. Same reasoning, and the same 5s bound, as
+// cmd/vmsync/main.go's own cleanupTargetNBD/cleanupSourceBridge closures,
+// which build a fresh context.Background() for their teardown SSH calls for
+// this identical reason.
+func killOrphanedRemoteBridge(client *remotessh.Client, pidFile, logFile string, bridgePort int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	if out, err := client.Run(ctx, BuildStopCommand(pidFile, logFile)); err != nil {
 		trace.Warning("failed to clean up remote nbd bridge helper after a failed start -- it may still be running on the remote host", "port", bridgePort, "error", err, "output", out)
 	}
