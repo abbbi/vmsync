@@ -26,7 +26,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.25.0'
-          # dnf install golanc
+          # dnf install golang
 
       # This repo doesn't commit go.mod/go.sum (see Dockerfile.debian's own
       # "go mod init vmsync && go mod tidy" step) -- bootstrap the module the
