@@ -130,20 +130,34 @@ func Relay(dst io.Writer, src io.Reader, compress bool, algo Algo, level string,
 			relayErr = closeErr
 		}
 	} else {
-		// src is wrapped to hide any io.WriterTo it implements -- a real
-		// *net.TCPConn does -- from io.Copy's own fast-path detection.
-		// Without this, whenever src reaches this call as a raw, unwrapped
-		// net.Conn (true exactly when both compress and netbuffer are off,
-		// the plain pass-through relay direction), io.Copy calls
-		// src.WriteTo(effectiveDst) instead of running its normal
-		// read-then-effectiveDst.Write loop -- bypassing CountingWriter's
-		// byte counting (confirmed: ByteCounters.Sent stayed 0 for exactly
-		// this one combination, real TCP round-trip test in
-		// pkg/nbdbridge, even though the relay itself still worked
-		// correctly and every byte still arrived). The compress and
-		// netbuffer branches above never hand a raw net.Conn directly to a
-		// copy call this way, so they were never affected.
-		_, relayErr = io.Copy(effectiveDst, struct{ io.Reader }{src})
+		// When there IS a wireCounter, src is wrapped to hide any
+		// io.WriterTo it implements -- a real *net.TCPConn does -- from
+		// io.Copy's own fast-path detection, so the copy runs its normal
+		// read-then-effectiveDst.Write loop through CountingWriter. This
+		// was added after ByteCounters.Sent was observed staying 0 for
+		// exactly the both-off combination in a real TCP round-trip test.
+		//
+		// It must NOT be applied when wireCounter is nil, which is how
+		// cmd/vmsync-bridge-helper calls this for both its directions.
+		// There, effectiveDst is still the caller's raw *net.TCPConn (no
+		// CountingWriter, no BoundedBuffer wrapping it), so io.Copy would
+		// otherwise reach dst.ReadFrom -> net.spliceFrom and move the data
+		// kernel-to-kernel with no userspace copy at all. spliceFrom
+		// type-switches on its reader and only splices for *TCPConn /
+		// tcpConnWithoutWriteTo / *UnixConn -- an anonymous
+		// struct{ io.Reader } hits its default branch and disables splice
+		// entirely, forcing every byte of the helper's highest-throughput
+		// (uncompressed) path through a 32 KiB userspace buffer instead.
+		//
+		// Gating on wireCounter costs nothing on the counting path: when
+		// it's non-nil, effectiveDst is a *CountingWriter (or a
+		// *BoundedBuffer), neither of which implements io.ReaderFrom, so
+		// splice was never available there to begin with.
+		plainSrc := src
+		if wireCounter != nil {
+			plainSrc = struct{ io.Reader }{src}
+		}
+		_, relayErr = io.Copy(effectiveDst, plainSrc)
 	}
 
 	if bufStage != nil {

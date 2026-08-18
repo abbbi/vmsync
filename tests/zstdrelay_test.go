@@ -775,6 +775,100 @@ func TestRelayCountsWireBytesOverRealTCPConn(t *testing.T) {
 	}
 }
 
+// TestRelayPassesThroughRealTCPConnsWithoutCounter pins the one shape the
+// wireCounter==nil gate in Relay's no-compression branch exists to preserve:
+// a raw *net.TCPConn source relayed to a raw *net.TCPConn destination, with
+// compression off, netbuffer off, and no counter -- exactly how
+// cmd/vmsync-bridge-helper relays uncompressed traffic in both directions.
+//
+// Both ends must be real TCP connections for this to mean anything: only
+// then is effectiveDst an io.ReaderFrom, which is what lets io.Copy reach
+// net.spliceFrom and move the data kernel-to-kernel. Wrapping src in an
+// anonymous struct{ io.Reader } (which Relay does only when there IS a
+// wireCounter to protect) makes spliceFrom's type switch fall to its default
+// branch and disables splice for this path entirely. This test asserts the
+// bytes still arrive intact whichever path io.Copy picks, so the gate can't
+// be "simplified" back into an unconditional wrap without at least keeping
+// correctness honest here.
+func TestRelayPassesThroughRealTCPConnsWithoutCounter(t *testing.T) {
+	payload := []byte(strings.Repeat("uncompressed helper pass-through payload ", 200))
+
+	srcLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen (source side): %v", err)
+	}
+	defer srcLn.Close()
+
+	srcAccepted := make(chan net.Conn, 1)
+	go func() {
+		if conn, err := srcLn.Accept(); err == nil {
+			srcAccepted <- conn
+		}
+	}()
+
+	srcWriter, err := net.Dial("tcp", srcLn.Addr().String())
+	if err != nil {
+		t.Fatalf("dial (source side): %v", err)
+	}
+	go func() {
+		srcWriter.Write(payload)
+		srcWriter.Close()
+	}()
+
+	src := <-srcAccepted
+	defer src.Close()
+
+	// Destination side: whatever Relay writes is drained to completion by the
+	// accepting goroutine, so Relay can never block on an unread socket.
+	dstLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen (destination side): %v", err)
+	}
+	defer dstLn.Close()
+
+	received := make(chan []byte, 1)
+	go func() {
+		conn, err := dstLn.Accept()
+		if err != nil {
+			received <- nil
+			return
+		}
+		defer conn.Close()
+		got, _ := io.ReadAll(conn)
+		received <- got
+	}()
+
+	dst, err := net.Dial("tcp", dstLn.Addr().String())
+	if err != nil {
+		t.Fatalf("dial (destination side): %v", err)
+	}
+	defer dst.Close()
+
+	relayErr, returned := runWithDeadline(t, 5*time.Second, func() error {
+		return zstdrelay.Relay(dst, src, false, zstdrelay.AlgoZstd, "", "", "", nil)
+	})
+	if !returned {
+		t.Fatal("Relay did not return within 5s")
+	}
+	if relayErr != nil {
+		t.Fatalf("Relay returned error: %v", relayErr)
+	}
+
+	// Half-close so the draining goroutine's ReadAll sees EOF and returns.
+	if tc, ok := dst.(*net.TCPConn); ok {
+		tc.CloseWrite()
+	}
+
+	select {
+	case got := <-received:
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("relayed %d bytes over a raw TCP->TCP hop, want the original %d bytes intact", len(got), len(payload))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("destination side never finished reading the relayed bytes")
+	}
+}
+
 var (
 	_ io.Reader = (*chunkReader)(nil)
 )
