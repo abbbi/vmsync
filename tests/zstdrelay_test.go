@@ -711,18 +711,23 @@ func TestRelayCompressRoundTrip(t *testing.T) {
 	}
 }
 
-// TestRelayCountsWireBytesOverRealTCPConn is a regression test for a bug
-// where Relay's plain (compress=false, no netbuffer) pass-through direction
-// silently failed to count bytes into wireCounter whenever src was a real
-// *net.TCPConn: io.Copy's own io.WriterTo/io.ReaderFrom fast-path detection
-// noticed *net.TCPConn implements io.WriterTo and called src.WriteTo(dst)
-// instead of running its usual read-then-dst.Write loop -- bypassing
-// CountingWriter's Write method (and its atomic counter increment) entirely,
-// even though the relayed bytes themselves still arrived correctly. A
-// bytes.Buffer/bytes.Reader-based test (like TestRelayCompressRoundTrip
-// above) can never catch this: neither implements the same fast-path
-// interface a real net.Conn does, which is exactly why this surfaced first
-// in pkg/nbdbridge's own real-TCP round-trip test, not here.
+// TestRelayCountsWireBytesOverRealTCPConn pins the invariant that Relay's
+// plain (compress=false, no netbuffer) pass-through direction accounts for
+// every byte in wireCounter when src is a real *net.TCPConn -- the shape
+// that matters, because *net.TCPConn implements io.WriterTo and so sends
+// io.Copy down its src.WriteTo(dst) fast path rather than the usual
+// read-then-dst.Write loop. A bytes.Buffer/bytes.Reader test (like
+// TestRelayCompressRoundTrip above) cannot exercise that at all: neither
+// implements the fast-path interfaces a real net.Conn does.
+//
+// It was originally written believing that fast path was itself the bug --
+// that WriteTo bypassed CountingWriter and left the counter at 0 -- and
+// Relay carried a wrapper to defeat it. That turned out not to be the
+// mechanism (TCPConn.WriteTo falls through to net.genericWriteTo, which
+// still calls dst.Write for every chunk; see Relay's own comment), so the
+// wrapper is gone. The assertion below is what actually guards the
+// invariant, and it is deliberately exact rather than merely non-zero: a
+// partial or double count fails it just as loudly as no count at all.
 func TestRelayCountsWireBytesOverRealTCPConn(t *testing.T) {
 	payload := []byte(strings.Repeat("nbd bridge relay payload data ", 200))
 
@@ -768,28 +773,29 @@ func TestRelayCountsWireBytesOverRealTCPConn(t *testing.T) {
 		t.Fatalf("relayed bytes mismatch: got %d bytes, want %d bytes", wire.Len(), len(payload))
 	}
 	if sent == 0 {
-		t.Fatal("wireCounter stayed 0 despite relaying real traffic over a genuine net.Conn source -- io.Copy bypassed CountingWriter via src's io.WriterTo fast path")
+		t.Fatal("wireCounter stayed 0 despite relaying real traffic over a genuine net.Conn source -- something between Relay and CountingWriter.Write is not accounting for the bytes")
 	}
 	if sent != uint64(len(payload)) {
 		t.Errorf("wireCounter = %d, want %d (exact payload length)", sent, len(payload))
 	}
 }
 
-// TestRelayPassesThroughRealTCPConnsWithoutCounter pins the one shape the
-// wireCounter==nil gate in Relay's no-compression branch exists to preserve:
-// a raw *net.TCPConn source relayed to a raw *net.TCPConn destination, with
-// compression off, netbuffer off, and no counter -- exactly how
-// cmd/vmsync-bridge-helper relays uncompressed traffic in both directions.
+// TestRelayPassesThroughRealTCPConnsWithoutCounter pins the shape Relay's
+// no-compression branch must leave on its fastest path: a raw *net.TCPConn
+// source relayed to a raw *net.TCPConn destination, with compression off,
+// netbuffer off, and no counter -- exactly how cmd/vmsync-bridge-helper
+// relays uncompressed traffic in both directions.
 //
 // Both ends must be real TCP connections for this to mean anything: only
 // then is effectiveDst an io.ReaderFrom, which is what lets io.Copy reach
-// net.spliceFrom and move the data kernel-to-kernel. Wrapping src in an
-// anonymous struct{ io.Reader } (which Relay does only when there IS a
-// wireCounter to protect) makes spliceFrom's type switch fall to its default
-// branch and disables splice for this path entirely. This test asserts the
-// bytes still arrive intact whichever path io.Copy picks, so the gate can't
-// be "simplified" back into an unconditional wrap without at least keeping
-// correctness honest here.
+// net.spliceFrom and move the data kernel-to-kernel with no userspace copy.
+// spliceFrom type-switches on its reader and splices only for *TCPConn /
+// tcpConnWithoutWriteTo / *UnixConn, so interposing any wrapper on src --
+// an anonymous struct{ io.Reader }, say -- silently drops this path to a
+// 32 KiB buffered copy. That is not something a correctness test would
+// otherwise notice, which is why this one exists: it asserts the bytes
+// arrive intact whichever path io.Copy takes, so anyone reintroducing a
+// wrapper at least has to keep the transfer honest while doing it.
 func TestRelayPassesThroughRealTCPConnsWithoutCounter(t *testing.T) {
 	payload := []byte(strings.Repeat("uncompressed helper pass-through payload ", 200))
 

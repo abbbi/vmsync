@@ -130,34 +130,46 @@ func Relay(dst io.Writer, src io.Reader, compress bool, algo Algo, level string,
 			relayErr = closeErr
 		}
 	} else {
-		// When there IS a wireCounter, src is wrapped to hide any
-		// io.WriterTo it implements -- a real *net.TCPConn does -- from
-		// io.Copy's own fast-path detection, so the copy runs its normal
-		// read-then-effectiveDst.Write loop through CountingWriter. This
-		// was added after ByteCounters.Sent was observed staying 0 for
-		// exactly the both-off combination in a real TCP round-trip test.
+		// src is passed to io.Copy unwrapped, deliberately. An earlier
+		// version wrapped it in a struct{ io.Reader } to hide any
+		// io.WriterTo it implements from io.Copy's fast-path detection,
+		// on the theory that io.Copy taking src.WriteTo(effectiveDst)
+		// would bypass CountingWriter and leave ByteCounters.Sent at 0.
 		//
-		// It must NOT be applied when wireCounter is nil, which is how
+		// That theory does not hold, for either connection type this ever
+		// gets. *net.TCPConn does implement io.WriterTo, but TCPConn.WriteTo
+		// splices only when its destination is a *net.UnixConn; for anything
+		// else it falls through to net.genericWriteTo, which is itself
+		// io.Copy(w, tcpConnWithoutWriteTo{c}) and so still calls w.Write --
+		// CountingWriter.Write -- for every chunk. The SSH-tunnelled case
+		// can't bypass it either: x/crypto/ssh's forwarded connection is a
+		// *chanConn wrapping an ssh.Channel, whose method set has no WriteTo
+		// at all, so io.Copy runs its plain loop there regardless.
+		//
+		// The Sent == 0 observation that prompted the wrap was real, but its
+		// cause was never identified and is not this. Rather than keep code
+		// whose only justification is an explanation that doesn't survive
+		// checking, the wrap is gone and the invariant is pinned by tests
+		// instead: TestRelayCountsWireBytesOverRealTCPConn (tests/) asserts
+		// the counter equals the payload length exactly, with a genuine
+		// *net.TCPConn as src so the WriterTo path is really taken, and
+		// TestStartLocalRelaysBytesRoundTrip plus its SSH counterpart in
+		// pkg/nbdbridge assert non-zero counters across every compress and
+		// netbuffer combination on both transports. If counting ever breaks
+		// again, those fail and the real cause can be found with evidence
+		// instead of re-guessed.
+		//
+		// Leaving src unwrapped also keeps io.Copy free to reach
+		// dst.ReadFrom -> net.spliceFrom when effectiveDst is a raw
+		// *net.TCPConn -- true whenever wireCounter is nil, which is how
 		// cmd/vmsync-bridge-helper calls this for both its directions.
-		// There, effectiveDst is still the caller's raw *net.TCPConn (no
-		// CountingWriter, no BoundedBuffer wrapping it), so io.Copy would
-		// otherwise reach dst.ReadFrom -> net.spliceFrom and move the data
-		// kernel-to-kernel with no userspace copy at all. spliceFrom
-		// type-switches on its reader and only splices for *TCPConn /
-		// tcpConnWithoutWriteTo / *UnixConn -- an anonymous
-		// struct{ io.Reader } hits its default branch and disables splice
-		// entirely, forcing every byte of the helper's highest-throughput
-		// (uncompressed) path through a 32 KiB userspace buffer instead.
-		//
-		// Gating on wireCounter costs nothing on the counting path: when
-		// it's non-nil, effectiveDst is a *CountingWriter (or a
-		// *BoundedBuffer), neither of which implements io.ReaderFrom, so
-		// splice was never available there to begin with.
-		plainSrc := src
-		if wireCounter != nil {
-			plainSrc = struct{ io.Reader }{src}
-		}
-		_, relayErr = io.Copy(effectiveDst, plainSrc)
+		// spliceFrom type-switches on its reader and only splices for
+		// *TCPConn / tcpConnWithoutWriteTo / *UnixConn, so an anonymous
+		// struct{ io.Reader } would hit its default branch and force every
+		// byte of the helper's highest-throughput (uncompressed) path
+		// through a 32 KiB userspace copy instead of moving it
+		// kernel-to-kernel.
+		_, relayErr = io.Copy(effectiveDst, src)
 	}
 
 	if bufStage != nil {

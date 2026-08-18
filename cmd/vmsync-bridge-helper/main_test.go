@@ -110,16 +110,37 @@ func newLoopbackPair(t *testing.T) (accepted, dialed net.Conn) {
 
 // startFakeRealExport starts a stand-in for the real, plaintext NBD endpoint
 // handleConn dials via -connect. It accepts exactly one connection, reads
-// everything sent to it until EOF (which, once handleConn's inbound relay
-// direction finishes, arrives via the real *net.TCPConn's own CloseWrite --
-// see main.go's handleConn), records what it received, writes back a fixed,
+// exactly expectBytes from it, records what it received, writes back a fixed,
 // known response distinct from the request, and half-closes so handleConn's
 // outbound relay direction can in turn see EOF and finish.
+//
+// It reads a KNOWN LENGTH via io.ReadFull rather than everything-until-EOF
+// via io.ReadAll, which is what it used to do. io.ReadAll cannot tell "the
+// peer sent the whole request and then half-closed" apart from "the peer sent
+// nothing at all and closed" -- both are a nil error and a slice, differing
+// only in length. That made a genuine truncation surface far away from where
+// it happened, as a puzzling byte-comparison mismatch in the caller, and it
+// made the content assertion depend on FIN timing rather than on the bytes
+// themselves.
+//
+// The distinction matters most for -compress=s2: s2's reader treats EOF at a
+// chunk boundary as a clean end of stream rather than corruption (see
+// readFull's own allowEOF handling in klauspost/compress/s2/reader.go), so a
+// stream that ends early decodes to zero bytes with NO error anywhere in the
+// pipeline -- RelayFromWire returns nil, handleConn half-closes, and the only
+// evidence left is an empty read here. zstd reports the same event as an
+// error instead, which is why this only ever showed up on the s2 case.
+// io.ReadFull turns it back into an explicit "unexpected EOF" naming the
+// moment it occurred.
+//
+// After the request, it confirms EOF actually follows: that half-close is a
+// real behavior of handleConn's inbound direction worth asserting, it just
+// shouldn't be load-bearing for the content check above.
 //
 // It returns the listener's address to hand to handleConn as -connect, plus
 // two receive-only channels reporting what was received and any failure, so
 // the caller can verify both directions of the relay independently.
-func startFakeRealExport(t *testing.T, response []byte) (addr string, receivedCh <-chan []byte, errCh <-chan error) {
+func startFakeRealExport(t *testing.T, expectBytes int, response []byte) (addr string, receivedCh <-chan []byte, errCh <-chan error) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -137,9 +158,16 @@ func startFakeRealExport(t *testing.T, response []byte) (addr string, receivedCh
 		}
 		defer conn.Close()
 
-		data, err := io.ReadAll(conn)
-		if err != nil {
-			ec <- fmt.Errorf("read request: %w", err)
+		data := make([]byte, expectBytes)
+		if _, err := io.ReadFull(conn, data); err != nil {
+			ec <- fmt.Errorf("read the %d-byte request the relay should have delivered: %w", expectBytes, err)
+			return
+		}
+		// Nothing more may follow: handleConn's inbound direction
+		// half-closes once it is done, so this must be a clean EOF and not
+		// extra bytes.
+		if n, err := conn.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+			ec <- fmt.Errorf("expected EOF after the %d-byte request (handleConn's inbound CloseWrite), got n=%d err=%v", expectBytes, n, err)
 			return
 		}
 		rc <- data
@@ -256,7 +284,7 @@ func TestHandleConnRelaysBothDirections(t *testing.T) {
 			request := bytes.Repeat([]byte("request-payload-"), 400)
 			response := bytes.Repeat([]byte("response-payload-"), 400)
 
-			realAddr, receivedCh, exportErrCh := startFakeRealExport(t, response)
+			realAddr, receivedCh, exportErrCh := startFakeRealExport(t, len(request), response)
 
 			accepted, dialed := newLoopbackPair(t)
 			defer dialed.Close()
@@ -309,13 +337,16 @@ func TestHandleConnRelaysBothDirections(t *testing.T) {
 				}
 			})
 			if !returned {
-				t.Fatal("timed out waiting for the fake real export to receive the relayed request")
+				t.Fatal("timed out waiting for the fake real export to receive the relayed request -- neither the full request nor its trailing EOF ever arrived")
 			}
 			if err != nil {
 				t.Fatalf("fake real export failed before responding: %v", err)
 			}
+			// Length is already guaranteed by the export's own io.ReadFull
+			// (a short delivery fails above, naming itself); what's left to
+			// check here is that the bytes came through unchanged.
 			if !bytes.Equal(got, request) {
-				t.Fatalf("fake real export received %d bytes, want the %d-byte request delivered unchanged", len(got), len(request))
+				t.Fatalf("fake real export received %d bytes that do not match the request -- the relay corrupted the payload in transit", len(got))
 			}
 
 			// Read back whatever the relay forwarded from the fake real
