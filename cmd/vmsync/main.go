@@ -591,6 +591,12 @@ func run(cfg struct {
 	PrometheusTextfile  string
 	IgnoreExternalSnapshot bool
 	Verify              string
+	// UpdateRole is unused here -- -update-role is handled entirely in
+	// main() and exits before run() is ever called. It has to be declared
+	// anyway: cfg is an anonymous struct passed by value, and two anonymous
+	// struct types are only identical when their fields match exactly, in
+	// order. Omitting it makes main()'s cfg unassignable to this parameter.
+	UpdateRole          string
 	ShowVersion         bool
 }) (runErr error) {
 	runStart := time.Now()
