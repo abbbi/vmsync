@@ -73,6 +73,63 @@ func (f *optionalValueFlag) Set(s string) error {
 	return nil
 }
 
+// syncConfig is every value the CLI accepts, parsed once in main() and
+// passed to run() by value.
+//
+// Deliberately a named type rather than the anonymous struct this used to
+// be, declared identically in both places. Two anonymous struct types are
+// identical in Go only when their fields match name-for-name,
+// type-for-type, IN ORDER -- so adding a flag meant editing two lists and
+// keeping them in step, and getting it wrong produced a compiler error that
+// prints both 30-field type literals in full without naming the field that
+// differs. Naming the type makes adding a flag a one-line change and turns
+// a mismatch into an "unknown field" error pointing at the actual mistake.
+//
+// Not every field is read by run(): UpdateRole and ShowVersion are handled
+// entirely in main(), which exits before run() is called. They live here
+// anyway because this type is the CLI surface, not run()'s parameter list.
+type syncConfig struct {
+	SourceURI      string
+	TargetURI      string
+	SourceDomain   string
+	TargetDomain   string
+	TargetDiskPath string
+	SourceNBDHost  string
+	SourceNBDPort  int
+	SourceNBDBind  string
+	TargetNBDHost  string
+	TargetNBDPort  int
+	TargetNBDBind  string
+
+	SSHUser       string
+	SSHKey        string
+	SSHPassword   string
+	SSHPort       int
+	SSHInsecure   bool
+	KnownHosts    string
+	SSHTimeoutSec int
+
+	Start               bool
+	Reinit              bool
+	ReinitAfterFailures int
+	Verify              string
+	IgnoreExternalSnapshot bool
+	IODepth                int
+
+	Compress         string
+	CompressLevel    string
+	NetBuffer        string
+	BridgeHelperPath string
+	UseSSH           bool
+
+	PrometheusTextfile string
+	Debug              bool
+
+	// Handled in main(), never read by run() -- see the type's own comment.
+	UpdateRole  string
+	ShowVersion bool
+}
+
 func main() {
 	if os.Getenv("PROFILE") == "development" {
 		host := "localhost:6060"
@@ -82,41 +139,7 @@ func main() {
 		}()
 	}
 
-	var cfg struct {
-		SourceURI      string
-		TargetURI      string
-		SourceDomain   string
-		TargetDomain   string
-		TargetDiskPath string
-		SourceNBDHost  string
-		SourceNBDPort  int
-		SourceNBDBind  string
-		TargetNBDHost  string
-		TargetNBDPort  int
-		TargetNBDBind  string
-		SSHUser        string
-		SSHKey         string
-		SSHPassword    string
-		SSHPort        int
-		SSHInsecure    bool
-		KnownHosts     string
-		SSHTimeoutSec  int
-		Debug               bool
-		Start               bool
-		Reinit              bool
-		ReinitAfterFailures int
-		Compress            string
-		CompressLevel       string
-		NetBuffer           string
-		BridgeHelperPath    string
-		UseSSH              bool
-		IODepth                int
-		PrometheusTextfile     string
-		IgnoreExternalSnapshot bool
-		Verify                 string
-		UpdateRole             string
-		ShowVersion            bool
-	}
+	var cfg syncConfig
 
 	flag.StringVar(&cfg.SourceURI, "source-uri", "", "libvirt source URI (example: qemu+ssh://src/system)")
 	flag.StringVar(&cfg.TargetURI, "target-uri", "", "libvirt target URI (example: qemu+ssh://target/system)")
@@ -559,46 +582,7 @@ func refuseReinitIfTargetRunning(targetDomain string, exists, running bool) erro
 	return nil
 }
 
-func run(cfg struct {
-	SourceURI      string
-	TargetURI      string
-	SourceDomain   string
-	TargetDomain   string
-	TargetDiskPath string
-	SourceNBDHost  string
-	SourceNBDPort  int
-	SourceNBDBind  string
-	TargetNBDHost  string
-	TargetNBDPort  int
-	TargetNBDBind  string
-	SSHUser        string
-	SSHKey         string
-	SSHPassword    string
-	SSHPort        int
-	SSHInsecure    bool
-	KnownHosts     string
-	SSHTimeoutSec       int
-	Debug               bool
-	Start               bool
-	Reinit              bool
-	ReinitAfterFailures int
-	Compress            string
-	CompressLevel       string
-	NetBuffer           string
-	BridgeHelperPath    string
-	UseSSH              bool
-	IODepth             int
-	PrometheusTextfile  string
-	IgnoreExternalSnapshot bool
-	Verify              string
-	// UpdateRole is unused here -- -update-role is handled entirely in
-	// main() and exits before run() is ever called. It has to be declared
-	// anyway: cfg is an anonymous struct passed by value, and two anonymous
-	// struct types are only identical when their fields match exactly, in
-	// order. Omitting it makes main()'s cfg unassignable to this parameter.
-	UpdateRole          string
-	ShowVersion         bool
-}) (runErr error) {
+func run(cfg syncConfig) (runErr error) {
 	runStart := time.Now()
 	defer func() {
 		trace.Info("vmsync run finished", "elapsed", time.Since(runStart).Round(time.Millisecond).String(), "success", runErr == nil)
