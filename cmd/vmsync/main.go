@@ -302,8 +302,19 @@ func main() {
 		}
 	}
 
+	// run() logs the failure itself, from a defer positioned to fire just
+	// before it writes the Prometheus textfile -- see that defer's own
+	// comment. Logging it again here would both duplicate the line and, more
+	// to the point, be too late to be counted in vmsync_error_count.
+	//
+	// The RecordTargetSyncFailure bookkeeping below genuinely cannot move
+	// into run(): it must only happen once run() has definitively failed, by
+	// which point the textfile is already written. Its own warning on failure
+	// is therefore still uncounted -- an accepted, narrow gap (it reports a
+	// problem writing the failure counter, not a problem with the sync
+	// itself, and the sync's failure is already recorded in
+	// vmsync_sync_state).
 	if err := run(cfg); err != nil {
-		trace.Error("sync failed", "error", err)
 		if cfg.ReinitAfterFailures > 0 && !verifying {
 			if count, rerr := libvirtsync.RecordTargetSyncFailure(cfg.TargetURI, cfg.TargetDomain); rerr != nil {
 				trace.Warning("failed to record sync failure in target metadata", "error", rerr)
@@ -811,6 +822,31 @@ func run(cfg struct {
 		wasInterrupted := interrupted
 		interruptedMu.Unlock()
 		writeMetricsTextfile(finalRunState(runErr, wasInterrupted, fsFreezeFailed))
+	}()
+	// Registered immediately after the metrics defer above specifically so it
+	// runs immediately BEFORE it: defers are LIFO, so the later something is
+	// registered here, the earlier it runs. This has to be logged while
+	// writeMetricsTextfile can still observe it, because vmsync_error_count
+	// is read from trace.ErrorCount() at that moment.
+	//
+	// This used to live in main()'s own post-run() error branch, which is too
+	// late: run() has already written the textfile by the time it returns, so
+	// a failure during early setup (SSH dial, URI parsing, flag validation)
+	// -- none of which log an error of their own, they just return one --
+	// produced vmsync_error_count 0 sitting next to a failure
+	// vmsync_sync_state, and any alert built on that counter missed the run
+	// entirely.
+	//
+	// Every other defer in run() is registered after this one and therefore
+	// runs before it, so errors logged during cleanup (a failed qemu-nbd
+	// teardown, a failed bridge stop) are still counted here too. The signal
+	// handler's own path doesn't reach this at all -- it calls
+	// writeMetricsTextfile(StateFailure) and os.Exit(1) directly, bypassing
+	// every defer, which is deliberate and unchanged.
+	defer func() {
+		if runErr != nil {
+			trace.Error("sync failed", "error", runErr)
+		}
 	}()
 
 	netbufferBlock, netbufferSize, err := nbdbridge.ParseNetBufferSpec(cfg.NetBuffer)
