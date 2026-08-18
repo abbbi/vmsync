@@ -950,8 +950,14 @@ func TestSetMetadataFieldsRejectsUnsafeFieldNames(t *testing.T) {
 			if err == nil {
 				t.Fatalf("SetMetadataFields() with field name %q returned no error -- full output: %s", field, out)
 			}
-			if !strings.Contains(err.Error(), field) {
-				t.Errorf("error %q does not name the offending field %q", err.Error(), field)
+			// Matched against the %q-quoted form, not the raw name: that is
+			// how the error embeds it, so a field containing a quote or a
+			// backslash appears escaped in the message. Comparing the raw
+			// string agrees only for names that happen to need no escaping,
+			// which is exactly the subset that does not need checking.
+			quoted := fmt.Sprintf("%q", field)
+			if !strings.Contains(err.Error(), quoted) {
+				t.Errorf("error %q does not name the offending field %s", err.Error(), quoted)
 			}
 			if out != "" {
 				t.Errorf("SetMetadataFields() returned XML alongside its error, want an empty string: %s", out)
