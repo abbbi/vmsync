@@ -291,7 +291,12 @@ func TestHandleConnRelaysBothDirections(t *testing.T) {
 
 			handleDone := make(chan struct{})
 			go func() {
-				handleConn(accepted, realAddr, tc.compress, tc.algo, tc.level, "", "")
+				handleConn(accepted, helperConfig{
+					ConnectAddr: realAddr,
+					Compress:    tc.compress,
+					Algo:        tc.algo,
+					Level:       tc.level,
+				})
 				close(handleDone)
 			}()
 
@@ -432,7 +437,12 @@ func TestHandleConnReturnsOnRealSideInterruption(t *testing.T) {
 
 	handleDone := make(chan struct{})
 	go func() {
-		handleConn(accepted, realLn.Addr().String(), false, zstdrelay.AlgoZstd, "3", "", "")
+		handleConn(accepted, helperConfig{
+			ConnectAddr: realLn.Addr().String(),
+			Compress:    false,
+			Algo:        zstdrelay.AlgoZstd,
+			Level:       "3",
+		})
 		close(handleDone)
 	}()
 

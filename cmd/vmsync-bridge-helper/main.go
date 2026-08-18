@@ -92,6 +92,39 @@ func validateCompressLevel(algo zstdrelay.Algo, level string) error {
 	return nil
 }
 
+// helperConfig is the resolved, validated configuration one helper process
+// runs with: built once in main() from the flags, then passed unchanged to
+// serve and on to every handleConn.
+//
+// A struct rather than the positional parameter list these two functions
+// used to take. That list had grown to seven arguments, four of them plain
+// strings and three of those adjacent (Level, NetBufferBlock,
+// NetBufferSize), with ListenAddr/ConnectAddr an adjacent pair of their
+// own. Transposing any same-typed pair compiled perfectly and failed at
+// runtime instead: swapped netbuffer arguments configure the buffer
+// backwards and merely relay badly, swapped addresses make the helper
+// listen where it should dial, and a compression level landing in a
+// netbuffer slot is parsed as a byte size. Named fields make each of those
+// a visible mistake at the assignment rather than a silent one at the call.
+type helperConfig struct {
+	// ListenAddr is the local host:port to accept bridged connections on.
+	ListenAddr string
+	// ConnectAddr is the real endpoint dialed once per accepted connection.
+	ConnectAddr string
+
+	// Compress gates the compression stage entirely; Algo and Level are
+	// only consulted when it is true.
+	Compress bool
+	Algo     zstdrelay.Algo
+	Level    string
+
+	// NetBufferBlock/NetBufferSize are the two halves of
+	// -netbuffer=<blocksize>,<buffersize>, already split and validated by
+	// netbuffer.ParseSpec. Both empty means the buffering stage is off.
+	NetBufferBlock string
+	NetBufferSize  string
+}
+
 func main() {
 	listenAddr := flag.String("listen", "", "local host:port to listen on for bridged connections (required)")
 	connectAddr := flag.String("connect", "", "real endpoint host:port to dial and forward plaintext traffic to/from, once per accepted connection (required)")
@@ -161,7 +194,17 @@ func main() {
 		os.Exit(2)
 	}
 
-	if err := serve(*listenAddr, *connectAddr, compress, algo, *level, netbufferBlock, netbufferSize); err != nil {
+	cfg := helperConfig{
+		ListenAddr:     *listenAddr,
+		ConnectAddr:    *connectAddr,
+		Compress:       compress,
+		Algo:           algo,
+		Level:          *level,
+		NetBufferBlock: netbufferBlock,
+		NetBufferSize:  netbufferSize,
+	}
+
+	if err := serve(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
 		os.Exit(1)
 	}
@@ -171,19 +214,19 @@ func main() {
 // handleConn on its own goroutine, indefinitely -- the same "listen, fork
 // per connection" role socat's "TCP-LISTEN:...,fork" used to play, now done
 // natively so the remote host no longer needs socat installed at all.
-func serve(listenAddr, connectAddr string, compress bool, algo zstdrelay.Algo, level string, netbufferBlock, netbufferSize string) error {
-	ln, err := net.Listen("tcp", listenAddr)
+func serve(cfg helperConfig) error {
+	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", listenAddr, err)
+		return fmt.Errorf("listen %s: %w", cfg.ListenAddr, err)
 	}
 	defer ln.Close()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			return fmt.Errorf("accept on %s: %w", listenAddr, err)
+			return fmt.Errorf("accept on %s: %w", cfg.ListenAddr, err)
 		}
-		go handleConn(conn, connectAddr, compress, algo, level, netbufferBlock, netbufferSize)
+		go handleConn(conn, cfg)
 	}
 }
 
@@ -213,7 +256,7 @@ func recoverRelayPanic(label string, fn func() error) (err error) {
 // the OS), all connections now share this one long-lived process, so an
 // unrecovered panic here would take down every other connection this helper
 // is currently serving, not just this one.
-func handleConn(conn net.Conn, connectAddr string, compress bool, algo zstdrelay.Algo, level string, netbufferBlock, netbufferSize string) {
+func handleConn(conn net.Conn, cfg helperConfig) {
 	defer conn.Close()
 	defer func() {
 		if r := recover(); r != nil {
@@ -221,9 +264,9 @@ func handleConn(conn net.Conn, connectAddr string, compress bool, algo zstdrelay
 		}
 	}()
 
-	real, err := net.Dial("tcp", connectAddr)
+	real, err := net.Dial("tcp", cfg.ConnectAddr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: dial %s: %v\n", connectAddr, err)
+		fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: dial %s: %v\n", cfg.ConnectAddr, err)
 		return
 	}
 	defer real.Close()
@@ -243,7 +286,7 @@ func handleConn(conn net.Conn, connectAddr string, compress bool, algo zstdrelay
 	go func() {
 		defer wg.Done()
 		reportErr(recoverRelayPanic("inbound relay (conn -> real)", func() error {
-			err := zstdrelay.RelayFromWire(real, conn, compress, algo, netbufferBlock, netbufferSize, nil)
+			err := zstdrelay.RelayFromWire(real, conn, cfg.Compress, cfg.Algo, cfg.NetBufferBlock, cfg.NetBufferSize, nil)
 			if tc, ok := real.(*net.TCPConn); ok {
 				tc.CloseWrite() // half-close: tell the real server we're done sending
 			}
@@ -264,7 +307,7 @@ func handleConn(conn net.Conn, connectAddr string, compress bool, algo zstdrelay
 	go func() {
 		defer wg.Done()
 		reportErr(recoverRelayPanic("outbound relay (real -> conn)", func() error {
-			err := zstdrelay.Relay(conn, real, compress, algo, level, netbufferBlock, netbufferSize, nil)
+			err := zstdrelay.Relay(conn, real, cfg.Compress, cfg.Algo, cfg.Level, cfg.NetBufferBlock, cfg.NetBufferSize, nil)
 			if tc, ok := conn.(*net.TCPConn); ok {
 				tc.CloseWrite()
 			}
