@@ -526,6 +526,24 @@ func replaceDomainName(domainXML, name string) (string, error) {
 // nil if domainXML doesn't even parse as XML, rather than produce a false
 // "elements are missing" signal for something that was never valid to
 // begin with.
+//
+// A <backingStore> element is counted itself but its CONTENTS are skipped
+// entirely, on both sides of missingXMLElements' comparison. This is the
+// content-level counterpart to intentionallyDroppedXMLElements suppressing
+// the "backingStore" name itself, and is needed for the same reason: a
+// backing chain's <backingStore> nests its own <format> and <source>
+// (libvirt renders it as <backingStore><format/><source/><backingStore/>
+// </backingStore>), so replaceDomainDiskPath clearing the whole subtree on
+// purpose takes those children with it. Counting them would report "source"
+// as dropped on every sync of any domain with an external snapshot or a
+// permanent linked clone -- the disk's OWN <source> survives, rewritten, so
+// only the count falls, not the name -- and "format" likewise, which
+// appears nowhere else in a typical domain. Both are exactly the
+// "guaranteed, permanent false positive on every such run" that
+// intentionallyDroppedXMLElements exists to prevent, just one level down.
+// Skipping the subtree rather than adding "source"/"format" to that
+// suppression list keeps a genuinely dropped disk <source> -- the real loss
+// this check is here to catch -- still fully visible.
 func xmlElementCounts(domainXML string) map[string]int {
 	counts := map[string]int{}
 	dec := xml.NewDecoder(strings.NewReader(domainXML))
@@ -537,8 +555,19 @@ func xmlElementCounts(domainXML string) map[string]int {
 			}
 			return nil
 		}
-		if start, ok := tok.(xml.StartElement); ok {
-			counts[start.Name.Local]++
+		start, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		counts[start.Name.Local]++
+		if start.Name.Local == "backingStore" {
+			// Consumes through this element's matching end tag, so nothing
+			// nested inside it is ever counted. Self-closing <backingStore/>
+			// works the same way: the decoder synthesizes both tokens, so
+			// Skip just consumes the end tag immediately.
+			if err := dec.Skip(); err != nil {
+				return nil
+			}
 		}
 	}
 	return counts
@@ -555,6 +584,14 @@ func xmlElementCounts(domainXML string) map[string]int {
 // guaranteed, permanent false positive on every such run, unlike the rare,
 // genuinely-worth-a-look struct-modeling gaps this warning is meant to
 // surface.
+//
+// This covers the element NAME only. Suppressing what a cleared
+// <backingStore> takes down with it -- the <format> and <source> a real
+// backing chain nests inside it -- is xmlElementCounts' job (see its own doc
+// comment): it skips the whole subtree instead, so those names stay fully
+// reportable everywhere else in the document. Adding them here instead would
+// be the easy fix and the wrong one, since a disk genuinely losing its own
+// <source> is precisely the loss this check exists to catch.
 var intentionallyDroppedXMLElements = map[string]bool{
 	"backingStore": true,
 }

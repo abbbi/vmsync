@@ -1097,6 +1097,42 @@ func TestXMLElementCounts(t *testing.T) {
 		}
 	})
 
+	// The subtree skip that keeps replaceDomainDiskPath's deliberate
+	// BackingStore = nil from being reported as lost configuration -- see
+	// xmlElementCounts' own doc comment. The fixture is shaped exactly like
+	// real libvirt output for a disk with a backing chain: <backingStore>
+	// nests its own <format>, its own <source>, and a terminating empty
+	// <backingStore/>. Only the outer backingStore itself and the disk's own
+	// top-level <source> may be counted; the three nested elements must not
+	// contribute at all, and <format> must not appear in the result.
+	t.Run("counts a backingStore element itself but nothing nested inside it", func(t *testing.T) {
+		xmlStr := `<domain>
+  <devices>
+    <disk>
+      <source file="/var/lib/libvirt/images/vda.snap1"/>
+      <backingStore type="file" index="1">
+        <format type="qcow2"/>
+        <source file="/var/lib/libvirt/images/vda.qcow2"/>
+        <backingStore/>
+      </backingStore>
+    </disk>
+  </devices>
+</domain>`
+		got := xmlElementCounts(xmlStr)
+		want := map[string]int{"domain": 1, "devices": 1, "disk": 1, "source": 1, "backingStore": 1}
+		for name, count := range want {
+			if got[name] != count {
+				t.Errorf("xmlElementCounts(...)[%q] = %d, want %d (full result: %v)", name, got[name], count, got)
+			}
+		}
+		if _, ok := got["format"]; ok {
+			t.Errorf("xmlElementCounts(...) counted %q from inside a backingStore subtree, want it skipped entirely (full result: %v)", "format", got)
+		}
+		if len(got) != len(want) {
+			t.Errorf("xmlElementCounts(...) = %v (%d distinct names), want exactly %d", got, len(got), len(want))
+		}
+	})
+
 	t.Run("malformed xml returns nil, not an empty map", func(t *testing.T) {
 		if got := xmlElementCounts("not xml at all <<<"); got != nil {
 			t.Errorf("xmlElementCounts(malformed) = %v, want nil", got)
@@ -1190,6 +1226,42 @@ func TestMissingXMLElements(t *testing.T) {
 	// snapshot or linked clone would log a permanent false-positive
 	// warning. A genuinely unrelated dropped element in the same document
 	// must still be reported, so this isn't just suppressing everything.
+	// The populated-backingStore counterpart to the empty-<backingStore/>
+	// case just below. Clearing a real backing chain takes the subtree's
+	// nested <format> and <source> with it; neither may be reported, or every
+	// sync of a domain with an external snapshot or a permanent linked clone
+	// logs a permanent false positive -- "format" appears nowhere else in a
+	// typical domain (its count falls 1 -> 0), and "source" loses exactly the
+	// one instance that lived inside backingStore while the disk's own
+	// survives, which the occurrence-count comparison is otherwise precisely
+	// sensitive enough to notice.
+	t.Run("clearing a populated backingStore reports neither it nor its nested source/format", func(t *testing.T) {
+		original := `<domain><devices><disk><source file="/vm/a.snap1"/>` +
+			`<backingStore type="file" index="1"><format type="qcow2"/>` +
+			`<source file="/vm/a.qcow2"/><backingStore/></backingStore></disk></devices></domain>`
+		rewritten := `<domain><devices><disk><source file="/mnt/target/a.qcow2"/></disk></devices></domain>`
+		if got := missingXMLElements(original, rewritten); got != nil {
+			t.Errorf("missingXMLElements(...) = %v, want nil -- backingStore and everything nested in it are cleared on purpose", got)
+		}
+	})
+
+	// The sensitivity half of the pin above: skipping backingStore's contents
+	// must not blind the check to a disk genuinely losing its OWN <source>.
+	// Here the first disk's top-level source disappears while its backing
+	// chain's nested one is skipped on both sides, so the only counted change
+	// is the real loss -- exactly what this check exists to surface.
+	t.Run("a disk losing its own source outside any backingStore is still reported", func(t *testing.T) {
+		original := `<domain><devices><disk><source file="/vm/a.qcow2"/>` +
+			`<backingStore type="file"><source file="/vm/base.qcow2"/></backingStore></disk>` +
+			`<disk><source file="/vm/b.qcow2"/></disk></devices></domain>`
+		rewritten := `<domain><devices><disk></disk><disk><source file="/vm/b.qcow2"/></disk></devices></domain>`
+		got := missingXMLElements(original, rewritten)
+		want := []string{"source"}
+		if len(got) != len(want) || got[0] != want[0] {
+			t.Errorf("missingXMLElements(...) = %v, want %v -- a disk's own dropped <source> must still be caught", got, want)
+		}
+	})
+
 	t.Run("backingStore is never reported as dropped, but an unrelated dropped element still is", func(t *testing.T) {
 		original := `<domain><devices><disk><backingStore/></disk><hostdev/></devices></domain>`
 		rewritten := `<domain><devices><disk/></devices></domain>`
@@ -1251,44 +1323,34 @@ func TestReplaceDomainDiskPathPreservesRichConfiguration(t *testing.T) {
 	if !strings.Contains(out, `file="/mnt/target/vdb.qcow2"`) {
 		t.Errorf("expected second disk rewritten to /mnt/target/vdb.qcow2, got: %s", out)
 	}
-	// backingStore itself is the element this function deliberately drops
-	// (see its own doc comment) -- but it will never show up in missing
-	// below, because missingXMLElements already suppresses it globally via
-	// intentionallyDroppedXMLElements (added specifically so a real sync of
-	// any domain with a backing chain doesn't log a permanent false-positive
-	// "dropped configuration" warning on every run). "format" and "source"
-	// are the visible side effects that denylist does NOT cover: this
-	// fixture's cleared backingStore nests exactly one <format type="qcow2"/>
-	// and one <source file=".../base.qcow2"/> (the backing file's own
-	// source, distinct from disk1's own top-level <source>, which survives,
-	// rewritten) -- a disk's own format is a <driver type="qcow2">
-	// attribute, not this element, and <format> is specifically a
-	// backingStore/mirror-job convention -- so once backingStore is gone,
-	// both have nowhere left to appear as that one instance. missingXMLElements
-	// compares occurrence counts (see its own doc comment), not mere
-	// presence, specifically so a repeated element losing one instance is
-	// still caught even though other same-named elements survive elsewhere
-	// in the document -- "source" still exists four times over in the
-	// rewritten output (both disks' own, the interface's, the hostdev's),
-	// so a presence-only check would never have surfaced this one instance
-	// going missing at all. intentionallyDroppedXMLElements deliberately
-	// does NOT also suppress "format"/"source" themselves (see its own doc
-	// comment) -- broadening that denylist risks masking a genuinely
-	// dropped instance of either in some unrelated context -- so this
-	// expected-missing list, not production code, is what accounts for it
-	// here. Everything else in this fixture (hostdev, tpm, qemu:commandline,
-	// network interface, graphics/video/controllers, the ignored cdrom,
-	// CPU/features/clock, UEFI loader/nvram) must still be there.
-	missing := missingXMLElements(xmlStr, out)
-	want := []string{"format", "source"}
-	if len(missing) != len(want) {
-		t.Fatalf("replaceDomainDiskPath() against a feature-rich domain = missing %v, want exactly %v -- full output: %s", missing, want, out)
-	}
-	for i := range want {
-		if missing[i] != want[i] {
-			t.Errorf("replaceDomainDiskPath() against a feature-rich domain = missing %v, want exactly %v -- full output: %s", missing, want, out)
-			break
-		}
+	// NOTHING may be reported as dropped here, and that includes the whole
+	// backingStore subtree this function deliberately clears. Two separate
+	// mechanisms cover it, and this fixture exercises both:
+	//
+	//   - the "backingStore" name itself, via intentionallyDroppedXMLElements.
+	//   - its CONTENTS, via xmlElementCounts skipping the subtree on both
+	//     sides of the comparison. This fixture's cleared backingStore nests
+	//     exactly one <format type="qcow2"/> and one
+	//     <source file=".../base.qcow2"/> (the backing file's own source,
+	//     distinct from disk1's own top-level <source>, which survives,
+	//     rewritten). Without that skip, both would be reported on every
+	//     single sync of any domain with an external snapshot or a permanent
+	//     linked clone: "format" appears nowhere else in a typical domain, so
+	//     its count falls 1 -> 0, and "source" -- which still exists four
+	//     times over in the rewritten output (both disks' own, the
+	//     interface's, the hostdev's) -- loses exactly the one instance that
+	//     lived inside backingStore, which the occurrence-count comparison
+	//     (see missingXMLElements' own doc comment) is otherwise precisely
+	//     sensitive enough to notice.
+	//
+	// Skipping the subtree rather than denylisting "format"/"source" outright
+	// is what keeps a genuinely dropped disk <source> -- the real loss this
+	// check exists to catch -- still visible. Everything else in this fixture
+	// (hostdev, tpm, qemu:commandline, network interface, graphics/video/
+	// controllers, the ignored cdrom, CPU/features/clock, UEFI loader/nvram)
+	// must still be there too.
+	if missing := missingXMLElements(xmlStr, out); len(missing) != 0 {
+		t.Errorf("replaceDomainDiskPath() against a feature-rich domain = missing %v, want none -- full output: %s", missing, out)
 	}
 }
 
