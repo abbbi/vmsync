@@ -169,16 +169,25 @@ refuses to run, with a clear message, against a source that isn't. The
 sequence is: a baseline full sync (`-reinit`); create a real external
 disk-only snapshot on the source (`virsh snapshot-create-as
 --disk-only --atomic`); sync+verify while it exists, checking three
-things — the sync/verify itself still succeeds, the log shows the
-expected "checkpoint creation blocked by an existing external snapshot"
-tolerance path (added specifically for this scenario — see
-`IsCheckpointBlockedBySnapshot` in `pkg/libvirtsync`), and the target
+things — the sync/verify itself still succeeds, vmsync actually saw the
+snapshot (`vmsync_external_snapshot_count` is non-zero, which is what
+proves the snapshot took effect on the disk being synced), and the target
 disk's resolved path did not drift while the snapshot was present; then
 remove the snapshot for real (`blockcommit --active --pivot --wait`,
 followed by `snapshot-delete --metadata` and removing the now-orphaned
 overlay file); then sync+verify once more, checking that the checkpoint
 chain actually resumes advancing rather than staying stuck in the
-tolerant-but-not-advancing state. A `blockcommit` failure here is treated
+tolerant-but-not-advancing state.
+
+Whether libvirt refuses to create a checkpoint while an external snapshot
+exists is **version-dependent** — newer libvirt/qemu pairs allow it. So
+the during-snapshot run reports which happened rather than requiring one:
+if the checkpoint was blocked, it confirms vmsync's tolerance path handled
+it (see `IsCheckpointBlockedBySnapshot` in `pkg/libvirtsync`); if libvirt
+permitted it, the chain simply advanced normally and the tolerance path
+was not needed. Both are a PASS. An earlier version of this stage demanded
+the tolerance log line and reported a healthy run on a permissive libvirt
+as a failure. A `blockcommit` failure here is treated
 as fatal rather than merely healed and retried (unlike Stage 2's tamper
 tests) — it can leave the source domain's own disk chain inconsistent,
 and the harness stops immediately with instructions to inspect it by hand

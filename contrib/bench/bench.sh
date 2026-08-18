@@ -637,27 +637,56 @@ stage_external_snapshot() {
                 log "source disk now redirected to overlay: ${overlay_path:-<could not resolve>}"
         fi
 
-        log "--- syncing while the external snapshot exists (expect: checkpoint creation tolerantly blocked, sync+verify still succeed) ---"
+        log "--- syncing while the external snapshot exists (expect: sync+verify succeed and the target path stays stable) ---"
         run_vmsync ext-snapshot during-snapshot -verify=fast
         if [ "$DRY_RUN" != yes ]; then
+                local snap_count=0
+                local target_path_during=""
+                if [ "$RUN_RC" = 0 ]; then
+                        snap_count="$(prom_sum "$RUN_PROM" vmsync_external_snapshot_count)"
+                        target_path_during="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")" || true
+                fi
+
                 if [ "$RUN_RC" != 0 ]; then
                         warn "FAIL: sync+verify while an external snapshot existed did not succeed (exit=$RUN_RC) -- see $RUN_LOG"
                         results_row "$CSV" ext-snapshot during-result 1 "" "" "" "" "" "FAIL sync did not succeed with snapshot present"
-                elif ! grep -q 'checkpoint creation blocked by an existing external snapshot' "$RUN_LOG" 2>/dev/null; then
-                        warn "FAIL: sync+verify succeeded, but never logged the expected checkpoint-blocked-by-snapshot tolerance path -- see $RUN_LOG (did the snapshot actually take effect on this disk?)"
-                        results_row "$CSV" ext-snapshot during-result 1 "" "" "" "" "" "FAIL checkpoint-blocked path not observed"
+                elif [ "$snap_count" -lt 1 ]; then
+                        # vmsync counts the source domain's external snapshots
+                        # itself and reports them as
+                        # vmsync_external_snapshot_count. Zero here means the
+                        # snapshot this stage just created was not visible to
+                        # the sync at all, so nothing below would be testing
+                        # what it claims to -- this is the real "did the
+                        # snapshot take effect?" check, which the old version
+                        # only ever asked rhetorically in a warning message.
+                        warn "FAIL: vmsync reported vmsync_external_snapshot_count=$snap_count during the sync, but this stage created an external snapshot on $TAMPER_DISK_DEV -- the snapshot did not take effect, or the metric is broken; see $RUN_LOG"
+                        results_row "$CSV" ext-snapshot during-result 1 "" "" "" "" "" "FAIL snapshot not visible to vmsync (count=$snap_count)"
+                elif [ -n "$target_path_before" ] && [ "$target_path_during" != "$target_path_before" ]; then
+                        warn "FAIL: target disk path changed while the snapshot existed (before='$target_path_before' during='$target_path_during') -- RootSource-based naming should have kept this stable"
+                        results_row "$CSV" ext-snapshot during-result 1 "" "" "" "" "" "FAIL target path drifted during snapshot"
+                elif grep -q 'checkpoint creation blocked by an existing external snapshot' "$RUN_LOG" 2>/dev/null; then
+                        log "   PASS: synced and verified with the external snapshot present; libvirt blocked the new checkpoint and vmsync's tolerance path handled it (vmsync_external_snapshot_count=$snap_count, target path unchanged)"
+                        results_row "$CSV" ext-snapshot during-result 0 "" "" "" "" "" "PASS synced+verified via tolerance path, count=$snap_count"
                 else
-                        local snap_count
-                        snap_count="$(prom_sum "$RUN_PROM" vmsync_external_snapshot_count)"
-                        local target_path_during=""
-                        target_path_during="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")" || true
-                        if [ -n "$target_path_before" ] && [ "$target_path_during" != "$target_path_before" ]; then
-                                warn "FAIL: target disk path changed while the snapshot existed (before='$target_path_before' during='$target_path_during') -- RootSource-based naming should have kept this stable"
-                                results_row "$CSV" ext-snapshot during-result 1 "" "" "" "" "" "FAIL target path drifted during snapshot"
-                        else
-                                log "   PASS: synced and verified correctly with the external snapshot present (vmsync_external_snapshot_count=$snap_count, target path unchanged)"
-                                results_row "$CSV" ext-snapshot during-result 0 "" "" "" "" "" "PASS synced+verified, path stable, count=$snap_count"
-                        fi
+                        # Not a failure. Whether libvirt refuses to create a
+                        # checkpoint while an external snapshot exists is
+                        # version-dependent, and newer libvirt/qemu pairs allow
+                        # it. When they do, vmsync's tolerance path is simply
+                        # never needed and the checkpoint chain keeps advancing
+                        # normally -- a better outcome than the one this stage
+                        # was originally written to expect. Treating "the
+                        # fallback wasn't needed" as "the fallback is broken"
+                        # is what this check used to do, and it made a healthy
+                        # run report a regression.
+                        #
+                        # The assertions that DO still apply here -- the sync
+                        # succeeded, the snapshot was genuinely visible to
+                        # vmsync, and the target path did not drift -- are all
+                        # checked above, which they previously were not: they
+                        # sat behind the tolerance-log grep and were skipped
+                        # entirely whenever it didn't match.
+                        log "   PASS: synced and verified with the external snapshot present; this libvirt permitted the checkpoint, so the tolerance path was not exercised (vmsync_external_snapshot_count=$snap_count, target path unchanged)"
+                        results_row "$CSV" ext-snapshot during-result 0 "" "" "" "" "" "PASS synced+verified, checkpoint not blocked by this libvirt, count=$snap_count"
                 fi
         fi
 
