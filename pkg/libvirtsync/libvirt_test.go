@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"vmsync/pkg/disk"
+	"vmsync/pkg/failover"
 
 	"libvirt.org/go/libvirt"
 )
@@ -740,7 +741,7 @@ func TestAllMetadataFieldsNoBlock(t *testing.T) {
 func TestUpdateSyncMetadata(t *testing.T) {
 	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
 	before := time.Now().Unix()
-	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "source-host.example.org", "sourcevm")
+	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "source-host.example.org", "sourcevm", "")
 	after := time.Now().Unix()
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
@@ -771,6 +772,114 @@ func TestUpdateSyncMetadata(t *testing.T) {
 	replicaSource, err := ParseMetadataField(out, MetadataFieldReplicaSource)
 	if err != nil || replicaSource != "source-host.example.org:sourcevm" {
 		t.Errorf("replica_source = %q, err=%v, want source-host.example.org:sourcevm", replicaSource, err)
+	}
+}
+
+// TestUpdateSyncMetadataDoesNotInheritSourceSideFields guards the fact that
+// makes this function subtle: the XML it is handed is the SOURCE's, and
+// DefineDomain turns whatever comes out into the TARGET's persistent
+// definition. Anything source-specific left in place is thereby stamped
+// onto the replica.
+//
+// The role is the one that bites hardest. After a direction inversion the
+// new source legitimately carries replication_role=source, and inheriting
+// it makes the first sync mark the new TARGET as a source -- which
+// TargetRoleAllowsSync then refuses forever, advising the operator to check
+// whether the URIs are reversed, immediately after they deliberately
+// reversed them.
+func TestUpdateSyncMetadataDoesNotInheritSourceSideFields(t *testing.T) {
+	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
+
+	// A source that is itself a former promoted target, replicating onward:
+	// every field here belongs to the source and to no replica of it.
+	srcXML, err := SetMetadataFields(base, map[string]string{
+		MetadataFieldReplicationRole: RoleSource,
+		MetadataFieldReplicaTargets:  "dr01:testvm,dr02:testvm",
+		MetadataFieldPromotedAt:      "1700000000",
+		MetadataFieldPromotedBy:      "alice",
+		MetadataFieldPromotedFrom:    "old-primary:testvm",
+		MetadataFieldPromotionMode:   "forced",
+	})
+	if err != nil {
+		t.Fatalf("building source xml: %v", err)
+	}
+
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", "")
+	if err != nil {
+		t.Fatalf("UpdateSyncMetadata() error = %v", err)
+	}
+
+	for _, field := range []string{
+		MetadataFieldReplicationRole,
+		MetadataFieldReplicaTargets,
+		MetadataFieldPromotedAt,
+		MetadataFieldPromotedBy,
+		MetadataFieldPromotedFrom,
+		MetadataFieldPromotionMode,
+	} {
+		if got, _ := ParseMetadataField(out, field); got != "" {
+			t.Errorf("%s = %q on the target, want it stripped -- that field describes the source", field, got)
+		}
+	}
+	// The target's own bookkeeping must still be written.
+	if got, _ := ParseMetadataField(out, MetadataFieldReplicaSource); got != "src-host:testvm" {
+		t.Errorf("replica_source = %q, want src-host:testvm", got)
+	}
+}
+
+// TestUpdateSyncMetadataPreservesTheTargetsOwnRole: a deliberate
+// -update-role=target must survive a sync. Because the new definition is
+// built from the source's XML, preserving it takes an explicit write --
+// before this, setting a role on a target was silently undone by the very
+// next successful run.
+func TestUpdateSyncMetadataPreservesTheTargetsOwnRole(t *testing.T) {
+	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
+	// The source carries a role of its own, to prove the value written is
+	// the TARGET's and not whatever the source happened to have.
+	srcXML, err := SetMetadataFields(base, map[string]string{MetadataFieldReplicationRole: RoleSource})
+	if err != nil {
+		t.Fatalf("building source xml: %v", err)
+	}
+
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", RoleTarget)
+	if err != nil {
+		t.Fatalf("UpdateSyncMetadata() error = %v", err)
+	}
+	if got, _ := ParseMetadataField(out, MetadataFieldReplicationRole); got != RoleTarget {
+		t.Errorf("replication_role = %q, want %q -- the target's own role, not the source's", got, RoleTarget)
+	}
+}
+
+// TestRoleConstantsMatchFailover keeps pkg/failover's copies of these
+// strings in step with the originals here.
+//
+// pkg/failover duplicates them deliberately: importing this package would
+// drag in libvirt and destroy the property that makes it valuable, namely
+// that the rules deciding whether a production VM gets overwritten compile
+// and test anywhere. The cost of that choice is exactly this risk -- one
+// side renamed and the other not -- so it is paid down here, in the package
+// that owns the values, rather than left to be discovered when a role stops
+// being recognised in production and every sync is refused.
+func TestRoleConstantsMatchFailover(t *testing.T) {
+	for _, tc := range []struct{ name, here, there string }{
+		{"RoleSource", RoleSource, failover.RoleSource},
+		{"RoleTarget", RoleTarget, failover.RoleTarget},
+		{"RolePromoted", RolePromoted, failover.RolePromoted},
+		{"RolePaused", RolePaused, failover.RolePaused},
+		{"replication_role", MetadataFieldReplicationRole, failover.FieldReplicationRole},
+		{"replica_source", MetadataFieldReplicaSource, failover.FieldReplicaSource},
+		{"replica_targets", MetadataFieldReplicaTargets, failover.FieldReplicaTargets},
+		{"last_checkpoint", MetadataFieldLastCheckpoint, failover.FieldLastCheckpoint},
+		{"last_sync_timestamp", MetadataFieldLastSync, failover.FieldLastSync},
+		{"failure_count", MetadataFieldFailureCount, failover.FieldFailureCount},
+		{"promoted_at", MetadataFieldPromotedAt, failover.FieldPromotedAt},
+		{"promoted_by", MetadataFieldPromotedBy, failover.FieldPromotedBy},
+		{"promoted_from", MetadataFieldPromotedFrom, failover.FieldPromotedFrom},
+		{"promotion_mode", MetadataFieldPromotionMode, failover.FieldPromotionMode},
+	} {
+		if tc.here != tc.there {
+			t.Errorf("%s: libvirtsync has %q, failover has %q -- they must be identical", tc.name, tc.here, tc.there)
+		}
 	}
 }
 

@@ -87,6 +87,22 @@ const (
 	// go through the same check, so the interlock cannot be bypassed by
 	// simply not using the thing that knows about it.
 	MetadataFieldReplicationRole = "replication_role"
+
+	// The promotion record. Written together when a domain is promoted to
+	// serve live, and stripped together whenever it stops being promoted
+	// (an inversion, or -update-role away from promoted). They are an audit
+	// trail rather than an interlock -- replication_role is what actually
+	// refuses a sync -- but they are what tells an operator, days later,
+	// which failover this was and how much data it accepted losing.
+	MetadataFieldPromotedAt   = "promoted_at"
+	MetadataFieldPromotedBy   = "promoted_by"
+	MetadataFieldPromotedFrom = "promoted_from"
+	// MetadataFieldPromotionMode records "planned" or "forced": whether the
+	// source was cleanly shut down first, or whether the promotion went
+	// ahead without reaching it at all. The difference is the difference
+	// between a failover with no data loss and one with an unbounded
+	// window, so it is recorded rather than inferred.
+	MetadataFieldPromotionMode = "promotion_mode"
 )
 
 // Replication roles, as stored in MetadataFieldReplicationRole. An empty or
@@ -132,6 +148,10 @@ var metadataFieldOrder = []string{
 	MetadataFieldFailureCount,
 	MetadataFieldReplicaSource,
 	MetadataFieldReplicaTargets,
+	MetadataFieldPromotedAt,
+	MetadataFieldPromotedBy,
+	MetadataFieldPromotedFrom,
+	MetadataFieldPromotionMode,
 }
 
 var vmsyncBlockRe = regexp.MustCompile(`(?s)<vmsync:vmsync[^>]*>.*?</vmsync:vmsync>`)
@@ -363,7 +383,17 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 		// domain that has an NVRAM file present at all, which is exactly
 		// why this previously failed -- silently, since the error was
 		// swallowed -- for every UEFI/OVMF target domain.
-		if err := d.UndefineFlags(libvirt.DOMAIN_UNDEFINE_KEEP_NVRAM); err != nil {
+		// CHECKPOINTS_METADATA is required, not optional: libvirt refuses to
+		// undefine an inactive domain that carries checkpoint metadata
+		// unless it is passed. A target acquires checkpoints whenever it has
+		// previously been a SOURCE -- which is exactly what the far end of
+		// an inverted pair is -- so without this the first sync in the new
+		// direction fails at its very last step, after having already copied
+		// the entire VM. Dropping the checkpoints is correct here anyway:
+		// this domain is being replaced wholesale by the source's
+		// definition, and a chain describing the disks it used to have is
+		// meaningless against the disks it is about to be given.
+		if err := d.UndefineFlags(libvirt.DOMAIN_UNDEFINE_KEEP_NVRAM | libvirt.DOMAIN_UNDEFINE_CHECKPOINTS_METADATA); err != nil {
 			return fmt.Errorf("undefine existing target domain %s: %w", targetDomainName, err)
 		}
 	}
@@ -813,13 +843,53 @@ func SetMetadataFields(domainXML string, updates map[string]string, removeFields
 // failure_count to 0, and records sourceHost:sourceDomain as this
 // (target) domain's current replica_source -- called on the TARGET's new
 // definition once a sync completes successfully.
-func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain string) (string, error) {
-	return SetMetadataFields(domainXML, map[string]string{
+//
+// Note what domainXML actually is at the only call site: the SOURCE's XML.
+// DefineDomain replaces the target's persistent definition with one derived
+// from it, so whatever metadata this function leaves in place becomes the
+// target's metadata, and anything the target used to carry is gone. That
+// makes the removeFields list below load-bearing rather than tidy-up:
+//
+//   - replica_targets and the promotion fields describe the SOURCE. Letting
+//     them ride along stamps them onto the replica, so a target would claim
+//     to replicate to the source's own targets, and a target of a domain
+//     that was once promoted would claim to have been promoted itself.
+//
+//   - replication_role is the worst of them. It is the interlock
+//     TargetRoleAllowsSync enforces, and carrying the source's value across
+//     means that after a direction inversion -- where the new source
+//     legitimately carries role=source -- the first sync stamps `source`
+//     onto the new target, and every subsequent sync is refused with an
+//     error telling the operator to check whether the URIs are reversed:
+//     advice that is exactly backwards for someone who has just
+//     deliberately reversed them.
+//
+// targetRole is the role the TARGET itself carries, read by the caller
+// immediately before this and re-checked against TargetRoleAllowsSync. It
+// is written back explicitly so a deliberate -update-role=target survives a
+// sync; empty means the target had no role, and the field is then removed
+// rather than inherited, preserving the property that vmsync never assigns
+// a role on its own.
+func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetRole string) (string, error) {
+	updates := map[string]string{
 		MetadataFieldLastCheckpoint: checkpoint,
 		MetadataFieldLastSync:       strconv.FormatInt(time.Now().Unix(), 10),
 		MetadataFieldFailureCount:   "0",
 		MetadataFieldReplicaSource:  ReplicaEntry(sourceHost, sourceDomain),
-	})
+	}
+	remove := []string{
+		MetadataFieldReplicaTargets,
+		MetadataFieldPromotedAt,
+		MetadataFieldPromotedBy,
+		MetadataFieldPromotedFrom,
+		MetadataFieldPromotionMode,
+	}
+	if targetRole == "" {
+		remove = append(remove, MetadataFieldReplicationRole)
+	} else {
+		updates[MetadataFieldReplicationRole] = targetRole
+	}
+	return SetMetadataFields(domainXML, updates, remove...)
 }
 
 // ReplicaEntry formats a host+domain pair the same way on both sides of a
@@ -1152,7 +1222,16 @@ func RecordTargetSyncFailure(targetURI, targetDomain string) (int, error) {
 	}
 	defer dom.Free()
 
-	domXML, err := dom.GetXMLDesc(0)
+	// DOMAIN_XML_INACTIVE, not flags=0. This function redefines the domain
+	// from whatever it reads here, and flags=0 returns the LIVE definition
+	// for a running domain -- including runtime-only elements assigned at
+	// boot (actual PCI addresses, live CPU/NUMA pinning) that do not belong
+	// in, and may not even be valid as, a persistent definition. See
+	// DefineDomain's own comment for the full reasoning; it applies with
+	// more force here, because the one case that most needs a failure
+	// recorded is a target that has been promoted and is now RUNNING, which
+	// is exactly when flags=0 diverges.
+	domXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
 	if err != nil {
 		return 0, fmt.Errorf("read target domain xml: %w", err)
 	}
@@ -1172,7 +1251,11 @@ func RecordTargetSyncFailure(targetURI, targetDomain string) (int, error) {
 		return 0, fmt.Errorf("update failure_count metadata: %w", err)
 	}
 
-	latestXML, err := dom.GetXMLDesc(0)
+	// Same flag as the read above, and it must stay the same: this compares
+	// the two to detect a concurrent redefine, so reading them with
+	// different flags would report every RUNNING target as concurrently
+	// modified and refuse to record any failure at all.
+	latestXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
 	if err != nil {
 		return 0, fmt.Errorf("re-read target domain xml before write: %w", err)
 	}
