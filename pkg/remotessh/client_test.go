@@ -87,18 +87,18 @@ func TestExpandHome(t *testing.T) {
 // ~/.ssh/config to test.
 func TestResolveSSHConnectionParams(t *testing.T) {
 	cases := []struct {
-		name       string
-		uriHost    string
-		uriUser    string
-		user       string
-		keyPath    string
-		port       int
-		timeout    time.Duration
-		sshConfig  map[string]string
-		wantAddr   string
-		wantUser   string
-		wantKey    string
-		wantPort   int
+		name        string
+		uriHost     string
+		uriUser     string
+		user        string
+		keyPath     string
+		port        int
+		timeout     time.Duration
+		sshConfig   map[string]string
+		wantAddr    string
+		wantUser    string
+		wantKey     string
+		wantPort    int
 		wantTimeout time.Duration
 	}{
 		{

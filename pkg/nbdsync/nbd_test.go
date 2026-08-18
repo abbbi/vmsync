@@ -742,10 +742,10 @@ func TestClampBufferSize(t *testing.T) {
 // the rest of this file -- see nbd.go's own doc comment on this function.
 func TestNextExtentScanOffset(t *testing.T) {
 	cases := []struct {
-		name                                            string
-		requestedOffset, requestedChunk, describedEnd   uint64
-		wantOffset                                      uint64
-		wantErr                                         bool
+		name                                          string
+		requestedOffset, requestedChunk, describedEnd uint64
+		wantOffset                                    uint64
+		wantErr                                       bool
 	}{
 		{
 			name:            "server described the full requested range",

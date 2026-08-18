@@ -53,8 +53,8 @@ type CachedConfig struct {
 	ETag string `json:"etag,omitempty"`
 	// FetchedAtUnix records when this was last confirmed with the UI, so the
 	// agent can report how stale its own instructions are.
-	FetchedAtUnix int64      `json:"fetched_at_unix"`
-	Config        UIConfig   `json:"config"`
+	FetchedAtUnix int64    `json:"fetched_at_unix"`
+	Config        UIConfig `json:"config"`
 }
 
 // UIConfig is the configuration the UI hands out. Phase 1 carries no

@@ -224,8 +224,8 @@ func TestVerificationRan(t *testing.T) {
 		attempted bool
 		want      bool
 	}{
-		{verify: "", attempted: false, want: false},  // plain sync / -reinit -- the critical case
-		{verify: "", attempted: true, want: false},   // defensive: shouldn't happen in practice
+		{verify: "", attempted: false, want: false}, // plain sync / -reinit -- the critical case
+		{verify: "", attempted: true, want: false},  // defensive: shouldn't happen in practice
 		{verify: "compare", attempted: false, want: false},
 		{verify: "fast", attempted: false, want: false},
 		{verify: "online", attempted: false, want: false},
@@ -285,11 +285,11 @@ func TestUnverifiableCheckpointMetadataError(t *testing.T) {
 	parseErr := errors.New("xml: malformed metadata element")
 
 	cases := []struct {
-		name              string
-		parent            string
-		checkpointErr     error
+		name               string
+		parent             string
+		checkpointErr      error
 		metadataCheckpoint string
-		wantErr           bool
+		wantErr            bool
 	}{
 		{name: "incremental, metadata read fine -> no error", parent: "vmsync-cpt-000042", checkpointErr: nil, metadataCheckpoint: "vmsync-cpt-000042", wantErr: false},
 		{name: "incremental, empty metadata -> must abort", parent: "vmsync-cpt-000042", checkpointErr: nil, metadataCheckpoint: "", wantErr: true},
@@ -323,10 +323,10 @@ func TestUnverifiableCheckpointMetadataError(t *testing.T) {
 // with no test coverage at all.
 func TestCheckpointChainConsistent(t *testing.T) {
 	cases := []struct {
-		name                   string
+		name                    string
 		metadataEntryCheckpoint string
-		parent                 string
-		want                   bool
+		parent                  string
+		want                    bool
 	}{
 		{name: "matches -- the common case on every normal incremental sync", metadataEntryCheckpoint: "vmsync-cpt-000042", parent: "vmsync-cpt-000042", want: true},
 		{name: "mismatch -- target's own metadata disagrees with the expected parent", metadataEntryCheckpoint: "vmsync-cpt-000041", parent: "vmsync-cpt-000042", want: false},
