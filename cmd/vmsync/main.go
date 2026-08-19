@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"vmsync/pkg/disk"
+	"vmsync/pkg/failover"
 	"vmsync/pkg/libvirtsync"
 	"vmsync/pkg/metrics"
 	"vmsync/pkg/nbdbridge"
@@ -178,6 +179,16 @@ type syncConfig struct {
 	// Handled in main(), never read by run() -- see the type's own comment.
 	UpdateRole  string
 	ShowVersion bool
+
+	// The failover modes, all handled in main() like -update-role: each
+	// changes state and exits, syncing nothing.
+	Promote            bool
+	Invert             bool
+	ShutdownDomain     bool
+	PromoteMode        string
+	PromotedBy         string
+	ForcePromote       bool
+	ShutdownTimeoutSec int
 }
 
 func main() {
@@ -225,6 +236,13 @@ func main() {
 	flag.BoolVar(&cfg.IgnoreExternalSnapshot, "ignore-external-snapshot", false, "If the source domain currently has any external disk snapshot, skip this run entirely")
 	flag.StringVar(&cfg.Verify, "verify", "", "After syncing, verify target matches source for every disk. Accepts compare|fast|online. See documentation for details. (compare|fast suspend the source domain, online does not)")
 	flag.StringVar(&cfg.UpdateRole, "update-role", "", "Set the replication role recorded in a domain's own vmsync metadata, then exit without syncing anything. Accepts "+strings.Join(libvirtsync.ValidRoles, "|")+" (\"none\" clears it). The domain is addressed with -target-uri/-target-domain regardless of which direction it currently replicates in. vmsync refuses to sync INTO a domain whose role is anything other than \"target\" or unset -- this is what stops a scheduled sync from overwriting a domain that was failed over to and then shut down for maintenance")
+	flag.BoolVar(&cfg.Promote, "promote", false, "Promote the replica named by -target-uri/-target-domain to serve live: record the promotion and, with -start, boot it. Refuses unless the target actually holds a usable replica. Must be run on the target's own host")
+	flag.BoolVar(&cfg.Invert, "invert", false, "Reverse a pair's direction after a failover: -source-uri/-source-domain name the OLD source, -target-uri/-target-domain the promoted replica. Run on the old source's host")
+	flag.BoolVar(&cfg.ShutdownDomain, "shutdown-domain", false, "Shut the domain named by -target-uri/-target-domain down cleanly and pause its replication. The source half of a planned failover; must be run on that domain's own host")
+	flag.StringVar(&cfg.PromoteMode, "promote-mode", string(failover.ModeForced), fmt.Sprintf("How this promotion came about, recorded on the domain: %q when the source was cleanly shut down first (no data lost), %q when it was never reached", failover.ModePlanned, failover.ModeForced))
+	flag.StringVar(&cfg.PromotedBy, "promoted-by", "", "Who is performing this promotion, recorded on the domain for attribution")
+	flag.BoolVar(&cfg.ForcePromote, "force-promote", false, "Promote even when the target does not look like a usable replica (missing disks, no completed sync, an interrupted copy). The data-loss window is then reported as unknown rather than guessed")
+	flag.IntVar(&cfg.ShutdownTimeoutSec, "shutdown-timeout-sec", 300, "How long -shutdown-domain waits for a clean guest shutdown. On expiry it fails and leaves the domain running rather than destroying it")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
@@ -281,6 +299,55 @@ func main() {
 	// do WHILE a misdirected sync is running. SetReplicationRole's own
 	// re-read-before-write guard is what protects the field itself from a
 	// concurrent writer.
+	// The failover modes sit alongside -update-role for the same reasons
+	// spelled out above it: each changes state on one or two domains and
+	// exits, syncing nothing, so none of the sync-path validation applies.
+	//
+	// Mutually exclusive with each other and with -update-role. Combining
+	// them has no meaning, and quietly running one of them would be a poor
+	// way to find that out.
+	{
+		var chosen []string
+		for _, m := range []struct {
+			on   bool
+			name string
+		}{
+			{cfg.Promote, "-promote"},
+			{cfg.Invert, "-invert"},
+			{cfg.ShutdownDomain, "-shutdown-domain"},
+			{cfg.UpdateRole != "", "-update-role"},
+		} {
+			if m.on {
+				chosen = append(chosen, m.name)
+			}
+		}
+		if len(chosen) > 1 {
+			trace.Error("conflicting modes", "error", fmt.Errorf("%s cannot be combined; each is a separate operation", strings.Join(chosen, " and ")))
+			os.Exit(2)
+		}
+
+		if len(chosen) == 1 && chosen[0] != "-update-role" {
+			trace.SetDebug(cfg.Debug)
+			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+			defer stop()
+
+			var err error
+			switch {
+			case cfg.Promote:
+				err = runPromote(ctx, cfg)
+			case cfg.Invert:
+				err = runInvert(ctx, cfg)
+			case cfg.ShutdownDomain:
+				err = runShutdownDomain(ctx, cfg)
+			}
+			if err != nil {
+				trace.Error(strings.TrimPrefix(chosen[0], "-"), "error", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		}
+	}
+
 	if cfg.UpdateRole != "" {
 		// Validated before connecting, so a typo costs an immediate,
 		// readable error rather than a libvirt round trip first.
@@ -2143,6 +2210,12 @@ func run(cfg syncConfig) (runErr error) {
 		trace.Info("VM is not in running state, skipping filesystem freeze")
 	}
 
+	// Captured before the call, not after: this is the instant the replica's
+	// contents will correspond to, because everything the guest writes from
+	// the moment the checkpoint exists belongs to the NEXT one. Recorded on
+	// the target further down so a later failover can state its data-loss
+	// window honestly instead of measuring from the end of the copy.
+	checkpointAt := time.Now()
 	if err := libvirtsync.CreateCheckpoint(srcDom, checkpointName, parent, qcowDisks); err != nil {
 		// A full sync (parent == "") has no earlier checkpoint to fall back
 		// on -- without a checkpoint at all there's no bitmap to establish a
@@ -2895,7 +2968,7 @@ func run(cfg syncConfig) (runErr error) {
 
 	trace.Info("Adding metadata information")
 	var newXML string
-	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint, util.HostFromURIOrLocal(cfg.SourceURI), cfg.SourceDomain, currentTargetRole)
+	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint, util.HostFromURIOrLocal(cfg.SourceURI), cfg.SourceDomain, currentTargetRole, checkpointAt.Unix())
 	if err != nil {
 		// UpdateSyncMetadata is a pure in-memory XML transformation -- no
 		// network or libvirt call involved -- so a failure here is almost
