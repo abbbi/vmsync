@@ -213,8 +213,8 @@ func TestEffectiveMaxConcurrent(t *testing.T) {
 		{"host ceiling lowers the config", 8, 3, 3},
 		{"host ceiling never raises the config", 2, 9, 2},
 		{"host ceiling lowers the default too", 0, 1, 1},
-		{"hard clamp applies to the config", 500, 0, hardMaxConcurrent},
-		{"hard clamp applies before the host ceiling", 500, 4, 4},
+		{"hard clamp applies to the config", 5000, 0, hardMaxConcurrent},
+		{"hard clamp applies before the host ceiling", 5000, 4, 4},
 		{"a negative config is treated as unset", -3, 0, defaultMaxConcurrent},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

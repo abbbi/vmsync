@@ -6,16 +6,25 @@ reports that to a control-plane UI.
 
 ## What it does, and what it deliberately cannot
 
-This is **phase 1 of the control plane, and it is read-only by
-construction**. There is no code path in this binary that starts a sync,
-changes a replication role, or modifies a domain in any way. The
-configuration the UI hands out carries no executable instruction to ignore
-— it holds a report interval, a poll hold time, and per-VM sync cadences
-used only to judge staleness. Scheduling and operations arrive in later
-phases.
+The agent inventories the local host's domains, assesses their replication
+health, reports that to the control-plane UI, and **runs the syncs the
+schedule names**.
 
-That is what makes it safe to install on production hypervisors before the
-rest of the control plane exists.
+What it still cannot do is act on a domain directly. It changes no
+replication role and touches no VM; the only thing it does to a hypervisor
+is run `vmsync`, which enforces its own refusals underneath — a target
+marked `promoted` or `paused` is refused no matter what any schedule says.
+
+The schedule is **typed data, never a command line**. The agent owns the
+flag vocabulary, validates every field before building anything, supplies
+SSH credentials from its own local flags, and executes with no shell — so
+there is nothing for a compromised UI to inject. The pairing comes from
+each VM's own `replica_targets` metadata rather than from anything the UI
+sends, so a UI cannot redirect a sync at a host of its choosing.
+
+Install with `--no-schedule` to keep a host reporting-only until you are
+ready for it to run syncs, or with `--standalone` to run the scheduler with
+no control plane at all.
 
 The agent **dials out and never listens**, so a hypervisor needs no inbound
 port. This matters for a DR site behind its own firewall, which is vmsync's
@@ -81,11 +90,156 @@ without touching the service.
 | `--hostname` | Name to report as. Defaults to the system hostname. |
 | `--http-timeout` | Per-request timeout. **Must exceed the UI's long-poll hold time**, or every config poll ends in a client-side timeout. Default 2m. |
 | `--once` | Report once and exit. |
+| `--standalone` | Run as a scheduler only, from this JSON file, with no control plane at all. See below. |
+| `--max-concurrent-syncs` | This host's ceiling on parallel vmsync jobs. Can only lower what the schedule asks for, never raise it. 0 (default) leaves it to the schedule. |
+| `--prometheus-dir` | When set, each scheduled sync gets `--prometheus-textfile <dir>/vmsync_<vm>.prom`. |
+
+## Logging, metrics and parallelism
+
+**Logging** goes to stderr, one line per event, via the same `pkg/trace`
+vmsync itself uses — so under systemd it lands in the journal with no file
+to rotate:
+
+```bash
+journalctl -u vmsync-agent -f
+```
+
+`--debug` adds the per-tick scheduling decisions and the full argv of every
+vmsync it runs. When a scheduled sync fails, the agent logs the exit code
+**and vmsync's own output tail**, so the journal on this host explains the
+failure without needing the UI.
+
+**Prometheus.** Pass `--prometheus-dir`; the agent then hands each run
+`--prometheus-textfile <dir>/vmsync_<vm>.prom`, one file per VM, which is
+what node_exporter's textfile collector expects:
+
+```bash
+vmsync-agent --standalone /etc/vmsync-agent/schedule.json \
+             --prometheus-dir /var/lib/node_exporter/textfile_collector
+```
+
+The agent writes nothing itself — vmsync does, exactly as it does when run
+from cron, so an existing dashboard keeps working unchanged. Nothing is
+written when the flag is unset.
+
+**Parallelism.** Each due VM runs in its own goroutine, one `vmsync`
+process each, admitted against two independent limits:
+
+| limit | set by | meaning |
+| --- | --- | --- |
+| `max_concurrent_syncs` | schedule (UI setting, or the standalone file) | jobs at once on this host. Default **4**. |
+| `--max-concurrent-syncs` | this agent | host-local **ceiling**; only lowers the above. |
+| `target_host_budget` | schedule | jobs at once *into* a given target host. |
+| hard clamp | built in | 128, whatever anything asks for -- a backstop against a mistyped value, not a recommendation. |
+
+`--max-concurrent-syncs` deliberately only lowers. How much concurrent I/O
+a hypervisor can absorb depends on its disks, its NICs and what else it is
+running — the host knows that and a control plane does not, so the UI can
+ask for less than the host allows but never more.
+
+The per-target-host budget is the one limit only a UI can compute: an agent
+cannot see that four *other* hosts are also replicating into the same
+target.
+
+A VM refused admission is not deferred — it retries on the next tick, as
+soon as a slot frees. A VM whose previous run is still going is skipped
+rather than overlapped, and runs are staggered so a fleet that all wants
+`interval_seconds: 900` does not fire on the same second.
 
 There is deliberately **no option to skip TLS verification.** The agent
 holds a credential and reports the estate's replication topology; an
 `--insecure` flag would be the first thing reached for during a certificate
 problem and the last thing anyone removed afterwards.
+
+## Standalone: a scheduler with no control plane
+
+`--standalone /path/to/schedule.json` runs the scheduler and nothing else.
+No enrolment, no credential, no reporting, no polling — the agent never
+opens a network connection to anything but the hypervisors it syncs to.
+
+This is not a reduced mode bolted on. The scheduler always ran from a cached
+configuration and always kept running while the UI was unreachable — that is
+the partition-tolerance the control plane is built on. The only thing that
+ever required a UI was the startup path, and `--standalone` skips it.
+
+What you get over a cron job: a real interval per VM, a cap on how many
+syncs run at once, a per-target-host budget so several sources cannot
+stampede one target, staggering so everything does not fire on the same
+minute, skip-if-still-running instead of overlapping runs, and each run's
+outcome in the journal. An agent installed this way can be enrolled with a
+UI later without changing anything about how it runs syncs.
+
+```bash
+vmsync-agent --standalone /etc/vmsync-agent/schedule.json
+```
+
+It cannot be combined with `--ui`, `--enrol-token`, `--ui-ca`, `--once` or
+`--no-schedule`. Those are refused rather than ignored: silently accepting
+them would leave you believing this host reports somewhere, which is exactly
+the belief that gets a host forgotten.
+
+### The file
+
+The same object the UI would otherwise send. Everything except `schedule` is
+optional.
+
+```json
+{
+  "schedule": [
+    {
+      "vm": "web01",
+      "interval_seconds": 900,
+      "enabled": true,
+      "target_host": "dr01",
+      "profile": {
+        "compress": "zstd",
+        "compress_level": "5",
+        "netbuffer": "128k,1G",
+        "io_depth": 16,
+        "verify": "online",
+        "target_disk_path": "/data/replicas"
+      }
+    }
+  ],
+  "max_concurrent_syncs": 4,
+  "target_host_budget": { "dr01": 2 }
+}
+```
+
+| field | meaning |
+| --- | --- |
+| `vm` | Source domain on **this** host. Its targets are read from its own libvirt metadata, never from this file. |
+| `interval_seconds` | How often to sync. Must be greater than 0. |
+| `enabled` | `false` keeps an entry visible while stopping it from running. |
+| `target_host` | Required only when the VM replicates to more than one target; otherwise the single target is used. |
+| `profile` | vmsync settings for this VM: `compress`, `compress_level`, `netbuffer`, `use_ssh`, `io_depth`, `verify`, `reinit_after_failures`, `target_disk_path`, `source_port_range`, `target_port_range`. Omit any of them for vmsync's default. |
+| `max_concurrent_syncs` | Cap on syncs running at once on this host. Default 4. |
+| `target_host_budget` | Cap on concurrent syncs *into* a given target host. |
+
+Note what is **not** in the file: no hostnames to replicate to, no
+credentials, no command line. The pairing comes from each VM's own
+`replica_targets` metadata, and SSH details come from the agent's own flags
+(`--ssh-user`, `--ssh-key`, …). This file says *when*, not *where* or *how
+to log in*.
+
+Parsing is strict — an unrecognised key is an error naming the key, not a
+silently ignored line. A misspelling that is quietly dropped does not look
+like a mistake, it looks like the scheduler not working.
+
+Changes take effect on restart; the file is read once at startup.
+
+```bash
+systemctl restart vmsync-agent
+```
+
+### It still says *when*, not *whether*
+
+`--standalone` schedules syncs. It does not weaken any of vmsync's own
+refusals: a target marked `promoted` or `paused` is still refused, the
+target-side run lock still excludes concurrent operations, and a role
+changed mid-sync still aborts the run before it redefines the domain. A
+schedule cannot talk vmsync into overwriting something it would otherwise
+protect.
 
 ### When you need `--ui-ca`, and when you don't
 

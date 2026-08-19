@@ -52,14 +52,20 @@ type SyncResult struct {
 }
 
 const (
-	// defaultMaxConcurrent is what the agent runs with when the UI has not
-	// said otherwise. vmsync is heavy -- NBD, compression, disk and network
-	// at once -- so the default is deliberately small.
-	defaultMaxConcurrent = 2
-	// hardMaxConcurrent clamps whatever the UI asks for. The UI is a
-	// separately-versioned program; its numbers are input to validate, not
-	// trusted state, and an accidental 500 here would thrash the host.
-	hardMaxConcurrent = 16
+	// defaultMaxConcurrent is what the agent runs with when nothing has said
+	// otherwise. vmsync is heavy -- NBD, compression, disk and network at
+	// once -- so this stays well below what a modern hypervisor could
+	// manage: a default that saturates the host is one every operator has to
+	// notice and turn down, whereas one that is merely conservative costs
+	// only a longer cycle on hosts nobody has tuned.
+	defaultMaxConcurrent = 4
+	// hardMaxConcurrent clamps whatever is asked for, from any source. It is
+	// a backstop against a nonsense value -- a mistyped 5000, or a UI of a
+	// different vintage -- not a recommendation: a host that genuinely wants
+	// this many parallel syncs is unusual, and the number it should actually
+	// run is a property of its disks and NICs, set deliberately with
+	// -max-concurrent-syncs rather than arrived at by hitting this ceiling.
+	hardMaxConcurrent = 128
 	// logTailBytes bounds what is kept from a run's output.
 	logTailBytes = 4000
 	// resultsKept is how many recent outcomes ride along in reports.
@@ -238,14 +244,38 @@ func (s *Scheduler) deferEntry(entry ScheduleEntry, now time.Time) {
 }
 
 // admit applies both concurrency limits, taking a slot if it succeeds.
-func (s *Scheduler) admit(vm, targetHost string, cfg UIConfig) bool {
-	max := cfg.MaxConcurrentSyncs
+// effectiveMaxConcurrent resolves how many syncs may run at once here.
+//
+// Three inputs, and the order between them is the point:
+//
+//   - fromConfig is what the schedule asks for (the UI's estate-wide
+//     setting, or max_concurrent_syncs in a standalone file). Zero means it
+//     expressed no opinion.
+//   - hostLimit is -max-concurrent-syncs on this agent. It is a CEILING,
+//     never a floor: it can only lower the number, never raise it. How much
+//     concurrent I/O a hypervisor can absorb is a property of that machine
+//     -- its disks, its NICs, what else it is running -- and the host is the
+//     only party that knows it. A UI must be able to ask for less than the
+//     host allows, and must never be able to ask for more.
+//   - hardMaxConcurrent clamps everything, because the UI is a separately
+//     versioned program whose answers are input to validate rather than
+//     trusted state.
+func effectiveMaxConcurrent(fromConfig, hostLimit int) int {
+	max := fromConfig
 	if max <= 0 {
 		max = defaultMaxConcurrent
 	}
 	if max > hardMaxConcurrent {
 		max = hardMaxConcurrent
 	}
+	if hostLimit > 0 && max > hostLimit {
+		max = hostLimit
+	}
+	return max
+}
+
+func (s *Scheduler) admit(vm, targetHost string, cfg UIConfig) bool {
+	max := effectiveMaxConcurrent(cfg.MaxConcurrentSyncs, s.cfg.MaxConcurrentSyncs)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -407,6 +437,15 @@ func (s *Scheduler) runOne(ctx context.Context, entry ScheduleEntry, plan syncPl
 		res.Error = err.Error()
 		trace.Error("scheduled sync failed", "vm", entry.VM, "target", plan.targetHost,
 			"exit_code", res.ExitCode, "duration_s", res.DurationSecs, "error", err)
+		// vmsync's own output goes to the host's log too, not only into the
+		// report. "exit status 1" on its own says nothing about what went
+		// wrong, and the journal on this host is where anyone looks first --
+		// before the UI, and in standalone mode instead of it, since there
+		// is no report for the tail to travel in and it would otherwise be
+		// captured into a buffer and dropped on the floor.
+		if out := strings.TrimSpace(res.LogTail); out != "" {
+			trace.Error("scheduled sync output", "vm", entry.VM, "output", out)
+		}
 	} else {
 		trace.Info("scheduled sync finished", "vm", entry.VM, "target", plan.targetHost, "duration_s", res.DurationSecs)
 	}
