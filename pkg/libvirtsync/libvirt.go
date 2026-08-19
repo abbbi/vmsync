@@ -103,6 +103,21 @@ const (
 	// between a failover with no data loss and one with an unbounded
 	// window, so it is recorded rather than inferred.
 	MetadataFieldPromotionMode = "promotion_mode"
+
+	// MetadataFieldCheckpointAt is when the checkpoint the replica's
+	// contents correspond to was created -- the START of the copy that
+	// produced them, not its end.
+	//
+	// last_sync_timestamp records when the copy FINISHED, which is the wrong
+	// instant to measure a failover's data loss from: everything the guest
+	// wrote from the checkpoint onward belongs to the NEXT checkpoint, so
+	// the replica is frozen at that earlier moment. Measuring from the end
+	// understates the loss by the whole copy duration -- minutes for a small
+	// delta, hours for a full sync over a WAN, and wrong in the unsafe
+	// direction exactly when the gap is widest. Absent on a target last
+	// written by an older vmsync, which pkg/failover then reports as a lower
+	// bound rather than as a precise figure.
+	MetadataFieldCheckpointAt = "checkpoint_at"
 )
 
 // Replication roles, as stored in MetadataFieldReplicationRole. An empty or
@@ -152,6 +167,7 @@ var metadataFieldOrder = []string{
 	MetadataFieldPromotedBy,
 	MetadataFieldPromotedFrom,
 	MetadataFieldPromotionMode,
+	MetadataFieldCheckpointAt,
 }
 
 var vmsyncBlockRe = regexp.MustCompile(`(?s)<vmsync:vmsync[^>]*>.*?</vmsync:vmsync>`)
@@ -870,12 +886,13 @@ func SetMetadataFields(domainXML string, updates map[string]string, removeFields
 // sync; empty means the target had no role, and the field is then removed
 // rather than inherited, preserving the property that vmsync never assigns
 // a role on its own.
-func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetRole string) (string, error) {
+func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetRole string, checkpointAtUnix int64) (string, error) {
 	updates := map[string]string{
 		MetadataFieldLastCheckpoint: checkpoint,
 		MetadataFieldLastSync:       strconv.FormatInt(time.Now().Unix(), 10),
 		MetadataFieldFailureCount:   "0",
 		MetadataFieldReplicaSource:  ReplicaEntry(sourceHost, sourceDomain),
+		MetadataFieldCheckpointAt:   strconv.FormatInt(checkpointAtUnix, 10),
 	}
 	remove := []string{
 		MetadataFieldReplicaTargets,

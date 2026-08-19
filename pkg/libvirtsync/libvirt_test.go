@@ -741,7 +741,7 @@ func TestAllMetadataFieldsNoBlock(t *testing.T) {
 func TestUpdateSyncMetadata(t *testing.T) {
 	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
 	before := time.Now().Unix()
-	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "source-host.example.org", "sourcevm", "")
+	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "source-host.example.org", "sourcevm", "", 1700000000)
 	after := time.Now().Unix()
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
@@ -804,7 +804,7 @@ func TestUpdateSyncMetadataDoesNotInheritSourceSideFields(t *testing.T) {
 		t.Fatalf("building source xml: %v", err)
 	}
 
-	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", "")
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", "", 1700000000)
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
@@ -841,7 +841,7 @@ func TestUpdateSyncMetadataPreservesTheTargetsOwnRole(t *testing.T) {
 		t.Fatalf("building source xml: %v", err)
 	}
 
-	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", RoleTarget)
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", RoleTarget, 1700000000)
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
