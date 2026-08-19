@@ -93,6 +93,12 @@ type agentConfig struct {
 	// at any point. Mutually exclusive with -ui and everything that only
 	// means something alongside one.
 	StandaloneFile string
+
+	// metrics is this agent's own metric state, carried here so the
+	// scheduler and both run paths reach the same instance without a
+	// package-level variable. Nil when -prometheus-dir is unset, and every
+	// method on it is nil-guarded, so no use site needs to branch.
+	metrics *agentMetrics
 }
 
 func main() {

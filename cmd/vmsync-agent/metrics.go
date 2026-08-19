@@ -367,9 +367,18 @@ func scanDomainStatus(cfg agentConfig) (int, map[string]int, error) {
 		return 0, nil, err
 	}
 	byStatus := map[string]int{}
+	now := time.Now()
 	for _, d := range domains {
-		st := inventory.Assess(d, time.Now(), 0)
-		byStatus[string(st.Status)]++
+		// .String(), not a string() conversion: inventory.Status is an int
+		// enum, so converting it would compile and silently yield a one-rune
+		// control character as the label value.
+		//
+		// cadence 0 means "no expected interval", which is right here: the
+		// cadences the UI distributes are for judging whether a TARGET is
+		// behind, and in standalone mode there is no estate-wide view to
+		// draw them from. Freshness is then simply not judged, rather than
+		// judged against a number invented locally.
+		byStatus[inventory.Assess(d, now, 0).Status.String()]++
 	}
 	return len(domains), byStatus, nil
 }
