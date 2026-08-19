@@ -118,9 +118,45 @@ vmsync-agent --standalone /etc/vmsync-agent/schedule.json \
              --prometheus-dir /var/lib/node_exporter/textfile_collector
 ```
 
-The agent writes nothing itself — vmsync does, exactly as it does when run
-from cron, so an existing dashboard keeps working unchanged. Nothing is
-written when the flag is unset.
+The agent also writes **its own** file, `vmsync-agent.prom`, describing the
+scheduler rather than any one sync. (Hyphenated so a domain named `agent`
+cannot collide with it.)
+
+| metric | why |
+| --- | --- |
+| `vmsync_agent_scheduled_vms` | VMs configured here, and `_disabled` for entries present but not runnable. |
+| `vmsync_agent_skipped_runs_total{reason}` | Due syncs that did not start: `host_concurrency`, `target_budget`, `already_running`, `invalid_profile`, `no_target`. |
+| `vmsync_agent_ui_last_contact_timestamp_seconds` | Last successful exchange with the UI. 0 when there has never been one. |
+| `vmsync_agent_config_age_seconds` | Age of the schedule actually in force. −1 if never fetched. |
+| `vmsync_agent_syncs_running` / `_max_concurrent_syncs` | Current parallelism against the effective ceiling. |
+| `vmsync_agent_sync_runs_total{result}` | Runs finished, success and failure. |
+| `vmsync_agent_last_attempt_timestamp_seconds{vm}` | When a sync was last *started* for each VM. |
+| `vmsync_agent_next_run_timestamp_seconds{vm}` | When each VM is next due. |
+| `vmsync_agent_domains_total` / `_domains{status}` | Host inventory by assessed status. |
+| `vmsync_agent_build_info{version}`, `_start_timestamp_seconds`, `_standalone` | Version, restart detection, whether a control plane is involved. |
+
+These exist because the per-VM files cannot answer *"is anything actually
+replicating?"*. A VM whose profile never validates, or that never wins a
+concurrency slot, never runs vmsync at all — so it never writes a per-VM
+file that could go stale and reveal it. The gap between
+`next_run_timestamp` and `last_attempt_timestamp`, and any movement in
+`skipped_runs_total`, is where that shows up.
+
+Two subtleties worth knowing when alerting on them. Every `reason` series
+exists from the first write at zero, so `increase()` over a window works
+from the start rather than only after the first occurrence. And
+`already_running` counts a slot the interval said a VM should have had —
+not one tick of a long sync — so a sync that takes longer than its interval
+increments it once per missed slot, which is the number you want.
+
+`ui_last_contact` and `config_age` are emitted in standalone mode too, as
+explicit zeros: a missing series and a UI that has never answered look
+identical to a query, and one is a design choice while the other is an
+outage.
+
+The agent writes nothing per-VM itself — vmsync does, exactly as it does
+when run from cron, so an existing dashboard keeps working unchanged.
+Nothing at all is written when the flag is unset.
 
 **Parallelism.** Each due VM runs in its own goroutine, one `vmsync`
 process each, admitted against two independent limits:

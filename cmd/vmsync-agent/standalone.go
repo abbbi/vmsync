@@ -86,6 +86,11 @@ func runStandalone(cfg agentConfig) error {
 
 	var wg sync.WaitGroup
 	sched := NewScheduler(cfg, state)
+	if cfg.metrics != nil {
+		wg.Add(1)
+		// scanInventory true: there is no reportLoop here to do it.
+		go func() { defer wg.Done(); metricsLoop(ctx, cfg, state, sched, cfg.metrics, true) }()
+	}
 	wg.Add(1)
 	go func() { defer wg.Done(); sched.Run(ctx) }()
 	wg.Wait()

@@ -170,6 +170,9 @@ func main() {
 		cfg.Hostname = h
 	}
 	trace.SetDebug(cfg.Debug)
+	if cfg.PrometheusDir != "" {
+		cfg.metrics = newAgentMetrics(version.Version, cfg.Hostname, cfg.StandaloneFile != "")
+	}
 
 	runner := run
 	if cfg.StandaloneFile != "" {
@@ -240,9 +243,17 @@ func run(cfg agentConfig) error {
 		trace.Info("scheduling disabled by -no-schedule; this agent will report and nothing else")
 	}
 
+	if cfg.metrics != nil {
+		wg.Add(1)
+		// scanInventory false: reportLoop already scans on its own
+		// interval and feeds the counts in, so doing it here too would
+		// double the libvirt work for the same numbers.
+		go func() { defer wg.Done(); metricsLoop(ctx, cfg, state, sched, cfg.metrics, false) }()
+	}
+
 	wg.Add(2)
 	go func() { defer wg.Done(); reportLoop(ctx, client, cfg, state, sched) }()
-	go func() { defer wg.Done(); pollLoop(ctx, client, store, state) }()
+	go func() { defer wg.Done(); pollLoop(ctx, client, store, state, cfg.metrics) }()
 	wg.Wait()
 	return nil
 }
@@ -332,9 +343,12 @@ func reportLoop(ctx context.Context, client *Client, cfg agentConfig, state *sha
 				trace.Error("the UI rejected this agent's credential; reporting will keep failing until it is enrolled again", "error", err)
 			} else {
 				trace.Warning("could not send report to the UI; will retry", "error", err)
+				cfg.metrics.uiFailed()
 			}
 		} else {
 			trace.Debug("reported", "domains", len(report.Domains))
+			cfg.metrics.uiContacted(time.Now())
+			cfg.metrics.setDomains(len(report.Domains), statusCounts(report.Domains))
 		}
 
 		interval := time.Duration(cached.Config.ReportIntervalSeconds) * time.Second
@@ -346,7 +360,7 @@ func reportLoop(ctx context.Context, client *Client, cfg agentConfig, state *sha
 	}
 }
 
-func pollLoop(ctx context.Context, client *Client, store Store, state *sharedState) {
+func pollLoop(ctx context.Context, client *Client, store Store, state *sharedState, m *agentMetrics) {
 	// Backoff applies only to failures. A successful poll returns
 	// immediately into the next one, which is what makes long-polling feel
 	// instant to an operator.
@@ -365,6 +379,10 @@ func pollLoop(ctx context.Context, client *Client, store Store, state *sharedSta
 		case ctx.Err() != nil:
 			return
 		case errors.Is(err, ErrUnchanged):
+			// A 304 IS a successful exchange: the UI answered, it simply
+			// had nothing new to say. Counting only changed configs would
+			// make a healthy, stable estate look like an unreachable one.
+			m.uiContacted(time.Now())
 			// Nothing changed within the hold; refresh the confirmation
 			// timestamp so the UI can still see this agent is current.
 			cached.FetchedAtUnix = time.Now().Unix()
@@ -379,6 +397,7 @@ func pollLoop(ctx context.Context, client *Client, store Store, state *sharedSta
 				trace.Error("the UI rejected this agent's credential", "error", err)
 			} else {
 				trace.Warning("could not poll the UI for configuration; continuing on the cached one", "error", err, "retry_in", backoff.String())
+				m.uiFailed()
 			}
 			select {
 			case <-ctx.Done():
@@ -399,6 +418,7 @@ func pollLoop(ctx context.Context, client *Client, store Store, state *sharedSta
 			// has to be visible.
 			trace.Warning("new configuration could not be cached to disk; it will be lost on restart", "error", err)
 		}
+		m.uiContacted(time.Now())
 		trace.Info("configuration updated from the UI", "report_interval_s", cfg.ReportIntervalSeconds, "poll_wait_s", cfg.PollWaitSeconds, "cadences", len(cfg.CadenceSeconds))
 		backoff = minBackoff
 	}

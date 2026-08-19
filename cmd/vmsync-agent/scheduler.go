@@ -90,6 +90,7 @@ type Scheduler struct {
 	nextRun  map[string]time.Time
 	inFlight map[string]bool // by VM
 	hostLoad map[string]int  // concurrent syncs INTO each target host
+	metrics  *agentMetrics   // nil is safe: every call is nil-guarded
 	results  []SyncResult
 }
 
@@ -100,6 +101,7 @@ func NewScheduler(cfg agentConfig, state *sharedState) *Scheduler {
 		nextRun:  map[string]time.Time{},
 		inFlight: map[string]bool{},
 		hostLoad: map[string]int{},
+		metrics:  cfg.metrics,
 	}
 }
 
@@ -153,7 +155,18 @@ func (s *Scheduler) launchDue(ctx context.Context, wg *sync.WaitGroup) {
 		if !entry.Enabled || entry.IntervalSeconds <= 0 || entry.VM == "" {
 			continue
 		}
+		// Dueness first, then busy-ness. The order matters for the metric:
+		// asking "is it running" every tick would count one long sync as
+		// hundreds of missed schedules, when what is worth counting is a
+		// slot its interval said it should have had.
 		if !s.due(entry, now) {
+			continue
+		}
+		if s.isRunning(entry.VM) {
+			// Its previous run has not finished. Counted separately from a
+			// concurrency refusal: this one means the interval is shorter
+			// than the sync takes, which no amount of extra capacity fixes.
+			s.metrics.skip(skipAlreadyRunning)
 			continue
 		}
 		if err := entry.Profile.Validate(); err != nil {
@@ -161,6 +174,7 @@ func (s *Scheduler) launchDue(ctx context.Context, wg *sync.WaitGroup) {
 			// rest of the schedule, and the message names the field so it
 			// can be fixed in the UI.
 			trace.Error("refusing to run a scheduled sync with an invalid profile", "vm", entry.VM, "error", err)
+			s.metrics.skip(skipInvalidProfile)
 			s.deferEntry(entry, now)
 			continue
 		}
@@ -168,6 +182,7 @@ func (s *Scheduler) launchDue(ctx context.Context, wg *sync.WaitGroup) {
 		req, err := s.buildRequest(entry)
 		if err != nil {
 			trace.Error("could not prepare a scheduled sync", "vm", entry.VM, "error", err)
+			s.metrics.skip(skipNoTarget)
 			s.deferEntry(entry, now)
 			continue
 		}
@@ -195,12 +210,13 @@ func (s *Scheduler) launchDue(ctx context.Context, wg *sync.WaitGroup) {
 // would still bunch every VM's sync into the same minute forever after. The
 // offset is derived from the VM name, so it is stable across restarts and a
 // given VM keeps its slot.
+// Deliberately says nothing about whether the VM is currently syncing:
+// launchDue checks that separately, immediately after, so a busy VM can be
+// counted as a missed slot rather than silently conflated with one that is
+// simply not due yet.
 func (s *Scheduler) due(entry ScheduleEntry, now time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.inFlight[entry.VM] {
-		return false
-	}
 	next, known := s.nextRun[entry.VM]
 	if !known {
 		interval := time.Duration(entry.IntervalSeconds) * time.Second
@@ -208,6 +224,25 @@ func (s *Scheduler) due(entry ScheduleEntry, now time.Time) bool {
 		return false
 	}
 	return !now.Before(next)
+}
+
+// isRunning reports whether this VM's previous run is still going.
+func (s *Scheduler) isRunning(vm string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inFlight[vm]
+}
+
+// metricsSnapshot returns what the metrics writer needs, taken under one
+// lock so the running count and the due times cannot disagree.
+func (s *Scheduler) metricsSnapshot() (running int, nextRun map[string]int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nextRun = make(map[string]int64, len(s.nextRun))
+	for vm, t := range s.nextRun {
+		nextRun[vm] = t.Unix()
+	}
+	return len(s.inFlight), nextRun
 }
 
 // stagger spreads first runs across the interval, deterministically per VM.
@@ -280,12 +315,14 @@ func (s *Scheduler) admit(vm, targetHost string, cfg UIConfig) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.inFlight) >= max {
+		s.metrics.skip(skipHostConcurrency)
 		return false
 	}
 	// The per-target-host budget is the limit only the UI can compute: this
 	// agent cannot see that other hosts are also writing to targetHost.
 	if budget, ok := cfg.TargetHostBudget[targetHost]; ok && budget > 0 {
 		if s.hostLoad[targetHost] >= budget {
+			s.metrics.skip(skipTargetBudget)
 			return false
 		}
 	}
@@ -417,6 +454,8 @@ func (s *Scheduler) runOne(ctx context.Context, entry ScheduleEntry, plan syncPl
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 60 * time.Second
 
+	s.metrics.runStarted(entry.VM, started)
+
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -449,6 +488,7 @@ func (s *Scheduler) runOne(ctx context.Context, entry ScheduleEntry, plan syncPl
 	} else {
 		trace.Info("scheduled sync finished", "vm", entry.VM, "target", plan.targetHost, "duration_s", res.DurationSecs)
 	}
+	s.metrics.runFinished(err == nil)
 	s.record(res)
 }
 
