@@ -295,10 +295,14 @@ func TestStartLocalRelaysBytesRoundTripOverSSH(t *testing.T) {
 			// channel conn reaching CountingWriter through a different
 			// io.Copy path is exactly the sort of difference that could
 			// silently zero these out.
-			if got := counters.SentSnapshot(); got == 0 {
+			// Bounded wait rather than an immediate read, for the reason
+			// waitForCounter's own comment sets out: the counter moves
+			// after the write it counts has already returned, so the
+			// payload arriving back proves nothing about it yet.
+			if !waitForCounter(counters.SentSnapshot) {
 				t.Error("ByteCounters.Sent stayed 0 despite relaying real traffic over ssh")
 			}
-			if got := counters.ReceivedSnapshot(); got == 0 {
+			if !waitForCounter(counters.ReceivedSnapshot) {
 				t.Error("ByteCounters.Received stayed 0 despite relaying real traffic over ssh")
 			}
 

@@ -181,6 +181,45 @@ func bridgeConfigCombos(netBufferSize string) []struct {
 // StartLocal: relayConnection only ever dereferences sshClient when
 // cfg.UseSSH is true, so this is a safe, SSH-free way to exercise the real
 // TCP relay end to end over loopback.
+// waitForCounter waits, briefly, for a byte counter to become non-zero.
+//
+// The payload arriving back at the test does NOT imply the counter has been
+// updated yet, and assuming it does is what made this test flaky on CI.
+// CountingWriter increments AFTER the underlying write returns:
+//
+//	n, err := c.W.Write(p)   // bytes are in the socket buffer from here
+//	atomic.AddUint64(...)    // ...but the counter only moves here
+//
+// Everything in between -- the fake remote echoing, the inbound relay
+// decoding and writing back, this test's ReadFull returning -- can complete
+// inside that gap, all on loopback, if the outbound goroutine happens to be
+// descheduled right after the write syscall. A loaded CI runner with few
+// cores makes that ordinary rather than exotic.
+//
+// It shows up only in the uncompressed, unbuffered combination because that
+// is the one where the whole payload moves in a single counted Write, so
+// there is exactly one increment and it is the one being raced. Compression
+// and buffering both produce several writes, and an earlier one has already
+// made the counter non-zero.
+//
+// Counting after the write is the correct production semantic -- counting
+// before would report bytes that failed to send -- so the fix belongs here:
+// wait for the value instead of assuming a happens-before edge that does
+// not exist. Bounded so a genuinely broken counter still fails the test
+// rather than hanging it.
+func waitForCounter(snapshot func() uint64) bool {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if snapshot() > 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestStartLocalRelaysBytesRoundTrip(t *testing.T) {
 	for _, tt := range bridgeConfigCombos("1M") {
 		t.Run(tt.name, func(t *testing.T) {
@@ -226,10 +265,10 @@ func TestStartLocalRelaysBytesRoundTrip(t *testing.T) {
 				t.Fatal(relayErr)
 			}
 
-			if got := counters.SentSnapshot(); got == 0 {
+			if !waitForCounter(counters.SentSnapshot) {
 				t.Error("ByteCounters.Sent stayed 0 despite relaying real traffic")
 			}
-			if got := counters.ReceivedSnapshot(); got == 0 {
+			if !waitForCounter(counters.ReceivedSnapshot) {
 				t.Error("ByteCounters.Received stayed 0 despite relaying real traffic")
 			}
 

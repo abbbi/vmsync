@@ -146,18 +146,26 @@ func Relay(dst io.Writer, src io.Reader, compress bool, algo Algo, level string,
 		// *chanConn wrapping an ssh.Channel, whose method set has no WriteTo
 		// at all, so io.Copy runs its plain loop there regardless.
 		//
-		// The Sent == 0 observation that prompted the wrap was real, but its
-		// cause was never identified and is not this. Rather than keep code
-		// whose only justification is an explanation that doesn't survive
-		// checking, the wrap is gone and the invariant is pinned by tests
-		// instead: TestRelayCountsWireBytesOverRealTCPConn (tests/) asserts
-		// the counter equals the payload length exactly, with a genuine
+		// The Sent == 0 observation that prompted the wrap was real, and its
+		// cause has since been found: it was never a bypass here at all,
+		// but a race in the test that observed it. CountingWriter
+		// increments AFTER the write it counts has returned, so a test that
+		// reads the counter the instant its payload round-trips has no
+		// happens-before edge to rely on -- and the uncompressed,
+		// unbuffered path moves the whole payload in a single counted
+		// Write, so that one increment is the only one there is to race.
+		// Fixed in the tests (see waitForCounter in pkg/nbdbridge), which
+		// is where it belonged: counting after a successful write is the
+		// correct semantic, since counting before would report bytes that
+		// never reached the wire.
+		//
+		// The invariant is pinned by tests rather than by the wrap:
+		// TestRelayCountsWireBytesOverRealTCPConn (tests/) asserts the
+		// counter equals the payload length exactly, with a genuine
 		// *net.TCPConn as src so the WriterTo path is really taken, and
 		// TestStartLocalRelaysBytesRoundTrip plus its SSH counterpart in
 		// pkg/nbdbridge assert non-zero counters across every compress and
-		// netbuffer combination on both transports. If counting ever breaks
-		// again, those fail and the real cause can be found with evidence
-		// instead of re-guessed.
+		// netbuffer combination on both transports.
 		//
 		// Leaving src unwrapped also keeps io.Copy free to reach
 		// dst.ReadFrom -> net.spliceFrom when effectiveDst is a raw
