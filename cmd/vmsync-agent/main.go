@@ -47,6 +47,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -82,6 +83,16 @@ type agentConfig struct {
 	SSHPort          int
 	SSHKnownHosts    string
 	NoSchedule       bool
+	// MaxConcurrentSyncs is this host's own ceiling on parallel syncs. See
+	// effectiveMaxConcurrent: it can only lower what the schedule asks for,
+	// never raise it, because how much concurrent I/O this machine can
+	// absorb is something only this machine knows.
+	MaxConcurrentSyncs int
+	// StandaloneFile, when set, makes this a scheduler and nothing else:
+	// the schedule is read from that path and no control plane is involved
+	// at any point. Mutually exclusive with -ui and everything that only
+	// means something alongside one.
+	StandaloneFile string
 }
 
 func main() {
@@ -101,6 +112,8 @@ func main() {
 	flag.StringVar(&cfg.SSHKey, "ssh-key", "", "SSH private key for reaching target hosts, passed through to vmsync")
 	flag.IntVar(&cfg.SSHPort, "ssh-port", 0, "SSH port for reaching target hosts (0 leaves vmsync's own default)")
 	flag.StringVar(&cfg.SSHKnownHosts, "ssh-known-hosts", "", "known_hosts file passed through to vmsync")
+	flag.IntVar(&cfg.MaxConcurrentSyncs, "max-concurrent-syncs", 0, "Ceiling on vmsync jobs running at once on this host. 0 leaves it to the schedule (the UI's setting, or max_concurrent_syncs in a --standalone file), which defaults to 2. This flag can only LOWER that number, never raise it: how much concurrent I/O this hypervisor can absorb is its own business, not the control plane's")
+	flag.StringVar(&cfg.StandaloneFile, "standalone", "", "Run as a scheduler only, from this JSON file, with no control plane: no enrolment, no credential, no reporting and no polling. The file holds the same object the UI would otherwise send (see the agent README). Cannot be combined with -ui")
 	flag.BoolVar(&cfg.NoSchedule, "no-schedule", false, "Report only; ignore any schedule the UI sends. Turns this back into a phase-1 read-only agent, which is the safe way to install it on a host before you are ready for it to run syncs")
 	flag.BoolVar(&cfg.Once, "once", false, "Report once and exit, instead of running as a daemon. For verifying a new install")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
@@ -118,8 +131,34 @@ func main() {
 		trace.Error("invalid command line", "error", fmt.Errorf("unexpected extra argument(s) %v", flag.Args()))
 		os.Exit(2)
 	}
-	if cfg.UIBase == "" {
-		trace.Error("invalid configuration", "error", errors.New("-ui is required"))
+	// -standalone replaces the control plane rather than supplementing it,
+	// so every flag that only means something in relation to a UI is
+	// refused alongside it. Accepting and ignoring them would leave an
+	// operator believing this agent reports somewhere, which is exactly the
+	// belief that gets a host forgotten.
+	if cfg.StandaloneFile != "" {
+		var conflicts []string
+		if cfg.UIBase != "" {
+			conflicts = append(conflicts, "-ui")
+		}
+		if cfg.EnrolToken != "" {
+			conflicts = append(conflicts, "-enrol-token")
+		}
+		if cfg.CAFile != "" {
+			conflicts = append(conflicts, "-ui-ca")
+		}
+		if cfg.Once {
+			conflicts = append(conflicts, "-once")
+		}
+		if cfg.NoSchedule {
+			conflicts = append(conflicts, "-no-schedule")
+		}
+		if len(conflicts) > 0 {
+			trace.Error("invalid configuration", "error", fmt.Errorf("-standalone cannot be combined with %s: it runs the scheduler from a local file with no control plane at all", strings.Join(conflicts, ", ")))
+			os.Exit(2)
+		}
+	} else if cfg.UIBase == "" {
+		trace.Error("invalid configuration", "error", errors.New("-ui is required (or -standalone to schedule from a local file with no control plane)"))
 		os.Exit(2)
 	}
 	if cfg.Hostname == "" {
@@ -132,7 +171,11 @@ func main() {
 	}
 	trace.SetDebug(cfg.Debug)
 
-	if err := run(cfg); err != nil {
+	runner := run
+	if cfg.StandaloneFile != "" {
+		runner = runStandalone
+	}
+	if err := runner(cfg); err != nil {
 		trace.Error("agent stopped", "error", err)
 		os.Exit(1)
 	}
