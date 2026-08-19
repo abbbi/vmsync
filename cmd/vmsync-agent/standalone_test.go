@@ -149,7 +149,11 @@ func TestValidateStandaloneConfig(t *testing.T) {
 				{VM: "web01", IntervalSeconds: 900,
 					Profile: SyncProfile{Compress: "gzip"}},
 			}},
-			"compression",
+			// The JSON field name, which is what SyncProfile.Validate uses
+			// and what the operator is looking at in the file. Naming the
+			// concept instead ("compression") would read well and match
+			// nothing.
+			`compress "gzip"`,
 		},
 		{
 			"bad verify mode",
@@ -157,7 +161,7 @@ func TestValidateStandaloneConfig(t *testing.T) {
 				{VM: "web01", IntervalSeconds: 900,
 					Profile: SyncProfile{Verify: "vigorously"}},
 			}},
-			"verification",
+			`verify "vigorously"`,
 		},
 		{
 			"negative budget",
