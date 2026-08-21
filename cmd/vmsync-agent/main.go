@@ -509,10 +509,52 @@ func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler, ledger 
 			FailureCount:   d.FailureCount,
 			ReplicaSource:  d.ReplicaSource,
 			ReplicaTargets: d.ReplicaTargets,
+			PromotedFrom:   d.PromotedFrom,
+			PromotedAtUnix: d.PromotedAtUnix,
+			PromotedBy:     d.PromotedBy,
+			PromotionMode:  d.PromotionMode,
+			Disks:          reportDisks(d.Disks),
 			Status:         a.Status.String(),
 			Reasons:        a.Reasons,
 			AgeSeconds:     a.AgeSeconds,
 		})
 	}
+	report.Filesystems = reportFilesystems(inventory.FilesystemsFor(domains))
 	return report, nil
+}
+
+// reportDisks and reportFilesystems convert pkg/inventory's types to the
+// wire ones. Written out rather than reusing inventory's structs directly
+// for the same reason ReportDomain is: the wire format changes only when
+// the protocol does, not when an internal struct is refactored.
+func reportDisks(in []inventory.DiskInfo) []ReportDisk {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]ReportDisk, 0, len(in))
+	for _, d := range in {
+		out = append(out, ReportDisk{
+			Path:           d.Path,
+			ApparentBytes:  d.ApparentBytes,
+			AllocatedBytes: d.AllocatedBytes,
+			Missing:        d.Missing,
+		})
+	}
+	return out
+}
+
+func reportFilesystems(in []inventory.Filesystem) []ReportFilesystem {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]ReportFilesystem, 0, len(in))
+	for _, f := range in {
+		out = append(out, ReportFilesystem{
+			Path:       f.Path,
+			TotalBytes: f.TotalBytes,
+			FreeBytes:  f.FreeBytes,
+			UsedBytes:  f.UsedBytes,
+		})
+	}
+	return out
 }

@@ -165,6 +165,9 @@ type Report struct {
 	// hundred bytes a minute and removes that failure entirely, with no new
 	// endpoint on either side.
 	OperationResults []OperationResult `json:"operation_results,omitempty"`
+	// Filesystems is the storage behind the disks above, one entry per
+	// distinct directory.
+	Filesystems []ReportFilesystem `json:"filesystems,omitempty"`
 }
 
 // ReportDomain is one domain's state as the agent found it. Defined here
@@ -181,9 +184,22 @@ type ReportDomain struct {
 	FailureCount   int      `json:"failure_count"`
 	ReplicaSource  string   `json:"replica_source,omitempty"`
 	ReplicaTargets []string `json:"replica_targets,omitempty"`
-	Status         string   `json:"status"`
-	Reasons        []string `json:"reasons,omitempty"`
-	AgeSeconds     int64    `json:"age_seconds"`
+	// The promotion record, present only on a domain failed over TO.
+	// PromotedFrom identifies which source a promotion displaced, which is
+	// what lets the control plane work out who must not keep running
+	// alongside it.
+	PromotedFrom   string `json:"promoted_from,omitempty"`
+	PromotedAtUnix int64  `json:"promoted_at_unix,omitempty"`
+	PromotedBy     string `json:"promoted_by,omitempty"`
+	PromotionMode  string `json:"promotion_mode,omitempty"`
+	// Disks is what this domain occupies on this host's storage: the
+	// allocated figure, not the apparent one, because that is what a copy
+	// actually costs. Paired with Report.Filesystems it answers "is there
+	// room to keep the old copy?" before an inversion rather than after.
+	Disks      []ReportDisk `json:"disks,omitempty"`
+	Status     string       `json:"status"`
+	Reasons    []string     `json:"reasons,omitempty"`
+	AgeSeconds int64        `json:"age_seconds"`
 }
 
 // SendReport uploads an inventory report.
@@ -274,4 +290,24 @@ func (c *Client) do(ctx context.Context, method, u, token string, payload any, h
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, fmt.Errorf("%s %s: %s: %s", method, u, resp.Status, strings.TrimSpace(string(detail)))
 	}
+}
+
+// ReportDisk mirrors pkg/inventory.DiskInfo on the wire.
+type ReportDisk struct {
+	Path           string `json:"path"`
+	ApparentBytes  int64  `json:"apparent_bytes"`
+	AllocatedBytes int64  `json:"allocated_bytes"`
+	Missing        bool   `json:"missing,omitempty"`
+}
+
+// ReportFilesystem mirrors pkg/inventory.Filesystem on the wire.
+//
+// One entry per distinct directory holding a VM's disks, not per host: a
+// hypervisor commonly spreads VMs across several pools, and "the host has
+// 2 TB free" is useless when the VM being inverted lives on the full one.
+type ReportFilesystem struct {
+	Path       string `json:"path"`
+	TotalBytes int64  `json:"total_bytes"`
+	FreeBytes  int64  `json:"free_bytes"`
+	UsedBytes  int64  `json:"used_bytes"`
 }

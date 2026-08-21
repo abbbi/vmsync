@@ -37,6 +37,7 @@ import (
 	"strings"
 	"time"
 
+	"vmsync/pkg/disk"
 	"vmsync/pkg/libvirtsync"
 
 	"libvirt.org/go/libvirt"
@@ -69,6 +70,21 @@ type Domain struct {
 	// has ever been replicated to.
 	ReplicaSource  string   `json:"replica_source,omitempty"`
 	ReplicaTargets []string `json:"replica_targets,omitempty"`
+
+	// The promotion record, present only on a domain that was failed over
+	// to. PromotedFrom is the "host:domain" it was promoted away from, and
+	// it is load-bearing rather than decorative: it is what identifies WHICH
+	// source a promotion displaced, and therefore which one must not keep
+	// running alongside it.
+	PromotedFrom   string `json:"promoted_from,omitempty"`
+	PromotedAtUnix int64  `json:"promoted_at_unix,omitempty"`
+	PromotedBy     string `json:"promoted_by,omitempty"`
+	PromotionMode  string `json:"promotion_mode,omitempty"`
+
+	// Disks is what this domain occupies on this host's storage. Reported
+	// so an operator can answer "is there room to keep the old copy?"
+	// before an inversion, rather than after the disk fills.
+	Disks []DiskInfo `json:"disks,omitempty"`
 }
 
 // IsTarget reports whether this domain is the receiving side of a pair.
@@ -299,9 +315,34 @@ func describe(dom *libvirt.Domain) (Domain, error) {
 		return d, nil
 	}
 
+	// RootSource, not Source: a domain sitting on an external snapshot has
+	// its live Source pointing at an overlay, while the file that actually
+	// holds the data -- and that a replica is named after -- is the base of
+	// the chain. Sizing the overlay would report a few megabytes for a
+	// hundred-gigabyte VM.
+	if disks, derr := disk.ParseQcowDisks(xml); derr == nil {
+		paths := make([]string, 0, len(disks))
+		for _, qd := range disks {
+			p := qd.RootSource
+			if p == "" {
+				p = qd.Source
+			}
+			paths = append(paths, p)
+		}
+		d.Disks = inspectDisks(paths)
+	}
+
 	d.Role, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldReplicationRole)
 	d.LastCheckpoint, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldLastCheckpoint)
 	d.ReplicaSource, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldReplicaSource)
+	d.PromotedFrom, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldPromotedFrom)
+	d.PromotedBy, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldPromotedBy)
+	d.PromotionMode, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldPromotionMode)
+	if raw, err := libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldPromotedAt); err == nil && raw != "" {
+		if n, convErr := strconv.ParseInt(raw, 10, 64); convErr == nil {
+			d.PromotedAtUnix = n
+		}
+	}
 
 	if raw, err := libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldLastSync); err == nil && raw != "" {
 		if ts, err := strconv.ParseInt(raw, 10, 64); err == nil {
