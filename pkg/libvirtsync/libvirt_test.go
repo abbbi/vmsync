@@ -875,6 +875,75 @@ func TestUpdateSyncMetadataRecordsWhetherTheSourceWasStopped(t *testing.T) {
 	}
 }
 
+// TestMergeMetadataFields covers the fragment-level merge that replaced the
+// whole-domain round-trip. Same contract as SetMetadataFields -- preserve
+// what you were not told about, removals win over updates -- but with
+// nothing but vmsync's own element in scope.
+func TestMergeMetadataFields(t *testing.T) {
+	// From nothing.
+	frag, err := mergeMetadataFields("", map[string]string{
+		MetadataFieldReplicationRole: RoleTarget,
+		MetadataFieldFailureCount:    "0",
+	})
+	if err != nil {
+		t.Fatalf("mergeMetadataFields: %v", err)
+	}
+	got := allMetadataFields(frag)
+	if got[MetadataFieldReplicationRole] != RoleTarget || got[MetadataFieldFailureCount] != "0" {
+		t.Fatalf("fields = %v", got)
+	}
+
+	// An update must leave untouched fields alone -- including one this
+	// build does not know about, which is how a newer vmsync's metadata
+	// survives an older one writing to the same domain.
+	frag = buildMetadataEntry(map[string]string{
+		MetadataFieldReplicationRole: RoleTarget,
+		MetadataFieldLastCheckpoint:  "vmsync-cpt-000007",
+		"invented_by_a_newer_build":  "keep me",
+	})
+	frag, err = mergeMetadataFields(frag, map[string]string{MetadataFieldFailureCount: "3"})
+	if err != nil {
+		t.Fatalf("mergeMetadataFields: %v", err)
+	}
+	got = allMetadataFields(frag)
+	if got[MetadataFieldLastCheckpoint] != "vmsync-cpt-000007" {
+		t.Error("an untouched field was lost")
+	}
+	if got["invented_by_a_newer_build"] != "keep me" {
+		t.Error("a field this build does not model was dropped")
+	}
+	if got[MetadataFieldFailureCount] != "3" {
+		t.Error("the update did not apply")
+	}
+
+	// Removals win over updates, so "set these, drop those" needs no
+	// ordering discipline from the caller.
+	frag, err = mergeMetadataFields(frag,
+		map[string]string{MetadataFieldFailureCount: "9"}, MetadataFieldFailureCount)
+	if err != nil {
+		t.Fatalf("mergeMetadataFields: %v", err)
+	}
+	if v := allMetadataFields(frag)[MetadataFieldFailureCount]; v != "" {
+		t.Errorf("failure_count = %q, want it removed", v)
+	}
+
+	// Emptying every field drops the element rather than leaving a husk.
+	frag, err = mergeMetadataFields(buildMetadataEntry(map[string]string{MetadataFieldFailureCount: "1"}),
+		nil, MetadataFieldFailureCount)
+	if err != nil {
+		t.Fatalf("mergeMetadataFields: %v", err)
+	}
+	if frag != "" {
+		t.Errorf("fragment = %q, want empty once no fields remain", frag)
+	}
+
+	// An unsafe field name is refused here exactly as SetMetadataFields
+	// refuses it: buildMetadataEntry interpolates names straight into a tag.
+	if _, err := mergeMetadataFields("", map[string]string{"bad name": "x"}); err == nil {
+		t.Error("accepted a field name that cannot be an XML element")
+	}
+}
+
 // TestRoleConstantsMatchFailover keeps pkg/failover's copies of these
 // strings in step with the originals here.
 //

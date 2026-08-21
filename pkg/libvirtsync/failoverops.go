@@ -127,44 +127,14 @@ func parseUnix(domXML, field string) int64 {
 	return n
 }
 
-// ApplyMetadata merges updates and drops removals on a domain's persistent
-// definition, re-reading first so a concurrent writer is detected rather
-// than clobbered -- the same guard SetReplicationRole uses.
+// ApplyMetadata merges updates and drops removals on a domain's vmsync
+// metadata.
 //
-// Deliberately refuses when the domain was redefined underneath it instead
-// of retrying: the caller decided what to write based on a state it read
-// earlier, and if that state has changed the decision itself may no longer
-// be the right one.
+// A thin name over SetDomainMetadataFields, kept because the failover paths
+// read better for it. See metadata.go for why this no longer redefines the
+// domain, and why refusing on a concurrent change beats retrying.
 func ApplyMetadata(mgr *Manager, domainName string, updates map[string]string, removals ...string) error {
-	dom, err := mgr.Conn.LookupDomainByName(domainName)
-	if err != nil {
-		return fmt.Errorf("look up domain %s: %w", domainName, err)
-	}
-	defer dom.Free()
-
-	domXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
-	if err != nil {
-		return fmt.Errorf("read domain %s xml: %w", domainName, err)
-	}
-	updatedXML, err := SetMetadataFields(domXML, updates, removals...)
-	if err != nil {
-		return fmt.Errorf("build updated metadata for %s: %w", domainName, err)
-	}
-
-	latestXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
-	if err != nil {
-		return fmt.Errorf("re-read domain %s xml before writing: %w", domainName, err)
-	}
-	if latestXML != domXML {
-		return fmt.Errorf("domain %s was redefined by something else while this change was being prepared; refusing to overwrite it", domainName)
-	}
-
-	newDom, err := mgr.Conn.DomainDefineXML(updatedXML)
-	if err != nil {
-		return fmt.Errorf("redefine domain %s with updated metadata: %w", domainName, err)
-	}
-	defer newDom.Free()
-	return nil
+	return SetDomainMetadataFields(mgr, domainName, updates, removals...)
 }
 
 // ShutdownDomain asks a domain to shut down cleanly and waits for it,

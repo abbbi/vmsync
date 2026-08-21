@@ -812,6 +812,16 @@ func warnIfXMLElementsDropped(context, original, rewritten string) {
 // far easier to be confident is safe.
 var metadataFieldNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]*$`)
 
+// SetMetadataFields operates on a whole domain document and is now used by
+// exactly one caller: UpdateSyncMetadata, whose output feeds DefineDomain.
+//
+// Everything that MUTATES metadata on an existing domain goes through
+// SetDomainMetadataFields instead, which uses libvirt's own metadata API and
+// never reconstructs the domain document. This one survives because the
+// target's definition is genuinely rebuilt from the source's XML on every
+// sync -- there the round-trip is the operation, not a side effect of
+// recording a field. See metadata.go.
+//
 // SetMetadataFields merges the given vmsync:field->value pairs into
 // domainXML's <metadata> block, preserving any existing vmsync fields not
 // mentioned in updates or removeFields (and any unrelated, non-vmsync
@@ -1002,47 +1012,29 @@ func appendReplicaTarget(list, entry string) string {
 // safe, already-established pattern RecordTargetSyncFailure uses to patch
 // a live target's failure_count.
 func RecordReplicaTarget(mgr *Manager, sourceDomainName, targetHost, targetDomain string, at time.Time) error {
-	dom, err := mgr.Conn.LookupDomainByName(sourceDomainName)
+	existing, err := ReadDomainMetadataField(mgr, sourceDomainName, MetadataFieldReplicaTargets)
 	if err != nil {
-		return fmt.Errorf("look up source domain %s to record replica target: %w", sourceDomainName, err)
+		return err
 	}
-	defer dom.Free()
-
-	domXML, err := dom.GetXMLDesc(0)
-	if err != nil {
-		return fmt.Errorf("read source domain %s xml: %w", sourceDomainName, err)
-	}
-
 	entry := ReplicaEntry(targetHost, targetDomain)
-	existing, _ := ParseMetadata(domXML, MetadataFieldReplicaTargets)
 	updatedList := appendReplicaTarget(existing, entry)
 
 	// This used to return early once the target was already recorded and no
 	// stale target-role fields remained, to skip an XML round-trip and a
-	// redefine per sync. That shortcut is gone, deliberately: the whole
-	// point of last_replicated_at is that it moves on EVERY successful sync,
-	// so there is no steady state left to skip.
+	// domain redefine per sync. That shortcut is gone, deliberately: the
+	// whole point of last_replicated_at is that it moves on EVERY successful
+	// sync, so there is no steady state left to skip.
 	//
-	// The cost is one source-side redefine per run -- the same order as the
-	// redefine the target already takes -- bought against being able to
-	// answer "when did this VM last replicate, and where to" from the source
-	// host alone, which is exactly the question a disaster leaves you with
-	// when the other site is unreachable.
-	updatedXML, err := SetMetadataFields(domXML, map[string]string{
+	// What made dropping it affordable is that this is no longer a redefine
+	// at all. The write goes through libvirt's own metadata API and touches
+	// only vmsync's namespaced element, so a per-sync write to a PRODUCTION
+	// domain costs a small metadata splice rather than a full-document
+	// round-trip that could drop configuration this tool does not model.
+	return SetDomainMetadataFields(mgr, sourceDomainName, map[string]string{
 		MetadataFieldReplicaTargets:   updatedList,
 		MetadataFieldLastReplicatedAt: strconv.FormatInt(at.Unix(), 10),
 		MetadataFieldLastReplicatedTo: entry,
 	}, MetadataFieldLastCheckpoint, MetadataFieldLastSync, MetadataFieldFailureCount)
-	if err != nil {
-		return fmt.Errorf("update replica_targets metadata: %w", err)
-	}
-
-	newDom, err := mgr.Conn.DomainDefineXML(updatedXML)
-	if err != nil {
-		return fmt.Errorf("redefine source domain %s with updated replica_targets metadata: %w", sourceDomainName, err)
-	}
-	defer newDom.Free()
-	return nil
 }
 
 // ReadTargetFailureCount reconnects to the target and returns the
@@ -1192,17 +1184,10 @@ func SetReplicationRole(mgr *Manager, domainName, role string) (previous string,
 		return "", err
 	}
 
-	dom, err := mgr.Conn.LookupDomainByName(domainName)
+	previous, err = ReadDomainMetadataField(mgr, domainName, MetadataFieldReplicationRole)
 	if err != nil {
-		return "", fmt.Errorf("look up domain %s to set its replication role: %w", domainName, err)
+		return "", err
 	}
-	defer dom.Free()
-
-	domXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
-	if err != nil {
-		return "", fmt.Errorf("read domain %s xml: %w", domainName, err)
-	}
-	previous, _ = ParseMetadata(domXML, MetadataFieldReplicationRole)
 
 	// Moving away from `promoted` takes the promotion record with it.
 	//
@@ -1218,7 +1203,6 @@ func SetReplicationRole(mgr *Manager, domainName, role string) (previous string,
 	// Only UpdateSyncMetadata and an inversion stripped them before, and the
 	// first of those runs only after a SUCCESSFUL sync -- which a domain
 	// stuck mid-recovery is precisely not getting.
-	var updatedXML string
 	promotionFields := []string{
 		MetadataFieldPromotedAt,
 		MetadataFieldPromotedBy,
@@ -1227,38 +1211,23 @@ func SetReplicationRole(mgr *Manager, domainName, role string) (previous string,
 	}
 	switch {
 	case role == RoleNone:
-		updatedXML, err = SetMetadataFields(domXML, nil,
+		err = SetDomainMetadataFields(mgr, domainName, nil,
 			append([]string{MetadataFieldReplicationRole}, promotionFields...)...)
 	case role == RolePromoted:
 		// Promotion itself is written by -promote, which records the whole
 		// record atomically. Setting the role to promoted by hand must not
 		// invent one, but must not destroy an existing one either.
-		updatedXML, err = SetMetadataFields(domXML, map[string]string{
+		err = SetDomainMetadataFields(mgr, domainName, map[string]string{
 			MetadataFieldReplicationRole: role,
 		})
 	default:
-		updatedXML, err = SetMetadataFields(domXML, map[string]string{
+		err = SetDomainMetadataFields(mgr, domainName, map[string]string{
 			MetadataFieldReplicationRole: role,
 		}, promotionFields...)
 	}
 	if err != nil {
-		return "", fmt.Errorf("update replication_role metadata: %w", err)
+		return "", err
 	}
-
-	latestXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
-	if err != nil {
-		return "", fmt.Errorf("re-read domain %s xml before write: %w", domainName, err)
-	}
-	if latestXML != domXML {
-		return "", fmt.Errorf("domain %s was redefined concurrently by something else while setting its replication role; refusing to overwrite it -- check whether another vmsync invocation or an external tool is also managing this domain", domainName)
-	}
-
-	newDom, err := mgr.Conn.DomainDefineXML(updatedXML)
-	if err != nil {
-		return "", fmt.Errorf("redefine domain %s with updated replication_role: %w", domainName, err)
-	}
-	defer newDom.Free()
-
 	return previous, nil
 }
 
@@ -1300,53 +1269,30 @@ func RecordTargetSyncFailure(targetURI, targetDomain string) (int, error) {
 	}
 	defer dom.Free()
 
-	// DOMAIN_XML_INACTIVE, not flags=0. This function redefines the domain
-	// from whatever it reads here, and flags=0 returns the LIVE definition
-	// for a running domain -- including runtime-only elements assigned at
-	// boot (actual PCI addresses, live CPU/NUMA pinning) that do not belong
-	// in, and may not even be valid as, a persistent definition. See
-	// DefineDomain's own comment for the full reasoning; it applies with
-	// more force here, because the one case that most needs a failure
-	// recorded is a target that has been promoted and is now RUNNING, which
-	// is exactly when flags=0 diverges.
-	domXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
+	// The whole read-modify-write is now confined to vmsync's own metadata
+	// element. It used to read the entire domain definition and define the
+	// result back, which mattered here more than anywhere: the case that
+	// most needs a failure recorded is a target that has been promoted and
+	// is RUNNING, and rewriting a live domain's persistent definition from
+	// a typed round-trip is how configuration goes missing.
+	frag, err := ReadDomainMetadata(dom)
 	if err != nil {
-		return 0, fmt.Errorf("read target domain xml: %w", err)
+		return 0, fmt.Errorf("target domain %s: %w", targetDomain, err)
 	}
 
 	current := 0
-	if value, err := ParseMetadata(domXML, MetadataFieldFailureCount); err == nil && value != "" {
-		if n, err := strconv.Atoi(value); err == nil {
+	if value := allMetadataFields(frag)[MetadataFieldFailureCount]; value != "" {
+		if n, convErr := strconv.Atoi(value); convErr == nil {
 			current = n
 		}
 	}
 	next := current + 1
 
-	updatedXML, err := SetMetadataFields(domXML, map[string]string{
+	if err := SetDomainMetadataFields(mgr, targetDomain, map[string]string{
 		MetadataFieldFailureCount: strconv.Itoa(next),
-	})
-	if err != nil {
-		return 0, fmt.Errorf("update failure_count metadata: %w", err)
+	}); err != nil {
+		return 0, err
 	}
-
-	// Same flag as the read above, and it must stay the same: this compares
-	// the two to detect a concurrent redefine, so reading them with
-	// different flags would report every RUNNING target as concurrently
-	// modified and refuse to record any failure at all.
-	latestXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
-	if err != nil {
-		return 0, fmt.Errorf("re-read target domain xml before write: %w", err)
-	}
-	if latestXML != domXML {
-		return 0, fmt.Errorf("target domain %s was redefined concurrently by something else while recording this failure; refusing to overwrite it -- check whether another vmsync invocation or an external tool is also managing this domain", targetDomain)
-	}
-
-	newDom, err := mgr.Conn.DomainDefineXML(updatedXML)
-	if err != nil {
-		return 0, fmt.Errorf("redefine target domain with updated failure_count: %w", err)
-	}
-	defer newDom.Free()
-
 	return next, nil
 }
 
