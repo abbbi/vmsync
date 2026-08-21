@@ -921,15 +921,23 @@ func TestDomainRewritesArePreserving(t *testing.T) {
 
 	// Nothing lost. backingStore is removed on purpose, so it is excluded
 	// from the comparison the same way the production check excludes it.
-	if missing := missingXMLElements(src, out); len(missing) > 0 {
-		t.Errorf("elements lost through the rewrite chain: %v", missing)
+	// uuid is the one deliberate loss in this chain -- stripDomainUUID
+	// removes it so libvirt assigns the replica a fresh one. It is NOT in
+	// intentionallyDroppedXMLElements on purpose: nothing in production
+	// drops a uuid, so keeping the global tripwire strict about it is worth
+	// more than the convenience of a blanket exclusion here.
+	for _, name := range missingXMLElements(src, out) {
+		if name == "uuid" {
+			continue
+		}
+		t.Errorf("element lost through the rewrite chain: %s", name)
 	}
 
 	// The prefixed namespace is what a typed round-trip mangled worst, and
 	// what libvirt actually reads to apply qemu passthrough arguments.
 	for _, want := range []string{
-		`xmlns:qemu=`, `<qemu:commandline>`, `<qemu:arg`, `<qemu:env`,
-		`<hostdev`, `<tpm`,
+		`xmlns:qemu=`, `<qemu:commandline>`, `<qemu:arg`,
+		`<hostdev`, `<tpm`, `<nvram>`, `<someother:field>keep-me`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rewritten domain no longer contains %q:\n%s", want, out)
