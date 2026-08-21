@@ -154,6 +154,90 @@ func TestSendReportPostsToTheAgentsOwnPath(t *testing.T) {
 	}
 }
 
+// The agent's half of the wire contract for fence state.
+//
+// Asserts the JSON field NAMES this sends, because the UI decodes reports
+// with DisallowUnknownFields: a name that drifts on this side does not
+// degrade the fence display, it rejects the entire report -- domains, roles,
+// sync results and all -- and looks in production like every upgraded host
+// going offline at once. vmsync-ui's TestAReportCarryingFenceStateIsAccepted
+// is the matching half, and pins the same strings.
+func TestSendReportCarriesFenceStateUnderTheAgreedNames(t *testing.T) {
+	var raw map[string]any
+	c, _ := stubUI(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&raw)
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	report := Report{
+		ReportedAtUnix: 1_800_000_000,
+		Hostname:       "hyper01p",
+		Domains: []ReportDomain{
+			{
+				Name: "web01", Active: true, Role: "source", Status: "ok",
+				Fenced: &ReportFenced{
+					FenceID: "f1", State: "failed", AtUnix: 1_799_999_000,
+					PeerRef: "hyper02p:web01", ArmedBy: "alice",
+					Error: "the guest did not shut down in time",
+				},
+			},
+			{
+				Name: "db01", Active: true, Role: "promoted", Status: "ok",
+				FenceID: "f2", FenceSource: "hyper00p:db01",
+				FenceArmedAtUnix: 1_799_998_000, FenceArmedBy: "bob",
+			},
+		},
+	}
+	if err := c.SendReport(context.Background(), report); err != nil {
+		t.Fatalf("SendReport() error = %v", err)
+	}
+
+	domains, _ := raw["domains"].([]any)
+	if len(domains) != 2 {
+		t.Fatalf("the UI received %d domains, want 2", len(domains))
+	}
+
+	first, _ := domains[0].(map[string]any)
+	fenced, ok := first["fenced"].(map[string]any)
+	if !ok {
+		t.Fatalf("no \"fenced\" object on the first domain: %v", first)
+	}
+	for field, want := range map[string]any{
+		"fence_id": "f1", "state": "failed",
+		"peer_ref": "hyper02p:web01", "armed_by": "alice",
+		"error": "the guest did not shut down in time",
+	} {
+		if got := fenced[field]; got != want {
+			t.Errorf("fenced.%s = %v, want %v", field, got, want)
+		}
+	}
+	if fenced["at_unix"] == nil {
+		t.Error("fenced.at_unix is missing; without it a fence has no time")
+	}
+
+	second, _ := domains[1].(map[string]any)
+	for field, want := range map[string]any{
+		"fence_id": "f2", "fence_source": "hyper00p:db01", "fence_armed_by": "bob",
+	} {
+		if got := second[field]; got != want {
+			t.Errorf("%s = %v, want %v", field, got, want)
+		}
+	}
+	if second["fence_armed_at_unix"] == nil {
+		t.Error("fence_armed_at_unix is missing")
+	}
+
+	// A domain nobody fenced must send NO fenced object at all, rather than
+	// an empty one: `omitempty` on a pointer is what keeps a report about a
+	// hundred untouched domains from carrying a hundred empty records.
+	if _, present := first["fence_source"]; present {
+		t.Error("a domain that armed no fence must omit fence_source entirely")
+	}
+	if _, present := second["fenced"]; present {
+		t.Error("a domain this host never fenced must omit the fenced object entirely")
+	}
+}
+
 func TestRevokedCredentialIsDistinguishedFromEveryOtherFailure(t *testing.T) {
 	// Worth its own error: every other failure is worth retrying, this one
 	// never succeeds until an operator issues a fresh enrolment token. An

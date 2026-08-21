@@ -183,6 +183,26 @@ func (l *fenceLedger) Records() []fenceRecord {
 	return out
 }
 
+// LatestByVM returns the most recent fence acted on for each VM.
+//
+// Most recent because a VM can be fenced more than once over its life --
+// failed over, recovered, failed over again -- and what a report should
+// carry is the state this domain is in NOW, not an archaeology of every
+// failover it has been through. The older records stay in the ledger, where
+// their only remaining job is to keep those tokens from firing again.
+func (l *fenceLedger) LatestByVM() map[string]fenceRecord {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make(map[string]fenceRecord, len(l.records))
+	for _, r := range l.records {
+		if prev, ok := out[r.VM]; ok && prev.AtUnix >= r.AtUnix {
+			continue
+		}
+		out[r.VM] = r
+	}
+	return out
+}
+
 // fenceLoop asks this host's peers whether any of them has displaced it.
 //
 // Its own loop, and deliberately independent of both the schedule and the

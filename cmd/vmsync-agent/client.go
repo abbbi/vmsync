@@ -201,6 +201,24 @@ type ReportDomain struct {
 	// available.
 	LastReplicatedAtUnix int64  `json:"last_replicated_at_unix,omitempty"`
 	LastReplicatedTo     string `json:"last_replicated_to,omitempty"`
+	// The fence this domain's promotion armed, present only on a promoted
+	// domain whose promotion asked for one. A promotion carrying none
+	// authorised nothing, which is what a DR drill looks like.
+	FenceID          string `json:"fence_id,omitempty"`
+	FenceSource      string `json:"fence_source,omitempty"`
+	FenceArmedAtUnix int64  `json:"fence_armed_at_unix,omitempty"`
+	FenceArmedBy     string `json:"fence_armed_by,omitempty"`
+	// Fenced is what THIS agent did about a fence naming this domain, from
+	// its own durable ledger.
+	//
+	// The half of the picture nothing else can supply. A fence that worked
+	// leaves a domain that is merely `paused` -- indistinguishable, from
+	// metadata alone, from one an operator paused deliberately. A fence that
+	// FAILED leaves no trace in libvirt at all: just a VM still running
+	// beside a promoted copy, which looks exactly like a failover nobody has
+	// got to yet. Without this the console sees consequences and never
+	// causes.
+	Fenced *ReportFenced `json:"fenced,omitempty"`
 	// Disks is what this domain occupies on this host's storage: the
 	// allocated figure, not the apparent one, because that is what a copy
 	// actually costs. Paired with Report.Filesystems it answers "is there
@@ -309,6 +327,25 @@ type ReportDisk struct {
 	ApparentBytes  int64  `json:"apparent_bytes"`
 	AllocatedBytes int64  `json:"allocated_bytes"`
 	Missing        bool   `json:"missing,omitempty"`
+}
+
+// ReportFenced is one entry from this agent's fence ledger: a fence it acted
+// on, and what came of it.
+type ReportFenced struct {
+	FenceID string `json:"fence_id"`
+	// State is the ledger's own: `done`, `failed`, or `running` for one
+	// interrupted mid-shutdown. Anything other than done means this domain
+	// may still be up alongside the promoted copy.
+	State string `json:"state"`
+	// AtUnix is when the attempt finished, or began if it never did.
+	AtUnix int64 `json:"at_unix,omitempty"`
+	// PeerRef is the promoted copy that displaced this domain, and ArmedBy
+	// whoever performed that promotion -- so "why is this VM off" is
+	// answerable from the console rather than from a journal on a
+	// hypervisor.
+	PeerRef string `json:"peer_ref,omitempty"`
+	ArmedBy string `json:"armed_by,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // ReportFilesystem mirrors pkg/inventory.Filesystem on the wire.

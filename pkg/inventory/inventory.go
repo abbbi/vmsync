@@ -81,6 +81,18 @@ type Domain struct {
 	PromotedBy     string `json:"promoted_by,omitempty"`
 	PromotionMode  string `json:"promotion_mode,omitempty"`
 
+	// The fence this promotion armed, present only on a promoted domain and
+	// only when the promotion was explicitly asked to arm one.
+	//
+	// Reported so the control plane can say a failover authorised stopping
+	// its old source, rather than leaving that visible nowhere but on the
+	// hypervisor. Its absence is meaningful too: a promotion with no fence
+	// authorised nothing, which is what a DR drill looks like.
+	FenceID          string `json:"fence_id,omitempty"`
+	FenceSource      string `json:"fence_source,omitempty"`
+	FenceArmedAtUnix int64  `json:"fence_armed_at_unix,omitempty"`
+	FenceArmedBy     string `json:"fence_armed_by,omitempty"`
+
 	// LastReplicatedAtUnix / LastReplicatedTo are written on a SOURCE: when
 	// it last replicated successfully, and to where. Distinct from
 	// LastSyncUnix, which lives on a TARGET and means "when was I last
@@ -358,6 +370,15 @@ func describe(dom *libvirt.Domain) (Domain, error) {
 	if raw, err := libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldPromotedAt); err == nil && raw != "" {
 		if n, convErr := strconv.ParseInt(raw, 10, 64); convErr == nil {
 			d.PromotedAtUnix = n
+		}
+	}
+
+	d.FenceID, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldFenceID)
+	d.FenceSource, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldFenceSource)
+	d.FenceArmedBy, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldFenceArmedBy)
+	if raw, err := libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldFenceArmedAt); err == nil && raw != "" {
+		if n, convErr := strconv.ParseInt(raw, 10, 64); convErr == nil {
+			d.FenceArmedAtUnix = n
 		}
 	}
 

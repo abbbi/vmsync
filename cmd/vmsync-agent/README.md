@@ -266,6 +266,20 @@ learn to ignore the metric that must never be ignored. A sweep that could
 not run leaves the previous value alone rather than clearing it: failing to
 look is not evidence the problem went away.
 
+The same facts also ride in every report to the control plane, per domain,
+as a `fenced` object carrying the fence id, its state, when it acted, which
+peer displaced this domain and who performed that promotion. That is the
+only route by which a console can tell a **fenced** VM from one an operator
+paused — both are just `paused` in libvirt — or notice a fence that failed,
+which leaves no mark in libvirt at all. A promoted domain additionally
+reports the fence its own promotion armed, so "did this failover authorise
+stopping anything" is answerable without reading metadata on a hypervisor.
+
+Reported by `--once` as well as by the daemon. A report replaces what the UI
+holds for that host, so a one-shot run that omitted this would quietly erase
+the console's record of which VMs were fenced — precisely while somebody is
+poking at a machine mid-incident.
+
 ## Standalone: a scheduler with no control plane
 
 `--standalone /path/to/schedule.json` runs the scheduler and nothing else.

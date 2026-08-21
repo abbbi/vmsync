@@ -297,7 +297,7 @@ func run(cfg agentConfig) error {
 	go func() { defer wg.Done(); fenceLoop(ctx, cfg, fences) }()
 
 	wg.Add(2)
-	go func() { defer wg.Done(); reportLoop(ctx, client, cfg, state, sched, ledger) }()
+	go func() { defer wg.Done(); reportLoop(ctx, client, cfg, state, sched, ledger, fences) }()
 	go func() { defer wg.Done(); pollLoop(ctx, client, store, state, cfg.metrics) }()
 	wg.Wait()
 	return nil
@@ -360,10 +360,21 @@ func ensureEnrolled(ctx context.Context, client *Client, store Store, cfg agentC
 }
 
 func reportOnce(ctx context.Context, client *Client, cfg agentConfig, cached CachedConfig) error {
-	// nil ledger: -once is an install check, and re-reporting stored
-	// operation results from a one-shot invocation would acknowledge work
-	// the daemon has not been running to do.
-	report, err := buildReport(cfg, cached, nil, nil)
+	// nil operation ledger: -once is an install check, and re-reporting
+	// stored operation results from a one-shot invocation would acknowledge
+	// work the daemon has not been running to do.
+	//
+	// The FENCE ledger is passed, though, and the difference matters. That
+	// one is not an acknowledgement protocol, it is state -- and a report
+	// carries the whole picture of a host, replacing what the UI holds. A
+	// -once run that omitted it would quietly erase the console's record of
+	// which VMs this host has fenced, exactly when somebody is poking at a
+	// machine mid-incident.
+	fences := newFenceLedger(cfg.StateDir)
+	if err := fences.Load(); err != nil {
+		return fmt.Errorf("load the fence ledger: %w", err)
+	}
+	report, err := buildReport(cfg, cached, nil, nil, fences)
 	if err != nil {
 		return err
 	}
@@ -374,10 +385,10 @@ func reportOnce(ctx context.Context, client *Client, cfg agentConfig, cached Cac
 	return nil
 }
 
-func reportLoop(ctx context.Context, client *Client, cfg agentConfig, state *sharedState, sched *Scheduler, ledger *operationLedger) {
+func reportLoop(ctx context.Context, client *Client, cfg agentConfig, state *sharedState, sched *Scheduler, ledger *operationLedger, fences *fenceLedger) {
 	for {
 		cached := state.get()
-		report, err := buildReport(cfg, cached, sched, ledger)
+		report, err := buildReport(cfg, cached, sched, ledger, fences)
 		if err != nil {
 			// A libvirt failure is worth logging loudly but is not fatal:
 			// libvirtd restarts, and an agent that exited would then need
@@ -473,7 +484,7 @@ func pollLoop(ctx context.Context, client *Client, store Store, state *sharedSta
 }
 
 // buildReport inventories the local host and assesses every domain.
-func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler, ledger *operationLedger) (Report, error) {
+func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler, ledger *operationLedger, fences *fenceLedger) (Report, error) {
 	mgr, err := libvirtsync.Connect(cfg.LibvirtURI)
 	if err != nil {
 		return Report{}, fmt.Errorf("connect to %s: %w", cfg.LibvirtURI, err)
@@ -512,6 +523,14 @@ func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler, ledger 
 		report.OperationResults = ledger.Results()
 	}
 
+	// What this host has fenced, keyed by VM. Read once rather than per
+	// domain: it is a lock and a map copy, and a report iterating hundreds
+	// of domains should not pay for it hundreds of times.
+	var fenced map[string]fenceRecord
+	if fences != nil {
+		fenced = fences.LatestByVM()
+	}
+
 	for _, d := range domains {
 		// A domain with no configured cadence is not judged on freshness;
 		// see inventory.Assess for why guessing one is worse than not.
@@ -536,6 +555,11 @@ func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler, ledger 
 			PromotionMode:        d.PromotionMode,
 			LastReplicatedAtUnix: d.LastReplicatedAtUnix,
 			LastReplicatedTo:     d.LastReplicatedTo,
+			FenceID:              d.FenceID,
+			FenceSource:          d.FenceSource,
+			FenceArmedAtUnix:     d.FenceArmedAtUnix,
+			FenceArmedBy:         d.FenceArmedBy,
+			Fenced:               reportFenced(fenced, d.Name),
 			Disks:                reportDisks(d.Disks),
 			Status:               a.Status.String(),
 			Reasons:              a.Reasons,
@@ -550,6 +574,24 @@ func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler, ledger 
 // wire ones. Written out rather than reusing inventory's structs directly
 // for the same reason ReportDomain is: the wire format changes only when
 // the protocol does, not when an internal struct is refactored.
+// reportFenced converts this host's ledger entry for one VM, or nil when it
+// has never fenced that domain -- which is the ordinary case for almost
+// every domain on almost every host, and is why the field is a pointer.
+func reportFenced(fenced map[string]fenceRecord, vm string) *ReportFenced {
+	rec, ok := fenced[vm]
+	if !ok {
+		return nil
+	}
+	return &ReportFenced{
+		FenceID: rec.FenceID,
+		State:   rec.State,
+		AtUnix:  rec.AtUnix,
+		PeerRef: rec.PeerRef,
+		ArmedBy: rec.ArmedBy,
+		Error:   rec.Error,
+	}
+}
+
 func reportDisks(in []inventory.DiskInfo) []ReportDisk {
 	if len(in) == 0 {
 		return nil
