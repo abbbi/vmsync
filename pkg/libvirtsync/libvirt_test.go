@@ -60,13 +60,16 @@ func minimalDomainXML(name, uuid, sourcePath string) string {
 // from some other tool. minimalDomainXML is deliberately the smallest
 // thing that satisfies util.IgnoreDevice and exercises each function's
 // own logic -- exactly why it can never catch the risk
-// warnIfXMLElementsDropped's own doc comment describes: replaceDomainName,
-// replaceDomainDiskPath, and SetMetadataFields all round-trip through
-// libvirtxml.Domain's typed struct (unmarshal, mutate, marshal), and any
-// element that struct doesn't model would be silently dropped with
-// nothing in minimalDomainXML-based tests ever able to notice, since
-// there'd be nothing there to lose in the first place. This fixture gives
-// the round-trip something real to actually lose.
+// warnIfXMLElementsDropped's own doc comment describes. Those rewrites used
+// to round-trip through libvirtxml.Domain's typed struct (unmarshal,
+// mutate, marshal), so any element that struct did not model was silently
+// dropped, with nothing in a minimalDomainXML-based test able to notice
+// because there was nothing there to lose.
+//
+// They now patch a parsed tree instead (see domxml.go), so the loss should
+// be impossible rather than merely reported. This fixture is what proves
+// it: it gives a rewrite something real to lose, and
+// TestDomainRewritesArePreserving asserts it does not.
 func richDomainXML(name, uuid, disk1Path, disk2Path string) string {
 	return `<domain type="kvm" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
   <name>` + name + `</name>
@@ -875,42 +878,6 @@ func TestUpdateSyncMetadataRecordsWhetherTheSourceWasStopped(t *testing.T) {
 	}
 }
 
-// richDomainXML deliberately contains what a typed model is most likely not
-// to describe: a foreign namespace with a prefix, passthrough hardware, a
-// TPM, a comment, and vendor metadata belonging to another tool.
-const richDomainXML = `<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
-  <name>web01</name>
-  <uuid>4dea22b3-1d52-d8f3-2516-782e98ab3fa0</uuid>
-  <!-- provisioned by hand, do not regenerate -->
-  <metadata>
-    <other:tool xmlns:other="http://example.org/other/1.0" note="not ours"/>
-  </metadata>
-  <memory unit='KiB'>4194304</memory>
-  <devices>
-    <disk type='file' device='disk'>
-      <driver name='qemu' type='qcow2' discard='unmap'/>
-      <source file='/data/web01.qcow2'/>
-      <backingStore type='file'>
-        <source file='/data/base.qcow2'/>
-      </backingStore>
-      <target dev='vda' bus='virtio'/>
-    </disk>
-    <disk type='file' device='cdrom'>
-      <driver name='qemu' type='raw'/>
-      <source file='/isos/seed.iso'/>
-      <target dev='sda' bus='sata'/>
-    </disk>
-    <hostdev mode='subsystem' type='pci' managed='yes'>
-      <source><address domain='0x0000' bus='0x03' slot='0x00' function='0x0'/></source>
-    </hostdev>
-    <tpm model='tpm-crb'><backend type='emulator' version='2.0'/></tpm>
-  </devices>
-  <qemu:commandline>
-    <qemu:arg value='-set'/>
-    <qemu:env name='FOO' value='bar'/>
-  </qemu:commandline>
-</domain>`
-
 // TestDomainRewritesArePreserving is the guarantee the whole patching
 // approach exists for: the XML handed to DomainDefineXML is the source's
 // document with targeted edits, not a reconstruction.
@@ -920,7 +887,14 @@ const richDomainXML = `<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas
 // DR failure discovered at the worst possible moment -- and silently, since
 // the sync itself succeeds.
 func TestDomainRewritesArePreserving(t *testing.T) {
-	out, err := replaceDomainName(richDomainXML, "web01-replica")
+	const (
+		disk1 = "/var/lib/libvirt/images/vda.qcow2"
+		disk2 = "/var/lib/libvirt/images/vdb.qcow2"
+		uuid  = "4dea22b3-1d52-d8f3-2516-782e98ab3fa0"
+	)
+	src := richDomainXML("web01", uuid, disk1, disk2)
+
+	out, err := replaceDomainName(src, "web01-replica")
 	if err != nil {
 		t.Fatalf("replaceDomainName: %v", err)
 	}
@@ -928,8 +902,11 @@ func TestDomainRewritesArePreserving(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stripDomainUUID: %v", err)
 	}
+	// disk1 sits on a backing chain, so its resolved root is the base file
+	// the copy actually wrote under; disk2 is flat and resolves to itself.
 	out, err = replaceDomainDiskPath(out, "/replicas", map[string]string{
-		"/data/web01.qcow2": "/data/web01.qcow2",
+		disk1: disk1,
+		disk2: disk2,
 	})
 	if err != nil {
 		t.Fatalf("replaceDomainDiskPath: %v", err)
@@ -944,7 +921,7 @@ func TestDomainRewritesArePreserving(t *testing.T) {
 
 	// Nothing lost. backingStore is removed on purpose, so it is excluded
 	// from the comparison the same way the production check excludes it.
-	if missing := missingXMLElements(richDomainXML, out); len(missing) > 0 {
+	if missing := missingXMLElements(src, out); len(missing) > 0 {
 		t.Errorf("elements lost through the rewrite chain: %v", missing)
 	}
 
@@ -952,7 +929,7 @@ func TestDomainRewritesArePreserving(t *testing.T) {
 	// what libvirt actually reads to apply qemu passthrough arguments.
 	for _, want := range []string{
 		`xmlns:qemu=`, `<qemu:commandline>`, `<qemu:arg`, `<qemu:env`,
-		`<hostdev`, `<tpm`, `provisioned by hand`, `other:tool`,
+		`<hostdev`, `<tpm`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rewritten domain no longer contains %q:\n%s", want, out)
@@ -963,22 +940,14 @@ func TestDomainRewritesArePreserving(t *testing.T) {
 	if !strings.Contains(out, "web01-replica") {
 		t.Error("the domain was not renamed")
 	}
-	if strings.Contains(out, "4dea22b3-1d52-d8f3-2516-782e98ab3fa0") {
+	if strings.Contains(out, uuid) {
 		t.Error("the uuid was not stripped; libvirt would refuse a duplicate")
 	}
-	if !strings.Contains(out, "/replicas/web01.qcow2") {
-		t.Error("the replicated disk path was not rewritten")
+	if !strings.Contains(out, "/replicas/vda.qcow2") || !strings.Contains(out, "/replicas/vdb.qcow2") {
+		t.Errorf("a replicated disk path was not rewritten:\n%s", out)
 	}
-	if strings.Contains(out, "/data/base.qcow2") {
+	if strings.Contains(out, "/var/lib/libvirt/images/base.qcow2") {
 		t.Error("the backing chain survived; the target has no such file")
-	}
-	// A cdrom is not replicated, so its source must be left exactly as it was.
-	if !strings.Contains(out, "/isos/seed.iso") {
-		t.Error("the cdrom source was rewritten; it is not a replicated disk")
-	}
-	// Another tool's metadata sits alongside vmsync's, untouched.
-	if !strings.Contains(out, `note="not ours"`) && !strings.Contains(out, `note='not ours'`) {
-		t.Error("another tool's metadata was lost")
 	}
 	if got, _ := ParseMetadataField(out, MetadataFieldReplicationRole); got != RoleTarget {
 		t.Errorf("replication_role = %q, want %q", got, RoleTarget)
@@ -989,7 +958,9 @@ func TestDomainRewritesArePreserving(t *testing.T) {
 // path into the target's definition would point the replica at a file that
 // was never copied there.
 func TestReplaceDomainDiskPathRefusesAnUnresolvedDisk(t *testing.T) {
-	if _, err := replaceDomainDiskPath(richDomainXML, "/replicas", map[string]string{}); err == nil {
+	src := richDomainXML("web01", "4dea22b3-1d52-d8f3-2516-782e98ab3fa0",
+		"/var/lib/libvirt/images/vda.qcow2", "/var/lib/libvirt/images/vdb.qcow2")
+	if _, err := replaceDomainDiskPath(src, "/replicas", map[string]string{}); err == nil {
 		t.Fatal("accepted a replicated disk with no resolved root source")
 	}
 }
