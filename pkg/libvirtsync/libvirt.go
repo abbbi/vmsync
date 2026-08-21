@@ -29,7 +29,6 @@ import (
 	"time"
 	"vmsync/pkg/disk"
 	"vmsync/pkg/trace"
-	"vmsync/pkg/util"
 
 	"libvirt.org/go/libvirt"
 	"libvirt.org/go/libvirtxml"
@@ -201,7 +200,11 @@ var metadataFieldOrder = []string{
 	MetadataFieldLastReplicatedTo,
 }
 
-var vmsyncBlockRe = regexp.MustCompile(`(?s)<vmsync:vmsync[^>]*>.*?</vmsync:vmsync>`)
+// vmsyncBlockRe is gone: finding and replacing the metadata element by
+// regex was only ever needed because libvirtxml models <metadata> as an
+// opaque string. The element is now located and replaced in the parsed
+// tree, which cannot be fooled by an attribute containing ">" or by the
+// element appearing inside a comment.
 
 type Manager struct {
 	Conn *libvirt.Connect
@@ -570,81 +573,6 @@ func shouldRewriteDiskPaths(targetDiskPath string, rootSourceByLiveSource map[st
 // on the target host or doesn't match its actual (backing-file-free) disk
 // -- something libvirt/qemu can refuse to start the domain over, or worse,
 // misinterpret.
-func replaceDomainDiskPath(domainXML, targetDiskPath string, rootSourceByLiveSource map[string]string) (string, error) {
-	domcfg := &libvirtxml.Domain{}
-	err := domcfg.Unmarshal(domainXML)
-	if err != nil {
-		return "", err
-	}
-
-	for i, d := range domcfg.Devices.Disks {
-		if util.IgnoreDevice(d) == true {
-			continue
-		}
-		// IgnoreDevice only guarantees a non-nil Driver; Source/Source.File
-		// are separate pointers and could still be nil for a malformed disk.
-		if d.Source == nil || d.Source.File == nil {
-			continue
-		}
-
-		liveSource := d.Source.File.File
-		rootSource, ok := rootSourceByLiveSource[liveSource]
-		if !ok {
-			// ParseQcowDisks and this domain's own live XML disagree on which
-			// disks exist -- exactly the "shouldn't happen" case above, but
-			// having actually happened. liveSource may be an external-snapshot
-			// overlay that was never copied to the target under that name (see
-			// this function's own doc comment), so writing it into the
-			// target's persistent definition here would silently point the
-			// domain at a nonexistent or wrong disk file. Fail loud instead.
-			return "", fmt.Errorf("disk %s: no resolved root source available, refusing to write its live path into the target's persistent definition", liveSource)
-		}
-		domcfg.Devices.Disks[i].Source.File.File = util.SetTargetPath(targetDiskPath, rootSource)
-		domcfg.Devices.Disks[i].BackingStore = nil
-	}
-
-	changed, err := domcfg.Marshal()
-	if err != nil {
-		return "", err
-	}
-
-	return changed, nil
-}
-
-func replace(domainXML, name string) (string, error) {
-	domcfg := &libvirtxml.Domain{}
-	err := domcfg.Unmarshal(domainXML)
-	if err != nil {
-		return "", err
-	}
-
-	domcfg.Name = name
-
-	changed, err := domcfg.Marshal()
-	if err != nil {
-		return "", err
-	}
-
-	return changed, nil
-}
-
-func replaceDomainName(domainXML, name string) (string, error) {
-	domcfg := &libvirtxml.Domain{}
-	err := domcfg.Unmarshal(domainXML)
-	if err != nil {
-		return "", err
-	}
-
-	domcfg.Name = name
-
-	changed, err := domcfg.Marshal()
-	if err != nil {
-		return "", err
-	}
-
-	return changed, nil
-}
-
 // xmlElementCounts returns, for each distinct element tag name (local name
 // only -- "hostdev", "commandline", etc. -- namespace prefixes aren't
 // distinguished, since the same element can legitimately round-trip through
@@ -763,21 +691,19 @@ func missingXMLElements(original, rewritten string) []string {
 // function/call-site name) listing any element names missingXMLElements
 // finds went missing between original and rewritten.
 //
-// This exists because replaceDomainName, replaceDomainDiskPath, and
-// SetMetadataFields all go through a full libvirtxml.Domain
-// unmarshal-then-marshal round-trip rather than editing the XML text
-// surgically, despite their own doc comments' promise to "keep source XML
-// intact" -- any element that struct doesn't model (hostdev passthrough,
-// TPM/launchSecurity, <qemu:commandline>, and similar less-common domain
-// features) would otherwise be silently dropped on marshal with nothing to
-// indicate anything went wrong, possibly not discovered until whatever
-// that configuration was for turns out to be missing on a failed-over
-// target VM. A real, exhaustive fix would mean editing the XML text
-// surgically instead of round-tripping it through a typed struct at all --
-// a much larger, higher-risk change to the single most-used code path in
-// this tool (every disk's target definition, every sync) that isn't
-// something to take on without the ability to test it against a wide
-// range of real, complex domain definitions first.
+// It exists because replaceDomainName, replaceDomainDiskPath and
+// SetMetadataFields all used to go through a full libvirtxml.Domain
+// unmarshal-then-marshal round-trip, which silently dropped any element
+// that struct did not model -- hostdev passthrough, TPM/launchSecurity,
+// <qemu:commandline> and similar less-common features -- with nothing to
+// indicate anything had gone wrong until whatever that configuration was
+// for turned out to be missing on a failed-over target.
+//
+// That round-trip is gone: those functions now patch a parsed tree (see
+// domxml.go), so unmodelled content survives by construction rather than by
+// the struct happening to model it. This check is kept as a tripwire. It
+// should never fire again, and if it does, the patching path is losing
+// something and that is worth hearing about at once.
 //
 // This check can't tell a genuine loss apart from a legitimate omission
 // (an empty or default-valued element the struct correctly normalizes
@@ -861,37 +787,15 @@ func SetMetadataFields(domainXML string, updates map[string]string, removeFields
 		}
 	}
 
-	domcfg := &libvirtxml.Domain{}
-	err := domcfg.Unmarshal(domainXML)
+	changed, err := setMetadataFieldsInDoc(domainXML, updates, removeFields...)
 	if err != nil {
 		return "", err
 	}
 
-	current := map[string]string{}
-	if domcfg.Metadata != nil {
-		current = allMetadataFields(domcfg.Metadata.XML)
-	}
-	for field, value := range updates {
-		current[field] = value
-	}
-	for _, field := range removeFields {
-		delete(current, field)
-	}
-	entry := buildMetadataEntry(current)
-
-	if domcfg.Metadata == nil {
-		domcfg.Metadata = &libvirtxml.DomainMetadata{XML: entry}
-	} else if vmsyncBlockRe.MatchString(domcfg.Metadata.XML) {
-		domcfg.Metadata.XML = vmsyncBlockRe.ReplaceAllLiteralString(domcfg.Metadata.XML, entry)
-	} else {
-		domcfg.Metadata.XML += entry
-	}
-
-	changed, err := domcfg.Marshal()
-	if err != nil {
-		return "", err
-	}
-
+	// Kept as a tripwire rather than removed. It should now never fire --
+	// nothing here reconstructs the document any more -- so if it ever does,
+	// something in the patching path is dropping content and that is worth
+	// hearing about immediately.
 	warnIfXMLElementsDropped("SetMetadataFields", domainXML, changed)
 	return changed, nil
 }
@@ -1458,21 +1362,6 @@ func allMetadataFields(metadataXML string) map[string]string {
 // into DomainDefineXML would see a generic, misleading "empty/malformed
 // XML" failure from libvirt with no indication the actual problem was here,
 // not there.
-func stripDomainUUID(domainXML string) (string, error) {
-	domcfg := &libvirtxml.Domain{}
-	if err := domcfg.Unmarshal(domainXML); err != nil {
-		return "", fmt.Errorf("parse domain xml to strip uuid: %w", err)
-	}
-
-	domcfg.UUID = ""
-	changed, err := domcfg.Marshal()
-	if err != nil {
-		return "", fmt.Errorf("re-marshal domain xml after stripping uuid: %w", err)
-	}
-
-	return changed, nil
-}
-
 // ListManagedCheckpoints lists dom's vmsync-managed checkpoints. Callers
 // (NextCheckpointName's chain-parent selection, DeleteAllManagedCheckpoints'
 // -reinit cleanup) act on the assumption that this list is complete -- a

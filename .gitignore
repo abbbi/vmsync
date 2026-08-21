@@ -1,0 +1,4 @@
+# Generated at build time, never committed: the Dockerfiles run
+# "go mod init vmsync && go mod tidy" themselves and explicitly exclude
+# these from the build context. Building locally recreates them.
+/go.sum

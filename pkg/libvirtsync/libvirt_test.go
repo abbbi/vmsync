@@ -875,6 +875,125 @@ func TestUpdateSyncMetadataRecordsWhetherTheSourceWasStopped(t *testing.T) {
 	}
 }
 
+// richDomainXML deliberately contains what a typed model is most likely not
+// to describe: a foreign namespace with a prefix, passthrough hardware, a
+// TPM, a comment, and vendor metadata belonging to another tool.
+const richDomainXML = `<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
+  <name>web01</name>
+  <uuid>4dea22b3-1d52-d8f3-2516-782e98ab3fa0</uuid>
+  <!-- provisioned by hand, do not regenerate -->
+  <metadata>
+    <other:tool xmlns:other="http://example.org/other/1.0" note="not ours"/>
+  </metadata>
+  <memory unit='KiB'>4194304</memory>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' discard='unmap'/>
+      <source file='/data/web01.qcow2'/>
+      <backingStore type='file'>
+        <source file='/data/base.qcow2'/>
+      </backingStore>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='/isos/seed.iso'/>
+      <target dev='sda' bus='sata'/>
+    </disk>
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <source><address domain='0x0000' bus='0x03' slot='0x00' function='0x0'/></source>
+    </hostdev>
+    <tpm model='tpm-crb'><backend type='emulator' version='2.0'/></tpm>
+  </devices>
+  <qemu:commandline>
+    <qemu:arg value='-set'/>
+    <qemu:env name='FOO' value='bar'/>
+  </qemu:commandline>
+</domain>`
+
+// TestDomainRewritesArePreserving is the guarantee the whole patching
+// approach exists for: the XML handed to DomainDefineXML is the source's
+// document with targeted edits, not a reconstruction.
+//
+// The failure this prevents is not cosmetic. The replica's definition is
+// what boots when the replica is promoted, so an element dropped here is a
+// DR failure discovered at the worst possible moment -- and silently, since
+// the sync itself succeeds.
+func TestDomainRewritesArePreserving(t *testing.T) {
+	out, err := replaceDomainName(richDomainXML, "web01-replica")
+	if err != nil {
+		t.Fatalf("replaceDomainName: %v", err)
+	}
+	out, err = stripDomainUUID(out)
+	if err != nil {
+		t.Fatalf("stripDomainUUID: %v", err)
+	}
+	out, err = replaceDomainDiskPath(out, "/replicas", map[string]string{
+		"/data/web01.qcow2": "/data/web01.qcow2",
+	})
+	if err != nil {
+		t.Fatalf("replaceDomainDiskPath: %v", err)
+	}
+	out, err = SetMetadataFields(out, map[string]string{
+		MetadataFieldReplicationRole: RoleTarget,
+		MetadataFieldLastCheckpoint:  "vmsync-cpt-000003",
+	})
+	if err != nil {
+		t.Fatalf("SetMetadataFields: %v", err)
+	}
+
+	// Nothing lost. backingStore is removed on purpose, so it is excluded
+	// from the comparison the same way the production check excludes it.
+	if missing := missingXMLElements(richDomainXML, out); len(missing) > 0 {
+		t.Errorf("elements lost through the rewrite chain: %v", missing)
+	}
+
+	// The prefixed namespace is what a typed round-trip mangled worst, and
+	// what libvirt actually reads to apply qemu passthrough arguments.
+	for _, want := range []string{
+		`xmlns:qemu=`, `<qemu:commandline>`, `<qemu:arg`, `<qemu:env`,
+		`<hostdev`, `<tpm`, `provisioned by hand`, `other:tool`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rewritten domain no longer contains %q:\n%s", want, out)
+		}
+	}
+
+	// And the edits actually happened.
+	if !strings.Contains(out, "web01-replica") {
+		t.Error("the domain was not renamed")
+	}
+	if strings.Contains(out, "4dea22b3-1d52-d8f3-2516-782e98ab3fa0") {
+		t.Error("the uuid was not stripped; libvirt would refuse a duplicate")
+	}
+	if !strings.Contains(out, "/replicas/web01.qcow2") {
+		t.Error("the replicated disk path was not rewritten")
+	}
+	if strings.Contains(out, "/data/base.qcow2") {
+		t.Error("the backing chain survived; the target has no such file")
+	}
+	// A cdrom is not replicated, so its source must be left exactly as it was.
+	if !strings.Contains(out, "/isos/seed.iso") {
+		t.Error("the cdrom source was rewritten; it is not a replicated disk")
+	}
+	// Another tool's metadata sits alongside vmsync's, untouched.
+	if !strings.Contains(out, `note="not ours"`) && !strings.Contains(out, `note='not ours'`) {
+		t.Error("another tool's metadata was lost")
+	}
+	if got, _ := ParseMetadataField(out, MetadataFieldReplicationRole); got != RoleTarget {
+		t.Errorf("replication_role = %q, want %q", got, RoleTarget)
+	}
+}
+
+// TestReplaceDomainDiskPathRefusesAnUnresolvedDisk: writing a live overlay
+// path into the target's definition would point the replica at a file that
+// was never copied there.
+func TestReplaceDomainDiskPathRefusesAnUnresolvedDisk(t *testing.T) {
+	if _, err := replaceDomainDiskPath(richDomainXML, "/replicas", map[string]string{}); err == nil {
+		t.Fatal("accepted a replicated disk with no resolved root source")
+	}
+}
+
 // TestMergeMetadataFields covers the fragment-level merge that replaced the
 // whole-domain round-trip. Same contract as SetMetadataFields -- preserve
 // what you were not told about, removals win over updates -- but with
