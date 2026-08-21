@@ -192,6 +192,13 @@ type ReportDomain struct {
 	PromotedAtUnix int64  `json:"promoted_at_unix,omitempty"`
 	PromotedBy     string `json:"promoted_by,omitempty"`
 	PromotionMode  string `json:"promotion_mode,omitempty"`
+	// LastReplicatedAtUnix / LastReplicatedTo are the SOURCE side of the
+	// same fact LastSyncUnix records on a target: when this VM last
+	// replicated, and where to. Reported so the question can be answered
+	// from either host, which is the only kind of answer a disaster leaves
+	// available.
+	LastReplicatedAtUnix int64  `json:"last_replicated_at_unix,omitempty"`
+	LastReplicatedTo     string `json:"last_replicated_to,omitempty"`
 	// Disks is what this domain occupies on this host's storage: the
 	// allocated figure, not the apparent one, because that is what a copy
 	// actually costs. Paired with Report.Filesystems it answers "is there

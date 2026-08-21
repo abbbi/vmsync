@@ -142,8 +142,8 @@ type syncConfig struct {
 	// step is not conceptually tied to that one flag.
 	ReplacedDiskAction string
 
-	SourceURI string
-	TargetURI string
+	SourceURI      string
+	TargetURI      string
 	SourceDomain   string
 	TargetDomain   string
 	TargetDiskPath string
@@ -171,10 +171,10 @@ type syncConfig struct {
 	KnownHosts    string
 	SSHTimeoutSec int
 
-	Start               bool
-	Reinit              bool
-	ReinitAfterFailures int
-	Verify              string
+	Start                  bool
+	Reinit                 bool
+	ReinitAfterFailures    int
+	Verify                 string
 	IgnoreExternalSnapshot bool
 	IODepth                int
 
@@ -2228,6 +2228,22 @@ func run(cfg syncConfig) (runErr error) {
 	// the target further down so a later failover can state its data-loss
 	// window honestly instead of measuring from the end of the copy.
 	checkpointAt := time.Now()
+	// Whether the SOURCE was already stopped at this instant, recorded on the
+	// target further down. A stopped source cannot write after the checkpoint,
+	// which makes the replica provably complete -- the only honest basis for a
+	// promotion to report zero data loss, as opposed to trusting that whoever
+	// typed -promote-mode=planned really did run a final sync.
+	//
+	// SHUTOFF specifically, not DomainActive's "not shut off": a PAUSED source
+	// is not writing right now but can be resumed the moment this run ends, so
+	// treating it as stopped would license a zero that a resume immediately
+	// falsifies.
+	sourceStoppedAtCheckpoint := false
+	if state, _, stateErr := srcDom.GetState(); stateErr == nil {
+		sourceStoppedAtCheckpoint = state == libvirt.DOMAIN_SHUTOFF
+	} else {
+		trace.Warning("could not read the source domain's state at checkpoint time; this replica will not claim a verified zero data-loss window", "vm", cfg.SourceDomain, "error", stateErr)
+	}
 	if err := libvirtsync.CreateCheckpoint(srcDom, checkpointName, parent, qcowDisks); err != nil {
 		// A full sync (parent == "") has no earlier checkpoint to fall back
 		// on -- without a checkpoint at all there's no bitmap to establish a
@@ -2980,7 +2996,7 @@ func run(cfg syncConfig) (runErr error) {
 
 	trace.Info("Adding metadata information")
 	var newXML string
-	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint, util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName), cfg.SourceDomain, currentTargetRole, checkpointAt.Unix())
+	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint, util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName), cfg.SourceDomain, currentTargetRole, checkpointAt.Unix(), sourceStoppedAtCheckpoint)
 	if err != nil {
 		// UpdateSyncMetadata is a pure in-memory XML transformation -- no
 		// network or libvirt call involved -- so a failure here is almost
@@ -3033,7 +3049,7 @@ func run(cfg syncConfig) (runErr error) {
 	// unlike replica_source on the target (set via UpdateSyncMetadata
 	// above), which shares this same non-fatal treatment for the same
 	// reason.
-	if err := libvirtsync.RecordReplicaTarget(srcMgr, cfg.SourceDomain, util.ReplicaHost(cfg.TargetURI, cfg.LocalHostName), cfg.TargetDomain); err != nil {
+	if err := libvirtsync.RecordReplicaTarget(srcMgr, cfg.SourceDomain, util.ReplicaHost(cfg.TargetURI, cfg.LocalHostName), cfg.TargetDomain, time.Now()); err != nil {
 		trace.Warning("failed to record replica_targets metadata on source domain", "domain", cfg.SourceDomain, "error", err)
 	}
 

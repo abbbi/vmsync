@@ -118,6 +118,34 @@ const (
 	// written by an older vmsync, which pkg/failover then reports as a lower
 	// bound rather than as a precise figure.
 	MetadataFieldCheckpointAt = "checkpoint_at"
+
+	// MetadataFieldSourceStoppedAtSync is written on the TARGET: the source
+	// domain was already shut off when the checkpoint behind this replica
+	// was taken.
+	//
+	// It is the only honest basis for saying a failover loses nothing. A
+	// stopped source cannot write, so the replica is complete as of that
+	// instant -- as opposed to "-promote-mode=planned was passed", which is
+	// a word the caller chose and evidence of nothing. Absent whenever the
+	// source was running, so a later incremental from a running source
+	// clears a stale one.
+	MetadataFieldSourceStoppedAtSync = "source_stopped_at_sync"
+
+	// Written on the SOURCE: when it last replicated successfully, and to
+	// where.
+	//
+	// Distinct from last_sync_timestamp, which lives on a TARGET and means
+	// "when was I last written". Same fact from two sides, and giving them
+	// one name would make a domain that is both a source and a target
+	// ambiguous about which it was reporting.
+	//
+	// These exist for the disaster case: standing at one host with the other
+	// unreachable, the question is "when did this VM last replicate, and
+	// where to" -- and before this the answer lived exclusively on the
+	// machine you cannot reach. With a source fanning out to several
+	// targets, it records the most recent one.
+	MetadataFieldLastReplicatedAt = "last_replicated_at"
+	MetadataFieldLastReplicatedTo = "last_replicated_to"
 )
 
 // Replication roles, as stored in MetadataFieldReplicationRole. An empty or
@@ -168,6 +196,9 @@ var metadataFieldOrder = []string{
 	MetadataFieldPromotedFrom,
 	MetadataFieldPromotionMode,
 	MetadataFieldCheckpointAt,
+	MetadataFieldSourceStoppedAtSync,
+	MetadataFieldLastReplicatedAt,
+	MetadataFieldLastReplicatedTo,
 }
 
 var vmsyncBlockRe = regexp.MustCompile(`(?s)<vmsync:vmsync[^>]*>.*?</vmsync:vmsync>`)
@@ -886,7 +917,7 @@ func SetMetadataFields(domainXML string, updates map[string]string, removeFields
 // sync; empty means the target had no role, and the field is then removed
 // rather than inherited, preserving the property that vmsync never assigns
 // a role on its own.
-func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetRole string, checkpointAtUnix int64) (string, error) {
+func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetRole string, checkpointAtUnix int64, sourceStopped bool) (string, error) {
 	updates := map[string]string{
 		MetadataFieldLastCheckpoint: checkpoint,
 		MetadataFieldLastSync:       strconv.FormatInt(time.Now().Unix(), 10),
@@ -900,6 +931,14 @@ func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetR
 		MetadataFieldPromotedBy,
 		MetadataFieldPromotedFrom,
 		MetadataFieldPromotionMode,
+	}
+	// Recorded only when true, and actively removed otherwise: a stale "the
+	// source was stopped" from an earlier sync would make a later promotion
+	// claim a verified zero it has no right to.
+	if sourceStopped {
+		updates[MetadataFieldSourceStoppedAtSync] = "1"
+	} else {
+		remove = append(remove, MetadataFieldSourceStoppedAtSync)
 	}
 	if targetRole == "" {
 		remove = append(remove, MetadataFieldReplicationRole)
@@ -962,7 +1001,7 @@ func appendReplicaTarget(list, entry string) string {
 // persistent definition that already matches by UUID directly, the same
 // safe, already-established pattern RecordTargetSyncFailure uses to patch
 // a live target's failure_count.
-func RecordReplicaTarget(mgr *Manager, sourceDomainName, targetHost, targetDomain string) error {
+func RecordReplicaTarget(mgr *Manager, sourceDomainName, targetHost, targetDomain string, at time.Time) error {
 	dom, err := mgr.Conn.LookupDomainByName(sourceDomainName)
 	if err != nil {
 		return fmt.Errorf("look up source domain %s to record replica target: %w", sourceDomainName, err)
@@ -978,28 +1017,21 @@ func RecordReplicaTarget(mgr *Manager, sourceDomainName, targetHost, targetDomai
 	existing, _ := ParseMetadata(domXML, MetadataFieldReplicaTargets)
 	updatedList := appendReplicaTarget(existing, entry)
 
-	staleFieldPresent := false
-	for _, field := range []string{MetadataFieldLastCheckpoint, MetadataFieldLastSync, MetadataFieldFailureCount} {
-		if v, _ := ParseMetadata(domXML, field); v != "" {
-			staleFieldPresent = true
-			break
-		}
-	}
-	if updatedList == existing && !staleFieldPresent {
-		// This target is already recorded and there's no stale
-		// target-role metadata left to strip -- checked BEFORE calling
-		// SetMetadataFields specifically to skip both its XML round-trip
-		// and the redefine below once steady state is reached, rather
-		// than comparing the round-tripped XML against the original
-		// afterward (a full libvirtxml unmarshal-then-marshal cycle
-		// essentially never reproduces its input byte-for-byte, even when
-		// nothing semantic changed, so that comparison would never
-		// actually skip anything).
-		return nil
-	}
-
+	// This used to return early once the target was already recorded and no
+	// stale target-role fields remained, to skip an XML round-trip and a
+	// redefine per sync. That shortcut is gone, deliberately: the whole
+	// point of last_replicated_at is that it moves on EVERY successful sync,
+	// so there is no steady state left to skip.
+	//
+	// The cost is one source-side redefine per run -- the same order as the
+	// redefine the target already takes -- bought against being able to
+	// answer "when did this VM last replicate, and where to" from the source
+	// host alone, which is exactly the question a disaster leaves you with
+	// when the other site is unreachable.
 	updatedXML, err := SetMetadataFields(domXML, map[string]string{
-		MetadataFieldReplicaTargets: updatedList,
+		MetadataFieldReplicaTargets:   updatedList,
+		MetadataFieldLastReplicatedAt: strconv.FormatInt(at.Unix(), 10),
+		MetadataFieldLastReplicatedTo: entry,
 	}, MetadataFieldLastCheckpoint, MetadataFieldLastSync, MetadataFieldFailureCount)
 	if err != nil {
 		return fmt.Errorf("update replica_targets metadata: %w", err)

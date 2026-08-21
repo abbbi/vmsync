@@ -43,6 +43,9 @@ type FailoverState struct {
 	ReplicaTargets   []string
 	FailureCount     int
 	HasCheckpoints   bool
+	// SourceStoppedAtSync: the source was already shut off when this
+	// replica's checkpoint was taken, so nothing was written after it.
+	SourceStoppedAtSync bool
 }
 
 // ReadFailoverState collects everything a promotion or an inversion needs
@@ -83,6 +86,9 @@ func ReadFailoverState(mgr *Manager, domainName string) (FailoverState, error) {
 	st.ReplicaSource, _ = ParseMetadata(domXML, MetadataFieldReplicaSource)
 	st.LastSyncUnix = parseUnix(domXML, MetadataFieldLastSync)
 	st.CheckpointAtUnix = parseUnix(domXML, MetadataFieldCheckpointAt)
+	if v, err := ParseMetadata(domXML, MetadataFieldSourceStoppedAtSync); err == nil && v != "" {
+		st.SourceStoppedAtSync = true
+	}
 
 	if v, err := ParseMetadata(domXML, MetadataFieldFailureCount); err == nil && v != "" {
 		if n, convErr := strconv.Atoi(v); convErr == nil {

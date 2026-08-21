@@ -86,6 +86,16 @@ type TargetState struct {
 	SyncInFlight bool
 	// Active is the domain's current runtime state.
 	Active bool
+	// SourceStoppedAtSync records that the SOURCE domain was already shut
+	// off when the checkpoint behind this replica was taken.
+	//
+	// This is the only honest basis for claiming a failover loses nothing.
+	// A stopped source cannot have written anything after that instant, so
+	// the replica is complete -- not "probably complete because someone
+	// followed the right procedure". It is written by the sync itself, on
+	// the target, so a promotion can read it locally without contacting the
+	// site it may be failing away from.
+	SourceStoppedAtSync bool
 }
 
 // PromotePlan is what to do, decided before anything is written.
@@ -120,6 +130,14 @@ type DataLoss struct {
 	Seconds int64
 	// LowerBoundOnly marks the understating case above.
 	LowerBoundOnly bool
+	// Verified means the figure rests on evidence about the DATA rather than
+	// on arithmetic against the current clock: the source was recorded as
+	// stopped when the replica's checkpoint was taken, so nothing could have
+	// been written after it.
+	//
+	// Only a verified zero is a real zero. An unverified one would be a
+	// claim about a procedure somebody says they followed.
+	Verified bool
 	// Reason explains an unknown, for display.
 	Reason string
 	// ClockSkew is set when the arithmetic produced a negative interval,
@@ -135,6 +153,9 @@ func (d DataLoss) String() string {
 			return "unknown (" + d.Reason + ")"
 		}
 		return "unknown"
+	}
+	if d.Verified && d.Seconds == 0 {
+		return "none (the source was already stopped when this replica's checkpoint was taken)"
 	}
 	s := fmt.Sprintf("%ds", d.Seconds)
 	if d.LowerBoundOnly {
@@ -223,6 +244,18 @@ func AssessPromote(st TargetState, opt PromoteOptions) (PromotePlan, error) {
 	plan.WriteMetadata = true
 	plan.PromotedFrom = st.ReplicaSource
 	plan.DataLoss = computeDataLoss(st, opt)
+
+	// A planned failover is supposed to be: stop the source, run one last
+	// sync, then promote. If that happened, the replica's checkpoint was
+	// taken against a stopped source and the window above is a verified
+	// zero. When it is not, the sequence was not completed -- most often
+	// because the final sync was skipped -- and the operator is told rather
+	// than left with a figure that quietly means something else.
+	if opt.Mode == ModePlanned && !plan.DataLoss.Verified {
+		plan.Notes = append(plan.Notes,
+			"this was requested as a planned failover, but the replica's checkpoint was taken while the source was still running: "+
+				"no final sync ran after the source stopped, so the window below is measured against the clock and covers writes that were never replicated")
+	}
 	return plan, nil
 }
 
@@ -262,11 +295,18 @@ func evidenceProblems(st TargetState) []string {
 // delta, hours for a full sync over a WAN, and biased in the unsafe
 // direction exactly when the difference is largest.
 func computeDataLoss(st TargetState, opt PromoteOptions) DataLoss {
-	if opt.Mode == ModePlanned {
-		// The source was shut down before this, so nothing was written
-		// after the last sync. Nothing was lost, and that is a fact about
-		// the procedure rather than an arithmetic result.
-		return DataLoss{Known: true, Seconds: 0}
+	// A source that was already stopped when the checkpoint was taken could
+	// not have written anything afterwards, so the replica is complete.
+	//
+	// This deliberately does NOT key off Mode. Mode is a label the caller
+	// passes -- anyone can type -promote-mode=planned -- and an earlier
+	// version of this function returned a hard zero for it on the strength
+	// of that word alone. A shutdown with no final sync after it, or the
+	// flag passed with no shutdown at all, then reported "0s lost" while
+	// discarding everything written since the last scheduled run. The
+	// procedure is worth recording for the audit trail; it is not evidence.
+	if st.SourceStoppedAtSync {
+		return DataLoss{Known: true, Verified: true, Seconds: 0}
 	}
 
 	from, lowerBound := st.CheckpointAtUnix, false

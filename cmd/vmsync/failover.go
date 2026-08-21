@@ -115,6 +115,11 @@ func runPromote(ctx context.Context, cfg syncConfig) error {
 		// could not have been acquired otherwise.
 		SyncInFlight: false,
 		Active:       st.Active,
+		// Written by the sync that produced this replica: the source was
+		// already stopped when its checkpoint was taken, so nothing was
+		// written afterwards. This is what turns "planned failover" from a
+		// claim into a measurement.
+		SourceStoppedAtSync: st.SourceStoppedAtSync,
 	}, failover.PromoteOptions{
 		Mode:    mode,
 		Start:   cfg.Start,

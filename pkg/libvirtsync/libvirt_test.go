@@ -741,7 +741,7 @@ func TestAllMetadataFieldsNoBlock(t *testing.T) {
 func TestUpdateSyncMetadata(t *testing.T) {
 	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
 	before := time.Now().Unix()
-	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "source-host.example.org", "sourcevm", "", 1700000000)
+	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "source-host.example.org", "sourcevm", "", 1700000000, false)
 	after := time.Now().Unix()
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
@@ -804,7 +804,7 @@ func TestUpdateSyncMetadataDoesNotInheritSourceSideFields(t *testing.T) {
 		t.Fatalf("building source xml: %v", err)
 	}
 
-	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", "", 1700000000)
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", "", 1700000000, false)
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
@@ -841,12 +841,37 @@ func TestUpdateSyncMetadataPreservesTheTargetsOwnRole(t *testing.T) {
 		t.Fatalf("building source xml: %v", err)
 	}
 
-	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", RoleTarget, 1700000000)
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", RoleTarget, 1700000000, false)
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
 	if got, _ := ParseMetadataField(out, MetadataFieldReplicationRole); got != RoleTarget {
 		t.Errorf("replication_role = %q, want %q -- the target's own role, not the source's", got, RoleTarget)
+	}
+}
+
+// TestUpdateSyncMetadataRecordsWhetherTheSourceWasStopped: this flag is the
+// only evidence a promotion has that a replica is complete, so a stale one
+// would let a later failover claim a verified zero it has no right to.
+func TestUpdateSyncMetadataRecordsWhetherTheSourceWasStopped(t *testing.T) {
+	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
+
+	stopped, err := UpdateSyncMetadata(base, "vmsync-cpt-000001", "src", "testvm", "", 1700000000, true)
+	if err != nil {
+		t.Fatalf("UpdateSyncMetadata: %v", err)
+	}
+	if got, _ := ParseMetadataField(stopped, MetadataFieldSourceStoppedAtSync); got == "" {
+		t.Error("a sync taken against a stopped source recorded nothing")
+	}
+
+	// A later incremental from a RUNNING source must clear it, or the
+	// replica keeps claiming a completeness it no longer has.
+	running, err := UpdateSyncMetadata(stopped, "vmsync-cpt-000002", "src", "testvm", "", 1700000100, false)
+	if err != nil {
+		t.Fatalf("UpdateSyncMetadata: %v", err)
+	}
+	if got, _ := ParseMetadataField(running, MetadataFieldSourceStoppedAtSync); got != "" {
+		t.Errorf("%s = %q after a sync from a running source, want it cleared", MetadataFieldSourceStoppedAtSync, got)
 	}
 }
 

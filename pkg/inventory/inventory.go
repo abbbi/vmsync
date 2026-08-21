@@ -81,6 +81,17 @@ type Domain struct {
 	PromotedBy     string `json:"promoted_by,omitempty"`
 	PromotionMode  string `json:"promotion_mode,omitempty"`
 
+	// LastReplicatedAtUnix / LastReplicatedTo are written on a SOURCE: when
+	// it last replicated successfully, and to where. Distinct from
+	// LastSyncUnix, which lives on a TARGET and means "when was I last
+	// written" -- the same fact seen from the two sides.
+	//
+	// They exist for the disaster case: from the source host alone, with the
+	// other site unreachable, the question is when this VM last replicated
+	// and where to.
+	LastReplicatedAtUnix int64  `json:"last_replicated_at_unix,omitempty"`
+	LastReplicatedTo     string `json:"last_replicated_to,omitempty"`
+
 	// Disks is what this domain occupies on this host's storage. Reported
 	// so an operator can answer "is there room to keep the old copy?"
 	// before an inversion, rather than after the disk fills.
@@ -336,6 +347,12 @@ func describe(dom *libvirt.Domain) (Domain, error) {
 	d.LastCheckpoint, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldLastCheckpoint)
 	d.ReplicaSource, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldReplicaSource)
 	d.PromotedFrom, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldPromotedFrom)
+	d.LastReplicatedTo, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldLastReplicatedTo)
+	if raw, err := libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldLastReplicatedAt); err == nil && raw != "" {
+		if n, convErr := strconv.ParseInt(raw, 10, 64); convErr == nil {
+			d.LastReplicatedAtUnix = n
+		}
+	}
 	d.PromotedBy, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldPromotedBy)
 	d.PromotionMode, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldPromotionMode)
 	if raw, err := libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldPromotedAt); err == nil && raw != "" {

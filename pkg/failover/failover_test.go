@@ -169,15 +169,61 @@ func TestAlreadyPromotedStillStarts(t *testing.T) {
 }
 
 func TestDataLossWindow(t *testing.T) {
-	t.Run("planned failover loses nothing", func(t *testing.T) {
-		// The source was shut down first, so this is a fact about the
-		// procedure, not an arithmetic result from two clocks.
-		plan, err := AssessPromote(healthyTarget(), PromoteOptions{Mode: ModePlanned, NowUnix: nowUnix})
+	t.Run("a stopped source at checkpoint time is a verified zero", func(t *testing.T) {
+		// The only honest basis for claiming nothing was lost: the source
+		// could not write after it stopped, so the replica is complete.
+		st := healthyTarget()
+		st.SourceStoppedAtSync = true
+		plan, err := AssessPromote(st, PromoteOptions{Mode: ModePlanned, NowUnix: nowUnix})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !plan.DataLoss.Known || plan.DataLoss.Seconds != 0 {
-			t.Errorf("data loss = %s, want a known 0", plan.DataLoss)
+		if !plan.DataLoss.Known || plan.DataLoss.Seconds != 0 || !plan.DataLoss.Verified {
+			t.Errorf("data loss = %+v, want a verified 0", plan.DataLoss)
+		}
+		if len(plan.Notes) != 0 {
+			t.Errorf("a correctly executed planned failover produced warnings: %v", plan.Notes)
+		}
+	})
+
+	// TestDataLossWindow/planned mode alone is not evidence is the bug this
+	// replaced: -promote-mode=planned is a string anybody can pass, and the
+	// old code returned a hard zero for it. A shutdown with no final sync
+	// after it -- or the flag with no shutdown at all -- then reported "0s
+	// lost" while discarding everything written since the last scheduled
+	// run.
+	t.Run("planned mode alone is not evidence", func(t *testing.T) {
+		st := healthyTarget() // source was still running at checkpoint time
+		plan, err := AssessPromote(st, PromoteOptions{Mode: ModePlanned, NowUnix: nowUnix})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if plan.DataLoss.Seconds == 0 {
+			t.Error("claimed zero data loss from the mode label alone")
+		}
+		if plan.DataLoss.Verified {
+			t.Error("marked an unverified figure as verified")
+		}
+		if plan.DataLoss.Seconds != 360 {
+			t.Errorf("data loss = %ds, want the real 360s window to the checkpoint", plan.DataLoss.Seconds)
+		}
+		// And it must say so, not just quietly report a different number.
+		if len(plan.Notes) == 0 {
+			t.Error("no note explaining that the planned sequence was not completed")
+		}
+	})
+
+	t.Run("a stopped source is a verified zero in forced mode too", func(t *testing.T) {
+		// The evidence is about the DATA, not the procedure, so the label
+		// the caller passed is irrelevant to it.
+		st := healthyTarget()
+		st.SourceStoppedAtSync = true
+		plan, err := AssessPromote(st, PromoteOptions{Mode: ModeForced, NowUnix: nowUnix})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !plan.DataLoss.Verified || plan.DataLoss.Seconds != 0 {
+			t.Errorf("data loss = %+v, want a verified 0", plan.DataLoss)
 		}
 	})
 
