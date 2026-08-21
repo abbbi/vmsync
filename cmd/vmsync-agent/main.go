@@ -230,14 +230,23 @@ func run(cfg agentConfig) error {
 		return reportOnce(ctx, client, cfg, cached)
 	}
 
-	// Three independent loops sharing the cached configuration. Reporting is
+	// Four independent loops sharing the cached configuration. Reporting is
 	// on a timer; polling blocks in a long poll and returns as soon as the
 	// UI has something to say, so an operator's change lands in seconds
 	// without the agent accepting inbound connections; the scheduler runs
 	// whatever the cached configuration says, including while the UI is
-	// unreachable.
+	// unreachable; and the operations loop executes one-shot instructions.
 	state := &sharedState{cached: cached}
 	var wg sync.WaitGroup
+
+	// Loaded before anything can execute. A ledger that failed to load
+	// would look like an agent that has never done anything, which would
+	// re-run every operation the UI is still publishing -- so this is
+	// fatal rather than best-effort.
+	ledger := newOperationLedger(cfg.StateDir)
+	if err := ledger.Load(); err != nil {
+		return fmt.Errorf("load the operation ledger: %w", err)
+	}
 
 	var sched *Scheduler
 	if !cfg.NoSchedule {
@@ -257,8 +266,17 @@ func run(cfg agentConfig) error {
 		go func() { defer wg.Done(); metricsLoop(ctx, cfg, state, sched, cfg.metrics, false) }()
 	}
 
+	// Started regardless of -no-schedule. That flag means "do not run the
+	// schedule", and a DR-site target host is exactly the machine most
+	// likely to carry it -- it has no schedule of its own, so nobody ever
+	// removes it -- while also being the machine a failover must run on.
+	// Tying the two together would deliver a promotion to a visibly healthy
+	// agent that silently ignores it.
+	wg.Add(1)
+	go func() { defer wg.Done(); operationsLoop(ctx, cfg, state, ledger) }()
+
 	wg.Add(2)
-	go func() { defer wg.Done(); reportLoop(ctx, client, cfg, state, sched) }()
+	go func() { defer wg.Done(); reportLoop(ctx, client, cfg, state, sched, ledger) }()
 	go func() { defer wg.Done(); pollLoop(ctx, client, store, state, cfg.metrics) }()
 	wg.Wait()
 	return nil
@@ -321,7 +339,10 @@ func ensureEnrolled(ctx context.Context, client *Client, store Store, cfg agentC
 }
 
 func reportOnce(ctx context.Context, client *Client, cfg agentConfig, cached CachedConfig) error {
-	report, err := buildReport(cfg, cached, nil)
+	// nil ledger: -once is an install check, and re-reporting stored
+	// operation results from a one-shot invocation would acknowledge work
+	// the daemon has not been running to do.
+	report, err := buildReport(cfg, cached, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -332,10 +353,10 @@ func reportOnce(ctx context.Context, client *Client, cfg agentConfig, cached Cac
 	return nil
 }
 
-func reportLoop(ctx context.Context, client *Client, cfg agentConfig, state *sharedState, sched *Scheduler) {
+func reportLoop(ctx context.Context, client *Client, cfg agentConfig, state *sharedState, sched *Scheduler, ledger *operationLedger) {
 	for {
 		cached := state.get()
-		report, err := buildReport(cfg, cached, sched)
+		report, err := buildReport(cfg, cached, sched, ledger)
 		if err != nil {
 			// A libvirt failure is worth logging loudly but is not fatal:
 			// libvirtd restarts, and an agent that exited would then need
@@ -431,7 +452,7 @@ func pollLoop(ctx context.Context, client *Client, store Store, state *sharedSta
 }
 
 // buildReport inventories the local host and assesses every domain.
-func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler) (Report, error) {
+func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler, ledger *operationLedger) (Report, error) {
 	mgr, err := libvirtsync.Connect(cfg.LibvirtURI)
 	if err != nil {
 		return Report{}, fmt.Errorf("connect to %s: %w", cfg.LibvirtURI, err)
@@ -460,6 +481,14 @@ func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler) (Report
 	}
 	if sched != nil {
 		report.Syncs = sched.Results()
+	}
+	if ledger != nil {
+		// Every stored result, on every report -- not just newly finished
+		// ones. The UI removing an operation from the config is what
+		// acknowledges it, and the ledger drops the record once that
+		// happens, so this list is self-limiting and a single lost report
+		// costs nothing.
+		report.OperationResults = ledger.Results()
 	}
 
 	for _, d := range domains {

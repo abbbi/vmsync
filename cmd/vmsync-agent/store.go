@@ -106,6 +106,17 @@ type UIConfig struct {
 	// single agent can see that four others are writing to the same target,
 	// so this is the one limit only the UI can compute.
 	TargetHostBudget map[string]int `json:"target_host_budget,omitempty"`
+
+	// Operations are one-shot instructions -- a promotion, an inversion --
+	// as opposed to the standing desired state above.
+	//
+	// They travel in the same document but are emphatically NOT the same
+	// kind of thing, and the agent treats them differently at every step:
+	// the schedule is replayed happily from the on-disk cache during a
+	// partition, while an operation is executed only from a config received
+	// over the wire in this process lifetime, exactly once ever, against a
+	// durable ledger. See operations.go.
+	Operations []Operation `json:"operations,omitempty"`
 }
 
 // DefaultUIConfig is what the agent runs with before it has ever reached
@@ -167,6 +178,22 @@ func (s Store) LoadCache() (CachedConfig, bool, error) {
 		return CachedConfig{Config: DefaultUIConfig()}, ok, err
 	}
 	c.Config = c.Config.Normalize()
+	// Operations never survive a restart, and this is where that is
+	// enforced -- structurally, rather than by everyone downstream
+	// remembering to.
+	//
+	// The cache exists so the SCHEDULE keeps running through a partition,
+	// which is desired state and safe to replay. An operation is the
+	// opposite: replaying one from disk means an agent that was killed
+	// mid-promotion, or simply restarted by a package upgrade, performs a
+	// failover from an instruction nobody re-issued and which may be hours
+	// stale. The ledger guards an operation that already ran; this guards
+	// one that never started.
+	//
+	// A still-current operation is not lost by this -- the UI keeps
+	// publishing until it sees a result, so the next poll delivers it again
+	// over the wire, where acting on it is legitimate.
+	c.Config.Operations = nil
 	return c, true, nil
 }
 

@@ -187,6 +187,37 @@ holds a credential and reports the estate's replication topology; an
 `--insecure` flag would be the first thing reached for during a certificate
 problem and the last thing anyone removed afterwards.
 
+## Operations: one-shot instructions
+
+Alongside the schedule, the UI can publish **operations** — a promotion, an
+inversion, a clean shutdown, a role change. They travel in the same document
+but are a different kind of thing, and the agent treats them differently at
+every step.
+
+The schedule is *desired state*: re-delivering it is harmless, which is what
+lets an agent keep running it through a partition. An operation is an
+*event*. Delivering it twice must not do it twice.
+
+| rule | why |
+| --- | --- |
+| Executed only from a config received over the wire in this process | The on-disk cache is replayed on restart. An operation replayed from disk is a failover from an instruction nobody re-issued. `LoadCache` strips them, so this is structural rather than a convention. |
+| Intent recorded **before** the work, in `operations.json` | Recording completion afterwards leaves the whole duration of a shutdown with no trace on disk; a crash there loses all knowledge of a half-performed failover. |
+| A record in **any** state refuses re-execution | Including `failed`. Re-running a failover that already went wrong, unattended, compounds it. A person re-issues with a fresh ID. |
+| `running` found at startup becomes `unknown`, never retried | The agent died mid-operation. What state the domain reached is something only an inspection establishes. |
+| Results re-sent on **every** report until the UI stops publishing | A result sent once is lost if that report doesn't land, leaving the UI publishing forever and the agent skipping forever — both halves working, jointly stuck. |
+| Hard expiry (`not_after_unix`) | A target host that was down when a promote was issued must not execute it days later, as a *first* delivery no replay guard covers. |
+| The UI's peer is checked against local metadata, never used as an endpoint | Everywhere else the far end comes from the VM's own `replica_source`/`replica_targets`. This is the one channel that can stop a production VM. |
+
+Operations run **one at a time**, and are **not** disabled by
+`--no-schedule`. That flag means "do not run the schedule" — and a DR target
+host is both the machine most likely to carry it and the machine a failover
+must run on. Tying the two together would deliver a promotion to a visibly
+healthy agent that silently ignores it.
+
+Every outcome is reported, including refusals. An operator watching a
+failover sit "pending" against a healthy agent, with nothing saying why, is
+the worst thing this could do.
+
 ## Standalone: a scheduler with no control plane
 
 `--standalone /path/to/schedule.json` runs the scheduler and nothing else.

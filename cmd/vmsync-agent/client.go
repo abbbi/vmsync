@@ -153,6 +153,18 @@ type Report struct {
 	// Syncs are recent scheduled-run outcomes, so an operator can see what
 	// happened without reading a journal on the host. Bounded by the agent.
 	Syncs []SyncResult `json:"syncs,omitempty"`
+	// OperationResults carries the outcome of every operation this agent
+	// still holds a ledger record for, re-sent on EVERY report until the UI
+	// stops publishing the operation.
+	//
+	// Repetition is the acknowledgement protocol, and it is deliberate. A
+	// result sent once is lost if that single report does not land -- the
+	// UI would keep publishing an operation the agent has already done and
+	// will now skip forever, a stable state in which both halves are
+	// individually working and jointly stuck. Re-sending costs a few
+	// hundred bytes a minute and removes that failure entirely, with no new
+	// endpoint on either side.
+	OperationResults []OperationResult `json:"operation_results,omitempty"`
 }
 
 // ReportDomain is one domain's state as the agent found it. Defined here
