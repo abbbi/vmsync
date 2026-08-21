@@ -120,6 +120,17 @@ const (
 // entirely in main(), which exits before run() is called. They live here
 // anyway because this type is the CLI surface, not run()'s parameter list.
 type syncConfig struct {
+	// LocalHostName is what to call THIS machine when recording it in
+	// replica_source / replica_targets / promoted_from.
+	//
+	// Only used when the relevant URI names no host, which means "this
+	// machine" -- and only for identity, never for connectivity. Empty falls
+	// back to the system hostname. It exists because the control plane
+	// correlates a pair by matching those references against the hostname an
+	// agent reports under, and an agent can be told to report under a name
+	// that is not os.Hostname().
+	LocalHostName string
+
 	// ReplacedDiskAction selects what happens to a target disk file that is
 	// about to be discarded and rebuilt: replacedDiskRename (the default) or
 	// replacedDiskDelete. See the switch in run()'s reinit block for why
@@ -236,6 +247,7 @@ func main() {
 	flag.BoolVar(&cfg.IgnoreExternalSnapshot, "ignore-external-snapshot", false, "If the source domain currently has any external disk snapshot, skip this run entirely")
 	flag.StringVar(&cfg.Verify, "verify", "", "After syncing, verify target matches source for every disk. Accepts compare|fast|online. See documentation for details. (compare|fast suspend the source domain, online does not)")
 	flag.StringVar(&cfg.UpdateRole, "update-role", "", "Set the replication role recorded in a domain's own vmsync metadata, then exit without syncing anything. Accepts "+strings.Join(libvirtsync.ValidRoles, "|")+" (\"none\" clears it). The domain is addressed with -target-uri/-target-domain regardless of which direction it currently replicates in. vmsync refuses to sync INTO a domain whose role is anything other than \"target\" or unset -- this is what stops a scheduled sync from overwriting a domain that was failed over to and then shut down for maintenance")
+	flag.StringVar(&cfg.LocalHostName, "local-host-name", "", "What to call this machine when recording it in replica_source/replica_targets/promoted_from, for a -source-uri or -target-uri that names no host. Defaults to the system hostname. Set it when something else refers to this host by a different name -- vmsync-agent passes its own --hostname here, because the control plane matches these references against the name an agent reports under")
 	flag.BoolVar(&cfg.Promote, "promote", false, "Promote the replica named by -target-uri/-target-domain to serve live: record the promotion and, with -start, boot it. Refuses unless the target actually holds a usable replica. Must be run on the target's own host")
 	flag.BoolVar(&cfg.Invert, "invert", false, "Reverse a pair's direction after a failover: -source-uri/-source-domain name the OLD source, -target-uri/-target-domain the promoted replica. Run on the old source's host")
 	flag.BoolVar(&cfg.ShutdownDomain, "shutdown-domain", false, "Shut the domain named by -target-uri/-target-domain down cleanly and pause its replication. The source half of a planned failover; must be run on that domain's own host")
@@ -2968,7 +2980,7 @@ func run(cfg syncConfig) (runErr error) {
 
 	trace.Info("Adding metadata information")
 	var newXML string
-	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint, util.HostFromURIOrLocal(cfg.SourceURI), cfg.SourceDomain, currentTargetRole, checkpointAt.Unix())
+	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint, util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName), cfg.SourceDomain, currentTargetRole, checkpointAt.Unix())
 	if err != nil {
 		// UpdateSyncMetadata is a pure in-memory XML transformation -- no
 		// network or libvirt call involved -- so a failure here is almost
@@ -3021,7 +3033,7 @@ func run(cfg syncConfig) (runErr error) {
 	// unlike replica_source on the target (set via UpdateSyncMetadata
 	// above), which shares this same non-fatal treatment for the same
 	// reason.
-	if err := libvirtsync.RecordReplicaTarget(srcMgr, cfg.SourceDomain, util.HostFromURIOrLocal(cfg.TargetURI), cfg.TargetDomain); err != nil {
+	if err := libvirtsync.RecordReplicaTarget(srcMgr, cfg.SourceDomain, util.ReplicaHost(cfg.TargetURI, cfg.LocalHostName), cfg.TargetDomain); err != nil {
 		trace.Warning("failed to record replica_targets metadata on source domain", "domain", cfg.SourceDomain, "error", err)
 	}
 

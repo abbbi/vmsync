@@ -392,6 +392,7 @@ func (s *Scheduler) buildRequest(entry ScheduleEntry) (syncPlan, error) {
 
 	plan := syncPlan{targetHost: host}
 	plan.SourceURI = s.cfg.LibvirtURI
+	plan.LocalHostName = s.cfg.Hostname
 	plan.SourceDomain = entry.VM
 	plan.TargetURI = fmt.Sprintf(s.cfg.TargetURIPattern, host)
 	plan.TargetDomain = targetDomain

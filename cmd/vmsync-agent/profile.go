@@ -234,6 +234,12 @@ type SyncRequest struct {
 	// agent-scheduled runs exactly as it does for cron-driven ones.
 	PrometheusTextfile string
 	BridgeHelperPath   string
+	// LocalHostName is the name this agent reports under, passed so the
+	// references vmsync writes into metadata match what the control plane
+	// correlates pairs by. Without it a local -source-uri records the host
+	// half as a loopback literal, which names every machine and therefore
+	// none.
+	LocalHostName string
 }
 
 // CommandArgs builds the argv for one vmsync invocation.
@@ -305,6 +311,9 @@ func (r SyncRequest) CommandArgs() []string {
 	}
 	if r.PrometheusTextfile != "" {
 		args = append(args, "-prometheus-textfile", r.PrometheusTextfile)
+	}
+	if r.LocalHostName != "" {
+		args = append(args, "-local-host-name", r.LocalHostName)
 	}
 	return args
 }

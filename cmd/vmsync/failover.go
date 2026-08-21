@@ -283,8 +283,8 @@ func runInvert(ctx context.Context, cfg syncConfig) error {
 		return fmt.Errorf("no domain named %s at %s", cfg.TargetDomain, cfg.TargetURI)
 	}
 
-	srcHost := util.HostFromURIOrLocal(cfg.SourceURI)
-	tgtHost := util.HostFromURIOrLocal(cfg.TargetURI)
+	srcHost := util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName)
+	tgtHost := util.ReplicaHost(cfg.TargetURI, cfg.LocalHostName)
 
 	plan, err := failover.AssessInvert(failover.PairState{
 		OldSource: failover.DomainEnd{

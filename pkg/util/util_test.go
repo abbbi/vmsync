@@ -20,6 +20,7 @@ package util
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 
 	"libvirt.org/go/libvirtxml"
@@ -240,4 +241,46 @@ func TestRemotePathExists(t *testing.T) {
 			t.Fatal("expected exists=true after trimming whitespace")
 		}
 	})
+}
+
+// TestReplicaHost pins the distinction that HostFromURIOrLocal does not
+// make, and getting it wrong is not cosmetic: replica_source is what the
+// control plane matches against the hostname an agent reports, so a
+// loopback literal there names every machine and therefore none.
+func TestReplicaHost(t *testing.T) {
+	for _, tc := range []struct {
+		name, uri, local, want string
+	}{
+		{"remote uri wins over the local name", "qemu+ssh://dr01/system", "prod01", "dr01"},
+		{"remote uri with a port", "qemu+ssh://dr01:2222/system", "prod01", "dr01"},
+		// The case that was broken: an agent always passes a local source
+		// URI, so this is every agent-driven pair.
+		{"local uri uses the supplied name", "qemu:///system", "prod01", "prod01"},
+		{"empty uri uses the supplied name", "", "prod01", "prod01"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ReplicaHost(tc.uri, tc.local); got != tc.want {
+				t.Errorf("ReplicaHost(%q, %q) = %q, want %q", tc.uri, tc.local, got, tc.want)
+			}
+		})
+	}
+
+	// With no name supplied it must fall back to the system hostname, never
+	// to the loopback literal HostFromURIOrLocal returns.
+	sys, err := os.Hostname()
+	if err != nil || sys == "" {
+		t.Skip("no system hostname available")
+	}
+	if got := ReplicaHost("qemu:///system", ""); got != sys {
+		t.Errorf("ReplicaHost with no local name = %q, want the system hostname %q", got, sys)
+	}
+	if got := ReplicaHost("qemu:///system", ""); got == "127.0.0.1" {
+		t.Error("fell back to the loopback literal, which is an address and not an identity")
+	}
+
+	// And the connectivity helper must keep its old behaviour: something
+	// still needs the loopback answer for a local URI.
+	if got := HostFromURIOrLocal("qemu:///system"); got != "127.0.0.1" {
+		t.Errorf("HostFromURIOrLocal(%q) = %q, want 127.0.0.1 -- connectivity semantics must not change", "qemu:///system", got)
+	}
 }

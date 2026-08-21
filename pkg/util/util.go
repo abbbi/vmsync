@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -36,12 +37,52 @@ func UriUsesSSH(raw string) bool {
 	return strings.Contains(strings.ToLower(u.Scheme), "ssh")
 }
 
+// HostFromURIOrLocal answers "what address do I CONNECT to for this URI",
+// falling back to loopback when the URI names no host because a URI with no
+// authority means this machine.
+//
+// For connectivity only. It is the wrong function for recording who a
+// replica belongs to -- see ReplicaHost, and the warning there about what
+// happens when the two are confused.
 func HostFromURIOrLocal(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil || u.Hostname() == "" {
 		return "127.0.0.1"
 	}
 	return u.Hostname()
+}
+
+// ReplicaHost answers a different question from HostFromURIOrLocal: "what
+// do I call this host when writing it down for someone else to read".
+//
+// The distinction is not academic. replica_source and replica_targets are
+// read by other hosts and by the control plane, which correlates a pair by
+// matching "<host>:<domain>" against the hostname an agent reports. A
+// connectivity answer of "127.0.0.1" is correct for opening a socket and
+// useless as an identity: written into metadata it names every machine and
+// therefore none, so every agent-driven pair fails to correlate, and
+// anything reasoning about which source a promotion displaced gets a
+// constant instead of a name.
+//
+// localName lets a caller supply the name the rest of the system knows this
+// host by -- an agent reports under a configurable hostname, and metadata
+// that disagreed with it would break the same correlation a different way.
+// Empty falls back to the system hostname.
+//
+// The loopback literal survives only as a last resort, so a host whose name
+// cannot be determined at all still writes something rather than an empty
+// reference.
+func ReplicaHost(rawURI, localName string) string {
+	if u, err := url.Parse(rawURI); err == nil && u.Hostname() != "" {
+		return u.Hostname()
+	}
+	if localName != "" {
+		return localName
+	}
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h
+	}
+	return "127.0.0.1"
 }
 
 func ConnectHostFromBindOrURI(bind, rawURI string) string {
