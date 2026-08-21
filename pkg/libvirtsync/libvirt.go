@@ -1172,13 +1172,42 @@ func SetReplicationRole(mgr *Manager, domainName, role string) (previous string,
 	}
 	previous, _ = ParseMetadata(domXML, MetadataFieldReplicationRole)
 
+	// Moving away from `promoted` takes the promotion record with it.
+	//
+	// Those fields describe a failover that is, by this very call, no longer
+	// in force. Leaving them behind lets a domain carry
+	// replication_role=target alongside a promoted_at and a promoted_from --
+	// a combination no promotion ever wrote, which anything reasoning about
+	// "was this displaced, and by whom" would read as fact. The one
+	// documented remedy for an unwanted promotion is -update-role=target
+	// (see TargetRoleAllowsSync's own message), so this is the common path,
+	// not an edge case.
+	//
+	// Only UpdateSyncMetadata and an inversion stripped them before, and the
+	// first of those runs only after a SUCCESSFUL sync -- which a domain
+	// stuck mid-recovery is precisely not getting.
 	var updatedXML string
-	if role == RoleNone {
-		updatedXML, err = SetMetadataFields(domXML, nil, MetadataFieldReplicationRole)
-	} else {
+	promotionFields := []string{
+		MetadataFieldPromotedAt,
+		MetadataFieldPromotedBy,
+		MetadataFieldPromotedFrom,
+		MetadataFieldPromotionMode,
+	}
+	switch {
+	case role == RoleNone:
+		updatedXML, err = SetMetadataFields(domXML, nil,
+			append([]string{MetadataFieldReplicationRole}, promotionFields...)...)
+	case role == RolePromoted:
+		// Promotion itself is written by -promote, which records the whole
+		// record atomically. Setting the role to promoted by hand must not
+		// invent one, but must not destroy an existing one either.
 		updatedXML, err = SetMetadataFields(domXML, map[string]string{
 			MetadataFieldReplicationRole: role,
 		})
+	default:
+		updatedXML, err = SetMetadataFields(domXML, map[string]string{
+			MetadataFieldReplicationRole: role,
+		}, promotionFields...)
 	}
 	if err != nil {
 		return "", fmt.Errorf("update replication_role metadata: %w", err)
