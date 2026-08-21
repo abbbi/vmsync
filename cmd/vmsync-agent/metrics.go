@@ -91,6 +91,14 @@ type agentMetrics struct {
 	domainTotal  int
 	domainStatus map[string]int
 	lastAttempt  map[string]int64
+
+	// uiClockSkew is how far this host's clock is from the control
+	// plane's, positive when the UI is ahead. Guarded by mu with the maps
+	// above rather than an atomic, because the warning decision needs the
+	// value and the last-warned time together.
+	uiClockSkew      time.Duration
+	uiClockSkewKnown bool
+	uiSkewWarnedAt   time.Time
 }
 
 func newAgentMetrics(version, hostname string, standalone bool) *agentMetrics {
@@ -221,6 +229,7 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 		lastAttempt[k] = v
 	}
 	domainTotal := m.domainTotal
+	uiSkew, uiSkewKnown := m.uiClockSkew, m.uiClockSkewKnown
 	domainStatus := make(map[string]int, len(m.domainStatus))
 	for k, v := range m.domainStatus {
 		domainStatus[k] = v
@@ -256,6 +265,12 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	configAge := int64(-1)
 	if cached.FetchedAtUnix > 0 {
 		configAge = now.Unix() - cached.FetchedAtUnix
+	}
+	// Emitted only once measured: a hardcoded 0 would be indistinguishable
+	// from "perfectly in sync", which is the one reading nobody should get
+	// for free.
+	if uiSkewKnown {
+		g("vmsync_agent_ui_clock_skew_seconds", "Control-plane clock minus this host's, in seconds. Timestamps written by different machines are compared throughout vmsync, so drift here makes those comparisons quietly wrong.", int64(uiSkew.Seconds()), "")
 	}
 	g("vmsync_agent_config_age_seconds", "Age of the configuration in force. -1 when it was never fetched.", configAge, "")
 
@@ -390,4 +405,44 @@ func statusCounts(domains []ReportDomain) map[string]int {
 		out[d.Status]++
 	}
 	return out
+}
+
+// clockSkewWarnAt is when a UI clock difference stops being noise.
+//
+// Generous because the HTTP Date header has one-second granularity, so a
+// reading is never better than about a second, and because a couple of
+// seconds changes no decision anyone makes. What it must catch is the case
+// where NTP has genuinely stopped working somewhere: tens of seconds or
+// more, which is enough to invert the comparison between a target's
+// last_sync and a source's last_replicated and make the wrong copy look
+// newer.
+const clockSkewWarnAt = 30 * time.Second
+
+// clockSkewWarnEvery bounds how often the warning repeats. The metric
+// carries the value continuously; the log line exists to be noticed once,
+// not to fill a journal every poll.
+const clockSkewWarnEvery = time.Hour
+
+// recordUIClockSkew stores the offset between this host's clock and the
+// control plane's, and warns when it grows large enough to matter.
+func (m *agentMetrics) recordUIClockSkew(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.uiClockSkew = d
+	m.uiClockSkewKnown = true
+	warn := false
+	if d < -clockSkewWarnAt || d > clockSkewWarnAt {
+		if m.uiSkewWarnedAt.IsZero() || time.Since(m.uiSkewWarnedAt) > clockSkewWarnEvery {
+			m.uiSkewWarnedAt = time.Now()
+			warn = true
+		}
+	}
+	m.mu.Unlock()
+
+	if warn {
+		trace.Warning("this host's clock disagrees with the control plane's; vmsync compares timestamps written by different machines, so replication ages and failover data-loss windows will be wrong until NTP is fixed",
+			"skew_seconds", int64(d.Seconds()), "threshold_seconds", int64(clockSkewWarnAt.Seconds()))
+	}
 }

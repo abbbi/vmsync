@@ -88,6 +88,16 @@ const runLockDir = "/run/vmsync-locks"
 // delays a run which is going to fail anyway.
 const targetLockTimeout = 30 * time.Second
 
+// clockSkewWarnAt is when a difference between two hosts' clocks stops
+// being measurement noise and starts corrupting comparisons.
+//
+// Generous on purpose: `date +%s` has one-second resolution and a WAN round
+// trip adds more, so a few seconds means nothing. Tens of seconds is enough
+// to invert the comparison between a target's last_sync and a source's
+// last_replicated, which is the point at which somebody could restore the
+// wrong copy.
+const clockSkewWarnAt = 30 * time.Second
+
 // targetLockKey namespaces the target-side lock so it cannot collide with
 // the source-side lock of a same-named domain. Both live in runLockDir, and
 // a domain that is replicated onto a host which also replicates it onward
@@ -1854,6 +1864,37 @@ func run(cfg syncConfig) (runErr error) {
 	}
 	defer targetLock.Close()
 	trace.Debug("holding the target-side run lock", "vm", cfg.TargetDomain, "host", util.HostFromURIOrLocal(cfg.TargetURI))
+
+	// Check the two clocks agree before anything depends on them.
+	//
+	// This run is about to write a timestamp on the target using THIS
+	// host's clock, and later reads -- the metadata-vs-file-timestamp
+	// consistency check, a promotion's data-loss window, the control
+	// plane's freshness judgement -- compare it against times taken
+	// elsewhere. Drift does not break any of that visibly; it makes every
+	// one of those answers quietly wrong, which is worse. NTP is a
+	// documented prerequisite, and this is what notices when it has stopped
+	// being true.
+	//
+	// A warning, never a refusal: a sync with skewed clocks still copies
+	// the right bytes, and refusing to replicate over a clock problem would
+	// turn a monitoring issue into an outage.
+	{
+		skewCtx, cancelSkew := context.WithTimeout(ctx, 15*time.Second)
+		skew, skewErr := util.RemoteClockSkew(skewCtx, targetSSHClient)
+		cancelSkew()
+		switch {
+		case skewErr != nil:
+			trace.Warning("could not compare this host's clock with the target's", "error", skewErr)
+		case skew < -clockSkewWarnAt || skew > clockSkewWarnAt:
+			trace.Warning("this host's clock disagrees with the target's; replication ages, failover data-loss windows and the target's out-of-band-modification check all compare timestamps written by the two, so they will be wrong until NTP is fixed",
+				"target_host", util.HostFromURIOrLocal(cfg.TargetURI),
+				"skew_seconds", int64(skew.Seconds()),
+				"threshold_seconds", int64(clockSkewWarnAt.Seconds()))
+		default:
+			trace.Debug("clocks agree", "skew_seconds", int64(skew.Seconds()))
+		}
+	}
 
 	defer cleanupTargetNBD("cleanup")
 	defer cleanupSourceBridge("cleanup")

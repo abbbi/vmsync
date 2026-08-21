@@ -62,6 +62,8 @@ type Client struct {
 	Base  string
 	HTTP  *http.Client
 	Creds Credentials
+	// OnClockSkew is optional; see its type for why it exists.
+	OnClockSkew clockSkewFunc
 }
 
 // NewClient builds a client that verifies the UI's certificate.
@@ -275,11 +277,13 @@ func (c *Client) do(ctx context.Context, method, u, token string, payload any, h
 		req.Header.Set(k, v)
 	}
 
+	sentAt := time.Now()
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%s %s: %w", method, u, err)
 	}
 	defer resp.Body.Close()
+	c.observeClockSkew(sentAt, time.Now(), resp)
 	if inspect != nil {
 		inspect(resp)
 	}
@@ -317,4 +321,44 @@ type ReportFilesystem struct {
 	TotalBytes int64  `json:"total_bytes"`
 	FreeBytes  int64  `json:"free_bytes"`
 	UsedBytes  int64  `json:"used_bytes"`
+}
+
+// OnClockSkew, when set, is called after every exchange with the UI with
+// the difference between this host's clock and the UI's.
+//
+// Wired to a metric rather than only a log line because the failure it
+// warns about is silent: vmsync compares timestamps written by two
+// different machines -- a target's last_sync against a source's
+// last_replicated, a promotion's data-loss window against a checkpoint --
+// and drifted clocks make every one of those comparisons quietly wrong
+// rather than visibly broken. NTP is a documented prerequisite; this is
+// what notices when it has stopped being true.
+type clockSkewFunc func(skew time.Duration)
+
+// observeClockSkew derives the UI's clock offset from the Date header every
+// HTTP response already carries, so it costs no extra request.
+//
+// The midpoint of send and receive is used rather than either end: the
+// server stamps Date somewhere between them, so comparing against receipt
+// alone would report the whole round trip as skew. What is left is half the
+// asymmetry in the two directions, which is far below the threshold anyone
+// would act on.
+//
+// Date has one-second granularity (RFC 9110), so a reading is never better
+// than about a second. That is why the warning threshold is generous:
+// sub-second "skew" here is the header's resolution, not a real problem.
+func (c *Client) observeClockSkew(sentAt, receivedAt time.Time, resp *http.Response) {
+	if c == nil || c.OnClockSkew == nil || resp == nil {
+		return
+	}
+	raw := resp.Header.Get("Date")
+	if raw == "" {
+		return
+	}
+	serverTime, err := http.ParseTime(raw)
+	if err != nil {
+		return
+	}
+	local := sentAt.Add(receivedAt.Sub(sentAt) / 2)
+	c.OnClockSkew(serverTime.Sub(local))
 }

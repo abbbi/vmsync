@@ -24,7 +24,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"libvirt.org/go/libvirtxml"
 )
@@ -149,4 +151,67 @@ func IgnoreDevice(d libvirtxml.DomainDisk) bool {
 	}
 
 	return false
+}
+
+// CommandRunner runs a command on a remote host. The one-method seam the
+// SSH client already satisfies, so this package needs no dependency on it.
+type CommandRunner interface {
+	Run(ctx context.Context, command string) (string, error)
+}
+
+// RemoteEpochCommand asks a POSIX host for its clock as Unix seconds.
+//
+// Deliberately the plainest thing that works: `date +%s` exists on every
+// system vmsync can already reach over SSH, needs no privilege, and cannot
+// be confused by locale.
+const RemoteEpochCommand = "date +%s"
+
+// ParseRemoteEpoch reads what RemoteEpochCommand printed.
+//
+// Split out from the round trip so the parsing has a test that needs no SSH
+// server: the interesting cases are a host that printed a warning banner
+// before the number, or one whose shell added trailing whitespace.
+func ParseRemoteEpoch(out string) (time.Time, error) {
+	fields := strings.Fields(strings.TrimSpace(out))
+	if len(fields) == 0 {
+		return time.Time{}, fmt.Errorf("remote host printed no time")
+	}
+	// The LAST field, not the first: a login banner or an MOTD arrives
+	// ahead of the answer on plenty of real hosts.
+	raw := fields[len(fields)-1]
+	secs, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("remote host printed %q, which is not a unix timestamp", raw)
+	}
+	return time.Unix(secs, 0), nil
+}
+
+// RemoteClockSkew reports the remote host's clock minus this host's,
+// positive when the remote is ahead.
+//
+// The local reading is the midpoint of send and receive, so the round trip
+// does not read as skew. Resolution is one second at best -- `date +%s`
+// emits whole seconds -- which is why callers should treat anything under a
+// few seconds as noise.
+//
+// This matters because vmsync compares timestamps written by two different
+// machines: a target's last_sync_timestamp against the source that wrote
+// it, a promotion's data-loss window against a checkpoint taken elsewhere,
+// and the metadata-vs-file-timestamp consistency check that decides whether
+// a target was modified out of band. Every one of those silently returns
+// the wrong answer when the two clocks disagree, rather than failing.
+func RemoteClockSkew(ctx context.Context, r CommandRunner) (time.Duration, error) {
+	sentAt := time.Now()
+	out, err := r.Run(ctx, RemoteEpochCommand)
+	if err != nil {
+		return 0, fmt.Errorf("read the remote host's clock: %w", err)
+	}
+	receivedAt := time.Now()
+
+	remote, err := ParseRemoteEpoch(out)
+	if err != nil {
+		return 0, err
+	}
+	local := sentAt.Add(receivedAt.Sub(sentAt) / 2)
+	return remote.Sub(local), nil
 }

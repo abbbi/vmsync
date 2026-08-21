@@ -216,6 +216,9 @@ func run(cfg agentConfig) error {
 		return err
 	}
 	client.Creds = creds
+	// Free: every HTTP response already carries a Date header, so the
+	// control plane doubles as a clock reference without an extra request.
+	client.OnClockSkew = cfg.metrics.recordUIClockSkew
 	trace.Info("agent ready", "agent_id", creds.AgentID, "ui", client.Base, "hostname", cfg.Hostname, "libvirt_uri", cfg.LibvirtURI)
 
 	cached, everFetched, err := store.LoadCache()

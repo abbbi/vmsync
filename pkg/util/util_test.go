@@ -21,7 +21,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strconv"
 	"testing"
+	"time"
 
 	"libvirt.org/go/libvirtxml"
 )
@@ -282,5 +284,80 @@ func TestReplicaHost(t *testing.T) {
 	// still needs the loopback answer for a local URI.
 	if got := HostFromURIOrLocal("qemu:///system"); got != "127.0.0.1" {
 		t.Errorf("HostFromURIOrLocal(%q) = %q, want 127.0.0.1 -- connectivity semantics must not change", "qemu:///system", got)
+	}
+}
+
+// TestParseRemoteEpoch covers what a real SSH session actually returns: the
+// answer is not always the only thing on the wire.
+func TestParseRemoteEpoch(t *testing.T) {
+	for _, tc := range []struct {
+		name, out string
+		want      int64
+		wantErr   bool
+	}{
+		{"plain", "1800000000", 1800000000, false},
+		{"trailing newline", "1800000000\n", 1800000000, false},
+		{"surrounding whitespace", "  1800000000  \n", 1800000000, false},
+		// Login banners and MOTDs arrive ahead of the answer on plenty of
+		// real hosts, which is why the LAST field is taken rather than the
+		// first.
+		{"after a banner", "Welcome to prod01\nLast login: Tue\n1800000000\n", 1800000000, false},
+		{"empty", "", 0, true},
+		{"not a number", "date: invalid option\n", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseRemoteEpoch(tc.out)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("ParseRemoteEpoch(%q) accepted junk", tc.out)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseRemoteEpoch(%q): %v", tc.out, err)
+			}
+			if got.Unix() != tc.want {
+				t.Errorf("= %d, want %d", got.Unix(), tc.want)
+			}
+		})
+	}
+}
+
+// TestRemoteClockSkewDirection pins the sign, which is the part that would
+// silently mislead: positive must mean the REMOTE is ahead.
+func TestRemoteClockSkewDirection(t *testing.T) {
+	ahead := time.Now().Add(2 * time.Hour).Unix()
+	skew, err := RemoteClockSkew(context.Background(), fakeRunner{out: strconv.FormatInt(ahead, 10)})
+	if err != nil {
+		t.Fatalf("RemoteClockSkew: %v", err)
+	}
+	if skew < 100*time.Minute || skew > 140*time.Minute {
+		t.Errorf("skew = %s, want about +2h for a remote that is ahead", skew)
+	}
+
+	behind := time.Now().Add(-2 * time.Hour).Unix()
+	skew, err = RemoteClockSkew(context.Background(), fakeRunner{out: strconv.FormatInt(behind, 10)})
+	if err != nil {
+		t.Fatalf("RemoteClockSkew: %v", err)
+	}
+	if skew > -100*time.Minute {
+		t.Errorf("skew = %s, want about -2h for a remote that is behind", skew)
+	}
+
+	// A host whose clock agrees must not register as skewed just because
+	// the round trip took time.
+	skew, err = RemoteClockSkew(context.Background(), fakeRunner{out: strconv.FormatInt(time.Now().Unix(), 10)})
+	if err != nil {
+		t.Fatalf("RemoteClockSkew: %v", err)
+	}
+	if skew < -2*time.Second || skew > 2*time.Second {
+		t.Errorf("skew = %s for an in-sync host, want within a second or so", skew)
+	}
+
+	// An unreachable host is an error, never a zero skew: reporting "the
+	// clocks agree" because the question could not be asked is the one
+	// answer that would actively mislead.
+	if _, err := RemoteClockSkew(context.Background(), fakeRunner{err: errors.New("ssh connection lost")}); err == nil {
+		t.Error("a failed round trip did not produce an error")
 	}
 }
