@@ -59,6 +59,16 @@ type Operation struct {
 	// checks), making the reported data-loss window unknown rather than
 	// fabricated.
 	Force bool `json:"force,omitempty"`
+	// ArmFence asks a promotion to authorise shutting the displaced source
+	// down, so the same VM does not end up serving in two places.
+	//
+	// Opt-in, and it stays opt-in all the way from the UI: a DR drill is a
+	// promotion too, and a drill that stopped production would be a far
+	// worse failure than the split brain it was rehearsing for. The source
+	// to fence is NOT taken from this message -- vmsync resolves it from the
+	// promoted domain's own replica_source, for the same reason PeerHost
+	// above is a claim to be checked rather than an endpoint to use.
+	ArmFence bool `json:"arm_fence,omitempty"`
 
 	CreatedAtUnix int64  `json:"created_at_unix"`
 	CreatedBy     string `json:"created_by,omitempty"`

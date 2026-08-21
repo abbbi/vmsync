@@ -19,10 +19,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"vmsync/pkg/disk"
@@ -134,8 +136,33 @@ func runPromote(ctx context.Context, cfg syncConfig) error {
 		trace.Warning("promote", "vm", cfg.TargetDomain, "note", n)
 	}
 
+	// Resolved before either branch, because arming is useful in both. The
+	// recovery case is real and not rare: promote, then notice the source is
+	// still serving, then re-run with -fence-source. That domain is already
+	// promoted, so nothing below would write -- and the operator would be
+	// left with no way to arm a fence short of demoting and promoting again.
+	fenced, err := resolveFenceSource(cfg.FenceSource, plan.PromotedFrom, st.ReplicaSource)
+	if err != nil {
+		return fmt.Errorf("refusing to promote %s: %w", cfg.TargetDomain, err)
+	}
+
 	if plan.AlreadyPromoted {
 		trace.Info("domain is already promoted; leaving its promotion record untouched", "vm", cfg.TargetDomain)
+		if fenced != "" {
+			// Only the fence fields. The promotion's own timestamp and
+			// actor stay exactly as the original promotion left them --
+			// that record describes when the failover happened, and a
+			// later fence does not change that.
+			updates, err := fenceUpdates(fenced, cfg.PromotedBy)
+			if err != nil {
+				return err
+			}
+			if err := libvirtsync.ApplyMetadata(mgr, cfg.TargetDomain, updates); err != nil {
+				return fmt.Errorf("arm a fence on the already-promoted %s: %w", cfg.TargetDomain, err)
+			}
+			trace.Info("armed a fence against the displaced source on an already-promoted domain",
+				"vm", cfg.TargetDomain, "fence_source", fenced)
+		}
 	} else if plan.WriteMetadata {
 		// Metadata BEFORE the domain is started, always. If this process
 		// dies between the two the domain is marked promoted but not
@@ -154,11 +181,34 @@ func runPromote(ctx context.Context, cfg syncConfig) error {
 		if cfg.PromotedBy != "" {
 			updates[libvirtsync.MetadataFieldPromotedBy] = cfg.PromotedBy
 		}
+
+		// Arming in the SAME write as the promotion record is the point.
+		// Two writes could leave a domain promoted with no fence (the split
+		// brain the operator asked to prevent) or -- worse -- a fence with
+		// no promotion, which is a token authorising a shutdown that
+		// nothing justifies. One metadata call makes both true or neither.
+		if fenced != "" {
+			armed, err := fenceUpdates(fenced, cfg.PromotedBy)
+			if err != nil {
+				return err
+			}
+			for k, v := range armed {
+				updates[k] = v
+			}
+		}
+
 		if err := libvirtsync.ApplyMetadata(mgr, cfg.TargetDomain, updates); err != nil {
 			return fmt.Errorf("record the promotion on %s: %w", cfg.TargetDomain, err)
 		}
 		trace.Info("promoted", "vm", cfg.TargetDomain, "mode", mode,
 			"from", plan.PromotedFrom, "by", cfg.PromotedBy, "data_loss", plan.DataLoss.String())
+		if fenced != "" {
+			trace.Info("armed a fence against the displaced source; it will shut itself down when its agent next checks, once and only once",
+				"vm", cfg.TargetDomain, "fence_source", fenced)
+		} else {
+			trace.Info("no fence was armed, so the source is free to keep running; pass -fence-source to stop it",
+				"vm", cfg.TargetDomain)
+		}
 	}
 
 	if plan.StartDomain {
@@ -171,6 +221,153 @@ func runPromote(ctx context.Context, cfg syncConfig) error {
 		trace.Warning("the promotion is recorded but the domain was NOT started; pass -start, or start it yourself", "vm", cfg.TargetDomain)
 	}
 	return nil
+}
+
+// fenceReport is what -read-fence prints: everything a displaced source
+// needs to decide whether to stop itself, and nothing else.
+//
+// Deliberately the raw observation rather than a verdict. The decision needs
+// one input this command cannot see -- whether this fence was acted on
+// before, which lives in the agent's durable ledger -- so computing a verdict
+// here would produce an authoritative-looking answer that is missing the
+// condition preventing a token from firing twice.
+type fenceReport struct {
+	// Reachable distinguishes "the peer says there is no fence" from "the
+	// peer could not be asked". The difference is the whole point: a
+	// partition is EXACTLY when a promotion is most likely to have happened
+	// and least likely to be visible, and treating silence as "no fence"
+	// keeps this domain running, which is the safe direction. Treating it as
+	// a fence would shut down a healthy primary every time a link flapped.
+	Reachable bool   `json:"reachable"`
+	Error     string `json:"error,omitempty"`
+
+	TargetRef    string              `json:"target_ref"`
+	TargetRole   string              `json:"target_role,omitempty"`
+	TargetActive bool                `json:"target_active"`
+	Fence        failover.FenceToken `json:"fence"`
+}
+
+// runReadFence reports the fence a peer's promotion armed, if any.
+//
+// The one failover mode that takes a REMOTE uri, and the only one that
+// needs to: it asks the other site a question rather than acting on this
+// one. It reads and prints; it changes nothing anywhere. The shutdown that
+// may follow is a separate, deliberate step by the caller -- which is what
+// lets the agent record its intent in the ledger between the two.
+func runReadFence(cfg syncConfig) error {
+	if cfg.TargetURI == "" || cfg.TargetDomain == "" {
+		return fmt.Errorf("-read-fence needs -target-uri and -target-domain naming the PROMOTED peer to ask")
+	}
+
+	rep := fenceReport{
+		// ReplicaHost, not HostFromURIOrLocal: this reference is an identity
+		// written for another machine to read and compare, not an address to
+		// dial. The two differ exactly where it matters -- a local uri
+		// resolves to a loopback literal, which names every host and so
+		// identifies none.
+		TargetRef: libvirtsync.ReplicaEntry(util.ReplicaHost(cfg.TargetURI, cfg.LocalHostName), cfg.TargetDomain),
+	}
+
+	// An unreachable peer is a normal answer here, not an error: it is
+	// reported as unreachable on stdout and the command still succeeds, so
+	// the caller can tell the two apart without parsing an error string or
+	// mapping an exit code. Exiting non-zero would make every network blip
+	// look like a broken invocation.
+	mgr, err := libvirtsync.Connect(cfg.TargetURI)
+	if err != nil {
+		rep.Error = err.Error()
+		return printFenceReport(rep)
+	}
+	defer mgr.Close()
+
+	st, err := libvirtsync.ReadFailoverState(mgr, cfg.TargetDomain)
+	if err != nil {
+		rep.Error = err.Error()
+		return printFenceReport(rep)
+	}
+	rep.Reachable = true
+	if !st.Exists {
+		// Reached the host, and the domain is not there. Not an error and
+		// emphatically not a fence: a peer with no such domain has promoted
+		// nothing.
+		return printFenceReport(rep)
+	}
+	rep.TargetRole = st.Role
+	rep.TargetActive = st.Active
+	rep.Fence = st.Fence
+	return printFenceReport(rep)
+}
+
+func printFenceReport(rep fenceReport) error {
+	out, err := json.Marshal(rep)
+	if err != nil {
+		return fmt.Errorf("encode the fence report: %w", err)
+	}
+	fmt.Println(string(out))
+	return nil
+}
+
+// resolveFenceSource turns the -fence-source flag into the reference to
+// write, or "" for no fence at all.
+//
+// candidates are the references worth using for bare -fence-source, best
+// first: the promotion's own corroborated promoted_from, then the target's
+// raw replica_source. Both come from the target's metadata; neither is
+// invented here, because a fence naming the wrong host would shut down an
+// uninvolved production VM.
+func resolveFenceSource(flagValue string, candidates ...string) (string, error) {
+	flagValue = strings.TrimSpace(flagValue)
+	if flagValue == "" {
+		return "", nil
+	}
+	if flagValue != fenceSourceAuto {
+		// An explicit reference. Validated for shape only: whether the host
+		// exists is not knowable from here, and the fence is addressed
+		// anyway -- a source only ever acts on a token naming itself, so a
+		// typo produces a fence nobody honours rather than a wrong shutdown.
+		if _, _, ok := splitReplicaRef(flagValue); !ok {
+			return "", fmt.Errorf("-fence-source %q is not a host:domain reference", flagValue)
+		}
+		return flagValue, nil
+	}
+	for _, c := range candidates {
+		if c = strings.TrimSpace(c); c != "" {
+			if _, _, ok := splitReplicaRef(c); ok {
+				return c, nil
+			}
+		}
+	}
+	// Refusing rather than quietly promoting without a fence. The operator
+	// asked for one; silently not arming it would leave them believing the
+	// source had been dealt with when nothing will ever stop it.
+	return "", fmt.Errorf(
+		"-fence-source was asked to work out the source by itself, but this domain records no usable replica_source; name it explicitly, as -fence-source=host:domain")
+}
+
+// fenceUpdates builds the metadata a fence is made of.
+func fenceUpdates(source, by string) (map[string]string, error) {
+	id, err := failover.NewFenceID()
+	if err != nil {
+		return nil, fmt.Errorf("arm a fence: %w", err)
+	}
+	updates := map[string]string{
+		libvirtsync.MetadataFieldFenceID:      id,
+		libvirtsync.MetadataFieldFenceSource:  source,
+		libvirtsync.MetadataFieldFenceArmedAt: strconv.FormatInt(time.Now().Unix(), 10),
+	}
+	if by != "" {
+		updates[libvirtsync.MetadataFieldFenceArmedBy] = by
+	}
+	return updates, nil
+}
+
+// splitReplicaRef checks a "host:domain" reference has both halves.
+func splitReplicaRef(ref string) (host, domain string, ok bool) {
+	i := strings.LastIndex(ref, ":")
+	if i <= 0 || i == len(ref)-1 {
+		return "", "", false
+	}
+	return ref[:i], ref[i+1:], true
 }
 
 // inspectReplicaDisks reports whether every disk file the domain refers to

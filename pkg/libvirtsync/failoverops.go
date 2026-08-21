@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"vmsync/pkg/failover"
 	"vmsync/pkg/trace"
 
 	"libvirt.org/go/libvirt"
@@ -46,6 +47,10 @@ type FailoverState struct {
 	// SourceStoppedAtSync: the source was already shut off when this
 	// replica's checkpoint was taken, so nothing was written after it.
 	SourceStoppedAtSync bool
+	// Fence is the shutdown a promotion armed against its displaced source.
+	// Zero on every domain that was never promoted, and on every promotion
+	// that did not ask for one -- a drill, for instance.
+	Fence failover.FenceToken
 }
 
 // ReadFailoverState collects everything a promotion or an inversion needs
@@ -89,6 +94,11 @@ func ReadFailoverState(mgr *Manager, domainName string) (FailoverState, error) {
 	if v, err := ParseMetadata(domXML, MetadataFieldSourceStoppedAtSync); err == nil && v != "" {
 		st.SourceStoppedAtSync = true
 	}
+
+	st.Fence.ID, _ = ParseMetadata(domXML, MetadataFieldFenceID)
+	st.Fence.Source, _ = ParseMetadata(domXML, MetadataFieldFenceSource)
+	st.Fence.ArmedBy, _ = ParseMetadata(domXML, MetadataFieldFenceArmedBy)
+	st.Fence.ArmedAt = parseUnix(domXML, MetadataFieldFenceArmedAt)
 
 	if v, err := ParseMetadata(domXML, MetadataFieldFailureCount); err == nil && v != "" {
 		if n, convErr := strconv.Atoi(v); convErr == nil {

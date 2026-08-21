@@ -83,6 +83,7 @@ type agentConfig struct {
 	SSHPort          int
 	SSHKnownHosts    string
 	NoSchedule       bool
+	NoAutoFence      bool
 	// MaxConcurrentSyncs is this host's own ceiling on parallel syncs. See
 	// effectiveMaxConcurrent: it can only lower what the schedule asks for,
 	// never raise it, because how much concurrent I/O this machine can
@@ -121,6 +122,7 @@ func main() {
 	flag.IntVar(&cfg.MaxConcurrentSyncs, "max-concurrent-syncs", 0, "Ceiling on vmsync jobs running at once on this host. 0 leaves it to the schedule (the UI's setting, or max_concurrent_syncs in a --standalone file), which defaults to 2. This flag can only LOWER that number, never raise it: how much concurrent I/O this hypervisor can absorb is its own business, not the control plane's")
 	flag.StringVar(&cfg.StandaloneFile, "standalone", "", "Run as a scheduler only, from this JSON file, with no control plane: no enrolment, no credential, no reporting and no polling. The file holds the same object the UI would otherwise send (see the agent README). Cannot be combined with -ui")
 	flag.BoolVar(&cfg.NoSchedule, "no-schedule", false, "Report only; ignore any schedule the UI sends. Turns this back into a phase-1 read-only agent, which is the safe way to install it on a host before you are ready for it to run syncs")
+	flag.BoolVar(&cfg.NoAutoFence, "no-autofence", false, "Do not shut this host's VMs down when a peer reports it has been failed over to. The split-brain check still runs and still warns -- loudly, every cycle -- but takes no action. For hosts where stopping a VM must stay a human decision")
 	flag.BoolVar(&cfg.Once, "once", false, "Report once and exit, instead of running as a daemon. For verifying a new install")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
@@ -277,6 +279,22 @@ func run(cfg agentConfig) error {
 	// agent that silently ignores it.
 	wg.Add(1)
 	go func() { defer wg.Done(); operationsLoop(ctx, cfg, state, ledger) }()
+
+	// Also started regardless of -no-schedule, and for a sharper reason
+	// than the operations loop: a source whose replication was disabled --
+	// by the operator, or by the failover that displaced it -- is MORE
+	// likely to be a split-brain risk, not less. Gating this on the
+	// schedule would switch off the protection exactly where it is needed.
+	fences := newFenceLedger(cfg.StateDir)
+	if err := fences.Load(); err != nil {
+		// Fatal for the same reason the operation ledger is: an agent that
+		// cannot read which fences it has already acted on would act on
+		// them again, and this ledger is the only thing making a fence
+		// single-use.
+		return fmt.Errorf("load the fence ledger: %w", err)
+	}
+	wg.Add(1)
+	go func() { defer wg.Done(); fenceLoop(ctx, cfg, fences) }()
 
 	wg.Add(2)
 	go func() { defer wg.Done(); reportLoop(ctx, client, cfg, state, sched, ledger) }()

@@ -145,6 +145,25 @@ const (
 	// targets, it records the most recent one.
 	MetadataFieldLastReplicatedAt = "last_replicated_at"
 	MetadataFieldLastReplicatedTo = "last_replicated_to"
+
+	// The fence a promotion armed, written on the PROMOTED domain: "this
+	// failover displaces <host>:<domain>, and that source must not run".
+	//
+	// Written only when the promotion was explicitly asked to arm one, so a
+	// DR drill promotes without authorising anything to be shut down. The
+	// displaced source reads these from the promoted domain's own libvirt
+	// and acts on them; it never infers a fence from role=promoted alone,
+	// because a drill and a real failover leave identical records and only
+	// one of them may stop a production VM. See pkg/failover/fence.go.
+	//
+	// fence_id makes the decision single-use: an agent records it in its
+	// ledger before acting, so one token can never fire twice -- which is
+	// what stops a token left behind by a January failover from shutting
+	// something down in August.
+	MetadataFieldFenceID      = "fence_id"
+	MetadataFieldFenceSource  = "fence_source"
+	MetadataFieldFenceArmedAt = "fence_armed_at"
+	MetadataFieldFenceArmedBy = "fence_armed_by"
 )
 
 // Replication roles, as stored in MetadataFieldReplicationRole. An empty or
@@ -198,6 +217,10 @@ var metadataFieldOrder = []string{
 	MetadataFieldSourceStoppedAtSync,
 	MetadataFieldLastReplicatedAt,
 	MetadataFieldLastReplicatedTo,
+	MetadataFieldFenceID,
+	MetadataFieldFenceSource,
+	MetadataFieldFenceArmedAt,
+	MetadataFieldFenceArmedBy,
 }
 
 // vmsyncBlockRe is gone: finding and replacing the metadata element by
@@ -845,6 +868,10 @@ func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetR
 		MetadataFieldPromotedBy,
 		MetadataFieldPromotedFrom,
 		MetadataFieldPromotionMode,
+		MetadataFieldFenceID,
+		MetadataFieldFenceSource,
+		MetadataFieldFenceArmedAt,
+		MetadataFieldFenceArmedBy,
 	}
 	// Recorded only when true, and actively removed otherwise: a stale "the
 	// source was stopped" from an earlier sync would make a later promotion
@@ -1112,6 +1139,12 @@ func SetReplicationRole(mgr *Manager, domainName, role string) (previous string,
 		MetadataFieldPromotedBy,
 		MetadataFieldPromotedFrom,
 		MetadataFieldPromotionMode,
+		// The fence that promotion armed dies with it: a domain that is
+		// no longer promoted is not displacing anybody.
+		MetadataFieldFenceID,
+		MetadataFieldFenceSource,
+		MetadataFieldFenceArmedAt,
+		MetadataFieldFenceArmedBy,
 	}
 	switch {
 	case role == RoleNone:

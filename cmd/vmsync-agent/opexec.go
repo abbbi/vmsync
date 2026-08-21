@@ -177,6 +177,13 @@ func operationArgs(cfg agentConfig, op Operation) ([]string, error) {
 		if op.Force {
 			args = append(args, "-force-promote")
 		}
+		if op.ArmFence {
+			// Bare, so vmsync resolves the source from the promoted
+			// domain's own replica_source rather than from anything that
+			// travelled over the network. The UI can ask for a fence; it
+			// cannot choose who gets shut down.
+			args = append(args, "-fence-source")
+		}
 		if op.CreatedBy != "" {
 			args = append(args, "-promoted-by", op.CreatedBy)
 		}

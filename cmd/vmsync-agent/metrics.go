@@ -99,6 +99,50 @@ type agentMetrics struct {
 	uiClockSkew      time.Duration
 	uiClockSkewKnown bool
 	uiSkewWarnedAt   time.Time
+
+	// Split-brain state. splitBrainVMs is the set of VMs this host is still
+	// running that a peer says it has been failed over from -- a gauge and
+	// not a counter, because what an operator needs to alert on is "is this
+	// true RIGHT NOW", and it clears by itself when the condition does.
+	//
+	// It is populated whether or not the agent acts: with -no-autofence, or
+	// after a fence that failed, the VM stays in the set and the metric
+	// stays up. That is the whole point -- the case where nothing was done
+	// about it is exactly the case somebody must be told about.
+	splitBrainVMs map[string]bool
+	fencesActed   atomic.Uint64
+	fencesFailed  atomic.Uint64
+}
+
+// setSplitBrain replaces the whole set from one complete sweep.
+//
+// Replace rather than merge, because that is what lets the condition clear
+// on its own: a VM that has been fenced is no longer running, so the next
+// sweep simply does not include it, and the gauge falls to zero without
+// anything having to remember to say so. A merge-based version would latch
+// forever after the first detection.
+func (m *agentMetrics) setSplitBrain(vms map[string]bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.splitBrainVMs = make(map[string]bool, len(vms))
+	for vm := range vms {
+		m.splitBrainVMs[vm] = true
+	}
+}
+
+// fenceActed counts a completed fence attempt.
+func (m *agentMetrics) fenceActed(ok bool) {
+	if m == nil {
+		return
+	}
+	if ok {
+		m.fencesActed.Add(1)
+	} else {
+		m.fencesFailed.Add(1)
+	}
 }
 
 func newAgentMetrics(version, hostname string, standalone bool) *agentMetrics {
@@ -273,6 +317,23 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 		g("vmsync_agent_ui_clock_skew_seconds", "Control-plane clock minus this host's, in seconds. Timestamps written by different machines are compared throughout vmsync, so drift here makes those comparisons quietly wrong.", int64(uiSkew.Seconds()), "")
 	}
 	g("vmsync_agent_config_age_seconds", "Age of the configuration in force. -1 when it was never fetched.", configAge, "")
+
+	// --- split brain ------------------------------------------------------
+	//
+	// The most alertable condition this agent can report. A non-zero value
+	// means one VM is running in two places at once, which corrupts nothing
+	// visibly and silently diverges two copies of the same data.
+	m.mu.Lock()
+	split := len(m.splitBrainVMs)
+	splitVMs := sortedKeys(m.splitBrainVMs)
+	m.mu.Unlock()
+
+	g("vmsync_agent_split_brain_vms", "VMs running on this host that a peer reports having been failed over from. Non-zero means one VM is live in two places; alert on it.", split, "")
+	for _, vm := range splitVMs {
+		g("vmsync_agent_split_brain", "1 while this host still runs a VM another host has been promoted for.", 1, fmt.Sprintf(",vm=%q", vm))
+	}
+	c("vmsync_agent_fences_total", "Fences this agent has acted on, by result. A failure here needs a person: fences are never retried automatically.", m.fencesActed.Load(), `,result="success"`)
+	fmt.Fprintf(&b, "vmsync_agent_fences_total{host=%q,result=\"failure\"} %d\n", host, m.fencesFailed.Load())
 
 	return b.String()
 }

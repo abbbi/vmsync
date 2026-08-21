@@ -387,6 +387,13 @@ const (
 	FieldPromotedBy      = "promoted_by"
 	FieldPromotedFrom    = "promoted_from"
 	FieldPromotionMode   = "promotion_mode"
+
+	// The fence a promotion armed, written on the PROMOTED domain. See
+	// fence.go for why the decision is armed rather than inferred.
+	FieldFenceID      = "fence_id"
+	FieldFenceSource  = "fence_source"
+	FieldFenceArmedAt = "fence_armed_at"
+	FieldFenceArmedBy = "fence_armed_by"
 )
 
 // AssessInvert decides whether a pair's direction may be reversed, and
@@ -455,6 +462,7 @@ func AssessInvert(st PairState) (InvertPlan, error) {
 			FieldLastSync,
 			FieldFailureCount,
 			FieldPromotedAt, FieldPromotedBy, FieldPromotedFrom, FieldPromotionMode,
+			FieldFenceID, FieldFenceSource, FieldFenceArmedAt, FieldFenceArmedBy,
 		},
 
 		// The promoted domain becomes the source.
@@ -470,6 +478,7 @@ func AssessInvert(st PairState) (InvertPlan, error) {
 			FieldLastSync,
 			FieldFailureCount,
 			FieldPromotedAt, FieldPromotedBy, FieldPromotedFrom, FieldPromotionMode,
+			FieldFenceID, FieldFenceSource, FieldFenceArmedAt, FieldFenceArmedBy,
 		},
 	}
 	return plan, nil
@@ -480,7 +489,7 @@ func AssessInvert(st PairState) (InvertPlan, error) {
 // the host, matching how hostnames are compared elsewhere.
 func removeRef(list []string, ref string) (remaining []string, removed bool) {
 	for _, e := range list {
-		if strings.EqualFold(strings.TrimSpace(e), ref) {
+		if equalRef(e, ref) {
 			removed = true
 			continue
 		}
@@ -494,7 +503,7 @@ func removeRef(list []string, ref string) (remaining []string, removed bool) {
 
 func containsRef(list []string, ref string) bool {
 	for _, e := range list {
-		if strings.EqualFold(strings.TrimSpace(e), ref) {
+		if equalRef(e, ref) {
 			return true
 		}
 	}

@@ -112,6 +112,13 @@ const (
 	// Distinctive enough to find with a glob when reclaiming space later,
 	// and clearly vmsync's doing rather than something a human left behind.
 	replacedDiskSuffix = ".vmsync-replaced-"
+
+	// fenceSourceAuto is what bare -fence-source resolves to: take the
+	// source to fence from the target's own replica_source, rather than
+	// making an operator retype a reference they can get wrong under
+	// pressure. Not a valid host:domain itself -- it has no colon -- so it
+	// can never be mistaken for one.
+	fenceSourceAuto = "auto"
 )
 
 // syncConfig is every value the CLI accepts, parsed once in main() and
@@ -203,12 +210,19 @@ type syncConfig struct {
 
 	// The failover modes, all handled in main() like -update-role: each
 	// changes state and exits, syncing nothing.
-	Promote            bool
-	Invert             bool
-	ShutdownDomain     bool
-	PromoteMode        string
-	PromotedBy         string
-	ForcePromote       bool
+	Promote        bool
+	Invert         bool
+	ShutdownDomain bool
+	ReadFence      bool
+	PromoteMode    string
+	PromotedBy     string
+	ForcePromote   bool
+	// FenceSource arms a fence against the displaced source: "auto" to take
+	// it from the target's own replica_source, an explicit "host:domain", or
+	// empty to arm nothing. Empty is the default because a promotion that
+	// shuts a production VM down must be asked for, never assumed -- a DR
+	// drill is a promotion too.
+	FenceSource        string
 	ShutdownTimeoutSec int
 }
 
@@ -246,6 +260,7 @@ func main() {
 	flag.StringVar(&cfg.ReplacedDiskAction, "replaced-disk-action", replacedDiskRename, fmt.Sprintf("What to do with a target disk file that is about to be discarded and rebuilt (currently only -reinit does this): %q renames it to <path>%s<unixtime> so its contents survive, %q removes it. Defaults to %q: the target of a reinit may be a former primary whose disks still hold everything written after the last successful sync, and that is unrecoverable once deleted. Renaming needs room for both copies, and the aside files are never reaped automatically", replacedDiskRename, replacedDiskSuffix, replacedDiskDelete, replacedDiskRename))
 	flag.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "Reinit automatically after N failures (disabled by default). Count is held on target XML")
 	compressArg := optionalValueFlag{bareDefault: "s2"}
+	fenceSourceArg := optionalValueFlag{bareDefault: fenceSourceAuto}
 	netBufferArg := optionalValueFlag{bareDefault: "128k,1G"}
 	flag.Var(&compressArg, "compress", "Compress NBD traffic between hosts. Bare -compress (no value) defaults to \"s2\"); ACCEPTS \"zstd\" or \"s2\". Requires vmsync-bridge-helper binary on target")
 	flag.StringVar(&cfg.CompressLevel, "compress-level", "3", "Compression level/mode to use when -compress is set. For -compress=zstd: a number 1-19 (default 3 when not set explicitly). For -compress=s2 (which has no numeric levels, including bare -compress, which defaults to s2): one of \"default\" (s2's own fastest mode), \"better\" (default here when not set explicitly), or \"best\".")
@@ -261,14 +276,17 @@ func main() {
 	flag.BoolVar(&cfg.Promote, "promote", false, "Promote the replica named by -target-uri/-target-domain to serve live: record the promotion and, with -start, boot it. Refuses unless the target actually holds a usable replica. Must be run on the target's own host")
 	flag.BoolVar(&cfg.Invert, "invert", false, "Reverse a pair's direction after a failover: -source-uri/-source-domain name the OLD source, -target-uri/-target-domain the promoted replica. Run on the old source's host")
 	flag.BoolVar(&cfg.ShutdownDomain, "shutdown-domain", false, "Shut the domain named by -target-uri/-target-domain down cleanly and pause its replication. The source half of a planned failover; must be run on that domain's own host")
+	flag.BoolVar(&cfg.ReadFence, "read-fence", false, "Ask the peer named by -target-uri/-target-domain whether its promotion armed a fence against this host, and print the answer as JSON. Reads only; changes nothing anywhere. Unlike the other failover modes this one accepts a REMOTE uri, because asking the other site is the entire operation. An unreachable peer is reported as unreachable rather than as an absence of fencing")
 	flag.StringVar(&cfg.PromoteMode, "promote-mode", string(failover.ModeForced), fmt.Sprintf("How this promotion came about, recorded on the domain: %q when the source was cleanly shut down first (no data lost), %q when it was never reached", failover.ModePlanned, failover.ModeForced))
 	flag.StringVar(&cfg.PromotedBy, "promoted-by", "", "Who is performing this promotion, recorded on the domain for attribution")
 	flag.BoolVar(&cfg.ForcePromote, "force-promote", false, "Promote even when the target does not look like a usable replica (missing disks, no completed sync, an interrupted copy). The data-loss window is then reported as unknown rather than guessed")
+	flag.Var(&fenceSourceArg, "fence-source", "With -promote: arm a fence so the displaced source shuts itself down, instead of leaving one VM running in two places. Bare -fence-source takes the source from the target's own replica_source; an explicit host:domain names it directly. Off by default, because a DR drill is a promotion too and must not stop production. The promoted domain records the decision; the source acts on it once, ever, and never destroys a guest that ignores the shutdown request")
 	flag.IntVar(&cfg.ShutdownTimeoutSec, "shutdown-timeout-sec", 300, "How long -shutdown-domain waits for a clean guest shutdown. On expiry it fails and leaves the domain running rather than destroying it")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
 	flag.Parse()
+	cfg.FenceSource = fenceSourceArg.value
 	cfg.Compress = compressArg.value
 	cfg.NetBuffer = netBufferArg.value
 
@@ -337,6 +355,7 @@ func main() {
 			{cfg.Promote, "-promote"},
 			{cfg.Invert, "-invert"},
 			{cfg.ShutdownDomain, "-shutdown-domain"},
+			{cfg.ReadFence, "-read-fence"},
 			{cfg.UpdateRole != "", "-update-role"},
 		} {
 			if m.on {
@@ -361,6 +380,8 @@ func main() {
 				err = runInvert(ctx, cfg)
 			case cfg.ShutdownDomain:
 				err = runShutdownDomain(ctx, cfg)
+			case cfg.ReadFence:
+				err = runReadFence(cfg)
 			}
 			if err != nil {
 				trace.Error(strings.TrimPrefix(chosen[0], "-"), "error", err)

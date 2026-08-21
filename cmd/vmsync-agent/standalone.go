@@ -93,6 +93,19 @@ func runStandalone(cfg agentConfig) error {
 	}
 	wg.Add(1)
 	go func() { defer wg.Done(); sched.Run(ctx) }()
+
+	// Split-brain protection runs here too. A standalone agent is the case
+	// with NO control plane to notice a failover and issue anything, so it
+	// is the one that most needs a host able to work out on its own that it
+	// has been displaced. The token still comes from the peer's libvirt, so
+	// nothing about the mechanism depends on a UI existing.
+	fences := newFenceLedger(cfg.StateDir)
+	if err := fences.Load(); err != nil {
+		return fmt.Errorf("load the fence ledger: %w", err)
+	}
+	wg.Add(1)
+	go func() { defer wg.Done(); fenceLoop(ctx, cfg, fences) }()
+
 	wg.Wait()
 	return nil
 }

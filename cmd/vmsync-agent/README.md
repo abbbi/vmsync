@@ -93,6 +93,7 @@ without touching the service.
 | `--standalone` | Run as a scheduler only, from this JSON file, with no control plane at all. See below. |
 | `--max-concurrent-syncs` | This host's ceiling on parallel vmsync jobs. Can only lower what the schedule asks for, never raise it. 0 (default) leaves it to the schedule. |
 | `--prometheus-dir` | When set, each scheduled sync gets `--prometheus-textfile <dir>/vmsync_<vm>.prom`. |
+| `--no-autofence` | Never shut a VM down because a peer reports having been failed over to. The check still runs and still warns, every cycle. See [Fencing](#fencing-stopping-a-vm-that-has-been-failed-over). |
 
 ## Logging, metrics and parallelism
 
@@ -217,6 +218,53 @@ healthy agent that silently ignores it.
 Every outcome is reported, including refusals. An operator watching a
 failover sit "pending" against a healthy agent, with nothing saying why, is
 the worst thing this could do.
+
+## Fencing: stopping a VM that has been failed over
+
+Every 60 seconds the agent asks, for each **running** VM this host is the
+source for, whether any of its replica targets has been promoted with a
+fence armed against this host. If one has, it shuts that VM down — cleanly,
+via `vmsync -shutdown-domain`, which never falls back to destroying a
+domain and leaves replication `paused`.
+
+This is what stops one VM serving in two places after a failover. The rules
+that decide it live in `vmsync` and are described in the [main
+README](../../README.md#fencing-not-running-one-vm-in-two-places); what
+matters here is how the agent behaves around them.
+
+| rule | why |
+| --- | --- |
+| The token is read from the **peer's own libvirt**, never from the UI | A UI-issued fence operation is an instruction to go and *check*. A wrong or compromised control plane cannot manufacture a token without also holding the target hypervisor. |
+| Runs regardless of `--no-schedule` | A displaced source is very often one whose replication was disabled — by the operator, or by the failover itself. Gating on the schedule would switch the protection off exactly where it is needed. |
+| Runs in `--standalone` too | That is the case with no control plane to notice a failover at all, so it is the one that most needs a host able to work this out for itself. |
+| Only **running** source domains are checked | A stopped domain cannot be half of a split brain. This is also what keeps the sweep cheap: one remote query per genuinely at-risk VM, not per defined domain. |
+| Intent recorded in `fences.json` **before** the shutdown | Same reasoning as operations: a crash between deciding and acting must not leave a token looking untouched. |
+| A fence is acted on **once, ever** — including one that failed | Kept in a ledger keyed by `fence_id`, separate from `operations.json` precisely because that one is pruned when the UI stops publishing, and a fence has no such acknowledgement. Sharing it would silently destroy the single-use property. |
+| An unreachable peer changes nothing | Not being able to ask is not evidence. Silence means keep serving. |
+
+`--no-autofence` keeps the check and the warnings but takes no action, for
+hosts where stopping a VM must stay a human decision. It is **not** latched:
+nothing was acted on, so the warning repeats every cycle until somebody
+resolves it.
+
+### When it doesn't work, it says so
+
+A failed fence is not retried, so it must not also go quiet. While this host
+is running a VM that a live promoted peer holds a fence against:
+
+```
+vmsync_agent_split_brain{host="prod01",vm="web01"} 1
+vmsync_agent_split_brain_vms{host="prod01"} 1
+vmsync_agent_fences_total{host="prod01",result="failure"} 1
+```
+
+`vmsync_agent_split_brain_vms` is the one to alert on. It is rebuilt from
+each complete sweep rather than updated as findings arrive, so it clears by
+itself once the condition ends — a gauge that latched at 1 forever after the
+first detection would be an alert nobody could clear, which is how people
+learn to ignore the metric that must never be ignored. A sweep that could
+not run leaves the previous value alone rather than clearing it: failing to
+look is not evidence the problem went away.
 
 ## Standalone: a scheduler with no control plane
 

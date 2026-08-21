@@ -802,6 +802,13 @@ func TestUpdateSyncMetadataDoesNotInheritSourceSideFields(t *testing.T) {
 		MetadataFieldPromotedBy:      "alice",
 		MetadataFieldPromotedFrom:    "old-primary:testvm",
 		MetadataFieldPromotionMode:   "forced",
+		// A fence this source armed when IT was promoted. Inheriting it
+		// would hand every replica a token authorising a shutdown of a
+		// host that has nothing to do with them.
+		MetadataFieldFenceID:      "f7c1e4a2",
+		MetadataFieldFenceSource:  "old-primary:testvm",
+		MetadataFieldFenceArmedAt: "1700000000",
+		MetadataFieldFenceArmedBy: "alice",
 	})
 	if err != nil {
 		t.Fatalf("building source xml: %v", err)
@@ -819,6 +826,10 @@ func TestUpdateSyncMetadataDoesNotInheritSourceSideFields(t *testing.T) {
 		MetadataFieldPromotedBy,
 		MetadataFieldPromotedFrom,
 		MetadataFieldPromotionMode,
+		MetadataFieldFenceID,
+		MetadataFieldFenceSource,
+		MetadataFieldFenceArmedAt,
+		MetadataFieldFenceArmedBy,
 	} {
 		if got, _ := ParseMetadataField(out, field); got != "" {
 			t.Errorf("%s = %q on the target, want it stripped -- that field describes the source", field, got)
@@ -1068,6 +1079,10 @@ func TestRoleConstantsMatchFailover(t *testing.T) {
 		{"promoted_by", MetadataFieldPromotedBy, failover.FieldPromotedBy},
 		{"promoted_from", MetadataFieldPromotedFrom, failover.FieldPromotedFrom},
 		{"promotion_mode", MetadataFieldPromotionMode, failover.FieldPromotionMode},
+		{"fence_id", MetadataFieldFenceID, failover.FieldFenceID},
+		{"fence_source", MetadataFieldFenceSource, failover.FieldFenceSource},
+		{"fence_armed_at", MetadataFieldFenceArmedAt, failover.FieldFenceArmedAt},
+		{"fence_armed_by", MetadataFieldFenceArmedBy, failover.FieldFenceArmedBy},
 	} {
 		if tc.here != tc.there {
 			t.Errorf("%s: libvirtsync has %q, failover has %q -- they must be identical", tc.name, tc.here, tc.there)
