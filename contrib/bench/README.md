@@ -262,6 +262,34 @@ again, ending exactly where it started. What it asserts:
 - `-update-role=target` takes the promotion record *and* the fence with
   it, and replication actually resumes afterwards.
 
+It also checks **who owns the target's disks**, which is the check that
+would have caught the bug the ownership handling was written for: vmsync
+creates those files by running `qemu-img` over SSH, so they belong to that
+SSH user — root — while qemu runs as `qemu` or `libvirt-qemu` and cannot
+open a root-owned disk. That surfaces during a failover, on the copy meant
+to take over.
+
+The stage works out what the target host *should* use by looking for a
+`qemu` or `libvirt-qemu` account itself, rather than reading it back out of
+vmsync's log — a test that asks the thing under test what the right answer
+is passes just as happily when both are wrong together. Then:
+
+- a **fresh** sync leaves the disk owned by that user (and, stated
+  separately because it is the bug's specific signature, *not* by root);
+- **`-reinit` preserves** the ownership it replaces. This is the sharper
+  half: reinit renames the correctly-owned disk aside and creates a fresh
+  root-owned one, silently turning a bootable replica into one qemu cannot
+  open;
+- an explicit **`-target-disk-owner` overrides** what was preserved.
+
+Each property only happens when a disk file is created from scratch, so
+this costs **two extra full copies** on top of the stage's own baseline.
+The sentinel it uses is the disk's *group*, set to `root` while leaving the
+owning user alone — deliberately harmless, so the disk stays openable
+throughout and an interrupted run never leaves an unbootable replica. If
+the target host has neither account, the ownership checks skip: there is no
+way to say what the right answer would be.
+
 It needs **`TARGET_VMSYNC_BIN`** in `bench.conf`: `-promote` and
 `-update-role` refuse a remote URI by design, so they must run on the
 target host over SSH rather than being driven from here like every other

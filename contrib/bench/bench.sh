@@ -95,13 +95,16 @@ trap), but no other stage touches the source's power state at all. Needs
 SOURCE_AGENT_BIN and TARGET_VMSYNC_BIN.
 
 Stage 6 (failover) is also NOT included by default. It promotes the target,
-arms and inspects a fence, and puts the target back to `target` with a fresh
-sync -- it never stops a domain and never reverses the pair. It is opt-in
-because an interrupted run can leave the target `promoted`, which makes every
-later sync fail until somebody clears it with -update-role=target. It needs
-TARGET_VMSYNC_BIN set in the config (vmsync on the TARGET host): -promote
-refuses a remote libvirt URI by design, so it must run where the domain is.
-Without that setting the stage skips rather than failing.
+arms and inspects a fence, checks who owns the target's disks, and puts the
+target back to `target` with a fresh sync -- it never stops a domain and
+never reverses the pair. It is opt-in because an interrupted run can leave
+the target `promoted`, which makes every later sync fail until somebody
+clears it with -update-role=target. It needs TARGET_VMSYNC_BIN set in the
+config (vmsync on the TARGET host): -promote refuses a remote libvirt URI by
+design, so it must run where the domain is. Without that setting the stage
+skips rather than failing. Note it runs THREE full syncs in total: its own
+baseline plus two more the disk-ownership checks need, since each property
+they test only happens when a disk file is created from scratch.
 EOF
 }
 
@@ -1053,6 +1056,129 @@ fo_check() {
 
 FAILOVER_FAILURES=0
 
+# target_disk_owner -> "user:group" of the target domain's disk, or empty.
+target_disk_owner() {
+	local path
+	path="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")" || true
+	[ -n "$path" ] || return 0
+	ssh_host_cmd "$TARGET_HOST" stat -c %U:%G "$path" 2>/dev/null | tr -d '[:space:]' || true
+}
+
+# expected_qemu_owner -> the "user:group" the target host's libvirt would run
+# qemu as, by the same rule vmsync itself uses.
+#
+# Reimplemented here rather than read out of vmsync's log on purpose: a test
+# that asked the thing under test what the right answer was would pass just as
+# happily when both were wrong together.
+expected_qemu_owner() {
+	local u g
+	for u in qemu libvirt-qemu; do
+		if ssh_host_cmd "$TARGET_HOST" getent passwd "$u" >/dev/null 2>&1; then
+			g=qemu
+			[ "$u" = libvirt-qemu ] && g=kvm
+			if ssh_host_cmd "$TARGET_HOST" getent group "$g" >/dev/null 2>&1; then
+				printf '%s:%s' "$u" "$g"
+			else
+				printf '%s:' "$u"
+			fi
+			return 0
+		fi
+	done
+	return 0
+}
+
+# stage_failover_disk_owner asserts the three ways a target disk can end up
+# with the right owner, each of which only happens when a file is CREATED --
+# hence a full sync per property.
+stage_failover_disk_owner() {
+	local sc="$1"
+	if [ "$DRY_RUN" = yes ]; then
+		# Every check here reads real state back off the target host, so
+		# there is nothing meaningful to print for a dry run -- but saying so
+		# beats a preview that silently omits two full syncs.
+		log "   (dry run: the disk-ownership checks read live state and run two extra -reinit syncs, so they do nothing here)"
+		return 0
+	fi
+
+	local expected expected_user expected_group
+	expected="$(expected_qemu_owner)"
+	expected_user="${expected%%:*}"
+	expected_group="${expected#*:}"
+
+	if [ -z "$expected_user" ]; then
+		warn "the target host has no qemu or libvirt-qemu account, so there is no way to say what SHOULD own its disks -- skipping the ownership checks"
+		results_row "$CSV" "$sc" disk_ownership 0 "" "" "" "" "" "SKIP no known qemu account on the target"
+		return 0
+	fi
+	log "   target host runs qemu as '$expected_user' -- checking disk ownership against that"
+
+	# 1. A first-ever sync. The baseline above created these files from
+	#    scratch, which is the case that was broken: nothing preserved,
+	#    nothing configured, and every distribution ships qemu.conf with the
+	#    setting commented out.
+	local owner user
+	owner="$(target_disk_owner)"
+	user="${owner%%:*}"
+	if [ "$user" = "$expected_user" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "a fresh sync leaves the disk owned by the qemu user" "$fo_ok" \
+		"disk is '$owner' want user '$expected_user'"
+
+	# Stated separately because root is the specific signature of the bug,
+	# and a failure saying so is more use than one saying "not qemu".
+	if [ "$user" != root ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the disk is not left owned by the SSH user vmsync ran as" "$fo_ok" \
+		"disk is '$owner' -- a root-owned disk is one the promoted domain cannot open"
+
+	if [ -z "$expected_group" ]; then
+		log "   (skipping the preserve/override checks: no group to use as a sentinel)"
+		return 0
+	fi
+
+	# 2. -reinit must PRESERVE ownership. This is the sharper half of the
+	#    bug: reinit renames the correctly-owned disk aside and creates a
+	#    fresh root-owned one, silently turning a bootable replica into one
+	#    qemu cannot open.
+	#
+	#    The sentinel is the GROUP, set to root while leaving the user alone.
+	#    That is deliberately harmless -- the disk stays openable by its
+	#    owning user throughout, so an interrupted run never leaves an
+	#    unbootable replica behind -- while still being distinguishable from
+	#    what detection alone would produce.
+	local path
+	path="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")" || true
+	if [ -z "$path" ]; then
+		warn "could not resolve the target disk path -- skipping the reinit ownership checks"
+		return 0
+	fi
+	if ! ssh_host_cmd "$TARGET_HOST" chown "${expected_user}:root" "$path"; then
+		warn "could not set the sentinel ownership -- skipping the reinit ownership checks"
+		return 0
+	fi
+
+	run_vmsync "$sc" owner-preserve -reinit
+	owner="$(target_disk_owner)"
+	if [ "$owner" = "${expected_user}:root" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "-reinit preserves the ownership it replaces" "$fo_ok" \
+		"disk is '$owner' want '${expected_user}:root' -- a reinit that resets ownership silently breaks a working replica"
+
+	# 3. An explicit -target-disk-owner overrides what was preserved. Runs
+	#    last so it also puts the ownership back where it belongs, whatever
+	#    the checks above found.
+	run_vmsync "$sc" owner-explicit -reinit -target-disk-owner "$expected"
+	owner="$(target_disk_owner)"
+	if [ "$owner" = "$expected" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "an explicit -target-disk-owner overrides the preserved one" "$fo_ok" \
+		"disk is '$owner' want '$expected'"
+
+	# Whatever happened above, do not leave the sentinel behind.
+	if [ "$owner" != "$expected" ]; then
+		warn "restoring the target disk's ownership to $expected by hand after a failed check"
+		ssh_host_cmd "$TARGET_HOST" chown "$expected" "$path" \
+			|| warn "could not restore ownership on $path -- fix it before promoting this replica"
+	fi
+	return 0
+}
+
 stage_failover() {
 	log "=== Stage 6: failover -- promotion, fencing, and the way back ==="
 
@@ -1095,6 +1221,17 @@ stage_failover() {
 			;;
 		esac
 	fi
+
+	# --- disk ownership -----------------------------------------------------
+	# The check that would have caught the bug this stage's neighbours were
+	# written after: vmsync creates the target's disks by running qemu-img
+	# over SSH, so they belong to that SSH user -- root. qemu does not run as
+	# root, so a root-owned disk is one the PROMOTED domain cannot open, and
+	# that is discovered during a failover on the copy meant to take over.
+	#
+	# Costs two extra full copies, because each property under test only
+	# happens when a disk file is created from scratch.
+	stage_failover_disk_owner "$sc"
 
 	# --- promote, WITHOUT arming a fence ------------------------------------
 	# The drill case, and the single most important safety property in the
