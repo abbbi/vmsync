@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -544,5 +545,77 @@ func runInvert(ctx context.Context, cfg syncConfig) error {
 	trace.Info("replication direction inverted",
 		"new_source", tgtHost+":"+cfg.TargetDomain, "new_target", srcHost+":"+cfg.SourceDomain)
 	trace.Warning("the first sync in the new direction must be a full one: there is no checkpoint chain this way round, and the new target's disks diverged at the failover")
+	warnAboutReversedDiskPaths(srcMgr, tgtMgr, cfg)
 	return nil
+}
+
+// warnAboutReversedDiskPaths tells the operator where the reversed sync has
+// to put its disks, when that is not where the old direction put them.
+//
+// -target-disk-path describes where THIS pair's replicas went, so after an
+// inversion it names the new SOURCE's own disks. Reused unchanged on the
+// reversed sync it aims at the wrong directory on the wrong host: either
+// failing because it does not exist there, or -- where it does -- writing
+// the replica there and redefining the domain to match, silently orphaning
+// the original disk.
+//
+// Only a warning, and it has to be. This command does not run the reversed
+// sync and has no schedule to correct; the next invocation's flags are the
+// operator's to type. (The control plane, which does own the schedule,
+// re-aims it itself -- see moveScheduleEntryLocked.)
+//
+// Best-effort throughout: this runs after the inversion has already been
+// applied, so nothing here may turn a completed inversion into a failure.
+func warnAboutReversedDiskPaths(srcMgr, tgtMgr *libvirtsync.Manager, cfg syncConfig) {
+	newTargetDir, ok := singleDiskDir(srcMgr, cfg.SourceDomain)
+	if !ok {
+		return
+	}
+	newSourceDir, ok := singleDiskDir(tgtMgr, cfg.TargetDomain)
+	if !ok {
+		return
+	}
+	if newTargetDir == newSourceDir {
+		// Symmetric layout: leaving -target-disk-path unset already puts the
+		// copy at the source's own path, which is the right place.
+		return
+	}
+	trace.Warning("the two ends keep their disks in different directories, so the reversed sync needs a different -target-disk-path than the old direction used -- without it the copy lands somewhere the new target does not keep its disks, and redefining the domain to match would orphan the originals",
+		"new_source_disks", newSourceDir, "new_target_disks", newTargetDir,
+		"use", "-target-disk-path "+newTargetDir)
+}
+
+// singleDiskDir reports the one directory holding every qcow2 disk of a
+// domain. False when there are none, or when they span several -- which
+// -target-disk-path cannot express in either direction.
+func singleDiskDir(mgr *libvirtsync.Manager, domain string) (string, bool) {
+	dom, err := mgr.LookupDomain(domain)
+	if err != nil {
+		return "", false
+	}
+	defer dom.Free()
+	domXML, err := dom.GetXMLDesc(0)
+	if err != nil {
+		return "", false
+	}
+	disks, err := disk.ParseQcowDisks(domXML)
+	if err != nil || len(disks) == 0 {
+		return "", false
+	}
+	dir := ""
+	for _, d := range disks {
+		// path, not filepath: these are paths on a libvirt host.
+		this := path.Dir(d.RootSource)
+		if dir == "" {
+			dir = this
+			continue
+		}
+		if dir != this {
+			return "", false
+		}
+	}
+	if dir == "" {
+		return "", false
+	}
+	return dir, true
 }

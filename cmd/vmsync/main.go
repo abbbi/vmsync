@@ -2192,6 +2192,22 @@ func run(cfg syncConfig) (runErr error) {
 		for _, d := range qcowDisks {
 			reinitTargetPath := util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
 
+			// Nothing to replace is an ordinary state, not a failure, and it
+			// has to be checked rather than shrugged off by the command:
+			// `rm -f` tolerates a missing file but `mv -n` does not, and
+			// rename is the DEFAULT. So a -reinit against a target that does
+			// not exist yet -- a first-ever run, one after a previous
+			// -reinit with delete, or a multi-disk domain where only some
+			// files are present -- failed outright on the move.
+			exists, err := util.RemotePathExists(ctx, targetSSHClient, reinitTargetPath)
+			if err != nil {
+				return fmt.Errorf("reinit: check whether target disk %s exists: %w", reinitTargetPath, err)
+			}
+			if !exists {
+				trace.Info("reinit: nothing to replace, the target disk does not exist yet", "path", reinitTargetPath)
+				continue
+			}
+
 			// Remember what owns this file BEFORE it is moved out of the
 			// way, because the replacement is created by qemu-img over SSH
 			// and will belong to that SSH user -- root. Whatever owns it now
