@@ -241,3 +241,111 @@ func TestReadQemuConfOwner(t *testing.T) {
 		}
 	})
 }
+
+// scriptedRunner answers each command from a table keyed by a substring of
+// it, so a test can say "this host has a qemu account but no libvirt-qemu"
+// without caring about the exact getent spelling.
+type scriptedRunner struct {
+	replies map[string]string
+	seen    []string
+}
+
+func (s *scriptedRunner) Run(_ context.Context, cmd string) (string, error) {
+	s.seen = append(s.seen, cmd)
+	for frag, out := range s.replies {
+		if strings.Contains(cmd, frag) {
+			return out, nil
+		}
+	}
+	return "no\n", nil
+}
+
+// The last-resort detection, which is what a FIRST-EVER sync relies on: every
+// distribution ships qemu.conf with the setting commented out, so a first
+// sync onto a fresh target reaches this and nothing else.
+func TestDetectQemuAccount(t *testing.T) {
+	t.Run("RHEL: a qemu account and a qemu group", func(t *testing.T) {
+		r := &scriptedRunner{replies: map[string]string{
+			"passwd 'qemu'": "yes\n",
+			"group 'qemu'":  "yes\n",
+		}}
+		got, found := DetectQemuAccount(context.Background(), r)
+		if got.User != "qemu" || got.Group != "qemu" {
+			t.Errorf("got %q:%q, want qemu:qemu", got.User, got.Group)
+		}
+		if len(found) != 1 {
+			t.Errorf("found %v, want exactly one candidate", found)
+		}
+		if got.Source == "" {
+			t.Error("an inferred owner must say it was inferred")
+		}
+	})
+
+	t.Run("Debian: libvirt-qemu in the kvm group", func(t *testing.T) {
+		r := &scriptedRunner{replies: map[string]string{
+			"passwd 'libvirt-qemu'": "yes\n",
+			"group 'kvm'":           "yes\n",
+		}}
+		got, _ := DetectQemuAccount(context.Background(), r)
+		if got.User != "libvirt-qemu" || got.Group != "kvm" {
+			t.Errorf("got %q:%q, want libvirt-qemu:kvm", got.User, got.Group)
+		}
+	})
+
+	t.Run("the user exists but its group does not", func(t *testing.T) {
+		// Naming an absent group would make the chown fail outright, throwing
+		// away a correct answer for the user half.
+		r := &scriptedRunner{replies: map[string]string{"passwd 'qemu'": "yes\n"}}
+		got, _ := DetectQemuAccount(context.Background(), r)
+		if got.User != "qemu" {
+			t.Errorf("got user %q, want qemu", got.User)
+		}
+		if got.Group != "" {
+			t.Errorf("got group %q, want it omitted since it does not exist", got.Group)
+		}
+	})
+
+	t.Run("no known account at all", func(t *testing.T) {
+		r := &scriptedRunner{}
+		got, found := DetectQemuAccount(context.Background(), r)
+		if !got.Empty() || len(found) != 0 {
+			t.Errorf("got %q / %v, want nothing determined", got.Spec(), found)
+		}
+	})
+
+	t.Run("both accounts exist, which must not be resolved silently", func(t *testing.T) {
+		r := &scriptedRunner{replies: map[string]string{
+			"passwd 'qemu'":         "yes\n",
+			"passwd 'libvirt-qemu'": "yes\n",
+			"group":                 "yes\n",
+		}}
+		got, found := DetectQemuAccount(context.Background(), r)
+		if !got.Empty() {
+			t.Errorf("got %q -- an ambiguous host must be reported, not guessed at", got.Spec())
+		}
+		if len(found) != 2 {
+			t.Errorf("found %v, want both candidates reported so the warning can name them", found)
+		}
+	})
+}
+
+func TestParseAccountExists(t *testing.T) {
+	for out, want := range map[string]bool{
+		"yes\n": true, "yes": true, " yes \n": true,
+		"no\n": false, "": false, "getent: command not found\n": false,
+	} {
+		if got := ParseAccountExists(out); got != want {
+			t.Errorf("ParseAccountExists(%q) = %v, want %v", out, got, want)
+		}
+	}
+}
+
+func TestAccountExistsCommandUsesNSS(t *testing.T) {
+	cmd := AccountExistsCommand("passwd", "qemu")
+	if !strings.Contains(cmd, "getent") {
+		t.Errorf("must consult NSS so an LDAP/SSSD account is found too: %q", cmd)
+	}
+	if !strings.Contains(cmd, "'qemu'") {
+		t.Errorf("the name is not quoted: %q", cmd)
+	}
+}

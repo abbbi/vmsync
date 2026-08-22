@@ -196,6 +196,77 @@ var QemuConfPaths = []string{
 	"/usr/local/etc/libvirt/qemu.conf",
 }
 
+// KnownQemuAccounts are the accounts a distribution's libvirt runs qemu as,
+// created by the package that ships qemu precisely for that purpose.
+//
+// Used only as a last resort, when qemu.conf leaves the setting commented
+// out -- which is how every distribution ships it, so this is the ordinary
+// case on a first-ever sync rather than an exotic one.
+//
+// Inferring from a system account's existence is weaker evidence than
+// reading a configured value, and it is worth being precise about why it is
+// nonetheless worth acting on. Being WRONG here is not worse than doing
+// nothing: the file is root-owned either way, and root-owned is already
+// unusable by a non-root qemu. If libvirt happens to run qemu as root, a
+// qemu-owned file is still perfectly openable by it. So the failure mode of
+// guessing is "no worse than before", while the failure mode of doing
+// nothing is a replica that cannot boot -- discovered during a failover.
+var KnownQemuAccounts = []DiskOwner{
+	{User: "qemu", Group: "qemu"},        // RHEL, Fedora, CentOS, SUSE
+	{User: "libvirt-qemu", Group: "kvm"}, // Debian, Ubuntu
+}
+
+// AccountExistsCommand builds a command that prints "yes" or "no".
+//
+// getent rather than reading /etc/passwd: it consults NSS, so an account
+// that lives in LDAP or SSSD -- entirely normal on a managed hypervisor --
+// is found too.
+// database is one of getent's own fixed names ("passwd", "group") and is
+// never operator input, so it is not quoted; name is, because it comes from
+// KnownQemuAccounts today and could come from elsewhere tomorrow.
+func AccountExistsCommand(database, name string) string {
+	return "getent " + database + " " + ShQuote(name) + " >/dev/null 2>&1 && echo yes || echo no"
+}
+
+// ParseAccountExists reads what AccountExistsCommand printed.
+func ParseAccountExists(out string) bool {
+	return strings.TrimSpace(out) == "yes"
+}
+
+// DetectQemuAccount finds which well-known qemu account exists on a host.
+//
+// Returns the owner to use plus every candidate that matched. More than one
+// match is deliberately NOT resolved by preference order: a host carrying
+// both `qemu` and `libvirt-qemu` is unusual enough that picking one silently
+// would be a worse answer than telling somebody to decide.
+func DetectQemuAccount(ctx context.Context, r CommandRunner) (DiskOwner, []string) {
+	var found []string
+	var first DiskOwner
+	for _, cand := range KnownQemuAccounts {
+		out, err := r.Run(ctx, AccountExistsCommand("passwd", cand.User))
+		if err != nil || !ParseAccountExists(out) {
+			continue
+		}
+		found = append(found, cand.User)
+		if !first.Empty() {
+			continue
+		}
+		o := DiskOwner{User: cand.User, Source: "a " + cand.User + " account on the target host"}
+		// Only name the group if it exists too. RHEL's qemu user is in a
+		// qemu group and Debian's libvirt-qemu is in kvm, but a chown naming
+		// a group that is absent fails outright -- and failing the run over
+		// the group half would throw away a correct answer for the user half.
+		if gout, gerr := r.Run(ctx, AccountExistsCommand("group", cand.Group)); gerr == nil && ParseAccountExists(gout) {
+			o.Group = cand.Group
+		}
+		first = o
+	}
+	if len(found) != 1 {
+		return DiskOwner{}, found
+	}
+	return first, found
+}
+
 // ReadQemuConfOwner asks a host what user its libvirt runs qemu as.
 //
 // Best-effort by design: a host that cannot be read, or whose qemu.conf says

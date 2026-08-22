@@ -450,6 +450,14 @@ func main() {
 		trace.Error("invalid -replaced-disk-action", "error", fmt.Errorf("-replaced-disk-action must be %q or %q, not %q", replacedDiskRename, replacedDiskDelete, cfg.ReplacedDiskAction))
 		os.Exit(2)
 	}
+
+	// Validated here rather than where it is used: the first place it would
+	// otherwise be parsed is after the full disk copy, and refusing a typo'd
+	// owner at that point would throw away the whole run.
+	if _, err := util.ParseDiskOwner(cfg.TargetDiskOwner); err != nil {
+		trace.Error("invalid -target-disk-owner", "error", err)
+		os.Exit(2)
+	}
 	if cfg.Compress != "" {
 		if err := nbdbridge.ValidateCompressAlgo(cfg.Compress); err != nil {
 			trace.Error("invalid compress configuration", "error", err)
@@ -829,12 +837,15 @@ func refuseReinitIfTargetRunning(targetDomain string, exists, running bool) erro
 	return nil
 }
 
-// qemuConfOwnerOnce caches the target's qemu.conf lookup for one run: every
-// disk resolves to the same answer, and asking once per disk would be one
-// SSH round trip per disk for a value that cannot change mid-run.
-var qemuConfOwnerOnce struct {
+// targetQemuOwnerOnce caches who should own the target's disks, resolved
+// once per run: every disk gets the same answer, and the lookup is several
+// SSH round trips for a value that cannot change mid-run.
+var targetQemuOwnerOnce struct {
 	sync.Once
 	owner util.DiskOwner
+	// candidates records what DetectQemuAccount found, so an ambiguous
+	// host can be reported as ambiguous rather than as undetermined.
+	candidates []string
 }
 
 // applyTargetDiskOwner gives a freshly created target disk an owner qemu can
@@ -871,20 +882,36 @@ func applyTargetDiskOwner(ctx context.Context, client *remotessh.Client, cfg syn
 		if !replaced.Empty() {
 			owner = replaced
 		} else {
-			qemuConfOwnerOnce.Do(func() {
-				qemuConfOwnerOnce.owner = util.ReadQemuConfOwner(ctx, client)
+			// Resolved once per run: every disk gets the same answer, and
+			// this is several SSH round trips.
+			targetQemuOwnerOnce.Do(func() {
+				targetQemuOwnerOnce.owner = util.ReadQemuConfOwner(ctx, client)
+				if !targetQemuOwnerOnce.owner.Empty() {
+					return
+				}
+				// qemu.conf said nothing, which is the ORDINARY case: every
+				// distribution ships that setting commented out, so this is
+				// where a first-ever sync lands rather than an exotic
+				// corner. Fall back to which well-known qemu account the
+				// host actually has.
+				targetQemuOwnerOnce.owner, targetQemuOwnerOnce.candidates =
+					util.DetectQemuAccount(ctx, client)
 			})
-			owner = qemuConfOwnerOnce.owner
+			owner = targetQemuOwnerOnce.owner
 		}
 	}
 
 	if owner.Empty() {
-		// Deliberately not a guess. The compiled-in default behind a
-		// commented qemu.conf differs by distribution, and chowning to the
-		// wrong user would look like the problem had been handled while
-		// leaving the domain just as unable to start.
-		trace.Warning("could not determine who should own the target disk, so it is left owned by the SSH user this ran as -- if that is root, the promoted domain may be unable to open it. Set -target-disk-owner (qemu:qemu on RHEL, libvirt-qemu:kvm on Debian), or set user/group in the target's /etc/libvirt/qemu.conf",
-			"disk", targetPath)
+		switch n := len(targetQemuOwnerOnce.candidates); {
+		case n > 1:
+			// Both a qemu and a libvirt-qemu account. Unusual enough that
+			// picking one silently would be a worse answer than saying so.
+			trace.Warning("the target host has more than one account libvirt might run qemu as, so the disk is left owned by the SSH user this ran as -- if that is root, the promoted domain may be unable to open it. Say which with -target-disk-owner",
+				"disk", targetPath, "candidates", strings.Join(targetQemuOwnerOnce.candidates, ", "))
+		default:
+			trace.Warning("could not determine who should own the target disk, so it is left owned by the SSH user this ran as -- if that is root, the promoted domain may be unable to open it. Set -target-disk-owner (qemu:qemu on RHEL, libvirt-qemu:kvm on Debian), or set user/group in the target's /etc/libvirt/qemu.conf",
+				"disk", targetPath)
+		}
 		return nil
 	}
 
