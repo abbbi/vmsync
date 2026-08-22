@@ -69,6 +69,14 @@ type Operation struct {
 	// promoted domain's own replica_source, for the same reason PeerHost
 	// above is a claim to be checked rather than an endpoint to use.
 	ArmFence bool `json:"arm_fence,omitempty"`
+	// ShutdownTimeoutSec is how long a clean guest shutdown may take, already
+	// resolved by the UI from the VM's own setting or the estate default.
+	//
+	// Carried on the operation rather than looked up when it runs, so the
+	// instruction means the same thing whenever it is executed -- a decision
+	// that silently meant 300 seconds in March and 900 in April is not one
+	// anybody can audit.
+	ShutdownTimeoutSec int `json:"shutdown_timeout_sec,omitempty"`
 
 	CreatedAtUnix int64  `json:"created_at_unix"`
 	CreatedBy     string `json:"created_by,omitempty"`

@@ -294,7 +294,7 @@ func run(cfg agentConfig) error {
 		return fmt.Errorf("load the fence ledger: %w", err)
 	}
 	wg.Add(1)
-	go func() { defer wg.Done(); fenceLoop(ctx, cfg, fences) }()
+	go func() { defer wg.Done(); fenceLoop(ctx, cfg, state, fences) }()
 
 	wg.Add(2)
 	go func() { defer wg.Done(); reportLoop(ctx, client, cfg, state, sched, ledger, fences) }()

@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -190,7 +191,11 @@ func operationArgs(cfg agentConfig, op Operation) ([]string, error) {
 		return args, nil
 
 	case OpShutdown:
-		return []string{"-shutdown-domain", "-target-uri", cfg.LibvirtURI, "-target-domain", op.VM}, nil
+		args := []string{"-shutdown-domain", "-target-uri", cfg.LibvirtURI, "-target-domain", op.VM}
+		if op.ShutdownTimeoutSec > 0 {
+			args = append(args, "-shutdown-timeout-sec", strconv.Itoa(op.ShutdownTimeoutSec))
+		}
+		return args, nil
 
 	case OpInvert:
 		if op.PeerHost == "" {

@@ -77,6 +77,10 @@ type ScheduleEntry struct {
 	// TargetHost against a multi-target source is refused rather than
 	// guessed at.
 	TargetHost string `json:"target_host,omitempty"`
+	// ShutdownTimeoutSec overrides UIConfig.ShutdownTimeoutSec for this VM,
+	// 0 to inherit it. How long a guest takes to stop cleanly is a property
+	// of what it runs, not of the estate.
+	ShutdownTimeoutSec int `json:"shutdown_timeout_sec,omitempty"`
 }
 
 // UIConfig is the configuration the UI hands out.
@@ -106,6 +110,13 @@ type UIConfig struct {
 	// single agent can see that four others are writing to the same target,
 	// so this is the one limit only the UI can compute.
 	TargetHostBudget map[string]int `json:"target_host_budget,omitempty"`
+	// ShutdownTimeoutSec is the estate default for a clean guest shutdown.
+	//
+	// Needed here as well as on each operation because the agent shuts
+	// domains down on its OWN initiative: a fence has no operation behind it,
+	// and during the partition that usually causes one there is no control
+	// plane to ask. Zero leaves vmsync its own default.
+	ShutdownTimeoutSec int `json:"shutdown_timeout_sec,omitempty"`
 
 	// Operations are one-shot instructions -- a promotion, an inversion --
 	// as opposed to the standing desired state above.

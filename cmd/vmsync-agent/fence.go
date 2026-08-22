@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -50,10 +51,14 @@ const (
 	// could not ask" quickly rather than wedging the whole sweep behind one
 	// unreachable host.
 	fenceReadTimeout = 30 * time.Second
-	// fenceShutdownTimeout bounds the shutdown that follows. Generous: it is
-	// a guest ACPI shutdown, and the alternative to waiting is destroying a
-	// running VM, which this design never does.
-	fenceShutdownTimeout = 10 * time.Minute
+	// fenceShutdownGrace is how much longer vmsync gets than the guest does.
+	//
+	// vmsync has to connect to libvirt, read state and write metadata either
+	// side of the wait itself, so bounding it at exactly the guest timeout
+	// would kill it just as the guest ran out -- turning "the guest did not
+	// stop in time", which is a clear diagnosis, into "the process
+	// disappeared", which is not.
+	fenceShutdownGrace = 2 * time.Minute
 	// fenceLedgerKept bounds the durable record. One entry per failover per
 	// VM, so this is effectively unbounded for any real estate while still
 	// refusing to grow without limit.
@@ -218,12 +223,12 @@ func (l *fenceLedger) LatestByVM() map[string]fenceRecord {
 //     loop is what makes the answer arrive when there is no UI to issue one.
 //     Either way the token is read from the peer's own libvirt, never taken
 //     on the control plane's word.
-func fenceLoop(ctx context.Context, cfg agentConfig, ledger *fenceLedger) {
+func fenceLoop(ctx context.Context, cfg agentConfig, state *sharedState, ledger *fenceLedger) {
 	ticker := time.NewTicker(fenceTickInterval)
 	defer ticker.Stop()
 
 	for {
-		sweepFences(ctx, cfg, ledger)
+		sweepFences(ctx, cfg, state, ledger)
 		select {
 		case <-ctx.Done():
 			return
@@ -241,7 +246,7 @@ func fenceLoop(ctx context.Context, cfg agentConfig, ledger *fenceLedger) {
 // incrementally maintained gauge would therefore latch at 1 and stay there
 // forever after the first successful fence -- an alert nobody could clear,
 // which trains people to ignore the one metric that must never be ignored.
-func sweepFences(ctx context.Context, cfg agentConfig, ledger *fenceLedger) {
+func sweepFences(ctx context.Context, cfg agentConfig, state *sharedState, ledger *fenceLedger) {
 	mgr, err := libvirtsync.Connect(cfg.LibvirtURI)
 	if err != nil {
 		trace.Error("fence check could not reach local libvirt", "error", err)
@@ -262,6 +267,11 @@ func sweepFences(ctx context.Context, cfg agentConfig, ledger *fenceLedger) {
 	// others, and publishing that would clear the split-brain state of every
 	// VM it never reached. Same reasoning as the error returns above: a
 	// partial answer is not a negative one.
+	// Read once per sweep. The schedule carries per-VM shutdown timeouts,
+	// and re-reading it for every domain would take the lock repeatedly to
+	// get the same answer.
+	cached := state.get().Config
+
 	split := map[string]bool{}
 	completed := false
 	defer func() {
@@ -298,7 +308,7 @@ func sweepFences(ctx context.Context, cfg agentConfig, ledger *fenceLedger) {
 			if ctx.Err() != nil {
 				return
 			}
-			if checkOneFence(ctx, cfg, ledger, d, ref) {
+			if checkOneFence(ctx, cfg, cached, ledger, d, ref) {
 				split[d.Name] = true
 			}
 		}
@@ -308,7 +318,7 @@ func sweepFences(ctx context.Context, cfg agentConfig, ledger *fenceLedger) {
 
 // checkOneFence asks one peer about one VM, and acts if it must. It reports
 // whether this VM is currently in split brain, for the caller's metric.
-func checkOneFence(ctx context.Context, cfg agentConfig, ledger *fenceLedger, d inventory.Domain, peerRef string) bool {
+func checkOneFence(ctx context.Context, cfg agentConfig, cached UIConfig, ledger *fenceLedger, d inventory.Domain, peerRef string) bool {
 	host, peerVM := splitReplicaRef(peerRef)
 	if host == "" || peerVM == "" {
 		trace.Error("fence check skipped a replica target that is not in host:domain form", "vm", d.Name, "target", peerRef)
@@ -366,7 +376,7 @@ func checkOneFence(ctx context.Context, cfg agentConfig, ledger *fenceLedger, d 
 		return true
 	}
 
-	fenceOneDomain(ctx, cfg, ledger, d.Name, peerRef, rep, verdict)
+	fenceOneDomain(ctx, cfg, cached, ledger, d.Name, peerRef, rep, verdict)
 
 	// Whether the shutdown succeeded is deliberately NOT what decides this.
 	// The domain was running in two places when this pass looked, which is
@@ -378,7 +388,7 @@ func checkOneFence(ctx context.Context, cfg agentConfig, ledger *fenceLedger, d 
 
 // fenceOneDomain records intent, shuts the domain down, and records what
 // happened.
-func fenceOneDomain(ctx context.Context, cfg agentConfig, ledger *fenceLedger, vm, peerRef string, rep fenceReport, verdict failover.FenceVerdict) {
+func fenceOneDomain(ctx context.Context, cfg agentConfig, cached UIConfig, ledger *fenceLedger, vm, peerRef string, rep fenceReport, verdict failover.FenceVerdict) {
 	now := time.Now()
 	rec := fenceRecord{
 		FenceID: rep.Fence.ID,
@@ -400,7 +410,15 @@ func fenceOneDomain(ctx context.Context, cfg agentConfig, ledger *fenceLedger, v
 	trace.Warning("FENCING: shutting this domain down because it has been failed over to another host",
 		"vm", vm, "peer", peerRef, "fence_id", rep.Fence.ID, "reason", verdict.Reason)
 
-	cctx, cancel := context.WithTimeout(ctx, fenceShutdownTimeout)
+	// How long the guest gets, and how long vmsync itself gets.
+	//
+	// The second must exceed the first, or this kills vmsync mid-wait --
+	// leaving a `running` ledger entry, a domain in an unknown state, and a
+	// fence that is latched and will never be tried again. That was a real
+	// hazard while the outer bound was a fixed ten minutes: any per-VM
+	// timeout above it would have been cut off before it could expire.
+	guestSec := shutdownTimeoutFor(cached, vm)
+	cctx, cancel := context.WithTimeout(ctx, shutdownProcessBound(guestSec))
 	defer cancel()
 
 	// The existing -shutdown-domain mode, unchanged: a clean guest shutdown
@@ -409,7 +427,10 @@ func fenceOneDomain(ctx context.Context, cfg agentConfig, ledger *fenceLedger, v
 	// that a fenced domain ends in exactly the state a deliberate planned
 	// failover would leave it in -- there is no second, subtly different
 	// shutdown path to keep in step.
-	args := []string{"-shutdown-domain", "-target-uri", cfg.LibvirtURI, "-target-domain", vm}
+	args := []string{
+		"-shutdown-domain", "-target-uri", cfg.LibvirtURI, "-target-domain", vm,
+		"-shutdown-timeout-sec", strconv.Itoa(guestSec),
+	}
 	cmd := exec.CommandContext(cctx, cfg.VmsyncPath, args...)
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 60 * time.Second
@@ -431,6 +452,80 @@ func fenceOneDomain(ctx context.Context, cfg agentConfig, ledger *fenceLedger, v
 	if err := ledger.Finish(rec); err != nil {
 		trace.Error("fence outcome could not be recorded", "vm", vm, "error", err)
 	}
+}
+
+// shutdownTimeoutFor picks how long a guest gets to stop cleanly: this VM's
+// own setting, then the estate default, then vmsync's own.
+//
+// The same order the UI resolves in when it creates a shutdown operation,
+// and it has to be: these two paths shut a domain down in identical ways,
+// and a VM that stops fine when an operator asks but fails when a fence does
+// would be a baffling thing to debug.
+//
+// Clamped rather than trusted. The config comes from a separately-versioned
+// program over the network, and this number decides how long a production VM
+// is given before its shutdown is called a failure -- a nonsense value would
+// either declare failure before the guest had begun or hang the sweep behind
+// one domain for hours.
+func shutdownTimeoutFor(cached UIConfig, vm string) int {
+	sec := 0
+	for _, e := range cached.Schedule {
+		if e.VM == vm && e.ShutdownTimeoutSec > 0 {
+			sec = e.ShutdownTimeoutSec
+			break
+		}
+	}
+	if sec <= 0 {
+		sec = cached.ShutdownTimeoutSec
+	}
+	if sec <= 0 {
+		sec = defaultShutdownTimeoutSec
+	}
+	if sec < minShutdownTimeoutSec {
+		sec = minShutdownTimeoutSec
+	}
+	if sec > maxShutdownTimeoutSec {
+		sec = maxShutdownTimeoutSec
+	}
+	return sec
+}
+
+// shutdownProcessBound is how long vmsync itself gets, given how long the
+// guest gets.
+//
+// Always strictly longer, and that is the whole point of it being its own
+// function. vmsync connects to libvirt, reads state and writes metadata
+// either side of the wait, so a bound equal to the guest timeout kills it
+// exactly as the guest runs out -- leaving a `running` ledger entry, a
+// domain in an unknown state, and a latched fence nothing will ever retry.
+// It also replaces a fixed ten-minute bound that any longer per-VM timeout
+// would silently have been cut off by.
+func shutdownProcessBound(guestSec int) time.Duration {
+	return time.Duration(guestSec)*time.Second + fenceShutdownGrace
+}
+
+// Bounds on a guest shutdown, mirroring the UI's own. Duplicated rather than
+// shared because the two are separately-versioned programs -- and because
+// the agent has to hold the line whatever a UI of any vintage sends.
+const (
+	defaultShutdownTimeoutSec = 300
+	minShutdownTimeoutSec     = 30
+	maxShutdownTimeoutSec     = 3600
+)
+
+// validateShutdownTimeoutSec accepts 0 (meaning "inherit") or a value in
+// range, for a configuration a PERSON wrote. Anything arriving from a UI is
+// clamped by shutdownTimeoutFor instead: one is a mistake to point out, the
+// other is input to survive.
+func validateShutdownTimeoutSec(sec int) error {
+	if sec == 0 {
+		return nil
+	}
+	if sec < minShutdownTimeoutSec || sec > maxShutdownTimeoutSec {
+		return fmt.Errorf("shutdown_timeout_sec %d is out of range: use 0 to inherit, or %d to %d seconds",
+			sec, minShutdownTimeoutSec, maxShutdownTimeoutSec)
+	}
+	return nil
 }
 
 // readPeerFence runs vmsync -read-fence against a peer and parses the answer.

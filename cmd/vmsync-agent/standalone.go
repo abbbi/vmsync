@@ -104,7 +104,7 @@ func runStandalone(cfg agentConfig) error {
 		return fmt.Errorf("load the fence ledger: %w", err)
 	}
 	wg.Add(1)
-	go func() { defer wg.Done(); fenceLoop(ctx, cfg, fences) }()
+	go func() { defer wg.Done(); fenceLoop(ctx, cfg, state, fences) }()
 
 	wg.Wait()
 	return nil
@@ -170,6 +170,18 @@ func validateStandaloneConfig(cfg UIConfig) error {
 		if err := e.Profile.Validate(); err != nil {
 			return fmt.Errorf("%s: %w", where, err)
 		}
+		// Refused rather than clamped. shutdownTimeoutFor clamps whatever a
+		// UI sends, because a separately-versioned program's output is input
+		// to survive -- but this file was typed by a person, and silently
+		// turning their 30000 into 3600 is the failure this function exists
+		// to prevent: it does not look like a mistake, it looks like the
+		// setting not working.
+		if err := validateShutdownTimeoutSec(e.ShutdownTimeoutSec); err != nil {
+			return fmt.Errorf("%s: %w", where, err)
+		}
+	}
+	if err := validateShutdownTimeoutSec(cfg.ShutdownTimeoutSec); err != nil {
+		return err
 	}
 	if cfg.MaxConcurrentSyncs < 0 {
 		return fmt.Errorf("max_concurrent_syncs cannot be negative")
