@@ -158,6 +158,11 @@ type syncConfig struct {
 	// invites passing the wrong one, and because the discard-and-rebuild
 	// step is not conceptually tied to that one flag.
 	ReplacedDiskAction string
+	// TargetDiskOwner is who should own the disk files vmsync creates on the
+	// target. See util.ParseDiskOwner: qemu-img runs over SSH as root, and
+	// qemu does not run as root, so an unowned-for disk is one a promoted
+	// domain may be unable to open.
+	TargetDiskOwner string
 
 	SourceURI      string
 	TargetURI      string
@@ -258,6 +263,7 @@ func main() {
 	flag.BoolVar(&cfg.Start, "start", false, "In case vm is in non-running state, start in paused mode to allow sync")
 	flag.BoolVar(&cfg.Reinit, "reinit", false, "Delete VM on target and restart a full sync process")
 	flag.StringVar(&cfg.ReplacedDiskAction, "replaced-disk-action", replacedDiskRename, fmt.Sprintf("What to do with a target disk file that is about to be discarded and rebuilt (currently only -reinit does this): %q renames it to <path>%s<unixtime> so its contents survive, %q removes it. Defaults to %q: the target of a reinit may be a former primary whose disks still hold everything written after the last successful sync, and that is unrecoverable once deleted. Renaming needs room for both copies, and the aside files are never reaped automatically", replacedDiskRename, replacedDiskSuffix, replacedDiskDelete, replacedDiskRename))
+	flag.StringVar(&cfg.TargetDiskOwner, "target-disk-owner", util.DiskOwnerAuto, fmt.Sprintf("Who should own the disk files created on the target: %q (default), %q, or an explicit \"user\", \"user:group\" or \":group\". vmsync creates those files by running qemu-img over SSH, so they are owned by that SSH user (root) -- while qemu runs as \"qemu\" on RHEL and \"libvirt-qemu\" on Debian, and cannot open a root-owned disk. libvirt's dynamic_ownership usually hides this, but it is off in plenty of deployments and cannot work at all on NFS with root_squash. %q preserves whatever owned the file before (which is what makes -reinit safe, since it replaces a correctly-owned disk with a fresh root-owned one) and otherwise takes what the target's libvirt qemu.conf sets; it never guesses, and warns instead. %q is the old behaviour", util.DiskOwnerAuto, util.DiskOwnerOff, util.DiskOwnerAuto, util.DiskOwnerOff))
 	flag.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "Reinit automatically after N failures (disabled by default). Count is held on target XML")
 	compressArg := optionalValueFlag{bareDefault: "s2"}
 	fenceSourceArg := optionalValueFlag{bareDefault: fenceSourceAuto}
@@ -820,6 +826,72 @@ func refuseReinitIfTargetRunning(targetDomain string, exists, running bool) erro
 	if exists && running {
 		return fmt.Errorf("reinit: target domain %s is running, shut it down before reinitializing", targetDomain)
 	}
+	return nil
+}
+
+// qemuConfOwnerOnce caches the target's qemu.conf lookup for one run: every
+// disk resolves to the same answer, and asking once per disk would be one
+// SSH round trip per disk for a value that cannot change mid-run.
+var qemuConfOwnerOnce struct {
+	sync.Once
+	owner util.DiskOwner
+}
+
+// applyTargetDiskOwner gives a freshly created target disk an owner qemu can
+// open, and says why it chose the one it did.
+//
+// The problem it exists for: vmsync creates these files by running qemu-img
+// over SSH, so they belong to that SSH user -- root, realistically. qemu does
+// not run as root (RHEL: `qemu`, Debian: `libvirt-qemu`), so a root-owned
+// disk is one the promoted domain may be unable to open, and that is
+// discovered during a failover, on the copy that was supposed to take over.
+//
+// libvirt's dynamic_ownership normally chowns disks as it starts a domain,
+// which is why this can go unnoticed for years. It is not something to lean
+// on: it is disabled in plenty of deployments, and on NFS with root_squash
+// it cannot work at all -- which is exactly where a DR replica often lives.
+//
+// A failure to chown fails the RUN rather than being logged and shrugged off.
+// The alternative is a sync that reports success and leaves behind a replica
+// that cannot boot, which is the failure mode this whole function exists to
+// remove.
+func applyTargetDiskOwner(ctx context.Context, client *remotessh.Client, cfg syncConfig, targetPath string, replaced util.DiskOwner) error {
+	owner, err := util.ParseDiskOwner(cfg.TargetDiskOwner)
+	if err != nil {
+		return err
+	}
+	if owner.IsOff() {
+		return nil
+	}
+
+	if owner.Empty() {
+		// auto. What owned the file before wins: it is evidence rather than
+		// inference -- this pair has synced before, and that ownership is
+		// what libvirt was working with.
+		if !replaced.Empty() {
+			owner = replaced
+		} else {
+			qemuConfOwnerOnce.Do(func() {
+				qemuConfOwnerOnce.owner = util.ReadQemuConfOwner(ctx, client)
+			})
+			owner = qemuConfOwnerOnce.owner
+		}
+	}
+
+	if owner.Empty() {
+		// Deliberately not a guess. The compiled-in default behind a
+		// commented qemu.conf differs by distribution, and chowning to the
+		// wrong user would look like the problem had been handled while
+		// leaving the domain just as unable to start.
+		trace.Warning("could not determine who should own the target disk, so it is left owned by the SSH user this ran as -- if that is root, the promoted domain may be unable to open it. Set -target-disk-owner (qemu:qemu on RHEL, libvirt-qemu:kvm on Debian), or set user/group in the target's /etc/libvirt/qemu.conf",
+			"disk", targetPath)
+		return nil
+	}
+
+	if out, err := client.Run(ctx, util.ChownCommand(owner, targetPath)); err != nil {
+		return fmt.Errorf("set ownership %s on target disk %s: %w: %s", owner.Spec(), targetPath, err, strings.TrimSpace(out))
+	}
+	trace.Info("set target disk ownership", "disk", targetPath, "owner", owner.Spec(), "from", owner.Source)
 	return nil
 }
 
@@ -2011,6 +2083,14 @@ func run(cfg syncConfig) (runErr error) {
 		}
 	}
 
+	// replacedDiskOwners remembers what owned each target disk before a
+	// -reinit displaced it, keyed by target path, so the freshly created
+	// replacement can be given the same ownership back.
+	//
+	// Written in the reinit block below, which runs to completion before any
+	// per-disk goroutine starts, and only read afterwards -- so no lock.
+	replacedDiskOwners := map[string]util.DiskOwner{}
+
 	if cfg.Reinit {
 		trace.Warning("reinit requested: discarding checkpoint chain and existing target state", "domain", cfg.SourceDomain)
 		if err := libvirtsync.AbortActiveBlockJobs(srcDom, qcowDisks); err != nil {
@@ -2084,6 +2164,26 @@ func run(cfg syncConfig) (runErr error) {
 		// deliberately somebody's decision, not a background job's.
 		for _, d := range qcowDisks {
 			reinitTargetPath := util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
+
+			// Remember what owns this file BEFORE it is moved out of the
+			// way, because the replacement is created by qemu-img over SSH
+			// and will belong to that SSH user -- root. Whatever owns it now
+			// is, by construction, ownership that worked: this domain has
+			// been synced before, and if it was ever started, libvirt opened
+			// these files. Restoring it after the copy is what stops a
+			// -reinit quietly converting a bootable replica into one qemu
+			// cannot open.
+			//
+			// Recorded even when the mode is "off" or an explicit owner was
+			// given, so the log can still say what changed.
+			if out, err := targetSSHClient.Run(ctx, util.StatOwnerCommand(reinitTargetPath)); err == nil {
+				if prev := util.ParseStatOwner(out); !prev.Empty() {
+					replacedDiskOwners[reinitTargetPath] = prev
+					trace.Debug("reinit: remembering the replaced disk's ownership",
+						"path", reinitTargetPath, "owner", prev.Spec())
+				}
+			}
+
 			var cmd string
 			switch cfg.ReplacedDiskAction {
 			case replacedDiskRename:
@@ -2600,6 +2700,26 @@ func run(cfg syncConfig) (runErr error) {
 		}
 		if err := runTargetCommand(createCmd, fmt.Sprintf("create remote qcow2 %s", targetPathInc)); err != nil {
 			return res, err
+		}
+
+		// Give the base image an owner qemu can actually open.
+		//
+		// Only the base, never the incremental overlay: the overlay exists
+		// for the duration of this run, is written by qemu-nbd as the same
+		// SSH user that created it, and is committed into the base and
+		// deleted before the domain is ever started. The base is the file a
+		// promoted domain boots from, and the only one whose ownership
+		// outlives the run.
+		//
+		// Only on a FULL sync, too. An incremental leaves the base file in
+		// place -- qemu-img commit writes into it without touching its
+		// ownership -- so there is nothing to correct, and a chown there
+		// would silently overrule ownership the storage layer or an
+		// administrator had deliberately set.
+		if !incrementalMode {
+			if err := applyTargetDiskOwner(ctx, targetSSHClient, cfg, targetPath, replacedDiskOwners[targetPath]); err != nil {
+				return res, err
+			}
 		}
 
 		targetPort := cfg.TargetNBDPort + i
