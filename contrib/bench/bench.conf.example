@@ -102,6 +102,20 @@ REINIT_AFTER_FAILURES_N=3
 # full -reinit sync legitimately takes longer than the default.
 DEFINE_ROLLBACK_WAIT_SECONDS=300
 
+# --- Failover test (Stage 6, opt-in via --stages ...,failover) --------------
+
+# Path to the vmsync binary ON THE TARGET HOST.
+#
+# Needed because -promote and -update-role refuse a remote libvirt URI by
+# design: a failover has to work when the other site is unreachable, so it
+# runs where the domain lives and needs no credentials to reach anywhere
+# else. This harness therefore has to invoke vmsync over SSH on the target
+# rather than driving it from here as every other stage does.
+#
+# Leave it unset to skip Stage 6 entirely (it skips with a message rather
+# than failing).
+#TARGET_VMSYNC_BIN=/usr/local/bin/vmsync
+
 # --- Output --------------------------------------------------------------
 
 RESULT_DIR=./results

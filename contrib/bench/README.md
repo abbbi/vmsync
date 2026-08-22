@@ -80,6 +80,7 @@ vmsync itself to work at all).
 ./bench.sh --stages verify    # just the verify+tamper tests
 ./bench.sh --stages snapshot  # just the external-snapshot lifecycle test
 ./bench.sh --stages matrix,verify,reinit,snapshot,define  # + Stage 5, opt-in
+./bench.sh --stages failover  # just the DR path: promotion, fencing, the way back
 ```
 
 Stage 2, Stage 3, and Stage 4 each run their own baseline `-reinit` full
@@ -224,6 +225,53 @@ before this stage existed, nothing exercised it end to end. Two sub-tests:
   disruption proves anything either way. `DEFINE_ROLLBACK_WAIT_SECONDS` in
   `bench.conf` caps how long it waits for the marker before giving up on
   that attempt.
+
+**Stage 6 (failover)** covers the DR path — promotion, the fence a
+promotion arms, and the role change that undoes both — which had no
+real-life coverage at all before it existed. Opt in with `--stages
+...,failover`.
+
+It is deliberately **power-neutral and direction-neutral**: it never stops
+a domain and never reverses a pair. The sequence is baseline `-reinit` →
+promote → inspect → arm a fence → inspect → `-update-role=target` → sync
+again, ending exactly where it started. What it asserts:
+
+- a promotion records `role=promoted`, a timestamp, and a `promoted_from`
+  matching the `replica_source` the sync itself wrote — which also catches
+  a real regression directly, since that field was once written as
+  `127.0.0.1:<vm>`, a name that identifies every host and therefore none;
+- **a promotion with no `-fence-source` arms nothing at all.** This is the
+  single most important safety property in the fencing design: a DR drill
+  is a promotion too, and one that authorised stopping production would be
+  worse than the split brain it was rehearsing for;
+- a promoted target **refuses to be synced into** — the backstop under
+  everything else;
+- `-read-fence` reports the peer's role and, once armed, the fence's id and
+  who it names, read from the other host exactly as a displaced source
+  would read it;
+- an **unreachable** peer reports `reachable=false` and still exits 0.
+  Silence must never read as "no fence is armed": a partition is precisely
+  when a promotion is most likely to have happened and least likely to be
+  visible;
+- a fence can be armed on an **already-promoted** domain without rewriting
+  the original promotion record — the recovery path for "promoted, then
+  noticed the old source is still serving";
+- `-shutdown-domain` **refuses a remote libvirt URI**, which is what keeps
+  a failover working when the other site is unreachable;
+- `-update-role=target` takes the promotion record *and* the fence with
+  it, and replication actually resumes afterwards.
+
+It needs **`TARGET_VMSYNC_BIN`** in `bench.conf`: `-promote` and
+`-update-role` refuse a remote URI by design, so they must run on the
+target host over SSH rather than being driven from here like every other
+stage. Without that setting the stage skips with a message rather than
+failing.
+
+Why it is opt-in rather than default: an interrupted run can leave the
+target `promoted`, and that makes every later sync fail until somebody
+clears it with `vmsync -update-role=target`. That is a worse thing to
+leave behind than any other stage does, even though nothing here is more
+destructive to the target than `-reinit` already is.
 
 If `bench.sh` runs directly on the source hypervisor itself (`SOURCE_URI`
 pointing at a local `qemu:///system`, say), set `SOURCE_LOCAL=yes` in

@@ -62,11 +62,11 @@ Options:
   --only PATTERN          only run Stage 1 scenarios whose name matches
                            PATTERN (a bash glob, e.g. "compress-zstd-*")
   --stages LIST           comma-separated subset of: matrix,verify,reinit,
-                           snapshot,define -- runs in whichever order LIST
-                           gives them, not a fixed canonical order (default:
-                           matrix,verify,reinit,snapshot, which just happens
-                           to already be written in that order; define is
-                           opt-in, see below)
+                           snapshot,define,failover -- runs in whichever order
+                           LIST gives them, not a fixed canonical order
+                           (default: matrix,verify,reinit,snapshot, which just
+                           happens to already be written in that order; define
+                           and failover are opt-in, see below)
   --dry-run               print every vmsync command line; touch nothing
                            (no ssh/qemu-io/vmsync calls actually made)
   -h, --help              this text
@@ -85,6 +85,15 @@ of risk than anything the other stages do (which never touch host-level
 networking), so it's opt-in even though it's no more destructive to the
 target VM itself than -reinit already is. See this file's own Stage 5
 comment before enabling it.
+
+Stage 6 (failover) is also NOT included by default. It promotes the target,
+arms and inspects a fence, and puts the target back to `target` with a fresh
+sync -- it never stops a domain and never reverses the pair. It is opt-in
+because an interrupted run can leave the target `promoted`, which makes every
+later sync fail until somebody clears it with -update-role=target. It needs
+TARGET_VMSYNC_BIN set in the config (vmsync on the TARGET host): -promote
+refuses a remote libvirt URI by design, so it must run where the domain is.
+Without that setting the stage skips rather than failing.
 EOF
 }
 
@@ -934,6 +943,337 @@ stage_define_domain() {
         return 0
 }
 
+# --- Stage 6: failover (promotion, fencing, the way back) ---------------------
+
+# The DR path had no real-life coverage at all before this stage: promotion,
+# the fence a promotion arms, and the role changes that undo both are the
+# highest-stakes code in vmsync and were exercised only by unit tests.
+#
+# Everything here is deliberately POWER-NEUTRAL and DIRECTION-NEUTRAL. It
+# never stops a domain and never reverses a pair -- the target is promoted,
+# inspected, and put back to `target` with a fresh sync, ending exactly where
+# it started. The genuinely invasive half of the DR path (shutting the source
+# down, inverting the pair) is Stage 7, separately opt-in, because those
+# change state this harness otherwise never touches.
+#
+# NOT in the default stage list, for one specific reason: an interrupted run
+# can leave the target `promoted`, and that makes every subsequent sync fail
+# until somebody clears it with -update-role=target. That is a worse thing to
+# leave behind than any other stage does, so it is opt-in even though it is
+# no more destructive than -reinit already is.
+#
+# Needs vmsync ON THE TARGET HOST (TARGET_VMSYNC_BIN in bench.conf): -promote
+# refuses a remote libvirt URI by design, so that a failover works when the
+# other site is unreachable and needs no credentials to reach it. Without
+# that setting the stage skips rather than failing.
+
+# vmsync_on_host HOST IS_LOCAL BIN SCENARIO PHASE ARGS... -- runs vmsync on a
+# specific host and records a results row, for the modes that refuse a remote
+# URI and must therefore run where the domain lives.
+#
+# Not run_vmsync: that one always supplies -source-uri/-target-uri/-source-
+# domain/-target-domain plus a prometheus textfile, which is right for a sync
+# and wrong for every mode here -- -promote takes only a target, and would
+# reject the source flags outright.
+vmsync_on_host() {
+	local host="$1" is_local="$2" bin="$3" scenario="$4" phase="$5"
+	shift 5
+	local log_file="$RUN_DIR/logs/${scenario}.${phase}.log"
+	RUN_LOG="$log_file"
+
+	log "-> $scenario/$phase (on $host)"
+	log "   $bin $*"
+	if [ "$DRY_RUN" = yes ]; then
+		RUN_RC=0
+		RUN_OUT=""
+		results_row "$CSV" "$scenario" "$phase" DRYRUN 0 "" "" "" "" "dry run -- not executed"
+		return 0
+	fi
+
+	set +e
+	RUN_OUT="$(maybe_ssh_cmd "$is_local" "$host" "$bin" "$@" 2>&1)"
+	RUN_RC=$?
+	set -e
+	printf '%s\n' "$RUN_OUT" >"$log_file"
+	log "   exit=$RUN_RC"
+	return 0
+}
+
+# vmsync_meta_field URI DOMAIN FIELD -> the value of one vmsync metadata
+# field, or empty when absent.
+#
+# The value lives in an `id` ATTRIBUTE, not in element text -- see
+# libvirtsync.buildMetadataEntry, which writes <vmsync:role id="promoted"/>.
+# Matching on local-name() sidesteps whatever namespace prefix virsh chooses
+# to echo back.
+vmsync_meta_field() {
+	local uri="$1" domain="$2" field="$3"
+	virsh_uri "$uri" metadata "$domain" --uri "$VMSYNC_METADATA_URI" --config 2>/dev/null \
+		| xmllint --xpath "string(//*[local-name()='${field}']/@id)" - 2>/dev/null || true
+}
+
+# fo_check SCENARIO LABEL OK DETAIL -- records one assertion, where OK is 0
+# for pass and anything else for fail.
+#
+# Call sites compute OK with an explicit `if [ ... ]; then fo_ok=0; else
+# fo_ok=1; fi` rather than testing and reading $? on the next line. That
+# looks more verbose than it needs to be and is not: this script runs under
+# `set -e`, where a bare failing `[ ... ]` is a failing command and aborts
+# the whole harness -- so the obvious spelling would turn the first failed
+# assertion into a silent exit instead of a recorded FAIL, which is the
+# opposite of what a test stage is for.
+fo_check() {
+	local scenario="$1" label="$2" ok="$3" detail="${4:-}"
+	if [ "$DRY_RUN" = yes ]; then
+		# Nothing ran, so nothing was proven. Recording a PASS here would
+		# make --dry-run report a clean failover test against hosts that
+		# were never contacted, which is worse than reporting nothing.
+		log "   SKIP (dry run): $label"
+		results_row "$CSV" "$scenario" "${label// /_}" DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+	if [ "$ok" = 0 ]; then
+		log "   PASS: $label"
+		results_row "$CSV" "$scenario" "${label// /_}" 0 "" "" "" "" "" "PASS"
+	else
+		warn "FAIL: $label${detail:+ -- $detail}"
+		# NOTES must not contain a comma (plain CSV, see results_row).
+		results_row "$CSV" "$scenario" "${label// /_}" 1 "" "" "" "" "" "FAIL ${detail//,/;}"
+		FAILOVER_FAILURES=$((FAILOVER_FAILURES + 1))
+	fi
+}
+
+FAILOVER_FAILURES=0
+
+stage_failover() {
+	log "=== Stage 6: failover -- promotion, fencing, and the way back ==="
+
+	if [ -z "${TARGET_VMSYNC_BIN:-}" ]; then
+		warn "TARGET_VMSYNC_BIN is not set in $CONF -- skipping stage 6. -promote must run ON the target host (it refuses a remote libvirt URI by design), so this stage needs to know where vmsync lives there."
+		results_row "$CSV" failover skipped 0 "" "" "" "" "" "SKIPPED TARGET_VMSYNC_BIN unset"
+		return 0
+	fi
+
+	local sc=failover
+	local src_ref tgt_local_uri="qemu:///system"
+
+	if [ "$DRY_RUN" != yes ]; then
+		require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
+	fi
+
+	# --- baseline: a real replica to promote --------------------------------
+	run_vmsync "$sc" baseline -reinit
+	if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
+		die "baseline full sync failed (see $RUN_LOG) -- aborting stage 6 before anything is promoted"
+	fi
+
+	# replica_source is what a bare -fence-source resolves the fence against,
+	# so read it once and assert every later reference against THIS rather
+	# than against a hostname reconstructed here. It also catches a real
+	# regression directly: this field was once written as "127.0.0.1:<vm>",
+	# which names every machine and therefore none.
+	if [ "$DRY_RUN" != yes ]; then
+		src_ref="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replica_source)"
+		if [ -n "$src_ref" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the sync recorded a replica_source on the target" "$fo_ok" "got '$src_ref'"
+		case "$src_ref" in
+		127.0.0.1:* | localhost:*)
+			fo_check "$sc" "replica_source names a real host rather than loopback" 1 "got '$src_ref'"
+			;;
+		*)
+			fo_check "$sc" "replica_source names a real host rather than loopback" 0
+			;;
+		esac
+	fi
+
+	# --- promote, WITHOUT arming a fence ------------------------------------
+	# The drill case, and the single most important safety property in the
+	# fencing design: a promotion that was not asked to arm a fence must
+	# authorise nothing at all.
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" promote \
+		-promote -target-uri "$tgt_local_uri" -target-domain "$TARGET_DOMAIN" \
+		-promote-mode planned -promoted-by bench-harness
+	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "promote succeeds against a freshly synced replica" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
+
+	if [ "$DRY_RUN" != yes ]; then
+		local role promoted_at promoted_from fence_src fence_id
+		role="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
+		if [ "$role" = promoted ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the target records role=promoted" "$fo_ok" "got '$role'"
+
+		promoted_at="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" promoted_at)"
+		if [ -n "$promoted_at" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the promotion is timestamped" "$fo_ok" "promoted_at empty"
+
+		promoted_from="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" promoted_from)"
+		if [ "$promoted_from" = "$src_ref" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "promoted_from names the source the replica came from" "$fo_ok" \
+			"got '$promoted_from' want '$src_ref'"
+
+		fence_src="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" fence_source)"
+		if [ -z "$fence_src" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "a promotion with no -fence-source arms NOTHING" "$fo_ok" \
+			"fence_source is '$fence_src' -- a DR drill must not authorise stopping production"
+	fi
+
+	# --- a promoted target refuses to be synced into ------------------------
+	# The backstop under the whole design. Nothing else in this stage matters
+	# if a scheduled sync can still overwrite a domain that is serving live.
+	run_vmsync "$sc" refuse-sync
+	if [ "$DRY_RUN" != yes ]; then
+		if [ "$RUN_RC" != 0 ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "syncing into a promoted target is refused" "$fo_ok" \
+			"vmsync exited 0 -- see $RUN_LOG"
+	fi
+
+	# --- read-fence: reachable, promoted, and NOT fenced --------------------
+	# -read-fence is the one failover mode that takes a remote URI, so it runs
+	# from here rather than on the target.
+	vmsync_on_host "$SOURCE_HOST" "$SOURCE_LOCAL" "$VMSYNC_BIN" "$sc" read-fence-unarmed \
+		-read-fence -target-uri "$TARGET_URI" -target-domain "$TARGET_DOMAIN"
+	if [ "$DRY_RUN" != yes ]; then
+		local reachable trole fid
+		if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "-read-fence exits 0 against a reachable peer" "$fo_ok" "exit $RUN_RC"
+
+		reachable="$(json_bool "$RUN_OUT" reachable)"
+		if [ "$reachable" = true ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "-read-fence reports the peer as reachable" "$fo_ok" "got '$reachable' from: $RUN_OUT"
+
+		trole="$(json_str "$RUN_OUT" target_role)"
+		if [ "$trole" = promoted ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "-read-fence reports the peer's role" "$fo_ok" "got '$trole'"
+
+		fid="$(json_str "$RUN_OUT" id)"
+		if [ -z "$fid" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "-read-fence reports no fence when none was armed" "$fo_ok" "got fence id '$fid'"
+	fi
+
+	# --- arm a fence on the ALREADY-promoted domain -------------------------
+	# The recovery path: promote, notice the old source is still serving, then
+	# arm. Re-running -promote must arm the fence without rewriting the
+	# original promotion record.
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" arm-fence \
+		-promote -target-uri "$tgt_local_uri" -target-domain "$TARGET_DOMAIN" \
+		-fence-source -promoted-by bench-harness
+	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "a fence can be armed on an already-promoted domain" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
+
+	if [ "$DRY_RUN" != yes ]; then
+		local fence_src2 fence_id2 promoted_at2
+		fence_src2="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" fence_source)"
+		if [ "$fence_src2" = "$src_ref" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the fence names the recorded source" "$fo_ok" \
+			"got '$fence_src2' want '$src_ref'"
+
+		fence_id2="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" fence_id)"
+		if [ -n "$fence_id2" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the fence has an id, which is what makes it single-use" "$fo_ok" "fence_id empty"
+
+		promoted_at2="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" promoted_at)"
+		if [ "$promoted_at2" = "$promoted_at" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "arming a fence leaves the original promotion record alone" "$fo_ok" \
+			"promoted_at changed from '$promoted_at' to '$promoted_at2'"
+
+		# And the token must be readable from the other side, which is how the
+		# displaced source actually learns about it.
+		vmsync_on_host "$SOURCE_HOST" "$SOURCE_LOCAL" "$VMSYNC_BIN" "$sc" read-fence-armed \
+			-read-fence -target-uri "$TARGET_URI" -target-domain "$TARGET_DOMAIN"
+		local rid rsrc
+		rid="$(json_str "$RUN_OUT" id)"
+		if [ "$rid" = "$fence_id2" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "-read-fence reports the armed fence id" "$fo_ok" "got '$rid' want '$fence_id2'"
+
+		rsrc="$(json_str "$RUN_OUT" source)"
+		if [ "$rsrc" = "$src_ref" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "-read-fence reports who the fence names" "$fo_ok" "got '$rsrc' want '$src_ref'"
+	fi
+
+	# --- an unreachable peer is NOT an absence of fencing -------------------
+	# Load-bearing: a partition is exactly when a promotion is most likely to
+	# have happened and least likely to be visible, so "could not ask" must
+	# never read as "nothing is armed".
+	if [ "$DRY_RUN" != yes ]; then
+		vmsync_on_host "$SOURCE_HOST" "$SOURCE_LOCAL" "$VMSYNC_BIN" "$sc" read-fence-unreachable \
+			-read-fence -target-uri "qemu+ssh://vmsync-bench-nonexistent.invalid/system" \
+			-target-domain "$TARGET_DOMAIN"
+		if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "-read-fence exits 0 for an unreachable peer" "$fo_ok" \
+			"exit $RUN_RC -- an unreachable peer is an answer, not a broken invocation"
+
+		local unreachable
+		unreachable="$(json_bool "$RUN_OUT" reachable)"
+		if [ "$unreachable" = false ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "an unreachable peer reports reachable=false" "$fo_ok" \
+			"got '$unreachable' -- silence must never read as 'no fence armed'"
+	fi
+
+	# --- the local-URI guard ------------------------------------------------
+	# -promote and -shutdown-domain must refuse a remote URI, which is what
+	# keeps a failover working when the other site is unreachable. Checked
+	# from here because it is rejected before anything is touched.
+	case "$TARGET_URI" in
+	*+ssh://*)
+		if [ "$DRY_RUN" != yes ]; then
+			vmsync_on_host "$SOURCE_HOST" "$SOURCE_LOCAL" "$VMSYNC_BIN" "$sc" refuse-remote-uri \
+				-shutdown-domain -target-uri "$TARGET_URI" -target-domain "$TARGET_DOMAIN"
+			if [ "$RUN_RC" != 0 ]; then fo_ok=0; else fo_ok=1; fi
+			fo_check "$sc" "-shutdown-domain refuses a remote libvirt URI" "$fo_ok" "exit $RUN_RC"
+		fi
+		;;
+	*)
+		log "   (skipping the remote-URI guard: TARGET_URI is not a +ssh one)"
+		;;
+	esac
+
+	# --- the way back -------------------------------------------------------
+	# -update-role=target is the documented remedy for an unwanted promotion,
+	# and it must take the promotion record and the fence with it: a domain
+	# carrying role=target alongside a live fence_source would be a token
+	# authorising a shutdown that nothing justifies.
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" update-role-back \
+		-update-role target -target-uri "$tgt_local_uri" -target-domain "$TARGET_DOMAIN"
+	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "-update-role=target succeeds" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
+
+	if [ "$DRY_RUN" != yes ]; then
+		local role_back fence_back promoted_back
+		role_back="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
+		if [ "$role_back" = target ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the target is a target again" "$fo_ok" "got '$role_back'"
+
+		fence_back="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" fence_source)"
+		if [ -z "$fence_back" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "clearing the role takes the fence with it" "$fo_ok" \
+			"fence_source is still '$fence_back'"
+
+		promoted_back="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" promoted_at)"
+		if [ -z "$promoted_back" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "clearing the role takes the promotion record with it" "$fo_ok" \
+			"promoted_at is still '$promoted_back'"
+	fi
+
+	# --- and replication actually resumes -----------------------------------
+	# The point of the way back. A role that clears but leaves the pair broken
+	# would be a worse outcome than not clearing at all.
+	run_vmsync "$sc" resync
+	if [ "$DRY_RUN" != yes ]; then
+		if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "replication resumes once the promotion is undone" "$fo_ok" \
+			"exit $RUN_RC see $RUN_LOG"
+	fi
+
+	if [ "$DRY_RUN" != yes ]; then
+		if [ "$FAILOVER_FAILURES" -eq 0 ]; then
+			log "=== Stage 6: all failover assertions passed ==="
+		else
+			warn "=== Stage 6: $FAILOVER_FAILURES failover assertion(s) FAILED -- see the report and logs/ ==="
+		fi
+	fi
+	return 0
+}
+
 # --- report ------------------------------------------------------------------
 
 generate_report() {
@@ -983,6 +1323,36 @@ generate_report() {
                 echo "|---|---|---|---|---|"
                 awk -F, 'NR>1 && ($1=="define-uuid-collision" || $1=="define-rollback") { printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $9 }' "$CSV"
                 echo
+                echo "## Stage 6: failover, fencing, and the way back"
+                echo
+                # Every row is one assertion, so the useful rendering is a
+                # pass/fail list rather than timings -- nothing here is a
+                # benchmark, and a wall-clock column would just be noise.
+                # Only the ASSERTION rows, which are the ones whose notes start
+                # with PASS/FAIL/SKIP. The stage also emits ordinary run rows
+                # (baseline, resync, ...) through run_vmsync, and listing those
+                # as though they were assertions would report a phase name as
+                # a passing test.
+                if awk -F, 'NR>1 && $1=="failover" && $9 ~ /^(PASS|FAIL|SKIP)/ { found=1 } END { exit !found }' "$CSV"; then
+                        awk -F, 'NR>1 && $1=="failover" && $9 ~ /^(PASS|FAIL|SKIP)/ {
+                                gsub(/_/, " ", $2)
+                                if ($9 ~ /^FAIL/)      printf "- **FAIL** — %s (%s)\n", $2, substr($9, 6)
+                                else if ($9 ~ /^SKIP/) printf "- _skipped_ — %s\n", $2
+                                else                   printf "- **PASS** — %s\n", $2
+                        }' "$CSV"
+                        echo
+                        awk -F, 'NR>1 && $1=="failover" && $9 ~ /^(PASS|FAIL|SKIP)/ {
+                                        if ($9 ~ /^FAIL/) f++; else if ($9 ~ /^SKIP/) s++; else p++
+                                }
+                                END {
+                                        if (f)      printf "**%d failover assertion(s) failed.**\n", f
+                                        else if (p) printf "All %d failover assertion(s) passed.\n", p
+                                        else        printf "_Nothing was executed (%d skipped)._\n", s
+                                }' "$CSV"
+                else
+                        echo "_not run (opt in with \`--stages failover\`)_"
+                fi
+                echo
                 echo "Full machine-readable data: \`results.csv\`. Per-run logs: \`logs/\`. Raw prometheus textfiles: \`prom/\`."
         } >"$report"
         log "report written to $report"
@@ -1002,7 +1372,8 @@ for s in "${stage_list[@]}"; do
         reinit) stage_reinit_after_failures ;;
         snapshot) stage_external_snapshot ;;
         define) stage_define_domain ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,reinit,snapshot,define)" ;;
+        failover) stage_failover ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,reinit,snapshot,define,failover)" ;;
         esac
 done
 

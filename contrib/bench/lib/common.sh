@@ -186,6 +186,26 @@ disk_source_path() {
 		| xmllint --xpath "string(//disk[target/@dev='${dev}']/source/@file)" - 2>/dev/null
 }
 
+# --- json (vmsync -read-fence) ------------------------------------------------
+
+# json_str JSON FIELD -> the value of a string field, or empty.
+# json_bool JSON FIELD -> "true"/"false", or empty when the field is absent.
+#
+# Deliberately grep, not jq: this harness's preflight requires vmsync, virsh,
+# xmllint, awk and ssh, and adding a sixth hard dependency for two fields
+# would be a poor trade. The only JSON it ever reads is vmsync's own
+# -read-fence report, which is one flat object plus a nested "fence" whose
+# key names ("id", "source") do not collide with the outer ones -- so a
+# whole-document match per key is unambiguous. Anything more structured than
+# that should get jq rather than a cleverer regex.
+json_str() {
+	printf '%s' "$1" | grep -o "\"$2\":\"[^\"]*\"" | head -1 | sed 's/^[^:]*:"//; s/"$//'
+}
+
+json_bool() {
+	printf '%s' "$1" | grep -o "\"$2\":\(true\|false\)" | head -1 | sed 's/.*://'
+}
+
 # --- prometheus textfile parsing --------------------------------------------
 
 # prom_sum FILE METRIC -> sum of every series' value for METRIC across all
