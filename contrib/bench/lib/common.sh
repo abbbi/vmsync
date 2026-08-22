@@ -64,6 +64,25 @@ maybe_ssh_cmd() {
 	fi
 }
 
+# run_shell_on HOST IS_LOCAL COMMAND_STRING - runs one SHELL command string
+# on HOST, locally or over ssh, forwarding stdin either way.
+#
+# Distinct from maybe_ssh_cmd, which takes an argv. That is the right shape
+# for a plain command and the wrong one the moment redirection, backgrounding
+# or a pipeline is involved: ssh flattens its argv into a string the remote
+# shell re-parses, so `maybe_ssh_cmd ... sh -c "a >b &"` arrives as
+# `sh -c a >b &` and does something else entirely. Passing the command as a
+# single argument sidesteps that, and the local branch runs it through sh so
+# both sides parse it identically.
+run_shell_on() {
+	local host="$1" is_local="$2" cmd="$3"
+	if [ "$is_local" = yes ]; then
+		sh -c "$cmd"
+	else
+		ssh_host_cmd "$host" "$cmd"
+	fi
+}
+
 # virsh_uri URI ARGS... - runs virsh against a libvirt URI (source or
 # target), reusing libvirt's own qemu+ssh:// transport instead of a second,
 # separate ssh hop. Forces LC_ALL=C: virsh translates its own output via

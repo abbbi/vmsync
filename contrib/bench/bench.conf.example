@@ -116,6 +116,37 @@ DEFINE_ROLLBACK_WAIT_SECONDS=300
 # than failing).
 #TARGET_VMSYNC_BIN=/usr/local/bin/vmsync
 
+# --- Fencing end to end with real agents (Stage 7, --stages ...,fence-agent) --
+#
+# WARNING: this stage STOPS THE SOURCE VM. It is the only stage that touches
+# the source's power state, and it has to -- a fence only ever acts on a
+# running domain, so a fence that never fires would prove nothing. It starts
+# the source again afterwards and clears both roles, but read Stage 7's own
+# comment in bench.sh before enabling it.
+
+# vmsync-agent on the SOURCE host. This is the agent that gets fenced.
+# Required for Stage 7; unset skips it.
+#SOURCE_AGENT_BIN=/usr/local/bin/vmsync-agent
+
+# vmsync-agent on the TARGET host. Optional: when set, Stage 7 also starts an
+# agent there and asserts it does NOT fence the promoted copy (a fence sweep
+# must skip anything whose role is not source).
+#TARGET_AGENT_BIN=/usr/local/bin/vmsync-agent
+
+# Path to vmsync on the SOURCE host, for the agent to shell out to. Defaults
+# to VMSYNC_BIN, which is right whenever SOURCE_LOCAL=yes.
+#SOURCE_VMSYNC_BIN=/usr/local/bin/vmsync
+
+# Scratch directory on each host for the throwaway standalone agent's config,
+# state dir and log. Removed by nothing -- inspect agent.log there when a
+# fence does not fire.
+#AGENT_WORK_DIR=/var/tmp/vmsync-bench-agent
+
+# How long to wait for the fence to shut the source down. The agent sweeps
+# once immediately at startup, so this mostly covers the guest's own
+# shutdown, not the sweep interval.
+#FENCE_WAIT_SECONDS=180
+
 # --- Output --------------------------------------------------------------
 
 RESULT_DIR=./results

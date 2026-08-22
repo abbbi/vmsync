@@ -81,6 +81,7 @@ vmsync itself to work at all).
 ./bench.sh --stages snapshot  # just the external-snapshot lifecycle test
 ./bench.sh --stages matrix,verify,reinit,snapshot,define  # + Stage 5, opt-in
 ./bench.sh --stages failover  # just the DR path: promotion, fencing, the way back
+./bench.sh --stages fence-agent  # + real agents; STOPS THE SOURCE VM, see below
 ```
 
 Stage 2, Stage 3, and Stage 4 each run their own baseline `-reinit` full
@@ -272,6 +273,46 @@ target `promoted`, and that makes every later sync fail until somebody
 clears it with `vmsync -update-role=target`. That is a worse thing to
 leave behind than any other stage does, even though nothing here is more
 destructive to the target than `-reinit` already is.
+
+**Stage 7 (fence-agent)** is the other half: Stage 6 proves the fence
+*token* is written and readable, this proves it is **acted on**. A real
+`vmsync-agent` runs on the source host, reads the token from the promoted
+peer's own libvirt, and shuts its copy down. Opt in with `--stages
+...,fence-agent`.
+
+> **This stage stops the source VM.** Every other stage deliberately leaves
+> the source's power state alone. This one cannot: a fence only ever acts on
+> a *running* domain, so a fence that never fires would prove nothing. It
+> restores the source afterwards — power state and both roles — and an
+> `EXIT` trap does the same on a crash or a Ctrl+C, but this is a different
+> class of intrusion from anything else here.
+
+The agents run in `--standalone` mode: no control plane, no enrolment, no
+credential. Their schedule entry is deliberately **disabled**, so no syncs
+run and the fence still fires — which is the design property being
+demonstrated, since a displaced source is very often one whose replication
+was already switched off.
+
+What it asserts:
+
+- the fence actually **shuts the displaced source down**, within
+  `FENCE_WAIT_SECONDS` (the agent sweeps once immediately at startup, so
+  this mostly covers the guest's own shutdown rather than the 60s tick);
+- the fenced source is left **`paused`**, not merely stopped — without that
+  the next sync would start replicating it again;
+- the agent recorded the fence in its **durable ledger** (`fences.json`)
+  with state `done`, which is what makes a fence single-use and would stop
+  a second attempt on the next sweep;
+- with `TARGET_AGENT_BIN` set, an agent on the target host **does not fence
+  the promoted copy**. A fence sweep must skip anything whose role is not
+  `source`, and a bug there would stop the copy that just took over.
+
+Needs `SOURCE_AGENT_BIN` (the agent that gets fenced) and
+`TARGET_VMSYNC_BIN` (to promote). `TARGET_AGENT_BIN`, `SOURCE_VMSYNC_BIN`,
+`AGENT_WORK_DIR` and `FENCE_WAIT_SECONDS` are optional — see
+`bench.conf.example`. Without the two required ones the stage skips rather
+than failing. When a fence does not fire, the agent's own log is at
+`$AGENT_WORK_DIR/agent.log` on the source host.
 
 If `bench.sh` runs directly on the source hypervisor itself (`SOURCE_URI`
 pointing at a local `qemu:///system`, say), set `SOURCE_LOCAL=yes` in

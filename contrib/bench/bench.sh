@@ -62,11 +62,12 @@ Options:
   --only PATTERN          only run Stage 1 scenarios whose name matches
                            PATTERN (a bash glob, e.g. "compress-zstd-*")
   --stages LIST           comma-separated subset of: matrix,verify,reinit,
-                           snapshot,define,failover -- runs in whichever order
-                           LIST gives them, not a fixed canonical order
+                           snapshot,define,failover,fence-agent -- runs in
+                           whichever order LIST gives them, not a fixed
+                           canonical order
                            (default: matrix,verify,reinit,snapshot, which just
-                           happens to already be written in that order; define
-                           and failover are opt-in, see below)
+                           happens to already be written in that order; define,
+                           failover and fence-agent are opt-in, see below)
   --dry-run               print every vmsync command line; touch nothing
                            (no ssh/qemu-io/vmsync calls actually made)
   -h, --help              this text
@@ -85,6 +86,13 @@ of risk than anything the other stages do (which never touch host-level
 networking), so it's opt-in even though it's no more destructive to the
 target VM itself than -reinit already is. See this file's own Stage 5
 comment before enabling it.
+
+Stage 7 (fence-agent) is opt-in too, and is the most intrusive thing here:
+it STOPS THE SOURCE VM. It runs real vmsync-agents in --standalone mode and
+proves a fence is actually acted on, not merely written. It restores the
+source's power state and both roles afterwards (and on a crash, via an EXIT
+trap), but no other stage touches the source's power state at all. Needs
+SOURCE_AGENT_BIN and TARGET_VMSYNC_BIN.
 
 Stage 6 (failover) is also NOT included by default. It promotes the target,
 arms and inspects a fence, and puts the target back to `target` with a fresh
@@ -1055,7 +1063,9 @@ stage_failover() {
 	fi
 
 	local sc=failover
-	local src_ref tgt_local_uri="qemu:///system"
+	# -promote and -update-role act on the host they run on, so the target
+	# host is addressed with its own LOCAL uri, never TARGET_URI.
+	local src_ref local_uri="qemu:///system"
 
 	if [ "$DRY_RUN" != yes ]; then
 		require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
@@ -1091,7 +1101,7 @@ stage_failover() {
 	# fencing design: a promotion that was not asked to arm a fence must
 	# authorise nothing at all.
 	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" promote \
-		-promote -target-uri "$tgt_local_uri" -target-domain "$TARGET_DOMAIN" \
+		-promote -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN" \
 		-promote-mode planned -promoted-by bench-harness
 	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "promote succeeds against a freshly synced replica" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
@@ -1155,7 +1165,7 @@ stage_failover() {
 	# arm. Re-running -promote must arm the fence without rewriting the
 	# original promotion record.
 	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" arm-fence \
-		-promote -target-uri "$tgt_local_uri" -target-domain "$TARGET_DOMAIN" \
+		-promote -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN" \
 		-fence-source -promoted-by bench-harness
 	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "a fence can be armed on an already-promoted domain" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
@@ -1233,7 +1243,7 @@ stage_failover() {
 	# carrying role=target alongside a live fence_source would be a token
 	# authorising a shutdown that nothing justifies.
 	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" update-role-back \
-		-update-role target -target-uri "$tgt_local_uri" -target-domain "$TARGET_DOMAIN"
+		-update-role target -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
 	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "-update-role=target succeeds" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
 
@@ -1271,6 +1281,240 @@ stage_failover() {
 			warn "=== Stage 6: $FAILOVER_FAILURES failover assertion(s) FAILED -- see the report and logs/ ==="
 		fi
 	fi
+	return 0
+}
+
+# --- Stage 7: fencing end to end, with real agents ----------------------------
+
+# Stage 6 proves the fence TOKEN is written and readable. This proves it is
+# ACTED ON: a real vmsync-agent on the source host reads the token from the
+# promoted peer's own libvirt and shuts its copy down.
+#
+# THIS STOPS THE SOURCE VM. Every other stage in this harness deliberately
+# leaves the source's power state alone -- this one cannot, because a fence
+# only ever acts on a RUNNING domain, and a fence that never fires proves
+# nothing. It restores the source afterwards (role and power state both), but
+# a crash mid-stage leaves the source shut off and `paused`.
+#
+# The agents run in --standalone mode, which needs no control plane, no
+# enrolment and no credential. Their schedule entry is deliberately DISABLED:
+# no syncs run, and the fence still fires -- which is the design property
+# being demonstrated, since a displaced source is very often one whose
+# replication was already switched off.
+#
+# An agent is started on BOTH hosts, and the target's has a real job: it must
+# NOT fence the promoted domain. sweepFences skips anything whose role is not
+# source, and a bug there would stop the copy that just took over.
+
+# agent_standalone_config VM -> the JSON for a --standalone agent that
+# schedules nothing and exists only to run its fence loop.
+agent_standalone_config() {
+	printf '{\n  "report_interval_seconds": 60,\n  "poll_wait_seconds": 30,\n  "schedule": [\n    { "vm": "%s", "interval_seconds": 86400, "enabled": false, "profile": {} }\n  ]\n}\n' "$1"
+}
+
+# agent_start HOST IS_LOCAL AGENT_BIN VMSYNC_BIN_THERE VM WORKDIR -> prints
+# the agent's PID.
+#
+# VMSYNC_BIN_THERE is passed explicitly rather than read from an outer
+# variable: the agent shells out to vmsync on ITS OWN host, so the source and
+# target agents need different paths, and relying on bash's dynamic scoping
+# to carry that in would be a trap for whoever edits this next.
+agent_start() {
+	local host="$1" is_local="$2" bin="$3" vmsync_there="$4" vm="$5" dir="$6"
+	agent_standalone_config "$vm" | run_shell_on "$host" "$is_local" \
+		"mkdir -p '$dir' && cat > '$dir/schedule.json'"
+	# setsid so the agent survives this ssh session closing, which it
+	# otherwise would not: without it the remote shell's exit takes the
+	# whole process group with it and the fence sweep never happens.
+	run_shell_on "$host" "$is_local" \
+		"setsid nohup '$bin' --standalone '$dir/schedule.json' --state-dir '$dir' --vmsync-path '$vmsync_there' --debug >'$dir/agent.log' 2>&1 < /dev/null & echo \$!"
+}
+
+agent_stop() {
+	local host="$1" is_local="$2" pid="$3" dir="$4"
+	[ -n "$pid" ] || return 0
+	# TERM, not KILL: the agent unwinds its loops on SIGTERM, and a KILL
+	# mid-shutdown is exactly the crash whose ledger handling this stage is
+	# not trying to test.
+	run_shell_on "$host" "$is_local" "kill $pid 2>/dev/null || true" || true
+}
+
+stage_fence_agent() {
+	log "=== Stage 7: fencing end to end, with real agents ==="
+
+	if [ -z "${TARGET_VMSYNC_BIN:-}" ] || [ -z "${SOURCE_AGENT_BIN:-}" ]; then
+		warn "TARGET_VMSYNC_BIN and SOURCE_AGENT_BIN must both be set in $CONF -- skipping stage 7. This stage needs vmsync on the target host (to promote) and vmsync-agent on the source host (to be fenced)."
+		results_row "$CSV" fence-agent skipped 0 "" "" "" "" "" "SKIPPED binaries unset"
+		return 0
+	fi
+
+	local sc=fence-agent
+	# Both -promote and -update-role act on the host they run on, so both
+	# ends use a LOCAL uri -- that restriction is the whole reason a failover
+	# needs no credentials to reach the site it is failing away from.
+	local local_uri="qemu:///system"
+	local agent_dir="${AGENT_WORK_DIR:-/var/tmp/vmsync-bench-agent}"
+	local src_pid="" tgt_pid=""
+	# Where each agent finds vmsync on its OWN host. SOURCE_VMSYNC_BIN falls
+	# back to VMSYNC_BIN, which is correct in the common SOURCE_LOCAL=yes
+	# setup where this harness runs on the source host itself.
+	local src_vmsync="${SOURCE_VMSYNC_BIN:-$VMSYNC_BIN}"
+
+	if [ "$DRY_RUN" = yes ]; then
+		log "   (dry run: stage 7 starts real background agents and stops the source VM, so it does nothing here)"
+		results_row "$CSV" "$sc" skipped DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+
+	# A fence only ever acts on a RUNNING domain. Skipping rather than
+	# starting the source ourselves, the same way Stage 4 does.
+	local src_state
+	src_state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN")" \
+		|| die "cannot query the source domain's state${VIRSH_ERR:+: $VIRSH_ERR}"
+	if [ "$src_state" != running ]; then
+		warn "source domain '$SOURCE_DOMAIN' is '$src_state', not running -- skipping stage 7. A fence only acts on a running domain, and this harness does not start the source itself."
+		results_row "$CSV" "$sc" skipped 0 "" "" "" "" "" "SKIPPED source not running"
+		return 0
+	fi
+
+	require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
+
+	# Whatever happens below, put the pair back: kill the agents, clear both
+	# roles, start the source again.
+	#
+	# Registered as an EXIT trap, not a RETURN one, and guarded so it runs at
+	# most once. RETURN would not fire on `die` (which exits) or on Ctrl+C --
+	# and those are precisely the cases that would otherwise leave the source
+	# shut off and `paused`, with every later sync refused and nothing on
+	# screen saying why.
+	FENCE_AGENT_CLEANED=no
+	fence_agent_cleanup() {
+		[ "$FENCE_AGENT_CLEANED" = yes ] && return 0
+		FENCE_AGENT_CLEANED=yes
+		log "stage 7: restoring the pair"
+		agent_stop "$SOURCE_HOST" "$SOURCE_LOCAL" "$src_pid" "$agent_dir"
+		agent_stop "$TARGET_HOST" no "$tgt_pid" "$agent_dir"
+
+		maybe_ssh_cmd "$SOURCE_LOCAL" "$SOURCE_HOST" "$src_vmsync" \
+			-update-role none -target-uri "$local_uri" -target-domain "$SOURCE_DOMAIN" \
+			>/dev/null 2>&1 \
+			|| warn "could not clear the source's replication role -- do it by hand: vmsync -update-role none -target-uri $local_uri -target-domain $SOURCE_DOMAIN"
+		ssh_host_cmd "$TARGET_HOST" "$TARGET_VMSYNC_BIN" \
+			-update-role target -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN" \
+			>/dev/null 2>&1 \
+			|| warn "could not put the target back to role=target -- do it by hand, or every later sync into it will be refused"
+
+		if [ "$src_state" = running ]; then
+			local now_state
+			now_state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN" 2>/dev/null || true)"
+			if [ "$now_state" != running ]; then
+				log "   starting the source domain again (this stage shut it down)"
+				virsh_uri "$SOURCE_URI" start "$SOURCE_DOMAIN" >/dev/null 2>&1 \
+					|| warn "could not start '$SOURCE_DOMAIN' again -- start it by hand"
+			fi
+		fi
+	}
+	trap 'fence_agent_cleanup' EXIT
+
+	# --- baseline ------------------------------------------------------------
+	run_vmsync "$sc" baseline -reinit
+	if [ "$RUN_RC" != 0 ]; then
+		die "baseline full sync failed (see $RUN_LOG) -- aborting stage 7 before anything is promoted"
+	fi
+
+	local src_ref
+	src_ref="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replica_source)"
+	if [ -n "$src_ref" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the sync recorded a replica_source to fence against" "$fo_ok" "got '$src_ref'"
+
+	# --- promote, arming a fence --------------------------------------------
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" promote-fenced \
+		-promote -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN" \
+		-promote-mode forced -fence-source -promoted-by bench-harness -start
+	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "promote with -fence-source succeeds" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
+
+	local fence_id
+	fence_id="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" fence_id)"
+	if [ -n "$fence_id" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the promotion armed a fence" "$fo_ok" "fence_id empty"
+
+	# The fence requires the promoted domain to be RUNNING: stopping the
+	# source while nothing serves would leave zero copies up.
+	local tgt_state
+	tgt_state="$(dom_state "$TARGET_URI" "$TARGET_DOMAIN" 2>/dev/null || true)"
+	if [ "$tgt_state" = running ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the promoted copy is running, which the fence requires" "$fo_ok" "got '$tgt_state'"
+
+	# --- the agents ----------------------------------------------------------
+	log "starting a standalone agent on the source host (schedule disabled -- only its fence loop matters)"
+	src_pid="$(agent_start "$SOURCE_HOST" "$SOURCE_LOCAL" "$SOURCE_AGENT_BIN" "$src_vmsync" "$SOURCE_DOMAIN" "$agent_dir" | tr -d "[:space:]")"
+	if [ -n "$src_pid" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the source agent started" "$fo_ok" "no pid returned"
+
+	if [ -n "${TARGET_AGENT_BIN:-}" ]; then
+		log "starting a standalone agent on the target host too -- it must NOT fence the promoted domain"
+		tgt_pid="$(agent_start "$TARGET_HOST" no "$TARGET_AGENT_BIN" "$TARGET_VMSYNC_BIN" "$TARGET_DOMAIN" "$agent_dir" | tr -d '[:space:]')"
+	fi
+
+	# --- wait for the fence to fire ------------------------------------------
+	# The agent sweeps once immediately on startup, before its first tick, so
+	# this is normally seconds rather than the 60s tick interval. The timeout
+	# covers the guest's own shutdown, which is the slow part.
+	local waited=0 limit="${FENCE_WAIT_SECONDS:-180}" state=""
+	log "waiting up to ${limit}s for the source agent to fence '$SOURCE_DOMAIN'"
+	while [ "$waited" -lt "$limit" ]; do
+		state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN" 2>/dev/null || true)"
+		[ "$state" = shutoff ] && break
+		sleep 5
+		waited=$((waited + 5))
+	done
+
+	if [ "$state" = shutoff ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the fence shut the displaced source down" "$fo_ok" \
+		"source is '$state' after ${waited}s -- see $agent_dir/agent.log on $SOURCE_HOST"
+
+	# --- and left it in the right state ---------------------------------------
+	if [ "$state" = shutoff ]; then
+		local src_role
+		src_role="$(vmsync_meta_field "$SOURCE_URI" "$SOURCE_DOMAIN" replication_role)"
+		if [ "$src_role" = paused ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the fenced source is left paused, not merely stopped" "$fo_ok" \
+			"got role '$src_role' -- without this the next sync would start it replicating again"
+
+		# The ledger is what makes a fence single-use. Its presence here is
+		# also what would stop a second attempt on the next sweep.
+		local ledger
+		ledger="$(run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "cat '$agent_dir/fences.json' 2>/dev/null || true")"
+		case "$ledger" in
+		*"$fence_id"*) fo_ok=0 ;;
+		*) fo_ok=1 ;;
+		esac
+		fo_check "$sc" "the agent recorded the fence in its durable ledger" "$fo_ok" \
+			"fence id '$fence_id' not found in $agent_dir/fences.json"
+
+		case "$ledger" in
+		*'"state": "done"'* | *'"state":"done"'*) fo_ok=0 ;;
+		*) fo_ok=1 ;;
+		esac
+		fo_check "$sc" "the ledger records the fence as done" "$fo_ok" "ledger: $(printf '%s' "$ledger" | tr -d '\n' | cut -c1-200)"
+	fi
+
+	# --- the target's own agent must have left the promoted copy alone --------
+	if [ -n "$tgt_pid" ]; then
+		local tgt_after
+		tgt_after="$(dom_state "$TARGET_URI" "$TARGET_DOMAIN" 2>/dev/null || true)"
+		if [ "$tgt_after" = running ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the target's own agent did NOT fence the promoted copy" "$fo_ok" \
+			"promoted domain is '$tgt_after' -- a fence sweep must skip anything whose role is not source"
+	fi
+
+	# Restore NOW rather than leaving it to the EXIT trap. The trap is the
+	# safety net for a die or a Ctrl+C; if it were also the normal path, a
+	# later stage in the same --stages list would run against a source that
+	# is still shut off and `paused`, and the report would be written before
+	# anything was put back.
+	fence_agent_cleanup
 	return 0
 }
 
@@ -1353,6 +1597,28 @@ generate_report() {
                         echo "_not run (opt in with \`--stages failover\`)_"
                 fi
                 echo
+                echo "## Stage 7: fencing end to end, with real agents"
+                echo
+                if awk -F, 'NR>1 && $1=="fence-agent" && $9 ~ /^(PASS|FAIL|SKIP)/ { found=1 } END { exit !found }' "$CSV"; then
+                        awk -F, 'NR>1 && $1=="fence-agent" && $9 ~ /^(PASS|FAIL|SKIP)/ {
+                                gsub(/_/, " ", $2)
+                                if ($9 ~ /^FAIL/)      printf "- **FAIL** — %s (%s)\n", $2, substr($9, 6)
+                                else if ($9 ~ /^SKIP/) printf "- _skipped_ — %s\n", $2
+                                else                   printf "- **PASS** — %s\n", $2
+                        }' "$CSV"
+                        echo
+                        awk -F, 'NR>1 && $1=="fence-agent" && $9 ~ /^(PASS|FAIL|SKIP)/ {
+                                        if ($9 ~ /^FAIL/) f++; else if ($9 ~ /^SKIP/) s++; else p++
+                                }
+                                END {
+                                        if (f)      printf "**%d fencing assertion(s) failed.**\n", f
+                                        else if (p) printf "All %d fencing assertion(s) passed.\n", p
+                                        else        printf "_Nothing was executed (%d skipped)._\n", s
+                                }' "$CSV"
+                else
+                        echo "_not run (opt in with \`--stages fence-agent\`; it stops the source VM)_"
+                fi
+                echo
                 echo "Full machine-readable data: \`results.csv\`. Per-run logs: \`logs/\`. Raw prometheus textfiles: \`prom/\`."
         } >"$report"
         log "report written to $report"
@@ -1373,7 +1639,8 @@ for s in "${stage_list[@]}"; do
         snapshot) stage_external_snapshot ;;
         define) stage_define_domain ;;
         failover) stage_failover ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,reinit,snapshot,define,failover)" ;;
+        fence-agent) stage_fence_agent ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,reinit,snapshot,define,failover,fence-agent)" ;;
         esac
 done
 
