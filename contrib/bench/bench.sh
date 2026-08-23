@@ -101,9 +101,11 @@ never reverses the pair. It is opt-in because it promotes a real replica:
 it puts the target back afterwards and an EXIT trap does the same on a die
 or a Ctrl+C, but a kill -9, or a way back that itself fails, leaves the
 target `promoted` -- and a promoted target refuses EVERY later sync in the
-estate, not just this harness's. Both this stage and Stage 7 refuse to start
-against one rather than failing three minutes into a copy, and print the
-exact command that clears it. It needs TARGET_VMSYNC_BIN set in the
+estate, not just this harness's. Both this stage and Stage 7 wipe vmsync's
+metadata off the domains they use before starting -- via virsh, not through
+vmsync itself, so a broken write path cannot also break the reset -- and skip
+with the exact remedy if that does not take. It needs TARGET_VMSYNC_BIN set
+in the
 config (vmsync on the TARGET host): -promote refuses a remote libvirt URI by
 design, so it must run where the domain is. Without that setting the stage
 skips rather than failing. Note it runs THREE full syncs in total: its own
@@ -1109,11 +1111,61 @@ FAILOVER_FAILURES=0
 
 # clear_target_promotion -> puts the target back to role=target. Prints
 # nothing on success; returns non-zero if it did not take.
+#
+# Used by the cleanup path, where going through vmsync is the point: this is
+# the same -update-role an operator would run, and a stage that quietly
+# reset state some other way would hide that it had stopped working. The
+# PRE-condition reset deliberately does not use it -- see reset_pair_state.
 clear_target_promotion() {
 	ssh_host_cmd "$TARGET_HOST" "$TARGET_VMSYNC_BIN" \
 		-update-role target -target-uri qemu:///system -target-domain "$TARGET_DOMAIN" \
 		>/dev/null 2>&1 || return 1
 	[ "$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)" = target ]
+}
+
+# has_vmsync_metadata URI DOMAIN -> true when the domain carries a vmsync
+# metadata block at all.
+has_vmsync_metadata() {
+	virsh_uri "$1" metadata "$2" --uri "$VMSYNC_METADATA_URI" --config >/dev/null 2>&1
+}
+
+# reset_pair_state STAGE -- wipes vmsync's own metadata off the domains this
+# stage is about to use, so it starts from a known state.
+#
+# Deliberately virsh rather than `vmsync -update-role`, and that is the whole
+# point of doing it here. A harness that resets state through the code it is
+# testing cannot recover when that code is broken: when writing metadata
+# failed outright, -update-role failed with it, every run left the target
+# promoted, and the next run then failed at its baseline for reasons that
+# said nothing about the real fault. virsh talks to libvirt directly and has
+# no such dependency.
+#
+# Wiping the whole block rather than just the role is safe here and slightly
+# better: these stages -reinit the target immediately, so nothing in it is
+# worth keeping, it sweeps up any junk an interrupted run or a hand-run
+# probe left behind, and it makes the stage's own "the sync recorded a
+# replica_source" assertion prove the sync wrote it rather than that it
+# happened to be there already.
+#
+# The source is only touched by Stage 7, which sets it paused when it fences;
+# its replica_targets and last_replicated_* are rewritten by that stage's own
+# baseline sync before anything reads them.
+reset_pair_state() {
+	local stage="$1" also_source="${2:-no}"
+	[ "$DRY_RUN" = yes ] && return 0
+
+	if has_vmsync_metadata "$TARGET_URI" "$TARGET_DOMAIN"; then
+		log "   resetting $TARGET_DOMAIN's vmsync metadata on $TARGET_HOST before starting"
+		virsh_uri "$TARGET_URI" metadata "$TARGET_DOMAIN" --uri "$VMSYNC_METADATA_URI" --remove --config >/dev/null 2>&1 \
+			|| warn "could not clear the target's vmsync metadata; if it is still marked promoted every sync below will be refused"
+	fi
+
+	if [ "$also_source" = yes ] && has_vmsync_metadata "$SOURCE_URI" "$SOURCE_DOMAIN"; then
+		log "   resetting $SOURCE_DOMAIN's vmsync metadata on $SOURCE_HOST before starting"
+		virsh_uri "$SOURCE_URI" metadata "$SOURCE_DOMAIN" --uri "$VMSYNC_METADATA_URI" --remove --config >/dev/null 2>&1 \
+			|| warn "could not clear the source's vmsync metadata; a leftover paused role from an interrupted run may still be there"
+	fi
+	return 0
 }
 
 # warn_target_still_promoted says what has to be done by hand, in full.
@@ -1126,18 +1178,19 @@ warn_target_still_promoted() {
 	warn "$TARGET_DOMAIN on $TARGET_HOST is still marked promoted. Every sync into it -- this harness's later stages included -- will be refused until that is cleared. Run this on $TARGET_HOST:  ${TARGET_VMSYNC_BIN:-vmsync} -update-role target -target-uri qemu:///system -target-domain $TARGET_DOMAIN"
 }
 
-# require_target_not_promoted -- a stage precondition.
+# require_target_syncable -- confirms the reset actually took.
 #
-# Checked up front because the alternative is discovering it three minutes
-# into a full disk copy, as a sync failure whose message is about roles
-# rather than about the stage that left it that way.
-require_target_not_promoted() {
+# reset_pair_state removes the metadata; this checks the result, because a
+# target still carrying `promoted` or `source` refuses every sync below and
+# the failure would otherwise surface three minutes into a full copy, as a
+# role error that says nothing about the stage that left it there.
+require_target_syncable() {
 	local stage="$1" role
 	[ "$DRY_RUN" = yes ] && return 0
 	role="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
 	case "$role" in
 	promoted | source)
-		warn "$stage: the target's replication_role is '$role', so every sync into it is refused -- skipping. This is what an earlier stage or run left behind if its own cleanup did not complete."
+		warn "$stage: the target's replication_role is still '$role' after resetting it, so every sync into it would be refused -- skipping."
 		warn_target_still_promoted
 		results_row "$CSV" "$stage" skipped 0 "" "" "" "" "" "SKIPPED target role is $role"
 		return 1
@@ -1285,7 +1338,8 @@ stage_failover() {
 
 	if [ "$DRY_RUN" != yes ]; then
 		require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
-		require_target_not_promoted "$sc" || return 0
+		reset_pair_state "$sc"
+		require_target_syncable "$sc" || return 0
 	fi
 
 	# The backstop for everything below. This stage promotes the target and
@@ -1647,6 +1701,16 @@ stage_fence_agent() {
 		return 0
 	fi
 
+	# Before the power check, so a run that skips below still leaves the pair
+	# clean. A killed Stage 7 leaves the source both shut off AND paused, and
+	# clearing the role here means the operator only has to start it.
+	#
+	# The source's role matters more here than it looks: a fence sweep skips
+	# any domain whose role is not `source`, so a leftover `paused` would
+	# make the fence silently never fire and this stage fail its central
+	# assertion for a reason that has nothing to do with fencing.
+	reset_pair_state "$sc" yes
+
 	# A fence only ever acts on a RUNNING domain. Skipping rather than
 	# starting the source ourselves, the same way Stage 4 does.
 	local src_state
@@ -1659,7 +1723,7 @@ stage_fence_agent() {
 	fi
 
 	require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
-	require_target_not_promoted "$sc" || return 0
+	require_target_syncable "$sc" || return 0
 
 	# Whatever happens below, put the pair back: kill the agents, clear both
 	# roles, start the source again.
