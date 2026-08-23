@@ -2320,10 +2320,19 @@ func run(cfg syncConfig) (runErr error) {
 		} else {
 			trace.Info("Target domain exists, parse metadata info")
 
-			tgtXML, err := tgtDom.GetXMLDesc(0)
+			// DOMAIN_XML_INACTIVE, because this document is read for
+			// nothing but vmsync's metadata, and vmsync's metadata is
+			// written to the PERSISTENT definition (AFFECT_CONFIG, see
+			// SetDomainMetadataFields). Flags 0 returns the LIVE
+			// definition of a running domain, which a config-only write
+			// never reaches -- so on a target that happens to be running,
+			// last_checkpoint would be read from a document no write ever
+			// lands in, and every sync would see whatever it said when the
+			// domain was started.
+			tgtXML, err := tgtDom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
 			if err != nil {
 				tgtDom.Free()
-				return fmt.Errorf("read source domain xml: %w", err)
+				return fmt.Errorf("read target domain xml: %w", err)
 			}
 			// tgtDom itself isn't touched again past this point -- only
 			// tgtXML (the plain string already extracted from it) is
