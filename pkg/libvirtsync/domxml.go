@@ -163,6 +163,41 @@ func ignoreDiskElement(disk *etree.Element) bool {
 // metadata under <metadata> is left exactly where it was -- the same promise
 // the old whole-document implementation made, now kept structurally rather
 // than by a typed model happening to round-trip it.
+// isVmsyncMetadataElement recognises vmsync's own metadata element in either
+// form it can legitimately take.
+//
+// etree matches on the literal PREFIX, not the namespace URI, so this has to
+// know about both spellings:
+//
+//   - `<vmsync:vmsync xmlns:vmsync="...">` -- what every domain written
+//     before the SetMetadata fix carries, and what libvirt itself produces
+//     when it injects its prefix;
+//   - `<vmsync xmlns="...">` -- the default-namespace form vmsync now emits,
+//     because a self-declared prefix made virDomainSetMetadata fail. See
+//     metadataStart.
+//
+// Missing either one would not merely skip an update: the caller adds its
+// rebuilt element afterwards, so an unrecognised existing one stays put and
+// the domain ends up with two vmsync metadata blocks, whose fields disagree
+// from that point on.
+//
+// The unprefixed form is only accepted when it actually declares vmsync's
+// namespace, so a `<vmsync>` element belonging to something else is left
+// alone -- the whole promise of this function is that other tools' metadata
+// is untouched.
+func isVmsyncMetadataElement(el *etree.Element) bool {
+	if el.Tag != metadataPrefix {
+		return false
+	}
+	switch el.Space {
+	case metadataPrefix:
+		return true
+	case "":
+		return el.SelectAttrValue("xmlns", "") == metadataNamespace
+	}
+	return false
+}
+
 func setMetadataFieldsInDoc(domainXML string, updates map[string]string, removeFields ...string) (string, error) {
 	doc, err := parseDomainDoc(domainXML)
 	if err != nil {
@@ -177,7 +212,7 @@ func setMetadataFieldsInDoc(domainXML string, updates map[string]string, removeF
 
 	var existing *etree.Element
 	for _, child := range metadata.ChildElements() {
-		if child.Space == metadataPrefix && child.Tag == metadataPrefix {
+		if isVmsyncMetadataElement(child) {
 			existing = child
 			break
 		}

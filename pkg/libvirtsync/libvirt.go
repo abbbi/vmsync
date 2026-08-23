@@ -52,8 +52,31 @@ const VerifyWindowCheckpointName = "vmsync-verify-window"
 
 const (
 	metadataNamespace = `http://vmsync.org/xmlns/libvirt/domain/1.0`
-	metadataStart     = `<vmsync:vmsync xmlns:vmsync="` + metadataNamespace + `">`
-	metadataEnd       = `</vmsync:vmsync>`
+	// A DEFAULT namespace declaration, not a prefixed one, and that is not
+	// cosmetic.
+	//
+	// virDomainSetMetadata takes the fragment plus a prefix and a uri, and
+	// injects the namespace itself with xmlNewNs(root, uri, "vmsync").
+	// libxml2's xmlNewNs returns NULL when that PREFIX is already declared on
+	// that node -- which it was, when this emitted
+	// `<vmsync:vmsync xmlns:vmsync="...">` -- and libvirt turns that into
+	// "internal error: failed to create a new XML namespace". Every write
+	// through the metadata API failed that way: promotion, role changes,
+	// failure counting, and recording replica_targets on the source.
+	//
+	// It went unnoticed because the other write path, rebuilding a target's
+	// whole definition and redefining it, embeds the identical XML and works
+	// fine -- a domain define parses the metadata subtree without injecting
+	// anything. So target-side metadata appeared while source-side metadata
+	// silently did not.
+	//
+	// Declaring it as the default namespace puts every element in the same
+	// namespace, leaves the `vmsync` PREFIX free for libvirt to attach, and
+	// reads back identically: both readers here match on namespace rather
+	// than prefix, so they accept this, the legacy prefixed form, and the
+	// mixture libvirt returns after injecting a prefix onto a default-ns root.
+	metadataStart = `<vmsync xmlns="` + metadataNamespace + `">`
+	metadataEnd   = `</vmsync>`
 
 	MetadataFieldLastCheckpoint = "last_checkpoint"
 	MetadataFieldLastSync       = "last_sync_timestamp"
@@ -1303,7 +1326,11 @@ func buildMetadataEntry(fields map[string]string) string {
 	b.WriteString(metadataStart)
 	written := make(map[string]bool, len(fields))
 	writeField := func(field, value string) {
-		b.WriteString("\n  <vmsync:")
+		// Unprefixed: the root declares the namespace as the default, so
+		// these are in it without carrying a prefix -- and leaving the
+		// prefix undeclared is what lets libvirt attach its own. See
+		// metadataStart.
+		b.WriteString("\n  <")
 		b.WriteString(field)
 		b.WriteString(" id=\"")
 		_ = xml.EscapeText(&b, []byte(value))
