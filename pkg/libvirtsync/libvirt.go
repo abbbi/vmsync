@@ -1016,7 +1016,13 @@ func ReadTargetFailureCount(targetURI, targetDomain string) (int, error) {
 	}
 	defer dom.Free()
 
-	domXML, err := dom.GetXMLDesc(0)
+	// DOMAIN_XML_INACTIVE, matching ReadReplicationRole and every write:
+	// RecordTargetSyncFailure stores this counter with AFFECT_CONFIG, so it
+	// only ever appears in the persistent definition. Flags 0 hands back the
+	// LIVE definition of a running domain instead, which no config write
+	// reaches -- and the case that most needs this counter read correctly is
+	// exactly a target that was promoted and is now running.
+	domXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
 	if err != nil {
 		return 0, fmt.Errorf("read target domain xml: %w", err)
 	}
@@ -1357,26 +1363,15 @@ func buildMetadataEntry(fields map[string]string) string {
 	return b.String()
 }
 
+// parseMetadataValue returns the id attribute of one vmsync metadata field,
+// "" when that field is absent.
+//
+// Delegates to allMetadataFields rather than walking the document itself.
+// The two used to carry their own copies of the same matching rules, and a
+// pair like that only has to drift once to leave half of vmsync able to read
+// a domain the other half reads as empty.
 func parseMetadataValue(metadataXML string, field string) string {
-	decoder := xml.NewDecoder(strings.NewReader("<metadata>" + metadataXML + "</metadata>"))
-	for {
-		token, err := decoder.Token()
-		if err != nil {
-			return ""
-		}
-		start, ok := token.(xml.StartElement)
-		if !ok || start.Name.Space != metadataNamespace || start.Name.Local != field {
-			continue
-		}
-
-		for _, attr := range start.Attr {
-			if attr.Name.Local == "id" {
-				return attr.Value
-			}
-		}
-
-		return ""
-	}
+	return allMetadataFields(metadataXML)[field]
 }
 
 // allMetadataFields returns every vmsync:field->id-attribute-value pair
@@ -1393,24 +1388,103 @@ func parseMetadataValue(metadataXML string, field string) string {
 // anything not on that list. The wrapping <vmsync:vmsync> element itself
 // is excluded -- it's the container, not a field.
 func allMetadataFields(metadataXML string) map[string]string {
+	fields, _ := metadataFields(metadataXML)
+	return fields
+}
+
+// metadataFields walks a vmsync metadata fragment -- or the whole body of a
+// domain's <metadata> element -- and returns its field->id pairs, along with
+// whether vmsync's own container element was found at all.
+//
+// Fields are matched by being INSIDE that container, not by carrying vmsync's
+// namespace themselves, and that distinction is the entire point of this
+// function.
+//
+// vmsync writes its fields unprefixed, under a default namespace declaration
+// on the container. It has no choice: declaring the `vmsync` prefix itself is
+// what made virDomainSetMetadata fail outright (see metadataStart). Whether
+// that default declaration survives the round trip is then not vmsync's to
+// decide -- libvirt re-namespaces the container with its own prefix on the
+// way in, and libxml2 copies, stores, serialises and reparses the document
+// several times before any of it comes back. Drop the declaration anywhere
+// along that path and the fields return in NO namespace, which a per-field
+// namespace match -- what this did -- reads as a domain with no metadata.
+//
+// That is not just a failed read. Every writer here is a read-modify-write:
+// SetDomainMetadataFields merges its updates into whatever it read back, so
+// fields that read as absent are not preserved, they are dropped from the
+// next write. One unrecognised spelling therefore erases replication_role,
+// last_checkpoint and the whole promotion record the next time anything
+// touches this domain's metadata for any reason.
+//
+// The container is still matched by NAMESPACE, and that is what makes scoping
+// to it safe rather than greedy: the namespace is how libvirt itself
+// identifies the element -- virDomainGetMetadata and `virsh metadata` both
+// take the uri and never the prefix -- so everything inside it is vmsync's by
+// construction, whatever namespace its serialisation left the children in.
+//
+// Elements in vmsync's namespace are still accepted outside any container
+// too, so this stays a superset of the rule it replaces and nothing that read
+// correctly before can stop reading now.
+func metadataFields(metadataXML string) (map[string]string, bool) {
 	fields := map[string]string{}
+	sawContainer := false
 	decoder := xml.NewDecoder(strings.NewReader("<metadata>" + metadataXML + "</metadata>"))
+	depth, containerDepth := 0, -1
 	for {
 		token, err := decoder.Token()
 		if err != nil {
-			return fields
+			return fields, sawContainer
 		}
-		start, ok := token.(xml.StartElement)
-		if !ok || start.Name.Space != metadataNamespace || start.Name.Local == "vmsync" {
-			continue
-		}
-		for _, attr := range start.Attr {
-			if attr.Name.Local == "id" {
-				fields[start.Name.Local] = attr.Value
-				break
+		switch el := token.(type) {
+		case xml.StartElement:
+			depth++
+			if isMetadataContainer(el.Name) {
+				sawContainer = true
+				if containerDepth < 0 {
+					containerDepth = depth
+				}
+				continue
 			}
+			// Direct children only. vmsync's fields are a flat list, so
+			// anything deeper belongs to a structure this version does not
+			// write and must not be flattened into a field beside them.
+			inContainer := containerDepth > 0 && depth == containerDepth+1
+			if !inContainer && el.Name.Space != metadataNamespace {
+				continue
+			}
+			for _, attr := range el.Attr {
+				if attr.Name.Local == "id" {
+					fields[el.Name.Local] = attr.Value
+					break
+				}
+			}
+		case xml.EndElement:
+			if depth == containerDepth {
+				containerDepth = -1
+			}
+			depth--
 		}
 	}
+}
+
+// isMetadataContainer reports whether name is vmsync's own <vmsync> element,
+// in any spelling it can arrive in.
+//
+// The second case covers a declaration that lives on an ancestor rather than
+// on the element itself: ParseMetadata is handed the raw inner XML of
+// <metadata>, torn out of the domain document by encoding/xml's ,innerxml, so
+// a declaration hoisted up onto <domain> is simply not present in the text
+// being parsed and the prefix arrives unresolved. An unresolved prefix is the
+// only way Space can be the literal string "vmsync" -- a prefix bound to
+// somebody else's namespace resolves to that namespace, not to itself -- so
+// accepting it cannot capture another tool's element. domxml.go's
+// serialiseElement guards the etree side of the same hazard.
+func isMetadataContainer(name xml.Name) bool {
+	if name.Local != metadataPrefix {
+		return false
+	}
+	return name.Space == metadataNamespace || name.Space == metadataPrefix
 }
 
 // stripDomainUUID returns domainXML with its <uuid> element removed, so a

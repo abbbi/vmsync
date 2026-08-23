@@ -19,6 +19,7 @@ package libvirtsync
 
 import (
 	"fmt"
+	"maps"
 
 	"libvirt.org/go/libvirt"
 )
@@ -81,7 +82,18 @@ func mergeMetadataFields(fragment string, updates map[string]string, removals ..
 		}
 	}
 
-	fields := allMetadataFields(fragment)
+	fields, sawContainer := metadataFields(fragment)
+	// A fragment that is present but yields nothing is the dangerous case,
+	// not the empty one: this is a merge, so anything not read back here is
+	// dropped from the write that follows -- replication_role and the
+	// promotion record included. Refusing costs a failed metadata update and
+	// says exactly what it saw; proceeding costs the domain's safety markers,
+	// silently, and only shows up the next time somebody needs them.
+	if fragment != "" && !sawContainer && len(fields) == 0 {
+		return "", fmt.Errorf("the vmsync metadata already on this domain could not be read, refusing to overwrite it: "+
+			"this update merges into what was read back, so writing now would drop whatever that element holds "+
+			"(replication_role and the promotion record among it). The fragment read was: %s", fragment)
+	}
 	for field, value := range updates {
 		fields[field] = value
 	}
@@ -97,14 +109,33 @@ func mergeMetadataFields(fragment string, updates map[string]string, removals ..
 	return buildMetadataEntry(fields), nil
 }
 
+// sameMetadataFields reports whether two metadata fragments carry the same
+// fields with the same values.
+//
+// Comparing the fragments as strings compares the wrong thing. What vmsync
+// writes and what libvirt hands back are never byte-identical: libvirt
+// attaches its own `vmsync` prefix to the element it stores, so a fragment
+// read back always differs from the one that produced it even when not a
+// single field changed. The "nothing to write" check below therefore never
+// fired, and every sync paid for a persistent-definition rewrite it did not
+// need -- on the SOURCE domain, which is production.
+//
+// Only the id attributes are compared, because they are the only thing vmsync
+// stores. Element text and attribute order carry no meaning here, so a
+// reformat by another tool is correctly not treated as somebody else's edit.
+func sameMetadataFields(a, b string) bool {
+	return maps.Equal(allMetadataFields(a), allMetadataFields(b))
+}
+
 // SetDomainMetadataFields merges field changes into a domain's vmsync
 // metadata without redefining the domain.
 //
 // The re-read before writing is the same concurrent-writer guard
-// SetReplicationRole has always had, but it now compares a small fragment
+// SetReplicationRole has always had, but it now compares vmsync's own fields
 // instead of two whole domain documents -- so it detects the thing it cares
 // about (somebody else changed vmsync's metadata) without being defeated by
-// an unrelated change elsewhere in the definition.
+// an unrelated change elsewhere in the definition, or by libvirt's own
+// re-spelling of the element (see sameMetadataFields).
 func SetDomainMetadataFields(mgr *Manager, domainName string, updates map[string]string, removals ...string) error {
 	dom, err := mgr.Conn.LookupDomainByName(domainName)
 	if err != nil {
@@ -120,7 +151,7 @@ func SetDomainMetadataFields(mgr *Manager, domainName string, updates map[string
 	if err != nil {
 		return fmt.Errorf("domain %s: %w", domainName, err)
 	}
-	if merged == before {
+	if sameMetadataFields(merged, before) {
 		return nil // nothing to write
 	}
 
@@ -128,7 +159,7 @@ func SetDomainMetadataFields(mgr *Manager, domainName string, updates map[string
 	if err != nil {
 		return fmt.Errorf("domain %s: %w", domainName, err)
 	}
-	if latest != before {
+	if !sameMetadataFields(latest, before) {
 		return fmt.Errorf("domain %s had its vmsync metadata changed by something else while this update was being prepared; refusing to overwrite it -- check whether another vmsync invocation or an external tool is also managing this domain", domainName)
 	}
 
