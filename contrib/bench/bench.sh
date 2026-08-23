@@ -310,6 +310,53 @@ vmsync_common_args "$iodepth_override"
         results_row "$CSV" "$scenario" "$phase" "$RUN_RC" "$RUN_WALL_SECONDS" "$transferred" "$compressed" "$disk_bytes" "$mode" ""
 }
 
+# BENCH_SYNC_EXTRA is the transport flags every stage EXCEPT the matrix adds
+# to its syncs, split from BENCH_SYNC_ARGS in bench.conf. Default: -compress.
+#
+# Stage 1 is the one stage measuring transport, so it must choose its own and
+# is deliberately left calling run_vmsync directly. Every other stage copies
+# a disk only so there is something real to tamper with, reinit, snapshot,
+# promote or fence -- the transport is incidental, and the fastest way across
+# the wire is simply the least waiting. On a link that is the bottleneck (a
+# saturated 1GbE reads as roughly 110 MB/s in results.csv) that is most of
+# their runtime, and Stage 6 alone does three full copies.
+#
+# Nothing about this changes what those stages test. vmsync's own port
+# allocator handles "whichever combination of -compress/-netbuffer/-verify is
+# active" by design, reserving 4N target ports when both are on, so the
+# verify modes compose with the bridge rather than working around it. Stage 3
+# already passed -compress unconditionally before this existed.
+#
+# Set BENCH_SYNC_ARGS="" to turn it off. -compress needs vmsync-bridge-helper
+# on the TARGET host; when it is missing every one of these stages fails at
+# its baseline, which is why those failures name this setting.
+read -ra BENCH_SYNC_EXTRA <<<"${BENCH_SYNC_ARGS--compress}"
+
+# bench_sync SCENARIO PHASE ARGS... -- run_vmsync plus those shared flags.
+#
+# A wrapper rather than appending at each call site: the empty case has to be
+# handled explicitly, because "${arr[@]}" on an empty array is an unbound
+# variable under `set -u` on bash before 4.4.
+bench_sync() {
+	local scenario="$1" phase="$2"
+	shift 2
+	if [ ${#BENCH_SYNC_EXTRA[@]} -gt 0 ]; then
+		run_vmsync "$scenario" "$phase" "$@" "${BENCH_SYNC_EXTRA[@]}"
+	else
+		run_vmsync "$scenario" "$phase" "$@"
+	fi
+}
+
+# bench_sync_hint names the likely cause when one of those syncs fails, since
+# the flags it adds are also the one extra thing that has to be installed on
+# the target.
+bench_sync_hint() {
+	if [ ${#BENCH_SYNC_EXTRA[@]} -gt 0 ]; then
+		printf ' -- this stage adds "%s" to every sync (BENCH_SYNC_ARGS in %s); -compress needs vmsync-bridge-helper on %s, so set BENCH_SYNC_ARGS="" if that is not installed there' \
+			"${BENCH_SYNC_EXTRA[*]}" "$CONF" "$TARGET_HOST"
+	fi
+}
+
 # load_axes parses scenarios.conf's [compress]/[netbuffer]/[use_ssh]/
 # [iodepth] sections into the matching *_OPTS global arrays -- one value
 # per line within each section, blank lines and whole-line "#" comments
@@ -476,9 +523,9 @@ stage_verify_tamper() {
         # correctness shouldn't depend on which transport carried the
         # preceding sync, and holding it fixed makes the three modes below
         # directly comparable to each other.
-        run_vmsync verify-baseline full -reinit
+        bench_sync verify-baseline full -reinit
         if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
-                die "baseline full sync for verify testing failed (see $RUN_LOG) -- aborting stage 2"
+                die "baseline full sync for verify testing failed (see $RUN_LOG) -- aborting stage 2$(bench_sync_hint)"
         fi
 
         local target_path=""
@@ -503,7 +550,7 @@ stage_verify_tamper() {
                                 || die "failed to inject test corruption into $target_path on $TARGET_HOST -- refusing to continue this sub-test"
                 fi
 
-                run_vmsync "verify-${mode}" tamper "-verify=$mode"
+                bench_sync "verify-${mode}" tamper "-verify=$mode"
 
                 if [ "$DRY_RUN" = yes ]; then
                         :
@@ -522,7 +569,7 @@ stage_verify_tamper() {
                 # the offset we just tampered with on the target -- only -reinit
                 # (which re-copies everything) is guaranteed to overwrite it.
                 log "   healing target with a full resync (-reinit)"
-                run_vmsync "verify-${mode}" heal -reinit
+                bench_sync "verify-${mode}" heal -reinit
                 if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
                         die "heal-after-tamper resync for -verify=$mode did not succeed (see $RUN_LOG) -- STOP and inspect $target_path by hand before trusting this target replica or continuing"
                 fi
@@ -549,9 +596,9 @@ stage_reinit_after_failures() {
         # forever and -reinit-after-failures never trips. This doesn't rely on
         # Stage 1 having run at all, so Stage 3 is self-sufficient like the
         # other stages.
-        run_vmsync reinit-after-failures baseline -reinit -compress
+        bench_sync reinit-after-failures baseline -reinit
         if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
-                die "baseline full sync for reinit-after-failures testing failed (see $RUN_LOG) -- aborting stage 3"
+                die "baseline full sync for reinit-after-failures testing failed (see $RUN_LOG) -- aborting stage 3$(bench_sync_hint)"
         fi
 
         # Induce N genuine, repeatable incremental-sync failures by removing
@@ -577,14 +624,14 @@ stage_reinit_after_failures() {
         log "inducing $n consecutive failures against the real target"
         local i
         for i in $(seq 1 "$n"); do
-                run_vmsync reinit-after-failures "induce-$i" -compress "-reinit-after-failures=$n"
+                bench_sync reinit-after-failures "induce-$i" "-reinit-after-failures=$n"
                 if [ "$RUN_RC" = 0 ] && [ "$DRY_RUN" != yes ]; then
                         warn "induced-failure run #$i unexpectedly succeeded (exit=0) -- check $RUN_LOG, this test's assumptions may not hold in your environment"
                 fi
         done
 
         log "running a real, correct sync with -reinit-after-failures=$n -- expecting it to force a full resync instead of the incremental one it would otherwise do"
-        run_vmsync reinit-after-failures trigger -compress "-reinit-after-failures=$n"
+        bench_sync reinit-after-failures trigger "-reinit-after-failures=$n"
 
         if [ "$DRY_RUN" = yes ]; then
                 :
@@ -633,9 +680,9 @@ stage_external_snapshot() {
         # comment next to that check). Without this baseline, a first-ever sync
         # of this domain would hit that fatal path instead of the tolerant one
         # this stage exists to test.
-        run_vmsync ext-snapshot baseline -reinit
+        bench_sync ext-snapshot baseline -reinit
         if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
-                die "baseline full sync for external-snapshot testing failed (see $RUN_LOG) -- aborting stage 4"
+                die "baseline full sync for external-snapshot testing failed (see $RUN_LOG) -- aborting stage 4$(bench_sync_hint)"
         fi
 
         local target_path_before=""
@@ -658,7 +705,7 @@ stage_external_snapshot() {
         fi
 
         log "--- syncing while the external snapshot exists (expect: sync+verify succeed and the target path stays stable) ---"
-        run_vmsync ext-snapshot during-snapshot -verify=fast
+        bench_sync ext-snapshot during-snapshot -verify=fast
         if [ "$DRY_RUN" != yes ]; then
                 local snap_count=0
                 local target_path_during=""
@@ -723,7 +770,7 @@ stage_external_snapshot() {
         fi
 
         log "--- syncing again after the external snapshot is gone (expect: checkpoint chain resumes advancing) ---"
-        run_vmsync ext-snapshot after-snapshot -verify=fast
+        bench_sync ext-snapshot after-snapshot -verify=fast
         if [ "$DRY_RUN" != yes ]; then
                 if [ "$RUN_RC" != 0 ]; then
                         warn "FAIL: sync+verify after removing the external snapshot did not succeed (exit=$RUN_RC) -- see $RUN_LOG"
@@ -783,13 +830,13 @@ stage_define_domain_uuid_collision() {
                 require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
         fi
 
-        run_vmsync define-uuid-collision baseline -reinit
+        bench_sync define-uuid-collision baseline -reinit
         if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
-                die "baseline full sync for DefineDomain uuid-collision testing failed (see $RUN_LOG) -- aborting stage 5a"
+                die "baseline full sync for DefineDomain uuid-collision testing failed (see $RUN_LOG) -- aborting stage 5a$(bench_sync_hint)"
         fi
 
         if [ "$DRY_RUN" = yes ]; then
-                run_vmsync define-uuid-collision trigger -reinit
+                bench_sync define-uuid-collision trigger -reinit
                 return 0
         fi
 
@@ -829,7 +876,7 @@ stage_define_domain_uuid_collision() {
                 | virsh_uri "$TARGET_URI" define /dev/stdin >/dev/null \
                 || die "failed to define throwaway uuid-collision domain '$collision_name' on target -- aborting stage 5a"
 
-        run_vmsync define-uuid-collision trigger -reinit
+        bench_sync define-uuid-collision trigger -reinit
 
         local pass=yes reason="" target_uuid_after=""
         if [ "$RUN_RC" != 0 ]; then
@@ -863,16 +910,16 @@ stage_define_domain_rollback() {
 
         if [ "$DRY_RUN" = yes ]; then
                 log "   (dry run: nothing to time or disrupt)"
-                run_vmsync define-rollback baseline -reinit
-                run_vmsync define-rollback trigger -reinit
+                bench_sync define-rollback baseline -reinit
+                bench_sync define-rollback trigger -reinit
                 return 0
         fi
 
         require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
 
-        run_vmsync define-rollback baseline -reinit
+        bench_sync define-rollback baseline -reinit
         if [ "$RUN_RC" != 0 ]; then
-                die "baseline full sync for DefineDomain rollback testing failed (see $RUN_LOG) -- aborting stage 5b"
+                die "baseline full sync for DefineDomain rollback testing failed (see $RUN_LOG) -- aborting stage 5b$(bench_sync_hint)"
         fi
 
         local xml_before
@@ -1155,7 +1202,7 @@ stage_failover_disk_owner() {
 		return 0
 	fi
 
-	run_vmsync "$sc" owner-preserve -reinit
+	bench_sync "$sc" owner-preserve -reinit
 	owner="$(target_disk_owner)"
 	if [ "$owner" = "${expected_user}:root" ]; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "-reinit preserves the ownership it replaces" "$fo_ok" \
@@ -1164,7 +1211,7 @@ stage_failover_disk_owner() {
 	# 3. An explicit -target-disk-owner overrides what was preserved. Runs
 	#    last so it also puts the ownership back where it belongs, whatever
 	#    the checks above found.
-	run_vmsync "$sc" owner-explicit -reinit -target-disk-owner "$expected"
+	bench_sync "$sc" owner-explicit -reinit -target-disk-owner "$expected"
 	owner="$(target_disk_owner)"
 	if [ "$owner" = "$expected" ]; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "an explicit -target-disk-owner overrides the preserved one" "$fo_ok" \
@@ -1198,9 +1245,9 @@ stage_failover() {
 	fi
 
 	# --- baseline: a real replica to promote --------------------------------
-	run_vmsync "$sc" baseline -reinit
+	bench_sync "$sc" baseline -reinit
 	if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
-		die "baseline full sync failed (see $RUN_LOG) -- aborting stage 6 before anything is promoted"
+		die "baseline full sync failed (see $RUN_LOG) -- aborting stage 6 before anything is promoted$(bench_sync_hint)"
 	fi
 
 	# replica_source is what a bare -fence-source resolves the fence against,
@@ -1243,6 +1290,20 @@ stage_failover() {
 	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "promote succeeds against a freshly synced replica" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
 
+	# Everything below this point only means anything against a target that
+	# is actually promoted. Running those checks anyway turns ONE root cause
+	# into a wall of failures -- and worse, some of them PASS vacuously: "a
+	# promotion with no -fence-source arms nothing" is trivially true when no
+	# promotion happened at all, which reads as reassurance about a property
+	# that was never exercised.
+	if [ "$fo_ok" != 0 ] && [ "$DRY_RUN" != yes ]; then
+		warn "the promotion failed, so every check that depends on a promoted target is skipped rather than reported as a separate failure -- fix that first, the rest of this stage cannot say anything until it works"
+		results_row "$CSV" "$sc" promotion_dependent_checks 0 "" "" "" "" "" "SKIP promote failed"
+		# Nothing was changed, so there is nothing to put back: the target
+		# is still the healthy replica the baseline left behind.
+		return 0
+	fi
+
 	if [ "$DRY_RUN" != yes ]; then
 		local role promoted_at promoted_from fence_src fence_id
 		role="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
@@ -1267,7 +1328,7 @@ stage_failover() {
 	# --- a promoted target refuses to be synced into ------------------------
 	# The backstop under the whole design. Nothing else in this stage matters
 	# if a scheduled sync can still overwrite a domain that is serving live.
-	run_vmsync "$sc" refuse-sync
+	bench_sync "$sc" refuse-sync
 	if [ "$DRY_RUN" != yes ]; then
 		if [ "$RUN_RC" != 0 ]; then fo_ok=0; else fo_ok=1; fi
 		fo_check "$sc" "syncing into a promoted target is refused" "$fo_ok" \
@@ -1404,7 +1465,7 @@ stage_failover() {
 	# --- and replication actually resumes -----------------------------------
 	# The point of the way back. A role that clears but leaves the pair broken
 	# would be a worse outcome than not clearing at all.
-	run_vmsync "$sc" resync
+	bench_sync "$sc" resync
 	if [ "$DRY_RUN" != yes ]; then
 		if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
 		fo_check "$sc" "replication resumes once the promotion is undone" "$fo_ok" \
@@ -1554,9 +1615,9 @@ stage_fence_agent() {
 	trap 'fence_agent_cleanup' EXIT
 
 	# --- baseline ------------------------------------------------------------
-	run_vmsync "$sc" baseline -reinit
+	bench_sync "$sc" baseline -reinit
 	if [ "$RUN_RC" != 0 ]; then
-		die "baseline full sync failed (see $RUN_LOG) -- aborting stage 7 before anything is promoted"
+		die "baseline full sync failed (see $RUN_LOG) -- aborting stage 7 before anything is promoted$(bench_sync_hint)"
 	fi
 
 	local src_ref

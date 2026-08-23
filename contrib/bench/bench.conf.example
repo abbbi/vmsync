@@ -69,6 +69,28 @@ SSH_KNOWN_HOSTS=""
 IO_DEPTH=8
 BRIDGE_HELPER_PATH=""   # empty = vmsync's own default (/usr/local/bin/vmsync-bridge-helper)
 
+# Transport flags added to every sync in every stage EXCEPT Stage 1.
+# Default: -compress.
+#
+# Stage 1 is the one stage measuring transport, so it chooses its own from
+# scenarios.conf and is never given these. Every other stage copies a disk
+# only so there is something real to tamper with, reinit, snapshot, promote
+# or fence -- the transport is incidental there, and the fastest way across
+# the wire is simply the least waiting. On a link that is the bottleneck (a
+# saturated 1GbE reads as roughly 110 MB/s in results.csv) that is most of
+# their runtime, and Stage 6 alone does three full copies.
+#
+# This does not change what those stages test: vmsync's port allocator
+# handles "whichever combination of -compress/-netbuffer/-verify is active"
+# by design, reserving 4N target ports when both are on, so the verify modes
+# compose with the bridge rather than working around it.
+#
+# -compress requires vmsync-bridge-helper on the TARGET host. Without it
+# every affected stage fails at its baseline -- and says so, naming this
+# setting. Set it to "" to turn it off, or to any vmsync transport flags,
+# e.g. "-compress=zstd -compress-level 3" or "-compress -netbuffer 128k,1G".
+#BENCH_SYNC_ARGS="-compress"
+
 # --- Verify + tamper test ------------------------------------------------
 
 # Which disk (libvirt <target dev='...'>) to tamper for the -verify
@@ -115,6 +137,7 @@ DEFINE_ROLLBACK_WAIT_SECONDS=300
 # Leave it unset to skip Stage 6 entirely (it skips with a message rather
 # than failing).
 #TARGET_VMSYNC_BIN=/usr/local/bin/vmsync
+
 
 # --- Fencing end to end with real agents (Stage 7, --stages ...,fence-agent) --
 #
