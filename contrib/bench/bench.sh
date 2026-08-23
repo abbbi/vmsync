@@ -97,9 +97,13 @@ SOURCE_AGENT_BIN and TARGET_VMSYNC_BIN.
 Stage 6 (failover) is also NOT included by default. It promotes the target,
 arms and inspects a fence, checks who owns the target's disks, and puts the
 target back to `target` with a fresh sync -- it never stops a domain and
-never reverses the pair. It is opt-in because an interrupted run can leave
-the target `promoted`, which makes every later sync fail until somebody
-clears it with -update-role=target. It needs TARGET_VMSYNC_BIN set in the
+never reverses the pair. It is opt-in because it promotes a real replica:
+it puts the target back afterwards and an EXIT trap does the same on a die
+or a Ctrl+C, but a kill -9, or a way back that itself fails, leaves the
+target `promoted` -- and a promoted target refuses EVERY later sync in the
+estate, not just this harness's. Both this stage and Stage 7 refuse to start
+against one rather than failing three minutes into a copy, and print the
+exact command that clears it. It needs TARGET_VMSYNC_BIN set in the
 config (vmsync on the TARGET host): -promote refuses a remote libvirt URI by
 design, so it must run where the domain is. Without that setting the stage
 skips rather than failing. Note it runs THREE full syncs in total: its own
@@ -1103,6 +1107,45 @@ fo_check() {
 
 FAILOVER_FAILURES=0
 
+# clear_target_promotion -> puts the target back to role=target. Prints
+# nothing on success; returns non-zero if it did not take.
+clear_target_promotion() {
+	ssh_host_cmd "$TARGET_HOST" "$TARGET_VMSYNC_BIN" \
+		-update-role target -target-uri qemu:///system -target-domain "$TARGET_DOMAIN" \
+		>/dev/null 2>&1 || return 1
+	[ "$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)" = target ]
+}
+
+# warn_target_still_promoted says what has to be done by hand, in full.
+#
+# Worth being explicit rather than terse: a target left `promoted` refuses
+# EVERY later sync, including the next stage's baseline and every scheduled
+# run in the estate, and the symptom is a sync failing for reasons that say
+# nothing about a promotion.
+warn_target_still_promoted() {
+	warn "$TARGET_DOMAIN on $TARGET_HOST is still marked promoted. Every sync into it -- this harness's later stages included -- will be refused until that is cleared. Run this on $TARGET_HOST:  ${TARGET_VMSYNC_BIN:-vmsync} -update-role target -target-uri qemu:///system -target-domain $TARGET_DOMAIN"
+}
+
+# require_target_not_promoted -- a stage precondition.
+#
+# Checked up front because the alternative is discovering it three minutes
+# into a full disk copy, as a sync failure whose message is about roles
+# rather than about the stage that left it that way.
+require_target_not_promoted() {
+	local stage="$1" role
+	[ "$DRY_RUN" = yes ] && return 0
+	role="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
+	case "$role" in
+	promoted | source)
+		warn "$stage: the target's replication_role is '$role', so every sync into it is refused -- skipping. This is what an earlier stage or run left behind if its own cleanup did not complete."
+		warn_target_still_promoted
+		results_row "$CSV" "$stage" skipped 0 "" "" "" "" "" "SKIPPED target role is $role"
+		return 1
+		;;
+	esac
+	return 0
+}
+
 # target_disk_owner -> "user:group" of the target domain's disk, or empty.
 target_disk_owner() {
 	local path
@@ -1242,7 +1285,30 @@ stage_failover() {
 
 	if [ "$DRY_RUN" != yes ]; then
 		require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
+		require_target_not_promoted "$sc" || return 0
 	fi
+
+	# The backstop for everything below. This stage promotes the target and
+	# is responsible for putting it back; a die, a Ctrl+C or a failed way
+	# back would otherwise leave it promoted, and a promoted target refuses
+	# every sync in the estate -- not just this harness's later stages.
+	#
+	# An EXIT trap rather than RETURN for the same reason Stage 7 uses one:
+	# RETURN does not fire on die or on a signal, and those are precisely the
+	# cases that would leave it behind.
+	FAILOVER_PROMOTED=no
+	FAILOVER_CLEANED=no
+	failover_cleanup() {
+		[ "$FAILOVER_CLEANED" = yes ] && return 0
+		FAILOVER_CLEANED=yes
+		[ "$FAILOVER_PROMOTED" = yes ] || return 0
+		if clear_target_promotion; then
+			log "stage 6: the target is back to role=target"
+		else
+			warn_target_still_promoted
+		fi
+	}
+	trap 'failover_cleanup' EXIT
 
 	# --- baseline: a real replica to promote --------------------------------
 	bench_sync "$sc" baseline -reinit
@@ -1289,6 +1355,7 @@ stage_failover() {
 		-promote-mode planned -promoted-by bench-harness
 	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "promote succeeds against a freshly synced replica" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
+	if [ "$fo_ok" = 0 ]; then FAILOVER_PROMOTED=yes; fi
 
 	# Everything below this point only means anything against a target that
 	# is actually promoted. Running those checks anyway turns ONE root cause
@@ -1460,6 +1527,16 @@ stage_failover() {
 		if [ -z "$promoted_back" ]; then fo_ok=0; else fo_ok=1; fi
 		fo_check "$sc" "clearing the role takes the promotion record with it" "$fo_ok" \
 			"promoted_at is still '$promoted_back'"
+
+		# Recording the failure is not enough. A target left promoted refuses
+		# every later sync, so a stage that merely noted it and moved on would
+		# hand the next stage a baseline failure with nothing pointing back
+		# here -- which is exactly what happened when -update-role could not
+		# write metadata at all.
+		if [ "$role_back" != target ]; then
+			warn "the way back did not take, so this stage is leaving the pair unusable rather than as it found it"
+			warn_target_still_promoted
+		fi
 	fi
 
 	# --- and replication actually resumes -----------------------------------
@@ -1479,6 +1556,12 @@ stage_failover() {
 			warn "=== Stage 6: $FAILOVER_FAILURES failover assertion(s) FAILED -- see the report and logs/ ==="
 		fi
 	fi
+
+	# Cleaned up above by the way-back step, so this only has to confirm it
+	# and stand the trap down -- leaving it armed would fire again at script
+	# exit, after the report had already been printed.
+	failover_cleanup
+	trap - EXIT
 	return 0
 }
 
@@ -1576,6 +1659,7 @@ stage_fence_agent() {
 	fi
 
 	require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
+	require_target_not_promoted "$sc" || return 0
 
 	# Whatever happens below, put the pair back: kill the agents, clear both
 	# roles, start the source again.
