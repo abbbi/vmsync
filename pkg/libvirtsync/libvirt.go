@@ -52,31 +52,47 @@ const VerifyWindowCheckpointName = "vmsync-verify-window"
 
 const (
 	metadataNamespace = `http://vmsync.org/xmlns/libvirt/domain/1.0`
-	// A DEFAULT namespace declaration, not a prefixed one, and that is not
-	// cosmetic.
+	// metadataWritePrefix is deliberately NOT "vmsync", and every field
+	// element carries it. Both halves of that are load-bearing.
 	//
 	// virDomainSetMetadata takes the fragment plus a prefix and a uri, and
-	// injects the namespace itself with xmlNewNs(root, uri, "vmsync").
+	// injects the namespace itself with xmlNewNs(root, uri, metadataPrefix).
 	// libxml2's xmlNewNs returns NULL when that PREFIX is already declared on
-	// that node -- which it was, when this emitted
-	// `<vmsync:vmsync xmlns:vmsync="...">` -- and libvirt turns that into
-	// "internal error: failed to create a new XML namespace". Every write
-	// through the metadata API failed that way: promotion, role changes,
-	// failure counting, and recording replica_targets on the source.
+	// the node, and libvirt turns that into "internal error: failed to create
+	// a new XML namespace". So the fragment may not declare `vmsync` itself --
+	// which the original `<vmsync:vmsync xmlns:vmsync="...">` did, and every
+	// write through the metadata API failed that way: promotion, role changes,
+	// failure counting, and recording replica_targets on the source. It hid
+	// for a long time because the other writer embeds the identical XML in a
+	// whole domain document and redefines it, and a define parses the metadata
+	// subtree without injecting anything, so target-side metadata appeared
+	// while source-side metadata silently did not.
 	//
-	// It went unnoticed because the other write path, rebuilding a target's
-	// whole definition and redefining it, embeds the identical XML and works
-	// fine -- a domain define parses the metadata subtree without injecting
-	// anything. So target-side metadata appeared while source-side metadata
-	// silently did not.
+	// Declaring the namespace as the DEFAULT instead got past that, and was
+	// still wrong. libvirt does not keep it: a domain written that way reads
+	// back as
 	//
-	// Declaring it as the default namespace puts every element in the same
-	// namespace, leaves the `vmsync` PREFIX free for libvirt to attach, and
-	// reads back identically: both readers here match on namespace rather
-	// than prefix, so they accept this, the legacy prefixed form, and the
-	// mixture libvirt returns after injecting a prefix onto a default-ns root.
-	metadataStart = `<vmsync xmlns="` + metadataNamespace + `">`
-	metadataEnd   = `</vmsync>`
+	//	<vmsync xmlns:vmsync="http://vmsync.org/xmlns/libvirt/domain/1.0">
+	//	  <failure_count id="1"/>
+	//	</vmsync>
+	//
+	// -- the default declaration turned into a prefixed one that nothing in
+	// the fragment uses, the tag left bare, the fields in no namespace at all.
+	// Fields that rely on a default declaration for their namespace lose it
+	// with the declaration, and since every writer here is a
+	// read-modify-write, a field that reads as absent is dropped from the next
+	// write rather than preserved.
+	//
+	// A separate prefix fixes both ends: `vmsync` stays free for libvirt to
+	// inject, and every field is bound to a declaration that sits on the
+	// element itself, so the fragment resolves standalone no matter what is
+	// done to the document around it. It is also the shape libvirt documents
+	// for <metadata> children, and the shape vmsync used for years before the
+	// prefix collision forced a change -- the same XML, with the one prefix
+	// libvirt reserves renamed out of the way.
+	metadataWritePrefix = "vms"
+	metadataStart       = `<` + metadataWritePrefix + `:vmsync xmlns:` + metadataWritePrefix + `="` + metadataNamespace + `">`
+	metadataEnd         = `</` + metadataWritePrefix + `:vmsync>`
 
 	MetadataFieldLastCheckpoint = "last_checkpoint"
 	MetadataFieldLastSync       = "last_sync_timestamp"
@@ -1332,11 +1348,13 @@ func buildMetadataEntry(fields map[string]string) string {
 	b.WriteString(metadataStart)
 	written := make(map[string]bool, len(fields))
 	writeField := func(field, value string) {
-		// Unprefixed: the root declares the namespace as the default, so
-		// these are in it without carrying a prefix -- and leaving the
-		// prefix undeclared is what lets libvirt attach its own. See
-		// metadataStart.
+		// Prefixed, against the declaration on the root. A field whose
+		// namespace comes from a DEFAULT declaration loses it the moment
+		// anything drops that declaration, and libvirt does exactly that.
+		// See metadataWritePrefix.
 		b.WriteString("\n  <")
+		b.WriteString(metadataWritePrefix)
+		b.WriteString(":")
 		b.WriteString(field)
 		b.WriteString(" id=\"")
 		_ = xml.EscapeText(&b, []byte(value))
@@ -1400,15 +1418,16 @@ func allMetadataFields(metadataXML string) map[string]string {
 // namespace themselves, and that distinction is the entire point of this
 // function.
 //
-// vmsync writes its fields unprefixed, under a default namespace declaration
-// on the container. It has no choice: declaring the `vmsync` prefix itself is
-// what made virDomainSetMetadata fail outright (see metadataStart). Whether
-// that default declaration survives the round trip is then not vmsync's to
-// decide -- libvirt re-namespaces the container with its own prefix on the
-// way in, and libxml2 copies, stores, serialises and reparses the document
-// several times before any of it comes back. Drop the declaration anywhere
-// along that path and the fields return in NO namespace, which a per-field
-// namespace match -- what this did -- reads as a domain with no metadata.
+// What a field's own namespace looks like coming back is not vmsync's to
+// decide. libvirt re-namespaces the container with its own prefix on the way
+// in, and libxml2 copies, stores, serialises and reparses the document
+// several times before any of it returns; a domain written with a default
+// declaration comes back with that declaration turned prefixed and unused, so
+// every field lands in NO namespace, which a per-field namespace match --
+// what this did -- reads as a domain with no metadata at all. The writer no
+// longer depends on a default declaration (see metadataWritePrefix), but
+// domains written by older builds still carry one, and nothing stops a future
+// libvirt from reshaping the new form too.
 //
 // That is not just a failed read. Every writer here is a read-modify-write:
 // SetDomainMetadataFields merges its updates into whatever it read back, so
@@ -1439,7 +1458,7 @@ func metadataFields(metadataXML string) (map[string]string, bool) {
 		switch el := token.(type) {
 		case xml.StartElement:
 			depth++
-			if isMetadataContainer(el.Name) {
+			if isMetadataContainer(el) {
 				sawContainer = true
 				if containerDepth < 0 {
 					containerDepth = depth
@@ -1468,23 +1487,66 @@ func metadataFields(metadataXML string) (map[string]string, bool) {
 	}
 }
 
-// isMetadataContainer reports whether name is vmsync's own <vmsync> element,
-// in any spelling it can arrive in.
+// isMetadataContainer reports whether el is vmsync's own <vmsync> element, in
+// any spelling it can arrive in.
 //
-// The second case covers a declaration that lives on an ancestor rather than
-// on the element itself: ParseMetadata is handed the raw inner XML of
-// <metadata>, torn out of the domain document by encoding/xml's ,innerxml, so
-// a declaration hoisted up onto <domain> is simply not present in the text
-// being parsed and the prefix arrives unresolved. An unresolved prefix is the
-// only way Space can be the literal string "vmsync" -- a prefix bound to
-// somebody else's namespace resolves to that namespace, not to itself -- so
-// accepting it cannot capture another tool's element. domxml.go's
-// serialiseElement guards the etree side of the same hazard.
-func isMetadataContainer(name xml.Name) bool {
-	if name.Local != metadataPrefix {
+// The rule is: an element named `vmsync` that either RESOLVES to vmsync's
+// namespace or DECLARES it. Resolving alone is not enough, because libvirt
+// hands the element back in a state where it resolves to nothing:
+//
+//	<vmsync xmlns:vmsync="http://vmsync.org/xmlns/libvirt/domain/1.0">
+//	  <failure_count id="1"/>
+//	</vmsync>
+//
+// That is a real fragment read off a real domain. The default declaration
+// vmsync wrote has become a PREFIXED declaration that nothing in the fragment
+// uses, while the tag stayed unprefixed -- so parsed on its own, the element
+// and every field in it are in no namespace at all. libvirt's own in-memory
+// tree still has the element bound to the uri (virDomainGetMetadata found it
+// by uri, and `virsh metadata --uri ... --remove` removes it), so the binding
+// is real; it is the serialisation that arrives incomplete.
+//
+// An unresolved `vmsync:` prefix is accepted for the same family of reasons:
+// ParseMetadata is handed the raw inner XML of <metadata>, torn out of the
+// domain document by encoding/xml's ,innerxml, so a declaration sitting on
+// <domain> is simply not in the text being parsed. An unresolved prefix is
+// also the only way Space can be the literal string "vmsync" -- a prefix
+// bound to somebody else's namespace resolves to that namespace, not to
+// itself -- so accepting it cannot capture another tool's element.
+//
+// What this still refuses is a bare <vmsync> that neither resolves to nor
+// declares the uri anywhere on itself. That element belongs to somebody else
+// until it proves otherwise, and mergeMetadataFields turns the refusal into a
+// loud error rather than a silent overwrite.
+func isMetadataContainer(el xml.StartElement) bool {
+	if el.Name.Local != metadataPrefix {
 		return false
 	}
-	return name.Space == metadataNamespace || name.Space == metadataPrefix
+	if el.Name.Space == metadataNamespace || el.Name.Space == metadataPrefix {
+		return true
+	}
+	for _, attr := range el.Attr {
+		if isMetadataNamespaceDeclaration(attr.Name.Space, attr.Name.Local, attr.Value) {
+			return true
+		}
+	}
+	return false
+}
+
+// isMetadataNamespaceDeclaration reports whether one attribute declares
+// vmsync's namespace, as the default (xmlns="...") or under any prefix
+// (xmlns:anything="...").
+//
+// Shared in spirit with domxml.go's etree-side check, and deliberately
+// indifferent to WHICH prefix carries it: what matters is that the element
+// names vmsync's uri, not how it spells the binding. Both parsers report an
+// `xmlns:foo` attribute with the space "xmlns" and the local name "foo", and
+// a bare `xmlns` with no space at all.
+func isMetadataNamespaceDeclaration(space, local, value string) bool {
+	if value != metadataNamespace {
+		return false
+	}
+	return space == "xmlns" || (space == "" && local == "xmlns")
 }
 
 // stripDomainUUID returns domainXML with its <uuid> element removed, so a

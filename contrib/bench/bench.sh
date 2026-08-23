@@ -586,8 +586,11 @@ stage_verify_tamper() {
 # --- Stage 3: -reinit-after-failures -----------------------------------------
 
 # Must match libvirtsync's own metadataNamespace constant (pkg/libvirtsync/
-# libvirt.go) -- this is the <vmsync:vmsync xmlns:vmsync="..."> block's own
-# namespace URI, not a libvirt connection URI.
+# libvirt.go) -- this is vmsync's metadata block's own namespace URI, not a
+# libvirt connection URI. Everything here keys on the URI rather than on a
+# prefix, and so does the xpath in vmsync_meta_field (local-name()), because
+# the prefix a domain's block carries depends on which vmsync version last
+# wrote it and on what libvirt did to it afterwards.
 VMSYNC_METADATA_URI="http://vmsync.org/xmlns/libvirt/domain/1.0"
 
 stage_reinit_after_failures() {

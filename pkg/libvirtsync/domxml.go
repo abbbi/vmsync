@@ -163,37 +163,52 @@ func ignoreDiskElement(disk *etree.Element) bool {
 // metadata under <metadata> is left exactly where it was -- the same promise
 // the old whole-document implementation made, now kept structurally rather
 // than by a typed model happening to round-trip it.
-// isVmsyncMetadataElement recognises vmsync's own metadata element in either
+// isVmsyncMetadataElement recognises vmsync's own metadata element in every
 // form it can legitimately take.
 //
-// etree matches on the literal PREFIX, not the namespace URI, so this has to
-// know about both spellings:
+// etree does no namespace resolution at all -- it keeps prefixes as literal
+// text -- so this cannot match on the uri the way libvirt does. It applies
+// the same rule libvirt.go's isMetadataContainer applies on the encoding/xml
+// side instead: an element named `vmsync` that either carries vmsync's own
+// prefix or DECLARES vmsync's namespace, under any prefix or as the default.
+// The spellings that reach here in practice:
 //
-//   - `<vmsync:vmsync xmlns:vmsync="...">` -- what every domain written
-//     before the SetMetadata fix carries, and what libvirt itself produces
-//     when it injects its prefix;
-//   - `<vmsync xmlns="...">` -- the default-namespace form vmsync now emits,
-//     because a self-declared prefix made virDomainSetMetadata fail. See
-//     metadataStart.
+//   - `<vmsync:vmsync xmlns:vmsync="...">` -- every domain written before the
+//     SetMetadata fix, and what libvirt produces when it injects its prefix;
+//   - `<vmsync xmlns="...">` -- the default-namespace form written between
+//     the two fixes, when a self-declared prefix was known to make
+//     virDomainSetMetadata fail but the cost of a default declaration was
+//     not yet known (see metadataWritePrefix);
+//   - `<vmsync xmlns:vmsync="...">` with unprefixed children -- what libvirt
+//     hands back after storing the previous one, with the declaration turned
+//     prefixed and the tag left bare;
+//   - `<vms:vmsync xmlns:vms="...">` -- what vmsync writes now.
 //
-// Missing either one would not merely skip an update: the caller adds its
-// rebuilt element afterwards, so an unrecognised existing one stays put and
-// the domain ends up with two vmsync metadata blocks, whose fields disagree
-// from that point on.
+// Missing any of them would not merely skip an update: the caller adds its
+// rebuilt element afterwards regardless, so an unrecognised existing one
+// stays put and the domain ends up with two vmsync metadata blocks, whose
+// fields disagree from that point on.
 //
-// The unprefixed form is only accepted when it actually declares vmsync's
-// namespace, so a `<vmsync>` element belonging to something else is left
-// alone -- the whole promise of this function is that other tools' metadata
-// is untouched.
+// A `<vmsync>` element that neither carries the prefix nor names the uri is
+// left alone -- the whole promise of this function is that other tools'
+// metadata is untouched.
 func isVmsyncMetadataElement(el *etree.Element) bool {
 	if el.Tag != metadataPrefix {
 		return false
 	}
-	switch el.Space {
-	case metadataPrefix:
+	if el.Space == metadataPrefix {
 		return true
-	case "":
-		return el.SelectAttrValue("xmlns", "") == metadataNamespace
+	}
+	return declaresMetadataNamespace(el)
+}
+
+// declaresMetadataNamespace reports whether el carries a declaration of
+// vmsync's namespace on itself, as the default or under any prefix.
+func declaresMetadataNamespace(el *etree.Element) bool {
+	for _, attr := range el.Attr {
+		if isMetadataNamespaceDeclaration(attr.Space, attr.Key, attr.Value) {
+			return true
+		}
 	}
 	return false
 }
@@ -254,14 +269,22 @@ func setMetadataFieldsInDoc(domainXML string, updates map[string]string, removeF
 // the vmsync namespace is declared on it.
 //
 // The declaration may legitimately live on an ancestor -- vmsync always
-// writes it on the element itself, but a document assembled by something
-// else may not -- and a fragment torn out without it would parse as being
-// in no namespace, so the fields would read as absent and be silently lost
-// on the merge.
+// writes it on the element itself, but libvirt has been observed moving it,
+// and a document assembled by something else may never have had it there --
+// and a fragment torn out without it parses as being in no namespace.
+//
+// The declaration added binds the uri to the prefix the element ACTUALLY
+// uses, rather than to a fixed one: the point is that the fragment resolves
+// on its own once separated from the document, and a declaration for a prefix
+// nothing in the fragment references does not achieve that.
 func serialiseElement(el *etree.Element) (string, error) {
 	cp := el.Copy()
-	if cp.SelectAttr("xmlns:"+metadataPrefix) == nil {
-		cp.CreateAttr("xmlns:"+metadataPrefix, metadataNamespace)
+	if !declaresMetadataNamespace(cp) {
+		if cp.Space == "" {
+			cp.CreateAttr("xmlns", metadataNamespace)
+		} else {
+			cp.CreateAttr("xmlns:"+cp.Space, metadataNamespace)
+		}
 	}
 	doc := etree.NewDocument()
 	doc.SetRoot(cp)
