@@ -119,7 +119,7 @@ func TestParseStatOwner(t *testing.T) {
 				t.Errorf("got %q:%q, want %q:%q", got.User, got.Group, tc.wantUser, tc.wantGrp)
 			}
 			if tc.wantUser == "" && !got.Empty() {
-				t.Error("unparseable output must yield an empty owner, not a partial one")
+				t.Error("unparsable output must yield an empty owner, not a partial one")
 			}
 		})
 	}
