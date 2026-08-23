@@ -1800,12 +1800,166 @@ stage_fence_agent() {
 	return 0
 }
 
+# --- verdicts ------------------------------------------------------------------
+
+# Every stage but the matrix records its own PASS/FAIL/SKIP in the notes
+# column, so a stage's verdict is derivable from results.csv rather than
+# needing each stage to remember to report one. Stage 1 is the exception: it
+# has no assertions, only timings, so its failure signal is a non-zero vmsync
+# exit.
+#
+# NON_MATRIX_SCENARIOS is how the two are told apart. Stage 1's scenario names
+# are generated from scenarios.conf and cannot be matched positively, so every
+# other stage's names are listed here and Stage 1 is what is left.
+NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-uuid-collision$|define-rollback$|failover$|fence-agent$)'
+
+# stage_pattern STAGE -> the regex matching that stage's scenario column.
+stage_pattern() {
+	case "$1" in
+	verify) printf '^verify-' ;;
+	reinit) printf '^reinit-after-failures$' ;;
+	snapshot) printf '^ext-snapshot$' ;;
+	define) printf '^define-(uuid-collision|rollback)$' ;;
+	failover) printf '^failover$' ;;
+	fence-agent) printf '^fence-agent$' ;;
+	*) printf '$^' ;; # matches nothing
+	esac
+}
+
+# stage_verdict STAGE -> "STATUS<TAB>DETAIL". Never fails; an unknown stage
+# reports SKIPPED rather than inventing a result.
+stage_verdict() {
+	local stage="$1"
+	if [ "$stage" = matrix ]; then
+		awk -F, -v non="$NON_MATRIX_SCENARIOS" '
+			NR>1 && $1 !~ non { n++; if ($3 != "0" && $3 != "DRYRUN") f++ }
+			END {
+				if (n == 0)      printf "SKIPPED\tnothing ran"
+				else if (f > 0)  printf "FAIL\t%d of %d vmsync runs exited non-zero", f, n
+				else             printf "PASS\t%d vmsync runs, all exited 0", n
+			}' "$CSV"
+		return 0
+	fi
+	awk -F, -v pat="$(stage_pattern "$stage")" '
+		NR>1 && $1 ~ pat {
+			if      ($9 ~ /^FAIL/) f++
+			else if ($9 ~ /^PASS/) p++
+			else if ($9 ~ /^SKIP/) s++
+		}
+		END {
+			if (f > 0)                  printf "FAIL\t%d of %d checks failed", f, f+p
+			else if (p > 0 && s > 0)    printf "PASS\t%d checks passed, %d skipped", p, s
+			else if (p > 0)             printf "PASS\t%d checks passed", p
+			else if (s > 0)             printf "SKIPPED\t%d checks skipped", s
+			else                        printf "SKIPPED\tnothing recorded"
+		}' "$CSV"
+}
+
+# announce_stage_verdict logs one stage's outcome as a banner.
+#
+# A banner because the thing being answered is "did that work", and a run
+# emits hundreds of lines -- an outcome on one indistinguishable line among
+# them is one nobody finds without searching for it.
+announce_stage_verdict() {
+	local stage="$1" verdict status detail
+	verdict="$(stage_verdict "$stage")"
+	status="${verdict%%	*}"
+	detail="${verdict#*	}"
+
+	RAN_STAGES+=("$stage")
+	RAN_VERDICTS+=("$status")
+	RAN_DETAILS+=("$detail")
+
+	log "------------------------------------------------------------"
+	case "$status" in
+	FAIL) warn "  stage $stage: FAIL -- $detail" ;;
+	PASS) log "  stage $stage: PASS -- $detail" ;;
+	*) log "  stage $stage: SKIPPED -- $detail" ;;
+	esac
+	log "------------------------------------------------------------"
+}
+
+RAN_STAGES=()
+RAN_VERDICTS=()
+RAN_DETAILS=()
+
+# overall_verdict -> FAIL, PASS or NOTHING VERIFIED.
+#
+# One function so the banner, the report and the exit status cannot disagree
+# about whether the run worked.
+#
+# Three states, not two, because a run where every stage skipped -- a dry
+# run, or a config missing the binaries the opt-in stages need -- has proven
+# nothing, and calling that PASS is the same false reassurance as a stage
+# reporting "all assertions passed" when it ran none.
+overall_verdict() {
+	local i passed=no
+	for i in "${!RAN_STAGES[@]}"; do
+		case "${RAN_VERDICTS[$i]}" in
+		FAIL)
+			printf 'FAIL'
+			return 0
+			;;
+		PASS) passed=yes ;;
+		esac
+	done
+	if [ "$passed" = yes ]; then
+		printf 'PASS'
+	else
+		printf 'NOTHING VERIFIED'
+	fi
+}
+
+# final_verdict prints the run's overall outcome and returns 0 only if every
+# stage that ran passed or was skipped.
+#
+# A run that ends without saying whether it worked is one whose result gets
+# decided by whoever scrolls furthest, so this is the last thing printed --
+# after the report, which is long.
+final_verdict() {
+	local i status overall
+	overall="$(overall_verdict)"
+
+	log "============================================================"
+	case "$overall" in
+	FAIL) warn "  BENCH RESULT: FAIL" ;;
+	PASS) log "  BENCH RESULT: PASS" ;;
+	*) warn "  BENCH RESULT: NOTHING VERIFIED -- every stage skipped, so this run proves nothing" ;;
+	esac
+	log "============================================================"
+	for i in "${!RAN_STAGES[@]}"; do
+		status="${RAN_VERDICTS[$i]}"
+		printf '    %-12s %-8s %s\n' "${RAN_STAGES[$i]}" "$status" "${RAN_DETAILS[$i]}"
+	done
+	log "============================================================"
+	log "results: $RUN_DIR"
+
+	# FAIL is always non-zero. "Nothing verified" is non-zero too in a real
+	# run -- being asked for stages and proving none of them is a problem,
+	# usually a config one -- but not in a dry run, where verifying nothing
+	# is the entire point and failing would make --dry-run useless as a
+	# syntax check.
+	case "$overall" in
+	FAIL) return 1 ;;
+	PASS) return 0 ;;
+	*) [ "$DRY_RUN" = yes ] ;;
+	esac
+}
+
 # --- report ------------------------------------------------------------------
 
 generate_report() {
-        local report="$RUN_DIR/report.md"
+        local report="$RUN_DIR/report.md" i
         {
                 echo "# vmsync benchmark report"
+                echo
+                echo "## Result: $(overall_verdict)"
+                echo
+                echo "| stage | result | |"
+                echo "|---|---|---|"
+                for i in "${!RAN_STAGES[@]}"; do
+                        echo "| ${RAN_STAGES[$i]} | ${RAN_VERDICTS[$i]} | ${RAN_DETAILS[$i]} |"
+                done
                 echo
                 echo "- Run: $RUN_ID"
                 echo "- Source: $SOURCE_DOMAIN @ $SOURCE_URI"
@@ -1924,7 +2078,12 @@ for s in "${stage_list[@]}"; do
         fence-agent) stage_fence_agent ;;
         *) die "unknown stage '$s' in --stages (want matrix,verify,reinit,snapshot,define,failover,fence-agent)" ;;
         esac
+        announce_stage_verdict "$s"
 done
 
 generate_report
-log "done. Results: $RUN_DIR"
+
+# Last, and it decides the exit status: a harness that always exits 0 cannot
+# be used by anything that would act on the answer, and "did that run work"
+# should not require reading a report to find out.
+final_verdict
