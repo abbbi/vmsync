@@ -266,14 +266,33 @@ Set `TAMPER_MODE=fixed` to go back to a single `TAMPER_OFFSET`/`TAMPER_LENGTH`.
 
 Every other stage verifies a replica built moments ago by a single
 `-reinit`. Stage 8 builds one the way a real deployment does — twenty
-incremental syncs, each carrying real guest writes — and only then asks
-whether corruption is still detectable. It then makes five tamper+verify
-attempts, cycling the three modes, rebuilding a shorter chain between each.
+incremental syncs, each carrying real guest writes — and corrupts it **part
+way through**, so the copies that follow run over the damage.
 
-Healing after a tamper has to be a full `-reinit` (an incremental sync
-re-copies only what the *source's* dirty bitmap says changed, and the source
-never wrote to the corrupted region), which costs the chain — hence the
-rebuild between attempts.
+Two things about the shape are deliberate.
+
+**Each mode gets its own full chain.** Healing after a tamper has to be a
+full `-reinit` — an incremental sync re-copies only what the *source's*
+dirty bitmap says changed, and the source never wrote to the corrupted
+region — and that destroys the chain. So a single chain followed by several
+tamper/verify attempts would test a deep chain exactly once and a one-deep
+chain every time after, while reporting all of them as though they had
+tested the same thing. Three modes therefore means three chains.
+
+**The corruption lands after a random copy, not after the last one.** Bit
+rot does not wait for a sync window to close. Injecting it mid-chain asks a
+question the end-of-chain version cannot: does the damage survive the
+incremental syncs that follow it, and is it still detectable afterwards?
+
+That opens one legitimate outcome that is neither pass nor fail. If the
+guest happened to write to the same region the corruption sat in, a later
+incremental copy overwrote it — correctly, by design — and there is nothing
+left for `-verify` to find. Scoring that as "verify missed it" would be a
+false accusation against the code under test, and it is not a rare corner:
+`GUEST_DIRTY` rewrites the same file every round, so its blocks are exactly
+the ones most likely to be re-copied. The harness therefore re-reads the
+corrupted region immediately before verifying, and records **SKIP —
+corruption healed by a later copy** when it is gone.
 
 It needs the guest to write between copies, or the chain is twenty no-ops
 against an empty dirty bitmap and the stage proves nothing. There is no
@@ -296,8 +315,9 @@ checkpoint would otherwise be taken mid-write. The stage asserts that the
 chain actually carried data, and fails if none of the copies transferred a
 byte.
 
-Budget for it: roughly `VERIFY_LONG_COPIES + VERIFY_LONG_ATTEMPTS × (2 +
-VERIFY_LONG_RECOPIES)` syncs, five of which are full `-reinit` resyncs.
+Budget for it: roughly `VERIFY_LONG_MODES × (VERIFY_LONG_COPIES + 1)` syncs
+plus one final heal — 64 with the defaults, four of them full resyncs. Trim
+`VERIFY_LONG_MODES` to a single mode if that is too much for one sitting.
 Consider setting `-replaced-disk-action=delete` for the run — the default
 renames each discarded target disk aside and those copies are never reaped.
 

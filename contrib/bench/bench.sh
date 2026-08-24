@@ -222,9 +222,19 @@ GUEST_DIRTY_MIB="${GUEST_DIRTY_MIB:-64}"
 
 # --- Stage 8 (verify-long) ---------------------------------------------------
 
+# Copies per MODE, not per stage: each mode gets its own chain, because the
+# -reinit that heals a tamper also destroys the chain (see stage_verify_long).
 VERIFY_LONG_COPIES="${VERIFY_LONG_COPIES:-20}"
-VERIFY_LONG_ATTEMPTS="${VERIFY_LONG_ATTEMPTS:-5}"
-VERIFY_LONG_RECOPIES="${VERIFY_LONG_RECOPIES:-3}"
+VERIFY_LONG_MODES="${VERIFY_LONG_MODES:-compare fast online}"
+
+for _m in $VERIFY_LONG_MODES; do
+	case "$_m" in
+	compare | fast | online) ;;
+	*) die "$CONF: VERIFY_LONG_MODES may only contain compare, fast or online -- got '$_m'" ;;
+	esac
+done
+unset _m
+[ "$VERIFY_LONG_COPIES" -ge 1 ] 2>/dev/null || die "$CONF: VERIFY_LONG_COPIES must be a positive integer"
 
 if [ "$DRY_RUN" != yes ]; then
         [ "${I_UNDERSTAND_THIS_IS_DESTRUCTIVE:-no}" = yes ] \
@@ -2262,17 +2272,42 @@ NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-uuid
 # incremental syncs, each carrying a real guest write -- and only then asks
 # whether corruption is still detectable. Deliberately opt-in: it is the
 # longest stage by a wide margin.
+# --- Stage 8: verify after a long incremental chain --------------------------
+#
+# Everything else here verifies a replica that was built moments ago by a
+# single -reinit. This builds one the way a real deployment does -- dozens of
+# incremental syncs, each carrying real guest writes -- and corrupts it at a
+# random point PART WAY THROUGH, so the copies that follow run over the damage
+# exactly as they would in production.
+#
+# Two things about the shape are deliberate, and both were wrong in the first
+# version of this stage:
+#
+#   - Every mode gets its OWN full chain. Healing after a tamper has to be a
+#     full -reinit (an incremental sync re-copies only what the SOURCE's dirty
+#     bitmap says changed, and the source never wrote to the corrupted region),
+#     which destroys the chain. So a single chain followed by several
+#     tamper/verify/heal attempts tests a deep chain exactly once and a
+#     one-deep chain every time after -- while reporting all of them as if
+#     they had tested the same thing.
+#
+#   - The corruption lands at a random copy, not after the last one. Bit rot
+#     does not wait for a sync window to close. Injecting it mid-chain asks a
+#     question the end-of-chain version cannot: does the damage survive the
+#     incremental syncs that follow it, and is it still detectable afterwards?
+#
+# Deliberately opt-in: it is by far the longest stage.
 stage_verify_long() {
 	log "=== Stage 8: -verify after a long incremental chain ==="
 
-	local copies="${VERIFY_LONG_COPIES}" attempts="${VERIFY_LONG_ATTEMPTS}" recopies="${VERIFY_LONG_RECOPIES}"
+	local copies="${VERIFY_LONG_COPIES}"
 
 	if [ "$DRY_RUN" != yes ]; then
-		# The chain is only meaningful if the guest is writing between
-		# copies, and that needs a RUNNING guest with a usable agent.
-		# Without it this stage would spend an hour proving that vmsync can
-		# copy nothing twenty times -- so it skips rather than reporting a
-		# green result that verified nothing.
+		# The chain is only meaningful if the guest writes between copies,
+		# and that needs a RUNNING guest with a usable agent. Without it this
+		# stage would spend an hour proving that vmsync can copy nothing
+		# twenty times -- so it skips rather than reporting a green result
+		# that verified nothing.
 		local src_state
 		src_state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN")" || src_state="unknown"
 		if [ "$src_state" != running ]; then
@@ -2288,81 +2323,133 @@ stage_verify_long() {
 		require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
 	fi
 
-	bench_sync verify-long baseline -reinit
-	if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
-		die "baseline full sync for verify-long failed (see $RUN_LOG) -- aborting stage 8$(bench_sync_hint)"
-	fi
+	local target_path="" vsize=0 mode
+	for mode in $VERIFY_LONG_MODES; do
+		log "--- verify-long/$mode: building a fresh ${copies}-deep chain ---"
 
-	local target_path="" vsize=0
-	if [ "$DRY_RUN" != yes ]; then
-		target_path="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")" || true
-		[ -n "$target_path" ] || die "could not resolve target disk path for dev='$TAMPER_DISK_DEV' -- check TAMPER_DISK_DEV in $CONF"
-		vsize="$(target_virtual_size "$target_path")" || true
-		[ -n "$vsize" ] && [ "$vsize" -gt 0 ] 2>/dev/null \
-			|| die "could not read the virtual size of $target_path on $TARGET_HOST via qemu-img info"
-	fi
+		bench_sync verify-long "${mode}-baseline" -reinit
+		if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
+			die "baseline full sync for verify-long/$mode failed (see $RUN_LOG) -- aborting stage 8$(bench_sync_hint)"
+		fi
 
-	verify_long_chain "$copies" chain
-	verify_long_assert_chain "$copies"
+		if [ "$DRY_RUN" != yes ] && [ -z "$target_path" ]; then
+			target_path="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")" || true
+			[ -n "$target_path" ] || die "could not resolve target disk path for dev='$TAMPER_DISK_DEV' -- check TAMPER_DISK_DEV in $CONF"
+			vsize="$(target_virtual_size "$target_path")" || true
+			[ -n "$vsize" ] && [ "$vsize" -gt 0 ] 2>/dev/null \
+				|| die "could not read the virtual size of $target_path on $TARGET_HOST via qemu-img info"
+			log "target disk under test: $target_path ($vsize bytes) on $TARGET_HOST"
+		fi
 
-	local attempt=1 mode
-	while [ "$attempt" -le "$attempts" ]; do
-		# Cycle the modes so a long run covers all three rather than
-		# hammering one, and so which mode meets which random offset varies
-		# with the seed rather than being fixed by position.
-		case $((attempt % 3)) in
-		1) mode=compare ;;
-		2) mode=fast ;;
-		*) mode=online ;;
-		esac
-		log "--- verify-long attempt $attempt/$attempts, mode=$mode ---"
-		verify_mode_subtest "$target_path" "$vsize" "$mode" verify-long "attempt-${attempt}-${mode}"
-		attempt=$((attempt + 1))
-		[ "$attempt" -le "$attempts" ] && verify_long_chain "$recopies" recopy
+		verify_long_round "$mode" "$copies" "$target_path" "$vsize"
 	done
+
+	# One heal, at the end. Each round already begins with its own -reinit,
+	# which heals whatever the previous round left behind; only the last one
+	# needs cleaning up after. (A round that die()s leaves the replica
+	# corrupted on purpose -- those messages say so and say to inspect it.)
+	heal_target verify-long final-heal "$target_path"
 	return 0
 }
 
-# verify_long_chain N LABEL -- N incremental copies, each preceded by a real
-# guest write. Sets VERIFY_LONG_MOVED to how many of them actually transferred
-# something.
-VERIFY_LONG_MOVED=0
-verify_long_chain() {
-	local n="$1" label="$2" i=1 moved
-	VERIFY_LONG_MOVED=0
-	while [ "$i" -le "$n" ]; do
+# verify_long_round MODE COPIES PATH VSIZE -- one mode's full chain, with the
+# corruption injected at a random point inside it.
+verify_long_round() {
+	local mode="$1" copies="$2" path="$3" vsize="$4"
+	local i=1 tamper_at=0 moved=0 tampered=no outcome
+
+	if [ "$DRY_RUN" != yes ]; then
+		# Which copy the damage lands after. 1..copies, so it can fall
+		# anywhere from "immediately, with every later copy running over it"
+		# to "after the last one", and the draw is part of the seeded
+		# sequence like every other.
+		TAMPER_SEQ=$((TAMPER_SEQ + 1))
+		tamper_at=$(($(rng_below "$copies") + 1))
+		log "   this round's corruption lands after copy $tamper_at of $copies (seed $TAMPER_SEED)"
+	fi
+
+	while [ "$i" -le "$copies" ]; do
 		if [ "$DRY_RUN" != yes ] && [ "$GUEST_DIRTY" = yes ]; then
-			guest_dirty || warn "guest write $i/$n failed -- this copy will carry less (or nothing) than intended"
+			guest_dirty || warn "guest write $i/$copies failed -- this copy will carry less (or nothing) than intended"
 		fi
-		bench_sync verify-long "${label}-${i}"
+		bench_sync verify-long "${mode}-copy-${i}"
 		if [ "$DRY_RUN" != yes ]; then
 			if [ "$RUN_RC" != 0 ]; then
-				die "incremental copy ${label}-${i} of the verify-long chain failed (see $RUN_LOG) -- the chain is broken, so nothing after it would mean anything"
+				die "incremental copy ${mode}-copy-${i} failed (see $RUN_LOG) -- the chain is broken, so nothing after it would mean anything"
 			fi
-			moved="$(prom_sum "$RUN_PROM" vmsync_transferred_bytes)"
-			[ "$moved" -gt 0 ] && VERIFY_LONG_MOVED=$((VERIFY_LONG_MOVED + 1))
+			[ "$(prom_sum "$RUN_PROM" vmsync_transferred_bytes)" -gt 0 ] && moved=$((moved + 1))
+
+			if [ "$i" -eq "$tamper_at" ]; then
+				require_dom_shutoff "$TARGET_URI" "$TARGET_DOMAIN" "target"
+				if draw_tamper "$vsize"; then
+					log "   corrupting after copy $i at offset $TAMPER_OFF length $TAMPER_LEN"
+					# mtime preserved, or the very next copy would die at
+					# vmsync's mtime guard instead of running over the damage
+					# the way a real incremental sync would.
+					tamper_target "$path" yes
+					tampered=yes
+				else
+					warn "SKIP verify-long/$mode: the configured tamper band does not fit inside a ${vsize}-byte disk"
+					results_row "$CSV" verify-long "${mode}-result" "" "" "" "" "" "" "SKIP tamper band does not fit the disk"
+				fi
+			fi
 		fi
 		i=$((i + 1))
 	done
-	return 0
-}
 
-# verify_long_assert_chain N -- the chain has to have carried real data, or the
-# verification below is being run against a replica no different from the
-# baseline and the stage proves nothing.
-verify_long_assert_chain() {
-	local n="$1"
 	if [ "$DRY_RUN" = yes ]; then
-		results_row "$CSV" verify-long chain-result DRYRUN "" "" "" "" "" "SKIP dry run"
+		# Still run the verify sync, so --dry-run prints every command line
+		# this round would issue -- which is the whole point of --dry-run.
+		bench_sync verify-long "${mode}-verify" "-verify=$mode"
+		results_row "$CSV" verify-long "${mode}-result" DRYRUN "" "" "" "" "" "SKIP dry run"
 		return 0
 	fi
-	if [ "$VERIFY_LONG_MOVED" -eq 0 ]; then
-		warn "FAIL: none of the $n incremental copies transferred a single byte -- the guest is not dirtying its disk, so this chain is $n no-ops and the verification below would test nothing. Check GUEST_DIRTY_PATH is writable in the guest and that dd reached the disk (conv=fsync)."
-		results_row "$CSV" verify-long chain-result 1 "" "" "" "" "" "FAIL chain carried no data"
-	else
-		log "   PASS: $VERIFY_LONG_MOVED of $n incremental copies carried real data"
-		results_row "$CSV" verify-long chain-result 0 "" "" "" "" "" "PASS chain carried real data"
+
+	# The chain has to have carried real data, or this is a ${copies}-long
+	# sequence of no-ops and the verification below tests nothing.
+	if [ "$moved" -eq 0 ]; then
+		warn "FAIL: none of the $copies incremental copies in the $mode round transferred a byte -- the guest is not dirtying its disk, so this chain is $copies no-ops. Check that GUEST_DIRTY_PATH is writable inside the guest and that dd is reaching the disk."
+		results_row "$CSV" verify-long "${mode}-chain" 1 "" "" "" "" "" "FAIL chain carried no data"
+		return 0
 	fi
+	log "   $moved of $copies copies carried real data"
+	results_row "$CSV" verify-long "${mode}-chain" 0 "" "" "" "" "" "PASS chain carried real data"
+
+	[ "$tampered" = yes ] || return 0
+
+	# Did the damage survive the copies that ran after it?
+	#
+	# It legitimately might not: an incremental sync re-copies every block the
+	# source's dirty bitmap reports, so if the guest happened to write to the
+	# same region the corruption sat in, a later copy overwrote it -- correctly
+	# and by design. Verify would then find nothing, and scoring that as "verify
+	# missed it" would be a false accusation against the code under test. This
+	# is not a rare corner either: GUEST_DIRTY rewrites the same file every
+	# round, so its blocks are exactly the ones most likely to be re-copied.
+	if ! ssh_host_cmd "$TARGET_HOST" qemu-io -r -f qcow2 \
+		-c "'read -P ${TAMPER_PATTERN} ${TAMPER_OFF} ${TAMPER_LEN}'" "'${path}'" >/dev/null 2>&1; then
+		log "   SKIP: a later incremental copy overwrote the corrupted region, so there is nothing left for -verify=$mode to find"
+		results_row "$CSV" verify-long "${mode}-result" "" "" "" "" "" "" "SKIP corruption healed by a later copy"
+		return 0
+	fi
+
+	bench_sync verify-long "${mode}-verify" "-verify=$mode"
+	outcome="$(verify_outcome "$RUN_PROM")"
+	case "$outcome" in
+	RAN_MISMATCH)
+		log "   PASS: -verify=$mode found the corruption after $((copies - tamper_at)) further incremental copies"
+		results_row "$CSV" verify-long "${mode}-result" 0 "" "" "" "" "" "PASS mismatch detected after a deep chain"
+		;;
+	RAN_CLEAN)
+		warn "FAIL: -verify=$mode ran and found NOTHING, though the corruption at offset $TAMPER_OFF length $TAMPER_LEN was still present on disk immediately before the compare (reproduce with TAMPER_SEED=$TAMPER_SEED). See $RUN_LOG"
+		results_row "$CSV" verify-long "${mode}-result" 1 "" "" "" "" "" "FAIL mismatch NOT detected"
+		;;
+	*)
+		warn "FAIL: -verify=$mode never reached its compare -- the run ended before verification ran, so nothing was verified (exit=$RUN_RC). See $RUN_LOG"
+		results_row "$CSV" verify-long "${mode}-result" 1 "" "" "" "" "" "FAIL verification never ran"
+		;;
+	esac
+	return 0
 }
 
 stage_pattern() {
@@ -2554,7 +2641,7 @@ generate_report() {
                                 printf "| %s | %s | %s | %.1f | %s |\n", $2, $3, $4, mib, $9
                         }' "$CSV"
                 else
-                        echo "_not run (opt in with \`--stages verify-long\`; it makes ~$VERIFY_LONG_COPIES incremental copies before it starts)_"
+                        echo "_not run (opt in with \`--stages verify-long\`; it builds a $VERIFY_LONG_COPIES-deep chain per mode)_"
                 fi
                 echo
                 echo "## Stage 3: reinit-after-failures"

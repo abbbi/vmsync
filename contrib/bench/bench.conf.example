@@ -165,9 +165,23 @@ TAMPER_LENGTH=4096
 # nothing. That is what GUEST_DIRTY below is for; without it the stage SKIPS
 # rather than reporting a green result that verified nothing.
 
-VERIFY_LONG_COPIES=20      # incremental syncs before the first tamper
-VERIFY_LONG_ATTEMPTS=5     # tamper+verify attempts, cycling compare/fast/online
-VERIFY_LONG_RECOPIES=3     # incremental syncs between attempts
+# Incremental syncs per MODE, not per stage. Each mode gets its own fresh
+# chain, because healing a tamper needs a full -reinit and that destroys the
+# chain -- so one chain followed by several tamper/verify attempts would test a
+# deep chain exactly once and a one-deep chain every time after, while
+# reporting all of them as if they had tested the same thing.
+#
+# The corruption is injected after a RANDOM copy within the chain rather than
+# after the last one, so the copies that follow run over the damage the way
+# they would in production. That asks a question the end-of-chain version
+# cannot: does the corruption survive the incremental syncs that follow it, and
+# is it still detectable afterwards?
+#
+# Budget roughly VERIFY_LONG_MODES x (VERIFY_LONG_COPIES + 1) syncs, plus one
+# final heal -- 64 with these defaults, three of them full resyncs. Trim
+# VERIFY_LONG_MODES to a single mode if that is too much for one sitting.
+VERIFY_LONG_COPIES=20
+VERIFY_LONG_MODES="compare fast online"
 
 # --- dirtying the guest's own disk ------------------------------------------
 #
