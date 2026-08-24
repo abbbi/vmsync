@@ -158,6 +158,10 @@ type syncConfig struct {
 	// invites passing the wrong one, and because the discard-and-rebuild
 	// step is not conceptually tied to that one flag.
 	ReplacedDiskAction string
+	// TestFault names a failure to inject into this run, or "" in every real
+	// one. See libvirtsync.TestFault for why this exists and why it is a flag
+	// rather than an environment variable.
+	TestFault string
 	// TargetDiskOwner is who should own the disk files vmsync creates on the
 	// target. See util.ParseDiskOwner: qemu-img runs over SSH as root, and
 	// qemu does not run as root, so an unowned-for disk is one a promoted
@@ -265,6 +269,7 @@ func main() {
 	flag.StringVar(&cfg.ReplacedDiskAction, "replaced-disk-action", replacedDiskRename, fmt.Sprintf("What to do with a target disk file that is about to be discarded and rebuilt (currently only -reinit does this): %q renames it to <path>%s<unixtime> so its contents survive, %q removes it. Defaults to %q: the target of a reinit may be a former primary whose disks still hold everything written after the last successful sync, and that is unrecoverable once deleted. Renaming needs room for both copies, and the aside files are never reaped automatically", replacedDiskRename, replacedDiskSuffix, replacedDiskDelete, replacedDiskRename))
 	flag.StringVar(&cfg.TargetDiskOwner, "target-disk-owner", util.DiskOwnerAuto, fmt.Sprintf("Who should own the disk files created on the target: %q (default), %q, or an explicit \"user\", \"user:group\" or \":group\". vmsync creates those files by running qemu-img over SSH, so they are owned by that SSH user (root) -- while qemu runs as \"qemu\" on RHEL and \"libvirt-qemu\" on Debian, and cannot open a root-owned disk. libvirt's dynamic_ownership usually hides this, but it is off in plenty of deployments and cannot work at all on NFS with root_squash. %q preserves whatever owned the file before (which is what makes -reinit safe, since it replaces a correctly-owned disk with a fresh root-owned one) and otherwise takes what the target's libvirt qemu.conf sets; it never guesses, and warns instead. %q is the old behaviour", util.DiskOwnerAuto, util.DiskOwnerOff, util.DiskOwnerAuto, util.DiskOwnerOff))
 	flag.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "Reinit automatically after N failures (disabled by default). Count is held on target XML")
+	flag.StringVar(&cfg.TestFault, "test", "", fmt.Sprintf("FOR TESTING ONLY: make vmsync deliberately fail at a chosen point, so error-recovery paths that cannot be reached from outside the process can be exercised. Accepts one of: %s. A run with this set WILL fail and its result means nothing as a replication. Listed here rather than hidden, so an operator who finds it in a log can look it up", strings.Join(libvirtsync.TestFaults, ", ")))
 	compressArg := optionalValueFlag{bareDefault: "s2"}
 	fenceSourceArg := optionalValueFlag{bareDefault: fenceSourceAuto}
 	netBufferArg := optionalValueFlag{bareDefault: "128k,1G"}
@@ -440,6 +445,20 @@ func main() {
 	if cfg.TargetDomain == "" {
 		cfg.TargetDomain = cfg.SourceDomain
 	}
+	// Fault injection, off in every real run. Validated before anything else
+	// touches a domain so a typo cannot masquerade as a normal sync, and
+	// announced at WARNING so a run doing this is never mistaken for one that
+	// is not -- the whole point of it is to make vmsync fail, and a reader
+	// finding that failure in a log needs to see why in the same place.
+	if err := libvirtsync.ValidateTestFault(cfg.TestFault); err != nil {
+		trace.Error("invalid -test", "error", err)
+		os.Exit(2)
+	}
+	if cfg.TestFault != "" {
+		libvirtsync.TestFault = cfg.TestFault
+		trace.Warning("FAULT INJECTION ACTIVE: this run will deliberately fail, and is not a replication anybody should rely on", "test", cfg.TestFault)
+	}
+
 	// Validated whether or not -reinit was passed, so a typo is caught at
 	// the point it is written rather than lying dormant until the day a
 	// -reinit-after-failures threshold trips and silently falls back to

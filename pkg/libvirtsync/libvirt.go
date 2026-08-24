@@ -34,6 +34,59 @@ import (
 	"libvirt.org/go/libvirtxml"
 )
 
+// TestFault names a failure vmsync should inject into itself, or "" for the
+// only value any real run ever has. Set once from -test before any sync
+// begins; never written again.
+//
+// This exists because some error paths cannot be reached from outside the
+// process. DefineDomain's rollback is the case that forced it: the window
+// between undefining the target and redefining it contains no I/O at all --
+// it is a few milliseconds of in-memory XML editing -- so there is nothing an
+// external harness can interrupt. Worse, the rollback restores over the same
+// libvirt connection, so cutting that connection to force the failure also
+// destroys the recovery being tested. The path was untestable, and an
+// untested rollback is one that restores a domain wrongly on the day it
+// finally runs.
+//
+// A flag rather than an environment variable, deliberately. An env var is
+// inherited by every child process by default, so one set in a systemd unit,
+// a cron environment or a container image would silently arm fault injection
+// in every vmsync the agent ever spawns. A flag has to be typed on a command
+// line -- and vmsync-agent builds its argv from a fixed allowlist of flags
+// (cmd/vmsync-agent/profile.go, opexec.go), so it cannot pass this one
+// through even if a control-plane payload asked it to.
+//
+// Unknown values are rejected at startup rather than ignored, so -test=typo
+// fails loudly instead of running a normal sync the operator believes is
+// testing something.
+var TestFault string
+
+// Injectable faults. Add the constant, add it to TestFaults, and put the
+// check where the failure belongs.
+const (
+	// TestFaultFailureDefine makes the target's redefine fail, exercising
+	// DefineDomain's rollback to the previous definition.
+	TestFaultFailureDefine = "failure-define"
+)
+
+// TestFaults is every accepted -test value, for validation and for the flag's
+// own help text.
+var TestFaults = []string{TestFaultFailureDefine}
+
+// ValidateTestFault reports whether name is an injectable fault. "" is valid
+// and means no injection.
+func ValidateTestFault(name string) error {
+	if name == "" {
+		return nil
+	}
+	for _, f := range TestFaults {
+		if name == f {
+			return nil
+		}
+	}
+	return fmt.Errorf("unknown -test fault %q: must be one of %s", name, strings.Join(TestFaults, ", "))
+}
+
 const CheckpointPrefix = "vmsync-cpt"
 
 // VerifyWindowCheckpointName names the ephemeral, throwaway checkpoint
@@ -564,6 +617,18 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 	}
 
 	warnIfXMLElementsDropped("DefineDomain", sourceDomainXML, updatedXML)
+
+	// -test=failure-define corrupts the document rather than returning a
+	// synthetic error, so that libvirt is genuinely called, genuinely refuses,
+	// and the rollback below runs against whatever state a real rejection
+	// leaves behind. Short-circuiting the call would instead test a path that
+	// only exists under the test flag: it would prove the rollback closure
+	// compiles, not that it recovers a domain libvirtd has just declined to
+	// redefine. See TestFault.
+	if TestFault == TestFaultFailureDefine {
+		trace.Warning("-test=" + TestFaultFailureDefine + ": corrupting the target domain XML so libvirt rejects this redefine")
+		updatedXML = "<vmsync-test-injected-failure>" + updatedXML
+	}
 
 	dom, err := target.Conn.DomainDefineXML(updatedXML)
 	if err != nil {

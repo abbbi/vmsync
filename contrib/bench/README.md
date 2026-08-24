@@ -38,13 +38,14 @@ again after it's removed) -- not just that the flags are accepted.
 - **The target domain must be shut off for the entire run, and stays that
   way throughout.** The harness never starts it. This is also what makes
   tampering it safe — nothing else has the file open at the time.
-- Stage 5b (opt-in, not run by default — see below) temporarily inserts an
-  `iptables` rule on the **target host itself** to force a real
-  `DomainDefineXML` failure. It's self-removing and this script also tries
-  an explicit cleanup afterward as a backstop, but it's the one stage that
-  touches host-level networking rather than just the VM/replica — only
-  enable it against the same disposable test host everything else here
-  already requires.
+- Stage 5 (opt-in, not run by default — see below) deliberately makes
+  vmsync fail: 5a defines a throwaway domain on the target to force a UUID
+  collision, and 5b runs one sync with `-test=failure-define` so the target
+  redefine is rejected and the rollback can be checked. Neither touches
+  host-level networking, and neither is more destructive to the replica
+  than `-reinit` already is — but they are failure injection rather than
+  measurement, so they only belong on the same disposable test host
+  everything else here already requires.
 
 **Point this at a disposable, dedicated test VM.** Never at a real,
 in-use replication pair. `bench.sh` refuses to run for real (as opposed to
@@ -318,8 +319,16 @@ byte.
 Budget for it: roughly `VERIFY_LONG_MODES × (VERIFY_LONG_COPIES + 1)` syncs
 plus one final heal — 64 with the defaults, four of them full resyncs. Trim
 `VERIFY_LONG_MODES` to a single mode if that is too much for one sitting.
-Consider setting `-replaced-disk-action=delete` for the run — the default
-renames each discarded target disk aside and those copies are never reaped.
+
+Disk space is the other budget. `REPLACED_DISK_ACTION` defaults to `delete`
+here, unlike vmsync itself, which defaults to `rename`: vmsync is right to
+keep the old copy, because a `-reinit` target may be a former primary whose
+disks still hold everything written since the last successful sync. That
+does not apply to the disposable VM this harness requires, and the aside
+copies are never reaped — so on a multi-GB disk, reinitting once per verify
+sub-test and four more times in Stage 8 would fill `TARGET_DISK_PATH`
+partway through a run and surface as a confusing mid-stage sync failure.
+Set it back to `rename` if you would rather keep every replaced copy.
 
 **Stage 3 (`-reinit-after-failures`)** first runs its own baseline full
 sync, then removes the target domain's own vmsync metadata
@@ -386,22 +395,35 @@ before this stage existed, nothing exercised it end to end. Two sub-tests:
   confirming the target's UUID changed (proof the retry executed) and the
   sync still succeeded overall. The throwaway domain is undefined again
   afterward either way.
-- **5b** is a best-effort timing race, not a hard pass/fail: it starts a
-  real `-reinit` sync in the background, watches its log for the
-  "Undefining domain on target system" line `DefineDomain` logs right
-  before the real work starts, and the instant it appears, briefly
-  disrupts the target's own SSH reachability (an `iptables REJECT` rule,
-  self-removing) to try to make the actual redefine call fail. If the
-  disruption lands, it checks that the sync failed **and** that the
-  target's domain definition (`virsh dumpxml`) is byte-identical to what
-  it was before the run — i.e. that rollback genuinely restored it rather
-  than leaving the target undefined or partially redefined. Because this
-  races a live, variable-duration copy with no way to synchronize on the
-  exact right instant from outside the vmsync process, missing the window
-  entirely is common and reported as a SKIP, never a FAIL — only a landed
-  disruption proves anything either way. `DEFINE_ROLLBACK_WAIT_SECONDS` in
-  `bench.conf` caps how long it waits for the marker before giving up on
-  that attempt.
+- **5b** runs one `-reinit` sync with `-test=failure-define`, vmsync's own
+  fault-injection flag. That corrupts the document handed to
+  `DomainDefineXML`, so libvirt genuinely refuses the redefine and the
+  rollback runs against the state a real rejection leaves behind — rather
+  than short-circuiting the call, which would only prove the rollback
+  closure compiles. The stage then checks that the run failed, that vmsync
+  logged restoring the previous definition, and that the target's
+  definition (`virsh dumpxml --inactive`) is byte-identical to what it was
+  before.
+
+  That last check is the one that matters: a replica defined from a
+  half-restored document is one that boots wrong on the day it is promoted.
+
+  **Why fault injection rather than breaking something externally.** 5b
+  used to watch the log for the undefine and then cut the target's SSH with
+  an `iptables` rule. It could never work. The window between the undefine
+  and the redefine holds no I/O at all — it is a few milliseconds of
+  in-memory XML editing — while the harness needed a poll interval plus a
+  fresh SSH handshake to get its rule in place. And landing it would have
+  been worse, because the rollback restores over the *same* libvirt
+  connection the disruption severs, so a perfect hit would have destroyed
+  the recovery it was testing. It could also report the opposite of the
+  truth: a rule landing slightly early killed the *undefine* instead, which
+  returns before the rollback closure is even built, leaving a non-zero
+  exit and an unchanged definition — indistinguishable from a successful
+  rollback, and scored as PASS.
+
+  `DEFINE_ROLLBACK_WAIT_SECONDS` is no longer used and can be removed from
+  `bench.conf`.
 
 **Stage 6 (failover)** covers the DR path — promotion, the fence a
 promotion arms, and the role change that undoes both — which had no

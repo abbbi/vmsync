@@ -78,14 +78,13 @@ first -- each is safe to run standalone via --stages. Stage 4 additionally
 requires the SOURCE domain to be running.
 
 Stage 5 (define) is NOT included by default -- pass --stages ...,define
-explicitly. Its second half (5b) temporarily manipulates an iptables rule
-on TARGET_HOST to force a DefineDomain redefine failure and confirm its
-rollback restores the target's prior definition; it's self-healing and
-this script also backstops the cleanup itself, but it's a different kind
-of risk than anything the other stages do (which never touch host-level
-networking), so it's opt-in even though it's no more destructive to the
-target VM itself than -reinit already is. See this file's own Stage 5
-comment before enabling it.
+explicitly. Its first half (5a) leaves a throwaway domain on the target
+briefly to force a UUID collision; its second half (5b) runs one sync with
+vmsync's own -test=failure-define, making the target redefine fail so the
+rollback to the previous definition can be checked. Both are no more
+destructive to the target VM than -reinit already is, and neither touches
+host-level networking any more, but they are deliberate failure injection
+rather than measurement. See this file's own Stage 5 comment.
 
 Stage 7 (fence-agent) is opt-in too, and is the most intrusive thing here:
 it STOPS THE SOURCE VM. It runs real vmsync-agents in --standalone mode and
@@ -1002,6 +1001,12 @@ guest_dirty() {
 # wrote it and on what libvirt did to it afterwards.
 VMSYNC_METADATA_URI="http://vmsync.org/xmlns/libvirt/domain/1.0"
 
+# Must match libvirtsync.TestFaultFailureDefine (pkg/libvirtsync/libvirt.go).
+# vmsync rejects an unknown -test value at startup, so a rename there shows up
+# here as an immediate, explicit "unknown -test fault" rather than as a stage
+# that quietly stops testing anything.
+VMSYNC_TEST_FAILURE_DEFINE="failure-define"
+
 stage_reinit_after_failures() {
         log "=== Stage 3: -reinit-after-failures ==="
         local n="${REINIT_AFTER_FAILURES_N:-3}"
@@ -1216,29 +1221,34 @@ stage_external_snapshot() {
 #   5a (reliable): a real UUID collision, forcing vmsync's documented
 #   stripped-UUID retry branch. Scored pass/fail.
 #
-#   5b (best-effort): a timed disruption aimed at making the actual
-#   redefine call fail outright, to check that DefineDomain's rollback
-#   genuinely restores the target's prior definition. This is a race
-#   against a live, variable-duration sync with no way to synchronize on
-#   the exact right instant from outside the vmsync process, so a missed
-#   window is scored as a SKIP, never a FAIL -- only a landed disruption
-#   proves anything either way.
+#   5b (deterministic): one sync run with vmsync's own -test=failure-define,
+#   which corrupts the document handed to DomainDefineXML so libvirt refuses
+#   the redefine, to check that DefineDomain's rollback genuinely restores
+#   the target's prior definition. Scored pass/fail.
 #
-# Not part of the default --stages list (see usage()): unlike every other
-# stage, 5b temporarily manipulates TARGET_HOST's own iptables rules over
-# the same SSH connection it's about to disrupt. The removal is scheduled
-# to fire on the target host itself so it doesn't depend on a second ssh
-# call the rule would also block, and this script additionally tries an
-# explicit cleanup afterward as a backstop -- but only run this stage
-# against the same fully disposable test host this whole harness already
-# requires (see the SAFETY note at the top of this file).
+#   5b used to try to force that failure from outside instead, with a timed
+#   iptables rule on TARGET_HOST. See stage_define_domain_rollback's own
+#   comment for why that could never work and why it sometimes reported the
+#   opposite of the truth.
+#
+# Not part of the default --stages list (see usage()): both halves are
+# deliberate failure injection rather than measurement, and 5a briefly
+# defines a throwaway domain on the target. Neither touches host-level
+# networking, and neither is more destructive to the target VM than -reinit
+# already is -- but run them against the same fully disposable test host this
+# whole harness already requires (see the SAFETY note at the top of this
+# file).
 
 # domain_definition_xml URI DOMAIN -> prints DOMAIN's current XML, or
 # nothing (empty string, exit 0) when it doesn't exist at all -- callers
 # that need to tell "genuinely undefined" apart from "query failed" should
 # check domain_exists first.
+# --inactive, matching the DOMAIN_XML_INACTIVE that DefineDomain itself
+# captures and would restore. Without it the two agree only because the target
+# happens to be shut off whenever this is called -- correct by accident, and
+# silently wrong the first time it is called on a running domain.
 domain_definition_xml() {
-        virsh_uri "$1" dumpxml "$2" 2>/dev/null
+        virsh_uri "$1" dumpxml --inactive "$2" 2>/dev/null
 }
 
 stage_define_domain_uuid_collision() {
@@ -1323,13 +1333,43 @@ stage_define_domain_uuid_collision() {
         return 0
 }
 
+# Stage 5b: DefineDomain's rollback-on-failure.
+#
+# This used to try to force the failure from outside, by watching the log for
+# the undefine and then cutting SSH to the target with an iptables rule. That
+# could never work, for two independent reasons:
+#
+#   - The window runs from UndefineFlags returning to DomainDefineXML being
+#     called, and holds no I/O at all -- rename, strip uuid, rewrite disk
+#     paths, splice metadata, all in memory, over in about a millisecond.
+#     The harness needed up to 200ms of poll latency plus a fresh SSH
+#     handshake to get its rule in place: two orders of magnitude late, every
+#     run.
+#   - Landing it would have been worse. The rollback restores over the SAME
+#     libvirt connection the disruption severs, so a perfectly timed hit
+#     necessarily kills the recovery being tested. No PASS was reachable.
+#
+# And it could report PASS wrongly: a rule landing slightly EARLY killed the
+# undefine instead, which returns before the rollback closure is even
+# constructed -- leaving a non-zero exit and an unchanged definition, which is
+# exactly what a successful rollback looks like from outside.
+#
+# So vmsync injects the failure itself now, via -test=failure-define. That
+# corrupts the document handed to DomainDefineXML rather than skipping the
+# call, so libvirt genuinely refuses it and the rollback runs against the
+# state a real rejection leaves behind. No timing, no background process, no
+# firewall rules on anybody's hypervisor.
+#
+# The verdict still reads vmsync's own log rather than inferring from the exit
+# code, because "the rollback restored it" and "nothing was ever undefined"
+# remain indistinguishable from the outside.
 stage_define_domain_rollback() {
-        log "--- Stage 5b: DefineDomain rollback-on-failure (best-effort, timing-dependent) ---"
+        log "--- Stage 5b: DefineDomain rollback-on-failure ---"
 
         if [ "$DRY_RUN" = yes ]; then
-                log "   (dry run: nothing to time or disrupt)"
                 bench_sync define-rollback baseline -reinit
-                bench_sync define-rollback trigger -reinit
+                bench_sync define-rollback trigger -reinit "-test=$VMSYNC_TEST_FAILURE_DEFINE"
+                results_row "$CSV" define-rollback result DRYRUN "" "" "" "" "" "SKIP dry run"
                 return 0
         fi
 
@@ -1340,75 +1380,54 @@ stage_define_domain_rollback() {
                 die "baseline full sync for DefineDomain rollback testing failed (see $RUN_LOG) -- aborting stage 5b$(bench_sync_hint)"
         fi
 
+        # Captured the same way DefineDomain captures it (DOMAIN_XML_INACTIVE),
+        # so "restored to what it was" compares the same document vmsync
+        # actually saved and would put back.
         local xml_before
         xml_before="$(domain_definition_xml "$TARGET_URI" "$TARGET_DOMAIN")"
         [ -n "$xml_before" ] || die "could not capture target domain XML before the rollback test -- aborting stage 5b"
 
-        local marker="Undefining domain on target system"
-        local log_file="$RUN_DIR/logs/define-rollback.trigger.log"
-        local prom_file="$RUN_DIR/prom/define-rollback.trigger.prom"
-        RUN_LOG="$log_file"
-        RUN_PROM="$prom_file"
-        vmsync_common_args
-        local args=("${VMSYNC_ARGS[@]}" -prometheus-textfile "$prom_file" -reinit)
-        log "   $VMSYNC_BIN ${args[*]}"
-        "$VMSYNC_BIN" "${args[@]}" >"$log_file" 2>&1 &
-        local vmsync_pid=$!
+        # The target must already exist for this to test anything: DefineDomain
+        # only undefines, and therefore only has something to roll back to,
+        # when it does. The baseline above is what guarantees that.
+        bench_sync define-rollback trigger -reinit "-test=$VMSYNC_TEST_FAILURE_DEFINE"
 
-        local max_wait="${DEFINE_ROLLBACK_WAIT_SECONDS:-300}"
-        local seen=no
-        SECONDS=0
-        while [ "$SECONDS" -lt "$max_wait" ]; do
-                if grep -q "$marker" "$log_file" 2>/dev/null; then
-                        seen=yes
-                        break
-                fi
-                kill -0 "$vmsync_pid" 2>/dev/null || break
-                sleep 0.2
-        done
-
-        local ssh_port="${SSH_PORT:-22}"
-        if [ "$seen" = yes ]; then
-                log "   marker seen after ${SECONDS}s, disrupting target SSH reachability for 3s"
-                ssh_host_cmd "$TARGET_HOST" \
-                        "iptables -I INPUT -p tcp --dport ${ssh_port} -j REJECT --reject-with tcp-reset && (sleep 3; iptables -D INPUT -p tcp --dport ${ssh_port} -j REJECT --reject-with tcp-reset) </dev/null >/dev/null 2>&1 &" \
-                        || warn "could not insert the disruption rule on $TARGET_HOST -- letting this run finish normally instead"
-        else
-                warn "SKIP: never saw '$marker' within ${max_wait}s (or vmsync exited first) -- too fast (or failed earlier) to time the disruption; raise DEFINE_ROLLBACK_WAIT_SECONDS in $CONF if your test VM's full sync legitimately takes longer than that"
-        fi
-
-        wait "$vmsync_pid" 2>/dev/null
-        RUN_RC=$?
-
-        # Backstop in case the self-scheduled removal above didn't fire (e.g.
-        # this script's own ssh_host_cmd got cut before it could background
-        # the removal) -- never fatal, and idempotent: -D on an already-
-        # absent rule just errors harmlessly.
-        ssh_host_cmd "$TARGET_HOST" "iptables -D INPUT -p tcp --dport ${ssh_port} -j REJECT --reject-with tcp-reset" >/dev/null 2>&1 || true
-
-        if [ "$seen" != yes ]; then
-                results_row "$CSV" define-rollback result 0 "" "" "" "" "" "SKIP disruption window missed"
-                return 0
-        fi
-
-        if [ "$RUN_RC" = 0 ]; then
-                warn "FAIL (inconclusive): the disruption landed but vmsync still exited 0 -- either the redefine completed before the block took effect, or it tolerated the disruption; see $log_file"
-                results_row "$CSV" define-rollback result 1 "" "" "" "" "" "FAIL disruption landed but run still succeeded"
-                return 0
-        fi
+        local rolled_back=no undefine_failed=no
+        grep -q "restored target domain to its previous definition" "$RUN_LOG" 2>/dev/null && rolled_back=yes
+        grep -q "undefine existing target domain" "$RUN_LOG" 2>/dev/null && undefine_failed=yes
 
         local xml_after
         xml_after="$(domain_definition_xml "$TARGET_URI" "$TARGET_DOMAIN")"
-        if [ -z "$xml_after" ]; then
-                warn "FAIL: target domain is gone/undefined after the disrupted run -- rollback did not restore it (see $log_file)"
-                results_row "$CSV" define-rollback result 1 "" "" "" "" "" "FAIL target left undefined, rollback did not restore it"
+
+        if [ "$RUN_RC" = 0 ]; then
+                warn "FAIL: -test=$VMSYNC_TEST_FAILURE_DEFINE was passed but the run still exited 0 -- the injected failure did not take effect. Is $VMSYNC_BIN old enough not to know the flag? See $RUN_LOG"
+                results_row "$CSV" define-rollback result 1 "" "" "" "" "" "FAIL injected failure did not take effect"
+        elif [ "$undefine_failed" = yes ]; then
+                warn "FAIL: the run failed at the UNDEFINE, before the injected redefine failure -- the rollback path was never reached (see $RUN_LOG)"
+                results_row "$CSV" define-rollback result 1 "" "" "" "" "" "FAIL failed at the undefine not the redefine"
+        elif [ "$rolled_back" != yes ]; then
+                # Distinguished from the cases below because "the redefine
+                # failed and nothing tried to restore" and "it restored the
+                # wrong thing" are different bugs with different fixes.
+                warn "FAIL: the redefine failed as instructed, but vmsync never reported restoring the previous definition -- the rollback did not run (see $RUN_LOG)"
+                results_row "$CSV" define-rollback result 1 "" "" "" "" "" "FAIL rollback never ran"
+        elif [ -z "$xml_after" ]; then
+                warn "FAIL: vmsync reported rolling back, but the target domain is gone/undefined -- the restore did not take (see $RUN_LOG)"
+                results_row "$CSV" define-rollback result 1 "" "" "" "" "" "FAIL target left undefined after a reported rollback"
         elif [ "$xml_after" = "$xml_before" ]; then
-                log "   PASS: run failed as expected (exit=$RUN_RC) and the target's definition matches what it was before -- rollback held"
+                log "   PASS: the redefine failed, the rollback ran, and the target's definition matches what it was before"
                 results_row "$CSV" define-rollback result 0 "" "" "" "" "" "PASS rollback restored prior definition"
         else
-                warn "FAIL: run failed (exit=$RUN_RC) but the target's definition differs from before -- rollback did not fully restore it (see $log_file)"
+                warn "FAIL: the rollback ran but the target's definition differs from what it was before -- it did not fully restore it. Diff the two dumps by hand; this is the failure mode that matters, because a replica defined from a half-restored document is one that boots wrong on the day it is promoted (see $RUN_LOG)"
                 results_row "$CSV" define-rollback result 1 "" "" "" "" "" "FAIL target definition differs from before the run"
         fi
+
+        # The trigger run reinitialised the disks and then failed before
+        # recording any metadata, so the replica is left with fresh disks and
+        # the OLD definition -- consistent, but with no checkpoint bookkeeping.
+        # Heal it, so a later stage in the same --stages list does not inherit
+        # a target that looks synced and is not.
+        heal_target define-rollback heal "$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")"
         return 0
 }
 
