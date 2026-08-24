@@ -90,8 +90,16 @@ type Policy struct {
 func (p Policy) Enabled() bool { return p.Count > 0 }
 
 // ParsePolicy reads a -retention value, e.g. "24,3h" for twenty-four restore
-// points at least three hours apart. An empty value, or a count of zero, means
-// the feature is off.
+// points at least three hours apart.
+//
+// Only an ABSENT flag disables the feature. Every value that is present must
+// describe something the caller actually wants, so a count of zero is refused
+// rather than quietly honoured: passing -retention says "keep restore points",
+// and asking to keep none of them is a contradiction, not a configuration. The
+// whole point of a retention flag is that the operator finds out at startup
+// whether they are getting what they asked for -- discovering months later
+// that a typo meant no restore points were ever taken is the failure this
+// refuses to allow.
 //
 // The comma form matches -netbuffer's existing "128k,1G". The duration is
 // lowercased first because Go's own parser is case-sensitive and rejects "3H",
@@ -103,15 +111,15 @@ func ParsePolicy(s string) (Policy, error) {
 	}
 	count, interval, ok := strings.Cut(s, ",")
 	if !ok {
-		return Policy{}, fmt.Errorf("invalid -retention %q: want COUNT,INTERVAL (for example 24,3h)", s)
+		return Policy{}, fmt.Errorf("invalid -retention %q: want COUNT,INTERVAL (for example 24,3h); omit -retention entirely to keep no restore points", s)
 	}
 
 	n, err := strconv.Atoi(strings.TrimSpace(count))
 	if err != nil {
 		return Policy{}, fmt.Errorf("invalid -retention %q: count %q is not a number", s, strings.TrimSpace(count))
 	}
-	if n < 0 {
-		return Policy{}, fmt.Errorf("invalid -retention %q: count may not be negative", s)
+	if n < 1 {
+		return Policy{}, fmt.Errorf("invalid -retention %q: count must be at least 1; omit -retention entirely to keep no restore points", s)
 	}
 
 	d, err := time.ParseDuration(strings.ToLower(strings.TrimSpace(interval)))

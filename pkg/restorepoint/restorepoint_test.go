@@ -27,7 +27,6 @@ func TestParsePolicy(t *testing.T) {
 		{in: "24,3H", want: Policy{Count: 24, Interval: 3 * time.Hour}, whyValid: "Go's duration parser is lowercase-only; the documented example must not fail"},
 		{in: "24,90m", want: Policy{Count: 24, Interval: 90 * time.Minute}},
 		{in: "1,0", want: Policy{Count: 1, Interval: 0}, whyValid: "a zero interval means every sync"},
-		{in: "0,3h", want: Policy{Count: 0, Interval: 3 * time.Hour}, whyValid: "count zero disables the feature"},
 		{in: "", want: Policy{}, whyValid: "flag not passed"},
 
 		{in: "24", wantErr: true},
@@ -37,6 +36,8 @@ func TestParsePolicy(t *testing.T) {
 		{in: "24,3 hours", wantErr: true},
 		{in: "-1,3h", wantErr: true},
 		{in: "24,-3h", wantErr: true},
+		{in: "0,3h", wantErr: true}, // omit the flag to disable; asking to keep none is a contradiction
+		{in: "0,0", wantErr: true},
 	} {
 		t.Run(tc.in, func(t *testing.T) {
 			got, err := ParsePolicy(tc.in)

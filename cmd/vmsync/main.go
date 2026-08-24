@@ -3107,6 +3107,22 @@ func run(cfg syncConfig) (runErr error) {
 	// plain syncs and -verify=compare/-verify=fast, which suspend instead of
 	// using a barrier). verifyWindow{} (checkpointName == "") tells
 	// runVerify to use the original compare path, not -verify=online's.
+	// Decided before any disk is copied, so a target that cannot deliver what
+	// -retention promises fails the run here rather than after paying for a
+	// full copy. Returns an inert value when retention is off or the interval
+	// has not elapsed, so nothing below needs a conditional of its own.
+	//
+	// Declared ahead of the closures rather than beside the loop that uses
+	// it, because syncDisk below captures it.
+	targetDiskPaths := make([]string, 0, len(qcowDisks))
+	for _, d := range qcowDisks {
+		targetDiskPaths = append(targetDiskPaths, util.SetTargetPath(cfg.TargetDiskPath, d.RootSource))
+	}
+	rp, err := newRestorePoints(ctx, cfg.RetentionPolicy, targetSSHClient, targetDiskPaths, checkpointName, checkpointAt)
+	if err != nil {
+		return err
+	}
+
 	syncDisk := func(i int, d disk.QcowDisk) (err error) {
 		diskStart := time.Now()
 		var res diskPhase1Result
@@ -3121,6 +3137,13 @@ func run(cfg syncConfig) (runErr error) {
 		}
 		res, err = copyAndCommit(i, d)
 		if err != nil {
+			return err
+		}
+		// Before verify, not after: the reflink costs milliseconds whatever
+		// the image size, while a compare can run for minutes, and a crash in
+		// between would lose the restore point for no benefit. What verify
+		// found is recorded on the sidecar instead.
+		if err := rp.take(ctx, util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)); err != nil {
 			return err
 		}
 		if cfg.Verify != "" {
@@ -3161,6 +3184,13 @@ func run(cfg syncConfig) (runErr error) {
 				phase1Results[i] = res // each goroutine only ever writes index i -- no race
 				recordDiskMetric(d, res.diskSize, res.writtenBytes, res.targetBridgeCounters, time.Since(diskStart))
 				if err != nil {
+					reportWorkerErr(err)
+					return
+				}
+				// Same point in the sequence as the single-phase path above:
+				// straight after this disk's own copy, before any compare.
+				// rp.take is safe to call from several goroutines at once.
+				if err := rp.take(ctx, util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)); err != nil {
 					reportWorkerErr(err)
 				}
 			}()
@@ -3234,6 +3264,20 @@ func run(cfg syncConfig) (runErr error) {
 	effectiveCheckpoint := checkpointName
 	if !checkpointAdvanced {
 		effectiveCheckpoint = parent
+	}
+
+	// Published here because every disk has now copied, and verified if
+	// -verify was asked for: reaching this line at all means the compare
+	// passed, since a mismatch returns long before it. Until this rename the
+	// set sits under a ".incomplete-" name and is self-evidently junk.
+	verifyState := restorepoint.VerifyNotRun
+	if cfg.Verify != "" {
+		verifyState = restorepoint.VerifyPassed
+	}
+	if err := rp.commit(ctx, verifyState,
+		util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName)+":"+cfg.SourceDomain,
+		checkpointAt, effectiveCheckpoint); err != nil {
+		return err
 	}
 	// Re-read the target's role and re-check it here, immediately before the
 	// redefine, rather than trusting the read at the top of run().
