@@ -462,6 +462,12 @@ func main() {
 		os.Exit(2)
 	}
 	cfg.RetentionPolicy = retentionPolicy
+	if cfg.RetentionPolicy.Enabled() {
+		// Said out loud on every run that asks for it. A feature whose whole
+		// value is "there will be a copy to go back to tomorrow" should never
+		// be something an operator has to infer from the absence of errors.
+		trace.Info("restore points enabled", "retention", cfg.RetentionPolicy.String(), "keep", cfg.RetentionPolicy.Count, "interval", cfg.RetentionPolicy.Interval.String())
+	}
 
 	// Fault injection, off in every real run. Validated before anything else
 	// touches a domain so a typo cannot masquerade as a normal sync, and

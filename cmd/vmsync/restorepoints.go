@@ -76,6 +76,10 @@ func newRestorePoints(ctx context.Context, policy restorepoint.Policy, runner re
 	if len(targetDiskPaths) == 0 {
 		return nil, fmt.Errorf("-retention is set but this domain has no disks to copy")
 	}
+	// Logged before the first decision, so that a run which takes no restore
+	// point can always be told apart from one where this code never ran at
+	// all. Every path below either logs its outcome or returns an error.
+	trace.Info("restore points: considering this run", "retention", policy.String(), "disks", len(targetDiskPaths), "first_disk", targetDiskPaths[0])
 
 	// A restore point is a SET: one disk from this sync beside another from
 	// a different one is not a recoverable machine. That only works if they
