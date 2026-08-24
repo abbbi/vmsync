@@ -13,17 +13,6 @@
 # Path to the vmsync binary under test.
 VMSYNC_BIN=/usr/local/bin/vmsync
 
-# libvirt URIs, exactly as you'd pass to vmsync's own -source-uri/-target-uri.
-# -target-uri MUST be qemu+ssh:// (vmsync itself requires this).
-SOURCE_URI="qemu+ssh://root@source-host.example.org/system"
-TARGET_URI="qemu+ssh://root@target-host.example.org/system"
-
-# Bare hostnames (no scheme/user), used by the harness's OWN direct ssh
-# calls (qemu-io tampering, removing a leftover snapshot overlay file) --
-# normally the same hosts as the URIs above.
-SOURCE_HOST=source-host.example.org
-TARGET_HOST=target-host.example.org
-
 # Set to "yes" if bench.sh itself runs directly on the source hypervisor
 # (e.g. SOURCE_URI is a local "qemu:///system" URI, not qemu+ssh://).
 # When "yes", the harness's own direct shell-outs against SOURCE_HOST
@@ -35,6 +24,18 @@ TARGET_HOST=target-host.example.org
 # is no equivalent TARGET_LOCAL: the target must stay reachable over SSH,
 # since vmsync itself requires -target-uri to be qemu+ssh://.
 SOURCE_LOCAL=yes
+
+# libvirt URIs, exactly as you'd pass to vmsync's own -source-uri/-target-uri.
+# -target-uri MUST be qemu+ssh:// (vmsync itself requires this).
+#SOURCE_URI="qemu+ssh://root@source-host.example.org/system"
+SOURCE_URI="qemu:///system"
+TARGET_URI="qemu+ssh://root@target-host.example.org/system"
+
+# Bare hostnames (no scheme/user), used by the harness's OWN direct ssh
+# calls (qemu-io tampering, removing a leftover snapshot overlay file) --
+# normally the same hosts as the URIs above.
+SOURCE_HOST=source-host.example.org
+TARGET_HOST=target-host.example.org
 
 # The VM to test. This harness syncs SOURCE_DOMAIN to TARGET_DOMAIN
 # repeatedly, deletes and recreates the target replica many times (-reinit),
