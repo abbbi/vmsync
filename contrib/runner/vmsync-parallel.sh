@@ -4,7 +4,7 @@
 # Written in 2026 by Orsiris de Jong <ozy@netpower.fr> for vmsync by Michael Ablassmeier <abi@grinser.de>
 
 
-#SCRIPT_BUILD=2026081701
+#SCRIPT_BUILD=2026082401
 LOG_FILE=/var/log/vmsync_parallel
 TARGET_VM_PATH=/vm_data
 VMSYNC=/usr/local/bin/vmsync
@@ -60,15 +60,17 @@ DEBUG=false
 
 
 usage() {
-        echo "Usage: $0 [--vm=NAME] [--reinit] [--usage]"
+        echo "Usage: $0 [--vm=NAME] [--reinit] [--verify] [--usage]"
         echo "  --vm=NAME         Restrict replication to this VM. Repeatable (--
 vm=web01 --vm=web02) to whitelist several. Omit entirely to replicate every VM $COMMAND_TO_LIST_VMS lists (minus IGNORE_VM_LIST)."
-        echo "  --reinit          Force vmsync's own -reinit (full resync from scratch) for every VM this run touches. Same destructive caveats as vmsync's -reinit itself,Off by default"
+        echo "  --reinit          Force vmsync's own -reinit (full resync from scratch) for every VM this run touches. Same destructive caveats as vmsync's -reinit itself, Off by default"
+        echo "  --verify          Force vmsync's own -verify (check data integrity) for every VM this run touches. Off by default"
         echo "  --usage/--help    Show this help message and exit."
 
 }
 VM_WHITELIST=()
 USE_REINIT=false
+VERIFY=false
 
 parse_args() {
         while [ $# -gt 0 ]; do
@@ -78,6 +80,9 @@ parse_args() {
                                 ;;
                         --reinit)
                                 USE_REINIT=true
+                                ;;
+                        --verify)
+                                VERIFY=true
                                 ;;
                         --usage|--help)
                                 usage
@@ -162,6 +167,7 @@ acquire_lock() {
 replicate() {
         # Preparing options
         opts=""
+        ports_increase=1
         bridging_enabled=false
         if [ "${COMPRESS_ALGO}" == "zstd" ] || [ "${COMPRESS_ALGO}" == "s2" ]; then
                 bridging_enabled=true
@@ -179,6 +185,10 @@ replicate() {
         fi
         if [ "${USE_REINIT}" == true ]; then
                 opts="${opts} -reinit"
+        fi
+        if [ "${VERIFY}" == true ]; then
+                opts="${opts} -verify=online"
+                ports_increse=2
         fi
 
         # Generating list of vmsync commands to execute
@@ -247,8 +257,8 @@ replicate() {
                         cmd_list="$cmd_list;${vmsync_cmd}"
                 fi
                 vm_count=$((vm_count+1))
-                source_base_port_start=$((source_base_port_end+1))
-                destination_base_port_start=$((destination_base_port_end+1))
+                source_base_port_start=$((source_base_port_end+ports_increase))
+                destination_base_port_start=$((destination_base_port_end+ports_increase))
         done
 
         log "$(date): Total number of VMs to replicate; ${vm_count}, launching ${REPLICATION_CONCURRENCY} tasks"
