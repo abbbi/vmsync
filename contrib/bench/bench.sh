@@ -61,8 +61,8 @@ Options:
   -s, --scenarios FILE    transport matrix file (default: ./scenarios.conf)
   --only PATTERN          only run Stage 1 scenarios whose name matches
                            PATTERN (a bash glob, e.g. "compress-zstd-*")
-  --stages LIST           comma-separated subset of: matrix,verify,reinit,
-                           snapshot,define,failover,fence-agent -- runs in
+  --stages LIST           comma-separated subset of: matrix,verify,verify-long,
+                           reinit,snapshot,define,failover,fence-agent -- runs in
                            whichever order LIST gives them, not a fixed
                            canonical order
                            (default: matrix,verify,reinit,snapshot, which just
@@ -164,6 +164,68 @@ source "$CONF"
 : "${RESULT_DIR:?set in $CONF}"
 SOURCE_LOCAL="${SOURCE_LOCAL:-yes}"
 
+# --- tamper placement --------------------------------------------------------
+
+TAMPER_MODE="${TAMPER_MODE:-random}"
+TAMPER_BAND_START="${TAMPER_BAND_START:-$TAMPER_OFFSET}"
+TAMPER_BAND_END="${TAMPER_BAND_END:-0}" # 0 = up to the disk's virtual size
+# 64 KiB, not 512, and that floor is load-bearing rather than cautious.
+# nbdsync reports mismatches at a 4096-byte granularity (mismatchScanGranularity
+# in pkg/nbdsync/nbd.go), so anything under 4 KiB is indistinguishable from a
+# 4 KiB tamper and buys no coverage at all. Above that, -verify=online discards
+# a whole reported range when ANY byte of it overlaps a region the guest wrote
+# during the compare window (overlapsAnyExtent in cmd/vmsync/main.go), and those
+# regions come from a qcow2 dirty bitmap at qemu's default 64 KiB granularity.
+# A tamper smaller than one granule can therefore be swallowed entire by a
+# single unrelated guest write, which reads as "verify missed it".
+TAMPER_LENGTH_MIN="${TAMPER_LENGTH_MIN:-65536}"
+TAMPER_LENGTH_MAX="${TAMPER_LENGTH_MAX:-262144}"
+TAMPER_ALIGN="${TAMPER_ALIGN:-4096}"
+TAMPER_PATTERN="${TAMPER_PATTERN:-0xAA}"
+TAMPER_SEED="${TAMPER_SEED:-}"
+
+case "$TAMPER_MODE" in
+random | fixed) ;;
+*) die "$CONF: TAMPER_MODE must be 'random' or 'fixed', not '$TAMPER_MODE'" ;;
+esac
+
+# Plain decimal byte counts only, for everything this script does arithmetic
+# on. qemu-io accepts k/M/G suffixes and bench.conf.example used to advertise
+# them, but $(( 100M )) is a bash syntax error, and under `set -e` that ends
+# the run with a bare arithmetic complaint rather than anything actionable.
+for _v in TAMPER_OFFSET TAMPER_LENGTH TAMPER_BAND_START TAMPER_BAND_END \
+	TAMPER_LENGTH_MIN TAMPER_LENGTH_MAX TAMPER_ALIGN; do
+	case "${!_v}" in
+	'' | *[!0-9]*)
+		die "$CONF: $_v must be a plain decimal byte count, not '${!_v}' -- size suffixes like 100M are not accepted here (write 104857600)"
+		;;
+	esac
+done
+unset _v
+
+# A zero fill is a content no-op wherever the source already reads as zero,
+# and undetectable by every verify mode by design -- so a run configured that
+# way would report "verify missed it" for a corruption that was never there.
+case "$TAMPER_PATTERN" in
+0x00 | 0x0 | 0) die "$CONF: TAMPER_PATTERN must be non-zero -- a zero fill is undetectable wherever the source already reads as zero" ;;
+esac
+
+[ "$TAMPER_LENGTH_MIN" -le "$TAMPER_LENGTH_MAX" ] \
+	|| die "$CONF: TAMPER_LENGTH_MIN ($TAMPER_LENGTH_MIN) exceeds TAMPER_LENGTH_MAX ($TAMPER_LENGTH_MAX)"
+[ "$TAMPER_ALIGN" -gt 0 ] || die "$CONF: TAMPER_ALIGN must be positive"
+
+# --- guest dirtying ----------------------------------------------------------
+
+GUEST_DIRTY="${GUEST_DIRTY:-yes}"
+GUEST_DIRTY_PATH="${GUEST_DIRTY_PATH:-/var/tmp/vmsync-bench-dirty}"
+GUEST_DIRTY_MIB="${GUEST_DIRTY_MIB:-64}"
+
+# --- Stage 8 (verify-long) ---------------------------------------------------
+
+VERIFY_LONG_COPIES="${VERIFY_LONG_COPIES:-20}"
+VERIFY_LONG_ATTEMPTS="${VERIFY_LONG_ATTEMPTS:-5}"
+VERIFY_LONG_RECOPIES="${VERIFY_LONG_RECOPIES:-3}"
+
 if [ "$DRY_RUN" != yes ]; then
         [ "${I_UNDERSTAND_THIS_IS_DESTRUCTIVE:-no}" = yes ] \
                 || die "$CONF: set I_UNDERSTAND_THIS_IS_DESTRUCTIVE=yes to run for real (or pass --dry-run to just print commands)"
@@ -178,10 +240,20 @@ mkdir -p "$RUN_DIR/logs" "$RUN_DIR/prom"
 CSV="$RUN_DIR/results.csv"
 results_init "$CSV"
 
+# Seeded from the run id when unset, and logged either way. A randomly placed
+# corruption is only worth having if the exact sequence can be replayed: rerun
+# with TAMPER_SEED=<this value> and every draw below repeats identically.
+TAMPER_SEED="${TAMPER_SEED:-$RUN_ID}"
+
 log "vmsync benchmark harness -- run id $RUN_ID"
 log "config: $CONF"
 log "scenarios: $SCENARIOS"
 log "results directory: $RUN_DIR"
+if [ "$TAMPER_MODE" = random ]; then
+	log "tamper placement: random, seed $TAMPER_SEED -- rerun with TAMPER_SEED=$TAMPER_SEED to reproduce this run's corruptions exactly"
+else
+	log "tamper placement: fixed, offset $TAMPER_OFFSET length $TAMPER_LENGTH"
+fi
 [ "$DRY_RUN" = yes ] && log "DRY RUN: no vmsync/ssh/qemu-io commands will actually execute"
 
 # --- preflight -------------------------------------------------------------
@@ -197,6 +269,12 @@ preflight() {
         command -v xmllint >/dev/null 2>&1 || die "xmllint not found locally (libxml2-utils/libxml2 package) -- needed to read domain XML reliably"
         command -v awk >/dev/null 2>&1 || die "awk not found"
         command -v ssh >/dev/null 2>&1 || die "ssh not found"
+        command -v md5sum >/dev/null 2>&1 || die "md5sum not found -- used to draw reproducible random tamper offsets (see TAMPER_SEED). Set TAMPER_MODE=fixed in $CONF to avoid needing it."
+        # -verify=compare shells out to `qemu-img compare` on the host running
+        # vmsync, not on either hypervisor (pkg/disk/disk.go's CompareImages).
+        # Missing it locally makes that one mode fail for a reason that has
+        # nothing to do with the replica.
+        command -v qemu-img >/dev/null 2>&1 || die "qemu-img not found locally -- -verify=compare runs it on this host to compare the two NBD exports"
 
         domain_exists "$SOURCE_URI" "$SOURCE_DOMAIN" || die "source domain '$SOURCE_DOMAIN' not found via $SOURCE_URI${VIRSH_ERR:+: $VIRSH_ERR}"
         if domain_exists "$TARGET_URI" "$TARGET_DOMAIN"; then
@@ -516,6 +594,141 @@ stage_matrix() {
         return 0
 }
 
+# --- tampering ---------------------------------------------------------------
+
+# TAMPER_SEQ counts draws, so each tamper in a run gets a different one while
+# the whole SEQUENCE stays a pure function of TAMPER_SEED.
+TAMPER_SEQ=0
+TAMPER_OFF=""
+TAMPER_LEN=""
+
+# rng_below N -> a deterministic integer in [0, N).
+#
+# Not $RANDOM and not awk's srand(): neither is reproducible ACROSS hosts or
+# implementations, and a randomly-placed corruption that cannot be replayed is
+# strictly worse than a fixed one -- a FAIL you cannot re-run is a FAIL you
+# cannot investigate. Hashing "seed:counter" is deterministic everywhere
+# md5sum exists, which is everywhere this harness already runs. 15 hex digits
+# is 60 bits, comfortably inside bash's signed 64-bit arithmetic.
+rng_below() {
+	local n="$1" hex
+	hex="$(printf '%s:%s' "$TAMPER_SEED" "$TAMPER_SEQ" | md5sum | cut -c1-15)"
+	printf '%s' "$(((16#$hex) % n))"
+}
+
+# target_virtual_size PATH -> the target disk's virtual size in bytes.
+#
+# Read off the image rather than from a previous run's Prometheus textfile:
+# vmsync_disk_size_bytes has one series per disk and prom_sum adds them up, so
+# on a multi-disk domain that number is not any single disk's size.
+target_virtual_size() {
+	local path="$1"
+	ssh_host_cmd "$TARGET_HOST" qemu-img info --output=json "'$path'" 2>/dev/null \
+		| awk -F'[:,]' '/"virtual-size"/ { gsub(/[^0-9]/, "", $2); print $2; exit }'
+}
+
+# draw_tamper VIRTUAL_SIZE -- chooses TAMPER_OFF/TAMPER_LEN. Returns non-zero
+# when the configured band cannot hold even the smallest tamper, so the caller
+# can SKIP rather than write somewhere it did not intend to.
+draw_tamper() {
+	local vsize="$1" start end span nlen nslot
+
+	if [ "$TAMPER_MODE" = fixed ]; then
+		TAMPER_OFF="$TAMPER_OFFSET"
+		TAMPER_LEN="$TAMPER_LENGTH"
+		[ $((TAMPER_OFF + TAMPER_LEN)) -le "$vsize" ] || return 1
+		return 0
+	fi
+
+	TAMPER_SEQ=$((TAMPER_SEQ + 1))
+
+	end="$TAMPER_BAND_END"
+	if [ "$end" -eq 0 ] || [ "$end" -gt "$vsize" ]; then end="$vsize"; fi
+	start=$(((TAMPER_BAND_START + TAMPER_ALIGN - 1) / TAMPER_ALIGN * TAMPER_ALIGN))
+	span=$((end - start))
+	[ "$span" -ge "$((TAMPER_LENGTH_MIN + TAMPER_ALIGN))" ] || return 1
+
+	# Length FIRST, then a slot that fits it. Drawing the offset first and
+	# clamping the length is how a draw near the end of the band collapses to
+	# length 0 -- a qemu-io write of nothing, which succeeds, changes nothing,
+	# and is then scored as "verify failed to detect it".
+	nlen=$(((TAMPER_LENGTH_MAX - TAMPER_LENGTH_MIN) / TAMPER_ALIGN + 1))
+	TAMPER_LEN=$((TAMPER_LENGTH_MIN + $(rng_below "$nlen") * TAMPER_ALIGN))
+	TAMPER_SEQ=$((TAMPER_SEQ + 1))
+	nslot=$(((span - TAMPER_LEN) / TAMPER_ALIGN + 1))
+	[ "$nslot" -ge 1 ] || return 1
+	TAMPER_OFF=$((start + $(rng_below "$nslot") * TAMPER_ALIGN))
+
+	[ $((TAMPER_OFF + TAMPER_LEN)) -le "$vsize" ] || return 1
+	return 0
+}
+
+# tamper_target PATH PRESERVE_MTIME -- corrupts the target replica in place.
+#
+# PRESERVE_MTIME decides which of two DIFFERENT protections is under test, and
+# it is not a way of getting around either.
+#
+# vmsync refuses an incremental sync when the target file's mtime is newer than
+# the last recorded sync (cmd/vmsync/main.go, "Target file on system is newer"),
+# and that check fires long before any compare -- before CreateCheckpoint, let
+# alone -verify. It catches one specific thing: somebody wrote to the replica
+# THROUGH THE FILESYSTEM since the last sync.
+#
+# -verify exists for the threat that check structurally cannot see: contents
+# that diverged with nothing visible at the filesystem layer -- a bad sector, a
+# silent write error, a scrub miscompare, a bug in vmsync's own copy path. Bit
+# rot does not touch mtime. So a tamper that leaves mtime alone tests the mtime
+# guard, and ONLY a tamper that restores it can reach, and therefore test, the
+# compare. Both are worth testing, which is why this harness does both,
+# separately and under their own names.
+tamper_target() {
+	local path="$1" preserve="$2" mtime=""
+
+	if [ "$preserve" = yes ]; then
+		mtime="$(ssh_host_cmd "$TARGET_HOST" stat -c %Y "'$path'")" \
+			|| die "could not read the mtime of $path on $TARGET_HOST before tampering -- refusing to corrupt a file whose state cannot be restored"
+	fi
+
+	ssh_host_cmd "$TARGET_HOST" qemu-io -f qcow2 \
+		-c "'write -P ${TAMPER_PATTERN} ${TAMPER_OFF} ${TAMPER_LEN}'" "'${path}'" \
+		|| die "failed to inject test corruption into $path on $TARGET_HOST -- refusing to continue this sub-test"
+
+	# Read it back. A qemu-io write that reports success but lands somewhere
+	# else, or gets swallowed, would otherwise turn into "verify missed it".
+	ssh_host_cmd "$TARGET_HOST" qemu-io -r -f qcow2 \
+		-c "'read -P ${TAMPER_PATTERN} ${TAMPER_OFF} ${TAMPER_LEN}'" "'${path}'" >/dev/null \
+		|| die "the test corruption did not read back from $path at offset $TAMPER_OFF length $TAMPER_LEN -- the tamper did not take, so nothing below would be testing what it claims"
+
+	if [ "$preserve" = yes ]; then
+		# touch -d @N sets nanoseconds to zero, so the restored stamp is at
+		# worst marginally OLDER than the original -- never newer, and the
+		# original passed the guard on the previous run by construction.
+		ssh_host_cmd "$TARGET_HOST" touch -d "@$mtime" "'$path'" \
+			|| die "could not restore the mtime of $path on $TARGET_HOST -- the sync below would fail at vmsync's mtime guard instead of reaching -verify, and would be scored as if it had verified"
+	fi
+}
+
+# verify_outcome PROMFILE -> RAN_MISMATCH | RAN_CLEAN | NOT_RUN
+#
+# The reason this exists rather than reading vmsync's exit code: a -verify run
+# that dies BEFORE its compare also exits non-zero, and scoring that as
+# "mismatch detected" is how this stage reported PASS for years while never
+# once exercising -verify. vmsync emits vmsync_verification_state only for a
+# run that actually reached the compare, so its presence answers "did this test
+# test anything" and its value answers "what did it find".
+verify_outcome() {
+	local prom="$1"
+	if ! prom_has "$prom" vmsync_verification_state; then
+		printf 'NOT_RUN'
+		return 0
+	fi
+	if [ "$(prom_first "$prom" vmsync_verification_state)" = 0 ]; then
+		printf 'RAN_CLEAN'
+	else
+		printf 'RAN_MISMATCH'
+	fi
+}
+
 # --- Stage 2: verify modes + target-side tampering -------------------------
 
 stage_verify_tamper() {
@@ -545,42 +758,203 @@ stage_verify_tamper() {
                 log "target disk under test: dev=$TAMPER_DISK_DEV path=$target_path (on $TARGET_HOST)"
         fi
 
+        local vsize=0
+        if [ "$DRY_RUN" != yes ]; then
+                vsize="$(target_virtual_size "$target_path")" || true
+                [ -n "$vsize" ] && [ "$vsize" -gt 0 ] 2>/dev/null \
+                        || die "could not read the virtual size of $target_path on $TARGET_HOST via qemu-img info -- needed to keep a tamper inside the disk"
+                log "target disk virtual size: $vsize bytes"
+        fi
+
+        # Sub-test A: the mtime guard. Tamper and leave the mtime alone, so
+        # vmsync sees a replica that was written to through the filesystem since
+        # the last sync and must refuse the incremental sync outright.
+        #
+        # This is what stage 2 has in fact been testing all along, unlabelled:
+        # the guard fires before the compare, and its non-zero exit was being
+        # scored as "-verify detected a mismatch". Naming it makes that coverage
+        # real instead of accidental, and leaves the verify sub-tests below free
+        # to test what they claim to.
+        verify_guard_subtest "$target_path" "$vsize"
+
         local mode
         for mode in compare fast online; do
-                log "--- verify=$mode: tampering ${target_path:-<unresolved in --dry-run>} at offset $TAMPER_OFFSET, length $TAMPER_LENGTH ---"
-
-                if [ "$DRY_RUN" != yes ]; then
-                        require_dom_shutoff "$TARGET_URI" "$TARGET_DOMAIN" "target"
-                        ssh_host_cmd "$TARGET_HOST" qemu-io -f qcow2 \
-                                -c "'write -P 0xAA ${TAMPER_OFFSET} ${TAMPER_LENGTH}'" "'${target_path}'" \
-                                || die "failed to inject test corruption into $target_path on $TARGET_HOST -- refusing to continue this sub-test"
-                fi
-
-                bench_sync "verify-${mode}" tamper "-verify=$mode"
-
-                if [ "$DRY_RUN" = yes ]; then
-                        :
-                elif [ "$RUN_RC" != 0 ]; then
-                        log "   PASS: -verify=$mode correctly reported a mismatch (exit=$RUN_RC)"
-                        results_row "$CSV" "verify-${mode}" tamper-result 0 "" "" "" "" "" "PASS mismatch detected"
-                else
-                        warn "FAIL: -verify=$mode did NOT report a mismatch after target-side tampering (exit=0) -- see $RUN_LOG. Note: -verify=online can legitimately discard an in-window mismatch as inconclusive if the guest happened to rewrite that exact region during the compare -- see README.md before treating this as a confirmed bug."
-                        results_row "$CSV" "verify-${mode}" tamper-result 1 "" "" "" "" "" "FAIL mismatch NOT detected"
-                fi
-
-                # Heal with a FULL resync unconditionally, regardless of the
-                # outcome above, before testing the next mode. An incremental
-                # sync would NOT fix this: it only re-copies blocks the source's
-                # own dirty bitmap says changed, and the source never wrote to
-                # the offset we just tampered with on the target -- only -reinit
-                # (which re-copies everything) is guaranteed to overwrite it.
-                log "   healing target with a full resync (-reinit)"
-                bench_sync "verify-${mode}" heal -reinit
-                if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
-                        die "heal-after-tamper resync for -verify=$mode did not succeed (see $RUN_LOG) -- STOP and inspect $target_path by hand before trusting this target replica or continuing"
-                fi
+                verify_mode_subtest "$target_path" "$vsize" "$mode" "verify-${mode}" tamper
         done
         return 0
+}
+
+# verify_guard_subtest PATH VSIZE -- asserts the mtime guard refuses a target
+# that was written to behind vmsync's back.
+verify_guard_subtest() {
+        local path="$1" vsize="$2"
+
+        log "--- verify-guard: tampering WITHOUT restoring mtime, expecting vmsync to refuse the sync ---"
+
+        if [ "$DRY_RUN" != yes ]; then
+                require_dom_shutoff "$TARGET_URI" "$TARGET_DOMAIN" "target"
+                if ! draw_tamper "$vsize"; then
+                        warn "SKIP verify-guard: the configured tamper band does not fit inside a ${vsize}-byte disk -- lower TAMPER_BAND_START or TAMPER_LENGTH_MIN in $CONF"
+                        results_row "$CSV" verify-guard tamper-result "" "" "" "" "" "" "SKIP tamper band does not fit the disk"
+                        return 0
+                fi
+                log "   corrupting at offset $TAMPER_OFF length $TAMPER_LEN (seed $TAMPER_SEED)"
+                tamper_target "$path" no
+        fi
+
+        bench_sync verify-guard tamper
+
+        if [ "$DRY_RUN" = yes ]; then
+                results_row "$CSV" verify-guard tamper-result DRYRUN "" "" "" "" "" "SKIP dry run"
+        elif [ "$RUN_RC" = 0 ]; then
+                warn "FAIL: vmsync accepted an incremental sync into a target whose disk had been modified since the last sync -- the mtime guard did not fire. See $RUN_LOG"
+                results_row "$CSV" verify-guard tamper-result 1 "" "" "" "" "" "FAIL mtime guard did not fire"
+        elif grep -q "Target file on system is newer" "$RUN_LOG" 2>/dev/null; then
+                log "   PASS: the mtime guard refused the sync"
+                results_row "$CSV" verify-guard tamper-result 0 "" "" "" "" "" "PASS mtime guard refused the sync"
+        else
+                warn "FAIL: the sync failed, but not at the mtime guard -- something else went wrong first. See $RUN_LOG"
+                results_row "$CSV" verify-guard tamper-result 1 "" "" "" "" "" "FAIL failed for some other reason"
+        fi
+
+        heal_target verify-guard tamper-heal "$path"
+}
+
+# verify_mode_subtest PATH VSIZE MODE SCENARIO PHASE -- asserts -verify=MODE
+# detects a corruption the mtime guard cannot see.
+#
+# SCENARIO and PHASE are passed rather than derived because two stages call
+# this: stage 2 once per mode, and stage 8 several times per mode. SCENARIO is
+# what stage_pattern matches on, and PHASE has to be unique within a run or the
+# per-run log and Prometheus files (named ${SCENARIO}.${PHASE}) overwrite each
+# other and the failing attempt's evidence is gone.
+verify_mode_subtest() {
+        local path="$1" vsize="$2" mode="$3" scenario="$4" phase="$5" outcome
+
+        log "--- verify=$mode: tampering ${path:-<unresolved in --dry-run>} with the mtime preserved ---"
+
+        if [ "$DRY_RUN" != yes ]; then
+                require_dom_shutoff "$TARGET_URI" "$TARGET_DOMAIN" "target"
+                if ! draw_tamper "$vsize"; then
+                        warn "SKIP $scenario/$phase: the configured tamper band does not fit inside a ${vsize}-byte disk"
+                        results_row "$CSV" "$scenario" "${phase}-result" "" "" "" "" "" "" "SKIP tamper band does not fit the disk"
+                        return 0
+                fi
+                log "   corrupting at offset $TAMPER_OFF length $TAMPER_LEN (seed $TAMPER_SEED)"
+                tamper_target "$path" yes
+        fi
+
+        bench_sync "$scenario" "$phase" "-verify=$mode"
+
+        if [ "$DRY_RUN" = yes ]; then
+                results_row "$CSV" "$scenario" "${phase}-result" DRYRUN "" "" "" "" "" "SKIP dry run"
+        else
+                outcome="$(verify_outcome "$RUN_PROM")"
+                case "$outcome" in
+                RAN_MISMATCH)
+                        log "   PASS: -verify=$mode ran and reported a mismatch"
+                        results_row "$CSV" "$scenario" "${phase}-result" 0 "" "" "" "" "" "PASS mismatch detected"
+                        ;;
+                RAN_CLEAN)
+                        warn "FAIL: -verify=$mode ran and found NOTHING after the target was corrupted at offset $TAMPER_OFF length $TAMPER_LEN (reproduce with TAMPER_SEED=$TAMPER_SEED). See $RUN_LOG. Note: -verify=online can legitimately discard an in-window mismatch as inconclusive if the guest rewrote that exact region during the compare -- see README.md before treating this as a confirmed bug."
+                        results_row "$CSV" "$scenario" "${phase}-result" 1 "" "" "" "" "" "FAIL mismatch NOT detected"
+                        ;;
+                *)
+                        warn "FAIL: -verify=$mode never reached its compare -- the run ended before verification ran, so nothing was verified (exit=$RUN_RC). vmsync emits no vmsync_verification_state for such a run. See $RUN_LOG"
+                        results_row "$CSV" "$scenario" "${phase}-result" 1 "" "" "" "" "" "FAIL verification never ran"
+                        ;;
+                esac
+        fi
+
+        heal_target "$scenario" "${phase}-heal" "$path"
+}
+
+# heal_target SCENARIO PHASE PATH -- undoes a tamper with a full resync.
+#
+# -reinit specifically, and unconditionally. An incremental sync would NOT fix
+# this: it re-copies only blocks the SOURCE's dirty bitmap says changed, and the
+# source never wrote to the offset that was corrupted on the target.
+heal_target() {
+        local scenario="$1" phase="$2" path="$3"
+        log "   healing target with a full resync (-reinit)"
+        bench_sync "$scenario" "$phase" -reinit
+        if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
+                die "heal-after-tamper resync for $scenario/$phase did not succeed (see $RUN_LOG) -- STOP and inspect $path by hand before trusting this target replica or continuing"
+        fi
+}
+
+# --- guest dirtying (Stage 8) -------------------------------------------------
+
+# Twenty incremental syncs of an idle guest copy nothing: each one takes a
+# checkpoint over an empty dirty bitmap, transfers ~0 bytes, and proves only
+# that vmsync can do nothing twenty times. To make the chain mean anything the
+# guest has to actually write between copies, which means running a command
+# INSIDE it -- there is no virsh verb for that, only the QEMU guest agent.
+
+# guest_exec_available -> true when the agent will accept guest-exec.
+#
+# Two separate things have to hold, and the first does not imply the second:
+# the agent has to be responding at all, and guest-exec must not be blocked.
+# RHEL-family packages ship /etc/sysconfig/qemu-ga with guest-exec and
+# guest-file-* in BLOCK_RPCS by default, so an agent that happily services
+# vmsync's own FSFreeze will still refuse to run dd. guest-info reports each
+# command with its own "enabled" flag, which answers both questions at once.
+guest_exec_available() {
+	local out
+	out="$(virsh_uri "$SOURCE_URI" qemu-agent-command "$SOURCE_DOMAIN" \
+		'{"execute":"guest-info"}' 2>&1)" || {
+		GUEST_EXEC_WHY="the guest agent did not respond on $SOURCE_DOMAIN (${out//$'\n'/ })"
+		return 1
+	}
+	# Each supported command is its own JSON object, so splitting on '{' puts
+	# one command's fields on one line regardless of key order.
+	if printf '%s' "$out" | tr '{' '\n' | grep '"name"[[:space:]]*:[[:space:]]*"guest-exec"' | grep -q '"enabled"[[:space:]]*:[[:space:]]*true'; then
+		return 0
+	fi
+	GUEST_EXEC_WHY="the guest agent is running but guest-exec is disabled -- on RHEL-family guests remove it from BLOCK_RPCS in /etc/sysconfig/qemu-ga and restart qemu-guest-agent"
+	return 1
+}
+
+# guest_dirty -- rewrites GUEST_DIRTY_MIB MiB of random data inside the guest,
+# synchronously, so the next sync has something real to copy.
+#
+# Always the SAME path. Rewriting one file in place keeps the guest's block
+# allocation stable, so every round dirties a comparable number of blocks and
+# the per-round transferred_bytes in results.csv is a flat line any deviation
+# stands out against. A fresh file per round would instead grow the image
+# monotonically across twenty rounds and drift the runtime with it.
+#
+# conv=fsync is not optional: libvirt's dirty bitmap tracks writes that reach
+# the virtual block device. A dd that returns with its data still in the
+# guest's page cache leaves the bitmap empty and the next incremental sync
+# copies nothing -- the exact failure this whole mechanism exists to avoid.
+guest_dirty() {
+	local out pid status waited=0
+	out="$(virsh_uri "$SOURCE_URI" qemu-agent-command "$SOURCE_DOMAIN" \
+		"{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"/bin/dd\",\"arg\":[\"if=/dev/urandom\",\"of=${GUEST_DIRTY_PATH}\",\"bs=1M\",\"count=${GUEST_DIRTY_MIB}\",\"conv=fsync\"],\"capture-output\":true}}" 2>&1)" \
+		|| { warn "guest-exec dd failed on $SOURCE_DOMAIN: ${out//$'\n'/ }"; return 1; }
+
+	pid="$(printf '%s' "$out" | grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$' | head -1)"
+	[ -n "$pid" ] || { warn "guest-exec returned no pid: ${out//$'\n'/ }"; return 1; }
+
+	# guest-exec is asynchronous -- it returns a pid immediately. Without this
+	# poll the next sync's checkpoint would be taken while dd is still running,
+	# and each round would copy an arbitrary fraction of the write.
+	while [ "$waited" -lt "${GUEST_DIRTY_TIMEOUT:-120}" ]; do
+		status="$(virsh_uri "$SOURCE_URI" qemu-agent-command "$SOURCE_DOMAIN" \
+			"{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":${pid}}}" 2>&1)" || true
+		if printf '%s' "$status" | grep -q '"exited"[[:space:]]*:[[:space:]]*true'; then
+			if printf '%s' "$status" | grep -q '"exitcode"[[:space:]]*:[[:space:]]*0'; then
+				return 0
+			fi
+			warn "dd inside $SOURCE_DOMAIN exited non-zero: ${status//$'\n'/ }"
+			return 1
+		fi
+		sleep 2
+		waited=$((waited + 2))
+	done
+	warn "dd inside $SOURCE_DOMAIN did not finish within ${GUEST_DIRTY_TIMEOUT:-120}s"
+	return 1
 }
 
 # --- Stage 3: -reinit-after-failures -----------------------------------------
@@ -1881,9 +2255,123 @@ stage_fence_agent() {
 NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-uuid-collision$|define-rollback$|failover$|fence-agent$)'
 
 # stage_pattern STAGE -> the regex matching that stage's scenario column.
+# --- Stage 8: verify after a long incremental chain --------------------------
+#
+# Everything else here verifies a replica that was built moments ago by a
+# single -reinit. This builds one the way a real deployment does -- dozens of
+# incremental syncs, each carrying a real guest write -- and only then asks
+# whether corruption is still detectable. Deliberately opt-in: it is the
+# longest stage by a wide margin.
+stage_verify_long() {
+	log "=== Stage 8: -verify after a long incremental chain ==="
+
+	local copies="${VERIFY_LONG_COPIES}" attempts="${VERIFY_LONG_ATTEMPTS}" recopies="${VERIFY_LONG_RECOPIES}"
+
+	if [ "$DRY_RUN" != yes ]; then
+		# The chain is only meaningful if the guest is writing between
+		# copies, and that needs a RUNNING guest with a usable agent.
+		# Without it this stage would spend an hour proving that vmsync can
+		# copy nothing twenty times -- so it skips rather than reporting a
+		# green result that verified nothing.
+		local src_state
+		src_state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN")" || src_state="unknown"
+		if [ "$src_state" != running ]; then
+			warn "SKIP stage verify-long: source domain '$SOURCE_DOMAIN' is '$src_state', but this stage needs a running guest to dirty its own disk between copies"
+			results_row "$CSV" verify-long precondition "" "" "" "" "" "" "SKIP source domain not running"
+			return 0
+		fi
+		if [ "$GUEST_DIRTY" = yes ] && ! guest_exec_available; then
+			warn "SKIP stage verify-long: $GUEST_EXEC_WHY"
+			results_row "$CSV" verify-long precondition "" "" "" "" "" "" "SKIP guest-exec unavailable"
+			return 0
+		fi
+		require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
+	fi
+
+	bench_sync verify-long baseline -reinit
+	if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
+		die "baseline full sync for verify-long failed (see $RUN_LOG) -- aborting stage 8$(bench_sync_hint)"
+	fi
+
+	local target_path="" vsize=0
+	if [ "$DRY_RUN" != yes ]; then
+		target_path="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")" || true
+		[ -n "$target_path" ] || die "could not resolve target disk path for dev='$TAMPER_DISK_DEV' -- check TAMPER_DISK_DEV in $CONF"
+		vsize="$(target_virtual_size "$target_path")" || true
+		[ -n "$vsize" ] && [ "$vsize" -gt 0 ] 2>/dev/null \
+			|| die "could not read the virtual size of $target_path on $TARGET_HOST via qemu-img info"
+	fi
+
+	verify_long_chain "$copies" chain
+	verify_long_assert_chain "$copies"
+
+	local attempt=1 mode
+	while [ "$attempt" -le "$attempts" ]; do
+		# Cycle the modes so a long run covers all three rather than
+		# hammering one, and so which mode meets which random offset varies
+		# with the seed rather than being fixed by position.
+		case $((attempt % 3)) in
+		1) mode=compare ;;
+		2) mode=fast ;;
+		*) mode=online ;;
+		esac
+		log "--- verify-long attempt $attempt/$attempts, mode=$mode ---"
+		verify_mode_subtest "$target_path" "$vsize" "$mode" verify-long "attempt-${attempt}-${mode}"
+		attempt=$((attempt + 1))
+		[ "$attempt" -le "$attempts" ] && verify_long_chain "$recopies" recopy
+	done
+	return 0
+}
+
+# verify_long_chain N LABEL -- N incremental copies, each preceded by a real
+# guest write. Sets VERIFY_LONG_MOVED to how many of them actually transferred
+# something.
+VERIFY_LONG_MOVED=0
+verify_long_chain() {
+	local n="$1" label="$2" i=1 moved
+	VERIFY_LONG_MOVED=0
+	while [ "$i" -le "$n" ]; do
+		if [ "$DRY_RUN" != yes ] && [ "$GUEST_DIRTY" = yes ]; then
+			guest_dirty || warn "guest write $i/$n failed -- this copy will carry less (or nothing) than intended"
+		fi
+		bench_sync verify-long "${label}-${i}"
+		if [ "$DRY_RUN" != yes ]; then
+			if [ "$RUN_RC" != 0 ]; then
+				die "incremental copy ${label}-${i} of the verify-long chain failed (see $RUN_LOG) -- the chain is broken, so nothing after it would mean anything"
+			fi
+			moved="$(prom_sum "$RUN_PROM" vmsync_transferred_bytes)"
+			[ "$moved" -gt 0 ] && VERIFY_LONG_MOVED=$((VERIFY_LONG_MOVED + 1))
+		fi
+		i=$((i + 1))
+	done
+	return 0
+}
+
+# verify_long_assert_chain N -- the chain has to have carried real data, or the
+# verification below is being run against a replica no different from the
+# baseline and the stage proves nothing.
+verify_long_assert_chain() {
+	local n="$1"
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" verify-long chain-result DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+	if [ "$VERIFY_LONG_MOVED" -eq 0 ]; then
+		warn "FAIL: none of the $n incremental copies transferred a single byte -- the guest is not dirtying its disk, so this chain is $n no-ops and the verification below would test nothing. Check GUEST_DIRTY_PATH is writable in the guest and that dd reached the disk (conv=fsync)."
+		results_row "$CSV" verify-long chain-result 1 "" "" "" "" "" "FAIL chain carried no data"
+	else
+		log "   PASS: $VERIFY_LONG_MOVED of $n incremental copies carried real data"
+		results_row "$CSV" verify-long chain-result 0 "" "" "" "" "" "PASS chain carried real data"
+	fi
+}
+
 stage_pattern() {
 	case "$1" in
-	verify) printf '^verify-' ;;
+	# Anchored to the four named sub-tests rather than a bare ^verify- , so a
+	# run doing both stages does not fold stage 8's rows into stage 2's
+	# verdict.
+	verify) printf '^verify-(guard|compare|fast|online)$' ;;
+	verify-long) printf '^verify-long$' ;;
 	reinit) printf '^reinit-after-failures$' ;;
 	snapshot) printf '^ext-snapshot$' ;;
 	define) printf '^define-(uuid-collision|rollback)$' ;;
@@ -2052,7 +2540,22 @@ generate_report() {
                 echo
                 echo "| mode | phase | exit | wall (s) | result |"
                 echo "|---|---|---|---|---|"
-                awk -F, 'NR>1 && $1 ~ /^verify-/ { printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $9 }' "$CSV"
+                awk -F, 'NR>1 && $1 ~ /^verify-(guard|baseline|compare|fast|online)/ { printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $9 }' "$CSV"
+                echo
+                echo "## Stage 8: verify after a long incremental chain"
+                echo
+                if awk -F, 'NR>1 && $1=="verify-long" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "Tamper placement: $TAMPER_MODE${TAMPER_MODE:+, seed \`$TAMPER_SEED\`}"
+                        echo
+                        echo "| phase | exit | wall (s) | transferred (MiB) | result |"
+                        echo "|---|---|---|---|---|"
+                        awk -F, 'NR>1 && $1=="verify-long" {
+                                mib = ($5+0) / 1048576
+                                printf "| %s | %s | %s | %.1f | %s |\n", $2, $3, $4, mib, $9
+                        }' "$CSV"
+                else
+                        echo "_not run (opt in with \`--stages verify-long\`; it makes ~$VERIFY_LONG_COPIES incremental copies before it starts)_"
+                fi
                 echo
                 echo "## Stage 3: reinit-after-failures"
                 echo
@@ -2138,12 +2641,13 @@ for s in "${stage_list[@]}"; do
         case "$s" in
         matrix) stage_matrix ;;
         verify) stage_verify_tamper ;;
+        verify-long) stage_verify_long ;;
         reinit) stage_reinit_after_failures ;;
         snapshot) stage_external_snapshot ;;
         define) stage_define_domain ;;
         failover) stage_failover ;;
         fence-agent) stage_fence_agent ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,reinit,snapshot,define,failover,fence-agent)" ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,verify-long,reinit,snapshot,define,failover,fence-agent)" ;;
         esac
         announce_stage_verdict "$s"
 done

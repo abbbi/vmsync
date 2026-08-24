@@ -22,7 +22,7 @@ again after it's removed) -- not just that the flags are accepted.
   with a full `-reinit` resync immediately after. A script bug, a killed
   SSH session, or an interrupted run partway through Stage 2 could leave
   the target replica genuinely corrupted until the next successful sync.
-- It deliberately removes the target domain's own `<vmsync:vmsync>`
+- It deliberately removes the target domain's own vmsync
   metadata block (`virsh metadata ... --remove --config`) to induce
   genuine, repeatable checkpoint-chain-inconsistency failures for
   `-reinit-after-failures` testing. This is real target-side state churn,
@@ -103,6 +103,64 @@ Results land in `results/<run-id>/`: `results.csv` (machine-readable),
 `logs/*.log` (full stdout+stderr per run), `prom/*.prom` (the raw
 `-prometheus-textfile` output per run).
 
+### Did it work?
+
+Each stage prints its own verdict as a banner the moment it finishes, and
+the run ends with an overall one — after the report, which is long:
+
+```
+[…] ============================================================
+[…]   BENCH RESULT: FAIL
+[…] ============================================================
+    matrix       PASS     1170 vmsync runs, all exited 0
+    failover     FAIL     4 of 21 checks failed
+    fence-agent  SKIPPED  binaries unset
+[…] ============================================================
+```
+
+The same table heads `report.md`, so a skim reaches the outcome rather than
+inferring it from the tables below.
+
+**The exit status means something**, so this can be driven by something that
+acts on the answer:
+
+| exit | meaning |
+| --- | --- |
+| `0` | every stage that ran passed |
+| `1` | a stage failed — or, in a real run, *nothing was verified*: stages were asked for and every one of them skipped, which is usually a config problem |
+| `1` | a `die`: a fatal precondition, before any stage could run |
+
+`--dry-run` verifies nothing by design and exits `0`.
+
+A stage's verdict comes from `results.csv` rather than from each stage
+remembering to report one: every stage but the matrix records `PASS`/`FAIL`/
+`SKIP` per assertion in the notes column, and the matrix — which has no
+assertions, only timings — fails if any `vmsync` exited non-zero.
+
+## Transport: every stage but the matrix
+
+Every stage **except Stage 1** adds `-compress` to its syncs, via
+`BENCH_SYNC_ARGS` in `bench.conf`.
+
+Stage 1 is the one stage measuring transport, so it chooses its own from
+`scenarios.conf` and is never given these. Every other stage copies a disk
+only so there is something real to tamper with, reinit, snapshot, promote or
+fence — the transport is incidental, and the fastest way across the wire is
+simply the least waiting. On a link that is the bottleneck (a saturated 1GbE
+reads as roughly 110 MB/s in `results.csv`) that is most of their runtime,
+and Stage 6 alone does three full copies.
+
+It does not change what those stages test. vmsync's port allocator handles
+*"whichever combination of `-compress`/`-netbuffer`/`-verify` is active"* by
+design, reserving 4N target ports when both are on, so the verify modes
+compose with the bridge rather than working around it. Stage 3 already
+passed `-compress` unconditionally before this was a setting.
+
+`-compress` needs `vmsync-bridge-helper` on the **target** host. Without it
+every affected stage fails at its baseline — and says so, naming this
+setting. Set `BENCH_SYNC_ARGS=""` to turn it off, or to any vmsync transport
+flags (`"-compress=zstd -compress-level 3"`, `"-compress -netbuffer 128k,1G"`).
+
 ## What this does and does not control
 
 **Stage 1 (transport matrix)** times a full sync (`-reinit`) followed
@@ -129,9 +187,40 @@ perfectly controlled; if you need a fixed, reproducible incremental
 workload, write a known amount of data from inside the guest yourself
 between runs.
 
-**Stage 2 (verify + tamper)** always tests all three modes against the
-same plain, no-bridge baseline sync, so the three are directly comparable
-to each other regardless of whatever Stage 1 scenario ran last. One
+**Stage 2 (verify + tamper)** runs *four* sub-tests, not three, because two
+different protections are involved and conflating them is how this stage
+spent a long time reporting `PASS` without ever exercising `-verify` at all.
+
+`vmsync` refuses an incremental sync when the target file's mtime is newer
+than the last recorded sync (`"Target file on system is newer"` in
+`cmd/vmsync/main.go`), and that check fires *early* — before the checkpoint
+is created, long before any compare. `qemu-io` tampering bumps the mtime, so
+the tamper sync used to die at that guard, and the harness scored its
+non-zero exit as "`-verify` detected the mismatch". It had not; it had never
+run.
+
+The two checks cover disjoint threats, so both are now tested by name:
+
+- **`verify-guard`** tampers and leaves the mtime alone, asserting the guard
+  refuses the sync *and* that no verification metric was emitted. That is
+  the "somebody wrote to the replica through the filesystem" case.
+- **`verify-compare` / `verify-fast` / `verify-online`** tamper, restore the
+  original mtime, and assert the compare ran and reported a mismatch. That
+  is the "contents diverged with nothing visible at the filesystem layer"
+  case — a bad sector, a silent write error, a scrub miscompare. **Bit rot
+  does not touch mtime**, so restoring it is not a way around the guard; it
+  is the only way to construct the scenario `-verify` exists for.
+
+The verify sub-tests key on `vmsync_verification_state`, which vmsync emits
+only for a run that actually reached its compare. Its *presence* answers
+"did this test test anything" and its *value* answers "what did it find" —
+a distinction an exit code cannot make.
+
+All three modes run against an
+identically-configured baseline sync, so they are directly comparable
+to each other regardless of whatever Stage 1 scenario ran last — see
+[Transport](#transport-every-stage-but-the-matrix) for what that
+configuration is. One
 caveat specific to `-verify=online`: unlike `compare`/`fast`, it never
 suspends the source, and cross-references any mismatch it finds against
 what the guest wrote to the *source* during the compare window, discarding
@@ -140,13 +229,80 @@ them. Since this harness tampers the *target* independently of source
 guest activity, that reconciliation should not swallow it — but if the
 running guest happens to legitimately rewrite the exact same region during
 that window, `-verify=online` could correctly and legitimately report no
-mismatch this round. `bench.conf`'s `TAMPER_OFFSET` should point somewhere
+mismatch this round. `bench.conf`'s tamper band should sit somewhere
 the guest is unlikely to be actively rewriting, to keep this rare; the
 harness logs a specific warning distinguishing this from an actual
 detection bug when it happens.
 
+### Where the corruption goes
+
+By default (`TAMPER_MODE=random`) every tamper picks its own offset and
+length, drawn from `TAMPER_BAND_START`/`TAMPER_BAND_END` and
+`TAMPER_LENGTH_MIN`/`TAMPER_LENGTH_MAX`. A single hand-picked offset only
+ever proves that *that* offset is detectable; varying it finds boundary
+cases in the mismatch scanner and offsets whose detection depends on where
+they fall.
+
+That is only useful because it is **reproducible**. The draw is seeded from
+`TAMPER_SEED`, which defaults to the run id, is logged at startup, and is
+repeated in every failure message. Re-run with `TAMPER_SEED=<that value>`
+and the whole sequence of corruptions repeats byte for byte. The seed is
+hashed with `md5sum` rather than using `$RANDOM` or `awk`'s `srand()`,
+neither of which is reproducible across hosts or implementations — and a
+failure you cannot replay is one you cannot investigate.
+
+`TAMPER_LENGTH_MIN` defaults to 64KiB, and that floor is arithmetic rather
+than caution. vmsync reports mismatches at a 4096-byte granularity, so
+anything smaller than that is indistinguishable from a 4KiB tamper. Above
+that, `-verify=online` discards a whole reported range when *any* byte of it
+overlaps a region the guest wrote during the compare window, and those
+regions come from a dirty bitmap at qemu's default 64KiB granularity — so a
+tamper smaller than one granule can be swallowed whole by an unrelated guest
+write and read as "verify missed it".
+
+Set `TAMPER_MODE=fixed` to go back to a single `TAMPER_OFFSET`/`TAMPER_LENGTH`.
+
+### Stage 8 (`verify-long`), opt-in
+
+Every other stage verifies a replica built moments ago by a single
+`-reinit`. Stage 8 builds one the way a real deployment does — twenty
+incremental syncs, each carrying real guest writes — and only then asks
+whether corruption is still detectable. It then makes five tamper+verify
+attempts, cycling the three modes, rebuilding a shorter chain between each.
+
+Healing after a tamper has to be a full `-reinit` (an incremental sync
+re-copies only what the *source's* dirty bitmap says changed, and the source
+never wrote to the corrupted region), which costs the chain — hence the
+rebuild between attempts.
+
+It needs the guest to write between copies, or the chain is twenty no-ops
+against an empty dirty bitmap and the stage proves nothing. There is no
+`virsh` verb for running a command inside a guest, so this goes through the
+QEMU guest agent's `guest-exec` RPC. **Two separate things must hold**: the
+agent must be responding — vmsync's own `FSFreeze` already needs that — *and*
+`guest-exec` must not be blocked. RHEL-family packages ship
+`/etc/sysconfig/qemu-ga` with `guest-exec` and `guest-file-*` in `BLOCK_RPCS`
+by default, so an agent that happily freezes filesystems will still refuse to
+run `dd`. The harness probes `guest-info` for this and **skips the stage**
+with a message naming the file, rather than spending an hour proving that
+vmsync can copy nothing twenty times.
+
+Two details that would otherwise make the chain meaningless: the write uses
+`conv=fsync`, because the dirty bitmap tracks writes that reach the virtual
+block device and a `dd` whose data is still in the guest's page cache leaves
+it empty; and the harness polls `guest-exec-status` until the write has
+exited, because `guest-exec` returns a pid immediately and the next
+checkpoint would otherwise be taken mid-write. The stage asserts that the
+chain actually carried data, and fails if none of the copies transferred a
+byte.
+
+Budget for it: roughly `VERIFY_LONG_COPIES + VERIFY_LONG_ATTEMPTS × (2 +
+VERIFY_LONG_RECOPIES)` syncs, five of which are full `-reinit` resyncs.
+Consider setting `-replaced-disk-action=delete` for the run — the default
+renames each discarded target disk aside and those copies are never reaped.
+
 **Stage 3 (`-reinit-after-failures`)** first runs its own baseline full
-sync, then removes the target domain's own `<vmsync:vmsync>` metadata
+sync, then removes the target domain's own vmsync metadata
 block (`virsh metadata ... --remove --config`) to induce `N` genuine,
 repeatable incremental-sync failures -- the same
 `unverifiableCheckpointMetadataError` a real target would hit if it were
@@ -283,7 +439,9 @@ is passes just as happily when both are wrong together. Then:
 - an explicit **`-target-disk-owner` overrides** what was preserved.
 
 Each property only happens when a disk file is created from scratch, so
-this costs **two extra full copies** on top of the stage's own baseline.
+this costs **two extra full copies** on top of the stage's own baseline --
+see [Transport](#transport-every-stage-but-the-matrix) for why that is
+cheaper than it sounds.
 The sentinel it uses is the disk's *group*, set to `root` while leaving the
 owning user alone — deliberately harmless, so the disk stays openable
 throughout and an interrupted run never leaves an unbootable replica. If
@@ -296,11 +454,39 @@ target host over SSH rather than being driven from here like every other
 stage. Without that setting the stage skips with a message rather than
 failing.
 
-Why it is opt-in rather than default: an interrupted run can leave the
-target `promoted`, and that makes every later sync fail until somebody
-clears it with `vmsync -update-role=target`. That is a worse thing to
-leave behind than any other stage does, even though nothing here is more
+Why it is opt-in rather than default: it promotes a real replica, and a
+target left `promoted` refuses **every** later sync in the estate — not just
+this harness's — until somebody clears it. That is a worse thing to leave
+behind than any other stage does, even though nothing here is more
 destructive to the target than `-reinit` already is.
+
+Three things keep that from happening. The stage puts the target back itself;
+an `EXIT` trap does the same on a `die` or a Ctrl+C; and if the way back does
+not take, it says so loudly and prints the exact command:
+
+```bash
+vmsync -update-role target -target-uri qemu:///system -target-domain <vm>   # on the target host
+```
+
+Both this stage and Stage 7 also **wipe vmsync's metadata off the domains
+they are about to use** before starting, so a run left half-finished by a
+`kill -9` does not block the next one. Stage 7 does the source too, since it
+is the one that fences.
+
+That reset goes through `virsh`, not `vmsync -update-role`, and the
+distinction matters: a harness that resets state through the code it is
+testing cannot recover when that code is broken. When writing metadata
+failed outright, `-update-role` failed with it, every run left the target
+`promoted`, and the *next* run then failed at its baseline for reasons that
+said nothing about the real fault. `virsh` talks to libvirt directly and has
+no such dependency. If the reset does not take, the stage still skips with
+the manual command rather than failing three minutes into a copy.
+
+Wiping the whole block rather than just the role is deliberate: these stages
+`-reinit` the target immediately so nothing in it is worth keeping, it sweeps
+up anything an interrupted run or a hand-run `virsh metadata --set` left
+behind, and it makes the stage's own *"the sync recorded a `replica_source`"*
+assertion prove the sync wrote it rather than that it was already there.
 
 **Stage 7 (fence-agent)** is the other half: Stage 6 proves the fence
 *token* is written and readable, this proves it is **acted on**. A real

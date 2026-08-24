@@ -236,6 +236,30 @@ prom_sum() {
 	awk -v m="^${metric}{" '$0 ~ m { s += $NF } END { printf "%d\n", s+0 }' "$file"
 }
 
+# prom_has FILE METRIC -> true when METRIC is PRESENT in FILE.
+#
+# Distinct from "prom_sum returned 0", and the distinction is the whole point
+# for the verification metrics: vmsync emits vmsync_verification_state only for
+# a run that actually reached its compare (pkg/metrics/metrics.go gates the
+# whole block, HELP lines included, on RunMetric.VerificationRan). So absent
+# means "this run never verified anything" while 0 means "it verified and found
+# no mismatch" -- two outcomes a summing reader cannot tell apart, and the
+# difference between a test that proved something and one that did not.
+prom_has() {
+	local file="$1" metric="$2"
+	[ -f "$file" ] || return 1
+	grep -q "^${metric}{" "$file"
+}
+
+# prom_first FILE METRIC -> the value of METRIC's first series, or empty when
+# the metric is absent. For single-valued, whole-run metrics (a state or a
+# timestamp) where summing across series would be meaningless.
+prom_first() {
+	local file="$1" metric="$2"
+	[ -f "$file" ] || return 0
+	awk -v m="^${metric}{" '$0 ~ m { print $NF; exit }' "$file"
+}
+
 # --- result recording --------------------------------------------------------
 
 # results_init FILE - (re)creates the CSV results file with a header.

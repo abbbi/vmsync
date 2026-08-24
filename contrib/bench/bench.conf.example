@@ -97,18 +97,104 @@ BRIDGE_HELPER_PATH=""   # empty = vmsync's own default (/usr/local/bin/vmsync-br
 # correctness tests.
 TAMPER_DISK_DEV=vda
 
-# Byte offset and length to overwrite with a fixed 0xAA pattern via
-# `qemu-io -c "write -P 0xAA OFFSET LENGTH"`. Both accept qemu-io's own
-# suffixes (k/M/G). Pick an offset that's actually within the disk's
-# allocated, real data region (well inside a filesystem, not e.g. the very
-# first few KiB of an unpartitioned disk) so the write is a genuine,
-# detectable content change -- and, for -verify=online specifically (see
-# README.md's note on its reconciliation window), somewhere the running
-# guest is unlikely to legitimately rewrite during a short compare window,
-# to avoid an occasional false "not detected" from the online mode
-# correctly discarding an in-window guest write as inconclusive.
+# EVERY byte count in this section is a plain decimal number. qemu-io accepts
+# k/M/G suffixes and an older version of this file advertised them, but the
+# harness now does arithmetic on these values to place a random corruption,
+# and $(( 100M )) is a bash syntax error that ends the run.
+
+# random: each tamper picks its own offset and length (default).
+# fixed:  every tamper uses TAMPER_OFFSET/TAMPER_LENGTH below, as before.
+#
+# Random placement finds what a single hand-picked offset cannot: a corruption
+# the compare happens to skip, a boundary case in the mismatch scanner, an
+# offset whose detection depends on where it falls. It is only useful because
+# it is reproducible -- see TAMPER_SEED.
+TAMPER_MODE=random
+
+# The band a random offset is drawn from. Keep it inside the disk's allocated,
+# real data region: well past the partition table and boot sectors, and not out
+# in never-written space, so the write is a genuine content change rather than
+# a hole the compare has no reason to look at. TAMPER_BAND_END=0 means "up to
+# the disk's virtual size", read off the image at run time.
+TAMPER_BAND_START=67108864   # 64MiB in
+TAMPER_BAND_END=0
+
+# The size range a random tamper is drawn from.
+#
+# The 64KiB floor is not caution, it is arithmetic. vmsync reports mismatches
+# at a 4096-byte granularity, so anything smaller than that is indistinguishable
+# from a 4KiB tamper. And -verify=online discards a whole reported range if ANY
+# byte of it overlaps a region the guest wrote during the compare window, where
+# those regions come from a dirty bitmap at qemu's default 64KiB granularity --
+# so a tamper smaller than one granule can be swallowed whole by an unrelated
+# guest write and read as "verify missed it".
+TAMPER_LENGTH_MIN=65536
+TAMPER_LENGTH_MAX=262144
+TAMPER_ALIGN=4096
+
+# The fill pattern. Must be non-zero: a zero fill is a content no-op wherever
+# the source already reads as zero, and undetectable by every verify mode by
+# design.
+TAMPER_PATTERN=0xAA
+
+# Seed for the random placement. Empty means "derive it from the run id", which
+# is logged at startup and printed with every failure. Re-run with
+# TAMPER_SEED=<that value> to replay a run's corruptions byte for byte.
+#
+# This is what makes random placement worth having. A failure at an offset you
+# cannot reproduce is a failure you cannot investigate.
+#TAMPER_SEED=
+
+# Used only when TAMPER_MODE=fixed. Same guidance as TAMPER_BAND_START above:
+# somewhere with real data in it. Note the default length is below the 64KiB
+# floor explained above, and is kept only for continuity with older configs.
 TAMPER_OFFSET=104857600   # 100MiB in
 TAMPER_LENGTH=4096
+
+# --- verify after a long incremental chain (Stage 8, --stages ...,verify-long) --
+#
+# Every other stage verifies a replica built moments ago by a single -reinit.
+# This one builds it the way a real deployment does -- dozens of incremental
+# syncs, each carrying real guest writes -- and only then asks whether
+# corruption is still detectable. It is the longest stage by a wide margin and
+# is opt-in for that reason.
+#
+# It needs the guest to actually write between copies, or the chain is just
+# VERIFY_LONG_COPIES no-ops against an empty dirty bitmap and the stage proves
+# nothing. That is what GUEST_DIRTY below is for; without it the stage SKIPS
+# rather than reporting a green result that verified nothing.
+
+VERIFY_LONG_COPIES=20      # incremental syncs before the first tamper
+VERIFY_LONG_ATTEMPTS=5     # tamper+verify attempts, cycling compare/fast/online
+VERIFY_LONG_RECOPIES=3     # incremental syncs between attempts
+
+# --- dirtying the guest's own disk ------------------------------------------
+#
+# There is no virsh verb for running a command inside a guest; this goes through
+# the QEMU guest agent's guest-exec RPC.
+#
+# TWO separate things must be true, and the first does not imply the second: the
+# agent has to be running (vmsync's own FSFreeze already needs that), AND
+# guest-exec must not be blocked. RHEL-family packages ship
+# /etc/sysconfig/qemu-ga with guest-exec and guest-file-* listed in BLOCK_RPCS
+# by default, so an agent that happily freezes filesystems will still refuse to
+# run dd. Remove it from that list and restart qemu-guest-agent. The harness
+# probes for this and says so rather than failing obscurely mid-stage.
+GUEST_DIRTY=yes
+
+# Always the same path, rewritten in place. That keeps the guest's block
+# allocation stable, so every round dirties a comparable number of blocks and
+# the per-round transferred_bytes in results.csv is a flat line any deviation
+# stands out against. A fresh file per round would grow the image monotonically
+# across twenty rounds instead.
+GUEST_DIRTY_PATH=/var/tmp/vmsync-bench-dirty
+GUEST_DIRTY_MIB=64
+
+# How long to wait for each in-guest write to finish. guest-exec is
+# asynchronous -- it returns a pid immediately -- so the harness polls
+# guest-exec-status rather than letting the next checkpoint be taken while dd
+# is still running.
+#GUEST_DIRTY_TIMEOUT=120
 
 # --- reinit-after-failures test ------------------------------------------
 
