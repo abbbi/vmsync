@@ -52,47 +52,70 @@ const VerifyWindowCheckpointName = "vmsync-verify-window"
 
 const (
 	metadataNamespace = `http://vmsync.org/xmlns/libvirt/domain/1.0`
-	// metadataWritePrefix is deliberately NOT "vmsync", and every field
-	// element carries it. Both halves of that are load-bearing.
+	// vmsync's metadata element is written in TWO different spellings,
+	// because it is written through two APIs that own the namespace
+	// differently. Which one is used is not a style choice; each is the only
+	// one its API accepts without destroying something.
 	//
-	// virDomainSetMetadata takes the fragment plus a prefix and a uri, and
-	// injects the namespace itself with xmlNewNs(root, uri, metadataPrefix).
-	// libxml2's xmlNewNs returns NULL when that PREFIX is already declared on
-	// the node, and libvirt turns that into "internal error: failed to create
-	// a new XML namespace". So the fragment may not declare `vmsync` itself --
-	// which the original `<vmsync:vmsync xmlns:vmsync="...">` did, and every
-	// write through the metadata API failed that way: promotion, role changes,
-	// failure counting, and recording replica_targets on the source. It hid
-	// for a long time because the other writer embeds the identical XML in a
-	// whole domain document and redefines it, and a define parses the metadata
-	// subtree without injecting anything, so target-side metadata appeared
-	// while source-side metadata silently did not.
+	// virDomainSetMetadata (metadata.go) takes the fragment plus a prefix and
+	// a uri and does the binding itself. libvirt's own source, in
+	// virXMLInjectNamespace:
 	//
-	// Declaring the namespace as the DEFAULT instead got past that, and was
-	// still wrong. libvirt does not keep it: a domain written that way reads
-	// back as
+	//	if (!(ns = xmlNewNs(node, uri, key)))                 -> hard error
+	//	virXMLForeachNode(node, virXMLAddElementNamespace, ns);
+	//
+	// where virXMLAddElementNamespace is `if (!node->ns) xmlSetNs(node, ns)`.
+	// So a fragment that binds nothing gets every one of its elements bound
+	// by libvirt, and a fragment that binds its own elements leaves libvirt's
+	// declaration attached to nothing. And xmlNewNs returns NULL when that
+	// PREFIX is already declared on the node -- which is why the original
+	// `<vmsync:vmsync xmlns:vmsync="...">` failed every write through this API
+	// with "internal error: failed to create a new XML namespace": promotion,
+	// role changes, failure counting, replica_targets on the source.
+	//
+	// The reason the fragment must be NAKED, rather than merely avoiding the
+	// `vmsync` prefix, is the read side. virXMLExtractNamespaceXML unbinds
+	// every element in the uri and then removes ONE declaration of it:
+	//
+	//	virXMLForeachNode(nodeCopy, virXMLRemoveElementNamespace, uri);
+	//	for (actualNs = nodeCopy->nsDef; actualNs; actualNs = actualNs->next) {
+	//	    if (STREQ_NULLABLE(actualNs->href, uri)) { ...unlink...; break; }
+	//
+	// A fragment that declares the uri itself therefore leaves TWO
+	// declarations on the stored element -- its own and libvirt's -- of which
+	// the extractor deletes exactly one. What comes back is
 	//
 	//	<vmsync xmlns:vmsync="http://vmsync.org/xmlns/libvirt/domain/1.0">
 	//	  <failure_count id="1"/>
 	//	</vmsync>
 	//
-	// -- the default declaration turned into a prefixed one that nothing in
-	// the fragment uses, the tag left bare, the fields in no namespace at all.
-	// Fields that rely on a default declaration for their namespace lose it
-	// with the declaration, and since every writer here is a
-	// read-modify-write, a field that reads as absent is dropped from the next
-	// write rather than preserved.
+	// with every element unbound and a declaration nothing uses: read on its
+	// own, a domain with no metadata. That is a real fragment off a real
+	// domain, and it is what a default declaration produced. A different
+	// prefix produces it too -- the extractor deletes whichever declaration
+	// comes first and keeps libvirt's. Declaring nothing leaves exactly one
+	// declaration to delete, and the fragment returns byte-identical to the
+	// one that was sent.
+	metadataFragmentStart = `<vmsync>`
+	metadataFragmentEnd   = `</vmsync>`
+
+	// The other writer grafts the element straight into a domain document and
+	// redefines it (domxml.go), where nothing injects anything -- so here the
+	// element must bind itself. It must also not be naked: every define runs
+	// virDomainDefPostParseCommon, which calls
+	// virXMLNodeSanitizeNamespaces(def->metadata), and that deletes any child
+	// of <metadata> with no namespace outright.
 	//
-	// A separate prefix fixes both ends: `vmsync` stays free for libvirt to
-	// inject, and every field is bound to a declaration that sits on the
-	// element itself, so the fragment resolves standalone no matter what is
-	// done to the document around it. It is also the shape libvirt documents
-	// for <metadata> children, and the shape vmsync used for years before the
-	// prefix collision forced a change -- the same XML, with the one prefix
-	// libvirt reserves renamed out of the way.
-	metadataWritePrefix = "vms"
-	metadataStart       = `<` + metadataWritePrefix + `:vmsync xmlns:` + metadataWritePrefix + `="` + metadataNamespace + `">`
-	metadataEnd         = `</` + metadataWritePrefix + `:vmsync>`
+	// The two spellings converge on ONE on-disk form, because libvirt binds
+	// the naked fragment to exactly this prefix: `<vmsync:vmsync
+	// xmlns:vmsync="...">` with prefixed children. That is also the spelling
+	// every vmsync version ever shipped recognises, which matters more than it
+	// looks -- virXMLNodeSanitizeNamespaces resolves two children sharing a
+	// namespace by deleting the LATER one, so if an older build ever failed to
+	// recognise this element and appended a second beside it, libvirt would
+	// keep the stale one and silently discard the new write.
+	metadataElementStart = `<` + metadataPrefix + `:vmsync xmlns:` + metadataPrefix + `="` + metadataNamespace + `">`
+	metadataElementEnd   = `</` + metadataPrefix + `:vmsync>`
 
 	MetadataFieldLastCheckpoint = "last_checkpoint"
 	MetadataFieldLastSync       = "last_sync_timestamp"
@@ -1257,13 +1280,19 @@ func RecordTargetSyncFailure(targetURI, targetDomain string) (int, error) {
 	// most needs a failure recorded is a target that has been promoted and
 	// is RUNNING, and rewriting a live domain's persistent definition from
 	// a typed round-trip is how configuration goes missing.
-	frag, err := ReadDomainMetadata(dom)
+	// readDomainMetadataFields, not allMetadataFields: what comes back here is
+	// the single element virDomainGetMetadata returned, not a <metadata> body,
+	// and the two are read by deliberately different rules. Reading a fragment
+	// with the document reader is how this counter got stuck at 1 -- every
+	// increment read the stored value as absent and re-recorded 1, so
+	// -reinit-after-failures never reached its threshold.
+	fields, err := readDomainMetadataFields(dom)
 	if err != nil {
 		return 0, fmt.Errorf("target domain %s: %w", targetDomain, err)
 	}
 
 	current := 0
-	if value := allMetadataFields(frag)[MetadataFieldFailureCount]; value != "" {
+	if value := fields[MetadataFieldFailureCount]; value != "" {
 		if n, convErr := strconv.Atoi(value); convErr == nil {
 			current = n
 		}
@@ -1343,18 +1372,25 @@ func ParseMetadataField(domainXML string, field string) (string, error) {
 // unrecognized-field ordering is still deterministic across runs rather
 // than depending on Go's randomized map iteration. Fields absent from the
 // map are simply omitted.
-func buildMetadataEntry(fields map[string]string) string {
+// buildMetadataFragment renders the naked form, for virDomainSetMetadata to
+// bind itself. buildMetadataElement renders the self-binding form, for
+// grafting into a domain document. See metadataFragmentStart for why these
+// cannot be the same string.
+func buildMetadataFragment(fields map[string]string) string {
+	return buildMetadataEntry(metadataFragmentStart, metadataFragmentEnd, "", fields)
+}
+
+func buildMetadataElement(fields map[string]string) string {
+	return buildMetadataEntry(metadataElementStart, metadataElementEnd, metadataPrefix+":", fields)
+}
+
+func buildMetadataEntry(open, close, fieldPrefix string, fields map[string]string) string {
 	var b strings.Builder
-	b.WriteString(metadataStart)
+	b.WriteString(open)
 	written := make(map[string]bool, len(fields))
 	writeField := func(field, value string) {
-		// Prefixed, against the declaration on the root. A field whose
-		// namespace comes from a DEFAULT declaration loses it the moment
-		// anything drops that declaration, and libvirt does exactly that.
-		// See metadataWritePrefix.
 		b.WriteString("\n  <")
-		b.WriteString(metadataWritePrefix)
-		b.WriteString(":")
+		b.WriteString(fieldPrefix)
 		b.WriteString(field)
 		b.WriteString(" id=\"")
 		_ = xml.EscapeText(&b, []byte(value))
@@ -1377,7 +1413,7 @@ func buildMetadataEntry(fields map[string]string) string {
 		writeField(field, fields[field])
 	}
 	b.WriteString("\n")
-	b.WriteString(metadataEnd)
+	b.WriteString(close)
 	return b.String()
 }
 
@@ -1406,61 +1442,73 @@ func parseMetadataValue(metadataXML string, field string) string {
 // anything not on that list. The wrapping <vmsync:vmsync> element itself
 // is excluded -- it's the container, not a field.
 func allMetadataFields(metadataXML string) map[string]string {
-	fields, _ := metadataFields(metadataXML)
+	fields, _, _ := metadataFields(metadataXML)
 	return fields
 }
 
-// metadataFields walks a vmsync metadata fragment -- or the whole body of a
-// domain's <metadata> element -- and returns its field->id pairs, along with
-// whether vmsync's own container element was found at all.
+// Two readers, and the difference between them is deliberate.
 //
-// Fields are matched by being INSIDE that container, not by carrying vmsync's
-// namespace themselves, and that distinction is the entire point of this
-// function.
+// metadataFields is handed a whole <metadata> BODY, which on any ordinary
+// host holds other tools' blocks too -- libosinfo's is usually the first
+// child. It must therefore identify vmsync's element and decline everything
+// else, because a field harvested from a neighbour's block does not merely
+// read wrong: the next merge writes it into vmsync's own element, on the
+// source, and every replica made from it afterwards.
 //
-// What a field's own namespace looks like coming back is not vmsync's to
-// decide. libvirt re-namespaces the container with its own prefix on the way
-// in, and libxml2 copies, stores, serialises and reparses the document
-// several times before any of it returns; a domain written with a default
-// declaration comes back with that declaration turned prefixed and unused, so
-// every field lands in NO namespace, which a per-field namespace match --
-// what this did -- reads as a domain with no metadata at all. The writer no
-// longer depends on a default declaration (see metadataWritePrefix), but
-// domains written by older builds still carry one, and nothing stops a future
-// libvirt from reshaping the new form too.
+// metadataFragmentFields is handed the single element virDomainGetMetadata
+// returned, which libvirt located BY vmsync's uri. It is ours by
+// construction, and it has to be taken on that basis, because the extractor
+// deliberately strips the evidence: virXMLExtractNamespaceXML unbinds every
+// element in the uri and deletes a declaration of it before serialising, so
+// absence of a namespace on the way out says nothing at all about what is
+// stored. See metadataFragmentStart.
 //
-// That is not just a failed read. Every writer here is a read-modify-write:
-// SetDomainMetadataFields merges its updates into whatever it read back, so
-// fields that read as absent are not preserved, they are dropped from the
-// next write. One unrecognised spelling therefore erases replication_role,
-// last_checkpoint and the whole promotion record the next time anything
-// touches this domain's metadata for any reason.
+// Both share the field rule, and that rule matches on CONTAINMENT rather than
+// on each field's own namespace. It has to: under the spelling libvirt hands
+// back, the fields have no namespace. Matching per-field -- what this did --
+// read a fully populated domain as empty, and since every writer here is a
+// read-modify-write, a field that reads as absent is not preserved but
+// dropped from the next write. One unrecognised spelling therefore erases
+// replication_role, last_checkpoint and the whole promotion record the next
+// time anything touches this domain's metadata for any reason.
 //
-// The container is still matched by NAMESPACE, and that is what makes scoping
-// to it safe rather than greedy: the namespace is how libvirt itself
-// identifies the element -- virDomainGetMetadata and `virsh metadata` both
-// take the uri and never the prefix -- so everything inside it is vmsync's by
-// construction, whatever namespace its serialisation left the children in.
-//
-// Elements in vmsync's namespace are still accepted outside any container
-// too, so this stays a superset of the rule it replaces and nothing that read
-// correctly before can stop reading now.
-func metadataFields(metadataXML string) (map[string]string, bool) {
+// Both also report `malformed`, for a shape that parses but cannot be
+// trusted -- a nested container, which no version has ever written and which
+// would make the fields under it read as an empty-but-valid block. That is
+// the one case a merge must refuse rather than treat as "nothing was there".
+func metadataFields(metadataXML string) (fields map[string]string, sawContainer, malformed bool) {
+	return walkMetadata(metadataXML, func(_ int, el xml.StartElement) bool {
+		return isMetadataContainer(el)
+	})
+}
+
+func metadataFragmentFields(fragment string) (fields map[string]string, sawContainer, malformed bool) {
+	return walkMetadata(fragment, func(depth int, el xml.StartElement) bool {
+		// depth 2 is the fragment's own root -- 1 is the <metadata> wrapper
+		// walkMetadata puts around it. The name is still checked, so a
+		// wildly unexpected return is refused rather than mined for fields.
+		return (depth == 2 && el.Name.Local == metadataPrefix) || isMetadataContainer(el)
+	})
+}
+
+func walkMetadata(metadataXML string, isContainer func(depth int, el xml.StartElement) bool) (map[string]string, bool, bool) {
 	fields := map[string]string{}
-	sawContainer := false
+	sawContainer, malformed := false, false
 	decoder := xml.NewDecoder(strings.NewReader("<metadata>" + metadataXML + "</metadata>"))
 	depth, containerDepth := 0, -1
 	for {
 		token, err := decoder.Token()
 		if err != nil {
-			return fields, sawContainer
+			return fields, sawContainer, malformed
 		}
 		switch el := token.(type) {
 		case xml.StartElement:
 			depth++
-			if isMetadataContainer(el) {
+			if isContainer(depth, el) {
 				sawContainer = true
-				if containerDepth < 0 {
+				if containerDepth > 0 {
+					malformed = true
+				} else {
 					containerDepth = depth
 				}
 				continue
@@ -1472,8 +1520,18 @@ func metadataFields(metadataXML string) (map[string]string, bool) {
 			if !inContainer && el.Name.Space != metadataNamespace {
 				continue
 			}
+			// Never a field called `vmsync`. Writing one back would nest a
+			// second container inside the first, which every later read
+			// reports as malformed -- a trap this would otherwise set for
+			// itself.
+			if el.Name.Local == metadataPrefix {
+				continue
+			}
 			for _, attr := range el.Attr {
-				if attr.Name.Local == "id" {
+				// An unprefixed id, specifically: a `t:id` belongs to
+				// whatever declared `t`, and taking it would make the value
+				// depend on attribute order.
+				if attr.Name.Local == "id" && attr.Name.Space == "" {
 					fields[el.Name.Local] = attr.Value
 					break
 				}

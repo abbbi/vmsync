@@ -173,16 +173,17 @@ func ignoreDiskElement(disk *etree.Element) bool {
 // prefix or DECLARES vmsync's namespace, under any prefix or as the default.
 // The spellings that reach here in practice:
 //
-//   - `<vmsync:vmsync xmlns:vmsync="...">` -- every domain written before the
-//     SetMetadata fix, and what libvirt produces when it injects its prefix;
-//   - `<vmsync xmlns="...">` -- the default-namespace form written between
-//     the two fixes, when a self-declared prefix was known to make
-//     virDomainSetMetadata fail but the cost of a default declaration was
-//     not yet known (see metadataWritePrefix);
+//   - `<vmsync:vmsync xmlns:vmsync="...">` -- what this writer emits, what
+//     libvirt stores for the other writer, and what every domain written
+//     before any of this carries;
+//   - `<vmsync xmlns="...">` and `<vms:vmsync xmlns:vms="...">` -- two
+//     intermediate spellings, from builds that knew a self-declared `vmsync`
+//     prefix made virDomainSetMetadata fail but not yet what the extractor
+//     does to a fragment that declares the uri at all (see
+//     metadataFragmentStart);
 //   - `<vmsync xmlns:vmsync="...">` with unprefixed children -- what libvirt
-//     hands back after storing the previous one, with the declaration turned
-//     prefixed and the tag left bare;
-//   - `<vms:vmsync xmlns:vms="...">` -- what vmsync writes now.
+//     handed back for both of those, the declaration turned prefixed and
+//     unused, the tag left bare.
 //
 // Missing any of them would not merely skip an update: the caller adds its
 // rebuilt element afterwards regardless, so an unrecognised existing one
@@ -197,7 +198,12 @@ func isVmsyncMetadataElement(el *etree.Element) bool {
 		return false
 	}
 	if el.Space == metadataPrefix {
-		return true
+		// vmsync's own prefix. Its declaration may sit on an ancestor and so
+		// not be visible on the element, which is why the absence of one is
+		// not disqualifying -- but a declaration on the element naming
+		// somebody ELSE's uri is.
+		uri := el.SelectAttrValue("xmlns:"+metadataPrefix, "")
+		return uri == "" || uri == metadataNamespace
 	}
 	return declaresMetadataNamespace(el)
 }
@@ -242,7 +248,11 @@ func setMetadataFieldsInDoc(domainXML string, updates map[string]string, removeF
 		fragment = frag
 	}
 
-	merged, err := mergeMetadataFields(fragment, updates, removeFields...)
+	fields, err := metadataFieldsFromFragment(fragment)
+	if err != nil {
+		return "", err
+	}
+	merged, err := mergeMetadataFields(fields, updates, removeFields...)
 	if err != nil {
 		return "", err
 	}
@@ -250,9 +260,14 @@ func setMetadataFieldsInDoc(domainXML string, updates map[string]string, removeF
 	if existing != nil {
 		metadata.RemoveChild(existing)
 	}
-	if merged != "" {
+	if len(merged) > 0 {
+		// buildMetadataElement, not buildMetadataFragment: this element is
+		// going straight into a domain document, where nothing will bind it
+		// and where every define runs virXMLNodeSanitizeNamespaces, which
+		// deletes namespace-less children of <metadata> outright. See
+		// metadataElementStart.
 		fragDoc := etree.NewDocument()
-		if err := fragDoc.ReadFromString(merged); err != nil {
+		if err := fragDoc.ReadFromString(buildMetadataElement(merged)); err != nil {
 			return "", fmt.Errorf("parse rebuilt vmsync metadata: %w", err)
 		}
 		metadata.AddChild(fragDoc.Root().Copy())

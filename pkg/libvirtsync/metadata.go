@@ -68,74 +68,77 @@ func ReadDomainMetadata(dom *libvirt.Domain) (string, error) {
 	return frag, nil
 }
 
-// mergeMetadataFields applies updates and removals to an existing
-// <vmsync:vmsync> fragment and returns the new one.
+// metadataFieldsFromFragment reads the fields out of one vmsync metadata
+// element, and REFUSES rather than quietly returning nothing when the element
+// is there but cannot be read.
 //
-// Pure, and operating on the fragment rather than a whole domain: the same
-// merge semantics SetMetadataFields documents -- fields not mentioned are
-// preserved, removals win over updates -- but with nothing else in scope to
-// damage. An empty result means the element should be dropped entirely.
-func mergeMetadataFields(fragment string, updates map[string]string, removals ...string) (string, error) {
-	for field := range updates {
-		if !metadataFieldNameRe.MatchString(field) {
-			return "", fmt.Errorf("invalid vmsync metadata field name %q: must start with a letter or underscore and contain only letters, digits, '_', '.' or '-'", field)
-		}
+// That refusal is the point of the function. Every write here is a
+// read-modify-write, so a field this does not return is not merely unread --
+// it is dropped from the write that follows, replication_role and the
+// promotion record among it. Refusing costs a failed metadata update that
+// says exactly what it saw; proceeding costs the domain's safety markers,
+// silently, and shows up the next time somebody needs them.
+//
+// An absent element is not an error: a domain with no vmsync metadata is the
+// ordinary first-run state. Nor is a container that is genuinely empty.
+func metadataFieldsFromFragment(fragment string) (map[string]string, error) {
+	fields, sawContainer, malformed := metadataFragmentFields(fragment)
+	if fragment == "" {
+		return fields, nil
 	}
-
-	fields, sawContainer := metadataFields(fragment)
-	// A fragment that is present but yields nothing is the dangerous case,
-	// not the empty one: this is a merge, so anything not read back here is
-	// dropped from the write that follows -- replication_role and the
-	// promotion record included. Refusing costs a failed metadata update and
-	// says exactly what it saw; proceeding costs the domain's safety markers,
-	// silently, and only shows up the next time somebody needs them.
-	if fragment != "" && !sawContainer && len(fields) == 0 {
-		return "", fmt.Errorf("the vmsync metadata already on this domain could not be read, refusing to overwrite it: "+
+	if malformed || (!sawContainer && len(fields) == 0) {
+		return nil, fmt.Errorf("the vmsync metadata already on this domain could not be read, refusing to overwrite it: "+
 			"this update merges into what was read back, so writing now would drop whatever that element holds "+
 			"(replication_role and the promotion record among it). The fragment read was: %s", fragment)
 	}
+	return fields, nil
+}
+
+// mergeMetadataFields applies updates and removals to a field set.
+//
+// Operating on fields rather than on serialised XML is what keeps the two
+// writers honest: they render the result differently -- one naked for
+// virDomainSetMetadata to bind, one self-binding for the domain document (see
+// metadataFragmentStart) -- and a merge that returned a string would have to
+// pick one of those for both. An empty result means the element should be
+// dropped entirely.
+func mergeMetadataFields(fields, updates map[string]string, removals ...string) (map[string]string, error) {
+	for field := range updates {
+		if !metadataFieldNameRe.MatchString(field) {
+			return nil, fmt.Errorf("invalid vmsync metadata field name %q: must start with a letter or underscore and contain only letters, digits, '_', '.' or '-'", field)
+		}
+	}
+
+	merged := maps.Clone(fields)
+	if merged == nil {
+		merged = map[string]string{}
+	}
 	for field, value := range updates {
-		fields[field] = value
+		merged[field] = value
 	}
 	// After the updates, so a field named in both is removed -- matching
 	// SetMetadataFields, where that ordering is what lets a caller express
 	// "set these, drop those" in one call without ordering its own arguments.
 	for _, field := range removals {
-		delete(fields, field)
+		delete(merged, field)
 	}
-	if len(fields) == 0 {
-		return "", nil
-	}
-	return buildMetadataEntry(fields), nil
-}
-
-// sameMetadataFields reports whether two metadata fragments carry the same
-// fields with the same values.
-//
-// Comparing the fragments as strings compares the wrong thing. What vmsync
-// writes and what libvirt hands back are never byte-identical: libvirt
-// attaches its own `vmsync` prefix to the element it stores, so a fragment
-// read back always differs from the one that produced it even when not a
-// single field changed. The "nothing to write" check below therefore never
-// fired, and every sync paid for a persistent-definition rewrite it did not
-// need -- on the SOURCE domain, which is production.
-//
-// Only the id attributes are compared, because they are the only thing vmsync
-// stores. Element text and attribute order carry no meaning here, so a
-// reformat by another tool is correctly not treated as somebody else's edit.
-func sameMetadataFields(a, b string) bool {
-	return maps.Equal(allMetadataFields(a), allMetadataFields(b))
+	return merged, nil
 }
 
 // SetDomainMetadataFields merges field changes into a domain's vmsync
 // metadata without redefining the domain.
 //
 // The re-read before writing is the same concurrent-writer guard
-// SetReplicationRole has always had, but it now compares vmsync's own fields
+// SetReplicationRole has always had, but it now compares vmsync's own FIELDS
 // instead of two whole domain documents -- so it detects the thing it cares
 // about (somebody else changed vmsync's metadata) without being defeated by
-// an unrelated change elsewhere in the definition, or by libvirt's own
-// re-spelling of the element (see sameMetadataFields).
+// an unrelated change elsewhere in the definition.
+//
+// Comparing serialised fragments would compare the wrong thing entirely:
+// virDomainGetMetadata does not hand back what virDomainSetMetadata was
+// given, so the "nothing to write" check could never fire and every sync paid
+// for a persistent-definition rewrite it did not need -- on the SOURCE
+// domain, which is production.
 func SetDomainMetadataFields(mgr *Manager, domainName string, updates map[string]string, removals ...string) error {
 	dom, err := mgr.Conn.LookupDomainByName(domainName)
 	if err != nil {
@@ -143,7 +146,7 @@ func SetDomainMetadataFields(mgr *Manager, domainName string, updates map[string
 	}
 	defer dom.Free()
 
-	before, err := ReadDomainMetadata(dom)
+	before, err := readDomainMetadataFields(dom)
 	if err != nil {
 		return fmt.Errorf("domain %s: %w", domainName, err)
 	}
@@ -151,16 +154,23 @@ func SetDomainMetadataFields(mgr *Manager, domainName string, updates map[string
 	if err != nil {
 		return fmt.Errorf("domain %s: %w", domainName, err)
 	}
-	if sameMetadataFields(merged, before) {
+	if maps.Equal(merged, before) {
 		return nil // nothing to write
 	}
 
-	latest, err := ReadDomainMetadata(dom)
+	latest, err := readDomainMetadataFields(dom)
 	if err != nil {
 		return fmt.Errorf("domain %s: %w", domainName, err)
 	}
-	if !sameMetadataFields(latest, before) {
+	if !maps.Equal(latest, before) {
 		return fmt.Errorf("domain %s had its vmsync metadata changed by something else while this update was being prepared; refusing to overwrite it -- check whether another vmsync invocation or an external tool is also managing this domain", domainName)
+	}
+
+	// Empty stays empty: the binding passes NULL for an empty string, which
+	// is how this API spells "remove the element".
+	fragment := ""
+	if len(merged) > 0 {
+		fragment = buildMetadataFragment(merged)
 	}
 
 	// AFFECT_CONFIG: the persistent definition is the record, and it is what
@@ -168,10 +178,18 @@ func SetDomainMetadataFields(mgr *Manager, domainName string, updates map[string
 	// make a running domain's runtime XML agree, but it would also mean
 	// touching a running production domain to record a timestamp, which is
 	// the thing this whole change exists to stop doing.
-	if err := dom.SetMetadata(libvirt.DOMAIN_METADATA_ELEMENT, merged, metadataPrefix, metadataNamespace, libvirt.DOMAIN_AFFECT_CONFIG); err != nil {
+	if err := dom.SetMetadata(libvirt.DOMAIN_METADATA_ELEMENT, fragment, metadataPrefix, metadataNamespace, libvirt.DOMAIN_AFFECT_CONFIG); err != nil {
 		return fmt.Errorf("write vmsync metadata on domain %s: %w", domainName, err)
 	}
 	return nil
+}
+
+func readDomainMetadataFields(dom *libvirt.Domain) (map[string]string, error) {
+	frag, err := ReadDomainMetadata(dom)
+	if err != nil {
+		return nil, err
+	}
+	return metadataFieldsFromFragment(frag)
 }
 
 // ReadDomainMetadataField returns one field from a domain's vmsync
@@ -183,9 +201,9 @@ func ReadDomainMetadataField(mgr *Manager, domainName, field string) (string, er
 	}
 	defer dom.Free()
 
-	frag, err := ReadDomainMetadata(dom)
+	fields, err := readDomainMetadataFields(dom)
 	if err != nil {
 		return "", fmt.Errorf("domain %s: %w", domainName, err)
 	}
-	return allMetadataFields(frag)[field], nil
+	return fields[field], nil
 }

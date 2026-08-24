@@ -20,6 +20,7 @@ package libvirtsync
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"strconv"
 	"strings"
@@ -28,6 +29,8 @@ import (
 
 	"vmsync/pkg/disk"
 	"vmsync/pkg/failover"
+
+	"github.com/beevik/etree"
 
 	"libvirt.org/go/libvirt"
 )
@@ -651,15 +654,15 @@ func TestSetMetadataFieldsAndParseMetadata(t *testing.T) {
 	})
 }
 
-// fieldTag renders the opening tag buildMetadataEntry emits for one field,
+// fieldTag renders the opening tag buildMetadataElement emits for one field,
 // so tests that care about ORDER do not have to hard-code the prefix that
 // carries vmsync's namespace.
 func fieldTag(field string) string {
-	return "<" + metadataWritePrefix + ":" + field
+	return "<" + metadataPrefix + ":" + field
 }
 
 func TestBuildMetadataEntry(t *testing.T) {
-	entry := buildMetadataEntry(map[string]string{
+	entry := buildMetadataElement(map[string]string{
 		MetadataFieldFailureCount:   "3",
 		MetadataFieldLastCheckpoint: "vmsync-cpt-000001",
 	})
@@ -673,7 +676,7 @@ func TestBuildMetadataEntry(t *testing.T) {
 	if idxCheckpoint > idxFailure {
 		t.Errorf("expected last_checkpoint before failure_count (fixed field order), got: %s", entry)
 	}
-	if !strings.HasPrefix(entry, metadataStart) || !strings.HasSuffix(entry, metadataEnd) {
+	if !strings.HasPrefix(entry, metadataElementStart) || !strings.HasSuffix(entry, metadataElementEnd) {
 		t.Errorf("expected entry to start/end with the vmsync block markers, got: %s", entry)
 	}
 }
@@ -686,7 +689,7 @@ func TestBuildMetadataEntry(t *testing.T) {
 // silently omitted the way it used to be even if allMetadataFields had
 // correctly read it back into the map in the first place.
 func TestBuildMetadataEntryUnknownFields(t *testing.T) {
-	entry := buildMetadataEntry(map[string]string{
+	entry := buildMetadataElement(map[string]string{
 		MetadataFieldFailureCount: "3",
 		"zzz_unknown":             "z-value",
 		"aaa_unknown":             "a-value",
@@ -709,7 +712,7 @@ func TestBuildMetadataEntryUnknownFields(t *testing.T) {
 }
 
 func TestParseMetadataValueMissingField(t *testing.T) {
-	entry := buildMetadataEntry(map[string]string{MetadataFieldLastCheckpoint: "vmsync-cpt-000001"})
+	entry := buildMetadataElement(map[string]string{MetadataFieldLastCheckpoint: "vmsync-cpt-000001"})
 	if v := parseMetadataValue(entry, MetadataFieldFailureCount); v != "" {
 		t.Errorf("parseMetadataValue() for an absent field = %q, want empty", v)
 	}
@@ -721,7 +724,7 @@ func TestParseMetadataValueMissingField(t *testing.T) {
 // enumerate -- not just the known ones parseMetadataValue looks up one at
 // a time.
 func TestAllMetadataFields(t *testing.T) {
-	entry := buildMetadataEntry(map[string]string{
+	entry := buildMetadataElement(map[string]string{
 		MetadataFieldLastCheckpoint: "vmsync-cpt-000001",
 		MetadataFieldFailureCount:   "3",
 		"some_future_field":         "future-value",
@@ -991,20 +994,19 @@ func TestReplaceDomainDiskPathRefusesAnUnresolvedDisk(t *testing.T) {
 	}
 }
 
-// TestMergeMetadataFields covers the fragment-level merge that replaced the
+// TestMergeMetadataFields covers the field-level merge that replaced the
 // whole-domain round-trip. Same contract as SetMetadataFields -- preserve
 // what you were not told about, removals win over updates -- but with
-// nothing but vmsync's own element in scope.
+// nothing but vmsync's own fields in scope.
 func TestMergeMetadataFields(t *testing.T) {
 	// From nothing.
-	frag, err := mergeMetadataFields("", map[string]string{
+	got, err := mergeMetadataFields(nil, map[string]string{
 		MetadataFieldReplicationRole: RoleTarget,
 		MetadataFieldFailureCount:    "0",
 	})
 	if err != nil {
 		t.Fatalf("mergeMetadataFields: %v", err)
 	}
-	got := allMetadataFields(frag)
 	if got[MetadataFieldReplicationRole] != RoleTarget || got[MetadataFieldFailureCount] != "0" {
 		t.Fatalf("fields = %v", got)
 	}
@@ -1012,16 +1014,15 @@ func TestMergeMetadataFields(t *testing.T) {
 	// An update must leave untouched fields alone -- including one this
 	// build does not know about, which is how a newer vmsync's metadata
 	// survives an older one writing to the same domain.
-	frag = buildMetadataEntry(map[string]string{
+	existing := map[string]string{
 		MetadataFieldReplicationRole: RoleTarget,
 		MetadataFieldLastCheckpoint:  "vmsync-cpt-000007",
 		"invented_by_a_newer_build":  "keep me",
-	})
-	frag, err = mergeMetadataFields(frag, map[string]string{MetadataFieldFailureCount: "3"})
+	}
+	got, err = mergeMetadataFields(existing, map[string]string{MetadataFieldFailureCount: "3"})
 	if err != nil {
 		t.Fatalf("mergeMetadataFields: %v", err)
 	}
-	got = allMetadataFields(frag)
 	if got[MetadataFieldLastCheckpoint] != "vmsync-cpt-000007" {
 		t.Error("an untouched field was lost")
 	}
@@ -1031,31 +1032,38 @@ func TestMergeMetadataFields(t *testing.T) {
 	if got[MetadataFieldFailureCount] != "3" {
 		t.Error("the update did not apply")
 	}
+	// The input map belongs to the caller and must come back unchanged --
+	// SetDomainMetadataFields compares the merge against it to decide whether
+	// there is anything to write at all.
+	if _, mutated := existing[MetadataFieldFailureCount]; mutated {
+		t.Error("the merge wrote into the caller's field map, so the no-op check can never fire")
+	}
 
 	// Removals win over updates, so "set these, drop those" needs no
 	// ordering discipline from the caller.
-	frag, err = mergeMetadataFields(frag,
+	got, err = mergeMetadataFields(got,
 		map[string]string{MetadataFieldFailureCount: "9"}, MetadataFieldFailureCount)
 	if err != nil {
 		t.Fatalf("mergeMetadataFields: %v", err)
 	}
-	if v := allMetadataFields(frag)[MetadataFieldFailureCount]; v != "" {
+	if v := got[MetadataFieldFailureCount]; v != "" {
 		t.Errorf("failure_count = %q, want it removed", v)
 	}
 
-	// Emptying every field drops the element rather than leaving a husk.
-	frag, err = mergeMetadataFields(buildMetadataEntry(map[string]string{MetadataFieldFailureCount: "1"}),
+	// Emptying every field yields nothing to write, which is how the element
+	// gets dropped rather than left as a husk.
+	got, err = mergeMetadataFields(map[string]string{MetadataFieldFailureCount: "1"},
 		nil, MetadataFieldFailureCount)
 	if err != nil {
 		t.Fatalf("mergeMetadataFields: %v", err)
 	}
-	if frag != "" {
-		t.Errorf("fragment = %q, want empty once no fields remain", frag)
+	if len(got) != 0 {
+		t.Errorf("fields = %v, want empty once no fields remain", got)
 	}
 
 	// An unsafe field name is refused here exactly as SetMetadataFields
-	// refuses it: buildMetadataEntry interpolates names straight into a tag.
-	if _, err := mergeMetadataFields("", map[string]string{"bad name": "x"}); err == nil {
+	// refuses it: the renderers interpolate names straight into a tag.
+	if _, err := mergeMetadataFields(nil, map[string]string{"bad name": "x"}); err == nil {
 		t.Error("accepted a field name that cannot be an XML element")
 	}
 }
@@ -1245,7 +1253,7 @@ func TestReplicationRoleRoundTripsThroughMetadata(t *testing.T) {
 // TestSetMetadataFieldsRejectsUnsafeFieldNames pins the validation that
 // stands in for what the fixed metadataFieldOrder list used to provide for
 // free: buildMetadataEntry interpolates a field name straight into the tag
-// it emits (metadataWritePrefix + ":" + field), and an element NAME -- unlike a value --
+// it emits (metadataPrefix + ":" + field), and an element NAME -- unlike a value --
 // has no escaping available, so an unsafe name can only ever produce
 // malformed XML. Before buildMetadataEntry started emitting unrecognized
 // fields (so SetMetadataFields could keep its promise to preserve fields it
@@ -1904,169 +1912,277 @@ func TestDomainJobOperationName(t *testing.T) {
 	})
 }
 
-// The write shape has two hard requirements, and this pins both.
+// --- vmsync's metadata element, and what libvirt does to it -----------------
 //
-// It must NOT declare the `vmsync` prefix. virDomainSetMetadata is handed the
-// fragment plus a prefix and a uri, and injects the namespace with
-// xmlNewNs(root, uri, "vmsync"); libxml2 returns NULL from that when the
-// prefix is already declared on the node, and libvirt turns it into "internal
-// error: failed to create a new XML namespace". That is what every write
-// through the metadata API did: promotion, role changes, failure counting,
-// and recording replica_targets on the source. It hid for a long time because
-// the OTHER writer embeds the identical XML in a whole domain document and
-// redefines it, which works fine -- a define parses the metadata subtree
-// without injecting anything -- so a target's metadata appeared while a
-// source's silently did not.
-//
-// And every FIELD must carry a prefix bound on the element itself, rather
-// than inherit a default declaration. Declaring the namespace as the default
-// satisfied the first requirement and failed this one: a domain written that
-// way reads back as
-//
-//	<vmsync xmlns:vmsync="http://vmsync.org/xmlns/libvirt/domain/1.0">
-//	  <failure_count id="1"/>
-//	</vmsync>
-//
-// with the default declaration gone and the fields in no namespace -- so they
-// read as absent, and since every writer merges into what it read, absent
-// means dropped on the next write.
-func TestMetadataEntryIsSelfContainedAndLeavesTheVmsyncPrefixFree(t *testing.T) {
-	entry := buildMetadataEntry(map[string]string{
-		MetadataFieldReplicationRole: RoleTarget,
-		MetadataFieldLastCheckpoint:  "vmsync-cpt-000001",
-	})
+// The tests below are pinned to a fragment read off a real domain, and to a
+// model of libvirt's own set/get path transcribed from its source. Between
+// them they cover the bug that made -reinit-after-failures never reach its
+// threshold, and the two failed attempts at fixing it.
 
-	if strings.Contains(entry, "xmlns:"+metadataPrefix+"=") {
-		t.Errorf("the fragment declares the vmsync prefix itself, which makes virDomainSetMetadata fail with "+
-			"\"failed to create a new XML namespace\":\n%s", entry)
-	}
-	if !strings.Contains(entry, `xmlns:`+metadataWritePrefix+`="`+metadataNamespace+`"`) {
-		t.Errorf("the fragment must bind vmsync's namespace to its own prefix, on the element itself:\n%s", entry)
-	}
-	if strings.Contains(entry, `xmlns="`) {
-		t.Errorf("a DEFAULT declaration does not survive libvirt, and takes every field's namespace with it:\n%s", entry)
-	}
-	for _, field := range []string{MetadataFieldReplicationRole, MetadataFieldLastCheckpoint} {
-		if !strings.Contains(entry, fieldTag(field)) {
-			t.Errorf("field %s is not bound to the declared prefix:\n%s", field, entry)
+// theObservedMangling is what virDomainGetMetadata returned for a domain
+// whose metadata had been written with a default namespace declaration.
+// Verbatim, because its value is that it is real: the default declaration has
+// become a prefixed one that nothing uses, the tag is bare, and the field is
+// in no namespace at all.
+const theObservedMangling = `<vmsync xmlns:vmsync="` + metadataNamespace + `">
+  <failure_count id="1"/>
+</vmsync>`
+
+// libvirtNS models a namespace scope for the two functions below: etree keeps
+// prefixes as literal text and resolves nothing, so resolution has to happen
+// here, exactly as libxml2 would do it.
+type libvirtNS struct {
+	def      string
+	prefixes map[string]string
+}
+
+func (s libvirtNS) extend(el *etree.Element) libvirtNS {
+	out := libvirtNS{def: s.def, prefixes: map[string]string{}}
+	maps.Copy(out.prefixes, s.prefixes)
+	for _, a := range el.Attr {
+		if a.Space == "" && a.Key == "xmlns" {
+			out.def = a.Value
+		}
+		if a.Space == "xmlns" {
+			out.prefixes[a.Key] = a.Value
 		}
 	}
-	// Every reader here matches on namespace, so the fields have to actually
-	// BE in it -- an undeclared fragment would parse into no namespace and
-	// read back as nothing, silently wiping metadata on the next merge.
-	got := allMetadataFields(entry)
-	if got[MetadataFieldReplicationRole] != RoleTarget || got[MetadataFieldLastCheckpoint] != "vmsync-cpt-000001" {
-		t.Errorf("the fragment does not read back through allMetadataFields: %v\n%s", got, entry)
+	return out
+}
+
+func (s libvirtNS) href(el *etree.Element) string {
+	if el.Space == "" {
+		return s.def
+	}
+	return s.prefixes[el.Space]
+}
+
+func walkWithNS(el *etree.Element, scope libvirtNS, fn func(*etree.Element, libvirtNS)) {
+	inner := scope.extend(el)
+	fn(el, inner)
+	for _, c := range el.ChildElements() {
+		walkWithNS(c, inner, fn)
 	}
 }
 
-// Every spelling must read back, because a domain carries whichever was
-// current when it was last written, and because libvirt reshapes the element
-// on the way through: it re-namespaces the container with its own prefix, and
-// libxml2 copies, stores, serialises and reparses the document several times
-// before any of it returns.
+// modelSetMetadata models virDomainSetMetadata for VIR_DOMAIN_METADATA_ELEMENT
+// and returns the element as libvirt would store it. From virxml.c:
 //
-// The case that actually bit is "libvirt dropped the default declaration":
-// vmsync's fields are unprefixed and rely on that declaration for their
-// namespace, so once it is gone a per-field namespace match reads a fully
-// populated domain as empty. -reinit-after-failures never tripped because
-// every induced failure read the count back as absent and re-recorded 1 --
-// and, far worse, each metadata write then merged into nothing, so any
-// update would have dropped replication_role and the promotion record with
-// it.
-func TestMetadataReadsBackEverySpellingItCanEncounter(t *testing.T) {
-	for name, frag := range map[string]string{
-		"the legacy prefixed form, on every domain written before the fix": `<vmsync:vmsync xmlns:vmsync="` + metadataNamespace + `">` +
-			`<vmsync:replication_role id="target"/><vmsync:last_checkpoint id="cpt-1"/></vmsync:vmsync>`,
-		"the default-namespace form vmsync now writes": `<vmsync xmlns="` + metadataNamespace + `">` +
-			`<replication_role id="target"/><last_checkpoint id="cpt-1"/></vmsync>`,
-		"what libvirt returns once it has attached its own prefix": `<vmsync:vmsync xmlns="` + metadataNamespace + `" xmlns:vmsync="` + metadataNamespace + `">` +
-			`<replication_role id="target"/><last_checkpoint id="cpt-1"/></vmsync:vmsync>`,
-		"the same, with the default declaration dropped on the way through": `<vmsync:vmsync xmlns:vmsync="` + metadataNamespace + `">` +
-			`<replication_role id="target"/><last_checkpoint id="cpt-1"/></vmsync:vmsync>`,
-		"a mixture, from a domain half-rewritten by two vmsync versions": `<vmsync:vmsync xmlns:vmsync="` + metadataNamespace + `">` +
-			`<vmsync:replication_role id="target"/><last_checkpoint id="cpt-1"/></vmsync:vmsync>`,
-		// ParseMetadata is handed the raw inner XML of <metadata>, so a
-		// declaration that ended up on <domain> is not in the text at all.
-		"the declaration hoisted onto an ancestor, out of the fragment": `<vmsync:vmsync>` +
-			`<replication_role id="target"/><last_checkpoint id="cpt-1"/></vmsync:vmsync>`,
-		// The one actually read off a real domain: the default declaration
-		// turned prefixed, the tag left bare, the fields in no namespace.
-		"what libvirt makes of a default declaration": `<vmsync xmlns:vmsync="` + metadataNamespace + `">` +
-			`<replication_role id="target"/><last_checkpoint id="cpt-1"/></vmsync>`,
-		"the self-contained form vmsync writes now": `<vms:vmsync xmlns:vms="` + metadataNamespace + `">` +
-			`<vms:replication_role id="target"/><vms:last_checkpoint id="cpt-1"/></vms:vmsync>`,
-		"the same, once libvirt has retagged the root with its own prefix": `<vmsync:vmsync xmlns:vms="` + metadataNamespace + `" xmlns:vmsync="` + metadataNamespace + `">` +
-			`<vms:replication_role id="target"/><vms:last_checkpoint id="cpt-1"/></vmsync:vmsync>`,
+//	virXMLInjectNamespace:
+//	    if (!(ns = xmlNewNs(node, uri, key)))    -> "failed to create a new
+//	                                                XML namespace"
+//	    virXMLForeachNode(node, virXMLAddElementNamespace, ns);
+//	virXMLAddElementNamespace:
+//	    if (!node->ns) xmlSetNs(node, ns);
+//
+// xmlNewNs rejects a duplicate PREFIX and never compares hrefs, which is why
+// the fragment may declare the uri under any prefix but not under `vmsync` --
+// and why libvirt binds every element of a fragment that binds none itself.
+func modelSetMetadata(t *testing.T, fragment string) (string, error) {
+	t.Helper()
+	doc := etree.NewDocument()
+	if err := doc.ReadFromString(fragment); err != nil {
+		t.Fatalf("model: parse fragment: %v", err)
+	}
+	root := doc.Root()
+
+	for _, a := range root.Attr {
+		if a.Space == "xmlns" && a.Key == metadataPrefix {
+			return "", fmt.Errorf("internal error: failed to create a new XML namespace")
+		}
+	}
+	root.CreateAttr("xmlns:"+metadataPrefix, metadataNamespace)
+	walkWithNS(root, libvirtNS{prefixes: map[string]string{}}, func(el *etree.Element, scope libvirtNS) {
+		if scope.href(el) == "" {
+			el.Space = metadataPrefix
+		}
+	})
+
+	out, err := doc.WriteToString()
+	if err != nil {
+		t.Fatalf("model: serialise: %v", err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// modelGetMetadata models virXMLExtractNamespaceXML, which is where the damage
+// happens. From virxml.c:
+//
+//	virXMLForeachNode(nodeCopy, virXMLRemoveElementNamespace, uri);
+//	for (actualNs = nodeCopy->nsDef; actualNs; actualNs = actualNs->next) {
+//	    if (STREQ_NULLABLE(actualNs->href, uri)) { ...unlink...; break; }
+//
+// Every element in the uri is unbound, and exactly ONE declaration of it is
+// removed. A fragment that declared the uri itself therefore leaves libvirt's
+// own declaration behind, bound to nothing.
+func modelGetMetadata(t *testing.T, stored string) string {
+	t.Helper()
+	doc := etree.NewDocument()
+	if err := doc.ReadFromString(stored); err != nil {
+		t.Fatalf("model: parse stored: %v", err)
+	}
+	root := doc.Root()
+
+	walkWithNS(root, libvirtNS{prefixes: map[string]string{}}, func(el *etree.Element, scope libvirtNS) {
+		if scope.href(el) == metadataNamespace {
+			el.Space = ""
+		}
+	})
+
+	kept := make([]etree.Attr, 0, len(root.Attr))
+	removed := false
+	for _, a := range root.Attr {
+		isDecl := a.Value == metadataNamespace &&
+			(a.Space == "xmlns" || (a.Space == "" && a.Key == "xmlns"))
+		if isDecl && !removed {
+			removed = true
+			continue
+		}
+		kept = append(kept, a)
+	}
+	root.Attr = kept
+
+	out, err := doc.WriteToString()
+	if err != nil {
+		t.Fatalf("model: serialise: %v", err)
+	}
+	return strings.TrimSpace(out)
+}
+
+// The model has to reproduce the fragment that was actually observed, from
+// the shape that actually produced it, or it is not a model of anything.
+func TestModelReproducesTheFragmentReadOffARealDomain(t *testing.T) {
+	defaultNS := `<vmsync xmlns="` + metadataNamespace + `">` + "\n  " +
+		`<failure_count id="1"/>` + "\n" + `</vmsync>`
+
+	stored, err := modelSetMetadata(t, defaultNS)
+	if err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if got := modelGetMetadata(t, stored); got != theObservedMangling {
+		t.Fatalf("the model does not reproduce the real fragment.\n got: %s\nwant: %s", got, theObservedMangling)
+	}
+}
+
+// The three write shapes that do not work, and the one that does.
+func TestOnlyANakedFragmentSurvivesTheMetadataAPI(t *testing.T) {
+	t.Run("declaring the vmsync prefix is rejected outright", func(t *testing.T) {
+		// The original shape. xmlNewNs returns NULL for a duplicate prefix,
+		// so promotion, role changes, failure counting and replica_targets
+		// all failed on this one.
+		legacy := `<vmsync:vmsync xmlns:vmsync="` + metadataNamespace + `">` +
+			`<vmsync:failure_count id="1"/></vmsync:vmsync>`
+		if _, err := modelSetMetadata(t, legacy); err == nil {
+			t.Fatal("expected the write to be refused")
+		}
+	})
+
+	for name, fragment := range map[string]string{
+		"a default declaration": `<vmsync xmlns="` + metadataNamespace + `">` + "\n  " +
+			`<failure_count id="1"/>` + "\n" + `</vmsync>`,
+		"a separate prefix": `<vms:vmsync xmlns:vms="` + metadataNamespace + `">` + "\n  " +
+			`<vms:failure_count id="1"/>` + "\n" + `</vms:vmsync>`,
 	} {
+		t.Run(name+" is accepted but comes back stripped", func(t *testing.T) {
+			stored, err := modelSetMetadata(t, fragment)
+			if err != nil {
+				t.Fatalf("set: %v", err)
+			}
+			if got := modelGetMetadata(t, stored); got != theObservedMangling {
+				t.Fatalf("expected the same mangling either way.\n got: %s\nwant: %s", got, theObservedMangling)
+			}
+		})
+	}
+
+	t.Run("declaring nothing round trips byte for byte", func(t *testing.T) {
+		fields := map[string]string{
+			MetadataFieldReplicationRole: RoleTarget,
+			MetadataFieldFailureCount:    "1",
+		}
+		fragment := buildMetadataFragment(fields)
+		stored, err := modelSetMetadata(t, fragment)
+		if err != nil {
+			t.Fatalf("set: %v", err)
+		}
+		if got := modelGetMetadata(t, stored); got != fragment {
+			t.Fatalf("not byte-identical.\nsent: %s\nback: %s", fragment, got)
+		}
+		// And what libvirt stores is exactly what the domain-document writer
+		// emits: one on-disk spelling, reached by two different APIs.
+		if want := buildMetadataElement(fields); stored != want {
+			t.Fatalf("the stored form diverges from the document writer's.\nstored: %s\n  want: %s", stored, want)
+		}
+	})
+}
+
+// Every spelling a domain can be carrying, because a domain carries whichever
+// was current when it was last written -- and because two intermediate builds
+// wrote shapes libvirt then stripped.
+var everyMetadataSpelling = map[string]string{
+	"the form both writers produce now": `<vmsync:vmsync xmlns:vmsync="` + metadataNamespace + `">` +
+		`<vmsync:replication_role id="target"/><vmsync:last_checkpoint id="cpt-1"/></vmsync:vmsync>`,
+	"a default declaration, from the first attempt at the prefix collision": `<vmsync xmlns="` + metadataNamespace + `">` +
+		`<replication_role id="target"/><last_checkpoint id="cpt-1"/></vmsync>`,
+	"a separate prefix, from the second attempt": `<vms:vmsync xmlns:vms="` + metadataNamespace + `">` +
+		`<vms:replication_role id="target"/><vms:last_checkpoint id="cpt-1"/></vms:vmsync>`,
+	"what libvirt handed back for both of those": `<vmsync xmlns:vmsync="` + metadataNamespace + `">` +
+		`<replication_role id="target"/><last_checkpoint id="cpt-1"/></vmsync>`,
+	"a mixture, from a domain half-rewritten by two versions": `<vmsync:vmsync xmlns:vmsync="` + metadataNamespace + `">` +
+		`<vmsync:replication_role id="target"/><last_checkpoint id="cpt-1"/></vmsync:vmsync>`,
+	// ParseMetadata is handed the raw inner XML of <metadata>, so a
+	// declaration that ended up on <domain> is not in the text at all.
+	"the declaration hoisted onto an ancestor, out of the fragment": `<vmsync:vmsync>` +
+		`<vmsync:replication_role id="target"/><vmsync:last_checkpoint id="cpt-1"/></vmsync:vmsync>`,
+	"both declarations, as libvirt holds it mid-flight": `<vmsync:vmsync xmlns="` + metadataNamespace + `" xmlns:vmsync="` + metadataNamespace + `">` +
+		`<replication_role id="target"/><last_checkpoint id="cpt-1"/></vmsync:vmsync>`,
+}
+
+func TestDocumentReaderAcceptsEverySpelling(t *testing.T) {
+	for name, frag := range everyMetadataSpelling {
 		t.Run(name, func(t *testing.T) {
 			got := allMetadataFields(frag)
-			if got[MetadataFieldReplicationRole] != "target" || got[MetadataFieldLastCheckpoint] != "cpt-1" {
+			if got[MetadataFieldReplicationRole] != RoleTarget || got[MetadataFieldLastCheckpoint] != "cpt-1" {
 				t.Errorf("allMetadataFields = %v, want both fields", got)
 			}
-			if v := parseMetadataValue(frag, MetadataFieldReplicationRole); v != "target" {
-				t.Errorf("parseMetadataValue = %q, want target", v)
+			if v := parseMetadataValue(frag, MetadataFieldReplicationRole); v != RoleTarget {
+				t.Errorf("parseMetadataValue = %q, want %q", v, RoleTarget)
 			}
 		})
 	}
 }
 
-// The etree writer finds vmsync's element by literal prefix, so it has to
-// know both spellings. Missing one does not merely skip the update: the
-// rebuilt element is added afterwards regardless, leaving the domain with
-// TWO vmsync metadata blocks whose fields disagree from then on.
-func TestSetMetadataFieldsReplacesEitherSpellingRatherThanDuplicatingIt(t *testing.T) {
-	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
-
-	for name, existing := range map[string]string{
-		"legacy prefixed": `<metadata><vmsync:vmsync xmlns:vmsync="` + metadataNamespace + `">` +
-			`<vmsync:failure_count id="7"/></vmsync:vmsync></metadata>`,
-		"default namespace": `<metadata><vmsync xmlns="` + metadataNamespace + `">` +
-			`<failure_count id="7"/></vmsync></metadata>`,
-		"what libvirt made of the default-namespace form": `<metadata><vmsync xmlns:vmsync="` + metadataNamespace + `">` +
-			`<failure_count id="7"/></vmsync></metadata>`,
-		"the self-contained form written now": `<metadata><vms:vmsync xmlns:vms="` + metadataNamespace + `">` +
-			`<vms:failure_count id="7"/></vms:vmsync></metadata>`,
-	} {
+// The fragment reader takes everything the document reader takes, plus the
+// naked form -- which the document reader is right to refuse and this one
+// must not, because libvirt strips the evidence on the way out.
+func TestFragmentReaderAlsoAcceptsTheNakedForm(t *testing.T) {
+	all := maps.Clone(everyMetadataSpelling)
+	all["the naked form virDomainGetMetadata returns now"] = `<vmsync>` +
+		`<replication_role id="target"/><last_checkpoint id="cpt-1"/></vmsync>`
+	for name, frag := range all {
 		t.Run(name, func(t *testing.T) {
-			// minimalDomainXML carries no <metadata> of its own.
-			seeded := strings.Replace(base, "</domain>", existing+"\n</domain>", 1)
-			if seeded == base {
-				t.Fatal("fixture drift: could not seed metadata into the domain")
-			}
-
-			out, err := SetMetadataFields(seeded, map[string]string{MetadataFieldLastCheckpoint: "cpt-9"})
+			got, err := metadataFieldsFromFragment(frag)
 			if err != nil {
-				t.Fatalf("SetMetadataFields() error = %v", err)
+				t.Fatalf("refused: %v", err)
 			}
-			if n := strings.Count(out, "vmsync.org/xmlns/libvirt/domain"); n != 1 {
-				t.Errorf("the domain carries %d vmsync metadata blocks, want exactly 1 -- an unrecognised existing one is left behind and the rebuilt one added beside it:\n%s", n, out)
-			}
-			// The pre-existing field must survive the merge, which only
-			// happens if the old element was found and read.
-			if v, _ := ParseMetadataField(out, MetadataFieldFailureCount); v != "7" {
-				t.Errorf("failure_count = %q, want 7 -- the existing element was not merged", v)
-			}
-			if v, _ := ParseMetadataField(out, MetadataFieldLastCheckpoint); v != "cpt-9" {
-				t.Errorf("last_checkpoint = %q, want cpt-9", v)
+			if got[MetadataFieldReplicationRole] != RoleTarget || got[MetadataFieldLastCheckpoint] != "cpt-1" {
+				t.Errorf("fields = %v, want both", got)
 			}
 		})
 	}
 }
 
-// Nothing outside vmsync's own element may be read as a vmsync field.
-//
-// Scoping fields to the container is what makes them readable whatever
-// namespace the serialisation left them in -- but it would be worthless if
-// the container itself were matched loosely, so the container is matched by
-// namespace and only by namespace.
-func TestMetadataReaderIgnoresOtherToolsBlocks(t *testing.T) {
+// The DOCUMENT reader must refuse an unmarked element. It is handed a whole
+// <metadata> body, and on an ordinary host the first child of that is
+// libosinfo's block -- whose <libosinfo:os id="..."/> would be harvested as a
+// vmsync field and then written into vmsync's own element by the next merge,
+// on the source, and onto every replica made from it afterwards.
+func TestDocumentReaderRefusesEverythingThatIsNotOurs(t *testing.T) {
 	for name, frag := range map[string]string{
-		"a <vmsync> element in somebody else's namespace": `<vmsync xmlns="http://example.org/other">` +
-			`<failure_count id="99"/></vmsync>`,
-		"a <vmsync> element in no namespace at all": `<vmsync><failure_count id="99"/></vmsync>`,
-		"another tool's block entirely": `<foo:bar xmlns:foo="http://example.org/foo">` +
-			`<failure_count id="99"/></foo:bar>`,
+		"a bare <vmsync>, which could be anybody's": `<vmsync><failure_count id="99"/></vmsync>`,
+		"a <vmsync> in somebody else's namespace":   `<vmsync xmlns="http://example.org/other"><failure_count id="99"/></vmsync>`,
+		"another tool's block":                      `<foo:bar xmlns:foo="http://example.org/foo"><failure_count id="99"/></foo:bar>`,
+		"libosinfo, as it appears on any ordinary host": `<libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">` +
+			`<libosinfo:os id="http://fedoraproject.org/fedora/38"/></libosinfo:libosinfo>`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := allMetadataFields(frag); len(got) != 0 {
@@ -2076,15 +2192,15 @@ func TestMetadataReaderIgnoresOtherToolsBlocks(t *testing.T) {
 	}
 }
 
-// A neighbouring block must not contribute fields, on either side of ours:
-// the container's depth is tracked, so leaving it has to stop the scoping.
-func TestMetadataReaderStopsAtTheEndOfVmsyncsOwnElement(t *testing.T) {
-	other := `<foo:bar xmlns:foo="http://example.org/foo"><failure_count id="99"/></foo:bar>`
-	ours := `<vmsync xmlns="` + metadataNamespace + `"><failure_count id="3"/></vmsync>`
+// A neighbouring block must contribute nothing, on either side of ours.
+func TestNeighbouringBlocksAreNotHarvested(t *testing.T) {
+	libosinfo := `<libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">` +
+		`<libosinfo:os id="http://fedoraproject.org/fedora/38"/></libosinfo:libosinfo>`
+	ours := `<vmsync xmlns:vmsync="` + metadataNamespace + `"><failure_count id="3"/></vmsync>`
 
 	for name, body := range map[string]string{
-		"the other tool's block first": other + ours,
-		"vmsync's block first":         ours + other,
+		"libosinfo first": libosinfo + ours,
+		"ours first":      ours + libosinfo,
 	} {
 		t.Run(name, func(t *testing.T) {
 			got := allMetadataFields(body)
@@ -2098,158 +2214,191 @@ func TestMetadataReaderStopsAtTheEndOfVmsyncsOwnElement(t *testing.T) {
 // Only DIRECT children of the container are fields. vmsync writes a flat
 // list, so a nested element belongs to a structure this version does not
 // write, and flattening it in beside the real fields would invent one.
-func TestMetadataReaderDoesNotFlattenNestedElements(t *testing.T) {
-	frag := `<vmsync:vmsync xmlns:vmsync="` + metadataNamespace + `">` +
-		`<failure_count id="3"><inner id="99"/></failure_count></vmsync:vmsync>`
-
+func TestNestedElementsAreNotFlattenedIntoFields(t *testing.T) {
+	frag := `<vmsync xmlns:vmsync="` + metadataNamespace + `">` +
+		`<failure_count id="3"><inner id="99"/></failure_count></vmsync>`
 	got := allMetadataFields(frag)
 	if len(got) != 1 || got[MetadataFieldFailureCount] != "3" {
 		t.Errorf("allMetadataFields = %v, want only failure_count=3", got)
 	}
 }
 
-// libvirtRoundTrip re-spells a fragment the way libvirt hands it back:
-// virDomainSetMetadata injects its own prefix onto the element it stores and
-// retags the root with it, so nothing written here ever returns in the form
-// it was written. The fields keep vmsync's own prefix, whose declaration
-// stays on the element -- which is the entire reason they are written that
-// way. See metadataWritePrefix.
-func libvirtRoundTrip(entry string) string {
-	entry = strings.Replace(entry, metadataStart,
-		`<`+metadataPrefix+`:vmsync xmlns:`+metadataWritePrefix+`="`+metadataNamespace+`"`+
-			` xmlns:`+metadataPrefix+`="`+metadataNamespace+`">`, 1)
-	return strings.Replace(entry, metadataEnd, `</`+metadataPrefix+`:vmsync>`, 1)
+// A foreign id attribute is not a field: `t:id` belongs to whatever declared
+// `t`, and taking it would make the value depend on attribute order.
+func TestAPrefixedIdAttributeIsNotAField(t *testing.T) {
+	frag := `<vmsync xmlns:vmsync="` + metadataNamespace + `" xmlns:t="http://example.org/t">` +
+		`<thing t:id="X"/><failure_count id="3"/></vmsync>`
+	got := allMetadataFields(frag)
+	if _, ok := got["thing"]; ok {
+		t.Errorf("a foreign id attribute became a field: %v", got)
+	}
+	if got[MetadataFieldFailureCount] != "3" {
+		t.Errorf("fields = %v", got)
+	}
 }
 
-// theObservedMangling is the fragment read off a real domain that had been
-// written with a default namespace declaration -- the shape that made
-// -reinit-after-failures never reach its threshold. Kept verbatim rather than
-// constructed, because its value is that it is real.
-const theObservedMangling = `<vmsync xmlns:vmsync="` + metadataNamespace + `">
-  <failure_count id="1"/>
-</vmsync>`
-
-// A domain already carrying the mangled form must still be readable, and the
-// next write must HEAL it rather than merge into nothing or add a second
-// block beside it.
-func TestTheObservedManglingReadsBackAndIsHealed(t *testing.T) {
-	if got := allMetadataFields(theObservedMangling); got[MetadataFieldFailureCount] != "1" || len(got) != 1 {
-		t.Fatalf("allMetadataFields = %v, want failure_count=1 -- this is a real fragment off a real domain", got)
-	}
-
-	merged, err := mergeMetadataFields(theObservedMangling, map[string]string{
-		MetadataFieldReplicationRole: RolePromoted,
+// A merge must never silently drop what it could not read. Losing a failure
+// count is recoverable; losing replication_role=promoted is not.
+func TestMetadataFieldsFromFragmentRefusesWhatItCannotRead(t *testing.T) {
+	t.Run("an element that is not vmsync's at all", func(t *testing.T) {
+		frag := `<other:thing xmlns:other="http://example.org/o"><a id="1"/></other:thing>`
+		if _, err := metadataFieldsFromFragment(frag); err == nil {
+			t.Error("accepted a fragment it could not read")
+		}
 	})
-	if err != nil {
-		t.Fatalf("merge refused the fragment: %v", err)
-	}
-	got := allMetadataFields(merged)
-	if got[MetadataFieldFailureCount] != "1" {
-		t.Errorf("the pre-existing field was lost by the merge: %v\n%s", got, merged)
-	}
-	if got[MetadataFieldReplicationRole] != RolePromoted {
-		t.Errorf("the update did not apply: %v\n%s", got, merged)
-	}
-	if strings.Contains(merged, `xmlns="`) || !strings.Contains(merged, `xmlns:`+metadataWritePrefix+`=`) {
-		t.Errorf("the rewrite did not heal the fragment into the self-contained form:\n%s", merged)
-	}
+	t.Run("a nested container, which would otherwise read as cleanly empty", func(t *testing.T) {
+		frag := `<vmsync xmlns:vmsync="` + metadataNamespace + `"><vmsync xmlns:vmsync="` + metadataNamespace + `">` +
+			`<failure_count id="5"/></vmsync></vmsync>`
+		if _, err := metadataFieldsFromFragment(frag); err == nil {
+			t.Error("a nested container read as an empty block, so the merge would drop what is under it")
+		}
+	})
+	// The two legitimately-empty cases must still read cleanly: a domain that
+	// has never carried vmsync metadata is the ordinary first-run state.
+	t.Run("an absent element", func(t *testing.T) {
+		if _, err := metadataFieldsFromFragment(""); err != nil {
+			t.Errorf("a domain with no vmsync metadata must read cleanly: %v", err)
+		}
+	})
+	t.Run("a container with no fields in it", func(t *testing.T) {
+		if _, err := metadataFieldsFromFragment(`<vmsync/>`); err != nil {
+			t.Errorf("an empty container must read cleanly: %v", err)
+		}
+	})
+}
 
-	// The etree writer must recognise it too. It does not resolve namespaces
-	// at all, so a spelling it misses is not skipped -- the rebuilt element is
-	// added anyway and the domain ends up carrying two of them.
+// The etree writer matches on literal prefixes, so a spelling it misses is
+// not merely skipped: the rebuilt element is added anyway, and libvirt's
+// virXMLNodeSanitizeNamespaces then resolves two same-namespace children by
+// deleting the LATER one -- keeping the stale block and discarding the write.
+func TestDocumentWriterReplacesEverySpellingRatherThanDuplicatingIt(t *testing.T) {
 	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
-	seeded := strings.Replace(base, "</domain>", "<metadata>"+theObservedMangling+"</metadata>\n</domain>", 1)
-	if seeded == base {
-		t.Fatal("fixture drift: could not seed metadata into the domain")
+
+	for name, existing := range everyMetadataSpelling {
+		t.Run(name, func(t *testing.T) {
+			seeded := strings.Replace(base, "</domain>", "<metadata>"+existing+"</metadata>\n</domain>", 1)
+			if seeded == base {
+				t.Fatal("fixture drift: could not seed metadata into the domain")
+			}
+			out, err := SetMetadataFields(seeded, map[string]string{MetadataFieldFailureCount: "9"})
+			if err != nil {
+				t.Fatalf("SetMetadataFields() error = %v", err)
+			}
+			if n := strings.Count(out, metadataNamespace); n != 1 {
+				t.Errorf("the domain carries %d vmsync metadata blocks, want exactly 1:\n%s", n, out)
+			}
+			if !strings.Contains(out, metadataElementStart) {
+				t.Errorf("the rewrite is not in the self-binding form, which a define would delete:\n%s", out)
+			}
+			for field, want := range map[string]string{
+				MetadataFieldReplicationRole: RoleTarget,
+				MetadataFieldLastCheckpoint:  "cpt-1",
+				MetadataFieldFailureCount:    "9",
+			} {
+				if got, _ := ParseMetadataField(out, field); got != want {
+					t.Errorf("%s = %q, want %q -- the existing element was not merged:\n%s", field, got, want, out)
+				}
+			}
+		})
 	}
-	out, err := SetMetadataFields(seeded, map[string]string{MetadataFieldLastCheckpoint: "cpt-9"})
+}
+
+// An element holding vmsync's PREFIX for somebody else's namespace is not
+// vmsync's, and must be left where it is.
+func TestDocumentWriterRefusesAnImpostorHoldingOurPrefix(t *testing.T) {
+	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
+	impostor := `<vmsync:vmsync xmlns:vmsync="http://example.org/impostor"><vmsync:failure_count id="99"/></vmsync:vmsync>`
+	seeded := strings.Replace(base, "</domain>", "<metadata>"+impostor+"</metadata>\n</domain>", 1)
+
+	out, err := SetMetadataFields(seeded, map[string]string{MetadataFieldFailureCount: "1"})
 	if err != nil {
 		t.Fatalf("SetMetadataFields() error = %v", err)
 	}
-	if n := strings.Count(out, "vmsync.org/xmlns/libvirt/domain"); n != 1 {
-		t.Errorf("the domain carries %d vmsync metadata blocks, want exactly 1:\n%s", n, out)
+	if !strings.Contains(out, "http://example.org/impostor") {
+		t.Errorf("somebody else's block was replaced:\n%s", out)
 	}
-	if v, _ := ParseMetadataField(out, MetadataFieldFailureCount); v != "1" {
-		t.Errorf("failure_count = %q, want 1 -- the existing element was not merged", v)
+	if !strings.Contains(out, metadataNamespace) {
+		t.Errorf("vmsync's own block was not added beside it:\n%s", out)
 	}
 }
 
-// The bench symptom, as a test: three induced failures each recorded
-// consecutive_failures=1, so -reinit-after-failures never reached its
-// threshold, because every increment read the stored count back as absent.
-func TestFailureCountIncrementsAcrossTheLibvirtRoundTrip(t *testing.T) {
-	stored := ""
+// The bench symptom, end to end through the modelled round trip: three
+// induced failures each recorded consecutive_failures=1, so
+// -reinit-after-failures never reached its threshold.
+func TestFailureCountIncrementsThroughTheRealRoundTrip(t *testing.T) {
+	fields := map[string]string{
+		MetadataFieldReplicationRole: RoleTarget,
+		MetadataFieldLastCheckpoint:  "vmsync-cpt-000001",
+	}
 	for want := 1; want <= 3; want++ {
+		stored, err := modelSetMetadata(t, buildMetadataFragment(fields))
+		if err != nil {
+			t.Fatalf("round %d: set: %v", want, err)
+		}
+		read, err := metadataFieldsFromFragment(modelGetMetadata(t, stored))
+		if err != nil {
+			t.Fatalf("round %d: %v", want, err)
+		}
+		if read[MetadataFieldReplicationRole] != RoleTarget || read[MetadataFieldLastCheckpoint] != "vmsync-cpt-000001" {
+			t.Fatalf("round %d lost a field that was not being updated: %v", want, read)
+		}
+
 		current := 0
-		if v := allMetadataFields(stored)[MetadataFieldFailureCount]; v != "" {
-			n, err := strconv.Atoi(v)
-			if err != nil {
-				t.Fatalf("stored failure_count %q does not parse: %v", v, err)
+		if v := read[MetadataFieldFailureCount]; v != "" {
+			n, convErr := strconv.Atoi(v)
+			if convErr != nil {
+				t.Fatalf("round %d: stored failure_count %q does not parse: %v", want, v, convErr)
 			}
 			current = n
 		}
 		next := current + 1
 		if next != want {
-			t.Fatalf("increment %d read the stored count as %d, so it recorded %d -- the count never reaches the threshold", want, current, next)
+			t.Fatalf("increment %d read the stored count as %d, so it recorded %d -- the threshold is never reached", want, current, next)
 		}
 
-		merged, err := mergeMetadataFields(stored, map[string]string{
-			MetadataFieldFailureCount: strconv.Itoa(next),
-		})
+		merged, err := mergeMetadataFields(read, map[string]string{MetadataFieldFailureCount: strconv.Itoa(next)})
 		if err != nil {
-			t.Fatalf("merge: %v", err)
+			t.Fatalf("round %d: merge: %v", want, err)
 		}
-		if sameMetadataFields(merged, stored) {
-			t.Fatalf("increment %d compared equal to what was stored and would be skipped as a no-op", want)
+		if maps.Equal(merged, read) {
+			t.Fatalf("round %d compared equal to what was stored and would be skipped as a no-op", want)
 		}
-		stored = libvirtRoundTrip(merged)
+		fields = merged
 	}
 }
 
-// A merge must never silently drop the fields it could not read. Losing a
-// count is recoverable; losing replication_role=promoted is not.
-func TestMergeRefusesMetadataItCannotRead(t *testing.T) {
-	unreadable := `<vmsync:vmsync xmlns:vmsync="http://example.org/impostor"><failure_count id="7"/></vmsync:vmsync>`
-	if _, err := mergeMetadataFields(unreadable, map[string]string{MetadataFieldFailureCount: "1"}); err == nil {
-		t.Error("merged into a fragment it could not read -- the write that follows would drop everything in it")
-	}
-
-	// The two legitimately-empty cases must still merge cleanly: a domain
-	// that has never carried vmsync metadata is the ordinary first-run state.
-	if _, err := mergeMetadataFields("", map[string]string{MetadataFieldFailureCount: "1"}); err != nil {
-		t.Errorf("a domain with no vmsync metadata must merge cleanly: %v", err)
-	}
-	empty := `<vmsync xmlns="` + metadataNamespace + `"/>`
-	if _, err := mergeMetadataFields(empty, map[string]string{MetadataFieldFailureCount: "1"}); err != nil {
-		t.Errorf("a recognised but empty container must merge cleanly: %v", err)
-	}
-}
-
-// The "nothing changed, skip the write" check has to compare fields, not
-// text: what vmsync writes and what libvirt returns are never byte-identical,
-// so comparing the fragments meant the check could never fire and every sync
-// rewrote the SOURCE domain's persistent definition for nothing.
-func TestUnchangedMetadataComparesEqualDespiteLibvirtsReSpelling(t *testing.T) {
-	entry := buildMetadataEntry(map[string]string{
+// The "nothing changed, skip the write" check compares FIELDS. Comparing the
+// serialised fragments would compare the wrong thing -- what is sent and what
+// comes back are different documents even when nothing changed -- so the
+// check could never fire, and every sync rewrote the SOURCE domain's
+// persistent definition for nothing.
+func TestUnchangedFieldsCompareEqualAcrossTheRoundTrip(t *testing.T) {
+	fields := map[string]string{
 		MetadataFieldReplicationRole: RoleTarget,
 		MetadataFieldLastCheckpoint:  "cpt-1",
-	})
-
-	if returned := libvirtRoundTrip(entry); entry == returned {
-		t.Fatal("fixture drift: the round trip is supposed to change the text")
-	} else if !sameMetadataFields(entry, returned) {
-		t.Error("a fragment does not compare equal to itself once libvirt has re-spelled it")
+	}
+	stored, err := modelSetMetadata(t, buildMetadataFragment(fields))
+	if err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	read, err := metadataFieldsFromFragment(modelGetMetadata(t, stored))
+	if err != nil {
+		t.Fatalf("read back: %v", err)
 	}
 
-	changed := buildMetadataEntry(map[string]string{
-		MetadataFieldReplicationRole: RoleTarget,
-		MetadataFieldLastCheckpoint:  "cpt-2",
-	})
-	if sameMetadataFields(entry, changed) {
+	unchanged, err := mergeMetadataFields(read, map[string]string{MetadataFieldReplicationRole: RoleTarget})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !maps.Equal(unchanged, read) {
+		t.Errorf("an update that changes nothing does not compare equal: %v vs %v", unchanged, read)
+	}
+
+	changed, err := mergeMetadataFields(read, map[string]string{MetadataFieldLastCheckpoint: "cpt-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if maps.Equal(changed, read) {
 		t.Error("a changed field compares equal, so the write would be skipped")
-	}
-	dropped := buildMetadataEntry(map[string]string{MetadataFieldReplicationRole: RoleTarget})
-	if sameMetadataFields(entry, dropped) {
-		t.Error("a dropped field compares equal, so the write would be skipped")
 	}
 }
