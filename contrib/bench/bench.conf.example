@@ -70,6 +70,25 @@ SSH_KNOWN_HOSTS=""
 IO_DEPTH=8
 BRIDGE_HELPER_PATH=""   # empty = vmsync's own default (/usr/local/bin/vmsync-bridge-helper)
 
+# What -reinit does with the target disk it is about to replace: "delete" or
+# "rename". This harness defaults to delete; vmsync itself defaults to rename.
+#
+# vmsync is right to rename by default -- the target of a -reinit may be a
+# former primary whose disks still hold everything written after the last
+# successful sync, and that is unrecoverable once deleted. None of that applies
+# to the disposable test VM this harness requires, which it deletes and
+# recreates dozens of times per run regardless.
+#
+# What does apply is the cost: every -reinit leaves a full-size aside copy that
+# is never reaped automatically, and this harness reinits constantly -- once per
+# verify sub-test, once per heal, four times in Stage 8 alone. On a multi-GB
+# disk that fills TARGET_DISK_PATH partway through a long run, and it surfaces
+# as a confusing mid-stage sync failure rather than as "out of disk".
+#
+# Set it to "rename" if you would rather keep every replaced copy and have the
+# space for them.
+REPLACED_DISK_ACTION=delete
+
 # Transport flags added to every sync in every stage EXCEPT Stage 1.
 # Default: -compress.
 #

@@ -164,6 +164,30 @@ source "$CONF"
 : "${RESULT_DIR:?set in $CONF}"
 SOURCE_LOCAL="${SOURCE_LOCAL:-yes}"
 
+# --- what -reinit does with the disk it replaces -----------------------------
+
+# `delete` here, though vmsync itself defaults to `rename`, and the difference
+# is about which risk applies where.
+#
+# vmsync is right to default to renaming: the target of a -reinit may be a
+# former primary whose disks still hold everything written after the last
+# successful sync, and that is unrecoverable once deleted. None of that is true
+# of this harness's target, which bench.conf.example insists must be a
+# disposable, dedicated test VM and which this script deletes and recreates
+# dozens of times per run anyway.
+#
+# What IS true here is the cost. Every -reinit leaves a full-size aside copy
+# that, as the flag's own help says, is never reaped automatically -- and this
+# harness reinits constantly: once per verify sub-test, once per heal, four
+# times in Stage 8 alone. On a multi-GB disk that fills TARGET_DISK_PATH partway
+# through a long run, and the failure surfaces as a confusing mid-stage sync
+# error rather than as "you are out of disk".
+REPLACED_DISK_ACTION="${REPLACED_DISK_ACTION:-delete}"
+case "$REPLACED_DISK_ACTION" in
+delete | rename) ;;
+*) die "$CONF: REPLACED_DISK_ACTION must be 'delete' or 'rename', not '$REPLACED_DISK_ACTION'" ;;
+esac
+
 # --- tamper placement --------------------------------------------------------
 
 TAMPER_MODE="${TAMPER_MODE:-random}"
@@ -318,6 +342,7 @@ vmsync_common_args() {
         [ -n "${SSH_PORT:-}" ] && VMSYNC_ARGS+=(-ssh-port "$SSH_PORT")
         [ -n "${SSH_KNOWN_HOSTS:-}" ] && VMSYNC_ARGS+=(-ssh-known-hosts "$SSH_KNOWN_HOSTS")
         [ -n "${BRIDGE_HELPER_PATH:-}" ] && VMSYNC_ARGS+=(-bridge-helper-path "$BRIDGE_HELPER_PATH")
+        [ -n "${REPLACED_DISK_ACTION:-}" ] && VMSYNC_ARGS+=(-replaced-disk-action "$REPLACED_DISK_ACTION")
         return 0
 }
 
