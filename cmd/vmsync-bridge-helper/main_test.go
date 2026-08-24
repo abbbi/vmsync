@@ -140,7 +140,29 @@ func newLoopbackPair(t *testing.T) (accepted, dialed net.Conn) {
 // It returns the listener's address to hand to handleConn as -connect, plus
 // two receive-only channels reporting what was received and any failure, so
 // the caller can verify both directions of the relay independently.
-func startFakeRealExport(t *testing.T, expectBytes int, response []byte) (addr string, receivedCh <-chan []byte, errCh <-chan error) {
+// The three return channels report three different things, and keeping them
+// separate is what makes this usable from a select.
+//
+// errCh carries ONLY a real failure -- it never receives a nil to mean
+// success. An earlier version signalled completion by sending nil on the same
+// channel, which made the caller's
+//
+//	select {
+//	case got = <-receivedCh:
+//	case err := <-exportErrCh:
+//	}
+//
+// a coin flip whenever this goroutine ran to completion before the caller
+// reached the select: both channels were ready, Go picks a ready case at
+// random, and picking the nil error left got nil and failed the test with
+// "received 0 bytes ... the relay corrupted the payload in transit" -- an
+// accusation against the relay for something the test did to itself. It
+// reproduced roughly half the time under -race -count 4, and every time with
+// a 50ms sleep before the select.
+//
+// doneCh closes when the goroutine has finished, whatever the outcome, so
+// waiting for it never consumes the error a later check wants to read.
+func startFakeRealExport(t *testing.T, expectBytes int, response []byte) (addr string, receivedCh <-chan []byte, errCh <-chan error, doneCh <-chan struct{}) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -149,7 +171,9 @@ func startFakeRealExport(t *testing.T, expectBytes int, response []byte) (addr s
 
 	rc := make(chan []byte, 1)
 	ec := make(chan error, 1)
+	dc := make(chan struct{})
 	go func() {
+		defer close(dc)
 		defer ln.Close()
 		conn, err := ln.Accept()
 		if err != nil {
@@ -179,10 +203,11 @@ func startFakeRealExport(t *testing.T, expectBytes int, response []byte) (addr s
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			tcpConn.CloseWrite()
 		}
-		ec <- nil
+		// Deliberately no `ec <- nil` here: success is signalled by dc
+		// closing, so that errCh staying empty is unambiguous.
 	}()
 
-	return ln.Addr().String(), rc, ec
+	return ln.Addr().String(), rc, ec, dc
 }
 
 // TestRecoverRelayPanic checks that a panicking fn is converted into a
@@ -284,7 +309,7 @@ func TestHandleConnRelaysBothDirections(t *testing.T) {
 			request := bytes.Repeat([]byte("request-payload-"), 400)
 			response := bytes.Repeat([]byte("response-payload-"), 400)
 
-			realAddr, receivedCh, exportErrCh := startFakeRealExport(t, len(request), response)
+			realAddr, receivedCh, exportErrCh, exportDoneCh := startFakeRealExport(t, len(request), response)
 
 			accepted, dialed := newLoopbackPair(t)
 			defer dialed.Close()
@@ -380,12 +405,20 @@ func TestHandleConnRelaysBothDirections(t *testing.T) {
 				t.Fatalf("relay delivered a response of %d bytes, want the %d-byte response delivered unchanged", respBuf.Len(), len(response))
 			}
 
-			err, returned = runWithDeadline(t, timeout, func() error { return <-exportErrCh })
+			// Waiting on doneCh rather than on errCh: errCh may legitimately
+			// be empty, and reading it to find out whether the goroutine
+			// finished would block forever exactly when nothing went wrong.
+			_, returned = runWithDeadline(t, timeout, func() error {
+				<-exportDoneCh
+				return nil
+			})
 			if !returned {
 				t.Fatal("timed out waiting for the fake real export goroutine to finish")
 			}
-			if err != nil {
+			select {
+			case err := <-exportErrCh:
 				t.Fatalf("fake real export goroutine finished with an error: %v", err)
+			default:
 			}
 
 			// handleConn spawns two goroutines (inbound and outbound relay
