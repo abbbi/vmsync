@@ -2402,3 +2402,81 @@ func TestUnchangedFieldsCompareEqualAcrossTheRoundTrip(t *testing.T) {
 		t.Error("a changed field compares equal, so the write would be skipped")
 	}
 }
+
+// A field the caller asked to remove is not a dropped element.
+//
+// UpdateSyncMetadata strips replica_targets and the promotion record from the
+// metadata it derives for a TARGET, because those describe a domain acting as
+// a SOURCE. Reporting that as "the patching path may have silently dropped
+// configuration" put a scary warning on every successful sync of any domain
+// that had ever been a source -- and it only started once the metadata writer
+// was fixed, because before that replica_targets could never be written in the
+// first place.
+func TestSetMetadataFieldsDoesNotWarnAboutItsOwnRemovals(t *testing.T) {
+	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
+	existing := metadataElementStart +
+		`<vmsync:replica_targets id="hyper02:web01"/>` +
+		`<vmsync:promoted_at id="1756041600"/>` +
+		`<vmsync:replication_role id="source"/>` +
+		metadataElementEnd
+	seeded := strings.Replace(base, "</domain>", "<metadata>"+existing+"</metadata>\n</domain>", 1)
+	if seeded == base {
+		t.Fatal("fixture drift: could not seed metadata into the domain")
+	}
+
+	out, err := SetMetadataFields(seeded,
+		map[string]string{MetadataFieldLastCheckpoint: "vmsync-cpt-000001"},
+		MetadataFieldReplicaTargets, MetadataFieldPromotedAt)
+	if err != nil {
+		t.Fatalf("SetMetadataFields() error = %v", err)
+	}
+
+	// The removals really did happen...
+	if v, _ := ParseMetadataField(out, MetadataFieldReplicaTargets); v != "" {
+		t.Errorf("replica_targets = %q, want it removed", v)
+	}
+	// ...and the untouched field survived.
+	if v, _ := ParseMetadataField(out, MetadataFieldReplicationRole); v != RoleSource {
+		t.Errorf("replication_role = %q, want it untouched", v)
+	}
+
+	// ...but neither removal is something to warn about. missingXMLElements
+	// is expected to see them; what must not happen is the warning reporting
+	// them once the requested removals are excluded.
+	missing := missingXMLElements(seeded, out)
+	if kept := filterExpected(missing, MetadataFieldReplicaTargets, MetadataFieldPromotedAt); len(kept) != 0 {
+		t.Errorf("%v would be reported as silently dropped configuration, but %v is all this call asked to remove",
+			kept, []string{MetadataFieldReplicaTargets, MetadataFieldPromotedAt})
+	}
+}
+
+// filterExpected mirrors warnIfXMLElementsDropped's own filtering, so the test
+// asserts on the same rule the warning applies rather than on a paraphrase.
+func filterExpected(missing []string, expected ...string) []string {
+	skip := make(map[string]bool, len(expected))
+	for _, name := range expected {
+		skip[name] = true
+	}
+	var kept []string
+	for _, name := range missing {
+		if !skip[name] {
+			kept = append(kept, name)
+		}
+	}
+	return kept
+}
+
+// A genuine loss must still be reported, or the filter above has made the
+// tripwire useless.
+func TestElementDropWarningStillCatchesRealLosses(t *testing.T) {
+	before := `<domain><name>x</name><devices><disk/><interface/></devices></domain>`
+	after := `<domain><name>x</name><devices><disk/></devices></domain>`
+
+	missing := missingXMLElements(before, after)
+	if len(missing) == 0 {
+		t.Fatal("a dropped <interface> was not noticed at all")
+	}
+	if kept := filterExpected(missing, MetadataFieldReplicaTargets); len(kept) == 0 {
+		t.Error("filtering unrelated expected removals silenced a genuine loss")
+	}
+}

@@ -872,12 +872,43 @@ func missingXMLElements(original, rewritten string) []string {
 // normalization on marshal (auto-assigned addresses, inserted defaults, and
 // the like), so it's a known, accepted gap rather than something this
 // function attempts.
-func warnIfXMLElementsDropped(context, original, rewritten string) {
+// expected names elements this particular call asked to have removed. They
+// are filtered out before warning, because an element the caller deleted BY
+// NAME is not evidence that the patching path lost anything -- it is the
+// patching path doing exactly what it was told.
+//
+// Without this, UpdateSyncMetadata warns on every successful sync of a domain
+// that has ever been a replication source: it removes replica_targets (and the
+// promotion record) from the metadata it derives for the TARGET, because those
+// fields describe a domain acting as a source and are meaningless, and
+// actively misleading, on a replica. That is the same "guaranteed, permanent
+// false positive on every such run" that intentionallyDroppedXMLElements
+// exists to prevent, differing only in that the set varies per call and so
+// cannot be a package-level list.
+//
+// It stayed hidden until the metadata writer was fixed. RecordReplicaTarget
+// could not write replica_targets at all while virDomainSetMetadata was
+// failing, so the field was never there to be removed and the tripwire never
+// fired.
+func warnIfXMLElementsDropped(context, original, rewritten string, expected ...string) {
 	missing := missingXMLElements(original, rewritten)
+	if len(expected) > 0 {
+		skip := make(map[string]bool, len(expected))
+		for _, name := range expected {
+			skip[name] = true
+		}
+		kept := missing[:0]
+		for _, name := range missing {
+			if !skip[name] {
+				kept = append(kept, name)
+			}
+		}
+		missing = kept
+	}
 	if len(missing) == 0 {
 		return
 	}
-	trace.Warning("domain xml elements present before this rewrite are missing afterward -- the domain-xml round-trip (unmarshal into a typed struct, then re-marshal) may have silently dropped configuration this tool doesn't model; verify the affected domain's definition still has everything you expect", "context", context, "missing_elements", strings.Join(missing, ", "))
+	trace.Warning("domain xml elements present before this rewrite are missing afterward -- this rewrite preserves everything it is not explicitly changing, so something in the patching path has dropped configuration; verify the affected domain's definition still has everything you expect", "context", context, "missing_elements", strings.Join(missing, ", "))
 }
 
 // metadataFieldNameRe is the set of field names SetMetadataFields accepts
@@ -946,7 +977,10 @@ func SetMetadataFields(domainXML string, updates map[string]string, removeFields
 	// nothing here reconstructs the document any more -- so if it ever does,
 	// something in the patching path is dropping content and that is worth
 	// hearing about immediately.
-	warnIfXMLElementsDropped("SetMetadataFields", domainXML, changed)
+	//
+	// removeFields is handed over so the fields this call deliberately
+	// deleted are not reported as losses; see warnIfXMLElementsDropped.
+	warnIfXMLElementsDropped("SetMetadataFields", domainXML, changed, removeFields...)
 	return changed, nil
 }
 
