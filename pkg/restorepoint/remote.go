@@ -20,7 +20,9 @@ package restorepoint
 import (
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Every command that reaches the target host is built here, as a string, so
@@ -215,6 +217,49 @@ func RemoveStagingCommand(root, name string) (string, error) {
 		return "", fmt.Errorf("refusing to remove %q: %w", name, err)
 	}
 	return "rm -rf " + shQuote(path.Join(root, name)), nil
+}
+
+// AsideSuffix marks a restore point directory that -reinit moved out of the
+// way instead of deleting.
+const AsideSuffix = ".replaced-"
+
+// RemoveRootCommand deletes every restore point for a replica, as -reinit does
+// when -replaced-disk-action=delete.
+//
+// root is re-checked rather than trusted even though Root built it: this emits
+// rm -rf on a directory derived from an operator-supplied path, and the tag
+// validation that protects RemoveCommand does not apply one level up.
+// Refusing anything not named DirName means the worst a wrong -target-disk-path
+// can do is delete a directory that is, by its own name, vmsync's.
+func RemoveRootCommand(root string) (string, error) {
+	if err := checkRoot(root); err != nil {
+		return "", err
+	}
+	return "rm -rf " + shQuote(root), nil
+}
+
+// RenameRootCommand moves every restore point aside instead of deleting them,
+// as -reinit does when -replaced-disk-action=rename. Returns the command and
+// the path the set was moved to, so the caller can name it in a warning.
+//
+// Renaming is the safe default for a replica disk, and it is the EXPENSIVE
+// option here. The aside copies keep sharing extents among themselves, so the
+// set still costs about one base image plus its deltas -- but the replica
+// rebuilt by this reinit shares nothing with them, so the target now carries a
+// second full base image, permanently, because nothing reaps these.
+func RenameRootCommand(root string, at time.Time) (cmd, aside string, err error) {
+	if err := checkRoot(root); err != nil {
+		return "", "", err
+	}
+	aside = root + AsideSuffix + strconv.FormatInt(at.UTC().Unix(), 10)
+	return "mv " + shQuote(root) + " " + shQuote(aside), aside, nil
+}
+
+func checkRoot(root string) error {
+	if path.Base(root) != DirName {
+		return fmt.Errorf("refusing to act on %q as a restore point directory: it is not named %q", root, DirName)
+	}
+	return nil
 }
 
 // ReadStatusCommand fetches one restore point's sidecar.

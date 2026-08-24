@@ -76,10 +76,6 @@ func newRestorePoints(ctx context.Context, policy restorepoint.Policy, runner re
 	if len(targetDiskPaths) == 0 {
 		return nil, fmt.Errorf("-retention is set but this domain has no disks to copy")
 	}
-	// Logged before the first decision, so that a run which takes no restore
-	// point can always be told apart from one where this code never ran at
-	// all. Every path below either logs its outcome or returns an error.
-	trace.Info("restore points: considering this run", "retention", policy.String(), "disks", len(targetDiskPaths), "first_disk", targetDiskPaths[0])
 
 	// A restore point is a SET: one disk from this sync beside another from
 	// a different one is not a recoverable machine. That only works if they
@@ -113,7 +109,7 @@ func newRestorePoints(ctx context.Context, policy restorepoint.Policy, runner re
 		return nil, fmt.Errorf("-retention: %w", err)
 	}
 	if !restorepoint.Due(restorepoint.Latest(existing.Points), at, policy) {
-		trace.Info("restore point not due yet", "kept", len(existing.Points), "interval", policy.Interval.String())
+		trace.Info("restore point not due yet", "kept", len(existing.Points), "interval", policy.Interval.String(), "dir", root)
 		return &restorePoints{}, nil
 	}
 
@@ -130,7 +126,7 @@ func newRestorePoints(ctx context.Context, policy restorepoint.Policy, runner re
 	if _, err := runner.Run(ctx, restorepoint.StageCommand(root, tag)); err != nil {
 		return nil, fmt.Errorf("-retention: create the staging directory for restore point %s: %w", tag, err)
 	}
-	trace.Info("taking a restore point", "tag", tag.String(), "keep", policy.Count)
+	trace.Info("taking a restore point", "tag", tag.String(), "keep", policy.Count, "dir", root)
 	return &restorePoints{runner: runner, root: root, tag: tag, policy: policy, armed: true}, nil
 }
 
@@ -195,7 +191,7 @@ func (r *restorePoints) commit(ctx context.Context, verifyState, source string, 
 	if _, err := r.runner.Run(ctx, restorepoint.CommitCommand(r.root, r.tag)); err != nil {
 		return fmt.Errorf("-retention: publish restore point %s: %w", r.tag, err)
 	}
-	trace.Info("restore point taken", "tag", r.tag.String(), "disks", len(disks), "verify", verifyState)
+	trace.Info("restore point taken", "tag", r.tag.String(), "disks", len(disks), "verify", verifyState, "path", restorepoint.Dir(r.root, r.tag))
 
 	r.prune(ctx)
 	return nil
@@ -242,4 +238,69 @@ func (r *restorePoints) prune(ctx context.Context) {
 		trace.Info("removed an expired restore point", "tag", tag.String())
 	}
 	trace.Info("restore points on target", "kept", len(plan.Keep), "removed", len(plan.Remove), "dir", r.root)
+}
+
+// sweepRestorePointsForReinit decides what a -reinit does to the restore
+// points of the replica it is about to discard.
+//
+// An operator-initiated reinit takes them with it, following
+// -replaced-disk-action exactly as the replica disks do: one knob, and the
+// same answer for the replica and for its history, because they describe the
+// same lineage and the reinit is discarding it deliberately.
+//
+// An AUTOMATIC reinit does not. -reinit-after-failures fires on a failure
+// count, and "syncs have been failing repeatedly" is uncomfortably close to
+// "something is wrong with the source" -- which is the exact scenario restore
+// points exist for. Silently discarding them at that moment is the one
+// behaviour that would make this feature worse than not having it. So they are
+// kept, loudly: refusing the reinit instead would turn an auto-heal into stuck
+// replication, which is worse again.
+func sweepRestorePointsForReinit(ctx context.Context, cfg syncConfig, runner remoteRunner, aTargetDiskPath string) error {
+	root := restorepoint.Root(aTargetDiskPath)
+
+	listing, err := listRestorePoints(ctx, runner, root)
+	if err != nil {
+		// Not fatal: failing a reinit because the restore point directory
+		// could not be listed would block recovery over bookkeeping.
+		trace.Warning("reinit: could not list restore points; leaving them in place", "dir", root, "error", err)
+		return nil
+	}
+	if len(listing.Points) == 0 && len(listing.Staging) == 0 {
+		return nil
+	}
+
+	if cfg.ReinitAutomatic {
+		trace.Warning("reinit: keeping the existing restore points, because this reinit was forced by -reinit-after-failures rather than asked for -- repeated sync failures are exactly when an older copy is worth having. They are no longer pruned by retention, since the replica they belong to is being rebuilt; remove them by hand once you are satisfied the new replica is good",
+			"kept", len(listing.Points), "dir", root)
+		return nil
+	}
+
+	switch cfg.ReplacedDiskAction {
+	case replacedDiskDelete:
+		cmd, err := restorepoint.RemoveRootCommand(root)
+		if err != nil {
+			return fmt.Errorf("reinit: %w", err)
+		}
+		if _, err := runner.Run(ctx, cmd); err != nil {
+			return fmt.Errorf("reinit: remove restore points in %s: %w", root, err)
+		}
+		trace.Info("reinit: removed the restore points belonging to the replaced replica", "removed", len(listing.Points), "dir", root)
+	default:
+		cmd, aside, err := restorepoint.RenameRootCommand(root, time.Now())
+		if err != nil {
+			return fmt.Errorf("reinit: %w", err)
+		}
+		if _, err := runner.Run(ctx, cmd); err != nil {
+			return fmt.Errorf("reinit: move restore points aside from %s: %w", root, err)
+		}
+		// Louder than the equivalent line for a single replaced disk, because
+		// the cost is different in kind. These copies share extents among
+		// themselves, so the set is about one base image plus its deltas --
+		// but the replica this reinit is about to build shares nothing with
+		// them, so the target now holds a second full base image until
+		// somebody removes it.
+		trace.Warning("reinit: moved the existing restore points aside rather than deleting them (-replaced-disk-action=rename). Nothing reaps these: the set costs roughly a second full copy of the replica for as long as it stays. Remove it by hand, or use -replaced-disk-action=delete",
+			"moved", len(listing.Points), "from", root, "to", aside)
+	}
+	return nil
 }

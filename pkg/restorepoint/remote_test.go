@@ -301,3 +301,58 @@ func TestOneRetentionCycle(t *testing.T) {
 		t.Error("the removal command does not name the tag the plan chose")
 	}
 }
+
+// -reinit acts on the whole directory, one level above the tag validation
+// that protects RemoveCommand -- so the directory name itself is the guard.
+func TestRootCommandsRefuseADirectoryThatIsNotOurs(t *testing.T) {
+	at := time.Unix(1756041600, 0)
+	for _, bad := range []string{
+		"/data/replicas",         // the replica's own directory
+		"/",                      // the obvious catastrophe
+		"/data/replicas/.vmsync", // close, but not the name
+		"",
+		"/data/replicas/.vmsync-rp/1756041600-vmsync-cpt-000042", // a point, not the root
+	} {
+		t.Run(bad, func(t *testing.T) {
+			if cmd, err := RemoveRootCommand(bad); err == nil {
+				t.Errorf("RemoveRootCommand accepted %q and would run: %s", bad, cmd)
+			}
+			if cmd, _, err := RenameRootCommand(bad, at); err == nil {
+				t.Errorf("RenameRootCommand accepted %q and would run: %s", bad, cmd)
+			}
+		})
+	}
+}
+
+func TestRootCommandsOnARealRoot(t *testing.T) {
+	root := Root("/data/replicas/web01-disk0.qcow2")
+	at := time.Unix(1756041600, 0)
+
+	rm, err := RemoveRootCommand(root)
+	if err != nil {
+		t.Fatalf("RemoveRootCommand: %v", err)
+	}
+	if !strings.Contains(rm, shQuote(root)) {
+		t.Errorf("remove does not name the directory: %s", rm)
+	}
+
+	mv, aside, err := RenameRootCommand(root, at)
+	if err != nil {
+		t.Fatalf("RenameRootCommand: %v", err)
+	}
+	if aside == root {
+		t.Fatal("the aside path is the same as the root, so the rename would be a no-op or fail")
+	}
+	if !strings.HasPrefix(aside, root+AsideSuffix) {
+		t.Errorf("aside = %q, want it derived from the root so it stays on the same filesystem", aside)
+	}
+	if !strings.Contains(mv, shQuote(aside)) {
+		t.Errorf("the command does not move to the path it reported: %s -> %s", mv, aside)
+	}
+	// A second reinit in the same second must not collide with the first in a
+	// way that silently discards one set... it will, and that is why the
+	// caller warns with the path rather than assuming uniqueness.
+	if _, again, _ := RenameRootCommand(root, at); again != aside {
+		t.Errorf("the same instant produced two different aside paths, %q and %q", aside, again)
+	}
+}

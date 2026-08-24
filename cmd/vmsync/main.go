@@ -164,6 +164,10 @@ type syncConfig struct {
 	// quote back at the operator.
 	Retention       string
 	RetentionPolicy restorepoint.Policy
+	// ReinitAutomatic is true when -reinit-after-failures forced this reinit
+	// rather than an operator asking for one. The two are not interchangeable
+	// where restore points are concerned: see sweepRestorePointsForReinit.
+	ReinitAutomatic bool
 	// TestFault names a failure to inject into this run, or "" in every real
 	// one. See libvirtsync.TestFault for why this exists and why it is a flag
 	// rather than an environment variable.
@@ -621,6 +625,9 @@ func main() {
 		} else if failures >= cfg.ReinitAfterFailures {
 			trace.Warning("reinit-after-failures threshold reached, forcing reinit", "consecutive_failures", failures, "threshold", cfg.ReinitAfterFailures)
 			cfg.Reinit = true
+			// Recorded, because a reinit nobody asked for must not be allowed
+			// to discard restore points. See the sweep in run().
+			cfg.ReinitAutomatic = true
 		}
 	}
 
@@ -2232,6 +2239,13 @@ func run(cfg syncConfig) (runErr error) {
 		// costs disk space and a stale file to clean up, and says so loudly
 		// in the log every time. Nothing reaps the aside files -- they are
 		// deliberately somebody's decision, not a background job's.
+		if len(qcowDisks) > 0 {
+			if err := sweepRestorePointsForReinit(ctx, cfg, targetSSHClient,
+				util.SetTargetPath(cfg.TargetDiskPath, qcowDisks[0].RootSource)); err != nil {
+				return err
+			}
+		}
+
 		for _, d := range qcowDisks {
 			reinitTargetPath := util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
 
