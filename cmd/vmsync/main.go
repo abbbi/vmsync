@@ -168,6 +168,11 @@ type syncConfig struct {
 	// rather than an operator asking for one. The two are not interchangeable
 	// where restore points are concerned: see sweepRestorePointsForReinit.
 	ReinitAutomatic bool
+	// The two read-only restore point verbs. Neither touches the replica,
+	// libvirt, or any replication state.
+	ListRestorePoints   bool
+	CloneRestorePoint   string
+	CloneRestorePointTo string
 	// TestFault names a failure to inject into this run, or "" in every real
 	// one. See libvirtsync.TestFault for why this exists and why it is a flag
 	// rather than an environment variable.
@@ -280,6 +285,9 @@ func main() {
 	flag.StringVar(&cfg.TargetDiskOwner, "target-disk-owner", util.DiskOwnerAuto, fmt.Sprintf("Who should own the disk files created on the target: %q (default), %q, or an explicit \"user\", \"user:group\" or \":group\". vmsync creates those files by running qemu-img over SSH, so they are owned by that SSH user (root) -- while qemu runs as \"qemu\" on RHEL and \"libvirt-qemu\" on Debian, and cannot open a root-owned disk. libvirt's dynamic_ownership usually hides this, but it is off in plenty of deployments and cannot work at all on NFS with root_squash. %q preserves whatever owned the file before (which is what makes -reinit safe, since it replaces a correctly-owned disk with a fresh root-owned one) and otherwise takes what the target's libvirt qemu.conf sets; it never guesses, and warns instead. %q is the old behaviour", util.DiskOwnerAuto, util.DiskOwnerOff, util.DiskOwnerAuto, util.DiskOwnerOff))
 	flag.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "Reinit automatically after N failures (disabled by default). Count is held on target XML")
 	flag.StringVar(&cfg.Retention, "retention", "", "Keep point-in-time copies of the replica on the target, as COUNT,INTERVAL -- for example 24,3h for twenty-four copies at least three hours apart, so a sync that faithfully replicated an already-damaged source can be stepped back from. The COUNT is the guarantee; the window it covers is not, because vmsync does not decide when it runs: the interval is a floor (\"take one if at least this long has passed\"), so a pair syncing every 4h gets 4h spacing and a pause leaves a gap. Copies are made with reflink, share storage with the replica, and cost almost nothing until they diverge -- but the target filesystem must support it (XFS with reflink=1, or btrfs), and this is refused at startup where it does not. Disabled by default")
+	flag.BoolVar(&cfg.ListRestorePoints, "list-restore-points", false, "List the restore points kept on the target and stop. Needs -target-uri and -target-disk-path; reads the target filesystem only, and touches neither the replica nor libvirt")
+	flag.StringVar(&cfg.CloneRestorePoint, "clone-restore-point", "", "Copy one restore point's disks to the directory given by -clone-to, and stop. Takes a tag from -list-restore-points. This is how to answer \"is that copy clean?\": boot a throwaway domain from the clone. It changes nothing about the replica, its metadata, or its role -- restoring in place is a different operation and is deliberately not this one")
+	flag.StringVar(&cfg.CloneRestorePointTo, "clone-to", "", "Directory on the target to write -clone-restore-point's copies into. Created if missing")
 	flag.StringVar(&cfg.TestFault, "test", "", fmt.Sprintf("FOR TESTING ONLY: make vmsync deliberately fail at a chosen point, so error-recovery paths that cannot be reached from outside the process can be exercised. Accepts one of: %s. A run with this set WILL fail and its result means nothing as a replication. Listed here rather than hidden, so an operator who finds it in a log can look it up", strings.Join(libvirtsync.TestFaults, ", ")))
 	compressArg := optionalValueFlag{bareDefault: "s2"}
 	fenceSourceArg := optionalValueFlag{bareDefault: fenceSourceAuto}
@@ -379,6 +387,8 @@ func main() {
 			{cfg.ShutdownDomain, "-shutdown-domain"},
 			{cfg.ReadFence, "-read-fence"},
 			{cfg.UpdateRole != "", "-update-role"},
+			{cfg.ListRestorePoints, "-list-restore-points"},
+			{cfg.CloneRestorePoint != "", "-clone-restore-point"},
 		} {
 			if m.on {
 				chosen = append(chosen, m.name)
@@ -404,6 +414,10 @@ func main() {
 				err = runShutdownDomain(ctx, cfg)
 			case cfg.ReadFence:
 				err = runReadFence(cfg)
+			case cfg.ListRestorePoints:
+				err = runListRestorePoints(ctx, cfg)
+			case cfg.CloneRestorePoint != "":
+				err = runCloneRestorePoint(ctx, cfg, cfg.CloneRestorePoint, cfg.CloneRestorePointTo)
 			}
 			if err != nil {
 				trace.Error(strings.TrimPrefix(chosen[0], "-"), "error", err)

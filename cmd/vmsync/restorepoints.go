@@ -21,11 +21,14 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"sort"
 	"sync"
 	"time"
 
+	"vmsync/pkg/remotessh"
 	"vmsync/pkg/restorepoint"
 	"vmsync/pkg/trace"
+	"vmsync/pkg/util"
 )
 
 // The -retention side of a sync: after each replica disk is copied, take a
@@ -302,5 +305,167 @@ func sweepRestorePointsForReinit(ctx context.Context, cfg syncConfig, runner rem
 		trace.Warning("reinit: moved the existing restore points aside rather than deleting them (-replaced-disk-action=rename). Nothing reaps these: the set costs roughly a second full copy of the replica for as long as it stays. Remove it by hand, or use -replaced-disk-action=delete",
 			"moved", len(listing.Points), "from", root, "to", aside)
 	}
+	return nil
+}
+
+// --- operator verbs ----------------------------------------------------------
+//
+// Both work off the filesystem alone and never touch libvirt, replication
+// state or the replica. That is not a shortcut: the restore point inventory IS
+// the directory (see docs/design/restore-points.md on why it cannot live in
+// vmsync's metadata), and an operator running these during an incident should
+// not be able to change anything by looking.
+
+// dialTargetForRestorePoints opens the SSH connection these verbs need.
+func dialTargetForRestorePoints(cfg syncConfig) (*remotessh.Client, error) {
+	if !util.UriUsesSSH(cfg.TargetURI) {
+		return nil, fmt.Errorf("-target-uri must be ssh-based to reach the restore points on the target")
+	}
+	sshCfg, err := remotessh.ConfigFromLibvirtURI(
+		cfg.TargetURI, cfg.SSHUser, cfg.SSHKey, cfg.SSHPassword,
+		cfg.KnownHosts, cfg.SSHPort, cfg.SSHInsecure,
+		time.Duration(cfg.SSHTimeoutSec)*time.Second,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return remotessh.Dial(sshCfg)
+}
+
+// restorePointRoot derives the restore point directory from -target-disk-path.
+//
+// Deliberately not by asking libvirt what disks the target has: these verbs
+// must work when the target domain is gone, half-defined, or was never
+// defined -- which is exactly the situation somebody reaching for a restore
+// point may be in.
+func restorePointRoot(cfg syncConfig) (string, error) {
+	if cfg.TargetDiskPath == "" {
+		return "", fmt.Errorf("-target-disk-path is required to locate restore points; they live in %s inside it", restorepoint.DirName)
+	}
+	return path.Join(cfg.TargetDiskPath, restorepoint.DirName), nil
+}
+
+// runListRestorePoints prints what is available to go back to.
+func runListRestorePoints(ctx context.Context, cfg syncConfig) error {
+	root, err := restorePointRoot(cfg)
+	if err != nil {
+		return err
+	}
+	client, err := dialTargetForRestorePoints(cfg)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	listing, err := listRestorePoints(ctx, client, root)
+	if err != nil {
+		return err
+	}
+	if len(listing.Points) == 0 {
+		trace.Info("no restore points on the target", "dir", root)
+	}
+
+	// Oldest first: read top to bottom, this is the history in the order it
+	// happened.
+	points := append([]restorepoint.Tag(nil), listing.Points...)
+	sort.Slice(points, func(i, j int) bool { return points[i].At.Before(points[j].At) })
+
+	fmt.Printf("%-20s  %-20s  %-10s  %s\n", "TAKEN", "CHECKPOINT", "VERIFY", "TAG")
+	for _, tag := range points {
+		verify, checkpoint := "unknown", tag.Checkpoint
+		out, err := client.Run(ctx, restorepoint.ReadStatusCommand(root, tag))
+		if err == nil {
+			if s, derr := restorepoint.DecodeStatus([]byte(out)); derr == nil {
+				verify = s.Verify
+				if s.Checkpoint != "" {
+					checkpoint = s.Checkpoint
+				}
+			}
+		}
+		// "unknown" rather than a guess when the sidecar is missing or
+		// unreadable: the whole reason it exists is to say how much
+		// confidence a restore point has earned, and inventing one would
+		// defeat it.
+		fmt.Printf("%-20s  %-20s  %-10s  %s\n",
+			tag.At.UTC().Format("2006-01-02 15:04:05"), checkpoint, verify, tag.String())
+	}
+
+	for _, name := range listing.Staging {
+		trace.Warning("an incomplete restore point is present, left by an interrupted run; the next sync with -retention will remove it", "entry", name)
+	}
+	for _, name := range listing.Unknown {
+		trace.Warning("an unrecognised entry is present in the restore point directory; vmsync will not touch it", "entry", name)
+	}
+	return nil
+}
+
+// runCloneRestorePoint materialises one restore point's disks somewhere the
+// operator names, and stops there.
+//
+// This is the whole point of phase 1. During an incident the question is "is
+// this copy clean", not "make the replica be this" -- and answering it by
+// booting a scratch domain from a clone reconciles no metadata, changes no
+// role, and leaves last_checkpoint valid. Restoring in place is a different
+// operation with a different risk, and is deliberately not this one.
+func runCloneRestorePoint(ctx context.Context, cfg syncConfig, tagName, dest string) error {
+	if dest == "" {
+		return fmt.Errorf("-clone-restore-point needs -clone-to DIR, the directory to write the copies into")
+	}
+	tag, err := restorepoint.ParseTag(tagName)
+	if err != nil {
+		return fmt.Errorf("%w -- run -list-restore-points to see the available tags", err)
+	}
+	root, err := restorePointRoot(cfg)
+	if err != nil {
+		return err
+	}
+	client, err := dialTargetForRestorePoints(cfg)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	// Confirm it is actually there before writing anything, so a mistyped tag
+	// fails clean instead of leaving an empty destination behind.
+	listing, err := listRestorePoints(ctx, client, root)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, t := range listing.Points {
+		if t.String() == tag.String() {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("no restore point %q in %s -- run -list-restore-points to see what is there", tag, root)
+	}
+
+	out, err := client.Run(ctx, restorepoint.ReadStatusCommand(root, tag))
+	if err != nil {
+		return fmt.Errorf("read the status sidecar of restore point %s: %w", tag, err)
+	}
+	status, err := restorepoint.DecodeStatus([]byte(out))
+	if err != nil {
+		return fmt.Errorf("restore point %s: %w", tag, err)
+	}
+	if len(status.Disks) == 0 {
+		return fmt.Errorf("restore point %s lists no disks; it may have been written by a newer vmsync", tag)
+	}
+
+	if _, err := client.Run(ctx, "mkdir -p "+util.ShQuote(dest)); err != nil {
+		return fmt.Errorf("create %s on the target: %w", dest, err)
+	}
+	for _, name := range status.Disks {
+		to := path.Join(dest, name)
+		if _, err := client.Run(ctx, restorepoint.CloneCommand(root, tag, name, to)); err != nil {
+			return fmt.Errorf("clone %s from restore point %s: %w", name, tag, err)
+		}
+		trace.Info("cloned a restore point disk", "disk", name, "to", to)
+	}
+
+	trace.Info("restore point cloned; the replica and its replication state are untouched", "tag", tag.String(), "disks", len(status.Disks), "dir", dest, "verify", status.Verify)
+	trace.Info("to inspect it, define a throwaway domain pointing at these files and boot it -- nothing here has changed the replica or its metadata")
 	return nil
 }
