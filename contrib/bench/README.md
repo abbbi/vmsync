@@ -263,6 +263,36 @@ write and read as "verify missed it".
 
 Set `TAMPER_MODE=fixed` to go back to a single `TAMPER_OFFSET`/`TAMPER_LENGTH`.
 
+### Stage 9 (`retention`), opt-in
+
+Covers `-retention` end to end against a real target. It skips cleanly, rather
+than failing, when the target filesystem cannot reflink — the same refusal
+vmsync itself gives.
+
+Most of it is counting directories, but two checks earn their place:
+
+**It measures the space a restore point actually consumed.** A restore point
+that was a full byte-for-byte copy would pass every other check here — the
+directory would exist, the disk would be there, it would boot. It would simply
+cost a whole replica per copy instead of sharing storage with it, and nothing
+would say so. So the stage reads free space (`df`, never `du` — see above)
+either side of a sync and fails if taking a restore point cost more than a
+tenth of the replica.
+
+**It checks that inspecting a restore point changes nothing.** `last_checkpoint`
+is read before `-list-restore-points` and `-clone-restore-point` and again
+after, and must be identical. If inspecting a copy moved it, the next
+incremental sync would write its delta onto the wrong baseline — which looks
+like a clean sync right up until a promotion. That is the phase 1 thesis stated
+as an assertion.
+
+The rest: the interval is honoured, pruning keeps the configured count and
+drops the oldest first, the sidecar records a verify state, the clone is a
+readable qcow2, and an operator `-reinit` sweeps the set.
+
+Uses `-retention=N,0` — a zero interval means every sync — so the stage does
+not have to sleep for hours to prove retention works.
+
 ### Stage 8 (`verify-long`), opt-in
 
 Every other stage verifies a replica built moments ago by a single

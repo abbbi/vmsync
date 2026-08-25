@@ -62,7 +62,8 @@ Options:
   --only PATTERN          only run Stage 1 scenarios whose name matches
                            PATTERN (a bash glob, e.g. "compress-zstd-*")
   --stages LIST           comma-separated subset of: matrix,verify,verify-long,
-                           reinit,snapshot,define,failover,fence-agent -- runs in
+                           reinit,snapshot,define,failover,fence-agent,retention
+                           -- runs in
                            whichever order LIST gives them, not a fixed
                            canonical order
                            (default: matrix,verify,reinit,snapshot, which just
@@ -2524,6 +2525,221 @@ verify_long_round() {
 	return 0
 }
 
+
+# --- Stage 9: -retention (restore points on the target) ----------------------
+#
+# Every assertion here is about the target's filesystem, because that is where
+# a restore point lives -- vmsync keeps no inventory of its own, deliberately
+# (docs/design/restore-points.md explains why it cannot).
+#
+# The reflink assertion is the one worth reading twice. A restore point that is
+# a full byte-for-byte copy would pass every other check in this stage: the
+# directory would exist, the disk would be there, it would boot. It would just
+# cost a whole replica per copy instead of sharing storage with it, and nothing
+# would say so. So the space it actually consumed is measured, not assumed.
+stage_retention() {
+	log "=== Stage 9: -retention restore points ==="
+	local sc=retention
+	local fo_ok=0
+
+	if [ "$DRY_RUN" = yes ]; then
+		bench_sync "$sc" baseline -reinit "-retention=3,0"
+		bench_sync "$sc" reflink-probe "-retention=3,0"
+		bench_sync "$sc" within-interval "-retention=3,1h"
+		fo_check "$sc" "a sync with -retention takes a restore point" 0
+		return 0
+	fi
+
+	require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
+	reset_pair_state "$sc" || return 0
+	require_target_syncable "$sc" || return 0
+
+	local rp_dir="${TARGET_DISK_PATH%/}/.vmsync-rp"
+
+	# Start from nothing, so every count below is this stage's own doing and
+	# not a leftover from an earlier run.
+	ssh_host_cmd "$TARGET_HOST" "rm -rf '$rp_dir'" >/dev/null 2>&1 || true
+
+	# --- does the target support this at all? --------------------------------
+	# An interval of 0 means "every sync", which is what a test wants: the
+	# alternative is a stage that sleeps for hours.
+	bench_sync "$sc" baseline -reinit "-retention=3,0"
+	if [ "$RUN_RC" != 0 ]; then
+		if grep -q "does not support reflink copies" "$RUN_LOG" 2>/dev/null; then
+			warn "SKIP stage retention: $TARGET_DISK_PATH on $TARGET_HOST does not support reflink copies (needs XFS with reflink=1, or btrfs)"
+			results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP target filesystem has no reflink support"
+			return 0
+		fi
+		die "baseline sync with -retention failed (see $RUN_LOG) -- aborting stage 9$(bench_sync_hint)"
+	fi
+
+	local n
+	n="$(rp_count "$rp_dir")"
+	if [ "$n" = 1 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "a sync with -retention takes a restore point" "$fo_ok" \
+		"expected exactly 1 in $rp_dir but found $n"
+
+	# --- is it actually sharing storage? -------------------------------------
+	# Measured across one more sync rather than inferred: if these were full
+	# copies, the target's free space would fall by roughly the size of the
+	# replica every time. A reflink costs a few metadata blocks.
+	local tdisk disk_bytes free_before free_after used
+	tdisk="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")" || true
+	if [ -n "$tdisk" ]; then
+		disk_bytes="$(ssh_host_cmd "$TARGET_HOST" "qemu-img info --output=json '$tdisk'" 2>/dev/null \
+			| awk -F: '/"actual-size"/ { gsub(/[^0-9]/, "", $2); print $2; exit }')"
+	fi
+	free_before="$(fs_free_bytes "$TARGET_HOST" "$TARGET_DISK_PATH")"
+	bench_sync "$sc" reflink-probe "-retention=3,0"
+	free_after="$(fs_free_bytes "$TARGET_HOST" "$TARGET_DISK_PATH")"
+
+	if [ -z "${disk_bytes:-}" ] || [ -z "$free_before" ] || [ -z "$free_after" ]; then
+		warn "SKIP the reflink space check: could not size the replica or read free space on $TARGET_HOST"
+		results_row "$CSV" "$sc" reflink_shares_storage "" "" "" "" "" "" "SKIP could not measure"
+	else
+		used=$((free_before - free_after))
+		# A tenth of the replica is a generous ceiling: a real copy costs the
+		# whole thing and a reflink costs metadata, so the gap is orders of
+		# magnitude. The slack absorbs whatever else on the host wrote during
+		# the sync, and a negative figure (the host freed space) is fine too.
+		if [ "$used" -lt $((disk_bytes / 10)) ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the restore point shares storage rather than copying the replica" "$fo_ok" \
+			"the filesystem lost ${used}B taking a restore point of a ${disk_bytes}B replica -- a reflink should cost almost nothing"
+	fi
+
+	# --- the sidecar ---------------------------------------------------------
+	local tag sidecar
+	tag="$(rp_newest "$rp_dir")"
+	sidecar="$(ssh_host_cmd "$TARGET_HOST" "cat '$rp_dir/$tag/status.json' 2>/dev/null || true")"
+	case "$sidecar" in
+	*'"verify"'*) fo_ok=0 ;;
+	*) fo_ok=1 ;;
+	esac
+	fo_check "$sc" "the restore point records what is known about it" "$fo_ok" \
+		"no verify state in $rp_dir/$tag/status.json: $(printf '%s' "$sidecar" | tr -d '\n' | tr ',' ';' | cut -c1-120)"
+
+	# --- the interval is honoured -------------------------------------------
+	local before_count after_count
+	before_count="$(rp_count "$rp_dir")"
+	bench_sync "$sc" within-interval "-retention=3,1h"
+	after_count="$(rp_count "$rp_dir")"
+	if [ "$after_count" = "$before_count" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "a sync inside the interval takes no new restore point" "$fo_ok" \
+		"count went from $before_count to $after_count despite -retention=3,1h"
+
+	# --- retention prunes to the count, oldest first -------------------------
+	local oldest
+	oldest="$(rp_oldest "$rp_dir")"
+	bench_sync "$sc" prune-1 "-retention=2,0"
+	bench_sync "$sc" prune-2 "-retention=2,0"
+	after_count="$(rp_count "$rp_dir")"
+	if [ "$after_count" = 2 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "retention prunes down to the configured count" "$fo_ok" \
+		"expected 2 with -retention=2,0 but found $after_count"
+
+	if rp_has "$rp_dir" "$oldest"; then fo_ok=1; else fo_ok=0; fi
+	fo_check "$sc" "pruning removes the oldest restore point first" "$fo_ok" \
+		"'$oldest' is still present after pruning to 2"
+
+	# --- listing and cloning change nothing ----------------------------------
+	# The phase 1 thesis: an operator can find out whether a restore point is
+	# clean without touching replication state. If inspecting one moved
+	# last_checkpoint, the next incremental sync would write its delta onto the
+	# wrong baseline -- exactly the hazard this feature is designed around, and
+	# one that would look like a clean sync right up until a promotion.
+	local cp_before cp_after clone_dir="/var/tmp/vmsync-bench-clone.$$"
+	cp_before="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_checkpoint)"
+	tag="$(rp_newest "$rp_dir")"
+
+	if vmsync_verb "$sc" list -list-restore-points; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "-list-restore-points reports them" "$fo_ok" "see $RUN_LOG"
+
+	if vmsync_verb "$sc" clone -clone-restore-point "$tag" -clone-to "$clone_dir"; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "-clone-restore-point materialises the restore point" "$fo_ok" "see $RUN_LOG"
+
+	if ssh_host_cmd "$TARGET_HOST" "for f in '$clone_dir'/*.qcow2; do qemu-img info \"\$f\" >/dev/null || exit 1; done" >/dev/null 2>&1; then
+		fo_ok=0
+	else
+		fo_ok=1
+	fi
+	fo_check "$sc" "the clone is a readable qcow2" "$fo_ok" "qemu-img info failed on $clone_dir"
+
+	cp_after="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_checkpoint)"
+	if [ "$cp_before" = "$cp_after" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "inspecting a restore point leaves replication state untouched" "$fo_ok" \
+		"last_checkpoint moved from '$cp_before' to '$cp_after' -- the next incremental sync would write onto the wrong baseline"
+
+	ssh_host_cmd "$TARGET_HOST" "rm -rf '$clone_dir'" >/dev/null 2>&1 || true
+
+	# --- an operator -reinit takes them with it ------------------------------
+	before_count="$(rp_count "$rp_dir")"
+	bench_sync "$sc" reinit-sweep -reinit "-retention=2,0"
+	after_count="$(rp_count "$rp_dir")"
+	# This very sync takes one of its own, so "swept" means the earlier ones
+	# are gone rather than the directory being empty.
+	if [ "$after_count" -lt "$before_count" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "an operator -reinit sweeps the restore points of the replica it replaces" "$fo_ok" \
+		"count was $before_count before the reinit and $after_count after"
+
+	return 0
+}
+
+# rp_count DIR -> how many PUBLISHED restore points are in DIR.
+#
+# Staging (".incomplete-") and unrecognised entries are excluded by the leading
+# digit, which is what makes every count above an assertion about restore
+# points rather than about directory contents.
+rp_count() {
+	ssh_host_cmd "$TARGET_HOST" "ls -1 '$1' 2>/dev/null | grep -c '^[0-9][0-9]*-' || true" | tr -d '[:space:]'
+}
+
+# rp_newest / rp_oldest -- sorted numerically, which works because a tag leads
+# with the checkpoint instant precisely so it sorts.
+rp_newest() {
+	ssh_host_cmd "$TARGET_HOST" "ls -1 '$1' 2>/dev/null | grep '^[0-9][0-9]*-' | sort -n | tail -1 || true" | tr -d '[:space:]'
+}
+
+rp_oldest() {
+	ssh_host_cmd "$TARGET_HOST" "ls -1 '$1' 2>/dev/null | grep '^[0-9][0-9]*-' | sort -n | head -1 || true" | tr -d '[:space:]'
+}
+
+rp_has() {
+	[ -n "${2:-}" ] || return 1
+	ssh_host_cmd "$TARGET_HOST" "test -d '$1/$2'" >/dev/null 2>&1
+}
+
+# fs_free_bytes HOST PATH -> free bytes on the filesystem holding PATH.
+#
+# df, never du. A reflink copy shares extents and du counts a shared extent
+# once for EVERY file referencing it, so du would report a directory of restore
+# points at many times its real cost -- and would make the check above claim a
+# reflink had consumed a full copy.
+fs_free_bytes() {
+	ssh_host_cmd "$1" "df -B1 --output=avail '$2' 2>/dev/null | tail -1" | tr -d '[:space:]'
+}
+
+# vmsync_verb SCENARIO PHASE ARGS... -- run one standalone vmsync verb against
+# the target, logged like any other run.
+#
+# Not bench_sync: these verbs copy nothing and need no source, and passing them
+# -source-uri would misrepresent what they touch. That they work with only
+# target-side flags is itself part of what this stage checks -- an operator
+# reaching for a restore point may have a source that is gone.
+vmsync_verb() {
+	local scenario="$1" phase="$2"
+	shift 2
+	local log_file="$RUN_DIR/logs/${scenario}.${phase}.log"
+	RUN_LOG="$log_file"
+	local args=(-target-uri "$TARGET_URI" -target-disk-path "$TARGET_DISK_PATH")
+	[ -n "${SSH_USER:-}" ] && args+=(-ssh-user "$SSH_USER")
+	[ -n "${SSH_KEY:-}" ] && args+=(-ssh-key "$SSH_KEY")
+	[ -n "${SSH_PORT:-}" ] && args+=(-ssh-port "$SSH_PORT")
+	[ -n "${SSH_KNOWN_HOSTS:-}" ] && args+=(-ssh-known-hosts "$SSH_KNOWN_HOSTS")
+	args+=("$@")
+	log "-> $scenario/$phase"
+	log "   $VMSYNC_BIN ${args[*]}"
+	"$VMSYNC_BIN" "${args[@]}" >"$log_file" 2>&1
+}
 stage_pattern() {
 	case "$1" in
 	# Anchored to the four named sub-tests rather than a bare ^verify- , so a
@@ -2536,6 +2752,7 @@ stage_pattern() {
 	define) printf '^define-(uuid-collision|rollback)$' ;;
 	failover) printf '^failover$' ;;
 	fence-agent) printf '^fence-agent$' ;;
+	retention) printf '^retention$' ;;
 	*) printf '$^' ;; # matches nothing
 	esac
 }
@@ -2725,6 +2942,16 @@ generate_report() {
                         echo "_not run (opt in with \`--stages verify-long\`; it builds a $VERIFY_LONG_COPIES-deep chain per mode)_"
                 fi
                 echo
+                echo "## Stage 9: retention (restore points on the target)"
+                echo
+                if awk -F, 'NR>1 && $1=="retention" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| check | exit | result |"
+                        echo "|---|---|---|"
+                        awk -F, 'NR>1 && $1=="retention" { gsub(/_/, " ", $2); printf "| %s | %s | %s |\n", $2, $3, $9 }' "$CSV"
+                else
+                        echo "_not run (opt in with \`--stages retention\`; needs a reflink-capable target filesystem)_"
+                fi
+                echo
                 echo "## Stage 3: reinit-after-failures"
                 echo
                 awk -F, 'NR>1 && $1=="reinit-after-failures" { printf "- %s/%s: exit=%s wall=%ss %s\n", $1, $2, $3, $4, $9 }' "$CSV"
@@ -2828,7 +3055,8 @@ for s in "${stage_list[@]}"; do
         define) stage_define_domain || stage_rc=$? ;;
         failover) stage_failover || stage_rc=$? ;;
         fence-agent) stage_fence_agent || stage_rc=$? ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,verify-long,reinit,snapshot,define,failover,fence-agent)" ;;
+        retention) stage_retention || stage_rc=$? ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,verify-long,reinit,snapshot,define,failover,fence-agent,retention)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
                 warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."
