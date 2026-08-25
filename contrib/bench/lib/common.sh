@@ -181,6 +181,50 @@ require_dom_shutoff_or_absent() {
 	fi
 }
 
+# stage_needs_target_shutoff CSV SCENARIO LABEL -- the non-fatal counterpart of
+# require_dom_shutoff_or_absent, for use INSIDE a stage. Returns 0 when the
+# target is shut off or absent; otherwise records a SKIP against SCENARIO and
+# returns 1 so the caller can stand down.
+#
+# The distinction is not stylistic. die() calls exit, so a precondition failing
+# inside a stage takes generate_report and final_verdict with it: a run that had
+# already passed seven stages ends on a FATAL line with no results table, no
+# record of what worked, and nothing to compare against the previous run. The
+# stage_rc capture in the dispatch loop cannot help, because die() never returns
+# for it to catch.
+#
+# And the state that trips it is usually not the stage's own doing -- most often
+# an earlier stage promoted the target, which boots it, and did not put it back.
+# Ending the run there punishes the operator twice: once for the leftover, and
+# once by discarding the results of everything that did work.
+#
+# preflight() deliberately still uses the fatal form. Nothing has run at that
+# point, so there is no report to lose and no reason to continue.
+stage_needs_target_shutoff() {
+	local csv="$1" scenario="$2" label="$3"
+	local uri="$TARGET_URI" domain="$TARGET_DOMAIN" state
+
+	if ! domain_exists "$uri" "$domain"; then
+		if virsh_err_is_not_found; then
+			return 0 # absent is fine: the stage's own baseline creates it
+		fi
+		warn "SKIP $label: cannot query target domain '$domain' via $uri: $VIRSH_ERR"
+		results_row "$csv" "$scenario" precondition "" "" "" "" "" "" "SKIP target domain could not be queried"
+		return 1
+	fi
+
+	if ! state="$(dom_state "$uri" "$domain")"; then
+		warn "SKIP $label: cannot query state of target domain '$domain' via $uri${VIRSH_ERR:+: $VIRSH_ERR}"
+		results_row "$csv" "$scenario" precondition "" "" "" "" "" "" "SKIP target state could not be queried"
+		return 1
+	fi
+	[ "$state" = "shutoff" ] && return 0
+
+	warn "SKIP $label: target domain '$domain' is '$state' and this harness never starts the target itself. If an earlier stage promoted it, that stage should have put it back -- shut it down and re-run."
+	results_row "$csv" "$scenario" precondition "" "" "" "" "" "" "SKIP target domain is $state"
+	return 1
+}
+
 # require_dom_running: the external-snapshot lifecycle test (Stage 4) needs
 # the SOURCE domain running -- removing an external disk-only snapshot via
 # a live blockcommit/pivot is a running-domain operation, and that's also

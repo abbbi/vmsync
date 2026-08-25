@@ -76,19 +76,20 @@ vmsync itself to work at all).
 
 ```bash
 ./bench.sh --dry-run          # print every vmsync command line, touch nothing
-./bench.sh                    # the full run: Stage 1, then 2, 3, then 4
+./bench.sh                    # the defaults: Stage 1, then 2, 3, 4, then 9
 ./bench.sh --only 'compress-zstd-*'   # Stage 1 only, matching scenarios
 ./bench.sh --stages verify    # just the verify+tamper tests
 ./bench.sh --stages snapshot  # just the external-snapshot lifecycle test
-./bench.sh --stages matrix,verify,reinit,snapshot,define  # + Stage 5, opt-in
+./bench.sh --stages retention # just the restore-point tests
+./bench.sh --stages matrix,verify,reinit,snapshot,retention,define  # + Stage 5, opt-in
 ./bench.sh --stages failover  # just the DR path: promotion, fencing, the way back
 ./bench.sh --stages fence-agent  # + real agents; STOPS THE SOURCE VM, see below
 ```
 
-Stage 2, Stage 3, and Stage 4 each run their own baseline `-reinit` full
-sync before anything else, so none of them actually depend on Stage 1(or
-any prior sync) having run first — each is safe to run standalone via
-`--stages`. This matters for more than just the "full vs incremental"
+Stage 2, Stage 3, Stage 4, and Stage 9 each run their own baseline
+`-reinit` full sync before anything else, so none of them actually depend
+on Stage 1(or any prior sync) having run first — each is safe to run
+standalone via `--stages`. This matters for more than just the "full vs incremental"
 distinction in their own pass/fail checks: Stage 3 specifically needs a
 target domain that already exists, since `-reinit-after-failures`'s
 counter lives in the target's own domain metadata and vmsync treats
@@ -263,11 +264,16 @@ write and read as "verify missed it".
 
 Set `TAMPER_MODE=fixed` to go back to a single `TAMPER_OFFSET`/`TAMPER_LENGTH`.
 
-### Stage 9 (`retention`), opt-in
+### Stage 9 (`retention`), default
 
 Covers `-retention` end to end against a real target. It skips cleanly, rather
 than failing, when the target filesystem cannot reflink — the same refusal
-vmsync itself gives.
+vmsync itself gives. That clean skip is why it can be a default stage: a target
+on ext4 records SKIP and the run continues, so nobody has to know in advance
+whether their storage supports the feature.
+
+It runs last of the defaults because it `-reinit`s the target several times
+over.
 
 Most of it is counting directories, but two checks earn their place:
 

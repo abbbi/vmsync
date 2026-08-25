@@ -37,7 +37,7 @@ CONF="$SCRIPT_DIR/bench.conf"
 SCENARIOS="$SCRIPT_DIR/scenarios.conf"
 DRY_RUN=no
 ONLY_PATTERN=""
-STAGES="matrix,verify,reinit,snapshot"
+STAGES="matrix,verify,reinit,snapshot,retention"
 
 # INTERRUPTED: vmsync catches SIGINT/SIGTERM itself (cleanup, then a plain
 # os.Exit(1) -- see cmd/vmsync/main.go's own signal handling), so a Ctrl+C
@@ -66,9 +66,11 @@ Options:
                            -- runs in
                            whichever order LIST gives them, not a fixed
                            canonical order
-                           (default: matrix,verify,reinit,snapshot, which just
-                           happens to already be written in that order; define,
-                           failover and fence-agent are opt-in, see below)
+                           (default: matrix,verify,reinit,snapshot,retention;
+                           retention is last because it reinitialises the
+                           target, and it skips cleanly where the target
+                           filesystem cannot reflink. define, failover,
+                           fence-agent and verify-long are opt-in, see below)
   --dry-run               print every vmsync command line; touch nothing
                            (no ssh/qemu-io/vmsync calls actually made)
   -h, --help              this text
@@ -602,6 +604,12 @@ stage_matrix() {
                                         log "--- [$n/$total] scenario: $name (compress=$compress netbuffer=$netbuf use_ssh=$use_ssh iodepth=$iodepth) ---"
 
                                         if [ "$DRY_RUN" != yes ]; then
+                                                # Still fatal here, unlike every other stage. This
+                                                # runs first and preflight checked the same thing
+                                                # moments ago, so reaching it means the target
+                                                # changed state mid-run -- and almost nothing has
+                                                # been recorded yet, so there is no report worth
+                                                # preserving by continuing.
                                                 require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
                                         fi
 
@@ -721,25 +729,25 @@ tamper_target() {
 
 	if [ "$preserve" = yes ]; then
 		mtime="$(ssh_host_cmd "$TARGET_HOST" stat -c %Y "'$path'")" \
-			|| die "could not read the mtime of $path on $TARGET_HOST before tampering -- refusing to corrupt a file whose state cannot be restored"
+			|| { warn "could not read the mtime of $path on $TARGET_HOST before tampering -- refusing to corrupt a file whose state cannot be restored"; return 1; }
 	fi
 
 	ssh_host_cmd "$TARGET_HOST" qemu-io -f qcow2 \
 		-c "'write -P ${TAMPER_PATTERN} ${TAMPER_OFF} ${TAMPER_LEN}'" "'${path}'" \
-		|| die "failed to inject test corruption into $path on $TARGET_HOST -- refusing to continue this sub-test"
+		|| { warn "failed to inject test corruption into $path on $TARGET_HOST -- refusing to continue this sub-test"; return 1; }
 
 	# Read it back. A qemu-io write that reports success but lands somewhere
 	# else, or gets swallowed, would otherwise turn into "verify missed it".
 	ssh_host_cmd "$TARGET_HOST" qemu-io -r -f qcow2 \
 		-c "'read -P ${TAMPER_PATTERN} ${TAMPER_OFF} ${TAMPER_LEN}'" "'${path}'" >/dev/null \
-		|| die "the test corruption did not read back from $path at offset $TAMPER_OFF length $TAMPER_LEN -- the tamper did not take, so nothing below would be testing what it claims"
+		|| { warn "the test corruption did not read back from $path at offset $TAMPER_OFF length $TAMPER_LEN -- the tamper did not take, so nothing below would be testing what it claims"; return 1; }
 
 	if [ "$preserve" = yes ]; then
 		# touch -d @N sets nanoseconds to zero, so the restored stamp is at
 		# worst marginally OLDER than the original -- never newer, and the
 		# original passed the guard on the previous run by construction.
 		ssh_host_cmd "$TARGET_HOST" touch -d "@$mtime" "'$path'" \
-			|| die "could not restore the mtime of $path on $TARGET_HOST -- the sync below would fail at vmsync's mtime guard instead of reaching -verify, and would be scored as if it had verified"
+			|| { warn "could not restore the mtime of $path on $TARGET_HOST -- the sync below would fail at vmsync's mtime guard instead of reaching -verify, and would be scored as if it had verified"; return 1; }
 	fi
 }
 
@@ -770,7 +778,7 @@ stage_verify_tamper() {
         log "=== Stage 2: -verify modes with deliberate target-side tampering ==="
 
         if [ "$DRY_RUN" != yes ]; then
-                require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
+                stage_needs_target_shutoff "$CSV" verify-precondition "stage verify" || return 0
         fi
 
         # A known-clean baseline under the plain, no-bridge transport -- verify
@@ -779,17 +787,18 @@ stage_verify_tamper() {
         # directly comparable to each other.
         bench_sync verify-baseline full -reinit
         if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
-                die "baseline full sync for verify testing failed (see $RUN_LOG) -- aborting stage 2$(bench_sync_hint)"
+                warn "baseline full sync for verify testing failed (see $RUN_LOG) -- aborting stage 2$(bench_sync_hint)"
+                return 1
         fi
 
         local target_path=""
         if [ "$DRY_RUN" != yes ]; then
                 # "|| true": disk_source_path's own failure (e.g. virsh dumpxml
                 # erroring under `set -o pipefail`) must fall through to the
-                # specific, actionable die() below instead of silently killing the
+                # specific, actionable message below instead of silently killing the
                 # script here with no message at all.
                 target_path="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")" || true
-                [ -n "$target_path" ] || die "could not resolve target disk path for dev='$TAMPER_DISK_DEV' via virsh dumpxml -- check TAMPER_DISK_DEV in $CONF"
+                [ -n "$target_path" ] || { warn "could not resolve target disk path for dev='$TAMPER_DISK_DEV' via virsh dumpxml -- check TAMPER_DISK_DEV in $CONF"; return 1; }
                 log "target disk under test: dev=$TAMPER_DISK_DEV path=$target_path (on $TARGET_HOST)"
         fi
 
@@ -797,7 +806,7 @@ stage_verify_tamper() {
         if [ "$DRY_RUN" != yes ]; then
                 vsize="$(target_virtual_size "$target_path")" || true
                 [ -n "$vsize" ] && [ "$vsize" -gt 0 ] 2>/dev/null \
-                        || die "could not read the virtual size of $target_path on $TARGET_HOST via qemu-img info -- needed to keep a tamper inside the disk"
+                        || { warn "could not read the virtual size of $target_path on $TARGET_HOST via qemu-img info -- needed to keep a tamper inside the disk"; return 1; }
                 log "target disk virtual size: $vsize bytes"
         fi
 
@@ -827,14 +836,22 @@ verify_guard_subtest() {
         log "--- verify-guard: tampering WITHOUT restoring mtime, expecting vmsync to refuse the sync ---"
 
         if [ "$DRY_RUN" != yes ]; then
-                require_dom_shutoff "$TARGET_URI" "$TARGET_DOMAIN" "target"
+                stage_needs_target_shutoff "$CSV" verify-guard "verify-guard" || return 0
                 if ! draw_tamper "$vsize"; then
                         warn "SKIP verify-guard: the configured tamper band does not fit inside a ${vsize}-byte disk -- lower TAMPER_BAND_START or TAMPER_LENGTH_MIN in $CONF"
                         results_row "$CSV" verify-guard tamper-result "" "" "" "" "" "" "SKIP tamper band does not fit the disk"
                         return 0
                 fi
                 log "   corrupting at offset $TAMPER_OFF length $TAMPER_LEN (seed $TAMPER_SEED)"
-                tamper_target "$path" no
+                # Healed on the way out even though the tamper failed: it can
+                # fail AFTER the corruption landed (the mtime restore is the
+                # last step), and standing down without healing would leave the
+                # next sub-test measuring this one's damage.
+                if ! tamper_target "$path" no; then
+                        results_row "$CSV" verify-guard tamper-result "" "" "" "" "" "" "SKIP the tamper could not be applied"
+                        heal_target verify-guard tamper-heal "$path"
+                        return 0
+                fi
         fi
 
         bench_sync verify-guard tamper
@@ -869,14 +886,18 @@ verify_mode_subtest() {
         log "--- verify=$mode: tampering ${path:-<unresolved in --dry-run>} with the mtime preserved ---"
 
         if [ "$DRY_RUN" != yes ]; then
-                require_dom_shutoff "$TARGET_URI" "$TARGET_DOMAIN" "target"
+                stage_needs_target_shutoff "$CSV" "$scenario" "$scenario/$phase" || return 0
                 if ! draw_tamper "$vsize"; then
                         warn "SKIP $scenario/$phase: the configured tamper band does not fit inside a ${vsize}-byte disk"
                         results_row "$CSV" "$scenario" "${phase}-result" "" "" "" "" "" "" "SKIP tamper band does not fit the disk"
                         return 0
                 fi
                 log "   corrupting at offset $TAMPER_OFF length $TAMPER_LEN (seed $TAMPER_SEED)"
-                tamper_target "$path" yes
+                if ! tamper_target "$path" yes; then
+                        results_row "$CSV" "$scenario" "${phase}-result" "" "" "" "" "" "" "SKIP the tamper could not be applied"
+                        heal_target "$scenario" "${phase}-heal" "$path"
+                        return 0
+                fi
         fi
 
         bench_sync "$scenario" "$phase" "-verify=$mode"
@@ -909,6 +930,12 @@ verify_mode_subtest() {
 # -reinit specifically, and unconditionally. An incremental sync would NOT fix
 # this: it re-copies only blocks the SOURCE's dirty bitmap says changed, and the
 # source never wrote to the offset that was corrupted on the target.
+#
+# One of only two die()s left inside a stage, and deliberately so. Everywhere
+# else a stage now returns non-zero so the report still prints, but a heal that
+# failed leaves a replica this harness knowingly corrupted: every later stage
+# would then measure that damage and report it as a vmsync defect. Losing the
+# report is the smaller loss.
 heal_target() {
         local scenario="$1" phase="$2" path="$3"
         log "   healing target with a full resync (-reinit)"
@@ -1022,7 +1049,8 @@ stage_reinit_after_failures() {
         # other stages.
         bench_sync reinit-after-failures baseline -reinit
         if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
-                die "baseline full sync for reinit-after-failures testing failed (see $RUN_LOG) -- aborting stage 3$(bench_sync_hint)"
+                warn "baseline full sync for reinit-after-failures testing failed (see $RUN_LOG) -- aborting stage 3$(bench_sync_hint)"
+                return 1
         fi
 
         # Induce N genuine, repeatable incremental-sync failures by removing
@@ -1042,7 +1070,7 @@ stage_reinit_after_failures() {
         if [ "$DRY_RUN" != yes ]; then
                 log "removing target vmsync metadata to induce $n genuine checkpoint-chain-inconsistency failures"
                 virsh_uri "$TARGET_URI" metadata "$TARGET_DOMAIN" --uri "$VMSYNC_METADATA_URI" --remove --config \
-                        || die "could not remove target vmsync metadata for reinit-after-failures testing -- aborting stage 3"
+                        || { warn "could not remove target vmsync metadata for reinit-after-failures testing -- aborting stage 3"; return 1; }
         fi
 
         log "inducing $n consecutive failures against the real target"
@@ -1091,7 +1119,7 @@ stage_external_snapshot() {
         log "=== Stage 4: external snapshot lifecycle (sync while a snapshot exists, then after it's removed) ==="
 
         if [ "$DRY_RUN" != yes ]; then
-                require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
+                stage_needs_target_shutoff "$CSV" ext-snapshot "stage snapshot" || return 0
                 require_dom_running "$SOURCE_URI" "$SOURCE_DOMAIN" "source"
         fi
 
@@ -1106,7 +1134,8 @@ stage_external_snapshot() {
         # this stage exists to test.
         bench_sync ext-snapshot baseline -reinit
         if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
-                die "baseline full sync for external-snapshot testing failed (see $RUN_LOG) -- aborting stage 4$(bench_sync_hint)"
+                warn "baseline full sync for external-snapshot testing failed (see $RUN_LOG) -- aborting stage 4$(bench_sync_hint)"
+                return 1
         fi
 
         local target_path_before=""
@@ -1120,7 +1149,7 @@ stage_external_snapshot() {
                 log "creating an external, disk-only snapshot '$snap_name' on source disk $TAMPER_DISK_DEV"
                 virsh_uri "$SOURCE_URI" snapshot-create-as --domain "$SOURCE_DOMAIN" --name "$snap_name" \
                         --diskspec "${TAMPER_DISK_DEV},snapshot=external" --disk-only --atomic \
-                        || die "failed to create external snapshot '$snap_name' on $SOURCE_DOMAIN -- aborting stage 4 (--atomic means either it's fully created or fully rolled back; nothing should be left half-done)"
+                        || { warn "failed to create external snapshot '$snap_name' on $SOURCE_DOMAIN -- aborting stage 4 (--atomic means either it's fully created or fully rolled back; nothing should be left half-done)"; return 1; }
                 # "|| true": same reasoning as the tamper test's own lookup -- fall
                 # through to a specific, actionable message rather than dying here
                 # with none.
@@ -1183,6 +1212,11 @@ stage_external_snapshot() {
 
         log "--- removing the external snapshot (blockcommit --active --pivot, then metadata cleanup) ---"
         if [ "$DRY_RUN" != yes ]; then
+                # The other die() left inside a stage, and the more serious of
+                # the two: this is the only place the harness can damage the
+                # SOURCE domain. A half-committed chain on a production source
+                # is not something to carry into another eight stages for the
+                # sake of finishing a report.
                 virsh_uri "$SOURCE_URI" blockcommit "$SOURCE_DOMAIN" "$TAMPER_DISK_DEV" --active --pivot --wait \
                         || die "blockcommit --active --pivot failed for $SOURCE_DOMAIN/$TAMPER_DISK_DEV -- STOP: the source domain's disk chain may now be in an inconsistent state, inspect it by hand (virsh -c $SOURCE_URI blockjob $SOURCE_DOMAIN $TAMPER_DISK_DEV) before continuing"
                 virsh_uri "$SOURCE_URI" snapshot-delete --domain "$SOURCE_DOMAIN" --snapshotname "$snap_name" --metadata \
@@ -1256,12 +1290,13 @@ stage_define_domain_uuid_collision() {
         log "--- Stage 5a: DefineDomain uuid-collision retry ---"
 
         if [ "$DRY_RUN" != yes ]; then
-                require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
+                stage_needs_target_shutoff "$CSV" define-precondition "stage define (5a)" || return 0
         fi
 
         bench_sync define-uuid-collision baseline -reinit
         if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
-                die "baseline full sync for DefineDomain uuid-collision testing failed (see $RUN_LOG) -- aborting stage 5a$(bench_sync_hint)"
+                warn "baseline full sync for DefineDomain uuid-collision testing failed (see $RUN_LOG) -- aborting stage 5a$(bench_sync_hint)"
+                return 1
         fi
 
         if [ "$DRY_RUN" = yes ]; then
@@ -1270,8 +1305,8 @@ stage_define_domain_uuid_collision() {
         fi
 
         local src_uuid target_uuid_before
-        src_uuid="$(domain_uuid "$SOURCE_URI" "$SOURCE_DOMAIN")" || die "could not read source domain UUID via $SOURCE_URI: $VIRSH_ERR"
-        target_uuid_before="$(domain_uuid "$TARGET_URI" "$TARGET_DOMAIN")" || die "could not read target domain UUID via $TARGET_URI: $VIRSH_ERR"
+        src_uuid="$(domain_uuid "$SOURCE_URI" "$SOURCE_DOMAIN")" || { warn "could not read source domain UUID via $SOURCE_URI: $VIRSH_ERR"; return 1; }
+        target_uuid_before="$(domain_uuid "$TARGET_URI" "$TARGET_DOMAIN")" || { warn "could not read target domain UUID via $TARGET_URI: $VIRSH_ERR"; return 1; }
         [ "$target_uuid_before" = "$src_uuid" ] || warn "target UUID ($target_uuid_before) doesn't match source UUID ($src_uuid) right after a fresh -reinit baseline -- unexpected, but continuing"
 
         # The target replica ($TARGET_DOMAIN) itself is still defined at this
@@ -1290,7 +1325,7 @@ stage_define_domain_uuid_collision() {
         # varstore file.
         log "undefining target domain '$TARGET_DOMAIN' to free its uuid for the throwaway collision domain"
         virsh_uri "$TARGET_URI" undefine "$TARGET_DOMAIN" --keep-nvram >/dev/null \
-                || die "could not undefine target domain '$TARGET_DOMAIN' to free its uuid for the collision test -- aborting stage 5a"
+                || { warn "could not undefine target domain '$TARGET_DOMAIN' to free its uuid for the collision test -- aborting stage 5a"; return 1; }
 
         local collision_name="vmsync-bench-uuid-collision-$$"
         log "defining throwaway domain '$collision_name' on target reusing source UUID $src_uuid"
@@ -1303,7 +1338,7 @@ stage_define_domain_uuid_collision() {
                 "  <devices></devices>" \
                 "</domain>" \
                 | virsh_uri "$TARGET_URI" define /dev/stdin >/dev/null \
-                || die "failed to define throwaway uuid-collision domain '$collision_name' on target -- aborting stage 5a"
+                || { warn "failed to define throwaway uuid-collision domain '$collision_name' on target -- aborting stage 5a"; return 1; }
 
         bench_sync define-uuid-collision trigger -reinit
 
@@ -1374,11 +1409,12 @@ stage_define_domain_rollback() {
                 return 0
         fi
 
-        require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
+        stage_needs_target_shutoff "$CSV" define-precondition "stage define (5b)" || return 0
 
         bench_sync define-rollback baseline -reinit
         if [ "$RUN_RC" != 0 ]; then
-                die "baseline full sync for DefineDomain rollback testing failed (see $RUN_LOG) -- aborting stage 5b$(bench_sync_hint)"
+                warn "baseline full sync for DefineDomain rollback testing failed (see $RUN_LOG) -- aborting stage 5b$(bench_sync_hint)"
+                return 1
         fi
 
         # Captured the same way DefineDomain captures it (DOMAIN_XML_INACTIVE),
@@ -1386,7 +1422,7 @@ stage_define_domain_rollback() {
         # actually saved and would put back.
         local xml_before
         xml_before="$(domain_definition_xml "$TARGET_URI" "$TARGET_DOMAIN")"
-        [ -n "$xml_before" ] || die "could not capture target domain XML before the rollback test -- aborting stage 5b"
+        [ -n "$xml_before" ] || { warn "could not capture target domain XML before the rollback test -- aborting stage 5b"; return 1; }
 
         # The target must already exist for this to test anything: DefineDomain
         # only undefines, and therefore only has something to roll back to,
@@ -1769,7 +1805,7 @@ stage_failover() {
 	local src_ref local_uri="qemu:///system"
 
 	if [ "$DRY_RUN" != yes ]; then
-		require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
+		stage_needs_target_shutoff "$CSV" "$sc" "stage failover" || return 0
 		reset_pair_state "$sc"
 		require_target_syncable "$sc" || return 0
 	fi
@@ -1799,7 +1835,8 @@ stage_failover() {
 	# --- baseline: a real replica to promote --------------------------------
 	bench_sync "$sc" baseline -reinit
 	if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
-		die "baseline full sync failed (see $RUN_LOG) -- aborting stage 6 before anything is promoted$(bench_sync_hint)"
+		warn "baseline full sync failed (see $RUN_LOG) -- aborting stage 6 before anything is promoted$(bench_sync_hint)"
+		return 1
 	fi
 
 	# replica_source is what a bare -fence-source resolves the fence against,
@@ -2147,14 +2184,14 @@ stage_fence_agent() {
 	# starting the source ourselves, the same way Stage 4 does.
 	local src_state
 	src_state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN")" \
-		|| die "cannot query the source domain's state${VIRSH_ERR:+: $VIRSH_ERR}"
+		|| { warn "cannot query the source domain's state${VIRSH_ERR:+: $VIRSH_ERR}"; return 1; }
 	if [ "$src_state" != running ]; then
 		warn "source domain '$SOURCE_DOMAIN' is '$src_state', not running -- skipping stage 7. A fence only acts on a running domain, and this harness does not start the source itself."
 		results_row "$CSV" "$sc" skipped 0 "" "" "" "" "" "SKIPPED source not running"
 		return 0
 	fi
 
-	require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
+	stage_needs_target_shutoff "$CSV" "$sc" "stage fence-agent" || return 0
 	require_target_syncable "$sc" || return 0
 
 	# Whatever happens below, put the pair back: kill the agents, clear both
@@ -2226,7 +2263,8 @@ stage_fence_agent() {
 	# --- baseline ------------------------------------------------------------
 	bench_sync "$sc" baseline -reinit
 	if [ "$RUN_RC" != 0 ]; then
-		die "baseline full sync failed (see $RUN_LOG) -- aborting stage 7 before anything is promoted$(bench_sync_hint)"
+		warn "baseline full sync failed (see $RUN_LOG) -- aborting stage 7 before anything is promoted$(bench_sync_hint)"
+		return 1
 	fi
 
 	local src_ref
@@ -2364,7 +2402,13 @@ stage_fence_agent() {
 # NON_MATRIX_SCENARIOS is how the two are told apart. Stage 1's scenario names
 # are generated from scenarios.conf and cannot be matched positively, so every
 # other stage's names are listed here and Stage 1 is what is left.
-NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-uuid-collision$|define-rollback$|failover$|fence-agent$)'
+# Prefixes rather than an exact list of every scenario name, so a new
+# sub-scenario in an existing stage does not silently start counting as a
+# Stage 1 transport run. "retention" was doing exactly that: its rows are not
+# excluded by name, so every restore point check was being folded into the
+# matrix verdict, and its one FAIL would have failed Stage 1 on any run that
+# included both.
+NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$)'
 
 # stage_pattern STAGE -> the regex matching that stage's scenario column.
 # --- Stage 8: verify after a long incremental chain --------------------------
@@ -2422,7 +2466,7 @@ stage_verify_long() {
 			results_row "$CSV" verify-long precondition "" "" "" "" "" "" "SKIP guest-exec unavailable"
 			return 0
 		fi
-		require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
+		stage_needs_target_shutoff "$CSV" verify-long "stage verify-long" || return 0
 	fi
 
 	local target_path="" vsize=0 mode
@@ -2431,25 +2475,31 @@ stage_verify_long() {
 
 		bench_sync verify-long "${mode}-baseline" -reinit
 		if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
-			die "baseline full sync for verify-long/$mode failed (see $RUN_LOG) -- aborting stage 8$(bench_sync_hint)"
+			warn "baseline full sync for verify-long/$mode failed (see $RUN_LOG) -- aborting stage 8$(bench_sync_hint)"
+			return 1
 		fi
 
 		if [ "$DRY_RUN" != yes ] && [ -z "$target_path" ]; then
 			target_path="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")" || true
-			[ -n "$target_path" ] || die "could not resolve target disk path for dev='$TAMPER_DISK_DEV' -- check TAMPER_DISK_DEV in $CONF"
+			[ -n "$target_path" ] || { warn "could not resolve target disk path for dev='$TAMPER_DISK_DEV' -- check TAMPER_DISK_DEV in $CONF"; return 1; }
 			vsize="$(target_virtual_size "$target_path")" || true
 			[ -n "$vsize" ] && [ "$vsize" -gt 0 ] 2>/dev/null \
-				|| die "could not read the virtual size of $target_path on $TARGET_HOST via qemu-img info"
+				|| { warn "could not read the virtual size of $target_path on $TARGET_HOST via qemu-img info"; return 1; }
 			log "target disk under test: $target_path ($vsize bytes) on $TARGET_HOST"
 		fi
 
-		verify_long_round "$mode" "$copies" "$target_path" "$vsize"
+		# A round that gives up returns non-zero, and this is a bare
+		# command under set -e, so without the guard the script would
+		# end here -- before generate_report, which is exactly the
+		# failure mode the return-instead-of-die conversion was for.
+		verify_long_round "$mode" "$copies" "$target_path" "$vsize" || return 1
 	done
 
 	# One heal, at the end. Each round already begins with its own -reinit,
 	# which heals whatever the previous round left behind; only the last one
-	# needs cleaning up after. (A round that die()s leaves the replica
-	# corrupted on purpose -- those messages say so and say to inspect it.)
+	# needs cleaning up after. (A round that gives up part-way skips this and
+	# leaves the replica corrupted on purpose -- its message says so and says
+	# to inspect it. The stage is marked FAIL and the report still prints.)
 	heal_target verify-long final-heal "$target_path"
 	return 0
 }
@@ -2477,18 +2527,23 @@ verify_long_round() {
 		bench_sync verify-long "${mode}-copy-${i}"
 		if [ "$DRY_RUN" != yes ]; then
 			if [ "$RUN_RC" != 0 ]; then
-				die "incremental copy ${mode}-copy-${i} failed (see $RUN_LOG) -- the chain is broken, so nothing after it would mean anything"
+				warn "incremental copy ${mode}-copy-${i} failed (see $RUN_LOG) -- the chain is broken, so nothing after it would mean anything"
+				return 1
 			fi
 			[ "$(prom_sum "$RUN_PROM" vmsync_transferred_bytes)" -gt 0 ] && moved=$((moved + 1))
 
 			if [ "$i" -eq "$tamper_at" ]; then
-				require_dom_shutoff "$TARGET_URI" "$TARGET_DOMAIN" "target"
+				stage_needs_target_shutoff "$CSV" verify-long "verify-long tamper" || return 0
 				if draw_tamper "$vsize"; then
 					log "   corrupting after copy $i at offset $TAMPER_OFF length $TAMPER_LEN"
 					# mtime preserved, or the very next copy would die at
 					# vmsync's mtime guard instead of running over the damage
 					# the way a real incremental sync would.
-					tamper_target "$path" yes
+					if ! tamper_target "$path" yes; then
+						results_row "$CSV" verify-long "${mode}-result" "" "" "" "" "" "" "SKIP the tamper could not be applied"
+						heal_target verify-long "${mode}-tamper-heal" "$path"
+						return 0
+					fi
 					tampered=yes
 				else
 					warn "SKIP verify-long/$mode: the configured tamper band does not fit inside a ${vsize}-byte disk"
@@ -2583,20 +2638,7 @@ stage_retention() {
 		return 0
 	fi
 
-	# Checked and SKIPPED rather than require_dom_shutoff_or_absent's die().
-	#
-	# A target left running is somebody else's mess -- most likely a stage
-	# earlier in this run that promoted it -- and ending the entire run over
-	# it, report and all, punishes the operator for a problem this stage did
-	# not cause and cannot fix. Saying so and standing down is more useful.
-	local tstate
-	tstate="$(dom_state "$TARGET_URI" "$TARGET_DOMAIN" 2>/dev/null || true)"
-	if [ -n "$tstate" ] && [ "$tstate" != shutoff ]; then
-		warn "SKIP stage retention: target domain '$TARGET_DOMAIN' is '$tstate' and this stage syncs into it. If an earlier stage promoted it, that stage should have put it back; shut it down and re-run."
-		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP target domain is $tstate"
-		return 0
-	fi
-
+	stage_needs_target_shutoff "$CSV" "$sc" "stage retention" || return 0
 	reset_pair_state "$sc" || return 0
 	require_target_syncable "$sc" || return 0
 
@@ -2616,7 +2658,8 @@ stage_retention() {
 			results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP target filesystem has no reflink support"
 			return 0
 		fi
-		die "baseline sync with -retention failed (see $RUN_LOG) -- aborting stage 9$(bench_sync_hint)"
+		warn "baseline sync with -retention failed (see $RUN_LOG) -- aborting stage 9$(bench_sync_hint)"
+		return 1
 	fi
 
 	local n
@@ -2748,7 +2791,7 @@ stage_retention() {
 		results_row "$CSV" "$sc" auto_reinit_preserves "" "" "" "" "" "" "SKIP nothing to preserve"
 	else
 		virsh_uri "$TARGET_URI" metadata "$TARGET_DOMAIN" --uri "$VMSYNC_METADATA_URI" --remove --config >/dev/null 2>&1 \
-			|| die "could not remove the target's vmsync metadata to induce failures -- aborting stage 9"
+			|| { warn "could not remove the target's vmsync metadata to induce failures -- aborting stage 9"; return 1; }
 
 		while [ "$i" -le "$n_fail" ]; do
 			bench_sync "$sc" "auto-induce-$i" "-reinit-after-failures=$n_fail" "-retention=$keep_all,0"
@@ -2859,14 +2902,17 @@ vmsync_verb() {
 }
 stage_pattern() {
 	case "$1" in
-	# Anchored to the four named sub-tests rather than a bare ^verify- , so a
+	# Anchored to the named sub-tests rather than a bare ^verify- , so a
 	# run doing both stages does not fold stage 8's rows into stage 2's
-	# verdict.
-	verify) printf '^verify-(guard|compare|fast|online)$' ;;
+	# verdict. "precondition" is in the list because a stage that stands
+	# down records its reason under that name, and a reason nothing matches
+	# is a reason nobody reads: the verdict would say "nothing recorded"
+	# rather than why the stage skipped.
+	verify) printf '^verify-(guard|compare|fast|online|precondition)$' ;;
 	verify-long) printf '^verify-long$' ;;
 	reinit) printf '^reinit-after-failures$' ;;
 	snapshot) printf '^ext-snapshot$' ;;
-	define) printf '^define-(uuid-collision|rollback)$' ;;
+	define) printf '^define-(uuid-collision|rollback|precondition)$' ;;
 	failover) printf '^failover$' ;;
 	fence-agent) printf '^fence-agent$' ;;
 	retention) printf '^retention$' ;;
@@ -2879,11 +2925,16 @@ stage_pattern() {
 stage_verdict() {
 	local stage="$1"
 	if [ "$stage" = matrix ]; then
+		# DRYRUN is counted apart from both. A dry run prints command
+		# lines and executes nothing, so its rows are evidence of nothing
+		# -- folding them in with the zero exit codes made --dry-run
+		# report "BENCH RESULT: PASS" against hosts never contacted.
 		awk -F, -v non="$NON_MATRIX_SCENARIOS" '
-			NR>1 && $1 !~ non { n++; if ($3 != "0" && $3 != "DRYRUN") f++ }
+			NR>1 && $1 !~ non { n++; if ($3 == "DRYRUN") d++; else if ($3 != "0") f++ }
 			END {
 				if (n == 0)      printf "SKIPPED\tnothing ran"
 				else if (f > 0)  printf "FAIL\t%d of %d vmsync runs exited non-zero", f, n
+				else if (d == n) printf "SKIPPED\t%d command lines printed, nothing executed", n
 				else             printf "PASS\t%d vmsync runs, all exited 0", n
 			}' "$CSV"
 		return 0
