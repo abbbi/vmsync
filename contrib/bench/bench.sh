@@ -2270,11 +2270,39 @@ stage_fence_agent() {
 		fo_check "$sc" "the agent recorded the fence in its durable ledger" "$fo_ok" \
 			"fence id '$fence_id' not found in $agent_dir/fences.json"
 
-		case "$ledger" in
-		*'"state": "done"'* | *'"state":"done"'*) fo_ok=0 ;;
+		# Polled, not sampled once, because the domain reaching shutoff does
+		# NOT mean the agent has finished.
+		#
+		# The agent writes its record as state=running BEFORE it shells out to
+		# vmsync, and only rewrites it to done once that process has exited
+		# (cmd/vmsync-agent/fence.go). The wait above breaks the moment libvirt
+		# reports the domain shut off -- which happens while vmsync is still
+		# running, since it goes on to pause replication afterwards. So reading
+		# the ledger right then reliably catches the record mid-flight, still
+		# saying running, and reports a working fence as a failure.
+		#
+		# That is exactly why the preceding check passed: the fence id is in
+		# the ledger from the running-state write.
+		local lwaited=0 llimit="${FENCE_LEDGER_WAIT_SECONDS:-60}" lstate=""
+		while [ "$lwaited" -lt "$llimit" ]; do
+			ledger="$(run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "cat '$agent_dir/fences.json' 2>/dev/null || true")"
+			case "$ledger" in
+			*'"state": "done"'* | *'"state":"done"'*) lstate=done; break ;;
+			*'"state": "failed"'* | *'"state":"failed"'*) lstate=failed; break ;;
+			esac
+			sleep 2
+			lwaited=$((lwaited + 2))
+		done
+
+		case "$lstate" in
+		done) fo_ok=0 ;;
 		*) fo_ok=1 ;;
 		esac
-		fo_check "$sc" "the ledger records the fence as done" "$fo_ok" "ledger: $(printf '%s' "$ledger" | tr -d '\n' | cut -c1-200)"
+		# "failed" is reported as itself rather than as a timeout: the agent
+		# recording a failed fence is a real finding about the fence, and it
+		# carries the reason.
+		fo_check "$sc" "the ledger records the fence as done" "$fo_ok" \
+			"ledger state after ${lwaited}s: ${lstate:-never reached a terminal state}; ledger: $(printf '%s' "$ledger" | tr -d '\n' | cut -c1-200)"
 	fi
 
 	# --- the target's own agent must have left the promoted copy alone --------
@@ -2547,10 +2575,19 @@ stage_verdict() {
 # emits hundreds of lines -- an outcome on one indistinguishable line among
 # them is one nobody finds without searching for it.
 announce_stage_verdict() {
-	local stage="$1" verdict status detail
+	local stage="$1" rc="${2:-0}" verdict status detail
 	verdict="$(stage_verdict "$stage")"
 	status="${verdict%%	*}"
 	detail="${verdict#*	}"
+
+	# A stage that exited non-zero is a FAIL whatever its recorded checks
+	# say, because it stopped before it could record the rest of them. The
+	# checks it did record stay in the detail, so the banner reports both
+	# what it found and that there was more it never got to.
+	if [ "$rc" != 0 ]; then
+		detail="stage exited with status $rc before finishing (recorded so far: $detail)"
+		status=FAIL
+	fi
 
 	RAN_STAGES+=("$stage")
 	RAN_VERDICTS+=("$status")
@@ -2768,19 +2805,35 @@ generate_report() {
 preflight
 
 IFS=',' read -ra stage_list <<<"$STAGES"
+# Each stage's exit status is captured rather than left to `set -e`.
+#
+# A stage is a bare command in this case statement, so under `set -e` a
+# non-zero return from one ends the entire script on the spot -- after the
+# stage has done its work, before generate_report and final_verdict, and
+# without a word about which stage it was or why. A run that stops between
+# "the stage finished" and "here is what it found" is the single most
+# confusing thing this harness can do: everything looks like it worked, and
+# then there is simply no report.
+#
+# So the status is caught, named, and folded into that stage's verdict. The
+# report always prints.
 for s in "${stage_list[@]}"; do
+        stage_rc=0
         case "$s" in
-        matrix) stage_matrix ;;
-        verify) stage_verify_tamper ;;
-        verify-long) stage_verify_long ;;
-        reinit) stage_reinit_after_failures ;;
-        snapshot) stage_external_snapshot ;;
-        define) stage_define_domain ;;
-        failover) stage_failover ;;
-        fence-agent) stage_fence_agent ;;
+        matrix) stage_matrix || stage_rc=$? ;;
+        verify) stage_verify_tamper || stage_rc=$? ;;
+        verify-long) stage_verify_long || stage_rc=$? ;;
+        reinit) stage_reinit_after_failures || stage_rc=$? ;;
+        snapshot) stage_external_snapshot || stage_rc=$? ;;
+        define) stage_define_domain || stage_rc=$? ;;
+        failover) stage_failover || stage_rc=$? ;;
+        fence-agent) stage_fence_agent || stage_rc=$? ;;
         *) die "unknown stage '$s' in --stages (want matrix,verify,verify-long,reinit,snapshot,define,failover,fence-agent)" ;;
         esac
-        announce_stage_verdict "$s"
+        if [ "$stage_rc" != 0 ]; then
+                warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."
+        fi
+        announce_stage_verdict "$s" "$stage_rc"
 done
 
 generate_report

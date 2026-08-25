@@ -290,6 +290,16 @@ DEFINE_ROLLBACK_WAIT_SECONDS=300
 # shutdown, not the sweep interval.
 #FENCE_WAIT_SECONDS=180
 
+# How long to then wait for the agent to finish RECORDING that fence.
+#
+# A separate wait, because the domain going shut off does not mean the agent
+# is done: it writes its ledger record as state=running before shelling out to
+# vmsync, and rewrites it to done only once that process exits -- and vmsync
+# goes on to pause replication after the shutdown. So the shutdown is observed
+# while the record still says running, and reading it at that instant reports
+# a perfectly good fence as a failure. Seconds, normally.
+#FENCE_LEDGER_WAIT_SECONDS=60
+
 # --- Output --------------------------------------------------------------
 
 RESULT_DIR=./results
