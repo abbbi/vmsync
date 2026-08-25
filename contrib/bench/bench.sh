@@ -2731,7 +2731,17 @@ stage_retention() {
 	# unverifiable checkpoint chain. Those runs fail before they reach the
 	# retention code, so they take no restore points of their own -- which is
 	# what makes the count below a clean before/after.
-	local n_fail=2 i=1 tags_before
+	# The retention count here is deliberately far above the number of restore
+	# points present, and that is what makes the assertion mean anything.
+	#
+	# With a tight count the triggering sync takes one of its own, retention
+	# prunes the oldest to stay within the count, and a preserved restore point
+	# disappears -- correctly, by policy, having never been touched by the
+	# reinit. The check would then report "the automatic reinit did not preserve
+	# them" for a run in which it did exactly that. Leaving room for every
+	# existing point plus the new one means the ONLY thing that can remove one
+	# is the sweep this check is about.
+	local n_fail=2 i=1 tags_before keep_all=9
 	tags_before="$(rp_list "$rp_dir")"
 	if [ -z "$tags_before" ]; then
 		warn "SKIP the auto-reinit check: no restore points survived to this point to preserve"
@@ -2741,14 +2751,14 @@ stage_retention() {
 			|| die "could not remove the target's vmsync metadata to induce failures -- aborting stage 9"
 
 		while [ "$i" -le "$n_fail" ]; do
-			bench_sync "$sc" "auto-induce-$i" "-reinit-after-failures=$n_fail" "-retention=2,0"
+			bench_sync "$sc" "auto-induce-$i" "-reinit-after-failures=$n_fail" "-retention=$keep_all,0"
 			if [ "$RUN_RC" = 0 ]; then
 				warn "induced sync $i unexpectedly succeeded -- the auto-reinit check below may not exercise what it claims"
 			fi
 			i=$((i + 1))
 		done
 
-		bench_sync "$sc" auto-trigger "-reinit-after-failures=$n_fail" "-retention=2,0"
+		bench_sync "$sc" auto-trigger "-reinit-after-failures=$n_fail" "-retention=$keep_all,0"
 
 		if [ "$RUN_RC" = 0 ] && grep -q "threshold reached" "$RUN_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
 		fo_check "$sc" "-reinit-after-failures forces a reinit once the threshold is reached" "$fo_ok" \
@@ -2763,7 +2773,7 @@ stage_retention() {
 		done
 		if [ -z "$missing" ]; then fo_ok=0; else fo_ok=1; fi
 		fo_check "$sc" "an automatic reinit preserves the existing restore points" "$fo_ok" \
-			"gone after -reinit-after-failures fired:$missing"
+			"gone after -reinit-after-failures fired:$missing -- retention was -retention=$keep_all,0 with only $(rp_count "$rp_dir") points present so pruning cannot account for this; the reinit swept them"
 
 		if grep -q "keeping the existing restore points" "$RUN_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
 		fo_check "$sc" "the automatic reinit says it kept them" "$fo_ok" \
