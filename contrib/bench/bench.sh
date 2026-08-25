@@ -2575,6 +2575,10 @@ stage_retention() {
 		bench_sync "$sc" baseline -reinit "-retention=3,0"
 		bench_sync "$sc" reflink-probe "-retention=3,0"
 		bench_sync "$sc" within-interval "-retention=3,1h"
+		bench_sync "$sc" prune-1 "-retention=2,0"
+		bench_sync "$sc" auto-induce-1 "-reinit-after-failures=2" "-retention=2,0"
+		bench_sync "$sc" auto-trigger "-reinit-after-failures=2" "-retention=2,0"
+		bench_sync "$sc" reinit-sweep -reinit "-retention=2,0"
 		fo_check "$sc" "a sync with -retention takes a restore point" 0
 		return 0
 	fi
@@ -2713,6 +2717,59 @@ stage_retention() {
 
 	ssh_host_cmd "$TARGET_HOST" "rm -rf '$clone_dir'" >/dev/null 2>&1 || true
 
+	# --- an AUTOMATIC reinit must not take them ------------------------------
+	#
+	# The carve-out that matters most, and the only one here where being wrong
+	# destroys data rather than disk space. -reinit-after-failures fires on a
+	# failure count, and "syncs have been failing repeatedly" is uncomfortably
+	# close to "something is wrong with the source" -- which is the exact
+	# situation these copies exist for. An auto-reinit that swept them would
+	# discard the operator's last good replica at the moment they most need it.
+	#
+	# Failures are induced the same way Stage 3 induces them: remove the
+	# target's vmsync metadata, and every incremental sync refuses with an
+	# unverifiable checkpoint chain. Those runs fail before they reach the
+	# retention code, so they take no restore points of their own -- which is
+	# what makes the count below a clean before/after.
+	local n_fail=2 i=1 tags_before
+	tags_before="$(rp_list "$rp_dir")"
+	if [ -z "$tags_before" ]; then
+		warn "SKIP the auto-reinit check: no restore points survived to this point to preserve"
+		results_row "$CSV" "$sc" auto_reinit_preserves "" "" "" "" "" "" "SKIP nothing to preserve"
+	else
+		virsh_uri "$TARGET_URI" metadata "$TARGET_DOMAIN" --uri "$VMSYNC_METADATA_URI" --remove --config >/dev/null 2>&1 \
+			|| die "could not remove the target's vmsync metadata to induce failures -- aborting stage 9"
+
+		while [ "$i" -le "$n_fail" ]; do
+			bench_sync "$sc" "auto-induce-$i" "-reinit-after-failures=$n_fail" "-retention=2,0"
+			if [ "$RUN_RC" = 0 ]; then
+				warn "induced sync $i unexpectedly succeeded -- the auto-reinit check below may not exercise what it claims"
+			fi
+			i=$((i + 1))
+		done
+
+		bench_sync "$sc" auto-trigger "-reinit-after-failures=$n_fail" "-retention=2,0"
+
+		if [ "$RUN_RC" = 0 ] && grep -q "threshold reached" "$RUN_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "-reinit-after-failures forces a reinit once the threshold is reached" "$fo_ok" \
+			"exit $RUN_RC and no threshold message in $RUN_LOG -- the check below would then prove nothing"
+
+		# Every tag that existed before the automatic reinit must still exist.
+		# Not a count: the triggering sync takes one of its own, so the count
+		# legitimately grows.
+		local missing="" t
+		for t in $tags_before; do
+			rp_has "$rp_dir" "$t" || missing="$missing $t"
+		done
+		if [ -z "$missing" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "an automatic reinit preserves the existing restore points" "$fo_ok" \
+			"gone after -reinit-after-failures fired:$missing"
+
+		if grep -q "keeping the existing restore points" "$RUN_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the automatic reinit says it kept them" "$fo_ok" \
+			"no such warning in $RUN_LOG -- an operator would have no way to know they are now charged at full size"
+	fi
+
 	# --- an operator -reinit takes them with it ------------------------------
 	before_count="$(rp_count "$rp_dir")"
 	bench_sync "$sc" reinit-sweep -reinit "-retention=2,0"
@@ -2748,6 +2805,14 @@ rp_oldest() {
 rp_has() {
 	[ -n "${2:-}" ] || return 1
 	ssh_host_cmd "$TARGET_HOST" "test -d '$1/$2'" >/dev/null 2>&1
+}
+
+# rp_list DIR -> every published restore point tag, whitespace separated.
+# Tags contain no spaces by construction (pkg/restorepoint refuses any
+# checkpoint name that is not letters, digits, '.', '_' or '-'), so word
+# splitting the result is safe.
+rp_list() {
+	ssh_host_cmd "$TARGET_HOST" "ls -1 '$1' 2>/dev/null | grep '^[0-9][0-9]*-' | sort -n || true" | tr '\n' ' '
 }
 
 # fs_free_bytes HOST PATH -> free bytes on the filesystem holding PATH.

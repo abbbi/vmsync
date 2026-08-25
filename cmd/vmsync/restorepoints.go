@@ -273,7 +273,15 @@ func sweepRestorePointsForReinit(ctx context.Context, cfg syncConfig, runner rem
 	}
 
 	if cfg.ReinitAutomatic {
-		trace.Warning("reinit: keeping the existing restore points, because this reinit was forced by -reinit-after-failures rather than asked for -- repeated sync failures are exactly when an older copy is worth having. They are no longer pruned by retention, since the replica they belong to is being rebuilt; remove them by hand once you are satisfied the new replica is good",
+		// Left exactly where they are, not moved aside: they stay listed by
+		// -list-restore-points, stay clonable, and stay under retention, so
+		// they age out normally instead of becoming a pile nothing reaps.
+		//
+		// What does change is their cost. The replica this reinit is about to
+		// rebuild shares no extents with them, so from now on they are charged
+		// at their full independent size rather than as deltas against the
+		// live replica.
+		trace.Warning("reinit: keeping the existing restore points, because this reinit was forced by -reinit-after-failures rather than asked for -- repeated sync failures are exactly when an older copy is worth having. They stay listed and stay under retention, but they no longer share storage with the replica being rebuilt, so they now cost their full size",
 			"kept", len(listing.Points), "dir", root)
 		return nil
 	}
