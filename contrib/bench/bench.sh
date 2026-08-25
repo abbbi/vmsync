@@ -2173,6 +2173,35 @@ stage_fence_agent() {
 		agent_stop "$SOURCE_HOST" "$SOURCE_LOCAL" "$src_pid" "$agent_dir"
 		agent_stop "$TARGET_HOST" no "$tgt_pid" "$agent_dir"
 
+		# This stage PROMOTED the target, and a promotion boots it. Nothing
+		# here started it deliberately, so it is easy to forget -- but every
+		# stage that syncs into the target refuses to run while it is up, and
+		# that refusal is a die(), which ends the whole run without a report.
+		# So "restoring the pair" has to mean both halves, not just the source
+		# this stage fenced.
+		#
+		# virsh rather than `vmsync -shutdown-domain`, for the reason
+		# reset_pair_state gives: a harness that restores state through the
+		# code under test cannot recover when that code is broken. It would
+		# also mark replication paused, which the role reset below would then
+		# have to undo.
+		local tgt_now waited=0
+		tgt_now="$(dom_state "$TARGET_URI" "$TARGET_DOMAIN" 2>/dev/null || true)"
+		if [ "$tgt_now" = running ]; then
+			log "   shutting the promoted target down again (this stage started it by promoting it)"
+			virsh_uri "$TARGET_URI" shutdown "$TARGET_DOMAIN" >/dev/null 2>&1 || true
+			while [ "$waited" -lt "${TARGET_SHUTDOWN_WAIT_SECONDS:-90}" ]; do
+				tgt_now="$(dom_state "$TARGET_URI" "$TARGET_DOMAIN" 2>/dev/null || true)"
+				[ "$tgt_now" = shutoff ] && break
+				sleep 3
+				waited=$((waited + 3))
+			done
+			if [ "$tgt_now" != shutoff ]; then
+				warn "the promoted target did not shut down gracefully within ${waited}s -- destroying it. It is a disposable replica and the next stage reinitialises it anyway, but leaving it running would make every later stage refuse to sync. Raise TARGET_SHUTDOWN_WAIT_SECONDS if this guest is legitimately slow to stop."
+				virsh_uri "$TARGET_URI" destroy "$TARGET_DOMAIN" >/dev/null 2>&1 || true
+			fi
+		fi
+
 		maybe_ssh_cmd "$SOURCE_LOCAL" "$SOURCE_HOST" "$src_vmsync" \
 			-update-role none -target-uri "$local_uri" -target-domain "$SOURCE_DOMAIN" \
 			>/dev/null 2>&1 \
@@ -2550,7 +2579,20 @@ stage_retention() {
 		return 0
 	fi
 
-	require_dom_shutoff_or_absent "$TARGET_URI" "$TARGET_DOMAIN" "target"
+	# Checked and SKIPPED rather than require_dom_shutoff_or_absent's die().
+	#
+	# A target left running is somebody else's mess -- most likely a stage
+	# earlier in this run that promoted it -- and ending the entire run over
+	# it, report and all, punishes the operator for a problem this stage did
+	# not cause and cannot fix. Saying so and standing down is more useful.
+	local tstate
+	tstate="$(dom_state "$TARGET_URI" "$TARGET_DOMAIN" 2>/dev/null || true)"
+	if [ -n "$tstate" ] && [ "$tstate" != shutoff ]; then
+		warn "SKIP stage retention: target domain '$TARGET_DOMAIN' is '$tstate' and this stage syncs into it. If an earlier stage promoted it, that stage should have put it back; shut it down and re-run."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP target domain is $tstate"
+		return 0
+	fi
+
 	reset_pair_state "$sc" || return 0
 	require_target_syncable "$sc" || return 0
 
