@@ -1205,13 +1205,67 @@ func TargetRoleAllowsSync(role string) error {
 	case "", RoleTarget:
 		return nil
 	case RoleSource:
-		return fmt.Errorf("target domain is marked replication_role=%q, meaning it is the SOURCE of a replication pair -- syncing into it would overwrite the original with its own replica; check that -source-uri/-target-uri are not reversed, or run -update-role=%s if the direction has genuinely changed", RoleSource, RoleTarget)
+		return fmt.Errorf("%w: target domain is marked replication_role=%q, meaning it is the SOURCE of a replication pair -- syncing into it would overwrite the original with its own replica; check that -source-uri/-target-uri are not reversed, or run -update-role=%s if the direction has genuinely changed", ErrRoleRefusesSync, RoleSource, RoleTarget)
 	case RolePromoted:
-		return fmt.Errorf("target domain is marked replication_role=%q, meaning it was failed over to and is now serving live -- refusing to overwrite it with a replica from the old source, whether or not it happens to be running at this moment; run -update-role=%s to deliberately turn it back into a replication target (its current disk contents will be discarded)", RolePromoted, RoleTarget)
+		return fmt.Errorf("%w: target domain is marked replication_role=%q, meaning it was failed over to and is now serving live -- refusing to overwrite it with a replica from the old source, whether or not it happens to be running at this moment; run -update-role=%s to deliberately turn it back into a replication target (its current disk contents will be discarded)", ErrRoleRefusesSync, RolePromoted, RoleTarget)
 	case RolePaused:
-		return fmt.Errorf("target domain is marked replication_role=%q, so replication into it is administratively suspended -- run -update-role=%s to resume", RolePaused, RoleTarget)
+		return fmt.Errorf("%w: target domain is marked replication_role=%q, so replication into it is administratively suspended -- run -update-role=%s to resume", ErrRoleRefusesSync, RolePaused, RoleTarget)
 	default:
-		return fmt.Errorf("target domain has an unrecognized replication_role=%q -- refusing to sync into a domain whose role this vmsync build does not understand (it was most likely written by a newer version; upgrade, or run -update-role=%s to override)", role, RoleTarget)
+		return fmt.Errorf("%w: target domain has an unrecognized replication_role=%q -- refusing to sync into a domain whose role this vmsync build does not understand (it was most likely written by a newer version; upgrade, or run -update-role=%s to override)", ErrRoleRefusesSync, role, RoleTarget)
+	}
+}
+
+// ErrRoleRefusesSync marks every refusal TargetRoleAllowsSync produces, so a
+// caller can tell "this domain's role forbids replicating into it" from "the
+// sync tried and broke".
+//
+// It exists for the failure counter. -reinit-after-failures counts consecutive
+// sync failures and, at its threshold, forces a full resync to auto-heal a
+// broken incremental chain -- and a role refusal is not that. It is a
+// deliberate administrative state, it says nothing about whether the
+// incremental mechanism works, and a reinit cannot heal it because this same
+// gate refuses the reinit too. Counting it does active harm in two directions:
+// the counter climbs forever against a domain nobody is trying to sync, and a
+// non-zero failure_count is itself one of the things that blocks a promotion
+// (pkg/failover's evidence check) -- so a paused replica an operator restored
+// in order to promote would become unpromotable purely because the scheduler
+// kept being told no.
+//
+// main() already exempts run-lock contention from the same counter on the same
+// reasoning: another vmsync holding the lock is not a broken sync either.
+var ErrRoleRefusesSync = errors.New("replication role does not permit syncing into this domain")
+
+// TargetRoleAllowsRestore is TargetRoleAllowsSync's counterpart for putting a
+// restore point back over a replica in place.
+//
+// It differs on exactly one value, and the difference is the point. A sync into
+// a PAUSED domain is refused because pausing means "stop replicating into this"
+// -- but restoring is not replicating, and an operator who paused replication
+// to work out what went wrong is precisely the operator who then wants to roll
+// the replica back. Making them run -update-role=target first would re-arm
+// every scheduled sync against a replica they are mid-way through repairing,
+// which is the opposite of what pausing was for. A restore leaves the domain
+// paused afterwards (see restorepoint.MetadataPlan), so allowing it here does
+// not weaken the interlock; it keeps a paused domain paused.
+//
+// source and promoted are refused for the same reasons as a sync, with the same
+// cure. promoted is the one that matters: a domain failed over to and then shut
+// down for maintenance passes every runtime check there is, and its disks are
+// live data that a restore would overwrite with an old replica's.
+//
+// Pure and standalone, mirroring TargetRoleAllowsSync, so the one decision
+// standing between an operator's typo and a live domain's disks is directly
+// testable without libvirt.
+func TargetRoleAllowsRestore(role string) error {
+	switch role {
+	case "", RoleTarget, RolePaused:
+		return nil
+	case RoleSource:
+		return fmt.Errorf("target domain is marked replication_role=%q, meaning it is the SOURCE of a replication pair -- restoring a restore point over it would overwrite the original with an old copy of its own replica; check that -target-uri/-target-domain name the replica and not the source", RoleSource)
+	case RolePromoted:
+		return fmt.Errorf("target domain is marked replication_role=%q, meaning it was failed over to and is now serving live -- refusing to overwrite live data with a restore point, whether or not it happens to be running at this moment; run -update-role=%s first if this domain is genuinely a replica again (its current disk contents will then be discarded)", RolePromoted, RoleTarget)
+	default:
+		return fmt.Errorf("target domain has an unrecognized replication_role=%q -- refusing to restore over a domain whose role this vmsync build does not understand (it was most likely written by a newer version; upgrade rather than overriding)", role)
 	}
 }
 

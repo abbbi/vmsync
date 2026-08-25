@@ -81,6 +81,7 @@ vmsync itself to work at all).
 ./bench.sh --stages verify    # just the verify+tamper tests
 ./bench.sh --stages snapshot  # just the external-snapshot lifecycle test
 ./bench.sh --stages retention # just the restore-point tests
+./bench.sh --stages restore   # + Stage 10: putting a restore point back, opt-in
 ./bench.sh --stages matrix,verify,reinit,snapshot,retention,define  # + Stage 5, opt-in
 ./bench.sh --stages failover  # just the DR path: promotion, fencing, the way back
 ./bench.sh --stages fence-agent  # + real agents; STOPS THE SOURCE VM, see below
@@ -298,6 +299,42 @@ readable qcow2, and an operator `-reinit` sweeps the set.
 
 Uses `-retention=N,0` — a zero interval means every sync — so the stage does
 not have to sleep for hours to prove retention works.
+
+### Stage 10 (`restore`), opt-in
+
+Stage 9 proves restore points get taken. Stage 10 proves one can be put back,
+with `-restore-restore-point`.
+
+It takes two restore points with real guest writes between them, so the two
+genuinely differ, and then compares files byte for byte (`cmp` on the target,
+never `du`-style inference) to establish that a rollback actually happened
+rather than that a command exited 0.
+
+**The check that earns the stage is the last one.** A restore rolls the
+replica's contents backwards while the source's checkpoint chain marches on,
+and nothing in vmsync's incremental path looks at disk content — it compares a
+checkpoint *name*. A restore that failed to invalidate the target's
+replication metadata would leave the next scheduled sync applying the source's
+newest delta onto rolled-back data, exiting 0, with green metrics, looking
+exactly like a healthy run. So the stage runs a real sync afterwards and
+asserts both that it **refused** and that the restored bytes are **still on
+disk** when it did.
+
+The rest: the assessment (no `-force-restore`) changes neither the replica nor
+its metadata; a restore is refused on a domain marked `promoted`; the metadata
+afterwards names the restored point's checkpoint and `checkpoint_at`, has
+`source_stopped_at_sync` cleared and `replication_role=paused`; the three
+fields `pkg/failover` reads as promotion evidence are all still satisfied
+(clearing them would make the feature defeat its own purpose); the displaced
+contents are kept and match what the replica held; and restoring consumes
+neither restore point, so a first choice that turns out to be wrong can be
+followed by a second.
+
+Why it is opt-in: it is new, and it deliberately leaves the target paused
+mid-stage. It clears that and heals with a `-reinit` on the way out — via
+`clear_target_role`, which falls back to `virsh` if `vmsync -update-role`
+itself is broken, because every later stage syncs into that target and all of
+them are refused while it stays paused.
 
 ### Stage 8 (`verify-long`), opt-in
 

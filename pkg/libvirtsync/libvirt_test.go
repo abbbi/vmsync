@@ -1197,6 +1197,15 @@ func TestTargetRoleAllowsSync(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.role) {
 				t.Errorf("TargetRoleAllowsSync(%q) error %q does not name the role it refused", tc.role, err.Error())
 			}
+			// EVERY refusal, not just some: main() uses this to keep a role
+			// refusal out of the -reinit-after-failures counter, and a branch
+			// that forgot to wrap would silently start counting again -- which
+			// climbs forever (the reinit it forces is refused by this same
+			// gate) and eventually blocks promotion on a non-zero
+			// failure_count.
+			if !errors.Is(err, ErrRoleRefusesSync) {
+				t.Errorf("TargetRoleAllowsSync(%q) error does not wrap ErrRoleRefusesSync, so main() would count it as a sync failure", tc.role)
+			}
 		})
 	}
 }

@@ -70,7 +70,8 @@ Options:
                            retention is last because it reinitialises the
                            target, and it skips cleanly where the target
                            filesystem cannot reflink. define, failover,
-                           fence-agent and verify-long are opt-in, see below)
+                           fence-agent, verify-long and restore are opt-in,
+                           see below)
   --dry-run               print every vmsync command line; touch nothing
                            (no ssh/qemu-io/vmsync calls actually made)
   -h, --help              this text
@@ -1636,14 +1637,19 @@ reset_pair_state() {
 	return 0
 }
 
-# warn_target_still_promoted says what has to be done by hand, in full.
+# warn_target_still_promoted [ROLE] says what has to be done by hand, in full.
 #
-# Worth being explicit rather than terse: a target left `promoted` refuses
-# EVERY later sync, including the next stage's baseline and every scheduled
-# run in the estate, and the symptom is a sync failing for reasons that say
-# nothing about a promotion.
+# Worth being explicit rather than terse: a target left with a role that
+# refuses syncs refuses EVERY later one, including the next stage's baseline
+# and every scheduled run in the estate, and the symptom is a sync failing for
+# reasons that say nothing about the role.
+#
+# ROLE defaults to promoted, which is what all but one caller means. Stage 10
+# passes paused: the cure is the same command, but telling an operator their
+# target is "marked promoted" when it is not sends them looking for a failover
+# that never happened.
 warn_target_still_promoted() {
-	warn "$TARGET_DOMAIN on $TARGET_HOST is still marked promoted. Every sync into it -- this harness's later stages included -- will be refused until that is cleared. Run this on $TARGET_HOST:  ${TARGET_VMSYNC_BIN:-vmsync} -update-role target -target-uri qemu:///system -target-domain $TARGET_DOMAIN"
+	warn "$TARGET_DOMAIN on $TARGET_HOST is still marked ${1:-promoted}. Every sync into it -- this harness's later stages included -- will be refused until that is cleared. Run this on $TARGET_HOST:  ${TARGET_VMSYNC_BIN:-vmsync} -update-role target -target-uri qemu:///system -target-domain $TARGET_DOMAIN"
 }
 
 # require_target_syncable -- confirms the reset actually took.
@@ -1657,9 +1663,13 @@ require_target_syncable() {
 	[ "$DRY_RUN" = yes ] && return 0
 	role="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
 	case "$role" in
-	promoted | source)
+	# paused is here because Stage 10 can create it: a restore deliberately
+	# pauses the replica it rolled back. It heals on the way out, but a run
+	# interrupted mid-stage leaves it set, and a sync into a paused target is
+	# refused exactly as one into a promoted target is.
+	promoted | source | paused)
 		warn "$stage: the target's replication_role is still '$role' after resetting it, so every sync into it would be refused -- skipping."
-		warn_target_still_promoted
+		warn_target_still_promoted "$role"
 		results_row "$CSV" "$stage" skipped 0 "" "" "" "" "" "SKIPPED target role is $role"
 		return 1
 		;;
@@ -2408,7 +2418,7 @@ stage_fence_agent() {
 # excluded by name, so every restore point check was being folded into the
 # matrix verdict, and its one FAIL would have failed Stage 1 on any run that
 # included both.
-NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$)'
+NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$)'
 
 # stage_pattern STAGE -> the regex matching that stage's scenario column.
 # --- Stage 8: verify after a long incremental chain --------------------------
@@ -2885,12 +2895,337 @@ fs_free_bytes() {
 # -source-uri would misrepresent what they touch. That they work with only
 # target-side flags is itself part of what this stage checks -- an operator
 # reaching for a restore point may have a source that is gone.
+
+# --- Stage 10: -restore-restore-point (rolling a replica back) ---------------
+#
+# Stage 9 proves restore points get taken. This proves one can be put back, and
+# almost every assertion here is about a way that could go wrong QUIETLY.
+#
+# The one worth reading twice is "the next sync refuses". A restore rolls the
+# replica's contents backwards while the source's checkpoint chain marches on,
+# and nothing in vmsync's incremental path looks at disk content -- it compares
+# a checkpoint NAME. So a restore that failed to invalidate the target's
+# replication metadata would leave the next scheduled sync applying the source's
+# newest delta onto six-hour-old data, exiting 0, with green metrics. That run
+# would look identical to a healthy one. It is the single failure this whole
+# feature is designed around, and it is checked here by running the sync for
+# real and asserting both that it refused AND that the restored bytes are still
+# on disk afterwards.
+stage_restore() {
+	log "=== Stage 10: -restore-restore-point ==="
+	local sc=restore
+	local fo_ok=0
+
+	if [ "$DRY_RUN" = yes ]; then
+		bench_sync "$sc" baseline -reinit "-retention=3,0"
+		bench_sync "$sc" second "-retention=3,0"
+		fo_check "$sc" "the assessment changes nothing" 0
+		fo_check "$sc" "the restore rolls the replica back" 0
+		fo_check "$sc" "the next sync refuses" 0
+		return 0
+	fi
+
+	stage_needs_target_shutoff "$CSV" "$sc" "stage restore" || return 0
+	reset_pair_state "$sc" || return 0
+	require_target_syncable "$sc" || return 0
+
+	local rp_dir="${TARGET_DISK_PATH%/}/.vmsync-rp"
+	ssh_host_cmd "$TARGET_HOST" "rm -rf '$rp_dir'" >/dev/null 2>&1 || true
+
+	# --- two restore points, with different contents between them ------------
+	bench_sync "$sc" baseline -reinit "-retention=3,0"
+	if [ "$RUN_RC" != 0 ]; then
+		if grep -q "does not support reflink copies" "$RUN_LOG" 2>/dev/null; then
+			warn "SKIP stage restore: $TARGET_DISK_PATH on $TARGET_HOST does not support reflink copies"
+			results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP target filesystem has no reflink support"
+			return 0
+		fi
+		warn "baseline sync failed (see $RUN_LOG) -- aborting stage 10$(bench_sync_hint)"
+		return 1
+	fi
+
+	local replica rp_old rp_new
+	replica="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")" || true
+	if [ -z "$replica" ]; then
+		warn "SKIP stage restore: could not resolve the target disk path for dev='$TAMPER_DISK_DEV'"
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP target disk path unresolved"
+		return 0
+	fi
+	rp_old="$(rp_newest "$rp_dir")"
+
+	# Real guest writes, so the two restore points genuinely differ. Without
+	# them an idle guest produces two byte-identical copies and every content
+	# assertion below would pass without proving anything -- so their absence
+	# is recorded as a SKIP rather than quietly weakening the stage.
+	local contents_differ=yes
+	if [ "$GUEST_DIRTY" = yes ] && guest_exec_available; then
+		guest_dirty || warn "guest write failed; the two restore points may end up identical"
+	else
+		contents_differ=no
+	fi
+
+	bench_sync "$sc" second "-retention=3,0"
+	if [ "$RUN_RC" != 0 ]; then
+		warn "second sync failed (see $RUN_LOG) -- aborting stage 10$(bench_sync_hint)"
+		return 1
+	fi
+	rp_new="$(rp_newest "$rp_dir")"
+
+	if [ -z "$rp_old" ] || [ -z "$rp_new" ] || [ "$rp_old" = "$rp_new" ]; then
+		warn "SKIP stage restore: expected two distinct restore points, got '$rp_old' and '$rp_new'"
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP could not take two distinct restore points"
+		return 0
+	fi
+	log "restore points: old=$rp_old new=$rp_new, replica=$replica"
+
+	local disk_base old_copy new_copy
+	disk_base="$(basename "$replica")"
+	old_copy="$rp_dir/$rp_old/$disk_base"
+	new_copy="$rp_dir/$rp_new/$disk_base"
+
+	# A restore point must actually be a copy of the replica as it was. If this
+	# fails, nothing below means anything.
+	if files_same "$replica" "$new_copy"; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the newest restore point is a copy of the current replica" "$fo_ok" \
+		"$replica and $new_copy differ"
+
+	if [ "$contents_differ" = yes ]; then
+		if files_same "$replica" "$old_copy"; then fo_ok=1; else fo_ok=0; fi
+		fo_check "$sc" "the older restore point differs from the current replica" "$fo_ok" \
+			"the guest writes between the two syncs did not reach the replica, so a rollback would be unobservable"
+	else
+		warn "SKIP the content-rollback assertions: guest-exec is unavailable, so both restore points hold identical data and a rollback could not be observed"
+		results_row "$CSV" "$sc" content_rollback "" "" "" "" "" "" "SKIP guest-exec unavailable"
+	fi
+
+	# --- the assessment must change nothing ----------------------------------
+	# -restore-restore-point without -force-restore is meant to be safe to run
+	# against a production replica while deciding. If it wrote anything, the
+	# operator's way of finding out what a restore would do would itself be the
+	# restore.
+	local cp_before role_before
+	cp_before="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_checkpoint)"
+	role_before="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
+
+	if vmsync_verb "$sc" assess -restore-restore-point "$rp_old"; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the assessment runs and reports" "$fo_ok" "see $RUN_LOG"
+
+	if grep -q "$rp_old" "$RUN_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the assessment names the restore point it would apply" "$fo_ok" "see $RUN_LOG"
+
+	if files_same "$replica" "$new_copy"; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the assessment leaves the replica untouched" "$fo_ok" \
+		"$replica changed during an assessment that was supposed to write nothing"
+
+	if [ "$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_checkpoint)" = "$cp_before" ] \
+		&& [ "$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)" = "$role_before" ]; then
+		fo_ok=0
+	else
+		fo_ok=1
+	fi
+	fo_check "$sc" "the assessment leaves replication metadata untouched" "$fo_ok" \
+		"last_checkpoint or replication_role moved during an assessment"
+
+	# --- role gating ---------------------------------------------------------
+	# A domain failed over to and then shut down for maintenance passes every
+	# runtime check there is: it is not running, its disks are there, its
+	# metadata is intact. replication_role is the only thing that knows those
+	# disks are live data rather than a replica.
+	if vmsync_verb "$sc" role-set -update-role promoted >/dev/null 2>&1; then
+		if vmsync_verb "$sc" role-refused -restore-restore-point "$rp_old" -force-restore; then
+			fo_ok=1
+		else
+			fo_ok=0
+		fi
+		fo_check "$sc" "a restore is refused on a promoted domain" "$fo_ok" \
+			"the restore was ALLOWED to overwrite a domain marked replication_role=promoted -- see $RUN_LOG"
+		clear_target_role "put replication_role back after the role gate check"
+	else
+		warn "SKIP the role gate check: could not set replication_role=promoted"
+		results_row "$CSV" "$sc" role_gate "" "" "" "" "" "" "SKIP could not set the role"
+	fi
+
+	# --- the restore itself --------------------------------------------------
+	local rp_checkpoint rp_checkpoint_at
+	rp_checkpoint="$(rp_status_field "$rp_dir" "$rp_old" checkpoint)"
+	rp_checkpoint_at="$(rp_status_field "$rp_dir" "$rp_old" checkpoint_at)"
+
+	if vmsync_verb "$sc" restore -restore-restore-point "$rp_old" -force-restore; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the restore runs" "$fo_ok" "see $RUN_LOG"
+
+	if [ "$contents_differ" = yes ]; then
+		if files_same "$replica" "$old_copy"; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the replica now holds the restored point's contents" "$fo_ok" \
+			"$replica does not match $old_copy after a restore that reported success"
+
+		if files_same "$replica" "$new_copy"; then fo_ok=1; else fo_ok=0; fi
+		fo_check "$sc" "the replica no longer holds what it held before" "$fo_ok" \
+			"$replica still matches $new_copy, so nothing was actually rolled back"
+	fi
+
+	# The restore point must SURVIVE being restored, or an operator gets one
+	# attempt: roll back to Tuesday, decide it is also bad, and Monday is gone
+	# too. Restoring reflinks a copy rather than moving the original precisely
+	# so this holds.
+	if rp_has "$rp_dir" "$rp_old" && rp_has "$rp_dir" "$rp_new"; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "restoring consumes neither restore point" "$fo_ok" \
+		"'$rp_old' or '$rp_new' is gone from $rp_dir after a restore"
+
+	# --- the displaced contents ----------------------------------------------
+	local aside
+	aside="$(ssh_host_cmd "$TARGET_HOST" "ls -1 '${replica}'.vmsync-replaced-* 2>/dev/null | tail -1 || true" | tr -d '[:space:]')"
+	if [ -n "$aside" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the displaced replica contents are kept" "$fo_ok" \
+		"no ${replica}.vmsync-replaced-* on $TARGET_HOST, so the pre-restore contents are unrecoverable"
+
+	if [ -n "$aside" ] && [ "$contents_differ" = yes ]; then
+		if files_same "$aside" "$new_copy"; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the kept contents are what the replica held before the restore" "$fo_ok" \
+			"$aside does not match $new_copy"
+	fi
+
+	# --- the metadata now describes the restored point -----------------------
+	local got
+	got="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
+	if [ "$got" = paused ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the restore pauses replication" "$fo_ok" \
+		"replication_role is '$got', not 'paused' -- the next scheduled sync would overwrite the restored data"
+
+	got="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_checkpoint)"
+	if [ -n "$rp_checkpoint" ] && [ "$got" = "$rp_checkpoint" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "last_checkpoint names the restored point's checkpoint" "$fo_ok" \
+		"last_checkpoint is '$got', the restore point's sidecar says '$rp_checkpoint'"
+
+	got="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" checkpoint_at)"
+	if [ -n "$rp_checkpoint_at" ] && [ "$got" = "$rp_checkpoint_at" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "checkpoint_at is rewound, so a promotion measures loss honestly" "$fo_ok" \
+		"checkpoint_at is '$got', the restore point's sidecar says '$rp_checkpoint_at'"
+
+	got="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" source_stopped_at_sync)"
+	if [ -z "$got" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "source_stopped_at_sync is cleared" "$fo_ok" \
+		"source_stopped_at_sync is still '$got' -- a promotion would report a VERIFIED zero data loss for rolled-back data"
+
+	# The three fields pkg/failover reads as evidence that a sync landed. A
+	# restore that cleared them would leave a replica that cannot be promoted
+	# without -force-promote, which is the one thing an operator restores in
+	# order to do.
+	local ev_cp ev_sync ev_fail
+	ev_cp="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_checkpoint)"
+	ev_sync="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_sync_timestamp)"
+	ev_fail="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" failure_count)"
+	if [ -n "$ev_cp" ] && [ -n "$ev_sync" ] && [ "${ev_fail:-0}" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the restored replica still satisfies the promotion evidence checks" "$fo_ok" \
+		"last_checkpoint='$ev_cp' last_sync_timestamp='$ev_sync' failure_count='$ev_fail' -- promoting would need -force-promote, and promoting is what a restore is for"
+
+	# --- the whole point: the next sync must not silently corrupt it ---------
+	#
+	# -reinit-after-failures is passed deliberately, and it is not decoration.
+	# A restored replica is paused, so every scheduled sync is refused -- and
+	# if a refusal counted as a sync failure, the counter would climb on a
+	# domain nobody is trying to sync, eventually reach the threshold, and
+	# force a reinit that this same gate refuses. Worse, a non-zero
+	# failure_count is itself one of the things that blocks a promotion, so
+	# the replica an operator restored in order to promote would quietly stop
+	# being promotable. The assertions below check the refusal AND that it
+	# left no mark.
+	bench_sync "$sc" next-sync "-reinit-after-failures=2"
+	if [ "$RUN_RC" != 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the next ordinary sync refuses to run against a restored replica" "$fo_ok" \
+		"a sync exited 0 against a replica whose contents were rolled back -- it applied a delta onto the wrong baseline and reported success. See $RUN_LOG"
+
+	if [ "$contents_differ" = yes ]; then
+		if files_same "$replica" "$old_copy"; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the restored contents survive the refused sync" "$fo_ok" \
+			"$replica no longer matches $old_copy, so the refused sync still wrote to it"
+	fi
+
+	got="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" failure_count)"
+	if [ "${got:-0}" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "a refused sync is not counted against the restored replica" "$fo_ok" \
+		"failure_count is '$got' after one refused sync with -reinit-after-failures=2 -- refusals are being counted as sync failures, so a paused replica climbs to the threshold and stops being promotable"
+
+	got="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
+	if [ "$got" = paused ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the refused sync leaves the pause in place" "$fo_ok" \
+		"replication_role is '$got' after the refused sync, not 'paused'"
+
+	# --- cleanup: hand the pair back the way the stage found it --------------
+	# The role MUST be cleared before the healing -reinit, not after: a paused
+	# target is refused at the sync's very first guard, so a reinit run while
+	# it is still paused would fail without healing anything -- and the next
+	# stage would inherit a paused target holding rolled-back contents.
+	clear_target_role "clear replication_role=paused after the restore"
+	bench_sync "$sc" heal -reinit
+	if [ "$RUN_RC" != 0 ]; then
+		warn "the healing -reinit after stage 10 did not succeed (see $RUN_LOG) -- the target is left holding restored (older) contents and paused/target role as last set. Inspect it before trusting later stages"
+	fi
+	ssh_host_cmd "$TARGET_HOST" "rm -f '${replica}'.vmsync-replaced-*" >/dev/null 2>&1 || true
+
+	return 0
+}
+
+# clear_target_role WHY -- put the target back to a role that permits syncing.
+#
+# Tries vmsync first, because -update-role is what an operator would run and
+# exercising it here is worth something. Falls back to virsh for the reason
+# reset_pair_state gives at length: a harness that can only restore state
+# through the code it is testing cannot recover when that code is broken, and
+# the failure then surfaces two stages later as an unrelated-looking baseline
+# error. Every stage after this one syncs into the target, and every one of them
+# is refused while it is paused, so this must not be able to leave it that way.
+#
+# Removing the whole metadata block is heavier than clearing one field and is
+# fine: the caller -reinits immediately afterwards, which writes it all back.
+clear_target_role() {
+	local why="$1"
+	if vmsync_verb restore role-clear -update-role target >/dev/null 2>&1; then
+		return 0
+	fi
+	warn "vmsync -update-role failed while trying to $why; removing the target's vmsync metadata with virsh instead, so later stages are not left refusing to sync into a paused target"
+	virsh_uri "$TARGET_URI" metadata "$TARGET_DOMAIN" --uri "$VMSYNC_METADATA_URI" --remove --config >/dev/null 2>&1 \
+		|| warn "that failed too -- $TARGET_DOMAIN on $TARGET_HOST is left with replication_role set and every later sync into it will be refused. Clear it by hand"
+	return 0
+}
+
+# files_same PATH_A PATH_B -- are these two files byte-identical on the target?
+#
+# cmp, not md5sum: it short-circuits on the first differing byte, which is the
+# common case for the "these must differ" assertions, and it needs no second
+# round trip to compare digests. Both paths are on the target host, so this is
+# one ssh call.
+#
+# Exits 0 for identical and non-zero for anything else INCLUDING a missing file,
+# so every caller's failure message names the two paths -- a comparison that
+# could not be made is not evidence of sameness.
+files_same() {
+	ssh_host_cmd "$TARGET_HOST" "cmp -s '$1' '$2'" >/dev/null 2>&1
+}
+
+# rp_status_field DIR TAG KEY -- one value out of a restore point's sidecar.
+#
+# sed rather than a JSON parser because jq is not in this harness's dependency
+# list and adding one for six fields would be a poor trade. Status.Encode writes
+# the sidecar with MarshalIndent, so every field really is on its own line in
+# the "key": value shape this matches -- which is a fact about vmsync's own
+# writer, not a hope about JSON in general.
+rp_status_field() {
+	ssh_host_cmd "$TARGET_HOST" "cat '$1/$2/status.json' 2>/dev/null || true" \
+		| sed -n "s/^[[:space:]]*\"$3\":[[:space:]]*\"\{0,1\}\([^\",]*\)\"\{0,1\},\{0,1\}[[:space:]]*$/\1/p" \
+		| head -1 | tr -d '[:space:]'
+}
 vmsync_verb() {
 	local scenario="$1" phase="$2"
 	shift 2
 	local log_file="$RUN_DIR/logs/${scenario}.${phase}.log"
 	RUN_LOG="$log_file"
-	local args=(-target-uri "$TARGET_URI" -target-disk-path "$TARGET_DISK_PATH")
+	# -target-domain is passed even though the two read-only verbs this
+	# started out serving (-list-restore-points, -clone-restore-point) work
+	# off the filesystem alone and ignore it. -restore-restore-point and
+	# -update-role do not: both act on the domain, and both refuse without
+	# it. Leaving it out made every verb that touches libvirt fail here for a
+	# reason that had nothing to do with what was being tested.
+	local args=(-target-uri "$TARGET_URI" -target-domain "$TARGET_DOMAIN" -target-disk-path "$TARGET_DISK_PATH")
 	[ -n "${SSH_USER:-}" ] && args+=(-ssh-user "$SSH_USER")
 	[ -n "${SSH_KEY:-}" ] && args+=(-ssh-key "$SSH_KEY")
 	[ -n "${SSH_PORT:-}" ] && args+=(-ssh-port "$SSH_PORT")
@@ -2916,6 +3251,7 @@ stage_pattern() {
 	failover) printf '^failover$' ;;
 	fence-agent) printf '^fence-agent$' ;;
 	retention) printf '^retention$' ;;
+	restore) printf '^restore$' ;;
 	*) printf '$^' ;; # matches nothing
 	esac
 }
@@ -3224,7 +3560,8 @@ for s in "${stage_list[@]}"; do
         failover) stage_failover || stage_rc=$? ;;
         fence-agent) stage_fence_agent || stage_rc=$? ;;
         retention) stage_retention || stage_rc=$? ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,verify-long,reinit,snapshot,define,failover,fence-agent,retention)" ;;
+        restore) stage_restore || stage_rc=$? ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,verify-long,reinit,snapshot,define,failover,fence-agent,retention,restore)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
                 warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."

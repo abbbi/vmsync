@@ -173,6 +173,14 @@ type syncConfig struct {
 	ListRestorePoints   bool
 	CloneRestorePoint   string
 	CloneRestorePointTo string
+	// RestoreRestorePoint names the restore point to put back over the
+	// replica, and ForceRestore is what turns the assessment into the act.
+	// Two flags rather than one because the assessment is the useful half
+	// during an incident: it names every file that would change and the exact
+	// replication state that would follow, and it can be run against a
+	// production replica while deciding.
+	RestoreRestorePoint string
+	ForceRestore        bool
 	// TestFault names a failure to inject into this run, or "" in every real
 	// one. See libvirtsync.TestFault for why this exists and why it is a flag
 	// rather than an environment variable.
@@ -288,6 +296,8 @@ func main() {
 	flag.BoolVar(&cfg.ListRestorePoints, "list-restore-points", false, "List the restore points kept on the target and stop. Needs -target-uri and -target-disk-path; reads the target filesystem only, and touches neither the replica nor libvirt")
 	flag.StringVar(&cfg.CloneRestorePoint, "clone-restore-point", "", "Copy one restore point's disks to the directory given by -clone-to, and stop. Takes a tag from -list-restore-points. This is how to answer \"is that copy clean?\": boot a throwaway domain from the clone. It changes nothing about the replica, its metadata, or its role -- restoring in place is a different operation and is deliberately not this one")
 	flag.StringVar(&cfg.CloneRestorePointTo, "clone-to", "", "Directory on the target to write -clone-restore-point's copies into. Created if missing")
+	flag.StringVar(&cfg.RestoreRestorePoint, "restore-restore-point", "", "Put one restore point back over the replica IN PLACE, discarding its current contents. Takes a tag from -list-restore-points. Without -force-restore this only prints an assessment and changes nothing. A restore is for promoting: it leaves replication PAUSED, because the next sync from the same source would otherwise overwrite exactly what was rolled back to")
+	flag.BoolVar(&cfg.ForceRestore, "force-restore", false, "Carry out -restore-restore-point instead of only assessing it. Required, because a restore replaces the replica's disks and cannot be undone once the displaced contents are removed")
 	flag.StringVar(&cfg.TestFault, "test", "", fmt.Sprintf("FOR TESTING ONLY: make vmsync deliberately fail at a chosen point, so error-recovery paths that cannot be reached from outside the process can be exercised. Accepts one of: %s. A run with this set WILL fail and its result means nothing as a replication. Listed here rather than hidden, so an operator who finds it in a log can look it up", strings.Join(libvirtsync.TestFaults, ", ")))
 	compressArg := optionalValueFlag{bareDefault: "s2"}
 	fenceSourceArg := optionalValueFlag{bareDefault: fenceSourceAuto}
@@ -389,6 +399,7 @@ func main() {
 			{cfg.UpdateRole != "", "-update-role"},
 			{cfg.ListRestorePoints, "-list-restore-points"},
 			{cfg.CloneRestorePoint != "", "-clone-restore-point"},
+			{cfg.RestoreRestorePoint != "", "-restore-restore-point"},
 		} {
 			if m.on {
 				chosen = append(chosen, m.name)
@@ -418,6 +429,8 @@ func main() {
 				err = runListRestorePoints(ctx, cfg)
 			case cfg.CloneRestorePoint != "":
 				err = runCloneRestorePoint(ctx, cfg, cfg.CloneRestorePoint, cfg.CloneRestorePointTo)
+			case cfg.RestoreRestorePoint != "":
+				err = runRestoreRestorePoint(ctx, cfg, cfg.RestoreRestorePoint)
 			}
 			if err != nil {
 				trace.Error(strings.TrimPrefix(chosen[0], "-"), "error", err)
@@ -658,7 +671,19 @@ func main() {
 	// itself, and the sync's failure is already recorded in
 	// vmsync_sync_state).
 	if err := run(cfg); err != nil {
-		if cfg.ReinitAfterFailures > 0 && !verifying {
+		// A role refusal is exempt for the same reason run-lock contention is
+		// (see the lock's own comment above): it is not a broken sync. The
+		// role gate is an administrative state, it says nothing about whether
+		// the incremental mechanism works, and the reinit this counter would
+		// eventually force is refused by that same gate -- so the count could
+		// only ever climb. It would also do real damage: a non-zero
+		// failure_count blocks promotion, so a replica deliberately paused
+		// (by -update-role=paused, or by a restore, which pauses precisely so
+		// the next sync does NOT overwrite what was just rolled back) would
+		// slowly become unpromotable because the scheduler kept being told no.
+		// The run still exits 1 and still reports vmsync_sync_state=failure:
+		// what is wrong is only counting it against the domain.
+		if cfg.ReinitAfterFailures > 0 && !verifying && !errors.Is(err, libvirtsync.ErrRoleRefusesSync) {
 			if count, rerr := libvirtsync.RecordTargetSyncFailure(cfg.TargetURI, cfg.TargetDomain); rerr != nil {
 				trace.Warning("failed to record sync failure in target metadata", "error", rerr)
 			} else {
