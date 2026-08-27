@@ -63,8 +63,9 @@ func (b *ByteCounters) ReceivedSnapshot() uint64 {
 }
 
 // ChecksumValue returns the final rolling hash (0 if checksum was disabled).
-// Combined deterministically from both directions so the same NBD session
-// always yields same value regardless of goroutine scheduling.
+// Combined symmetrically so local (out=client→server, in=server→client)
+// and helper (out=server→client, in=client→server) yield same value
+// despite swapped direction labels.
 func (b *ByteCounters) ChecksumValue() uint64 {
 	if b == nil || (b.outHash == nil && b.inHash == nil) {
 		return 0
@@ -78,9 +79,7 @@ func (b *ByteCounters) ChecksumValue() uint64 {
 	if b.inHash != nil {
 		in = b.inHash.Sum64()
 	}
-	// Deterministic combine: xor with rotate to avoid trivial cancellation
-	// when both directions happen to hash to same value (e.g., empty).
-	return out ^ (in<<1 | in>>63) ^ 0x9e3779b97f4a7c15
+	return out ^ in
 }
 
 // ChecksumAlgo returns the resolved algo used for this bridge ("" if disabled).

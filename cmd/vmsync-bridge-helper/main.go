@@ -399,12 +399,12 @@ func handleConn(conn net.Conn, cfg helperConfig) {
 	// Persist rolling hash for the source to verify single final hash
 	// before merging. Written per-port so parallel disks (different ports)
 	// do not interfere. Best-effort: failure to write just means the
-	// source's re-read fallback will be used. Combined deterministically
-	// from both directions.
+	// source's re-read fallback will be used. Combined symmetrically
+	// so local and helper agree despite swapped out/in labels.
 	if outHash != nil && inHash != nil {
 		outVal := outHash.Sum64()
 		inVal := inHash.Sum64()
-		final := outVal ^ (inVal<<1 | inVal>>63) ^ 0x9e3779b97f4a7c15
+		final := outVal ^ inVal
 		if _, portStr, err := net.SplitHostPort(cfg.ListenAddr); err == nil {
 			if port, err := strconv.Atoi(portStr); err == nil {
 				dir := "/run/vmsync-bridge"

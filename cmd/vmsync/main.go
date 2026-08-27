@@ -3064,7 +3064,19 @@ func run(cfg syncConfig) (runErr error) {
 		// both sides (no extra disk read). Remote helper writes
 		// /run/vmsync-bridge/checksum-<port>.hash after connection close.
 		if ckAlgo != checksum.AlgoNone && bridgeCfg.ChecksumEnabled() && res.targetBridgeCounters != nil {
+			// Give local relay a moment to finish flushing last bytes through
+			// zstd's internal buffer/BoundedBuffer so hash is final. Poll
+			// until stable to avoid racing the helper's wg.Wait.
+			time.Sleep(300 * time.Millisecond)
 			localHash := res.targetBridgeCounters.ChecksumValue()
+			for k := 0; k < 3; k++ {
+				time.Sleep(100 * time.Millisecond)
+				if h2 := res.targetBridgeCounters.ChecksumValue(); h2 != localHash {
+					localHash = h2
+					continue
+				}
+				break
+			}
 			tbPort := cfg.TargetNBDPort + len(qcowDisks) + i
 			remoteHashFile := fmt.Sprintf("/run/vmsync-bridge/checksum-%d.hash", tbPort)
 			var remoteHashStr string
