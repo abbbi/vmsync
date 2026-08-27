@@ -605,7 +605,6 @@ func main() {
 			os.Exit(2)
 		}
 	}
-	}
 
 	trace.SetDebug(cfg.Debug)
 
