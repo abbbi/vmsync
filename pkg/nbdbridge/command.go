@@ -89,6 +89,12 @@ func BuildStartCommand(cfg Config, bridgePort, realPort int, pidFile, logFile st
 		// (-netbuffer is also an optional-value flag on the helper side).
 		args = append(args, "-netbuffer="+cfg.NetBufferBlock+","+cfg.NetBufferSize)
 	}
+	if cfg.ChecksumEnabled() {
+		// Concrete resolved algo, not "auto" — both sides must use the same
+		// hash so the final Sum64() values are comparable. Source already
+		// resolved via checksum.Resolve, helper will not re-resolve.
+		args = append(args, "-checksum="+string(cfg.ResolvedChecksum()))
+	}
 	helperCmd := quoteArgs(args...)
 
 	return fmt.Sprintf("setsid sh -c %s </dev/null >%s 2>&1 & echo $! > %s",

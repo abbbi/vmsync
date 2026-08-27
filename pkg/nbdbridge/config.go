@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"vmsync/pkg/checksum"
 	"vmsync/pkg/netbuffer"
 	"vmsync/pkg/zstdrelay"
 )
@@ -53,6 +54,12 @@ type Config struct {
 	// tunnel (an SSH direct-tcpip channel), at the cost of SSH's own
 	// channel-level flow-control overhead.
 	UseSSH bool
+	// Checksum enables rolling hash verification over the plaintext NBD
+	// stream when a bridge is active. "auto" (default when -checksum is
+	// set) picks crc32c if hardware accelerated else xxhash; "off"/"" disables.
+	// Only meaningful when Enabled() is true — without a relay there is no
+	// hook to hash the stream, so auto silently disables (see run()).
+	Checksum string
 }
 
 // NetBufferEnabled reports whether --netbuffer was set.
@@ -63,6 +70,24 @@ func (c Config) NetBufferEnabled() bool {
 // Enabled reports whether any bridging is requested at all.
 func (c Config) Enabled() bool {
 	return c.Compress || c.NetBufferEnabled()
+}
+
+// ChecksumEnabled reports whether rolling hash verification is requested.
+func (c Config) ChecksumEnabled() bool {
+	if c.Checksum == "" {
+		return false
+	}
+	a, err := checksum.Parse(c.Checksum)
+	if err != nil {
+		return false
+	}
+	return a != checksum.AlgoNone
+}
+
+// ResolvedChecksum returns the concrete algo after auto resolution.
+func (c Config) ResolvedChecksum() checksum.Algo {
+	a, _ := checksum.Parse(c.Checksum)
+	return checksum.Resolve(a)
 }
 
 // ValidateCompressLevel checks the --compress-level value is valid for the

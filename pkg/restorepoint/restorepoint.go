@@ -214,6 +214,12 @@ type Status struct {
 	Source       string   `json:"source"`
 	Verify       string   `json:"verify"`
 	Disks        []string `json:"disks"`
+	// Checksum captures the fast inline hash taken during the copy that
+	// produced this restore point ("" / 0 when that sync ran without
+	// -checksum). Lets an operator answer "is Tuesday's copy bit-identical
+	// to what the source sent?" without re-reading the source.
+	ChecksumAlgo  string `json:"checksum_algo,omitempty"`
+	ChecksumValue uint64 `json:"checksum,omitempty"`
 }
 
 // Encode renders a sidecar. Indented because the first reader of one of these

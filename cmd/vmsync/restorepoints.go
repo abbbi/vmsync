@@ -20,16 +20,26 @@ package main
 import (
 	"context"
 	"fmt"
+	"hash"
 	"path"
 	"sort"
 	"sync"
 	"time"
 
+	"vmsync/pkg/checksum"
 	"vmsync/pkg/remotessh"
 	"vmsync/pkg/restorepoint"
 	"vmsync/pkg/trace"
 	"vmsync/pkg/util"
 )
+
+func newHashForAlgo(algo string) (hash.Hash64, error) {
+	a, err := checksum.Parse(algo)
+	if err != nil {
+		return nil, err
+	}
+	return checksum.New(a)
+}
 
 // The -retention side of a sync: after each replica disk is copied, take a
 // reflink copy of it, and once the whole set is there, publish it and prune
@@ -60,6 +70,18 @@ type restorePoints struct {
 
 	mu    sync.Mutex
 	disks []string
+	// checksum captures the inline copy hash when -checksum is enabled, folded
+	// across all disks in TargetDev order for determinism. Empty/0 when
+	// checksum was off for this run.
+	checksumAlgo    string
+	checksumValue   uint64
+	checksumEntries []checksumEntry
+}
+
+type checksumEntry struct {
+	disk  string
+	algo  string
+	value uint64
 }
 
 // newRestorePoints decides whether this run takes a restore point, and refuses
@@ -141,6 +163,30 @@ func listRestorePoints(ctx context.Context, runner remoteRunner, root string) (r
 	return restorepoint.ParseListing(out)
 }
 
+// setChecksum records the inline copy hash for the restore point sidecar.
+// Called once after all disks have copied, before commit. The value is the
+// deterministic fold of per-disk checksums in disk order, so the same VM
+// content always yields the same restore-point checksum regardless of copy
+// concurrency.
+func (r *restorePoints) setChecksum(algo string, value uint64) {
+	if r == nil || !r.armed {
+		return
+	}
+	r.mu.Lock()
+	r.checksumAlgo = algo
+	r.checksumValue = value
+	r.mu.Unlock()
+}
+
+func (r *restorePoints) addDiskChecksum(disk, algo string, value uint64) {
+	if r == nil || !r.armed || algo == "" || value == 0 {
+		return
+	}
+	r.mu.Lock()
+	r.checksumEntries = append(r.checksumEntries, checksumEntry{disk: disk, algo: algo, value: value})
+	r.mu.Unlock()
+}
+
 // take copies one replica disk into the staging restore point.
 //
 // Called right after that disk's own copy and commit, and deliberately before
@@ -174,15 +220,56 @@ func (r *restorePoints) commit(ctx context.Context, verifyState, source string, 
 
 	r.mu.Lock()
 	disks := append([]string(nil), r.disks...)
+	ckAlgo := r.checksumAlgo
+	ckVal := r.checksumValue
+	entries := append([]checksumEntry(nil), r.checksumEntries...)
 	r.mu.Unlock()
+	// Fold per-disk checksums deterministically if they were recorded via
+	// addDiskChecksum (single-phase path) rather than a single setChecksum.
+	if ckAlgo == "" && len(entries) > 0 {
+		sort.Slice(entries, func(i, j int) bool { return entries[i].disk < entries[j].disk })
+		ckAlgo = entries[0].algo
+		// Use the same algo's hasher to fold 8-byte per-disk values in
+		// sorted disk order — matches nbdsync's own aggregate construction.
+		if h, err := newHashForAlgo(ckAlgo); err == nil {
+			for _, e := range entries {
+				if e.algo != ckAlgo {
+					trace.Warning("restore point checksum: mixed algo across disks, using first", "disk", e.disk, "algo", e.algo, "expected", ckAlgo)
+					continue
+				}
+				var b [8]byte
+				v := e.value
+				b[0] = byte(v)
+				b[1] = byte(v >> 8)
+				b[2] = byte(v >> 16)
+				b[3] = byte(v >> 24)
+				b[4] = byte(v >> 32)
+				b[5] = byte(v >> 40)
+				b[6] = byte(v >> 48)
+				b[7] = byte(v >> 56)
+				_, _ = h.Write(b[:])
+			}
+			ckVal = h.Sum64()
+		} else {
+			// Fallback: xor-rotate fold when hasher unavailable
+			var acc uint64
+			for _, e := range entries {
+				acc ^= e.value
+				acc = acc<<13 | acc>>51
+			}
+			ckVal = acc
+		}
+	}
 
 	status := restorepoint.Status{
-		Checkpoint:   effectiveCheckpoint,
-		CheckpointAt: checkpointAt.Unix(),
-		TakenAt:      time.Now().Unix(),
-		Source:       source,
-		Verify:       verifyState,
-		Disks:        disks,
+		Checkpoint:    effectiveCheckpoint,
+		CheckpointAt:  checkpointAt.Unix(),
+		TakenAt:       time.Now().Unix(),
+		Source:        source,
+		Verify:        verifyState,
+		Disks:         disks,
+		ChecksumAlgo:  ckAlgo,
+		ChecksumValue: ckVal,
 	}
 	cmd, err := restorepoint.StatusCommand(r.root, r.tag, status)
 	if err != nil {

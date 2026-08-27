@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 
+	"vmsync/pkg/checksum"
 	"vmsync/pkg/netbuffer"
 	"vmsync/pkg/portalloc"
 )
@@ -63,6 +64,13 @@ type SyncProfile struct {
 	// Verify is "", "compare", "fast" or "online". Note that compare and
 	// fast SUSPEND the source domain; online does not.
 	Verify string `json:"verify,omitempty"`
+	// Checksum is "", "auto", "crc32c", "xxhash" or "off". Empty means
+	// "auto" (inherited from vmsync's own default: hw crc32c if present
+	// else xxhash, silently disabled when no zstdrelay bridge is active).
+	Checksum string `json:"checksum,omitempty"`
+	// ChecksumVerify is kept for compat — vmsync's -checksum already does
+	// single final rolling-hash verify; this is now an alias.
+	ChecksumVerify bool `json:"checksum_verify,omitempty"`
 	// ReinitAfterFailures forces a full resync after N consecutive failures.
 	ReinitAfterFailures int `json:"reinit_after_failures,omitempty"`
 	// TargetDiskPath is where the replica's disks live on the target host.
@@ -164,6 +172,17 @@ func (p SyncProfile) Validate() error {
 	case "", "compare", "fast", "online":
 	default:
 		return fmt.Errorf("verify %q is not one of \"\", \"compare\", \"fast\", \"online\"", p.Verify)
+	}
+
+	switch p.Checksum {
+	case "", "auto", "crc32c", "crc32", "xxhash", "xxhash64", "off", "none", "false", "disable", "disabled":
+	default:
+		return fmt.Errorf("checksum %q is not one of \"auto\", \"crc32c\", \"xxhash\", \"off\"", p.Checksum)
+	}
+	if p.ChecksumVerify && p.Checksum != "" {
+		if a, _ := checksum.Parse(p.Checksum); a == checksum.AlgoNone {
+			return fmt.Errorf("checksum_verify requires checksum to be enabled (got %q)", p.Checksum)
+		}
 	}
 
 	if p.ReinitAfterFailures < 0 || p.ReinitAfterFailures > maxReinitAfterFailures {
@@ -296,6 +315,20 @@ func (r SyncRequest) CommandArgs() []string {
 	}
 	if p.IODepth > 0 {
 		args = append(args, "-io-depth", strconv.Itoa(p.IODepth))
+	}
+	if p.Checksum != "" {
+		// Normalize crc32 -> crc32c for the CLI which expects the canonical form.
+		ck := p.Checksum
+		if ck == "crc32" {
+			ck = "crc32c"
+		}
+		if ck == "xxhash64" {
+			ck = "xxhash"
+		}
+		args = append(args, "-checksum="+ck)
+		if p.ChecksumVerify {
+			args = append(args, "-checksum-verify")
+		}
 	}
 	if p.Verify != "" {
 		args = append(args, "-verify="+p.Verify)

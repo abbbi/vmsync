@@ -57,6 +57,13 @@ type DiskMetric struct {
 	// then nothing sat between the plain NBD read and write.
 	CompressedTransferredBytes uint64
 	DurationSeconds            float64
+	// ChecksumAlgo/ChecksumValue carry the fast inline checksum when
+	// -checksum is enabled (e.g., "crc32c" -> 0x1a2b3c4d). Zero value
+	// means checksum was disabled for this run, so the metric is not
+	// emitted for that disk rather than emitting a misleading 0.
+	ChecksumAlgo     string
+	ChecksumValue    uint64
+	ChecksumVerified bool
 }
 
 // RunMetric holds the overall result of one vmsync invocation -- unlike
@@ -149,6 +156,41 @@ func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 	for _, m := range disks {
 		fmt.Fprintf(&b, "vmsync_sync_duration_seconds{source_host=%q,target_host=%q,vm=%q,disk=%q} %.3f\n",
 			m.SourceHost, m.TargetHost, m.VM, m.Disk, m.DurationSeconds)
+	}
+
+	// Only emitted when -checksum was enabled — same gating rationale as
+	// verification: a run without checksum must not emit a 0 that looks like
+	// "checksum 0 matched".
+	hasChecksum := false
+	for _, m := range disks {
+		if m.ChecksumAlgo != "" {
+			hasChecksum = true
+			break
+		}
+	}
+	if hasChecksum {
+		fmt.Fprintln(&b, "# HELP vmsync_disk_checksum Checksum of the dirty bytes copied for this disk (streaming hash in chunk offset order). Algo label identifies the hash (crc32c/xxhash)")
+		fmt.Fprintln(&b, "# TYPE vmsync_disk_checksum gauge")
+		for _, m := range disks {
+			if m.ChecksumAlgo == "" {
+				continue
+			}
+			fmt.Fprintf(&b, "vmsync_disk_checksum{source_host=%q,target_host=%q,vm=%q,disk=%q,algo=%q} %d\n",
+				m.SourceHost, m.TargetHost, m.VM, m.Disk, m.ChecksumAlgo, m.ChecksumValue)
+		}
+		fmt.Fprintln(&b, "# HELP vmsync_disk_checksum_verified Whether this disk's post-copy checksum re-read matched (1) or not (0)")
+		fmt.Fprintln(&b, "# TYPE vmsync_disk_checksum_verified gauge")
+		for _, m := range disks {
+			if m.ChecksumAlgo == "" {
+				continue
+			}
+			verified := 0
+			if m.ChecksumVerified {
+				verified = 1
+			}
+			fmt.Fprintf(&b, "vmsync_disk_checksum_verified{source_host=%q,target_host=%q,vm=%q,disk=%q,algo=%q} %d\n",
+				m.SourceHost, m.TargetHost, m.VM, m.Disk, m.ChecksumAlgo, verified)
+		}
 	}
 
 	fmt.Fprintln(&b, "# HELP vmsync_sync_state Result of the last vmsync run as a whole (0=success, 1=failure, 2=succeeded but guest filesystem freeze failed -- checkpoint is only crash-consistent, not application-consistent).")

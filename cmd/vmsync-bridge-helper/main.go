@@ -32,11 +32,15 @@ package main
 import (
 	"flag"
 	"fmt"
+	"hash"
+	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 
+	"vmsync/pkg/checksum"
 	"vmsync/pkg/netbuffer"
 	"vmsync/pkg/version"
 	"vmsync/pkg/zstdrelay"
@@ -123,6 +127,11 @@ type helperConfig struct {
 	// netbuffer.ParseSpec. Both empty means the buffering stage is off.
 	NetBufferBlock string
 	NetBufferSize  string
+	// Checksum enables rolling hash verification of plaintext. "auto" is
+	// resolved on the helper's own host to crc32c if hw else xxhash; the
+	// caller (BuildStartCommand) already passes the resolved concrete algo
+	// so both sides use the same one.
+	Checksum string
 }
 
 func main() {
@@ -130,9 +139,11 @@ func main() {
 	connectAddr := flag.String("connect", "", "real endpoint host:port to dial and forward plaintext traffic to/from, once per accepted connection (required)")
 	compressArg := optionalValueFlag{bareDefault: "s2"}
 	netBufferArg := optionalValueFlag{bareDefault: "128k,1G"}
+	checksumArg := optionalValueFlag{bareDefault: "crc32c"}
 	flag.Var(&compressArg, "compress", "Same syntax as vmsync")
 	level := flag.String("compress-level", "3", "Same syntax as vmsync")
 	flag.Var(&netBufferArg, "netbuffer", "Same syntax as vmsync")
+	flag.Var(&checksumArg, "checksum", "rolling checksum algo auto|crc32c|xxhash|off (default off); when set both sides hash plaintext and helper writes final hash to /run/vmsync-bridge/checksum-<port>.hash")
 	showVersion := flag.Bool("v", false, "Show version and exit")
 	showVersionLong := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
@@ -193,6 +204,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
 		os.Exit(2)
 	}
+	// Validate checksum if provided — helper accepts the resolved concrete
+	// algo from BuildStartCommand (not auto), so we just check it parses.
+	if checksumArg.value != "" {
+		if _, err := checksum.Parse(checksumArg.value); err != nil {
+			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
+			os.Exit(2)
+		}
+	}
 
 	cfg := helperConfig{
 		ListenAddr:     *listenAddr,
@@ -202,6 +221,7 @@ func main() {
 		Level:          *level,
 		NetBufferBlock: netbufferBlock,
 		NetBufferSize:  netbufferSize,
+		Checksum:       checksumArg.value,
 	}
 
 	if err := serve(cfg); err != nil {
@@ -249,6 +269,39 @@ func recoverRelayPanic(label string, fn func() error) (err error) {
 	return fn()
 }
 
+// hashingReader wraps an io.Reader and feeds every byte read into h.
+type hashingReader struct {
+	R io.Reader
+	H hash.Hash
+	M *sync.Mutex
+}
+
+func (h *hashingReader) Read(p []byte) (int, error) {
+	n, err := h.R.Read(p)
+	if n > 0 && h.H != nil {
+		h.M.Lock()
+		_, _ = h.H.Write(p[:n])
+		h.M.Unlock()
+	}
+	return n, err
+}
+
+// hashingWriter wraps an io.Writer and feeds every byte written into h.
+type hashingWriter struct {
+	W io.Writer
+	H hash.Hash
+	M *sync.Mutex
+}
+
+func (h *hashingWriter) Write(p []byte) (int, error) {
+	if h.H != nil && len(p) > 0 {
+		h.M.Lock()
+		_, _ = h.H.Write(p)
+		h.M.Unlock()
+	}
+	return h.W.Write(p)
+}
+
 // handleConn serves exactly one accepted connection: dial the real NBD
 // endpoint and relay bidirectionally until either side is done. It never
 // lets a panic escape -- unlike the old one-process-per-connection model
@@ -271,6 +324,33 @@ func handleConn(conn net.Conn, cfg helperConfig) {
 	}
 	defer real.Close()
 
+	// Rolling hash of plaintext, separate per direction to avoid
+	// non-deterministic interleaving, combined deterministically at the end.
+	var outHash, inHash hash.Hash64
+	var hMu sync.Mutex
+	var hashAlgo checksum.Algo
+	if cfg.Checksum != "" {
+		if a, err := checksum.Parse(cfg.Checksum); err == nil && a != checksum.AlgoNone {
+			a = checksum.Resolve(a)
+			if h1, err := checksum.New(a); err == nil {
+				if h2, err := checksum.New(a); err == nil {
+					outHash = h1
+					inHash = h2
+					hashAlgo = a
+				}
+			}
+		}
+	}
+	// Wrap plaintext side so hash sees bytes before compress / after decompress.
+	realReaderForRelay := io.Reader(real)
+	realWriterForRelay := io.Writer(real)
+	if outHash != nil {
+		realReaderForRelay = &hashingReader{R: real, H: outHash, M: &hMu}
+	}
+	if inHash != nil {
+		realWriterForRelay = &hashingWriter{W: real, H: inHash, M: &hMu}
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	var firstErr error
@@ -286,7 +366,7 @@ func handleConn(conn net.Conn, cfg helperConfig) {
 	go func() {
 		defer wg.Done()
 		reportErr(recoverRelayPanic("inbound relay (conn -> real)", func() error {
-			err := zstdrelay.RelayFromWire(real, conn, cfg.Compress, cfg.Algo, cfg.NetBufferBlock, cfg.NetBufferSize, nil)
+			err := zstdrelay.RelayFromWire(realWriterForRelay, conn, cfg.Compress, cfg.Algo, cfg.NetBufferBlock, cfg.NetBufferSize, nil)
 			if tc, ok := real.(*net.TCPConn); ok {
 				tc.CloseWrite() // half-close: tell the real server we're done sending
 			}
@@ -307,7 +387,7 @@ func handleConn(conn net.Conn, cfg helperConfig) {
 	go func() {
 		defer wg.Done()
 		reportErr(recoverRelayPanic("outbound relay (real -> conn)", func() error {
-			err := zstdrelay.Relay(conn, real, cfg.Compress, cfg.Algo, cfg.Level, cfg.NetBufferBlock, cfg.NetBufferSize, nil)
+			err := zstdrelay.Relay(conn, realReaderForRelay, cfg.Compress, cfg.Algo, cfg.Level, cfg.NetBufferBlock, cfg.NetBufferSize, nil)
 			if tc, ok := conn.(*net.TCPConn); ok {
 				tc.CloseWrite()
 			}
@@ -316,6 +396,25 @@ func handleConn(conn net.Conn, cfg helperConfig) {
 	}()
 
 	wg.Wait()
+	// Persist rolling hash for the source to verify single final hash
+	// before merging. Written per-port so parallel disks (different ports)
+	// do not interfere. Best-effort: failure to write just means the
+	// source's re-read fallback will be used. Combined deterministically
+	// from both directions.
+	if outHash != nil && inHash != nil {
+		outVal := outHash.Sum64()
+		inVal := inHash.Sum64()
+		final := outVal ^ (inVal<<1 | inVal>>63) ^ 0x9e3779b97f4a7c15
+		if _, portStr, err := net.SplitHostPort(cfg.ListenAddr); err == nil {
+			if port, err := strconv.Atoi(portStr); err == nil {
+				dir := "/run/vmsync-bridge"
+				_ = os.MkdirAll(dir, 0755)
+				p := filepath.Join(dir, fmt.Sprintf("checksum-%d.hash", port))
+				content := fmt.Sprintf("%s:%016x\n", hashAlgo, final)
+				_ = os.WriteFile(p, []byte(content), 0644)
+			}
+		}
+	}
 	if firstErr != nil {
 		fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: connection %s: %v\n", conn.RemoteAddr(), firstErr)
 	}

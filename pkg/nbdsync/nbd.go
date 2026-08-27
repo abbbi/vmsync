@@ -21,10 +21,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"hash"
 
 	"strconv"
 	"time"
 
+	"vmsync/pkg/checksum"
 	"vmsync/pkg/trace"
 
 	nbd "libguestfs.org/libnbd"
@@ -278,35 +280,101 @@ func negotiateBufferSize(a, b *nbd.Libnbd, roleA, roleB string) uint64 {
 // number of read/write pairs kept in flight simultaneously (see the
 // pipelining comment below); values less than 1 are clamped to 1.
 func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport string, dstHost string, dstPort int, extents []Extent, ioDepth int) (writtenBytes uint64, err error) {
+	wb, _, err := CopyExtentsTCPWithChecksum(ctx, srcHost, srcPort, srcExport, dstHost, dstPort, extents, ioDepth, checksum.AlgoNone, false)
+	return wb, err
+}
+
+// CopyStats is the checksum-aware result of a copy. Kept separate from the
+// bare writtenBytes return so existing callers (tests, older call sites) keep
+// compiling without change — CopyExtentsTCP above is the backward-compatible
+// wrapper.
+type CopyStats struct {
+	WrittenBytes uint64
+	// Checksum is the streaming hash over the concatenated dirty bytes in
+	// offset order (the same order CompareTCP walks). Zero when checksum was
+	// disabled. Valid even on partial failure — reflects whatever was
+	// successfully read+written before the error.
+	Checksum uint64
+	Algo     checksum.Algo
+	// Verified reports whether every chunk was read back from the target and
+	// hash-matched after Pwrite+Flush (only when verify=true). False when
+	// checksum was disabled or when verification was not requested.
+	Verified bool
+}
+
+// CopyExtentsTCPWithChecksum is CopyExtentsTCP plus a fast inline checksum.
+//
+// algo=="" (checksum.AlgoNone) disables hashing entirely — identical
+// performance to the original path, zero extra CPU. algo="crc32c" uses Go's
+// hardware-accelerated CRC-32 Castagnoli (SSE4.2/PCLMUL on amd64, CRC
+// instructions on arm64) at ~3–5% overhead; algo="xxhash" uses a pure-Go
+// 64-bit hash at similar speed without hardware gates. Both stream over the
+// source bytes in chunk-offset order, so the same disk with the same dirty
+// set always yields the same aggregate, and a single flipped bit flips the
+// result.
+//
+// When verify=true the target is read back per-chunk after each successful
+// Pwrite and hash-compared before the chunk is counted as written. This
+// catches not only network/compression corruption but also a target qemu-nbd
+// that acknowledged the write yet stored the wrong bytes (e.g., backing-file
+// mis-attach). It costs one extra target Pread per chunk — roughly 1.5× copy
+// time on a fast link — so it is off by default and intended for periodic
+// deep checks (nightly) rather than every incremental.
+func CopyExtentsTCPWithChecksum(ctx context.Context, srcHost string, srcPort int, srcExport string, dstHost string, dstPort int, extents []Extent, ioDepth int, algo checksum.Algo, verify bool) (writtenBytes uint64, stats CopyStats, err error) {
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return 0, CopyStats{}, err
+	}
+	// Validate algo early so a typo fails before opening connections,
+	// mirroring how copyAndCommit validates flags in cmd/vmsync.
+	if algo != checksum.AlgoNone {
+		if _, perr := checksum.Parse(string(algo)); perr != nil {
+			return 0, CopyStats{}, perr
+		}
+		algo = checksum.Resolve(algo)
 	}
 	src, err := nbd.Create()
 	if err != nil {
-		return 0, fmt.Errorf("create source nbd handle: %w", err)
+		return 0, CopyStats{}, fmt.Errorf("create source nbd handle: %w", err)
 	}
 	defer src.Close()
 
 	dst, err := nbd.Create()
 	if err != nil {
-		return 0, fmt.Errorf("create target nbd handle: %w", err)
+		return 0, CopyStats{}, fmt.Errorf("create target nbd handle: %w", err)
 	}
 	defer dst.Close()
 
 	if srcExport != "" {
 		if err := src.SetExportName(srcExport); err != nil {
-			return 0, fmt.Errorf("set source export name %s: %w", srcExport, err)
+			return 0, CopyStats{}, fmt.Errorf("set source export name %s: %w", srcExport, err)
 		}
 	}
 	if err := src.ConnectTcp(srcHost, strconv.Itoa(srcPort)); err != nil {
-		return 0, fmt.Errorf("connect source nbd tcp %s:%d: %w", srcHost, srcPort, err)
+		return 0, CopyStats{}, fmt.Errorf("connect source nbd tcp %s:%d: %w", srcHost, srcPort, err)
 	}
 
 	if err := dst.ConnectTcp(dstHost, strconv.Itoa(dstPort)); err != nil {
-		return 0, fmt.Errorf("connect target nbd tcp %s:%d: %w", dstHost, dstPort, err)
+		return 0, CopyStats{}, fmt.Errorf("connect target nbd tcp %s:%d: %w", dstHost, dstPort, err)
 	}
 
 	buffer_size := negotiateBufferSize(src, dst, "src", "dst")
+
+	// Separate handle for per-chunk verify re-reads (when -checksum-verify is set)
+	// to avoid interfering with the pipeline's own AIO state on dst.
+	var vrfy *nbd.Libnbd
+	if verify && algo != checksum.AlgoNone {
+		vh, err := nbd.Create()
+		if err != nil {
+			return 0, CopyStats{}, fmt.Errorf("create verify nbd handle: %w", err)
+		}
+		// No export name for target (whole disk)
+		if err := vh.ConnectTcp(dstHost, strconv.Itoa(dstPort)); err != nil {
+			vh.Close()
+			return 0, CopyStats{}, fmt.Errorf("connect verify target nbd tcp %s:%d: %w", dstHost, dstPort, err)
+		}
+		vrfy = vh
+		defer vrfy.Close()
+	}
 
 	totalBytes := uint64(0)
 	for _, ex := range extents {
@@ -340,6 +408,14 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 		}
 	}
 
+	var digest hash.Hash64
+	if algo != checksum.AlgoNone {
+		if h, herr := checksum.New(algo); herr == nil {
+			digest = h
+			stats.Algo = algo
+		}
+	}
+
 	start := time.Now()
 	lastLog := start
 	lastProgress := start
@@ -362,14 +438,19 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 		slotWriting
 	)
 	type slot struct {
-		state  int
-		buf    nbd.AioBuffer
-		offset uint64
-		length uint64
-		cookie uint64
-		opErr  int
+		state    int
+		buf      nbd.AioBuffer
+		offset   uint64
+		length   uint64
+		cookie   uint64
+		opErr    int
+		chunkIdx int
 	}
 	slots := make([]slot, pipelineDepth)
+	// chunkHashes holds per-chunk hash for deterministic aggregate
+	// (offset order, not completion order). Indexed by chunks[] index.
+	chunkHashes := make([]uint64, len(chunks))
+	chunkHashed := make([]bool, len(chunks))
 
 	nextChunk := 0
 	reading, writing := 0, 0
@@ -424,12 +505,14 @@ copyLoop:
 				continue
 			}
 			c := chunks[nextChunk]
+			chunkIdx := nextChunk
 			nextChunk++
 			idx := i
 			slots[idx].buf = nbd.MakeAioBuffer(uint(c.length))
 			slots[idx].offset = c.offset
 			slots[idx].length = c.length
 			slots[idx].opErr = 0
+			slots[idx].chunkIdx = chunkIdx
 			cookie, err := src.AioPread(slots[idx].buf, c.offset, &nbd.AioPreadOptargs{
 				CompletionCallbackSet: true,
 				CompletionCallback: func(errp *int) int {
@@ -489,6 +572,13 @@ copyLoop:
 				copyErr = fmt.Errorf("source nbd pread offset=%d len=%d: errno %d", slots[i].offset, slots[i].length, slots[i].opErr)
 				break copyLoop
 			}
+			// Inline checksum: hash source bytes before they go to the target.
+			// Stored per-chunk by index for deterministic final aggregate
+			// (completion order is non-deterministic under pipelining).
+			if algo != checksum.AlgoNone && slots[i].chunkIdx >= 0 && slots[i].chunkIdx < len(chunkHashes) {
+				chunkHashes[slots[i].chunkIdx] = checksum.HashBytes(algo, slots[i].buf.Slice())
+				chunkHashed[slots[i].chunkIdx] = true
+			}
 			idx := i
 			slots[idx].opErr = 0
 			cookie, err := dst.AioPwrite(slots[idx].buf, slots[idx].offset, &nbd.AioPwriteOptargs{
@@ -537,6 +627,76 @@ copyLoop:
 				slots[i].state = slotFree
 				copyErr = fmt.Errorf("target nbd pwrite offset=%d len=%d: errno %d", slots[i].offset, slots[i].length, slots[i].opErr)
 				break copyLoop
+			}
+			// Per-chunk verify (when -checksum-verify is set): re-read same
+			// chunk from target via separate handle and compare hash before
+			// counting it. Catches corruption before the chunk is considered
+			// durable, failing fast on first bad chunk rather than single
+			// final at end.
+			if verify && algo != checksum.AlgoNone && vrfy != nil {
+				vbuf := nbd.MakeAioBuffer(uint(slots[i].length))
+				var vOpErr int
+				// Use AioPread with callback to capture remote errno, same
+				// pattern as main pipeline.
+				idxV := i // capture for closure
+				_ = idxV
+				cookieV, errV := vrfy.AioPread(vbuf, slots[i].offset, &nbd.AioPreadOptargs{
+					CompletionCallbackSet: true,
+					CompletionCallback: func(errp *int) int {
+						if errp != nil {
+							vOpErr = *errp
+						}
+						return 0
+					},
+				})
+				if errV != nil {
+					vbuf.Free()
+					slots[i].buf.Free()
+					slots[i].state = slotFree
+					copyErr = fmt.Errorf("verify re-read aio_pread offset=%d len=%d: %w", slots[i].offset, slots[i].length, errV)
+					break copyLoop
+				}
+				// Poll until completed
+				for {
+					doneV, errV2 := vrfy.AioCommandCompleted(cookieV)
+					if errV2 != nil {
+						vbuf.Free()
+						slots[i].buf.Free()
+						slots[i].state = slotFree
+						copyErr = fmt.Errorf("verify aio check offset=%d: %w", slots[i].offset, errV2)
+						break copyLoop
+					}
+					if doneV {
+						break
+					}
+					if _, err := vrfy.Poll(10); err != nil {
+						vbuf.Free()
+						slots[i].buf.Free()
+						slots[i].state = slotFree
+						copyErr = fmt.Errorf("verify poll offset=%d: %w", slots[i].offset, err)
+						break copyLoop
+					}
+				}
+				if copyErr != nil {
+					vbuf.Free()
+					break copyLoop
+				}
+				if vOpErr != 0 {
+					vbuf.Free()
+					slots[i].buf.Free()
+					slots[i].state = slotFree
+					copyErr = fmt.Errorf("verify pread offset=%d len=%d: errno %d", slots[i].offset, slots[i].length, vOpErr)
+					break copyLoop
+				}
+				targetHash := checksum.HashBytes(algo, vbuf.Slice())
+				vbuf.Free()
+				sourceHash := chunkHashes[slots[i].chunkIdx]
+				if targetHash != sourceHash {
+					slots[i].buf.Free()
+					slots[i].state = slotFree
+					copyErr = fmt.Errorf("checksum mismatch per-chunk at offset=%d len=%d: source %016x target %016x algo %s", slots[i].offset, slots[i].length, sourceHash, targetHash, string(algo))
+					break copyLoop
+				}
 			}
 			slots[i].buf.Free()
 			slots[i].state = slotFree
@@ -618,20 +778,250 @@ copyLoop:
 		dst.Poll(10)
 	}
 
+	// Deterministic aggregate: fold per-chunk hashes in chunk offset order
+	// into the streaming digest, so the same disk content always yields the
+	// same final value regardless of pipeline completion order.
+	if digest != nil {
+		for i := range chunkHashes {
+			if !chunkHashed[i] {
+				continue
+			}
+			var b [8]byte
+			h := chunkHashes[i]
+			b[0] = byte(h)
+			b[1] = byte(h >> 8)
+			b[2] = byte(h >> 16)
+			b[3] = byte(h >> 24)
+			b[4] = byte(h >> 32)
+			b[5] = byte(h >> 40)
+			b[6] = byte(h >> 48)
+			b[7] = byte(h >> 56)
+			_, _ = digest.Write(b[:])
+		}
+		stats.Checksum = digest.Sum64()
+	}
+	stats.WrittenBytes = writtenBytes
+
 	if copyErr != nil {
-		return writtenBytes, copyErr
+		// Even on failure, stats carries partial checksum for metrics/audit.
+		if digest != nil {
+			trace.Info("nbd copy failed (partial checksum)", "written_bytes", writtenBytes, "device", srcExport, "algo", string(algo), "checksum", fmt.Sprintf("%016x", stats.Checksum))
+		}
+		return writtenBytes, stats, copyErr
 	}
 
 	if err := dst.Flush(nil); err != nil {
-		return writtenBytes, fmt.Errorf("flush target nbd: %w", err)
+		return writtenBytes, stats, fmt.Errorf("flush target nbd: %w", err)
 	}
 	elapsed := time.Since(start)
 	avgMibPerSec := 0.0
 	if elapsed.Seconds() > 0 {
 		avgMibPerSec = (float64(writtenBytes) / (1024.0 * 1024.0)) / elapsed.Seconds()
 	}
-	trace.Info("nbd copy complete", "written_bytes", writtenBytes, "device", srcExport, "elapsed", elapsed.Round(time.Millisecond).String(), "avg_mib_per_sec", fmt.Sprintf("%.2f", avgMibPerSec))
-	return writtenBytes, nil
+	if algo != checksum.AlgoNone {
+		trace.Info("nbd copy complete", "written_bytes", writtenBytes, "device", srcExport, "elapsed", elapsed.Round(time.Millisecond).String(), "avg_mib_per_sec", fmt.Sprintf("%.2f", avgMibPerSec), "algo", string(algo), "checksum", fmt.Sprintf("%016x", stats.Checksum))
+	} else {
+		trace.Info("nbd copy complete", "written_bytes", writtenBytes, "device", srcExport, "elapsed", elapsed.Round(time.Millisecond).String(), "avg_mib_per_sec", fmt.Sprintf("%.2f", avgMibPerSec))
+	}
+
+	// Per-chunk verify already validated each chunk inline via re-read
+	// on the verify handle; just mark verified. Single-final bridge hash
+	// verification (for -checksum without -checksum-verify) is done outside
+	// this function in copyAndCommit via local vs remote bridge hash files.
+	if verify && algo != checksum.AlgoNone {
+		stats.Verified = true
+		trace.Info("checksum verify passed (per-chunk)", "device", srcExport, "algo", string(algo), "checksum", fmt.Sprintf("%016x", stats.Checksum))
+	}
+
+	return writtenBytes, stats, nil
+}
+
+// StreamChecksumTCP computes a streaming checksum over the given extents
+// (or the whole image when extents is nil/empty) via NBD Pread, using the
+// same buffer-negotiation and pipelined AIO depth as CopyExtentsTCP. The
+// result is deterministic for the same extent set and algo — it hashes dirty
+// ranges in offset order, so it matches CopyStats.Checksum for an identical
+// copy. Used for post-copy verify re-read and for auditing existing images.
+func StreamChecksumTCP(ctx context.Context, host string, port int, exportName string, extents []Extent, algo checksum.Algo) (uint64, error) {
+	if algo == checksum.AlgoNone {
+		return 0, fmt.Errorf("checksum algo not set")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	h, err := checksum.New(algo)
+	if err != nil {
+		return 0, err
+	}
+	conn, err := nbd.Create()
+	if err != nil {
+		return 0, fmt.Errorf("create nbd handle: %w", err)
+	}
+	defer conn.Close()
+	if exportName != "" {
+		if err := conn.SetExportName(exportName); err != nil {
+			return 0, fmt.Errorf("set export name %s: %w", exportName, err)
+		}
+	}
+	if err := conn.ConnectTcp(host, strconv.Itoa(port)); err != nil {
+		return 0, fmt.Errorf("connect nbd tcp %s:%d: %w", host, port, err)
+	}
+	// When extents is nil we hash the whole image — size derived from NBD.
+	// When extents is provided we hash exactly those dirty ranges, same as
+	// CopyExtentsTCP's chunk list, so the two are comparable. For whole-image
+	// mode extents==nil we fall back to one extent covering [0,size).
+	if len(extents) == 0 {
+		size, err := conn.GetSize()
+		if err != nil {
+			return 0, fmt.Errorf("nbd get size: %w", err)
+		}
+		extents = []Extent{{Offset: 0, Length: size, Dirty: true}}
+	}
+	// Negotiate buffer size against a single handle — use defaultMaxBufferSize
+	// as the peer maximum for the other side since there's no second handle.
+	// Clamped same as CopyExtentsTCP.
+	var bufferSize uint64 = defaultMaxBufferSize
+	if max, err := conn.GetBlockSize(nbd.SIZE_MAXIMUM); err == nil && max > 0 {
+		bufferSize = clampBufferSize(max, maxNegotiatedBufferSize)
+	}
+	type chkChunk struct {
+		offset uint64
+		length uint64
+		idx    int
+	}
+	var chunks []chkChunk
+	for _, ex := range extents {
+		if !ex.Dirty || ex.Length == 0 {
+			continue
+		}
+		remaining := ex.Length
+		cur := ex.Offset
+		for remaining > 0 {
+			step := bufferSize
+			if remaining < step {
+				step = remaining
+			}
+			chunks = append(chunks, chkChunk{offset: cur, length: step, idx: len(chunks)})
+			cur += step
+			remaining -= step
+		}
+	}
+	if len(chunks) == 0 {
+		return h.Sum64(), nil
+	}
+	perChunk := make([]uint64, len(chunks))
+	const chkSlots = 8
+	type slot struct {
+		buf      nbd.AioBuffer
+		offset   uint64
+		length   uint64
+		cookie   uint64
+		opErr    int
+		chunkIdx int
+		state    int
+	}
+	const sFree, sPending = 0, 1
+	slots := make([]slot, chkSlots)
+	next := 0
+	pending := 0
+	lastProgress := time.Now()
+	var readErr error
+readLoop:
+	for next < len(chunks) || pending > 0 {
+		select {
+		case <-ctx.Done():
+			readErr = fmt.Errorf("checksum read cancelled: %w", ctx.Err())
+			break readLoop
+		default:
+		}
+		if stalled(lastProgress, time.Now(), noProgressTimeout) {
+			readErr = fmt.Errorf("checksum read stalled: no read completed in over %s", noProgressTimeout)
+			break readLoop
+		}
+		for i := range slots {
+			if slots[i].state != sFree || next >= len(chunks) {
+				continue
+			}
+			c := chunks[next]
+			next++
+			idx := i
+			slots[idx].buf = nbd.MakeAioBuffer(uint(c.length))
+			slots[idx].offset = c.offset
+			slots[idx].length = c.length
+			slots[idx].chunkIdx = c.idx
+			slots[idx].opErr = 0
+			cookie, err := conn.AioPread(slots[idx].buf, c.offset, &nbd.AioPreadOptargs{
+				CompletionCallbackSet: true,
+				CompletionCallback: func(errp *int) int {
+					if errp != nil {
+						slots[idx].opErr = *errp
+					}
+					return 0
+				},
+			})
+			if err != nil {
+				slots[idx].buf.Free()
+				readErr = fmt.Errorf("checksum aio_pread offset=%d len=%d: %w", c.offset, c.length, err)
+				break readLoop
+			}
+			slots[idx].cookie = cookie
+			slots[idx].state = sPending
+			pending++
+		}
+		if pending > 0 {
+			if _, err := conn.Poll(10); err != nil {
+				readErr = fmt.Errorf("checksum poll: %w", err)
+				break readLoop
+			}
+		}
+		for i := range slots {
+			if slots[i].state != sPending {
+				continue
+			}
+			done, err := conn.AioCommandCompleted(slots[i].cookie)
+			if err != nil {
+				readErr = fmt.Errorf("checksum aio check offset=%d: %w", slots[i].offset, err)
+				break readLoop
+			}
+			if !done {
+				continue
+			}
+			lastProgress = time.Now()
+			pending--
+			if slots[i].opErr != 0 {
+				errno := slots[i].opErr
+				slots[i].buf.Free()
+				slots[i].state = sFree
+				readErr = fmt.Errorf("checksum pread offset=%d len=%d: errno %d", slots[i].offset, slots[i].length, errno)
+				break readLoop
+			}
+			perChunk[slots[i].chunkIdx] = checksum.HashBytes(algo, slots[i].buf.Slice())
+			slots[i].buf.Free()
+			slots[i].state = sFree
+		}
+	}
+	for i := range slots {
+		if slots[i].state != sFree {
+			slots[i].buf.Free()
+		}
+	}
+	if readErr != nil {
+		return 0, readErr
+	}
+	// Fold per-chunk hashes in offset order (chunks already in that order).
+	for _, ch := range perChunk {
+		var b [8]byte
+		b[0] = byte(ch)
+		b[1] = byte(ch >> 8)
+		b[2] = byte(ch >> 16)
+		b[3] = byte(ch >> 24)
+		b[4] = byte(ch >> 32)
+		b[5] = byte(ch >> 40)
+		b[6] = byte(ch >> 48)
+		b[7] = byte(ch >> 56)
+		_, _ = h.Write(b[:])
+	}
+	return h.Sum64(), nil
 }
 
 // CompareTCP does a full, byte-for-byte comparison of two NBD exports (a and

@@ -20,12 +20,15 @@ package nbdbridge
 import (
 	"context"
 	"fmt"
+	"hash"
+	"io"
 	"net"
 	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
 
+	"vmsync/pkg/checksum"
 	"vmsync/pkg/remotessh"
 	"vmsync/pkg/trace"
 	"vmsync/pkg/zstdrelay"
@@ -38,6 +41,14 @@ import (
 type ByteCounters struct {
 	Sent     uint64
 	Received uint64
+	// checksum fields hold rolling hashes of plaintext NBD bytes when
+	// -checksum is active. Separate hashes per direction avoid
+	// non-deterministic interleaving — both directions together would share
+	// one hash with concurrent writes whose order depends on scheduler.
+	checksumAlgo checksum.Algo
+	outHash      hash.Hash64
+	inHash       hash.Hash64
+	checksumMu   sync.Mutex
 }
 
 // SentSnapshot atomically reads the total bytes sent over the wire so far.
@@ -49,6 +60,68 @@ func (b *ByteCounters) SentSnapshot() uint64 {
 // so far.
 func (b *ByteCounters) ReceivedSnapshot() uint64 {
 	return atomic.LoadUint64(&b.Received)
+}
+
+// ChecksumValue returns the final rolling hash (0 if checksum was disabled).
+// Combined deterministically from both directions so the same NBD session
+// always yields same value regardless of goroutine scheduling.
+func (b *ByteCounters) ChecksumValue() uint64 {
+	if b == nil || (b.outHash == nil && b.inHash == nil) {
+		return 0
+	}
+	b.checksumMu.Lock()
+	defer b.checksumMu.Unlock()
+	var out, in uint64
+	if b.outHash != nil {
+		out = b.outHash.Sum64()
+	}
+	if b.inHash != nil {
+		in = b.inHash.Sum64()
+	}
+	// Deterministic combine: xor with rotate to avoid trivial cancellation
+	// when both directions happen to hash to same value (e.g., empty).
+	return out ^ (in<<1 | in>>63) ^ 0x9e3779b97f4a7c15
+}
+
+// ChecksumAlgo returns the resolved algo used for this bridge ("" if disabled).
+func (b *ByteCounters) ChecksumAlgo() string {
+	if b == nil {
+		return ""
+	}
+	return string(b.checksumAlgo)
+}
+
+// hashingReader wraps an io.Reader and feeds every byte read into h.
+type hashingReader struct {
+	R io.Reader
+	H hash.Hash
+	M *sync.Mutex
+}
+
+func (h *hashingReader) Read(p []byte) (int, error) {
+	n, err := h.R.Read(p)
+	if n > 0 && h.H != nil {
+		h.M.Lock()
+		_, _ = h.H.Write(p[:n])
+		h.M.Unlock()
+	}
+	return n, err
+}
+
+// hashingWriter wraps an io.Writer and feeds every byte written into h.
+type hashingWriter struct {
+	W io.Writer
+	H hash.Hash
+	M *sync.Mutex
+}
+
+func (h *hashingWriter) Write(p []byte) (int, error) {
+	if h.H != nil && len(p) > 0 {
+		h.M.Lock()
+		_, _ = h.H.Write(p)
+		h.M.Unlock()
+	}
+	return h.W.Write(p)
 }
 
 // recoverRelayPanic runs fn, converting any panic into a returned error
@@ -100,6 +173,16 @@ func StartLocal(ctx context.Context, sshClient *remotessh.Client, remoteBridgeAd
 	}
 
 	counters = &ByteCounters{}
+	if cfg.ChecksumEnabled() {
+		algo := cfg.ResolvedChecksum()
+		if h1, herr := checksum.New(algo); herr == nil {
+			if h2, herr2 := checksum.New(algo); herr2 == nil {
+				counters.checksumAlgo = algo
+				counters.outHash = h1
+				counters.inHash = h2
+			}
+		}
+	}
 	var wg sync.WaitGroup
 	var closeOnce sync.Once
 	stopFn := func() error {
@@ -177,10 +260,17 @@ func relayConnection(conn net.Conn, sshClient *remotessh.Client, remoteBridgeAdd
 	}
 
 	// conn (plaintext, from the local NBD client) -> [compress+flush] -> [buffer] -> remote (wire, over SSH)
+	// When checksum is enabled each direction hashes to its own rolling
+	// hash to avoid non-deterministic interleaving — both directions share
+	// the same mutex only for final combination in ChecksumValue().
+	plainReader := io.Reader(conn)
+	if counters.outHash != nil {
+		plainReader = &hashingReader{R: conn, H: counters.outHash, M: &counters.checksumMu}
+	}
 	go func() {
 		defer relayWg.Done()
 		reportErr(recoverRelayPanic("outbound relay (conn -> remote)", func() error {
-			err := zstdrelay.Relay(remote, conn, cfg.Compress, algo, cfg.CompressLevel, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Sent)
+			err := zstdrelay.Relay(remote, plainReader, cfg.Compress, algo, cfg.CompressLevel, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Sent)
 			// Half-close the SSH channel once we're done sending, mirroring what
 			// cmd/vmsync-bridge-helper does on its own outbound direction
 			// (tc.CloseWrite() after its stdin hits EOF). Without this, nothing
@@ -199,10 +289,14 @@ func relayConnection(conn net.Conn, sshClient *remotessh.Client, remoteBridgeAdd
 		}))
 	}()
 	// remote (wire, over SSH) -> [buffer] -> [decompress] -> conn (plaintext, to the local NBD client)
+	plainWriter := io.Writer(conn)
+	if counters.inHash != nil {
+		plainWriter = &hashingWriter{W: conn, H: counters.inHash, M: &counters.checksumMu}
+	}
 	go func() {
 		defer relayWg.Done()
 		reportErr(recoverRelayPanic("inbound relay (remote -> conn)", func() error {
-			err := zstdrelay.RelayFromWire(conn, remote, cfg.Compress, algo, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Received)
+			err := zstdrelay.RelayFromWire(plainWriter, remote, cfg.Compress, algo, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Received)
 			// Half-close conn once remote is done sending, mirroring the
 			// outbound goroutine's own remote.CloseWrite() above (and
 			// cmd/vmsync-bridge-helper's matching inbound leg). Without

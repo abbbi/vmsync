@@ -35,6 +35,7 @@ import (
 	"syscall"
 	"time"
 
+	"vmsync/pkg/checksum"
 	"vmsync/pkg/disk"
 	"vmsync/pkg/failover"
 	"vmsync/pkg/libvirtsync"
@@ -190,6 +191,17 @@ type syncConfig struct {
 	// qemu does not run as root, so an unowned-for disk is one a promoted
 	// domain may be unable to open.
 	TargetDiskOwner string
+	// Checksum enables the fast inline data integrity hash (P0.4). crc32c is
+	// hardware-accelerated (SSE4.2/PCLMUL); xxhash is pure-Go and fastest on
+	// hosts without CRC offload. "auto" (default) picks hw if present else
+	// xxhash; use "off"/"false" to disable. When enabled the rolling hash
+	// is sent once at end and verified before the target file is merged —
+	// aborting and deleting the temp overlay on mismatch. Without
+	// -compress/-netbuffer (no zstdrelay) checksumming is not allowed and
+	// auto silently disables.
+	Checksum         string
+	ChecksumExplicit bool
+	ChecksumVerify   bool
 
 	SourceURI      string
 	TargetURI      string
@@ -308,6 +320,9 @@ func main() {
 	flag.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/local/bin/vmsync-bridge-helper", "Remote path to the vmsync-bridge-helper binary. Defaults to /usr/local/bin")
 	flag.BoolVar(&cfg.UseSSH, "use-ssh", false, "When --compress/--netbuffer is set, route the bridged NBD traffic through the existing SSH connection as an encrypted tunnel")
 	flag.IntVar(&cfg.IODepth, "io-depth", 8, "Number of NBD read/write pairs to keep in flight simultaneously during the disk copy, defaults to 8")
+	checksumArg := optionalValueFlag{bareDefault: "crc32c", value: string(checksum.AlgoAuto)}
+	flag.Var(&checksumArg, "checksum", "Fast rolling checksum over dirty bytes (single final hash, not per-chunk). Default \"auto\" (crc32c if hw CRC present — SSE4.2/PCLMUL on amd64, CRC32 on arm64 — otherwise xxhash). Hash is sent once after all chunks and verified on the target before the temp overlay is merged; mismatch aborts that disk, deletes the temp file, and fails the sync with no commit. Requires -compress and/or -netbuffer (zstdrelay) — without a relay auto silently disables; explicit \"-checksum=crc32c|xxhash\" with no relay errors. Bare -checksum is \"crc32c\", \"-checksum=off|false|none\" disables")
+	flag.BoolVar(&cfg.ChecksumVerify, "checksum-verify", false, "Kept for compatibility — -checksum already does single final rolling-hash verify (abort before merge) when a relay is active. This flag currently aliases the same single-final verify; a future per-chunk mode may use it to enable earlier detection")
 	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write sync metrics to this path in Prometheus textfile-collector format. Name should be something like /var/lib/node_exporter/textfile_collector/vmsync_[vmname].prom")
 	flag.BoolVar(&cfg.IgnoreExternalSnapshot, "ignore-external-snapshot", false, "If the source domain currently has any external disk snapshot, skip this run entirely")
 	flag.StringVar(&cfg.Verify, "verify", "", "After syncing, verify target matches source for every disk. Accepts compare|fast|online. See documentation for details. (compare|fast suspend the source domain, online does not)")
@@ -329,6 +344,7 @@ func main() {
 	cfg.FenceSource = fenceSourceArg.value
 	cfg.Compress = compressArg.value
 	cfg.NetBuffer = netBufferArg.value
+	cfg.Checksum = checksumArg.value
 
 	// A flag.Var flag whose Value implements IsBoolFlag (both -compress and
 	// -netbuffer, here) never consumes a following space-separated argument
@@ -341,7 +357,7 @@ func main() {
 	// mistake -- fail loudly instead of silently ignoring whatever came
 	// after them.
 	if flag.NArg() > 0 {
-		trace.Error("invalid command line", "error", fmt.Errorf("unexpected extra argument(s) %v -- if you meant to pass a value to -compress or -netbuffer, use -compress=value / -netbuffer=value (with an \"=\"), not a space", flag.Args()))
+		trace.Error("invalid command line", "error", fmt.Errorf("unexpected extra argument(s) %v -- if you meant to pass a value to -compress, -netbuffer or -checksum, use -flag=value (with an \"=\"), not a space", flag.Args()))
 		os.Exit(2)
 	}
 
@@ -350,11 +366,16 @@ func main() {
 	// ("3") -- needed below to swap in s2's own default ("better") instead
 	// when -compress=s2 and the user didn't ask for a specific level.
 	compressLevelExplicit := false
+	checksumExplicit := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "compress-level" {
 			compressLevelExplicit = true
 		}
+		if f.Name == "checksum" {
+			checksumExplicit = true
+		}
 	})
+	cfg.ChecksumExplicit = checksumExplicit
 
 	if cfg.ShowVersion {
 		trace.Info(fmt.Sprintf("vmsync Version: %s", version.Version))
@@ -573,6 +594,17 @@ func main() {
 	default:
 		trace.Error("invalid verify configuration", "error", fmt.Errorf("-verify must be \"compare\", \"fast\", or \"online\" (or omitted to disable verification), got %q", cfg.Verify))
 		os.Exit(2)
+	}
+	if _, err := checksum.Parse(cfg.Checksum); err != nil {
+		trace.Error("invalid -checksum", "error", err)
+		os.Exit(2)
+	}
+	if cfg.ChecksumVerify {
+		if a, _ := checksum.Parse(cfg.Checksum); a == checksum.AlgoNone {
+			trace.Error("invalid -checksum-verify", "error", fmt.Errorf("-checksum-verify requires -checksum to be enabled (got %q)", cfg.Checksum))
+			os.Exit(2)
+		}
+	}
 	}
 
 	trace.SetDebug(cfg.Debug)
@@ -1338,6 +1370,7 @@ func run(cfg syncConfig) (runErr error) {
 		NetBufferSize:  netbufferSize,
 		HelperPath:     cfg.BridgeHelperPath,
 		UseSSH:         cfg.UseSSH,
+		Checksum:       cfg.Checksum,
 	}
 	if err := nbdbridge.CheckLocal(bridgeCfg); err != nil {
 		return err
@@ -1352,6 +1385,27 @@ func run(cfg syncConfig) (runErr error) {
 			if uriHost := util.HostFromURIOrLocal(cfg.TargetURI); cfg.TargetNBDHost != uriHost {
 				return fmt.Errorf("--compress/--netbuffer require --target-nbd-host to match the host in --target-uri (got %s, expected %s): the remote bridge only forwards to 127.0.0.1 on that same host", cfg.TargetNBDHost, uriHost)
 			}
+		}
+	}
+	// Rolling checksum is only meaningful over zstdrelay — without
+	// -compress/-netbuffer there is no relay to hash and verify, and the
+	// cheap "send final hash once, abort before merge" path cannot be used.
+	// Default auto silently disables in that case; explicit -checksum with no
+	// relay is an error so the operator knows why their requested checksum
+	// is not happening.
+	if a, _ := checksum.Parse(cfg.Checksum); a != checksum.AlgoNone {
+		if !bridgeCfg.Enabled() {
+			if cfg.ChecksumExplicit {
+				return fmt.Errorf("-checksum=%q requires -compress and/or -netbuffer (zstdrelay): without a relay there is no rolling hash to verify and the cheap single-hash abort path cannot be used — add -compress or use -checksum=off to disable", cfg.Checksum)
+			}
+			trace.Warning("checksum=auto requested but no zstdrelay bridge active — checksum disabled (checksum=off): rolling hash verification requires -compress and/or -netbuffer (zstdrelay); run with -compress or add -checksum=off to silence", "requested", cfg.Checksum)
+			cfg.Checksum = "off"
+			bridgeCfg.Checksum = "off"
+		} else {
+			// Log resolved algo for operator visibility; Resolve picks hw.
+			resolved := checksum.Resolve(a)
+			trace.Info("checksum enabled", "requested", cfg.Checksum, "resolved", string(resolved), "hardware_accelerated", checksum.IsHardwareAccelerated())
+			bridgeCfg.Checksum = cfg.Checksum
 		}
 	}
 
@@ -2762,7 +2816,7 @@ func run(cfg syncConfig) (runErr error) {
 	// syncDisk's defer) and -verify=online's two-phase path (duration =
 	// copy only, recorded right after copyAndCommit -- see its own doc
 	// comment for why) don't each carry their own copy of it.
-	recordDiskMetric := func(d disk.QcowDisk, diskSize, writtenBytes uint64, targetBridgeCounters *nbdbridge.ByteCounters, duration time.Duration) {
+	recordDiskMetric := func(d disk.QcowDisk, diskSize, writtenBytes uint64, targetBridgeCounters *nbdbridge.ByteCounters, duration time.Duration, checksumAlgo string, checksumValue uint64, checksumVerified bool) {
 		if cfg.PrometheusTextfile == "" {
 			return
 		}
@@ -2786,6 +2840,9 @@ func run(cfg syncConfig) (runErr error) {
 			TransferredBytes:           writtenBytes,
 			CompressedTransferredBytes: compressedBytes,
 			DurationSeconds:            duration.Seconds(),
+			ChecksumAlgo:               checksumAlgo,
+			ChecksumValue:              checksumValue,
+			ChecksumVerified:           checksumVerified,
 		})
 		metricsMu.Unlock()
 	}
@@ -2801,6 +2858,9 @@ func run(cfg syncConfig) (runErr error) {
 		targetPath           string
 		diskSize             uint64
 		writtenBytes         uint64
+		checksumAlgo         string
+		checksumValue        uint64
+		checksumVerified     bool
 		targetBridgeCounters *nbdbridge.ByteCounters
 	}
 
@@ -2935,6 +2995,12 @@ func run(cfg syncConfig) (runErr error) {
 			// so the bridge ports lay out right after them, as one contiguous
 			// block [TargetNBDPort+N, TargetNBDPort+2N).
 			targetBridgePort := targetPort + len(qcowDisks)
+			// Pre-clean stale rolling-hash file from previous run on same port
+			// so a `cat` after the new copy cannot return old hash before the
+			// helper has overwritten it. Best-effort.
+			if bridgeCfg.ChecksumEnabled() {
+				_, _ = targetSSHClient.Run(ctx, "rm -f "+util.ShQuote(fmt.Sprintf("/run/vmsync-bridge/checksum-%d.hash", targetBridgePort)))
+			}
 			bridgeStopCmd, err := nbdbridge.StartRemote(ctx, targetSSHClient, targetBridgePort, targetPort, bridgeCfg)
 			if err != nil {
 				return res, fmt.Errorf("start target nbd bridge for %s: %w", d.TargetDev, err)
@@ -2963,9 +3029,92 @@ func run(cfg syncConfig) (runErr error) {
 		}
 
 		trace.Info("copy extents to remote target", "extents", len(extents), "path", targetPath, "disk_size", res.diskSize)
-		res.writtenBytes, err = nbdsync.CopyExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, effectiveTargetHost, effectiveTargetPort, extents, cfg.IODepth)
+		ckAlgo, _ := checksum.Parse(cfg.Checksum)
+		ckAlgo = checksum.Resolve(ckAlgo)
+		// Rolling checksum: single final hash over dirty bytes (cheap audit)
+		// plus bridge hash verification when a relay is active. The bridge
+		// hash is of the plaintext NBD stream (both directions) computed
+		// inline in zstdrelay — no extra disk read. Verified once after all
+		// chunks, before the temp overlay is merged, so a mismatch aborts
+		// and deletes the temp file with no bad commit.
+		var copyStats nbdsync.CopyStats
+		res.writtenBytes, copyStats, err = nbdsync.CopyExtentsTCPWithChecksum(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, effectiveTargetHost, effectiveTargetPort, extents, cfg.IODepth, ckAlgo, false)
+		res.checksumAlgo = string(copyStats.Algo)
+		res.checksumValue = copyStats.Checksum
+		res.checksumVerified = copyStats.Verified
 		if err != nil {
+			// Rolling checksum (single final hash) failed or any copy error:
+			// target data is already on disk but not yet merged — delete the
+			// temp overlay so a half-written image is never committed. For
+			// full sync the base itself is half-written. Best-effort: do not
+			// mask the original copy error.
+			if incrementalMode && targetPathInc != "" {
+				_, _ = targetSSHClient.Run(ctx, "rm -f "+util.ShQuote(targetPathInc))
+			} else if targetPath != "" && !incrementalMode {
+				// Full sync with reinit already handled old file via rename;
+				// this new file is corrupt — remove it.
+				_, _ = targetSSHClient.Run(ctx, "rm -f "+util.ShQuote(targetPath))
+			}
+			// Stop the export that was holding the file, best-effort.
+			_, _ = targetSSHClient.Run(ctx, stopCmd)
 			return res, err
+		}
+
+		// Bridge rolling hash verification: single final hash, abort before merge.
+		// Hash is of the plaintext NBD stream computed inline in zstdrelay on
+		// both sides (no extra disk read). Remote helper writes
+		// /run/vmsync-bridge/checksum-<port>.hash after connection close.
+		if ckAlgo != checksum.AlgoNone && bridgeCfg.ChecksumEnabled() && res.targetBridgeCounters != nil {
+			localHash := res.targetBridgeCounters.ChecksumValue()
+			tbPort := cfg.TargetNBDPort + len(qcowDisks) + i
+			remoteHashFile := fmt.Sprintf("/run/vmsync-bridge/checksum-%d.hash", tbPort)
+			var remoteHashStr string
+			for attempt := 0; attempt < 5; attempt++ {
+				out, _ := targetSSHClient.Run(ctx, "cat "+util.ShQuote(remoteHashFile)+" 2>/dev/null || true")
+				out = strings.TrimSpace(out)
+				if out != "" {
+					remoteHashStr = out
+					break
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			if remoteHashStr == "" {
+				trace.Warning("checksum enabled but remote bridge hash not found, skipping bridge verification (relying on dirty-bytes hash only) — helper may be old version without checksum support", "disk", d.TargetDev, "port", tbPort)
+			} else {
+				var remoteHex string
+				var remoteAlgo string
+				if parts := strings.SplitN(remoteHashStr, ":", 2); len(parts) == 2 {
+					remoteAlgo = strings.TrimSpace(parts[0])
+					remoteHex = strings.TrimSpace(parts[1])
+				} else {
+					remoteHex = strings.TrimSpace(remoteHashStr)
+				}
+				remoteHash, perr := strconv.ParseUint(remoteHex, 16, 64)
+				if perr != nil {
+					trace.Warning("could not parse remote bridge hash, failing verification", "disk", d.TargetDev, "remoteHashStr", remoteHashStr, "error", perr)
+					if incrementalMode && targetPathInc != "" {
+						_, _ = targetSSHClient.Run(ctx, "rm -f "+util.ShQuote(targetPathInc))
+					}
+					_, _ = targetSSHClient.Run(ctx, stopCmd)
+					return res, fmt.Errorf("checksum bridge hash parse failed for %s: %q: %w", d.TargetDev, remoteHashStr, perr)
+				}
+				if remoteAlgo != "" && remoteAlgo != string(ckAlgo) {
+					trace.Warning("remote bridge hash algo mismatch", "disk", d.TargetDev, "localAlgo", string(ckAlgo), "remoteAlgo", remoteAlgo)
+				}
+				if localHash != remoteHash {
+					trace.Error("checksum mismatch (bridge rolling hash): local vs remote differ — aborting before merge", "disk", d.TargetDev, "local", fmt.Sprintf("%016x", localHash), "remote", fmt.Sprintf("%016x", remoteHash), "algo", string(ckAlgo))
+					if incrementalMode && targetPathInc != "" {
+						_, _ = targetSSHClient.Run(ctx, "rm -f "+util.ShQuote(targetPathInc))
+					} else if targetPath != "" && !incrementalMode {
+						_, _ = targetSSHClient.Run(ctx, "rm -f "+util.ShQuote(targetPath))
+					}
+					_, _ = targetSSHClient.Run(ctx, stopCmd)
+					return res, fmt.Errorf("checksum mismatch (bridge) for %s: local %016x remote %016x algo %s — data corrupted in transit (zstdrelay), temp file deleted, no commit", d.TargetDev, localHash, remoteHash, string(ckAlgo))
+				}
+				trace.Info("bridge checksum verified", "disk", d.TargetDev, "algo", string(ckAlgo), "hash", fmt.Sprintf("%016x", localHash))
+				res.checksumVerified = true
+				_, _ = targetSSHClient.Run(ctx, "rm -f "+util.ShQuote(remoteHashFile))
+			}
 		}
 
 		if res.targetBridgeCounters != nil {
@@ -3191,7 +3340,7 @@ func run(cfg syncConfig) (runErr error) {
 			// res's fields simply stay at their zero value if the sync
 			// failed before reaching the step that would have set them.
 			defer func() {
-				recordDiskMetric(d, res.diskSize, res.writtenBytes, res.targetBridgeCounters, time.Since(diskStart))
+				recordDiskMetric(d, res.diskSize, res.writtenBytes, res.targetBridgeCounters, time.Since(diskStart), res.checksumAlgo, res.checksumValue, res.checksumVerified)
 			}()
 		}
 		res, err = copyAndCommit(i, d)
@@ -3204,6 +3353,10 @@ func run(cfg syncConfig) (runErr error) {
 		// found is recorded on the sidecar instead.
 		if err := rp.take(ctx, util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)); err != nil {
 			return err
+		}
+		// Record checksum for restore-point sidecar when -checksum is enabled.
+		if res.checksumAlgo != "" {
+			rp.addDiskChecksum(d.TargetDev, res.checksumAlgo, res.checksumValue)
 		}
 		if cfg.Verify != "" {
 			return runVerify(i, d, res, verifyWindow{})
@@ -3241,7 +3394,7 @@ func run(cfg syncConfig) (runErr error) {
 				diskStart := time.Now()
 				res, err := copyAndCommit(i, d)
 				phase1Results[i] = res // each goroutine only ever writes index i -- no race
-				recordDiskMetric(d, res.diskSize, res.writtenBytes, res.targetBridgeCounters, time.Since(diskStart))
+				recordDiskMetric(d, res.diskSize, res.writtenBytes, res.targetBridgeCounters, time.Since(diskStart), res.checksumAlgo, res.checksumValue, res.checksumVerified)
 				if err != nil {
 					reportWorkerErr(err)
 					return
@@ -3251,6 +3404,8 @@ func run(cfg syncConfig) (runErr error) {
 				// rp.take is safe to call from several goroutines at once.
 				if err := rp.take(ctx, util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)); err != nil {
 					reportWorkerErr(err)
+				} else if res.checksumAlgo != "" {
+					rp.addDiskChecksum(d.TargetDev, res.checksumAlgo, res.checksumValue)
 				}
 			}()
 		}
