@@ -123,6 +123,10 @@ func runPromote(ctx context.Context, cfg syncConfig) error {
 		// written afterwards. This is what turns "planned failover" from a
 		// claim into a measurement.
 		SourceStoppedAtSync: st.SourceStoppedAtSync,
+		// Changes nothing about whether this promotion is allowed; it changes
+		// what the plan SAYS about the window, which on a rolled-back replica
+		// is the age of a copy somebody chose rather than replication lag.
+		RestoredFrom: st.RestoredFrom,
 	}, failover.PromoteOptions{
 		Mode:    mode,
 		Start:   cfg.Start,

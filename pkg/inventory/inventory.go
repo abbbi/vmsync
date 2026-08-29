@@ -104,6 +104,16 @@ type Domain struct {
 	LastReplicatedAtUnix int64  `json:"last_replicated_at_unix,omitempty"`
 	LastReplicatedTo     string `json:"last_replicated_to,omitempty"`
 
+	// The restore record: this replica's disks were rolled back to one of
+	// its restore points rather than being what the last sync copied.
+	//
+	// Reported because it is the only thing that survives a promotion to
+	// explain an unusually wide data-loss window. Every other signal is
+	// ambiguous with an ordinary lagging replica.
+	RestoredFrom   string `json:"restored_from,omitempty"`
+	RestoredAtUnix int64  `json:"restored_at_unix,omitempty"`
+	RestoredBy     string `json:"restored_by,omitempty"`
+
 	// Disks is what this domain occupies on this host's storage. Reported
 	// so an operator can answer "is there room to keep the old copy?"
 	// before an inversion, rather than after the disk fills.
@@ -378,9 +388,16 @@ func describe(dom *libvirt.Domain) (Domain, error) {
 	d.ReplicaSource, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldReplicaSource)
 	d.PromotedFrom, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldPromotedFrom)
 	d.LastReplicatedTo, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldLastReplicatedTo)
+	d.RestoredFrom, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldRestoredFrom)
+	d.RestoredBy, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldRestoredBy)
 	if raw, err := libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldLastReplicatedAt); err == nil && raw != "" {
 		if n, convErr := strconv.ParseInt(raw, 10, 64); convErr == nil {
 			d.LastReplicatedAtUnix = n
+		}
+	}
+	if raw, err := libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldRestoredAt); err == nil && raw != "" {
+		if n, convErr := strconv.ParseInt(raw, 10, 64); convErr == nil {
+			d.RestoredAtUnix = n
 		}
 	}
 	d.PromotedBy, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldPromotedBy)

@@ -85,6 +85,9 @@ func TestRestorePointFieldNamesMatch(t *testing.T) {
 		{MetadataFieldCheckpointAt, restorepoint.FieldCheckpointAt, "checkpoint_at"},
 		{MetadataFieldSourceStoppedAtSync, restorepoint.FieldSourceStoppedAtSync, "source_stopped_at_sync"},
 		{MetadataFieldReplicationRole, restorepoint.FieldReplicationRole, "replication_role"},
+		{MetadataFieldRestoredFrom, restorepoint.FieldRestoredFrom, "restored_from"},
+		{MetadataFieldRestoredAt, restorepoint.FieldRestoredAt, "restored_at"},
+		{MetadataFieldRestoredBy, restorepoint.FieldRestoredBy, "restored_by"},
 	} {
 		if c.mine != c.theirs {
 			t.Errorf("%s: libvirtsync says %q, pkg/restorepoint says %q", c.what, c.mine, c.theirs)

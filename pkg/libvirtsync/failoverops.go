@@ -47,6 +47,9 @@ type FailoverState struct {
 	// SourceStoppedAtSync: the source was already shut off when this
 	// replica's checkpoint was taken, so nothing was written after it.
 	SourceStoppedAtSync bool
+	// RestoredFrom is the restore point this replica's disks were rolled
+	// back to, empty for a replica that was never restored.
+	RestoredFrom string
 	// Fence is the shutdown a promotion armed against its displaced source.
 	// Zero on every domain that was never promoted, and on every promotion
 	// that did not ask for one -- a drill, for instance.
@@ -94,6 +97,7 @@ func ReadFailoverState(mgr *Manager, domainName string) (FailoverState, error) {
 	if v, err := ParseMetadata(domXML, MetadataFieldSourceStoppedAtSync); err == nil && v != "" {
 		st.SourceStoppedAtSync = true
 	}
+	st.RestoredFrom, _ = ParseMetadata(domXML, MetadataFieldRestoredFrom)
 
 	st.Fence.ID, _ = ParseMetadata(domXML, MetadataFieldFenceID)
 	st.Fence.Source, _ = ParseMetadata(domXML, MetadataFieldFenceSource)

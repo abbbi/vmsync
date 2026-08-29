@@ -177,10 +177,34 @@ const (
 	FieldCheckpointAt        = "checkpoint_at"
 	FieldSourceStoppedAtSync = "source_stopped_at_sync"
 	FieldReplicationRole     = "replication_role"
+	FieldRestoredFrom        = "restored_from"
+	FieldRestoredAt          = "restored_at"
+	FieldRestoredBy          = "restored_by"
 )
 
 // RolePausedValue is libvirtsync.RolePaused, duplicated for the same reason.
 const RolePausedValue = "paused"
+
+// Provenance is what a restore records about ITSELF, as opposed to what it
+// records about the contents it put back.
+//
+// Separate from Status because the two answer different questions and come
+// from different places: Status is read off the restore point's own sidecar
+// and describes the copy, while this describes the act -- which point, when,
+// and at whose instruction. An operator reading a promoted domain later needs
+// both, and neither can be derived from the other.
+type Provenance struct {
+	// Tag identifies the restore point the contents came from.
+	Tag string
+	// AtUnix is when the rollback was performed, NOT when the copy was
+	// taken. The gap between the two is exactly the thing an incident
+	// timeline is trying to establish.
+	AtUnix int64
+	// By is whoever asked for it, empty when nobody said. Carried for the
+	// same reason promoted_by is: a control plane's audit log does not
+	// survive losing the control plane, and this does.
+	By string
+}
 
 // MetadataPlan is what a restore writes onto the replica's domain metadata,
 // derived from the restore point's own sidecar.
@@ -240,14 +264,32 @@ const RolePausedValue = "paused"
 // one blocks promotion), replica_targets, last_replicated_at/to (they describe
 // a life as a SOURCE), and the promotion and fence records (an audit trail of a
 // failover that rolling a disk back does not undo).
-func MetadataPlan(s Status) (updates map[string]string, removals []string) {
+func MetadataPlan(s Status, r Provenance) (updates map[string]string, removals []string) {
 	updates = map[string]string{
 		FieldFailureCount:    "0",
 		FieldReplicationRole: RolePausedValue,
 	}
+	// The restore record. Written here rather than by the caller so that
+	// rolling the disks back and saying so are one metadata write: a restore
+	// that landed without its provenance would be exactly the state nothing
+	// downstream can recognise afterwards.
+	if r.Tag != "" {
+		updates[FieldRestoredFrom] = r.Tag
+	}
+	if r.AtUnix > 0 {
+		updates[FieldRestoredAt] = strconv.FormatInt(r.AtUnix, 10)
+	}
+	if r.By != "" {
+		updates[FieldRestoredBy] = r.By
+	} else {
+		// Removed rather than left: a restore with no attribution must not
+		// inherit whoever performed the LAST one, which is what a stale
+		// value on a domain restored twice would mean.
+		removals = append(removals, FieldRestoredBy)
+	}
 	// Always: the sidecar cannot attest it, and a stale one is a verified
 	// zero-data-loss promotion of rolled-back data.
-	removals = []string{FieldSourceStoppedAtSync}
+	removals = append(removals, FieldSourceStoppedAtSync)
 
 	if s.Checkpoint != "" {
 		updates[FieldLastCheckpoint] = s.Checkpoint

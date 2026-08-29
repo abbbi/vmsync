@@ -218,7 +218,7 @@ func fullStatus() Status {
 }
 
 func TestMetadataPlanDescribesTheRestoredPoint(t *testing.T) {
-	updates, removals := MetadataPlan(fullStatus())
+	updates, removals := MetadataPlan(fullStatus(), testProvenance())
 
 	for field, want := range map[string]string{
 		FieldLastCheckpoint:  "vmsync-cpt-000042",
@@ -242,7 +242,7 @@ func TestMetadataPlanKeepsTheReplicaPromotable(t *testing.T) {
 	// last_sync_timestamp, and a non-zero failure_count. Promoting the
 	// restored replica is the entire reason anyone restores, so a plan that
 	// cleared these would make the feature defeat itself.
-	updates, removals := MetadataPlan(fullStatus())
+	updates, removals := MetadataPlan(fullStatus(), testProvenance())
 	for _, f := range []string{FieldLastCheckpoint, FieldLastSync} {
 		if updates[f] == "" {
 			t.Errorf("%s is not set; an empty one blocks promotion", f)
@@ -260,7 +260,7 @@ func TestMetadataPlanPausesReplication(t *testing.T) {
 	// The field that makes the rest safe. Without it the next scheduled sync
 	// overwrites the restored data with exactly what the operator rolled away
 	// from -- and under -reinit-after-failures it does so unattended.
-	updates, removals := MetadataPlan(fullStatus())
+	updates, removals := MetadataPlan(fullStatus(), testProvenance())
 	if updates[FieldReplicationRole] != RolePausedValue {
 		t.Fatalf("replication_role = %q, want %q", updates[FieldReplicationRole], RolePausedValue)
 	}
@@ -274,7 +274,7 @@ func TestMetadataPlanNeverTouchesFieldsThatDoNotDescribeDiskContent(t *testing.T
 	// promotion; replica_targets and last_replicated_* describe a life as a
 	// SOURCE; the promotion and fence records are an audit trail of a failover
 	// that rolling a disk back does not undo.
-	updates, removals := MetadataPlan(fullStatus())
+	updates, removals := MetadataPlan(fullStatus(), testProvenance())
 	for _, f := range []string{
 		"replica_source", "replica_targets", "last_replicated_at", "last_replicated_to",
 		"promoted_at", "promoted_by", "promoted_from", "promotion_mode",
@@ -293,7 +293,7 @@ func TestMetadataPlanRemovesWhatAnOldSidecarCannotSupply(t *testing.T) {
 	// A sidecar written before checkpoint_at existed, or by a run whose
 	// checkpoint chain could not advance. Guessing a value would be worse than
 	// having none: checkpoint_at is what a promotion measures data loss from.
-	updates, removals := MetadataPlan(Status{Disks: []string{"vm.qcow2"}})
+	updates, removals := MetadataPlan(Status{Disks: []string{"vm.qcow2"}}, testProvenance())
 	for _, f := range []string{FieldLastCheckpoint, FieldLastSync, FieldCheckpointAt} {
 		if _, ok := updates[f]; ok {
 			t.Errorf("%s was invented from an empty sidecar: %q", f, updates[f])
@@ -317,7 +317,7 @@ func TestMetadataPlanNeverSetsAndRemovesTheSameField(t *testing.T) {
 		"no checkpoint_at": {Checkpoint: "c", TakenAt: 1, Disks: []string{"d"}},
 		"no checkpoint":    {CheckpointAt: 1, TakenAt: 1, Disks: []string{"d"}},
 	} {
-		updates, removals := MetadataPlan(s)
+		updates, removals := MetadataPlan(s, testProvenance())
 		for _, r := range removals {
 			if _, ok := updates[r]; ok {
 				t.Errorf("%s: %s is both set and removed", name, r)
@@ -333,4 +333,61 @@ func contains(hay []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+func testProvenance() Provenance {
+	return Provenance{Tag: "1756041600-vmsync-cpt-000042", AtUnix: 1756900000, By: "alice"}
+}
+
+// The restore record is what makes a rolled-back replica recognisable AFTER it
+// has been promoted -- at which point role=paused has been overwritten and
+// every other signal is ambiguous with an ordinary lagging replica.
+func TestMetadataPlanRecordsItsOwnProvenance(t *testing.T) {
+	updates, _ := MetadataPlan(fullStatus(), testProvenance())
+
+	for field, want := range map[string]string{
+		FieldRestoredFrom: "1756041600-vmsync-cpt-000042",
+		FieldRestoredAt:   "1756900000",
+		FieldRestoredBy:   "alice",
+	} {
+		if got := updates[field]; got != want {
+			t.Errorf("updates[%s] = %q, want %q", field, got, want)
+		}
+	}
+
+	// restored_at is when the ROLLBACK happened, not when the copy was taken.
+	// The gap between the two is the thing an incident timeline is trying to
+	// establish, so conflating them would defeat the point of recording it.
+	if updates[FieldRestoredAt] == updates[FieldCheckpointAt] || updates[FieldRestoredAt] == updates[FieldLastSync] {
+		t.Error("restored_at duplicates a field describing the copy; it must record when the rollback was performed")
+	}
+}
+
+func TestMetadataPlanClearsAStaleAttribution(t *testing.T) {
+	// A domain restored twice, the second time by an unattributed run: the
+	// first restore's actor must not be left standing as though they asked
+	// for the second.
+	p := testProvenance()
+	p.By = ""
+	updates, removals := MetadataPlan(fullStatus(), p)
+
+	if _, ok := updates[FieldRestoredBy]; ok {
+		t.Error("an unattributed restore invented a restored_by")
+	}
+	if !contains(removals, FieldRestoredBy) {
+		t.Error("restored_by must be REMOVED when nobody is named, or a previous restore's actor survives")
+	}
+	// The other two still record what happened.
+	if updates[FieldRestoredFrom] == "" || updates[FieldRestoredAt] == "" {
+		t.Error("an unattributed restore must still record which point and when")
+	}
+}
+
+func TestMetadataPlanNeverSetsAndRemovesProvenance(t *testing.T) {
+	updates, removals := MetadataPlan(fullStatus(), testProvenance())
+	for _, r := range removals {
+		if _, ok := updates[r]; ok {
+			t.Errorf("%s is both set and removed", r)
+		}
+	}
 }

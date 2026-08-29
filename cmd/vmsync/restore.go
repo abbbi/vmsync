@@ -85,6 +85,11 @@ type restorePlan struct {
 	// temps parallels disks: where each staged copy lands before the swap.
 	temps []string
 
+	// restoredBy is -restored-by, carried onto the plan so the assessment can
+	// show what would be recorded; provenance is the whole record.
+	restoredBy string
+	provenance restorepoint.Provenance
+
 	updates  map[string]string
 	removals []string
 }
@@ -106,7 +111,7 @@ func runRestoreRestorePoint(ctx context.Context, cfg syncConfig, tagName string)
 	}
 	defer tgtMgr.Close()
 
-	plan := restorePlan{tag: tag}
+	plan := restorePlan{tag: tag, restoredBy: cfg.RestoredBy}
 	if err := checkRestoreTargetState(tgtMgr, cfg, &plan); err != nil {
 		return err
 	}
@@ -399,7 +404,15 @@ func loadRestorePlan(ctx context.Context, client remoteRunner, plan *restorePlan
 		plan.asides = append(plan.asides, replica+replacedDiskSuffix+strconv.FormatInt(stamp, 10))
 		plan.temps = append(plan.temps, restorepoint.RestoreTempPath(replica, stamp))
 	}
-	plan.updates, plan.removals = restorepoint.MetadataPlan(status)
+	// The rollback's own instant, not the copy's. Fixed here rather than at
+	// the moment of the write so the assessment names exactly what the
+	// restore would record.
+	plan.provenance = restorepoint.Provenance{
+		Tag:    plan.tag.String(),
+		AtUnix: time.Now().Unix(),
+		By:     plan.restoredBy,
+	}
+	plan.updates, plan.removals = restorepoint.MetadataPlan(status, plan.provenance)
 	return nil
 }
 
@@ -463,11 +476,14 @@ var restoreFieldOrder = []string{
 	restorepoint.FieldSourceStoppedAtSync,
 	restorepoint.FieldFailureCount,
 	restorepoint.FieldReplicationRole,
+	restorepoint.FieldRestoredFrom,
+	restorepoint.FieldRestoredAt,
+	restorepoint.FieldRestoredBy,
 }
 
 func annotateRestoreField(field, value string) string {
 	switch field {
-	case restorepoint.FieldCheckpointAt, restorepoint.FieldLastSync:
+	case restorepoint.FieldCheckpointAt, restorepoint.FieldLastSync, restorepoint.FieldRestoredAt:
 		if n, err := strconv.ParseInt(value, 10, 64); err == nil && n > 0 {
 			return fmt.Sprintf("%s  (%s)", value, time.Unix(n, 0).UTC().Format("2006-01-02 15:04:05 UTC"))
 		}

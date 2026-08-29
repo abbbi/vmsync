@@ -230,10 +230,16 @@ type ReportDomain struct {
 	// domain's metadata -- so without this the control plane could only ask
 	// for a restore point it has never seen. Absent on any host not using
 	// -retention, which is the ordinary case.
-	RestorePoints []ReportRestorePoint `json:"restore_points,omitempty"`
-	Status        string               `json:"status"`
-	Reasons       []string             `json:"reasons,omitempty"`
-	AgeSeconds    int64                `json:"age_seconds"`
+	// The restore record: this replica's disks were rolled back to one of
+	// its restore points. Survives a promotion, and is the only thing that
+	// then explains an unusually wide data-loss window.
+	RestoredFrom   string               `json:"restored_from,omitempty"`
+	RestoredAtUnix int64                `json:"restored_at_unix,omitempty"`
+	RestoredBy     string               `json:"restored_by,omitempty"`
+	RestorePoints  []ReportRestorePoint `json:"restore_points,omitempty"`
+	Status         string               `json:"status"`
+	Reasons        []string             `json:"reasons,omitempty"`
+	AgeSeconds     int64                `json:"age_seconds"`
 }
 
 // ReportRestorePoint mirrors pkg/inventory.RestorePointInfo on the wire.

@@ -279,12 +279,20 @@ func operationArgs(cfg agentConfig, schedule []ScheduleEntry, op Operation) ([]s
 		// a request that reports success having done nothing at all. The
 		// assessment step is not lost: it moves to the UI, which must show
 		// what the restore would do before anyone can issue this.
-		return []string{
+		args := []string{
 			"-restore-restore-point", op.Tag,
 			"-force-restore",
 			"-target-uri", cfg.LibvirtURI,
 			"-target-domain", op.VM,
-		}, nil
+		}
+		if op.CreatedBy != "" {
+			// Recorded on the domain, exactly as -promoted-by is. Without it
+			// a rollback issued from a browser leaves the control plane's
+			// audit log as the only record of who chose it -- and that log is
+			// on the machine most likely to be unreachable when somebody asks.
+			args = append(args, "-restored-by", op.CreatedBy)
+		}
+		return args, nil
 
 	case OpReinit:
 		// A one-shot full resync, as its own operation rather than a flag on

@@ -181,6 +181,11 @@ type syncConfig struct {
 	// production replica while deciding.
 	RestoreRestorePoint string
 	ForceRestore        bool
+	// RestoredBy is whoever asked for the rollback, recorded on the domain.
+	// The counterpart of -promoted-by, and there for the same reason: an
+	// audit log in a control plane does not survive losing the control
+	// plane, and domain metadata does.
+	RestoredBy string
 	// TestFault names a failure to inject into this run, or "" in every real
 	// one. See libvirtsync.TestFault for why this exists and why it is a flag
 	// rather than an environment variable.
@@ -298,6 +303,7 @@ func main() {
 	flag.StringVar(&cfg.CloneRestorePointTo, "clone-to", "", "Directory on the target to write -clone-restore-point's copies into. Created if missing")
 	flag.StringVar(&cfg.RestoreRestorePoint, "restore-restore-point", "", "Put one restore point back over the replica IN PLACE, discarding its current contents. Takes a tag from -list-restore-points. -target-disk-path is optional here (unlike the read-only verbs): a restore needs the target domain to exist, so where its disks are is read from the domain itself. Without -force-restore this only prints an assessment and changes nothing. A restore is for promoting: it leaves replication PAUSED, because the next sync from the same source would otherwise overwrite exactly what was rolled back to")
 	flag.BoolVar(&cfg.ForceRestore, "force-restore", false, "Carry out -restore-restore-point instead of only assessing it. Required, because a restore replaces the replica's disks and cannot be undone once the displaced contents are removed")
+	flag.StringVar(&cfg.RestoredBy, "restored-by", "", "Who asked for the rollback, recorded on the domain as restored_by. The counterpart of -promoted-by: a promoted domain's data-loss window says how far back its contents are, but only this says somebody chose to put them there")
 	flag.StringVar(&cfg.TestFault, "test", "", fmt.Sprintf("FOR TESTING ONLY: make vmsync deliberately fail at a chosen point, so error-recovery paths that cannot be reached from outside the process can be exercised. Accepts one of: %s. A run with this set WILL fail and its result means nothing as a replication. Listed here rather than hidden, so an operator who finds it in a log can look it up", strings.Join(libvirtsync.TestFaults, ", ")))
 	compressArg := optionalValueFlag{bareDefault: "s2"}
 	fenceSourceArg := optionalValueFlag{bareDefault: fenceSourceAuto}

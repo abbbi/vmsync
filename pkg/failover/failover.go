@@ -84,6 +84,16 @@ type TargetState struct {
 	OverlayPresent bool
 	// SyncInFlight means a sync is writing this target right now.
 	SyncInFlight bool
+	// RestoredFrom is the restore point this replica's disks were rolled
+	// back to, empty for the overwhelming majority of replicas.
+	//
+	// It changes nothing about whether a promotion is allowed -- a rolled
+	// back replica is a perfectly promotable one, which is the entire point
+	// of restoring. What it changes is the EXPLANATION offered alongside the
+	// data-loss window: without it, a wide window on a planned failover is
+	// reported as a missing final sync, and an operator goes looking for one
+	// that never went missing.
+	RestoredFrom string
 	// Active is the domain's current runtime state.
 	Active bool
 	// SourceStoppedAtSync records that the SOURCE domain was already shut
@@ -252,9 +262,20 @@ func AssessPromote(st TargetState, opt PromoteOptions) (PromotePlan, error) {
 	// because the final sync was skipped -- and the operator is told rather
 	// than left with a figure that quietly means something else.
 	if opt.Mode == ModePlanned && !plan.DataLoss.Verified {
-		plan.Notes = append(plan.Notes,
-			"this was requested as a planned failover, but the replica's checkpoint was taken while the source was still running: "+
-				"no final sync ran after the source stopped, so the window below is measured against the clock and covers writes that were never replicated")
+		// A rolled-back replica reaches here too, and the note above would
+		// misdescribe it: the final sync may well have run: what makes the
+		// window wide is that somebody deliberately replaced these contents
+		// with an older copy. Same conclusion, different cause, and an
+		// operator sent looking for a missing sync would not find one.
+		if st.RestoredFrom != "" {
+			plan.Notes = append(plan.Notes,
+				"this replica's disks were rolled back to restore point "+st.RestoredFrom+
+					", so the window below is the age of THAT copy rather than replication lag -- everything written since it was taken is being given up deliberately")
+		} else {
+			plan.Notes = append(plan.Notes,
+				"this was requested as a planned failover, but the replica's checkpoint was taken while the source was still running: "+
+					"no final sync ran after the source stopped, so the window below is measured against the clock and covers writes that were never replicated")
+		}
 	}
 	return plan, nil
 }

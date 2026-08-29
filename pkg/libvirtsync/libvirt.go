@@ -218,6 +218,32 @@ const (
 	// window, so it is recorded rather than inferred.
 	MetadataFieldPromotionMode = "promotion_mode"
 
+	// The restore record: this domain's disks were rolled back to one of its
+	// restore points, rather than being what the last sync copied.
+	//
+	// Written together by a restore and never inferred, because every
+	// indirect signal for it is ambiguous. An old checkpoint_at looks exactly
+	// like a lagging replica; failure_count=0 is what a clean sync writes;
+	// and replication_role=paused is overwritten by the very promotion that
+	// most needs this recorded. Without these fields an operator looking at a
+	// promoted domain six months later cannot learn that its contents were
+	// deliberately rolled back before it was promoted -- only that its
+	// data-loss window was unusually wide, which is a symptom and not an
+	// explanation.
+	//
+	// They are the counterpart of the promotion record, and they are here for
+	// the same reason it is: in domain metadata rather than only in a control
+	// plane's audit log, so the answer survives losing the control plane.
+	//
+	// Cleared by the next successful sync, without being named in
+	// UpdateSyncMetadata's removal list: that function rebuilds the target's
+	// metadata from the SOURCE's XML, so a target-only field it does not set
+	// simply does not survive -- and a replica that has just been fully
+	// recopied is, correctly, no longer a restored one.
+	MetadataFieldRestoredFrom = "restored_from"
+	MetadataFieldRestoredAt   = "restored_at"
+	MetadataFieldRestoredBy   = "restored_by"
+
 	// MetadataFieldCheckpointAt is when the checkpoint the replica's
 	// contents correspond to was created -- the START of the copy that
 	// produced them, not its end.
@@ -330,6 +356,9 @@ var metadataFieldOrder = []string{
 	MetadataFieldPromotionMode,
 	MetadataFieldCheckpointAt,
 	MetadataFieldSourceStoppedAtSync,
+	MetadataFieldRestoredFrom,
+	MetadataFieldRestoredAt,
+	MetadataFieldRestoredBy,
 	MetadataFieldLastReplicatedAt,
 	MetadataFieldLastReplicatedTo,
 	MetadataFieldFenceID,
