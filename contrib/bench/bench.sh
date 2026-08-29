@@ -61,12 +61,15 @@ Options:
   -s, --scenarios FILE    transport matrix file (default: ./scenarios.conf)
   --only PATTERN          only run Stage 1 scenarios whose name matches
                            PATTERN (a bash glob, e.g. "compress-zstd-*")
-  --stages LIST           comma-separated subset of: matrix,verify,verify-long,
-                           reinit,snapshot,define,failover,fence-agent,retention,
-						   restore,invert
-                           -- runs in
-                           whichever order LIST gives them, not a fixed
-                           canonical order
+  --stages LIST           comma-separated subset of, in stage-number order:
+                             1  matrix        6  failover
+                             2  verify        7  fence-agent
+                             3  reinit        8  verify-long
+                             4  snapshot      9  retention
+                             5  define       10  restore
+                                             11  invert
+                           Runs in whichever order LIST gives them, not a
+                           fixed canonical one.
                            (default: matrix,verify,reinit,snapshot,retention;
                            retention is last because it reinitialises the
                            target, and it skips cleanly where the target
@@ -77,10 +80,10 @@ Options:
                            (no ssh/qemu-io/vmsync calls actually made)
   -h, --help              this text
 
-Stages 2, 3, and 4 each start with their own baseline -reinit full sync,
-so none of them actually require Stage 1 (or any prior sync) to have run
-first -- each is safe to run standalone via --stages. Stage 4 additionally
-requires the SOURCE domain to be running.
+Stages 2, 3, 4, 9, 10 and 11 each start with their own baseline -reinit full
+sync, so none of them actually require Stage 1 (or any prior sync) to have
+run first -- each is safe to run standalone via --stages. Stage 4
+additionally requires the SOURCE domain to be running.
 
 Stage 5 (define) is NOT included by default -- pass --stages ...,define
 explicitly. Its first half (5a) leaves a throwaway domain on the target
@@ -90,13 +93,6 @@ rollback to the previous definition can be checked. Both are no more
 destructive to the target VM than -reinit already is, and neither touches
 host-level networking any more, but they are deliberate failure injection
 rather than measurement. See this file's own Stage 5 comment.
-
-Stage 7 (fence-agent) is opt-in too, and is the most intrusive thing here:
-it STOPS THE SOURCE VM. It runs real vmsync-agents in --standalone mode and
-proves a fence is actually acted on, not merely written. It restores the
-source's power state and both roles afterwards (and on a crash, via an EXIT
-trap), but no other stage touches the source's power state at all. Needs
-SOURCE_AGENT_BIN and TARGET_VMSYNC_BIN.
 
 Stage 6 (failover) is also NOT included by default. It promotes the target,
 arms and inspects a fence, checks who owns the target's disks, and puts the
@@ -109,12 +105,34 @@ estate, not just this harness's. Both this stage and Stage 7 wipe vmsync's
 metadata off the domains they use before starting -- via virsh, not through
 vmsync itself, so a broken write path cannot also break the reset -- and skip
 with the exact remedy if that does not take. It needs TARGET_VMSYNC_BIN set
-in the
-config (vmsync on the TARGET host): -promote refuses a remote libvirt URI by
-design, so it must run where the domain is. Without that setting the stage
-skips rather than failing. Note it runs THREE full syncs in total: its own
-baseline plus two more the disk-ownership checks need, since each property
-they test only happens when a disk file is created from scratch.
+in the config (vmsync on the TARGET host): -promote refuses a remote libvirt
+URI by design, so it must run where the domain is. Without that setting the
+stage skips rather than failing. Note it runs THREE full syncs in total: its
+own baseline plus two more the disk-ownership checks need, since each
+property they test only happens when a disk file is created from scratch.
+
+Stage 7 (fence-agent) is opt-in too, and is the most intrusive thing here:
+it STOPS THE SOURCE VM. It runs real vmsync-agents in --standalone mode and
+proves a fence is actually acted on, not merely written. It restores the
+source's power state and both roles afterwards (and on a crash, via an EXIT
+trap). Needs SOURCE_AGENT_BIN and TARGET_VMSYNC_BIN.
+
+Stage 8 (verify-long) is opt-in and slow: it builds a replica the way a real
+deployment does -- twenty incremental syncs carrying real guest writes --
+then corrupts it part way along that chain and checks -verify still finds it.
+
+Stage 9 (retention) IS a default. It covers -retention end to end and skips
+cleanly, rather than failing, where the target filesystem cannot reflink.
+
+Stage 10 (restore) is opt-in: it rolls the replica back to a restore point
+and leaves replication paused mid-stage, clearing that and healing on the
+way out.
+
+Stage 11 (invert) is opt-in and is the OTHER stage that stops the source VM.
+It has to: -invert refuses while the old source is running, since the
+inversion would make it a replication target, and asserting that refusal is
+part of what the stage tests. It shuts the source down gracefully, never
+destroys it, and starts it again whatever happened.
 EOF
 }
 
@@ -3630,12 +3648,12 @@ stage_pattern() {
 	# is a reason nobody reads: the verdict would say "nothing recorded"
 	# rather than why the stage skipped.
 	verify) printf '^verify-(guard|compare|fast|online|precondition)$' ;;
-	verify-long) printf '^verify-long$' ;;
 	reinit) printf '^reinit-after-failures$' ;;
 	snapshot) printf '^ext-snapshot$' ;;
 	define) printf '^define-(uuid-collision|rollback|precondition)$' ;;
 	failover) printf '^failover$' ;;
 	fence-agent) printf '^fence-agent$' ;;
+	verify-long) printf '^verify-long$' ;;
 	retention) printf '^retention$' ;;
 	restore) printf '^restore$' ;;
 	invert) printf '^invert$' ;;
@@ -3940,16 +3958,16 @@ for s in "${stage_list[@]}"; do
         case "$s" in
         matrix) stage_matrix || stage_rc=$? ;;
         verify) stage_verify_tamper || stage_rc=$? ;;
-        verify-long) stage_verify_long || stage_rc=$? ;;
         reinit) stage_reinit_after_failures || stage_rc=$? ;;
         snapshot) stage_external_snapshot || stage_rc=$? ;;
         define) stage_define_domain || stage_rc=$? ;;
         failover) stage_failover || stage_rc=$? ;;
         fence-agent) stage_fence_agent || stage_rc=$? ;;
+        verify-long) stage_verify_long || stage_rc=$? ;;
         retention) stage_retention || stage_rc=$? ;;
         restore) stage_restore || stage_rc=$? ;;
         invert) stage_invert || stage_rc=$? ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,verify-long,reinit,snapshot,define,failover,fence-agent,retention,restore,invert)" ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
                 warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."

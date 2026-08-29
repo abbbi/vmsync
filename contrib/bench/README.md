@@ -78,19 +78,21 @@ vmsync itself to work at all).
 ./bench.sh --dry-run          # print every vmsync command line, touch nothing
 ./bench.sh                    # the defaults: Stage 1, then 2, 3, 4, then 9
 ./bench.sh --only 'compress-zstd-*'   # Stage 1 only, matching scenarios
-./bench.sh --stages verify    # just the verify+tamper tests
-./bench.sh --stages snapshot  # just the external-snapshot lifecycle test
-./bench.sh --stages retention # just the restore-point tests
-./bench.sh --stages restore   # + Stage 10: putting a restore point back, opt-in
-./bench.sh --stages matrix,verify,reinit,snapshot,retention,define  # + Stage 5, opt-in
-./bench.sh --stages failover  # just the DR path: promotion, fencing, the way back
-./bench.sh --stages fence-agent  # + real agents; STOPS THE SOURCE VM, see below
+./bench.sh --stages verify       # 2  just the verify+tamper tests
+./bench.sh --stages snapshot     # 4  just the external-snapshot lifecycle test
+./bench.sh --stages define       # 5  opt-in: deliberate DefineDomain failures
+./bench.sh --stages failover     # 6  opt-in: the DR path — promotion, fencing, the way back
+./bench.sh --stages fence-agent  # 7  opt-in: real agents; STOPS THE SOURCE VM, see below
+./bench.sh --stages verify-long  # 8  opt-in: a 20-deep chain, then tamper and verify
+./bench.sh --stages retention    # 9  just the restore-point tests
+./bench.sh --stages restore      # 10 opt-in: putting a restore point back
+./bench.sh --stages invert       # 11 opt-in: reversing a pair; STOPS THE SOURCE VM
 ```
 
-Stage 2, Stage 3, Stage 4, and Stage 9 each run their own baseline
-`-reinit` full sync before anything else, so none of them actually depend
-on Stage 1(or any prior sync) having run first — each is safe to run
-standalone via `--stages`. This matters for more than just the "full vs incremental"
+Stages 2, 3, 4, 9, 10 and 11 each run their own baseline `-reinit` full
+sync before anything else, so none of them actually depend on Stage 1 (or
+any prior sync) having run first — each is safe to run standalone via
+`--stages`. This matters for more than just the "full vs incremental"
 distinction in their own pass/fail checks: Stage 3 specifically needs a
 target domain that already exists, since `-reinit-after-failures`'s
 counter lives in the target's own domain metadata and vmsync treats
@@ -264,144 +266,6 @@ tamper smaller than one granule can be swallowed whole by an unrelated guest
 write and read as "verify missed it".
 
 Set `TAMPER_MODE=fixed` to go back to a single `TAMPER_OFFSET`/`TAMPER_LENGTH`.
-
-### Stage 9 (`retention`), default
-
-Covers `-retention` end to end against a real target. It skips cleanly, rather
-than failing, when the target filesystem cannot reflink — the same refusal
-vmsync itself gives. That clean skip is why it can be a default stage: a target
-on ext4 records SKIP and the run continues, so nobody has to know in advance
-whether their storage supports the feature.
-
-It runs last of the defaults because it `-reinit`s the target several times
-over.
-
-Most of it is counting directories, but two checks earn their place:
-
-**It measures the space a restore point actually consumed.** A restore point
-that was a full byte-for-byte copy would pass every other check here — the
-directory would exist, the disk would be there, it would boot. It would simply
-cost a whole replica per copy instead of sharing storage with it, and nothing
-would say so. So the stage reads free space (`df`, never `du` — see above)
-either side of a sync and fails if taking a restore point cost more than a
-tenth of the replica.
-
-**It checks that inspecting a restore point changes nothing.** `last_checkpoint`
-is read before `-list-restore-points` and `-clone-restore-point` and again
-after, and must be identical. If inspecting a copy moved it, the next
-incremental sync would write its delta onto the wrong baseline — which looks
-like a clean sync right up until a promotion. That is the phase 1 thesis stated
-as an assertion.
-
-The rest: the interval is honoured, pruning keeps the configured count and
-drops the oldest first, the sidecar records a verify state, the clone is a
-readable qcow2, and an operator `-reinit` sweeps the set.
-
-Uses `-retention=N,0` — a zero interval means every sync — so the stage does
-not have to sleep for hours to prove retention works.
-
-### Stage 10 (`restore`), opt-in
-
-Stage 9 proves restore points get taken. Stage 10 proves one can be put back,
-with `-restore-restore-point`.
-
-It takes two restore points with real guest writes between them, so the two
-genuinely differ, and then compares files byte for byte (`cmp` on the target,
-never `du`-style inference) to establish that a rollback actually happened
-rather than that a command exited 0.
-
-**The check that earns the stage is the last one.** A restore rolls the
-replica's contents backwards while the source's checkpoint chain marches on,
-and nothing in vmsync's incremental path looks at disk content — it compares a
-checkpoint *name*. A restore that failed to invalidate the target's
-replication metadata would leave the next scheduled sync applying the source's
-newest delta onto rolled-back data, exiting 0, with green metrics, looking
-exactly like a healthy run. So the stage runs a real sync afterwards and
-asserts both that it **refused** and that the restored bytes are **still on
-disk** when it did.
-
-The rest: the assessment (no `-force-restore`) changes neither the replica nor
-its metadata; a restore is refused on a domain marked `promoted`; the metadata
-afterwards names the restored point's checkpoint and `checkpoint_at`, has
-`source_stopped_at_sync` cleared and `replication_role=paused`; the three
-fields `pkg/failover` reads as promotion evidence are all still satisfied
-(clearing them would make the feature defeat its own purpose); the displaced
-contents are kept and match what the replica held; and restoring consumes
-neither restore point, so a first choice that turns out to be wrong can be
-followed by a second.
-
-Why it is opt-in: it is new, and it deliberately leaves the target paused
-mid-stage. It clears that and heals with a `-reinit` on the way out — via
-`clear_target_role`, which falls back to `virsh` if `vmsync -update-role`
-itself is broken, because every later stage syncs into that target and all of
-them are refused while it stays paused.
-
-### Stage 8 (`verify-long`), opt-in
-
-Every other stage verifies a replica built moments ago by a single
-`-reinit`. Stage 8 builds one the way a real deployment does — twenty
-incremental syncs, each carrying real guest writes — and corrupts it **part
-way through**, so the copies that follow run over the damage.
-
-Two things about the shape are deliberate.
-
-**Each mode gets its own full chain.** Healing after a tamper has to be a
-full `-reinit` — an incremental sync re-copies only what the *source's*
-dirty bitmap says changed, and the source never wrote to the corrupted
-region — and that destroys the chain. So a single chain followed by several
-tamper/verify attempts would test a deep chain exactly once and a one-deep
-chain every time after, while reporting all of them as though they had
-tested the same thing. Three modes therefore means three chains.
-
-**The corruption lands after a random copy, not after the last one.** Bit
-rot does not wait for a sync window to close. Injecting it mid-chain asks a
-question the end-of-chain version cannot: does the damage survive the
-incremental syncs that follow it, and is it still detectable afterwards?
-
-That opens one legitimate outcome that is neither pass nor fail. If the
-guest happened to write to the same region the corruption sat in, a later
-incremental copy overwrote it — correctly, by design — and there is nothing
-left for `-verify` to find. Scoring that as "verify missed it" would be a
-false accusation against the code under test, and it is not a rare corner:
-`GUEST_DIRTY` rewrites the same file every round, so its blocks are exactly
-the ones most likely to be re-copied. The harness therefore re-reads the
-corrupted region immediately before verifying, and records **SKIP —
-corruption healed by a later copy** when it is gone.
-
-It needs the guest to write between copies, or the chain is twenty no-ops
-against an empty dirty bitmap and the stage proves nothing. There is no
-`virsh` verb for running a command inside a guest, so this goes through the
-QEMU guest agent's `guest-exec` RPC. **Two separate things must hold**: the
-agent must be responding — vmsync's own `FSFreeze` already needs that — *and*
-`guest-exec` must not be blocked. RHEL-family packages ship
-`/etc/sysconfig/qemu-ga` with `guest-exec` and `guest-file-*` in `BLOCK_RPCS`
-by default, so an agent that happily freezes filesystems will still refuse to
-run `dd`. The harness probes `guest-info` for this and **skips the stage**
-with a message naming the file, rather than spending an hour proving that
-vmsync can copy nothing twenty times.
-
-Two details that would otherwise make the chain meaningless: the write uses
-`conv=fsync`, because the dirty bitmap tracks writes that reach the virtual
-block device and a `dd` whose data is still in the guest's page cache leaves
-it empty; and the harness polls `guest-exec-status` until the write has
-exited, because `guest-exec` returns a pid immediately and the next
-checkpoint would otherwise be taken mid-write. The stage asserts that the
-chain actually carried data, and fails if none of the copies transferred a
-byte.
-
-Budget for it: roughly `VERIFY_LONG_MODES × (VERIFY_LONG_COPIES + 1)` syncs
-plus one final heal — 64 with the defaults, four of them full resyncs. Trim
-`VERIFY_LONG_MODES` to a single mode if that is too much for one sitting.
-
-Disk space is the other budget. `REPLACED_DISK_ACTION` defaults to `delete`
-here, unlike vmsync itself, which defaults to `rename`: vmsync is right to
-keep the old copy, because a `-reinit` target may be a former primary whose
-disks still hold everything written since the last successful sync. That
-does not apply to the disposable VM this harness requires, and the aside
-copies are never reaped — so on a multi-GB disk, reinitting once per verify
-sub-test and four more times in Stage 8 would fill `TARGET_DISK_PATH`
-partway through a run and surface as a confusing mid-stage sync failure.
-Set it back to `rename` if you would rather keep every replaced copy.
 
 **Stage 3 (`-reinit-after-failures`)** first runs its own baseline full
 sync, then removes the target domain's own vmsync metadata
@@ -649,6 +513,203 @@ pointing at a local `qemu:///system`, say), set `SOURCE_LOCAL=yes` in
 `SOURCE_HOST` (removing the leftover overlay file after `blockcommit`)
 run locally instead of over SSH, so no SSH access to the source host is
 needed at all in that setup.
+
+### Stage 8 (`verify-long`), opt-in
+
+Every other stage verifies a replica built moments ago by a single
+`-reinit`. Stage 8 builds one the way a real deployment does — twenty
+incremental syncs, each carrying real guest writes — and corrupts it **part
+way through**, so the copies that follow run over the damage.
+
+Two things about the shape are deliberate.
+
+**Each mode gets its own full chain.** Healing after a tamper has to be a
+full `-reinit` — an incremental sync re-copies only what the *source's*
+dirty bitmap says changed, and the source never wrote to the corrupted
+region — and that destroys the chain. So a single chain followed by several
+tamper/verify attempts would test a deep chain exactly once and a one-deep
+chain every time after, while reporting all of them as though they had
+tested the same thing. Three modes therefore means three chains.
+
+**The corruption lands after a random copy, not after the last one.** Bit
+rot does not wait for a sync window to close. Injecting it mid-chain asks a
+question the end-of-chain version cannot: does the damage survive the
+incremental syncs that follow it, and is it still detectable afterwards?
+
+That opens one legitimate outcome that is neither pass nor fail. If the
+guest happened to write to the same region the corruption sat in, a later
+incremental copy overwrote it — correctly, by design — and there is nothing
+left for `-verify` to find. Scoring that as "verify missed it" would be a
+false accusation against the code under test, and it is not a rare corner:
+`GUEST_DIRTY` rewrites the same file every round, so its blocks are exactly
+the ones most likely to be re-copied. The harness therefore re-reads the
+corrupted region immediately before verifying, and records **SKIP —
+corruption healed by a later copy** when it is gone.
+
+It needs the guest to write between copies, or the chain is twenty no-ops
+against an empty dirty bitmap and the stage proves nothing. There is no
+`virsh` verb for running a command inside a guest, so this goes through the
+QEMU guest agent's `guest-exec` RPC. **Two separate things must hold**: the
+agent must be responding — vmsync's own `FSFreeze` already needs that — *and*
+`guest-exec` must not be blocked. RHEL-family packages ship
+`/etc/sysconfig/qemu-ga` with `guest-exec` and `guest-file-*` in `BLOCK_RPCS`
+by default, so an agent that happily freezes filesystems will still refuse to
+run `dd`. The harness probes `guest-info` for this and **skips the stage**
+with a message naming the file, rather than spending an hour proving that
+vmsync can copy nothing twenty times.
+
+Two details that would otherwise make the chain meaningless: the write uses
+`conv=fsync`, because the dirty bitmap tracks writes that reach the virtual
+block device and a `dd` whose data is still in the guest's page cache leaves
+it empty; and the harness polls `guest-exec-status` until the write has
+exited, because `guest-exec` returns a pid immediately and the next
+checkpoint would otherwise be taken mid-write. The stage asserts that the
+chain actually carried data, and fails if none of the copies transferred a
+byte.
+
+Budget for it: roughly `VERIFY_LONG_MODES × (VERIFY_LONG_COPIES + 1)` syncs
+plus one final heal — 64 with the defaults, four of them full resyncs. Trim
+`VERIFY_LONG_MODES` to a single mode if that is too much for one sitting.
+
+Disk space is the other budget. `REPLACED_DISK_ACTION` defaults to `delete`
+here, unlike vmsync itself, which defaults to `rename`: vmsync is right to
+keep the old copy, because a `-reinit` target may be a former primary whose
+disks still hold everything written since the last successful sync. That
+does not apply to the disposable VM this harness requires, and the aside
+copies are never reaped — so on a multi-GB disk, reinitting once per verify
+sub-test and four more times in Stage 8 would fill `TARGET_DISK_PATH`
+partway through a run and surface as a confusing mid-stage sync failure.
+Set it back to `rename` if you would rather keep every replaced copy.
+
+### Stage 9 (`retention`), default
+
+Covers `-retention` end to end against a real target. It skips cleanly, rather
+than failing, when the target filesystem cannot reflink — the same refusal
+vmsync itself gives. That clean skip is why it can be a default stage: a target
+on ext4 records SKIP and the run continues, so nobody has to know in advance
+whether their storage supports the feature.
+
+It runs last of the defaults because it `-reinit`s the target several times
+over.
+
+Most of it is counting directories, but two checks earn their place:
+
+**It measures the space a restore point actually consumed.** A restore point
+that was a full byte-for-byte copy would pass every other check here — the
+directory would exist, the disk would be there, it would boot. It would simply
+cost a whole replica per copy instead of sharing storage with it, and nothing
+would say so. So the stage reads free space (`df`, never `du` — see above)
+either side of a sync and fails if taking a restore point cost more than a
+tenth of the replica.
+
+**It checks that inspecting a restore point changes nothing.** `last_checkpoint`
+is read before `-list-restore-points` and `-clone-restore-point` and again
+after, and must be identical. If inspecting a copy moved it, the next
+incremental sync would write its delta onto the wrong baseline — which looks
+like a clean sync right up until a promotion. That is the phase 1 thesis stated
+as an assertion.
+
+The rest: the interval is honoured, pruning keeps the configured count and
+drops the oldest first, the sidecar records a verify state, the clone is a
+readable qcow2, and an operator `-reinit` sweeps the set.
+
+Uses `-retention=N,0` — a zero interval means every sync — so the stage does
+not have to sleep for hours to prove retention works.
+
+### Stage 10 (`restore`), opt-in
+
+Stage 9 proves restore points get taken. Stage 10 proves one can be put back,
+with `-restore-restore-point`.
+
+It takes two restore points with real guest writes between them, so the two
+genuinely differ, and then compares files byte for byte (`cmp` on the target,
+never `du`-style inference) to establish that a rollback actually happened
+rather than that a command exited 0.
+
+**The check that earns the stage is the last one.** A restore rolls the
+replica's contents backwards while the source's checkpoint chain marches on,
+and nothing in vmsync's incremental path looks at disk content — it compares a
+checkpoint *name*. A restore that failed to invalidate the target's
+replication metadata would leave the next scheduled sync applying the source's
+newest delta onto rolled-back data, exiting 0, with green metrics, looking
+exactly like a healthy run. So the stage runs a real sync afterwards and
+asserts both that it **refused** and that the restored bytes are **still on
+disk** when it did.
+
+The rest: the assessment (no `-force-restore`) changes neither the replica nor
+its metadata; a restore is refused on a domain marked `promoted`; the metadata
+afterwards names the restored point's checkpoint and `checkpoint_at`, has
+`source_stopped_at_sync` cleared and `replication_role=paused`; the three
+fields `pkg/failover` reads as promotion evidence are all still satisfied
+(clearing them would make the feature defeat its own purpose); the displaced
+contents are kept and match what the replica held; and restoring consumes
+neither restore point, so a first choice that turns out to be wrong can be
+followed by a second.
+
+Why it is opt-in: it is new, and it deliberately leaves the target paused
+mid-stage. It clears that and heals with a `-reinit` on the way out — via
+`clear_target_role`, which falls back to `virsh` if `vmsync -update-role`
+itself is broken, because every later stage syncs into that target and all of
+them are refused while it stays paused.
+
+### Stage 11 (`invert`), opt-in
+
+Nothing benched inversion before this, which is why it earns a stage: it is the
+one operation that rewrites **both** ends' metadata, and each of its failure
+modes leaves a pair that looks configured and cannot sync.
+
+**The check it was written for is the disk-path one.** `-target-disk-path` names
+where *this direction's* replicas go, so after an inversion the same value
+points at where the new **source** keeps its disks, not the new target. Reuse it
+on the reversed sync and the copy lands somewhere the new target does not keep
+its disks; the domain is then redefined to match and its original disks are
+orphaned — still on disk, still costing space, referenced by nothing. vmsync's
+answer is to warn and name the value to use, so the stage asserts that warning:
+that it fires when the two ends differ, that it names the right directory, and —
+just as important — that it stays **silent** when both ends use the same
+directory. A warning that always fires teaches operators to ignore it.
+
+The rest: both roles flip; each end records the other as its new peer; the
+promotion record is cleared; the old source's checkpoint chain is discarded (it
+describes a chain running the other way, and a fail-back would chain onto it);
+a sync in the **old** direction is refused afterwards, which is the interlock
+that stops a cron job overwriting the new source with its own replica; and
+re-running `-invert` on an already-inverted pair succeeds and says it had
+nothing to do — that being the documented recovery from a half-applied
+inversion, where one end's metadata write landed and the other's did not.
+
+**What it deliberately does not do is run the reversed sync.** That writes into
+the *source* domain's disks, which no other stage does, and it would prove
+nothing the assertions above do not already establish. Everything here is
+metadata and log text; the source's disks are never written.
+
+Peer references are compared against the strings **vmsync itself wrote** during
+the baseline, never rebuilt from `SOURCE_HOST`/`TARGET_HOST` — same reason Stage
+6 gives: a reconstructed reference only asserts that two strings this harness
+built match each other, and comparing the real ones also catches the regression
+that once wrote `replica_source` as `127.0.0.1:<vm>`.
+
+**This stage STOPS THE SOURCE VM**, like Stage 7 and for a reason that is part
+of what it tests: `-invert` refuses while the old source is running, because the
+inversion makes it a replication target and a running target is one scheduled
+sync away from being overwritten under a live workload. vmsync will not stop a
+production domain as a side effect of a metadata command, so the harness has to.
+That refusal is asserted first — including that it tells the operator what to do
+— and only then is the source shut down.
+
+It shuts down **gracefully and never destroys**. If the guest does not stop
+within `SOURCE_SHUTDOWN_WAIT_SECONDS` (default 90) the stage skips the rest
+rather than pulling its power: Stage 6 will hard-stop a disposable replica, but
+this is the one domain in the pair standing in for production, and destroying it
+to run a test is the wrong trade. The EXIT trap starts it again whatever
+happened — that restart runs before anything else in the cleanup, and is not
+conditional on the inversion having got anywhere.
+
+Why it is opt-in: besides stopping the source, an inversion leaves it marked as
+a replication **target**, which is worse to leave behind than a promoted target
+— every later stage and every scheduled run in the estate syncs *from* that
+domain. The trap clears both ends' metadata and heals with a full resync, but
+the risk is real enough to be asked for rather than assumed.
 
 ## Files
 
