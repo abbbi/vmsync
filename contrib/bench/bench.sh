@@ -62,7 +62,8 @@ Options:
   --only PATTERN          only run Stage 1 scenarios whose name matches
                            PATTERN (a bash glob, e.g. "compress-zstd-*")
   --stages LIST           comma-separated subset of: matrix,verify,verify-long,
-                           reinit,snapshot,define,failover,fence-agent,retention
+                           reinit,snapshot,define,failover,fence-agent,retention,
+						   restore,invert
                            -- runs in
                            whichever order LIST gives them, not a fixed
                            canonical order
@@ -70,8 +71,8 @@ Options:
                            retention is last because it reinitialises the
                            target, and it skips cleanly where the target
                            filesystem cannot reflink. define, failover,
-                           fence-agent, verify-long and restore are opt-in,
-                           see below)
+                           fence-agent, verify-long, restore and invert are
+                           opt-in, see below)
   --dry-run               print every vmsync command line; touch nothing
                            (no ssh/qemu-io/vmsync calls actually made)
   -h, --help              this text
@@ -2418,7 +2419,7 @@ stage_fence_agent() {
 # excluded by name, so every restore point check was being folded into the
 # matrix verdict, and its one FAIL would have failed Stage 1 on any run that
 # included both.
-NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$)'
+NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$)'
 
 # stage_pattern STAGE -> the regex matching that stage's scenario column.
 # --- Stage 8: verify after a long incremental chain --------------------------
@@ -3223,6 +3224,299 @@ rp_status_field() {
 		| sed -n "s/^[[:space:]]*\"$3\":[[:space:]]*\"\{0,1\}\([^\",]*\)\"\{0,1\},\{0,1\}[[:space:]]*$/\1/p" \
 		| head -1 | tr -d '[:space:]'
 }
+
+# --- Stage 11: -invert (reversing a pair's direction) ------------------------
+#
+# Nothing benched inversion before this, which is why it earns a stage: it is
+# the one operation that rewrites BOTH ends' metadata, and every one of its
+# failure modes leaves a pair that looks configured and cannot sync.
+#
+# The check the stage was written for is the disk-path one. -target-disk-path
+# names where THIS direction's replicas go, so after an inversion the same
+# value points at where the new SOURCE keeps its disks, not the new target. Reuse
+# it on the reversed sync and the copy lands somewhere the new target does not
+# keep its disks; the domain is then redefined to match and its original disks
+# are orphaned -- still on disk, still costing space, referenced by nothing.
+# vmsync's answer is to warn and name the value to use, so that warning is
+# asserted here: that it fires when the two ends differ, and that it names the
+# right directory.
+#
+# What this stage deliberately does NOT do is run the reversed sync. That would
+# write into the SOURCE domain's disks, which no other stage does and which the
+# harness's own warnings about Stage 4 exist for -- and it would prove only what
+# the assertions below already establish. Everything here is metadata and log
+# text; the source's disks are never written.
+stage_invert() {
+	log "=== Stage 11: -invert direction reversal ==="
+	local sc=invert
+	local fo_ok=0
+
+	if [ -z "${TARGET_VMSYNC_BIN:-}" ]; then
+		warn "TARGET_VMSYNC_BIN is not set in $CONF -- skipping stage 11. An inversion needs the target promoted first, and -promote must run ON the target host (it refuses a remote libvirt URI by design)."
+		results_row "$CSV" "$sc" skipped 0 "" "" "" "" "" "SKIPPED TARGET_VMSYNC_BIN unset"
+		return 0
+	fi
+
+	if [ "$DRY_RUN" = yes ]; then
+		bench_sync "$sc" baseline -reinit
+		fo_check "$sc" "invert flips both ends' roles" 0
+		fo_check "$sc" "the old direction is refused afterwards" 0
+		fo_check "$sc" "invert is idempotent" 0
+		return 0
+	fi
+
+	stage_needs_target_shutoff "$CSV" "$sc" "stage invert" || return 0
+	reset_pair_state "$sc" yes
+	require_target_syncable "$sc" || return 0
+
+	# The backstop. An inversion leaves the SOURCE marked as a replication
+	# target, and a source in that state refuses to be synced FROM by every
+	# later stage and every scheduled run in the estate -- a worse thing to
+	# leave behind than a promoted target, because nothing else in this
+	# harness resets the source. An EXIT trap rather than RETURN for the
+	# reason Stage 6 gives: RETURN does not fire on a signal.
+	INVERT_DONE=no
+	INVERT_CLEANED=no
+	invert_cleanup() {
+		[ "$INVERT_CLEANED" = yes ] && return 0
+		INVERT_CLEANED=yes
+		[ "$INVERT_DONE" = yes ] || return 0
+		log "stage 11: putting the pair back the way round it started"
+		# virsh, not vmsync -update-role: this has to work when the code
+		# under test is what is broken. reset_pair_state explains at length.
+		reset_pair_state "$sc" yes
+		bench_sync "$sc" heal -reinit
+		if [ "$RUN_RC" != 0 ]; then
+			warn "stage 11: the healing -reinit did not succeed (see $RUN_LOG). $SOURCE_DOMAIN and $TARGET_DOMAIN have had their vmsync metadata cleared, so nothing refuses a sync -- but the pair has no checkpoint chain until one completes."
+		fi
+	}
+	trap invert_cleanup EXIT
+
+	# --- baseline ------------------------------------------------------------
+	bench_sync "$sc" baseline -reinit
+	if [ "$RUN_RC" != 0 ]; then
+		warn "baseline full sync failed (see $RUN_LOG) -- aborting stage 11 before anything is inverted$(bench_sync_hint)"
+		return 1
+	fi
+
+	# Captured BEFORE the inversion: afterwards the roles are swapped and
+	# "which end keeps its disks where" reads backwards.
+	local new_target_dir new_source_dir cpts_before
+	new_target_dir="$(domain_disk_dir "$SOURCE_URI" "$SOURCE_DOMAIN")"
+	new_source_dir="$(domain_disk_dir "$TARGET_URI" "$TARGET_DOMAIN")"
+	cpts_before="$(vmsync_checkpoint_count "$SOURCE_URI" "$SOURCE_DOMAIN")"
+
+	# The two ends as VMSYNC spells them, read from what the baseline sync
+	# just wrote, never rebuilt from SOURCE_HOST/TARGET_HOST.
+	#
+	# Stage 6 makes the same choice and gives the reason: a reference this
+	# harness reconstructs would be asserting that two strings this harness
+	# built match each other. These are the real ones, and comparing them
+	# also catches the regression that once wrote replica_source as
+	# "127.0.0.1:<vm>" -- a name for every machine and therefore for none.
+	local src_ref tgt_ref
+	src_ref="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replica_source)"
+	tgt_ref="$(vmsync_meta_field "$SOURCE_URI" "$SOURCE_DOMAIN" replica_targets)"
+	case "$tgt_ref" in
+	*,*)
+		# A source that fans out to several targets. The entry for THIS pair
+		# cannot be picked apart from the others without reconstructing a
+		# hostname, which is the thing being avoided.
+		warn "$SOURCE_DOMAIN replicates to more than one target ($tgt_ref); the peer-reference assertions need a single-target pair"
+		tgt_ref=""
+		;;
+	esac
+	log "disk directories: new source (currently target) = ${new_source_dir:-<scattered>}, new target (currently source) = ${new_target_dir:-<scattered>}"
+
+	if [ "${cpts_before:-0}" -gt 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the baseline left a checkpoint chain on the source" "$fo_ok" \
+		"$SOURCE_DOMAIN has $cpts_before vmsync checkpoints, so there is no chain for the inversion to discard and that assertion below would pass vacuously"
+
+	# --- promote, so there is something to invert toward ---------------------
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" promote \
+		-promote -target-uri "qemu:///system" -target-domain "$TARGET_DOMAIN" \
+		-promote-mode planned -promoted-by bench-harness
+	if [ "$RUN_RC" != 0 ]; then
+		warn "promote failed (see $RUN_LOG) -- aborting stage 11; an inversion needs a promoted peer"
+		INVERT_DONE=yes # the promotion may have landed; let the trap reset it
+		return 1
+	fi
+	INVERT_DONE=yes
+
+	# --- invert ---------------------------------------------------------------
+	# Run from here rather than on either host: -invert genuinely spans both
+	# ends, and this is the one failover verb that takes a remote URI.
+	vmsync_verb_pair "$sc" invert -invert
+	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "invert succeeds against a promoted peer" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
+
+	# --- both ends' metadata flipped -----------------------------------------
+	local got
+	got="$(vmsync_meta_field "$SOURCE_URI" "$SOURCE_DOMAIN" replication_role)"
+	if [ "$got" = target ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the old source is now a replication target" "$fo_ok" \
+		"$SOURCE_DOMAIN's replication_role is '$got', not 'target'"
+
+	got="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
+	if [ "$got" = source ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the promoted replica is now the source" "$fo_ok" \
+		"$TARGET_DOMAIN's replication_role is '$got', not 'source'"
+
+	if [ -n "$tgt_ref" ]; then
+		got="$(vmsync_meta_field "$SOURCE_URI" "$SOURCE_DOMAIN" replica_source)"
+		if [ "$got" = "$tgt_ref" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the new target records who it now replicates from" "$fo_ok" \
+			"replica_source is '$got', expected '$tgt_ref' -- the same string the baseline sync wrote as this source's replica_target"
+	else
+		results_row "$CSV" "$sc" new_target_replica_source "" "" "" "" "" "" "SKIP the pair fans out to several targets"
+	fi
+
+	if [ -n "$src_ref" ]; then
+		got="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replica_targets)"
+		case ",$got," in
+		*",$src_ref,"*) fo_ok=0 ;;
+		*) fo_ok=1 ;;
+		esac
+		fo_check "$sc" "the new source records who it now replicates to" "$fo_ok" \
+			"replica_targets is '$got', which does not contain '$src_ref' -- the same string the baseline sync wrote as this target's replica_source"
+	else
+		results_row "$CSV" "$sc" new_source_replica_targets "" "" "" "" "" "" "SKIP the baseline recorded no replica_source to compare against"
+	fi
+
+	# The promotion record goes with the promotion. Leaving it would make a
+	# domain that is now an ordinary source still read as failed-over-to.
+	got="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" promoted_at)"
+	if [ -z "$got" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the promotion record is cleared by the inversion" "$fo_ok" \
+		"promoted_at is still '$got' on a domain that is now simply the source"
+
+	# --- the old source's checkpoint chain is discarded ----------------------
+	# It describes a chain running the other way, a later fail-back would
+	# chain onto it, and it blocks the undefine that every sync INTO this
+	# domain now ends with.
+	local cpts_after
+	cpts_after="$(vmsync_checkpoint_count "$SOURCE_URI" "$SOURCE_DOMAIN")"
+	if [ "${cpts_after:-1}" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the old source's checkpoint chain is discarded" "$fo_ok" \
+		"$SOURCE_DOMAIN still has $cpts_after vmsync checkpoints after the inversion; a fail-back would chain onto a chain running the wrong way"
+
+	# --- the warnings an operator has to act on ------------------------------
+	if grep -q "must be a full one" "$RUN_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "invert says the first reversed sync must be full" "$fo_ok" \
+		"no such warning in $RUN_LOG -- there is no checkpoint chain this way round, and an operator not told that will try an incremental"
+
+	# THE check this stage exists for.
+	if [ -z "$new_target_dir" ] || [ -z "$new_source_dir" ]; then
+		warn "SKIP the -target-disk-path warning check: one of the domains keeps its disks in more than one directory, which is the case vmsync deliberately says nothing about"
+		results_row "$CSV" "$sc" disk_path_warning "" "" "" "" "" "" "SKIP disks span several directories"
+	elif [ "$new_target_dir" = "$new_source_dir" ]; then
+		# Symmetric layout: leaving -target-disk-path unset already puts the
+		# copy at the source's own path, so a warning would be noise. Assert
+		# the SILENCE -- a warning that always fires teaches operators to
+		# ignore it.
+		if grep -q "different directories" "$RUN_LOG" 2>/dev/null; then fo_ok=1; else fo_ok=0; fi
+		fo_check "$sc" "no disk-path warning when both ends use the same directory" "$fo_ok" \
+			"invert warned about differing directories when both ends use $new_source_dir"
+	else
+		if grep -q "different directories" "$RUN_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "invert warns that the reversed sync needs a different -target-disk-path" "$fo_ok" \
+			"the two ends keep disks in different directories ($new_source_dir vs $new_target_dir) and nothing in $RUN_LOG said so -- reusing the old value would orphan $SOURCE_DOMAIN's disks"
+
+		if grep -q -- "-target-disk-path $new_target_dir" "$RUN_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the warning names the directory to use" "$fo_ok" \
+			"the warning does not name '$new_target_dir', which is where $SOURCE_DOMAIN actually keeps its disks -- a warning an operator cannot act on is not one"
+	fi
+
+	# --- the interlock: the OLD direction is now refused ---------------------
+	# The half that makes an interrupted inversion survivable. Syncing the
+	# old way round would overwrite the new source with its own replica, and
+	# the role gate is what stands between a cron job and exactly that.
+	#
+	# Nothing is written by this: the gate runs immediately after the target
+	# connection, long before -reinit's disk removal or any copy.
+	bench_sync "$sc" old-direction
+	if [ "$RUN_RC" != 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "a sync in the old direction is refused after inverting" "$fo_ok" \
+		"a sync exited 0 into $TARGET_DOMAIN, which is now the SOURCE of this pair -- it would overwrite the original with its own replica. See $RUN_LOG"
+
+	# --- idempotence ---------------------------------------------------------
+	# An inversion is two metadata writes on two hosts, so the second can
+	# fail with the first done. Re-running is the documented recovery, and it
+	# has to be safe on a pair that is already fully inverted.
+	vmsync_verb_pair "$sc" invert-again -invert
+	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "inverting an already-inverted pair succeeds" "$fo_ok" \
+		"exit $RUN_RC -- re-running is the recovery for a half-applied inversion, so it must not fail on a complete one. See $RUN_LOG"
+
+	if grep -qi "already inverted" "$RUN_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "and says it had nothing to do" "$fo_ok" \
+		"no 'already inverted' in $RUN_LOG -- a second run reporting success without saying it was a no-op reads as having done the work twice"
+
+	invert_cleanup
+	trap - EXIT
+	return 0
+}
+
+# vmsync_verb_pair SCENARIO PHASE ARGS... -- run a vmsync verb that spans BOTH
+# ends, from here.
+#
+# -invert is the only one: it writes to the old source and the promoted
+# replica, so unlike -promote it cannot run on one host with a local URI.
+# Distinct from run_vmsync, which adds a prometheus textfile and the transport
+# flags a sync needs and a verb rejects.
+vmsync_verb_pair() {
+	local scenario="$1" phase="$2"
+	shift 2
+	local log_file="$RUN_DIR/logs/${scenario}.${phase}.log"
+	RUN_LOG="$log_file"
+	local args=(
+		-source-uri "$SOURCE_URI" -source-domain "$SOURCE_DOMAIN"
+		-target-uri "$TARGET_URI" -target-domain "$TARGET_DOMAIN"
+	)
+	[ -n "${SSH_USER:-}" ] && args+=(-ssh-user "$SSH_USER")
+	[ -n "${SSH_KEY:-}" ] && args+=(-ssh-key "$SSH_KEY")
+	[ -n "${SSH_PORT:-}" ] && args+=(-ssh-port "$SSH_PORT")
+	[ -n "${SSH_KNOWN_HOSTS:-}" ] && args+=(-ssh-known-hosts "$SSH_KNOWN_HOSTS")
+	args+=("$@")
+	log "-> $scenario/$phase"
+	log "   $VMSYNC_BIN ${args[*]}"
+	set +e
+	"$VMSYNC_BIN" "${args[@]}" >"$log_file" 2>&1
+	RUN_RC=$?
+	set -e
+	return 0
+}
+
+# domain_disk_dir URI DOMAIN -> the single directory this domain keeps its
+# disks in, or empty when they are spread across more than one.
+#
+# Empty rather than a first answer on purpose: it mirrors vmsync's own
+# singleDiskDir, which says nothing at all about a scattered domain because
+# there is no single -target-disk-path that could describe one.
+# domblklist rather than xmllint on the domain XML, unlike disk_source_path
+# beside it: --xpath on an attribute returns nodes as `file="..." file="..."`
+# on one line, which only splits back apart correctly if no path contains a
+# space. virsh prints one disk per row and already has to be installed.
+#
+# $2 == "disk" drops cdroms and floppies, which have source paths and are not
+# what a replica is made of.
+domain_disk_dir() {
+	virsh_uri "$1" domblklist "$2" --details 2>/dev/null \
+		| awk '$2 == "disk" && $4 ~ /^\// { p = $4; sub(/\/[^\/]*$/, "", p); print p }' \
+		| sort -u \
+		| awk 'NR==1 { d=$0 } NR>1 { exit 1 } END { if (NR==1) print d }'
+}
+
+# vmsync_checkpoint_count URI DOMAIN -> how many vmsync-managed checkpoints
+# the domain carries.
+#
+# Only vmsync's own: a domain may legitimately carry checkpoints somebody
+# else created, and counting those would make "the chain was discarded" fail
+# for a reason that has nothing to do with vmsync.
+vmsync_checkpoint_count() {
+	virsh_uri "$1" checkpoint-list "$2" --name 2>/dev/null \
+		| grep -c '^vmsync-cpt-' || true
+}
 vmsync_verb() {
 	local scenario="$1" phase="$2"
 	shift 2
@@ -3266,6 +3560,7 @@ stage_pattern() {
 	fence-agent) printf '^fence-agent$' ;;
 	retention) printf '^retention$' ;;
 	restore) printf '^restore$' ;;
+	invert) printf '^invert$' ;;
 	*) printf '$^' ;; # matches nothing
 	esac
 }
@@ -3575,7 +3870,8 @@ for s in "${stage_list[@]}"; do
         fence-agent) stage_fence_agent || stage_rc=$? ;;
         retention) stage_retention || stage_rc=$? ;;
         restore) stage_restore || stage_rc=$? ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,verify-long,reinit,snapshot,define,failover,fence-agent,retention,restore)" ;;
+        invert) stage_invert || stage_rc=$? ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,verify-long,reinit,snapshot,define,failover,fence-agent,retention,restore,invert)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
                 warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."
