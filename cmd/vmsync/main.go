@@ -433,6 +433,15 @@ func main() {
 				err = runRestoreRestorePoint(ctx, cfg, cfg.RestoreRestorePoint)
 			}
 			if err != nil {
+				// Nothing was done, so this must not read as a failure. The
+				// caller most likely to care is the agent: a terminal result
+				// burns the operation's id permanently, and "another vmsync
+				// was busy" is the one outcome that deserves another go.
+				if errors.Is(err, util.ErrLockHeld) {
+					trace.Warning("standing down: another vmsync is already working on this domain, and nothing was changed -- retry once it finishes",
+						"vm", cfg.TargetDomain, "error", err)
+					os.Exit(util.ExitBusy)
+				}
 				trace.Error(strings.TrimPrefix(chosen[0], "-"), "error", err)
 				os.Exit(1)
 			}
@@ -671,6 +680,15 @@ func main() {
 	// itself, and the sync's failure is already recorded in
 	// vmsync_sync_state).
 	if err := run(cfg); err != nil {
+		// The target-side counterpart of the source-lock skip above. Another
+		// vmsync is already working on this target -- ours stood down before
+		// touching anything, so this is a clean no-op, not a failure: exit 0,
+		// no failure counted, and (see run()'s metrics defer) no metrics
+		// record written.
+		if errors.Is(err, util.ErrLockHeld) {
+			trace.Info("another vmsync is already working on this target, skipping", "vm", cfg.TargetDomain, "error", err)
+			os.Exit(0)
+		}
 		// A role refusal is exempt for the same reason run-lock contention is
 		// (see the lock's own comment above): it is not a broken sync. The
 		// role gate is an administrative state, it says nothing about whether
@@ -1299,6 +1317,17 @@ func run(cfg syncConfig) (runErr error) {
 	// update, DefineDomain) can still fail after every disk has already
 	// synced successfully.
 	defer func() {
+		// A run that stood down because another vmsync holds the target lock
+		// writes NOTHING, the same as the source-side lock skip -- which
+		// happens before run() is entered and so never reaches this defer at
+		// all. Neither state would be true here: StateFailure is what the
+		// skip exists to avoid, and StateSuccess would claim a sync that did
+		// not happen. Leaving the previous run's record in place is what a
+		// skip means, and it keeps vmsync_last_run_timestamp_seconds honest
+		// about when this pair last actually synced.
+		if errors.Is(runErr, util.ErrLockHeld) {
+			return
+		}
 		interruptedMu.Lock()
 		wasInterrupted := interrupted
 		interruptedMu.Unlock()
@@ -2073,6 +2102,20 @@ func run(cfg syncConfig) (runErr error) {
 	targetLock, lockErr := util.AcquireRemoteRunLock(targetLockCtx, targetSSHClient, runLockDir, targetLockKey(cfg.TargetDomain))
 	cancelTargetLock()
 	if lockErr != nil {
+		// Wrapped, not swallowed: main() reads ErrLockHeld off this and
+		// exits 0 without counting a failure, exactly as it already does for
+		// the source-side lock -- which is what AcquireRemoteRunLock's own
+		// doc comment says callers should do. Contention means another
+		// vmsync is working on this target right now, which is a reason to
+		// stand down and let it, not evidence that anything is broken.
+		//
+		// Treating it as a failure had a cost beyond a misleading exit code:
+		// it counted toward -reinit-after-failures, so two agents syncing
+		// different sources into one target host, or a cron run colliding
+		// with a scheduled one, would climb that counter on a perfectly
+		// healthy replica -- eventually forcing a full resync nobody asked
+		// for, and blocking promotion on a non-zero failure_count in the
+		// meantime.
 		return fmt.Errorf("target %s on %s: %w", cfg.TargetDomain, util.HostFromURIOrLocal(cfg.TargetURI), lockErr)
 	}
 	defer targetLock.Close()

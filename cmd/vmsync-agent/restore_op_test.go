@@ -21,6 +21,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"vmsync/pkg/util"
 )
 
 func restoreOp() Operation {
@@ -176,6 +178,92 @@ func TestProfileValidateChecksRetention(t *testing.T) {
 	for _, bad := range []string{"24", "0,3h", "-1,3h", "24,", "24,banana", "abc,3h"} {
 		if err := (SyncProfile{Retention: bad}).Validate(); err == nil {
 			t.Errorf("Validate accepted retention %q", bad)
+		}
+	}
+}
+
+// Abandon is the one hole in "recorded once, never retried", so what it does
+// and what it does not do are both worth pinning.
+func TestAbandonMakesAnOperationRetryable(t *testing.T) {
+	l := newOperationLedger(t.TempDir())
+	op := restoreOp()
+
+	if err := l.Begin(op, time.Now()); err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if _, seen := l.Seen(op.ID); !seen {
+		t.Fatal("Begin did not record the intent")
+	}
+
+	if err := l.Abandon(op.ID); err != nil {
+		t.Fatalf("Abandon: %v", err)
+	}
+	// Seen reports ANY recorded id as seen, whatever its state, so leaving a
+	// `running` entry behind would make the operation permanently
+	// un-retryable -- which is exactly the damage this exists to undo.
+	if _, seen := l.Seen(op.ID); seen {
+		t.Error("the abandoned operation is still recorded, so the next tick will skip it forever")
+	}
+	// And it must not be reported to the UI as an outcome, because none
+	// happened.
+	for _, r := range l.Results() {
+		if r.ID == op.ID {
+			t.Errorf("the abandoned operation is still reported as a result: %+v", r)
+		}
+	}
+
+	// Retrying really works: a second Begin with the same id succeeds.
+	if err := l.Begin(op, time.Now()); err != nil {
+		t.Fatalf("could not re-Begin an abandoned operation: %v", err)
+	}
+	if _, seen := l.Seen(op.ID); !seen {
+		t.Error("the retry was not recorded")
+	}
+}
+
+func TestAbandonSurvivesARestart(t *testing.T) {
+	// The removal has to reach disk, or an agent restarted between the
+	// deferral and the retry would load a `running` entry and refuse the
+	// operation forever.
+	dir := t.TempDir()
+	op := restoreOp()
+
+	first := newOperationLedger(dir)
+	if err := first.Begin(op, time.Now()); err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if err := first.Abandon(op.ID); err != nil {
+		t.Fatalf("Abandon: %v", err)
+	}
+
+	second := newOperationLedger(dir)
+	if err := second.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, seen := second.Seen(op.ID); seen {
+		t.Error("the abandoned entry came back after a restart; the removal did not reach disk")
+	}
+}
+
+func TestAbandonAnUnknownIDIsNotAnError(t *testing.T) {
+	// It runs on a path where the caller cannot be certain Begin landed.
+	l := newOperationLedger(t.TempDir())
+	if err := l.Abandon("never-seen"); err != nil {
+		t.Fatalf("Abandon of an unknown id: %v", err)
+	}
+}
+
+// The exit status is a contract between two binaries: vmsync exits with it and
+// the agent reads it off a finished process. Pinned because a change on one
+// side alone turns "I did nothing, retry me" into "I failed" -- which burns
+// the operation's id permanently.
+func TestExitBusyIsDistinctFromEveryOrdinaryStatus(t *testing.T) {
+	if util.ExitBusy != 75 {
+		t.Errorf("ExitBusy = %d, want 75 (sysexits.h EX_TEMPFAIL)", util.ExitBusy)
+	}
+	for _, ordinary := range []int{0, 1, 2} {
+		if util.ExitBusy == ordinary {
+			t.Errorf("ExitBusy collides with the ordinary status %d", ordinary)
 		}
 	}
 }

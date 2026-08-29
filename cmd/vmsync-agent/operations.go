@@ -268,6 +268,45 @@ func (l *operationLedger) Finish(op Operation, res OperationResult, now time.Tim
 	})
 }
 
+// Abandon undoes a Begin, so the operation is retried on a later tick.
+//
+// This is the one hole in "recorded once, never retried", and it is deliberate
+// and narrow. That rule exists because a crash mid-operation is
+// indistinguishable from a completed one -- so intent is written first and a
+// `running` record that survives a restart is never re-run, on the reasoning
+// that replaying a failover is worse than not finishing one.
+//
+// Contention is the case where that reasoning does not apply: vmsync exited
+// cleanly and deliberately, with a code that means "I took no lock and did
+// nothing". That is a positive statement from the process itself, not an
+// absence of information, and it is the only thing this is called for. An
+// operation stuck behind a sync would otherwise burn its id forever and have
+// to be reissued by hand from the UI -- while the reason it failed cleared up
+// on its own seconds later.
+//
+// Removing the entry rather than marking it: Seen() reports any recorded id as
+// seen whatever its state, and Results() reports every entry to the UI. A
+// record left behind would be both un-retryable and visible as an outcome that
+// never happened.
+func (l *operationLedger) Abandon(id string) error {
+	l.mu.Lock()
+	if _, ok := l.entries[id]; !ok {
+		l.mu.Unlock()
+		return nil
+	}
+	delete(l.entries, id)
+	snapshot := make(map[string]ledgerEntry, len(l.entries))
+	for k, v := range l.entries {
+		snapshot[k] = v
+	}
+	l.mu.Unlock()
+
+	if err := writeJSONAtomic(l.path, snapshot, 0o644); err != nil {
+		return fmt.Errorf("remove the abandoned record of operation %s from the ledger: %w", id, err)
+	}
+	return nil
+}
+
 func (l *operationLedger) put(e ledgerEntry) error {
 	l.mu.Lock()
 	l.entries[e.ID] = e

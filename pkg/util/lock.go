@@ -38,6 +38,26 @@ import (
 // running, nothing to do here".
 var ErrLockHeld = errors.New("lock already held by another process")
 
+// ExitBusy is the process exit status meaning "stood down without doing
+// anything, because another vmsync holds the lock for this domain".
+//
+// 75 is sysexits.h's EX_TEMPFAIL: a temporary failure, retry later. It lives
+// here rather than in either command because it is a contract BETWEEN two
+// binaries -- vmsync exits with it, and vmsync-agent reads it off a finished
+// process and decides not to record a terminal result -- and a constant two
+// programs must agree on is exactly what does not belong in one of them.
+//
+// It exists because the two ordinary codes both lie for an operator verb. 0
+// would report a restore that never happened as done; 1 would report one that
+// never started as failed, which the agent records terminally and can then
+// never retry with the same operation id -- while the reason it could not run
+// clears up on its own seconds later.
+//
+// A SYNC does not use it. Contention there is an ordinary skip and exits 0,
+// because a scheduler running every few minutes simply tries again and nothing
+// needs to tell the cases apart.
+const ExitBusy = 75
+
 // safeKeyReplacer makes a lock key filesystem-safe reversibly (percent-
 // encoding style), rather than via lossy character substitution -- mapping
 // both "/" and " " to the same "_" would make two different keys (e.g.

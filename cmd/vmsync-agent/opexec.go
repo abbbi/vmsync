@@ -28,6 +28,7 @@ import (
 
 	"vmsync/pkg/libvirtsync"
 	"vmsync/pkg/trace"
+	"vmsync/pkg/util"
 )
 
 // opTickInterval is how often the executor looks for work. Operations
@@ -131,6 +132,35 @@ func runOperation(ctx context.Context, cfg agentConfig, schedule []ScheduleEntry
 	cmd.Stdout, cmd.Stderr = &out, &out
 
 	runErr := cmd.Run()
+
+	// Exit 75 (EX_TEMPFAIL) is vmsync saying it stood down without touching
+	// anything, because another vmsync holds the lock for this domain --
+	// almost always a scheduled sync for the same pair.
+	//
+	// Not a result: recording one would burn this operation's id permanently,
+	// and the reason it could not run clears up by itself when that sync
+	// finishes. So the intent record is removed and the next tick tries
+	// again, which is the same thing that happens when Begin itself fails.
+	// The operation stays published by the UI throughout, so nothing is lost
+	// if this agent restarts in between.
+	//
+	// Retrying is bounded, and by the right thing: the operation carries its
+	// own NotAfterUnix, so if the sync blocking it outlasts that deadline the
+	// next tick refuses it as expired and says so. A restore deferred past
+	// its own expiry SHOULD stop rather than fire whenever the sync happens
+	// to finish -- the same reasoning the deadline exists for.
+	if cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == util.ExitBusy {
+		trace.Info("deferring an operation: another vmsync is working on this domain, nothing was changed",
+			"id", op.ID, "kind", op.Kind, "vm", op.VM)
+		if err := ledger.Abandon(op.ID); err != nil {
+			// The record stays `running`, so this operation is now stuck:
+			// Seen() will refuse to retry it and the UI keeps publishing it
+			// until somebody cancels it. Loud, because the fix is manual.
+			trace.Error("could not release a deferred operation's record; it will not be retried and must be reissued", "id", op.ID, "error", err)
+		}
+		return
+	}
+
 	res := OperationResult{
 		State:         OpStateDone,
 		StartedAtUnix: now.Unix(),
