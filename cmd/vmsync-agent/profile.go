@@ -25,6 +25,7 @@ import (
 
 	"vmsync/pkg/netbuffer"
 	"vmsync/pkg/portalloc"
+	"vmsync/pkg/restorepoint"
 )
 
 // SyncProfile is the transport configuration for one scheduled sync, as
@@ -67,6 +68,20 @@ type SyncProfile struct {
 	ReinitAfterFailures int `json:"reinit_after_failures,omitempty"`
 	// TargetDiskPath is where the replica's disks live on the target host.
 	TargetDiskPath string `json:"target_disk_path,omitempty"`
+	// Retention is "<count>,<interval>" (e.g. "24,3h"), or empty to keep no
+	// restore points.
+	//
+	// Without this a scheduled sync never passes -retention, so an estate run
+	// entirely through the control plane takes no restore points at all --
+	// and a restore operation would have nothing to restore. The feature was
+	// reachable only from a hand-run or cron vmsync until this existed.
+	//
+	// Note the target's filesystem must support reflink copies (XFS with
+	// reflink=1, or btrfs) or vmsync REFUSES the whole run rather than
+	// silently making each restore point a full copy. That refusal is
+	// deliberate, and it means a bad value here stops replication for that
+	// pair -- so it is validated below rather than discovered at 3am.
+	Retention string `json:"retention,omitempty"`
 	// SourcePortRange/TargetPortRange are passed to vmsync's own port
 	// selection: a fixed port, a range, or "auto".
 	SourcePortRange string `json:"source_port_range,omitempty"`
@@ -183,6 +198,15 @@ func (p SyncProfile) Validate() error {
 		}
 	}
 
+	if p.Retention != "" {
+		// The engine's own parser, for the same reason netbuffer and the
+		// port ranges use theirs: a value this agent accepts and vmsync then
+		// rejects is a schedule that looks configured and never runs.
+		if _, err := restorepoint.ParsePolicy(p.Retention); err != nil {
+			return fmt.Errorf("retention: %w", err)
+		}
+	}
+
 	for label, spec := range map[string]string{
 		"source_port_range": p.SourcePortRange,
 		"target_port_range": p.TargetPortRange,
@@ -261,6 +285,9 @@ func (r SyncRequest) CommandArgs() []string {
 
 	if p.TargetDiskPath != "" {
 		args = append(args, "-target-disk-path", p.TargetDiskPath)
+	}
+	if p.Retention != "" {
+		args = append(args, "-retention", p.Retention)
 	}
 	if r.SSHUser != "" {
 		args = append(args, "-ssh-user", r.SSHUser)

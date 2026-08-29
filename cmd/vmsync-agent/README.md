@@ -247,6 +247,32 @@ hosts where stopping a VM must stay a human decision. It is **not** latched:
 nothing was acted on, so the warning repeats every cycle until somebody
 resolves it.
 
+### How long a guest gets
+
+A shutdown that overruns is reported as a **failure**, and a failed fence is
+latched — so a guest that simply needed longer looks exactly like one that
+refused to stop, and nothing will try again. Getting this number right
+matters more than it sounds.
+
+Resolved in three steps: the VM's own `shutdown_timeout_sec` on its schedule
+entry, then the config's estate-wide `shutdown_timeout_sec`, then vmsync's
+own 300 seconds. A **shutdown operation** instead carries a value the UI
+already resolved, so the instruction means the same thing whenever it runs.
+
+Two guards worth knowing about:
+
+- Whatever the config says is **clamped to 30–3600 seconds**. It arrives
+  from a separately-versioned program over the network, and this number
+  decides how long a production VM is given before its shutdown is called a
+  failure. A `--standalone` file is *refused* rather than clamped, because
+  that one was typed by a person and silently changing their number is the
+  failure mode that file's strict parsing exists to prevent.
+- vmsync itself is given **two minutes more** than the guest is. Bounding it
+  at exactly the guest timeout would kill it just as the guest ran out,
+  turning "the guest did not stop in time" — a clear diagnosis — into "the
+  process disappeared", and leaving a `running` ledger entry behind a fence
+  that will never be retried.
+
 ### When it doesn't work, it says so
 
 A failed fence is not retried, so it must not also go quiet. While this host
@@ -327,10 +353,12 @@ optional.
         "io_depth": 16,
         "verify": "online",
         "target_disk_path": "/data/replicas"
-      }
+      },
+      "shutdown_timeout_sec": 900
     }
   ],
   "max_concurrent_syncs": 4,
+  "shutdown_timeout_sec": 300,
   "target_host_budget": { "dr01": 2 }
 }
 ```
@@ -342,7 +370,9 @@ optional.
 | `enabled` | `false` keeps an entry visible while stopping it from running. |
 | `target_host` | Required only when the VM replicates to more than one target; otherwise the single target is used. |
 | `profile` | vmsync settings for this VM: `compress`, `compress_level`, `netbuffer`, `use_ssh`, `io_depth`, `verify`, `reinit_after_failures`, `target_disk_path`, `source_port_range`, `target_port_range`. Omit any of them for vmsync's default. |
+| `shutdown_timeout_sec` (per entry) | How long THIS guest gets to stop cleanly, in seconds. Omit to inherit the file-level value below. 30-3600; out of range is an error, not a clamp. |
 | `max_concurrent_syncs` | Cap on syncs running at once on this host. Default 4. |
+| `shutdown_timeout_sec` (top level) | Default for every VM with no value of its own. Omit for vmsync's own 300s. |
 | `target_host_budget` | Cap on concurrent syncs *into* a given target host. |
 
 Note what is **not** in the file: no hostnames to replicate to, no

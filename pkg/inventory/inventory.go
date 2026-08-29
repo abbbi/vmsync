@@ -108,6 +108,19 @@ type Domain struct {
 	// so an operator can answer "is there room to keep the old copy?"
 	// before an inversion, rather than after the disk fills.
 	Disks []DiskInfo `json:"disks,omitempty"`
+
+	// RestorePoints is what this replica can be rolled back to.
+	//
+	// The one piece of a domain's state that is not in its metadata: restore
+	// points are directories beside the disks, deliberately, because vmsync
+	// keeps no inventory of its own for them. Reported because a restore
+	// operation names a TAG, and unlike every other operation's parameter
+	// -- a role, a peer -- a tag cannot be derived from anything already
+	// reported. Without this the control plane could only ask for a restore
+	// point it has never seen.
+	//
+	// Nil on the ordinary host, which is any host not using -retention.
+	RestorePoints []RestorePointInfo `json:"restore_points,omitempty"`
 }
 
 // IsTarget reports whether this domain is the receiving side of a pair.
@@ -353,6 +366,11 @@ func describe(dom *libvirt.Domain) (Domain, error) {
 			paths = append(paths, p)
 		}
 		d.Disks = inspectDisks(paths)
+		// After the disks, because it is derived from where they are -- the
+		// same rule the sync path uses to place them, rather than any
+		// configured target_disk_path, which agrees only when it happens to
+		// name the directory the disks are really in.
+		d.RestorePoints = RestorePointsFor(d)
 	}
 
 	d.Role, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldReplicationRole)

@@ -561,6 +561,7 @@ func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler, ledger 
 			FenceArmedBy:         d.FenceArmedBy,
 			Fenced:               reportFenced(fenced, d.Name),
 			Disks:                reportDisks(d.Disks),
+			RestorePoints:        reportRestorePoints(d.RestorePoints),
 			Status:               a.Status.String(),
 			Reasons:              a.Reasons,
 			AgeSeconds:           a.AgeSeconds,
@@ -603,6 +604,26 @@ func reportDisks(in []inventory.DiskInfo) []ReportDisk {
 			ApparentBytes:  d.ApparentBytes,
 			AllocatedBytes: d.AllocatedBytes,
 			Missing:        d.Missing,
+		})
+	}
+	return out
+}
+
+func reportRestorePoints(in []inventory.RestorePointInfo) []ReportRestorePoint {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]ReportRestorePoint, 0, len(in))
+	for _, r := range in {
+		out = append(out, ReportRestorePoint{
+			Tag:              r.Tag,
+			TakenAtUnix:      r.TakenAtUnix,
+			CheckpointAtUnix: r.CheckpointAtUnix,
+			Checkpoint:       r.Checkpoint,
+			Source:           r.Source,
+			Verify:           r.Verify,
+			Disks:            r.Disks,
+			Incomplete:       r.Incomplete,
 		})
 	}
 	return out

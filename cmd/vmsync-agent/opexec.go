@@ -61,7 +61,7 @@ func operationsLoop(ctx context.Context, cfg agentConfig, state *sharedState, le
 		published := map[string]bool{}
 		for _, op := range cached.Config.Operations {
 			published[op.ID] = true
-			runOperation(ctx, cfg, op, ledger)
+			runOperation(ctx, cfg, cached.Config.Schedule, op, ledger)
 			if ctx.Err() != nil {
 				return
 			}
@@ -79,7 +79,7 @@ func operationsLoop(ctx context.Context, cfg agentConfig, state *sharedState, le
 }
 
 // runOperation executes one operation, exactly once, ever.
-func runOperation(ctx context.Context, cfg agentConfig, op Operation, ledger *operationLedger) {
+func runOperation(ctx context.Context, cfg agentConfig, schedule []ScheduleEntry, op Operation, ledger *operationLedger) {
 	if _, seen := ledger.Seen(op.ID); seen {
 		// Already acted on, in some state. Its stored result is re-reported
 		// until the UI stops publishing it; nothing else to do.
@@ -105,7 +105,7 @@ func runOperation(ctx context.Context, cfg agentConfig, op Operation, ledger *op
 		return
 	}
 
-	args, err := operationArgs(cfg, op)
+	args, err := operationArgs(cfg, schedule, op)
 	if err != nil {
 		finishOperation(ledger, op, OperationResult{State: OpStateRefused, Error: err.Error()}, now)
 		return
@@ -158,14 +158,31 @@ func finishOperation(ledger *operationLedger, op Operation, res OperationResult,
 	}
 }
 
+// scheduleEntryFor finds the schedule entry a reinit needs, by VM name.
+//
+// Case-sensitive, matching libvirt: a domain name is what it is, and matching
+// loosely here would let a reinit resolve to a different pair's transport
+// settings than the operator's schedule shows.
+func scheduleEntryFor(schedule []ScheduleEntry, vm string) (ScheduleEntry, bool) {
+	for _, e := range schedule {
+		if e.VM == vm {
+			return e, true
+		}
+	}
+	return ScheduleEntry{}, false
+}
+
 // operationArgs builds the vmsync argv for an operation.
 //
-// The local URI throughout: -promote and -shutdown-domain refuse a remote
-// one by design, so that a failover needs no credentials to reach the site
-// that just failed. Inversion is the exception -- it genuinely spans both
-// ends -- and runs on the OLD SOURCE, which already has the SSH path
-// because that is the direction syncs run.
-func operationArgs(cfg agentConfig, op Operation) ([]string, error) {
+// The local URI throughout: -promote, -shutdown-domain and -restore-restore-point
+// all act on the host they run on, so that a failover needs no credentials to
+// reach the site that just failed. Two exceptions, both of which genuinely span
+// both ends and both of which run on the SOURCE, which already has the SSH path
+// because that is the direction syncs run: inversion, and reinit.
+//
+// The schedule is here only for reinit, which is the one kind that is a SYNC
+// and therefore needs a whole transport configuration rather than a domain name.
+func operationArgs(cfg agentConfig, schedule []ScheduleEntry, op Operation) ([]string, error) {
 	switch op.Kind {
 	case OpPromote:
 		args := []string{"-promote", "-target-uri", cfg.LibvirtURI, "-target-domain", op.VM}
@@ -217,12 +234,50 @@ func operationArgs(cfg agentConfig, op Operation) ([]string, error) {
 		}
 		return []string{"-update-role", op.Mode, "-target-uri", cfg.LibvirtURI, "-target-domain", op.VM}, nil
 
+	case OpRestore:
+		// The local URI, like promote and shutdown-domain: a restore acts on
+		// the host it runs on, so it needs no credentials to reach anywhere.
+		//
+		// -target-disk-path is deliberately NOT passed. The engine derives
+		// the directory from the target domain's own definition, which is
+		// the same rule the sync used to place the restore points -- a
+		// configured path agrees only when it happens to name the directory
+		// the disks are really in. See restoreRootFor.
+		//
+		// -force-restore is mandatory here. Without it the run only prints
+		// an assessment and changes nothing, which as an operation would be
+		// a request that reports success having done nothing at all. The
+		// assessment step is not lost: it moves to the UI, which must show
+		// what the restore would do before anyone can issue this.
+		return []string{
+			"-restore-restore-point", op.Tag,
+			"-force-restore",
+			"-target-uri", cfg.LibvirtURI,
+			"-target-domain", op.VM,
+		}, nil
+
 	case OpReinit:
 		// A one-shot full resync, as its own operation rather than a flag on
 		// the schedule. On the schedule it would be desired state with
 		// nobody to clear it, and every run would delete the target's disks
 		// again -- forever.
-		return nil, fmt.Errorf("reinit operations are not implemented yet (operation %s)", op.ID)
+		//
+		// Unlike every other kind here this is a SYNC, so it runs on the
+		// source and needs that pair's whole transport configuration --
+		// which lives in the schedule, not on the operation. Built from the
+		// same SyncRequest a scheduled run uses, so a reinit differs from an
+		// ordinary sync by exactly one flag and cannot drift from it.
+		entry, ok := scheduleEntryFor(schedule, op.VM)
+		if !ok {
+			return nil, fmt.Errorf("reinit operation %s names %s, which this agent has no schedule entry for -- a reinit is a full resync and needs that pair's source, target and transport settings, which live on the schedule. Note a reinit runs on the SOURCE's agent, unlike promote and restore which run on the target's", op.ID, op.VM)
+		}
+		plan, err := buildSyncRequest(cfg, entry)
+		if err != nil {
+			return nil, fmt.Errorf("reinit operation %s: %w", op.ID, err)
+		}
+		// The scheduled sync's own argv plus one flag, so a reinit cannot
+		// drift from the sync it is a one-off variant of.
+		return append(plan.CommandArgs(), "-reinit"), nil
 	}
 	return nil, fmt.Errorf("operation %s has kind %q, which this agent does not understand", op.ID, op.Kind)
 }

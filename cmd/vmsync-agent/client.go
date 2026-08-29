@@ -223,10 +223,39 @@ type ReportDomain struct {
 	// allocated figure, not the apparent one, because that is what a copy
 	// actually costs. Paired with Report.Filesystems it answers "is there
 	// room to keep the old copy?" before an inversion rather than after.
-	Disks      []ReportDisk `json:"disks,omitempty"`
-	Status     string       `json:"status"`
-	Reasons    []string     `json:"reasons,omitempty"`
-	AgeSeconds int64        `json:"age_seconds"`
+	Disks []ReportDisk `json:"disks,omitempty"`
+	// RestorePoints is what this replica can be rolled back to, newest
+	// first. Reported because a restore operation names a TAG, and a tag is
+	// a directory on this host's filesystem rather than anything in the
+	// domain's metadata -- so without this the control plane could only ask
+	// for a restore point it has never seen. Absent on any host not using
+	// -retention, which is the ordinary case.
+	RestorePoints []ReportRestorePoint `json:"restore_points,omitempty"`
+	Status        string               `json:"status"`
+	Reasons       []string             `json:"reasons,omitempty"`
+	AgeSeconds    int64                `json:"age_seconds"`
+}
+
+// ReportRestorePoint mirrors pkg/inventory.RestorePointInfo on the wire.
+type ReportRestorePoint struct {
+	Tag              string `json:"tag"`
+	TakenAtUnix      int64  `json:"taken_at_unix"`
+	CheckpointAtUnix int64  `json:"checkpoint_at_unix,omitempty"`
+	Checkpoint       string `json:"checkpoint,omitempty"`
+	Source           string `json:"source,omitempty"`
+	// Verify is "not-run", "passed" or "failed". "not-run" is the ordinary
+	// state, not a fault: restore points are taken before -verify runs. It
+	// is carried so an operator choosing between them can tell "never
+	// checked" from "checked and clean" -- reporting nothing would make
+	// those two indistinguishable at exactly the wrong moment.
+	Verify string `json:"verify,omitempty"`
+	// Disks are the basenames this point holds, so a confirmation dialog can
+	// say what a restore would replace without a second round trip.
+	Disks []string `json:"disks,omitempty"`
+	// Incomplete marks one whose sidecar could not be read. Listed anyway:
+	// the directory is the inventory, and hiding an entry that exists on
+	// disk would make this disagree with -list-restore-points.
+	Incomplete bool `json:"incomplete,omitempty"`
 }
 
 // SendReport uploads an inventory report.

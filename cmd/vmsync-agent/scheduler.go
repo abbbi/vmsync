@@ -356,9 +356,20 @@ type syncPlan struct {
 // would be a parameter needing validation; one read from local state is not
 // attacker-controlled at all.
 func (s *Scheduler) buildRequest(entry ScheduleEntry) (syncPlan, error) {
-	mgr, err := libvirtsync.Connect(s.cfg.LibvirtURI)
+	return buildSyncRequest(s.cfg, entry)
+}
+
+// buildSyncRequest is buildRequest's body, as a free function.
+//
+// Split out because the operations loop needs it too: a reinit operation is a
+// full sync, so it needs this pair's entire transport configuration, and
+// building that a second way would let a reinit drift from the scheduled sync
+// it is supposed to be a one-off variant of. Nothing here ever needed the
+// Scheduler -- only its agentConfig.
+func buildSyncRequest(cfg agentConfig, entry ScheduleEntry) (syncPlan, error) {
+	mgr, err := libvirtsync.Connect(cfg.LibvirtURI)
 	if err != nil {
-		return syncPlan{}, fmt.Errorf("connect to %s: %w", s.cfg.LibvirtURI, err)
+		return syncPlan{}, fmt.Errorf("connect to %s: %w", cfg.LibvirtURI, err)
 	}
 	defer mgr.Close()
 
@@ -391,19 +402,19 @@ func (s *Scheduler) buildRequest(entry ScheduleEntry) (syncPlan, error) {
 	}
 
 	plan := syncPlan{targetHost: host}
-	plan.SourceURI = s.cfg.LibvirtURI
-	plan.LocalHostName = s.cfg.Hostname
+	plan.SourceURI = cfg.LibvirtURI
+	plan.LocalHostName = cfg.Hostname
 	plan.SourceDomain = entry.VM
-	plan.TargetURI = fmt.Sprintf(s.cfg.TargetURIPattern, host)
+	plan.TargetURI = fmt.Sprintf(cfg.TargetURIPattern, host)
 	plan.TargetDomain = targetDomain
 	plan.Profile = entry.Profile
-	plan.SSHUser = s.cfg.SSHUser
-	plan.SSHKey = s.cfg.SSHKey
-	plan.SSHPort = s.cfg.SSHPort
-	plan.SSHKnownHosts = s.cfg.SSHKnownHosts
-	plan.BridgeHelperPath = s.cfg.BridgeHelperPath
-	if s.cfg.PrometheusDir != "" {
-		plan.PrometheusTextfile = filepath.Join(s.cfg.PrometheusDir, "vmsync_"+entry.VM+".prom")
+	plan.SSHUser = cfg.SSHUser
+	plan.SSHKey = cfg.SSHKey
+	plan.SSHPort = cfg.SSHPort
+	plan.SSHKnownHosts = cfg.SSHKnownHosts
+	plan.BridgeHelperPath = cfg.BridgeHelperPath
+	if cfg.PrometheusDir != "" {
+		plan.PrometheusTextfile = filepath.Join(cfg.PrometheusDir, "vmsync_"+entry.VM+".prom")
 	}
 	return plan, nil
 }

@@ -23,6 +23,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"vmsync/pkg/restorepoint"
 )
 
 // Operation is a one-shot instruction for exactly one agent.
@@ -77,6 +79,21 @@ type Operation struct {
 	// that silently meant 300 seconds in March and 900 in April is not one
 	// anybody can audit.
 	ShutdownTimeoutSec int `json:"shutdown_timeout_sec,omitempty"`
+	// Tag names the restore point a restore operation puts back.
+	//
+	// The one operation parameter that cannot be checked against local
+	// libvirt metadata the way PeerHost is, because a restore point is a
+	// directory rather than anything a domain records. It is checked against
+	// the filesystem instead: vmsync confirms the tag is in the target's own
+	// listing before it writes anything, and restorepoint.ParseTag refuses
+	// path separators, shell metacharacters and parent references outright,
+	// because this value is interpolated into commands including rm -rf.
+	//
+	// The agent still rejects an unknown tag before running anything, so a
+	// stale one from a UI whose report predates a prune is REFUSED and
+	// reported rather than surfacing as a failed run whose output nobody
+	// reads.
+	Tag string `json:"tag,omitempty"`
 
 	CreatedAtUnix int64  `json:"created_at_unix"`
 	CreatedBy     string `json:"created_by,omitempty"`
@@ -99,6 +116,13 @@ const (
 	OpShutdown = "shutdown-domain"
 	OpSetRole  = "set-role"
 	OpReinit   = "reinit"
+	// OpRestore rolls a replica back to one of its restore points, in place.
+	//
+	// The most destructive operation here: it replaces the replica's disks
+	// and pauses replication into it. It runs on the host holding the disks,
+	// with a local URI and no credentials, exactly like promote and
+	// shutdown-domain.
+	OpRestore = "restore"
 )
 
 // OperationResult is what the agent reports back.
@@ -325,6 +349,20 @@ func (op Operation) Validate(localPeers []string, now time.Time) error {
 	}
 	switch op.Kind {
 	case OpPromote, OpInvert, OpShutdown, OpSetRole, OpReinit:
+	case OpRestore:
+		// Checked HERE rather than in operationArgs, because a kind that
+		// passes Validate and then fails argv-building is recorded refused
+		// with its ID burned forever -- a bad tag would cost the operator
+		// the operation, not just the attempt. ParseTag is also what bounds
+		// the value before it reaches a shell: it refuses path separators,
+		// shell metacharacters and parent references, and this string ends
+		// up interpolated into commands including rm -rf.
+		if op.Tag == "" {
+			return fmt.Errorf("operation %s is a restore but names no restore point", op.ID)
+		}
+		if _, err := restorepoint.ParseTag(op.Tag); err != nil {
+			return fmt.Errorf("operation %s names an unusable restore point: %w", op.ID, err)
+		}
 	default:
 		// A kind from a newer UI. Refused and REPORTED rather than ignored:
 		// silence here would leave an operator watching a failover sit
