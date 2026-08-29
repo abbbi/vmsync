@@ -100,7 +100,7 @@ func TestShutdownTimeoutIsClamped(t *testing.T) {
 func TestShutdownOperationPassesItsTimeout(t *testing.T) {
 	cfg := agentConfig{LibvirtURI: "qemu:///system"}
 
-	args, err := operationArgs(cfg, Operation{
+	args, err := operationArgs(cfg, nil, Operation{
 		ID: "op-1", Kind: OpShutdown, VM: "web01", ShutdownTimeoutSec: 900,
 	})
 	if err != nil {
@@ -118,7 +118,7 @@ func TestShutdownOperationPassesItsTimeout(t *testing.T) {
 
 	// An older UI sends no timeout. vmsync's own default is then the right
 	// answer, and passing an explicit 0 would override it with nonsense.
-	args, err = operationArgs(cfg, Operation{ID: "op-2", Kind: OpShutdown, VM: "web01"})
+	args, err = operationArgs(cfg, nil, Operation{ID: "op-2", Kind: OpShutdown, VM: "web01"})
 	if err != nil {
 		t.Fatal(err)
 	}

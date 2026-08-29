@@ -258,7 +258,7 @@ func TestOperationArgs(t *testing.T) {
 	t.Run("promote", func(t *testing.T) {
 		op := promoteOp()
 		op.StartVM, op.Force = true, true
-		args, err := operationArgs(cfg, op)
+		args, err := operationArgs(cfg, nil, op)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -281,7 +281,7 @@ func TestOperationArgs(t *testing.T) {
 	t.Run("invert spans both ends", func(t *testing.T) {
 		op := promoteOp()
 		op.Kind = OpInvert
-		args, err := operationArgs(cfg, op)
+		args, err := operationArgs(cfg, nil, op)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -299,7 +299,7 @@ func TestOperationArgs(t *testing.T) {
 	t.Run("invert without a peer is refused", func(t *testing.T) {
 		op := promoteOp()
 		op.Kind, op.PeerHost = OpInvert, ""
-		if _, err := operationArgs(cfg, op); err == nil {
+		if _, err := operationArgs(cfg, nil, op); err == nil {
 			t.Error("built an invert with no far end")
 		}
 	})
@@ -307,7 +307,7 @@ func TestOperationArgs(t *testing.T) {
 	t.Run("set-role needs a role", func(t *testing.T) {
 		op := promoteOp()
 		op.Kind, op.Mode = OpSetRole, ""
-		if _, err := operationArgs(cfg, op); err == nil {
+		if _, err := operationArgs(cfg, nil, op); err == nil {
 			t.Error("built a set-role with no role")
 		}
 	})
