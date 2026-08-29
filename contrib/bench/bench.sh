@@ -3277,9 +3277,27 @@ stage_invert() {
 	# reason Stage 6 gives: RETURN does not fire on a signal.
 	INVERT_DONE=no
 	INVERT_CLEANED=no
+	INVERT_STOPPED_SOURCE=no
 	invert_cleanup() {
 		[ "$INVERT_CLEANED" = yes ] && return 0
 		INVERT_CLEANED=yes
+
+		# The source restart comes FIRST and is unconditional on
+		# INVERT_DONE: this stage shuts the source down to satisfy
+		# -invert's own precondition, and leaving a production-shaped
+		# source powered off is a worse thing to walk away from than any
+		# metadata this stage could scramble. It also has to happen even
+		# when the stage aborted before inverting anything.
+		if [ "$INVERT_STOPPED_SOURCE" = yes ]; then
+			local now_state
+			now_state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN" 2>/dev/null || true)"
+			if [ "$now_state" != running ]; then
+				log "   starting the source domain again (this stage shut it down)"
+				virsh_uri "$SOURCE_URI" start "$SOURCE_DOMAIN" >/dev/null 2>&1 \
+					|| warn "could not start '$SOURCE_DOMAIN' again -- start it by hand; every later stage that dirties the guest needs it running"
+			fi
+		fi
+
 		[ "$INVERT_DONE" = yes ] || return 0
 		log "stage 11: putting the pair back the way round it started"
 		# virsh, not vmsync -update-role: this has to work when the code
@@ -3296,6 +3314,8 @@ stage_invert() {
 	bench_sync "$sc" baseline -reinit
 	if [ "$RUN_RC" != 0 ]; then
 		warn "baseline full sync failed (see $RUN_LOG) -- aborting stage 11 before anything is inverted$(bench_sync_hint)"
+		invert_cleanup
+		trap - EXIT
 		return 1
 	fi
 
@@ -3338,10 +3358,68 @@ stage_invert() {
 		-promote-mode planned -promoted-by bench-harness
 	if [ "$RUN_RC" != 0 ]; then
 		warn "promote failed (see $RUN_LOG) -- aborting stage 11; an inversion needs a promoted peer"
-		INVERT_DONE=yes # the promotion may have landed; let the trap reset it
+		# The promotion may have landed even though the command failed, so
+		# the reset has to run -- and run NOW rather than at shell exit,
+		# which is where an armed EXIT trap would fire. A target left
+		# promoted refuses every sync in the estate, so every later stage
+		# would fail for a reason that has nothing to do with them.
+		INVERT_DONE=yes
+		invert_cleanup
+		trap - EXIT
 		return 1
 	fi
 	INVERT_DONE=yes
+
+	# --- the guard: inversion is refused while the old source runs -----------
+	# An inversion makes the old source a replication target, and a running
+	# target is one scheduled sync away from being overwritten under a live
+	# workload. vmsync refuses rather than stopping a production VM as a side
+	# effect of a metadata command -- which is exactly the kind of helpfulness
+	# nobody wants from a tool that can also delete disks.
+	#
+	# Free to assert, because the source IS running at this point: every other
+	# stage needs it up.
+	local src_state
+	src_state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN" 2>/dev/null || true)"
+	if [ "$src_state" = running ]; then
+		vmsync_verb_pair "$sc" invert-while-running -invert
+		if [ "$RUN_RC" != 0 ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "invert is refused while the old source is still running" "$fo_ok" \
+			"exit $RUN_RC -- inverting would make $SOURCE_DOMAIN a replication target while it is serving, and the next sync would overwrite it under a live workload. See $RUN_LOG"
+
+		if grep -qi "shut it down" "$RUN_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "and says what to do about it" "$fo_ok" \
+			"the refusal in $RUN_LOG does not tell the operator to shut the domain down first"
+	else
+		warn "SKIP the running-source refusal check: $SOURCE_DOMAIN is '$src_state', not running"
+		results_row "$CSV" "$sc" invert_refuses_running_source "" "" "" "" "" "" "SKIP source not running"
+	fi
+
+	# --- stop the source, which is that precondition -------------------------
+	if [ "$src_state" = running ]; then
+		log "   shutting the source down: -invert requires it, because the inversion makes it a replication target"
+		INVERT_STOPPED_SOURCE=yes
+		virsh_uri "$SOURCE_URI" shutdown "$SOURCE_DOMAIN" >/dev/null 2>&1 || true
+		local waited=0 now_state="$src_state"
+		while [ "$waited" -lt "${SOURCE_SHUTDOWN_WAIT_SECONDS:-90}" ]; do
+			now_state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN" 2>/dev/null || true)"
+			[ "$now_state" = shutoff ] && break
+			sleep 3
+			waited=$((waited + 3))
+		done
+		if [ "$now_state" != shutoff ]; then
+			# Deliberately NOT destroyed. Stage 6 will hard-stop a disposable
+			# replica, but this is the SOURCE -- the one domain in this pair
+			# standing in for production -- and pulling its power to run a
+			# test is a worse trade than not running the test. The cleanup
+			# still starts it if it did stop later.
+			warn "SKIP the rest of stage 11: $SOURCE_DOMAIN did not shut down within ${waited}s and this stage will not destroy the source to proceed. Raise SOURCE_SHUTDOWN_WAIT_SECONDS if this guest is legitimately slow to stop."
+			results_row "$CSV" "$sc" invert_precondition "" "" "" "" "" "" "SKIP source would not shut down"
+			invert_cleanup
+			trap - EXIT
+			return 0
+		fi
+	fi
 
 	# --- invert ---------------------------------------------------------------
 	# Run from here rather than on either host: -invert genuinely spans both
