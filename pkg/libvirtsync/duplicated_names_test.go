@@ -105,7 +105,7 @@ func TestRestorePointFieldNamesMatch(t *testing.T) {
 func TestARestoredReplicaIsRefusedBySync(t *testing.T) {
 	updates, _ := restorepoint.MetadataPlan(restorepoint.Status{
 		Checkpoint: "vmsync-cpt-000042", CheckpointAt: 1, TakenAt: 2, Disks: []string{"d.qcow2"},
-	})
+	}, restorepoint.Provenance{Tag: "2-vmsync-cpt-000042", AtUnix: 3, By: "alice"})
 	role := updates[MetadataFieldReplicationRole]
 	if role == "" {
 		t.Fatal("a restore leaves no replication_role at all, so the next sync would be allowed")
