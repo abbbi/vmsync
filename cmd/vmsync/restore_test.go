@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -202,6 +203,178 @@ func TestCheckRestoreIdentityIgnoresAnUnparsableLastReplicatedAt(t *testing.T) {
 	plan.lastReplicatedAt = "not-a-timestamp"
 	if err := checkRestoreIdentity(restoreTestCfg(), plan); err != nil {
 		t.Fatalf("an unparsable last_replicated_at blocked a restore: %v", err)
+	}
+}
+
+// restoreRootFor derives -target-disk-path from the domain when the flag is
+// absent. A restore refuses outright without the domain, so by the time this
+// runs the domain is known to exist and has already said where its disks are.
+
+func TestRestoreRootForDerivesFromTheDomainWhenTheFlagIsAbsent(t *testing.T) {
+	cfg := restoreTestCfg()
+	cfg.TargetDiskPath = ""
+
+	replicaDir, root, err := restoreRootFor(cfg, restoreTestPlan(t))
+	if err != nil {
+		t.Fatalf("restoreRootFor: %v", err)
+	}
+	if replicaDir != "/data/replicas" {
+		t.Errorf("replicaDir = %q, want /data/replicas", replicaDir)
+	}
+	// The SAME rule the sync path uses, restorepoint.Root(actual disk path) --
+	// not path.Join(flag, DirName). Those agree only when the flag names the
+	// directory the disks are really in, so a sync run without the flag takes
+	// restore points the verbs cannot find.
+	if want := restorepoint.Root("/data/replicas/web01.qcow2"); root != want {
+		t.Errorf("root = %q, want %q (the same expression the sync path uses)", root, want)
+	}
+}
+
+func TestRestoreRootForPrefersAnExplicitFlag(t *testing.T) {
+	cfg := restoreTestCfg()
+	cfg.TargetDiskPath = "/elsewhere"
+
+	replicaDir, root, err := restoreRootFor(cfg, restoreTestPlan(t))
+	if err != nil {
+		t.Fatalf("restoreRootFor: %v", err)
+	}
+	if replicaDir != "/elsewhere" || root != "/elsewhere/"+restorepoint.DirName {
+		t.Fatalf("an explicit -target-disk-path was ignored: dir=%q root=%q", replicaDir, root)
+	}
+	// Ignored, not trusted: checkRestoreIdentity refuses it against this same
+	// domain, so a wrong flag cannot silently aim the restore elsewhere.
+	plan := restoreTestPlan(t)
+	plan.replicaDir = replicaDir
+	plan.disks = []string{"/elsewhere/web01.qcow2", "/elsewhere/web01-data.qcow2"}
+	if err := checkRestoreIdentity(cfg, plan); err == nil {
+		t.Fatal("an explicit -target-disk-path naming files the domain does not own was accepted")
+	}
+}
+
+func TestRestoreRootForRefusesScatteredDisks(t *testing.T) {
+	// -retention refuses such a domain outright ("every target disk in one
+	// directory so a restore point is a single consistent set"), so there is
+	// no set to find. Picking one of the directories would look in an empty
+	// one and report "no restore point" for entirely the wrong reason.
+	plan := restoreTestPlan(t)
+	plan.domXML = strings.Replace(plan.domXML,
+		"/data/replicas/web01-data.qcow2", "/data/other/web01-data.qcow2", 1)
+	cfg := restoreTestCfg()
+	cfg.TargetDiskPath = ""
+
+	_, _, err := restoreRootFor(cfg, plan)
+	if err == nil {
+		t.Fatal("a domain whose disks span two directories was accepted")
+	}
+	for _, want := range []string{"/data/replicas", "/data/other", "-target-disk-path"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
+func TestRestoreRootForRefusesADomainWithNoQcowDisks(t *testing.T) {
+	plan := restoreTestPlan(t)
+	plan.domXML = `<domain type='kvm'><name>web01</name><devices></devices></domain>`
+	cfg := restoreTestCfg()
+	cfg.TargetDiskPath = ""
+
+	if _, _, err := restoreRootFor(cfg, plan); err == nil {
+		t.Fatal("a domain with no qcow2 disks was accepted; there is nowhere for restore points to be")
+	}
+}
+
+// uriRunsCommandsLocally decides whether cp, mv and rm run here or over SSH.
+// Getting it wrong in the permissive direction runs them against the wrong
+// machine's filesystem -- silently, because the paths very likely exist there
+// too.
+func TestUriRunsCommandsLocally(t *testing.T) {
+	local := []string{
+		"qemu:///system",
+		"qemu:///session",
+		"qemu+unix:///system",
+		"qemu://localhost/system",
+		"qemu://127.0.0.1/system",
+	}
+	for _, uri := range local {
+		if !uriRunsCommandsLocally(uri) {
+			t.Errorf("uriRunsCommandsLocally(%q) = false, want true -- vmsync is on the host holding the disks", uri)
+		}
+	}
+
+	remote := []struct{ uri, why string }{
+		{"qemu+ssh://tgthost/system", "ssh: the operator named a user and a key, and running as whoever invoked vmsync would change who owns the files it creates"},
+		{"qemu+ssh://localhost/system", "ssh even to localhost stays on the ssh path, for the same reason"},
+		{"qemu+tcp://tgthost/system", "THE trap: neither ssh nor local. Running commands here would touch this machine's filesystem while libvirt acts on another's"},
+		{"qemu+tls://tgthost/system", "same as tcp"},
+		{"qemu://tgthost/system", "names a remote host"},
+	}
+	for _, tc := range remote {
+		if uriRunsCommandsLocally(tc.uri) {
+			t.Errorf("uriRunsCommandsLocally(%q) = true, want false -- %s", tc.uri, tc.why)
+		}
+	}
+}
+
+func TestTargetRunnerRefusesAURIItCannotRunCommandsOn(t *testing.T) {
+	// qemu+tcp:// reaches libvirt but offers no way to run a shell command on
+	// the host. Falling back to local would be silently wrong, so it refuses --
+	// and the message has to name the two ways out, since the fix is a
+	// different URI scheme rather than a missing flag.
+	cfg := syncConfig{TargetURI: "qemu+tcp://tgthost/system", TargetDiskPath: "/data/replicas"}
+	_, closeRunner, err := targetRunnerForRestorePoints(cfg)
+	closeRunner()
+	if err == nil {
+		t.Fatal("a qemu+tcp:// target URI was accepted; commands would have run on the wrong host")
+	}
+	for _, want := range []string{"qemu+ssh://", "qemu:///system"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not offer %s as a way out", err.Error(), want)
+		}
+	}
+}
+
+func TestTargetRunnerCleanupIsAlwaysSafeToCall(t *testing.T) {
+	// Callers defer it unconditionally, including on the error path, so a nil
+	// func would turn every bad URI into a panic.
+	for _, uri := range []string{"qemu:///system", "qemu+tcp://tgthost/system", "::not a uri::"} {
+		_, closeRunner, _ := targetRunnerForRestorePoints(syncConfig{TargetURI: uri})
+		if closeRunner == nil {
+			t.Fatalf("targetRunnerForRestorePoints(%q) returned a nil cleanup", uri)
+		}
+		closeRunner()
+	}
+}
+
+// localRunner has to behave exactly as remotessh.Client.Run does, because
+// every command builder in pkg/restorepoint is written against those
+// semantics. A difference here would show up as a restore command that works
+// over SSH and misbehaves on the host itself.
+func TestLocalRunnerMatchesTheSSHRunContract(t *testing.T) {
+	ctx := context.Background()
+	r := localRunner{}
+
+	out, err := r.Run(ctx, "echo hello")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out != "hello" {
+		t.Errorf("Run trimmed output = %q, want %q", out, "hello")
+	}
+
+	// stderr is merged, not dropped: the command builders write their refusal
+	// messages to stderr and the callers put them in the error.
+	out, err = r.Run(ctx, "echo oops >&2; exit 1")
+	if err == nil {
+		t.Fatal("a non-zero exit was reported as success")
+	}
+	if !strings.Contains(out, "oops") {
+		t.Errorf("stderr was dropped: output = %q", out)
+	}
+
+	// Shell, not a parsed argv: the builders emit if/fi, pipes and redirection.
+	if out, err = r.Run(ctx, "if [ -n \"x\" ]; then echo yes; fi"); err != nil || out != "yes" {
+		t.Errorf("shell constructs are not honoured: out=%q err=%v", out, err)
 	}
 }
 

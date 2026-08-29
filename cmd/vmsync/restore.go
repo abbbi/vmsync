@@ -20,13 +20,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"path"
 	"strconv"
 	"time"
 
 	"vmsync/pkg/disk"
 	"vmsync/pkg/libvirtsync"
-	"vmsync/pkg/remotessh"
 	"vmsync/pkg/restorepoint"
 	"vmsync/pkg/trace"
 	"vmsync/pkg/util"
@@ -62,6 +62,11 @@ type restorePlan struct {
 	status restorepoint.Status
 	root   string
 	dir    string
+	// replicaDir is the directory the replica's disks live in -- taken from
+	// -target-disk-path when given, otherwise read off the domain itself. Kept
+	// on the plan rather than passed around so every message names the
+	// directory actually used, not the flag that may have been empty.
+	replicaDir string
 
 	// role is the target's replication_role as found, before the restore
 	// pauses it.
@@ -90,12 +95,6 @@ func runRestoreRestorePoint(ctx context.Context, cfg syncConfig, tagName string)
 	if err != nil {
 		return fmt.Errorf("%w -- run -list-restore-points to see the available tags", err)
 	}
-	root, err := restorePointRoot(cfg)
-	if err != nil {
-		return err
-	}
-	replicaDir := cfg.TargetDiskPath
-
 	// libvirt first, and before the SSH connection: the two questions that can
 	// refuse this outright -- what role the domain has, and whether it is
 	// running -- are both answered there, and asking them first means a
@@ -107,28 +106,34 @@ func runRestoreRestorePoint(ctx context.Context, cfg syncConfig, tagName string)
 	}
 	defer tgtMgr.Close()
 
-	plan := restorePlan{tag: tag, root: root, dir: restorepoint.Dir(root, tag)}
+	plan := restorePlan{tag: tag}
 	if err := checkRestoreTargetState(tgtMgr, cfg, &plan); err != nil {
 		return err
 	}
 
-	client, err := dialTargetForRestorePoints(cfg)
+	replicaDir, root, err := restoreRootFor(cfg, plan)
 	if err != nil {
 		return err
 	}
-	defer client.Close()
+	plan.replicaDir, plan.root, plan.dir = replicaDir, root, restorepoint.Dir(root, tag)
+
+	client, closeRunner, err := targetRunnerForRestorePoints(cfg)
+	if err != nil {
+		return err
+	}
+	defer closeRunner()
 
 	// The same lock a sync takes, for the same reason and under the same key.
 	// Without it a scheduled sync can be mid-copy on the exact files being
 	// replaced, with a qemu-nbd holding them open -- and neither side would
 	// see the other. Phase 1's read-only verbs take no lock; this one must.
-	lock, err := util.AcquireRemoteRunLock(ctx, client, runLockDir, targetLockKey(cfg.TargetDomain))
+	lock, err := acquireTargetRunLock(ctx, cfg, client)
 	if err != nil {
 		return fmt.Errorf("restore: %w", err)
 	}
 	defer lock.Close()
 
-	if err := loadRestorePlan(ctx, client, replicaDir, &plan); err != nil {
+	if err := loadRestorePlan(ctx, client, &plan); err != nil {
 		return err
 	}
 	// Before the assessment, not after: the assessment describes a restore in
@@ -144,6 +149,75 @@ func runRestoreRestorePoint(ctx context.Context, cfg syncConfig, tagName string)
 		return nil
 	}
 	return applyRestore(ctx, client, tgtMgr, cfg, plan)
+}
+
+// restoreRootFor decides where this restore's files are: the directory holding
+// the replica's disks, and the restore point root inside it.
+//
+// -target-disk-path is optional HERE and required by the read-only verbs, and
+// the asymmetry is not an oversight. Those verbs are built to work on a target
+// that is gone, half-defined, or was never defined -- which is a state an
+// operator reaching for a restore point may well be in -- so they cannot ask
+// libvirt anything. A restore is the opposite case by construction: it refuses
+// outright without the domain, because rolling the disks back and failing to
+// invalidate the domain's replication metadata is the one outcome the next sync
+// cannot detect. So by the time this runs, the domain is known to exist and has
+// already told us where its disks are.
+//
+// Deriving is also MORE correct than the flag, not merely more convenient. The
+// sync path puts restore points at restorepoint.Root(the actual disk path);
+// the verbs look in path.Join(-target-disk-path, DirName). Those agree only
+// when the flag names the directory the disks are really in -- so a sync run
+// WITHOUT -target-disk-path (target path defaults to the source's own) takes
+// restore points the verbs then cannot find. Reading the path back off the
+// domain uses the same rule the sync used, whatever the flags were.
+//
+// An explicit flag still wins, so an operator can point at a directory
+// deliberately; checkRestoreIdentity then verifies it against this same domain
+// and refuses if they disagree.
+func restoreRootFor(cfg syncConfig, plan restorePlan) (replicaDir, root string, err error) {
+	if cfg.TargetDiskPath != "" {
+		return cfg.TargetDiskPath, path.Join(cfg.TargetDiskPath, restorepoint.DirName), nil
+	}
+
+	disks, err := disk.ParseQcowDisks(plan.domXML)
+	if err != nil {
+		return "", "", fmt.Errorf("read the disks of target domain %s to locate its restore points: %w -- or name the directory with -target-disk-path", cfg.TargetDomain, err)
+	}
+	if len(disks) == 0 {
+		return "", "", fmt.Errorf("target domain %s lists no qcow2 disks, so there is nowhere for its restore points to be -- name the directory with -target-disk-path if they are somewhere else", cfg.TargetDomain)
+	}
+
+	// A restore point is a SET, and a set only exists if the disks share a
+	// directory -- which is exactly why -retention refuses to run when they do
+	// not. A domain whose disks are scattered therefore has no restore points
+	// to find, and guessing one of the directories would look up an empty one
+	// and report "no restore point" for the wrong reason.
+	replicaDir = path.Dir(disks[0].Source)
+	for _, d := range disks[1:] {
+		if other := path.Dir(d.Source); other != replicaDir {
+			return "", "", fmt.Errorf("target domain %s keeps its disks in more than one directory (%s and %s), so it has no single restore point set -- -retention refuses such a domain for the same reason; name the directory with -target-disk-path if you know where to look",
+				cfg.TargetDomain, replicaDir, other)
+		}
+	}
+	trace.Debug("located the restore points from the target domain's own disks", "vm", cfg.TargetDomain, "dir", replicaDir)
+	return replicaDir, restorepoint.Root(disks[0].Source), nil
+}
+
+// acquireTargetRunLock takes the target-side run lock, whichever side of the
+// SSH boundary this is running on.
+//
+// The two implementations meet on the same file: both flock RunLockPath(dir,
+// key), so a local restore and a sync driving that target over SSH contend
+// correctly with each other -- which is the entire point, since the thing
+// being excluded is a sync writing the very disks about to be replaced.
+func acquireTargetRunLock(ctx context.Context, cfg syncConfig, runner remoteRunner) (io.Closer, error) {
+	key := targetLockKey(cfg.TargetDomain)
+	if holder, ok := runner.(util.CommandHolder); ok {
+		return util.AcquireRemoteRunLock(ctx, holder, runLockDir, key)
+	}
+	// Local: the same flock the source-side lock in main() uses.
+	return util.AcquireRunLock(runLockDir, key)
 }
 
 // checkRestoreTargetState answers the two questions that refuse a restore
@@ -229,8 +303,8 @@ func checkRestoreIdentity(cfg syncConfig, plan restorePlan) error {
 	}
 	for _, p := range plan.disks {
 		if !owned[p] {
-			return fmt.Errorf("target domain %s does not refer to %s, but -target-disk-path %s says that is where its replica lives (the domain's disks are %v) -- these are not the same machine's files; check that -target-domain and -target-disk-path name the same replica",
-				cfg.TargetDomain, p, cfg.TargetDiskPath, ownedList)
+			return fmt.Errorf("target domain %s does not refer to %s, but %s is where this restore would look for its replica (the domain's disks are %v) -- these are not the same machine's files; check that -target-domain and -target-disk-path name the same replica",
+				cfg.TargetDomain, p, plan.replicaDir, ownedList)
 		}
 	}
 
@@ -268,7 +342,8 @@ func checkRestoreIdentity(cfg syncConfig, plan restorePlan) error {
 }
 
 // loadRestorePlan fills in everything the restore would touch, writing nothing.
-func loadRestorePlan(ctx context.Context, client remoteRunner, replicaDir string, plan *restorePlan) error {
+func loadRestorePlan(ctx context.Context, client remoteRunner, plan *restorePlan) error {
+	replicaDir := plan.replicaDir
 	// Confirm the tag is really there before reading anything out of it, so a
 	// mistyped tag fails naming the tag rather than naming a missing file.
 	listing, err := listRestorePoints(ctx, client, plan.root)
@@ -350,6 +425,7 @@ func printRestoreAssessment(cfg syncConfig, plan restorePlan) {
 	fmt.Printf("  replica of      %s\n", orNone(plan.replicaSource))
 	fmt.Printf("  verify          %s%s\n", orNone(plan.status.Verify), verifyCaveat(plan.status.Verify))
 	fmt.Printf("  target role     %s\n", orNone(plan.role))
+	fmt.Printf("  restore points  %s\n", plan.root)
 	fmt.Printf("\n  disks to replace (%d):\n", len(plan.disks))
 	for i, d := range plan.disks {
 		fmt.Printf("    %s\n", d)
@@ -438,7 +514,7 @@ func verifyCaveat(v string) string {
 // a replica whose contents are OLDER than its metadata claims -- which is
 // precisely the state the next incremental sync cannot detect and will corrupt.
 // One of those two failure modes is recoverable and one is not.
-func applyRestore(ctx context.Context, client *remotessh.Client, tgtMgr *libvirtsync.Manager, cfg syncConfig, plan restorePlan) error {
+func applyRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.Manager, cfg syncConfig, plan restorePlan) error {
 	// Remembered before anything displaces the files, exactly as -reinit does:
 	// the copies are created by the SSH user (often root), and a replica qemu
 	// cannot open is a restore that produced an unbootable VM.
@@ -538,7 +614,7 @@ func applyRestore(ctx context.Context, client *remotessh.Client, tgtMgr *libvirt
 // reported individually and loudly. The end state is named explicitly either
 // way, because "some disks are from Tuesday and some are from today" is a state
 // nobody should have to work out from a stack trace.
-func undoRestore(ctx context.Context, client *remotessh.Client, tgtMgr *libvirtsync.Manager, cfg syncConfig, plan restorePlan, upTo int, owners []util.DiskOwner) {
+func undoRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.Manager, cfg syncConfig, plan restorePlan, upTo int, owners []util.DiskOwner) {
 	if upTo == 0 {
 		trace.Warning("restore: no disk had been replaced yet, so the replica is exactly as it was. The staged copies and the aside copies are left in place for inspection",
 			"staged", plan.temps, "asides", plan.asides)

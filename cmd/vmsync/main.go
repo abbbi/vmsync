@@ -296,7 +296,7 @@ func main() {
 	flag.BoolVar(&cfg.ListRestorePoints, "list-restore-points", false, "List the restore points kept on the target and stop. Needs -target-uri and -target-disk-path; reads the target filesystem only, and touches neither the replica nor libvirt")
 	flag.StringVar(&cfg.CloneRestorePoint, "clone-restore-point", "", "Copy one restore point's disks to the directory given by -clone-to, and stop. Takes a tag from -list-restore-points. This is how to answer \"is that copy clean?\": boot a throwaway domain from the clone. It changes nothing about the replica, its metadata, or its role -- restoring in place is a different operation and is deliberately not this one")
 	flag.StringVar(&cfg.CloneRestorePointTo, "clone-to", "", "Directory on the target to write -clone-restore-point's copies into. Created if missing")
-	flag.StringVar(&cfg.RestoreRestorePoint, "restore-restore-point", "", "Put one restore point back over the replica IN PLACE, discarding its current contents. Takes a tag from -list-restore-points. Without -force-restore this only prints an assessment and changes nothing. A restore is for promoting: it leaves replication PAUSED, because the next sync from the same source would otherwise overwrite exactly what was rolled back to")
+	flag.StringVar(&cfg.RestoreRestorePoint, "restore-restore-point", "", "Put one restore point back over the replica IN PLACE, discarding its current contents. Takes a tag from -list-restore-points. -target-disk-path is optional here (unlike the read-only verbs): a restore needs the target domain to exist, so where its disks are is read from the domain itself. Without -force-restore this only prints an assessment and changes nothing. A restore is for promoting: it leaves replication PAUSED, because the next sync from the same source would otherwise overwrite exactly what was rolled back to")
 	flag.BoolVar(&cfg.ForceRestore, "force-restore", false, "Carry out -restore-restore-point instead of only assessing it. Required, because a restore replaces the replica's disks and cannot be undone once the displaced contents are removed")
 	flag.StringVar(&cfg.TestFault, "test", "", fmt.Sprintf("FOR TESTING ONLY: make vmsync deliberately fail at a chosen point, so error-recovery paths that cannot be reached from outside the process can be exercised. Accepts one of: %s. A run with this set WILL fail and its result means nothing as a replication. Listed here rather than hidden, so an operator who finds it in a log can look it up", strings.Join(libvirtsync.TestFaults, ", ")))
 	compressArg := optionalValueFlag{bareDefault: "s2"}
@@ -955,7 +955,11 @@ var targetQemuOwnerOnce struct {
 // The alternative is a sync that reports success and leaves behind a replica
 // that cannot boot, which is the failure mode this whole function exists to
 // remove.
-func applyTargetDiskOwner(ctx context.Context, client *remotessh.Client, cfg syncConfig, targetPath string, replaced util.DiskOwner) error {
+// The runner is an interface rather than *remotessh.Client because a restore
+// can run on the target host itself, where reaching the filesystem is exec
+// and not ssh. Nothing in here needed the concrete type: the two qemu-account
+// helpers it calls already took this same one-method seam.
+func applyTargetDiskOwner(ctx context.Context, client util.CommandRunner, cfg syncConfig, targetPath string, replaced util.DiskOwner) error {
 	owner, err := util.ParseDiskOwner(cfg.TargetDiskOwner)
 	if err != nil {
 		return err

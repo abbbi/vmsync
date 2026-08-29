@@ -3013,6 +3013,15 @@ stage_restore() {
 	if grep -q "$rp_old" "$RUN_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "the assessment names the restore point it would apply" "$fo_ok" "see $RUN_LOG"
 
+	# Same assessment, without -target-disk-path. A restore refuses outright
+	# without the target domain, so it can read the directory off the domain
+	# instead -- and doing so uses the same rule the sync used to place the
+	# restore points, which the flag only matches when it happens to name the
+	# directory the disks are really in.
+	if VERB_OMIT_DISK_PATH=yes vmsync_verb "$sc" assess-derived -restore-restore-point "$rp_old"; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the restore finds its restore points without -target-disk-path" "$fo_ok" \
+		"it could not locate $rp_dir from the target domain's own disks -- see $RUN_LOG"
+
 	if files_same "$replica" "$new_copy"; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "the assessment leaves the replica untouched" "$fo_ok" \
 		"$replica changed during an assessment that was supposed to write nothing"
@@ -3225,7 +3234,12 @@ vmsync_verb() {
 	# -update-role do not: both act on the domain, and both refuse without
 	# it. Leaving it out made every verb that touches libvirt fail here for a
 	# reason that had nothing to do with what was being tested.
-	local args=(-target-uri "$TARGET_URI" -target-domain "$TARGET_DOMAIN" -target-disk-path "$TARGET_DISK_PATH")
+	local args=(-target-uri "$TARGET_URI" -target-domain "$TARGET_DOMAIN")
+	# VERB_OMIT_DISK_PATH=yes leaves -target-disk-path off, which is how the
+	# restore's ability to find its own restore points gets tested: it reads
+	# the directory off the target domain, and the flag would mask a failure
+	# to do so.
+	[ "${VERB_OMIT_DISK_PATH:-no}" = yes ] || args+=(-target-disk-path "$TARGET_DISK_PATH")
 	[ -n "${SSH_USER:-}" ] && args+=(-ssh-user "$SSH_USER")
 	[ -n "${SSH_KEY:-}" ] && args+=(-ssh-key "$SSH_KEY")
 	[ -n "${SSH_PORT:-}" ] && args+=(-ssh-port "$SSH_PORT")

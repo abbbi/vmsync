@@ -20,8 +20,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"os/exec"
 	"path"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -324,10 +327,71 @@ func sweepRestorePointsForReinit(ctx context.Context, cfg syncConfig, runner rem
 // vmsync's metadata), and an operator running these during an incident should
 // not be able to change anything by looking.
 
-// dialTargetForRestorePoints opens the SSH connection these verbs need.
-func dialTargetForRestorePoints(cfg syncConfig) (*remotessh.Client, error) {
+// localRunner runs a restore point command on THIS host.
+//
+// Restore points live beside the replica's disks, so every command here acts
+// on the host holding them -- and when vmsync is already running on that host,
+// reaching it means exec, not ssh. Without this, all three verbs refused a
+// local -target-uri, which meant they could not be used on the one machine
+// where the files actually are: an operator standing at the DR site, and the
+// agent, which has only qemu:///system.
+//
+// Its Run must behave exactly as remotessh.Client.Run does, because every
+// command builder in pkg/restorepoint is written against those semantics:
+// stdout and stderr merged, whitespace trimmed, a non-zero exit reported as an
+// error with the output still returned. sh -c rather than a parsed argv,
+// because the builders emit shell -- pipes, redirections, if/fi.
+type localRunner struct{}
+
+func (localRunner) Run(ctx context.Context, command string) (string, error) {
+	out, err := exec.CommandContext(ctx, "sh", "-c", command).CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		return text, fmt.Errorf("run command %q: %w", command, err)
+	}
+	return text, nil
+}
+
+// uriRunsCommandsLocally reports whether a shell command for this libvirt URI
+// would act on the host vmsync is running on.
+//
+// Deliberately NOT "is it not ssh". qemu+tcp://otherhost/system is neither ssh
+// nor local, and treating it as local would run rm and mv against the wrong
+// machine's filesystem -- silently, since the paths would very likely exist
+// there too. Only a URI naming no host at all, or naming this one, qualifies.
+//
+// An ssh URI pointing at localhost stays on the ssh path on purpose: the
+// operator named a user and a key, and quietly running as whoever invoked
+// vmsync instead would change which account owns the files it creates.
+func uriRunsCommandsLocally(raw string) bool {
+	if util.UriUsesSSH(raw) {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	switch u.Hostname() {
+	case "", "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+
+// targetRunnerForRestorePoints returns something that can run commands where
+// the restore points are, plus the cleanup for it.
+//
+// The cleanup is always non-nil, so callers defer it unconditionally.
+func targetRunnerForRestorePoints(cfg syncConfig) (remoteRunner, func(), error) {
+	if uriRunsCommandsLocally(cfg.TargetURI) {
+		trace.Debug("restore points: reaching the target filesystem locally", "uri", cfg.TargetURI)
+		return localRunner{}, func() {}, nil
+	}
 	if !util.UriUsesSSH(cfg.TargetURI) {
-		return nil, fmt.Errorf("-target-uri must be ssh-based to reach the restore points on the target")
+		// qemu+tcp:// and friends: a remote host with no way to run a command
+		// on it. Named explicitly rather than folded into a generic refusal,
+		// because the fix is a different URI scheme and not a missing flag.
+		return nil, func() {}, fmt.Errorf("-target-uri %q names a remote host but not a way to run commands on it -- restore points live in the target's filesystem, so this needs either an ssh-based URI (qemu+ssh://) or vmsync running on the target itself with a local URI (qemu:///system)", cfg.TargetURI)
 	}
 	sshCfg, err := remotessh.ConfigFromLibvirtURI(
 		cfg.TargetURI, cfg.SSHUser, cfg.SSHKey, cfg.SSHPassword,
@@ -335,20 +399,32 @@ func dialTargetForRestorePoints(cfg syncConfig) (*remotessh.Client, error) {
 		time.Duration(cfg.SSHTimeoutSec)*time.Second,
 	)
 	if err != nil {
-		return nil, err
+		return nil, func() {}, err
 	}
-	return remotessh.Dial(sshCfg)
+	client, err := remotessh.Dial(sshCfg)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	return client, func() { client.Close() }, nil
 }
 
-// restorePointRoot derives the restore point directory from -target-disk-path.
+// restorePointRoot derives the restore point directory from -target-disk-path,
+// for the two READ-ONLY verbs.
 //
 // Deliberately not by asking libvirt what disks the target has: these verbs
 // must work when the target domain is gone, half-defined, or was never
 // defined -- which is exactly the situation somebody reaching for a restore
-// point may be in.
+// point may be in. They also never connect to libvirt at all, so they still
+// answer when libvirtd itself is the thing that is broken.
+//
+// -restore-restore-point does derive it (restoreRootFor), and the asymmetry is
+// deliberate: a restore refuses outright without the domain, so by the time it
+// looks the domain has already said where its disks are. See that function for
+// why deriving is the more correct answer rather than merely the convenient
+// one.
 func restorePointRoot(cfg syncConfig) (string, error) {
 	if cfg.TargetDiskPath == "" {
-		return "", fmt.Errorf("-target-disk-path is required to locate restore points; they live in %s inside it", restorepoint.DirName)
+		return "", fmt.Errorf("-target-disk-path is required to locate restore points; they live in %s inside it. (-restore-restore-point reads it off the target domain instead, but these verbs are built to work on a target whose domain is gone, so they cannot)", restorepoint.DirName)
 	}
 	return path.Join(cfg.TargetDiskPath, restorepoint.DirName), nil
 }
@@ -359,11 +435,11 @@ func runListRestorePoints(ctx context.Context, cfg syncConfig) error {
 	if err != nil {
 		return err
 	}
-	client, err := dialTargetForRestorePoints(cfg)
+	client, closeRunner, err := targetRunnerForRestorePoints(cfg)
 	if err != nil {
 		return err
 	}
-	defer client.Close()
+	defer closeRunner()
 
 	listing, err := listRestorePoints(ctx, client, root)
 	if err != nil {
@@ -427,11 +503,11 @@ func runCloneRestorePoint(ctx context.Context, cfg syncConfig, tagName, dest str
 	if err != nil {
 		return err
 	}
-	client, err := dialTargetForRestorePoints(cfg)
+	client, closeRunner, err := targetRunnerForRestorePoints(cfg)
 	if err != nil {
 		return err
 	}
-	defer client.Close()
+	defer closeRunner()
 
 	// Confirm it is actually there before writing anything, so a mistyped tag
 	// fails clean instead of leaving an empty destination behind.
