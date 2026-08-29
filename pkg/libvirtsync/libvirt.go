@@ -1997,7 +1997,39 @@ func DeleteCheckpointIfExists(dom *libvirt.Domain, checkpointName string) error 
 		return fmt.Errorf("lookup checkpoint %s for deletion: %w", checkpointName, err)
 	}
 	defer cp.Free()
-	if err := cp.Delete(0); err != nil {
+
+	// METADATA_ONLY when the domain is not running, and only then.
+	//
+	// Deleting a checkpoint normally means merging its dirty bitmap into the
+	// next one, which qemu does live -- so with no flags libvirt refuses
+	// outright on an inactive domain: VIR_ERR_OPERATION_UNSUPPORTED, "cannot
+	// delete checkpoint for inactive domain". That made -invert impossible to
+	// complete by its own rules: AssessInvert REQUIRES the old source shut
+	// down, because the inversion turns it into a replication target and a
+	// running target is one scheduled sync from being overwritten under a
+	// live workload -- and then the very next step tried to drop that
+	// domain's checkpoint chain, which needs it running. Every inversion
+	// following the documented procedure failed at that step, having changed
+	// nothing.
+	//
+	// The flag drops libvirt's record of the checkpoint and leaves its bitmap
+	// in the qcow2. That is a real cost -- orphan bitmaps take space and
+	// accumulate -- and it is bounded here to a case where it does not
+	// matter: the only caller that deletes from an inactive domain is the
+	// inversion, whose whole point is that these disks become a replication
+	// TARGET. The first sync in the new direction must be a full one (invert
+	// says so in its own output), and a full sync refuses to write over an
+	// existing target disk, so that sync is a -reinit, which replaces the
+	// file and the orphan bitmaps with it.
+	//
+	// A running domain still gets the complete deletion. Doing metadata-only
+	// unconditionally would leave bitmaps behind on every ordinary sync,
+	// where the domain IS running and the full delete works.
+	var flags libvirt.DomainCheckpointDeleteFlags
+	if active, activeErr := DomainActive(dom); activeErr == nil && !active {
+		flags |= libvirt.DOMAIN_CHECKPOINT_DELETE_METADATA_ONLY
+	}
+	if err := cp.Delete(flags); err != nil {
 		return fmt.Errorf("delete checkpoint %s: %w", checkpointName, err)
 	}
 	return nil
@@ -2014,8 +2046,12 @@ func DeleteAllManagedCheckpoints(dom *libvirt.Domain) error {
 		return err
 	}
 	for _, name := range checkpointDeletionOrder(existing) {
+		// Returned unwrapped: DeleteCheckpointIfExists already names the
+		// checkpoint, and wrapping again produced "delete checkpoint X:
+		// delete checkpoint X: <cause>" in the log -- twice the length for
+		// none of the information.
 		if err := DeleteCheckpointIfExists(dom, name); err != nil {
-			return fmt.Errorf("delete checkpoint %s: %w", name, err)
+			return err
 		}
 	}
 	return nil
