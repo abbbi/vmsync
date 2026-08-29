@@ -68,6 +68,18 @@ type SyncProfile struct {
 	ReinitAfterFailures int `json:"reinit_after_failures,omitempty"`
 	// TargetDiskPath is where the replica's disks live on the target host.
 	TargetDiskPath string `json:"target_disk_path,omitempty"`
+	// TimestampToleranceSec is how far a replica disk's mtime may be ahead of
+	// the last sync timestamp before vmsync refuses, in seconds.
+	//
+	// Here rather than only on the command line because the outage it exists
+	// to end is one an agent-managed estate hits hardest: those two
+	// timestamps come from different hosts' clocks, so a target running a
+	// second fast fails EVERY scheduled sync for that pair, forever, with an
+	// error blaming out-of-band modification. A knob only reachable by
+	// hand-running vmsync would not fix a schedule.
+	//
+	// Zero is vmsync's own default and the behaviour that predates the flag.
+	TimestampToleranceSec int `json:"timestamp_tolerance_sec,omitempty"`
 	// Retention is "<count>,<interval>" (e.g. "24,3h"), or empty to keep no
 	// restore points.
 	//
@@ -136,6 +148,12 @@ func PresetProfile(name Preset) (SyncProfile, bool) {
 const (
 	maxIODepth             = 64
 	maxReinitAfterFailures = 100
+	// An hour. Enough for any clock disagreement worth calling drift --
+	// NTP-managed hosts differ by milliseconds and a badly broken one by
+	// seconds or minutes -- and past it the out-of-band-modification check
+	// would tolerate a whole working morning's worth of stray writes, which
+	// is switching the check off rather than allowing for skew.
+	maxTimestampToleranceSec = 3600
 )
 
 // Validate rejects anything this agent will not run. Every error names the
@@ -196,6 +214,15 @@ func (p SyncProfile) Validate() error {
 		if p.TargetDiskPath != filepath.Clean(p.TargetDiskPath) {
 			return fmt.Errorf("target_disk_path %q is not a clean path (contains \"..\", a trailing slash, or a doubled separator)", p.TargetDiskPath)
 		}
+	}
+
+	// Bounded on both sides. Negative is a typo; and past an hour this stops
+	// being a tolerance for clock disagreement and becomes a way to switch
+	// the out-of-band-modification check off, which is a different decision
+	// and should not be reachable by fat-fingering a zero.
+	if p.TimestampToleranceSec < 0 || p.TimestampToleranceSec > maxTimestampToleranceSec {
+		return fmt.Errorf("timestamp_tolerance_sec %d is out of range (0 to compare exactly, otherwise up to %d -- beyond that the check stops catching anything)",
+			p.TimestampToleranceSec, maxTimestampToleranceSec)
 	}
 
 	if p.Retention != "" {
@@ -288,6 +315,9 @@ func (r SyncRequest) CommandArgs() []string {
 	}
 	if p.Retention != "" {
 		args = append(args, "-retention", p.Retention)
+	}
+	if p.TimestampToleranceSec > 0 {
+		args = append(args, "-timestamp-tolerance-sec", strconv.Itoa(p.TimestampToleranceSec))
 	}
 	if r.SSHUser != "" {
 		args = append(args, "-ssh-user", r.SSHUser)

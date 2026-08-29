@@ -224,6 +224,11 @@ type syncConfig struct {
 	SSHInsecure   bool
 	KnownHosts    string
 	SSHTimeoutSec int
+	// TimestampToleranceSec is how far a replica disk's mtime may be ahead
+	// of last_sync_timestamp before the out-of-band-modification check
+	// refuses. Zero, the default, is the behaviour that predates the flag.
+	// See targetFileNewerThanSync for why a tolerance is needed at all.
+	TimestampToleranceSec int
 
 	Start                  bool
 	Reinit                 bool
@@ -292,6 +297,7 @@ func main() {
 	flag.BoolVar(&cfg.SSHInsecure, "ssh-insecure-host-key", false, "disable host key verification (not recommended)")
 	flag.StringVar(&cfg.KnownHosts, "ssh-known-hosts", "", "known_hosts file path (defaults to ~/.ssh/known_hosts)")
 	flag.IntVar(&cfg.SSHTimeoutSec, "ssh-timeout-sec", 10, "ssh connection timeout in seconds")
+	flag.IntVar(&cfg.TimestampToleranceSec, "timestamp-tolerance-sec", 0, "How far a replica disk's mtime may be ahead of the last sync timestamp before the sync refuses, in seconds. These are two DIFFERENT clocks -- the mtime is the target host's, the timestamp is this host's -- so with the default of 0 a target whose clock runs even a second fast fails every incremental sync with an error blaming out-of-band modification. Set this above the drift the error reports to recover without a full -reinit; a value near -30s worth of NTP jitter is reasonable, and fixing NTP is better")
 	flag.BoolVar(&cfg.Start, "start", false, "In case vm is in non-running state, start in paused mode to allow sync")
 	flag.BoolVar(&cfg.Reinit, "reinit", false, "Delete VM on target and restart a full sync process")
 	flag.StringVar(&cfg.ReplacedDiskAction, "replaced-disk-action", replacedDiskRename, fmt.Sprintf("What to do with a target disk file that is about to be discarded and rebuilt (currently only -reinit does this): %q renames it to <path>%s<unixtime> so its contents survive, %q removes it. Defaults to %q: the target of a reinit may be a former primary whose disks still hold everything written after the last successful sync, and that is unrecoverable once deleted. Renaming needs room for both copies, and the aside files are never reaped automatically", replacedDiskRename, replacedDiskSuffix, replacedDiskDelete, replacedDiskRename))
@@ -868,6 +874,51 @@ func checkpointChainConsistent(metadataEntryCheckpoint, parent string) bool {
 		return true
 	}
 	return metadataEntryCheckpoint == parent
+}
+
+// targetFileNewerThanSync reports whether a replica disk looks like it was
+// written to behind vmsync's back since the last sync, and by how much.
+//
+// THE TWO TIMESTAMPS COME FROM DIFFERENT CLOCKS, and that is the whole reason
+// this function takes a tolerance. mtime is `stat -c %Y` on the TARGET host,
+// so it is the target's clock; lastSync is last_sync_timestamp, written by
+// UpdateSyncMetadata from time.Now() on the host RUNNING vmsync, which is the
+// source side. Comparing them is only meaningful to the extent those two
+// clocks agree.
+//
+// With no tolerance -- which is what this was before the flag existed -- a
+// target whose clock is even one second ahead of the source's fails this check
+// on every incremental sync, forever, with an error blaming out-of-band
+// modification. The replica is fine; the clocks are not. That is a permanent,
+// self-inflicted replication outage caused by NTP drift, and recovering from
+// it needed either a full -reinit or a clock fix on a host an operator may not
+// control.
+//
+// The check is still worth having: it catches somebody writing to the replica
+// through the filesystem between syncs, which no checkpoint comparison can
+// see. A tolerance narrows it rather than removing it -- an out-of-band write
+// is normally minutes or hours after a sync, not inside the window two NTP
+// clients disagree by.
+//
+// Parsed as integers rather than compared as strings. The old string
+// comparison happened to order 10-digit unix timestamps correctly and will
+// keep doing so until the year 2286, but it silently reported "newer" for any
+// value that was not a number at all -- a stat that printed an error, say --
+// which is the wrong answer in the dangerous direction.
+func targetFileNewerThanSync(mtime, lastSync string, tolerance time.Duration) (newer bool, aheadBy time.Duration, err error) {
+	m, err := strconv.ParseInt(strings.TrimSpace(mtime), 10, 64)
+	if err != nil {
+		return false, 0, fmt.Errorf("target file mtime %q is not a unix timestamp: %w", mtime, err)
+	}
+	s, err := strconv.ParseInt(strings.TrimSpace(lastSync), 10, 64)
+	if err != nil {
+		return false, 0, fmt.Errorf("last_sync_timestamp %q is not a unix timestamp: %w", lastSync, err)
+	}
+	ahead := time.Duration(m-s) * time.Second
+	if tolerance < 0 {
+		tolerance = 0
+	}
+	return ahead > tolerance, ahead, nil
 }
 
 // listeningPorts asks a host which TCP ports are currently in LISTEN state,
@@ -2517,9 +2568,17 @@ func run(cfg syncConfig) (runErr error) {
 					if err != nil {
 						return fmt.Errorf("%w: %s", err, out)
 					}
-					if out > metadataEntryTimestamp {
-						return fmt.Errorf("Target file on system is newer (%s)  than last sync timestamp: %s: file on target has been changed between syncs", out, targetPath)
-
+					newer, aheadBy, cmpErr := targetFileNewerThanSync(out, metadataEntryTimestamp, time.Duration(cfg.TimestampToleranceSec)*time.Second)
+					if cmpErr != nil {
+						return fmt.Errorf("comparing %s against the last sync timestamp: %w", targetPath, cmpErr)
+					}
+					if newer {
+						// The skew is named, because the number is what tells
+						// the two causes apart: a few seconds is two hosts'
+						// clocks disagreeing, and hours is somebody having
+						// written to the replica.
+						return fmt.Errorf("target file %s has an mtime %s newer than the last sync timestamp, beyond the %ds tolerance -- either something wrote to the replica between syncs, or this host's clock and the target's disagree by that much (they are different clocks: the mtime is the target's, last_sync_timestamp is this host's). If it is clock drift, fix NTP or raise -timestamp-tolerance-sec above %d",
+							targetPath, aheadBy, cfg.TimestampToleranceSec, int64(aheadBy.Seconds()))
 					}
 				}
 				trace.Info("Successfully verified target file timestamps")

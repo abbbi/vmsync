@@ -434,3 +434,85 @@ func TestSourcePortsNeeded(t *testing.T) {
 		t.Errorf("sourcePortsNeeded(true) = %d, want 2 (export plus its bridge at +1)", got)
 	}
 }
+
+// targetFileNewerThanSync is the guard that catches somebody writing to the
+// replica between syncs -- and, before it took a tolerance, the guard that
+// turned a one-second NTP disagreement into a permanent replication outage.
+// The two timestamps it compares come from different hosts' clocks.
+func TestTargetFileNewerThanSync(t *testing.T) {
+	const sync = "1756041600"
+
+	for name, tc := range map[string]struct {
+		mtime     string
+		tolerance time.Duration
+		wantNewer bool
+	}{
+		// The ordinary case: the disk was written before the metadata, so
+		// its mtime is at or behind the sync timestamp.
+		"older than the sync": {"1756041500", 0, false},
+		"exactly the sync":    {sync, 0, false},
+		// Zero tolerance is what the flag exists to escape: one second of
+		// forward drift on the target fails every incremental sync, forever,
+		// with an error blaming out-of-band modification.
+		"one second ahead, no tolerance": {"1756041601", 0, true},
+		"one second ahead, 30s allowed":  {"1756041601", 30 * time.Second, false},
+		"30s ahead, 30s allowed":         {"1756041630", 30 * time.Second, false},
+		// The boundary is exclusive: 31s ahead of a 30s tolerance is over.
+		"31s ahead, 30s allowed": {"1756041631", 30 * time.Second, true},
+		// A tolerance does not blind the check. An out-of-band write is
+		// normally minutes or hours after a sync, not inside NTP jitter.
+		"an hour ahead, 30s allowed": {"1756045200", 30 * time.Second, true},
+		// Behind by a lot is not "newer" at any tolerance -- a target clock
+		// running slow is a different problem and not this one's to report.
+		"an hour behind": {"1756038000", 0, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			newer, _, err := targetFileNewerThanSync(tc.mtime, sync, tc.tolerance)
+			if err != nil {
+				t.Fatalf("targetFileNewerThanSync: %v", err)
+			}
+			if newer != tc.wantNewer {
+				t.Errorf("newer = %v, want %v", newer, tc.wantNewer)
+			}
+		})
+	}
+}
+
+func TestTargetFileNewerThanSyncReportsTheSkew(t *testing.T) {
+	// The number is what tells the two causes apart: seconds means two
+	// clocks disagree, hours means somebody wrote to the replica. The error
+	// message quotes it so an operator can size the flag from one failure.
+	_, ahead, err := targetFileNewerThanSync("1756041690", "1756041600", 0)
+	if err != nil {
+		t.Fatalf("targetFileNewerThanSync: %v", err)
+	}
+	if ahead != 90*time.Second {
+		t.Errorf("ahead = %v, want 90s", ahead)
+	}
+}
+
+func TestTargetFileNewerThanSyncRefusesNonNumericInput(t *testing.T) {
+	// The old string comparison reported "newer" for anything that was not a
+	// number -- a stat that printed an error, say -- which is the wrong
+	// answer in the dangerous direction: it fails the sync while describing
+	// a modification that never happened.
+	if _, _, err := targetFileNewerThanSync("stat: No such file or directory", "1756041600", 0); err == nil {
+		t.Error("a stat error was accepted as an mtime")
+	}
+	if _, _, err := targetFileNewerThanSync("1756041600", "not-a-timestamp", 0); err == nil {
+		t.Error("an unparsable last_sync_timestamp was accepted")
+	}
+}
+
+func TestTargetFileNewerThanSyncTreatsANegativeToleranceAsZero(t *testing.T) {
+	// A negative value can only come from a typo, and reading it as "even
+	// stricter than exact" would refuse syncs whose mtime is correctly equal
+	// to the timestamp.
+	newer, _, err := targetFileNewerThanSync("1756041600", "1756041600", -5*time.Second)
+	if err != nil {
+		t.Fatalf("targetFileNewerThanSync: %v", err)
+	}
+	if newer {
+		t.Error("a negative tolerance made an equal timestamp count as newer")
+	}
+}
