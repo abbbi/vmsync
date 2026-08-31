@@ -26,7 +26,9 @@ import (
 
 func testRunLog(t *testing.T) *runLog {
 	t.Helper()
-	l := newRunLog(t.TempDir(), "session-1")
+	// nil metrics: every method on agentMetrics is nil-guarded, and none of
+	// these tests is about the gauge.
+	l := newRunLog(t.TempDir(), "session-1", nil)
 	if err := l.Open(); err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -44,7 +46,7 @@ func TestRunLogAppendFailsWhenTheFileCannotBeWritten(t *testing.T) {
 	if err := os.WriteFile(blocker, []byte("a file, not a directory"), 0o600); err != nil {
 		t.Fatalf("set up the blocker: %v", err)
 	}
-	l := newRunLog(filepath.Join(blocker, "state"), "session-1")
+	l := newRunLog(filepath.Join(blocker, "state"), "session-1", nil)
 
 	if err := l.Open(); err == nil {
 		t.Fatal("Open reported success against an unwritable path")
