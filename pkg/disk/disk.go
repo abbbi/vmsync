@@ -84,7 +84,22 @@ func ParseQcowDisks(domainXML string) ([]QcowDisk, error) {
 		}
 
 		if util.IgnoreDevice(d) == true {
-			trace.Info("skipping incompatible", "device", targetDev)
+			// The domain name, because this is not only called per-sync:
+			// inventory.Scan runs it for EVERY domain on the host on every
+			// report cycle, so without it an agent emits a stream of
+			// "skipping vda" with nothing saying which of forty VMs it means.
+			//
+			// The reason too. "incompatible" covers two quite different
+			// things -- a cdrom, which is expected and uninteresting, and a
+			// disk whose driver is not qcow2, which is a VM somebody may
+			// believe is being replicated and is not. Reading the same line
+			// for both is what makes the second one easy to miss.
+			format := "none"
+			if d.Driver != nil && d.Driver.Type != "" {
+				format = d.Driver.Type
+			}
+			trace.Info("skipping incompatible device, it will not be replicated",
+				"vm", domcfg.Name, "device", targetDev, "device_type", d.Device, "format", format)
 			continue
 		}
 
