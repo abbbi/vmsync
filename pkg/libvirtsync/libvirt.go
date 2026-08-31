@@ -1998,38 +1998,33 @@ func DeleteCheckpointIfExists(dom *libvirt.Domain, checkpointName string) error 
 	}
 	defer cp.Free()
 
-	// METADATA_ONLY when the domain is not running, and only then.
+	// NEVER metadata-only. It was tried here and it corrupts the pair.
 	//
-	// Deleting a checkpoint normally means merging its dirty bitmap into the
-	// next one, which qemu does live -- so with no flags libvirt refuses
-	// outright on an inactive domain: VIR_ERR_OPERATION_UNSUPPORTED, "cannot
-	// delete checkpoint for inactive domain". That made -invert impossible to
-	// complete by its own rules: AssessInvert REQUIRES the old source shut
-	// down, because the inversion turns it into a replication target and a
-	// running target is one scheduled sync from being overwritten under a
-	// live workload -- and then the very next step tried to drop that
-	// domain's checkpoint chain, which needs it running. Every inversion
-	// following the documented procedure failed at that step, having changed
-	// nothing.
+	// Deleting a checkpoint means merging its dirty bitmap into the next one,
+	// which qemu only does live -- so on an inactive domain libvirt refuses
+	// with VIR_ERR_OPERATION_UNSUPPORTED, "cannot delete checkpoint for
+	// inactive domain". VIR_DOMAIN_CHECKPOINT_DELETE_METADATA_ONLY gets past
+	// that refusal by dropping libvirt's RECORD of the checkpoint and leaving
+	// the bitmap in the qcow2. The domain then has no checkpoints as far as
+	// libvirt is concerned, `virsh checkpoint-list` shows none, and the next
+	// sync starts its chain again at vmsync-cpt-000001 -- at which point qemu
+	// refuses: "Bitmap already exists: vmsync-cpt-000001". Every subsequent
+	// sync for that pair fails the same way, and nothing in libvirt's view
+	// explains why. Recovery is qemu-img bitmap --remove per disk, by hand.
 	//
-	// The flag drops libvirt's record of the checkpoint and leaves its bitmap
-	// in the qcow2. That is a real cost -- orphan bitmaps take space and
-	// accumulate -- and it is bounded here to a case where it does not
-	// matter: the only caller that deletes from an inactive domain is the
-	// inversion, whose whole point is that these disks become a replication
-	// TARGET. The first sync in the new direction must be a full one (invert
-	// says so in its own output), and a full sync refuses to write over an
-	// existing target disk, so that sync is a -reinit, which replaces the
-	// file and the orphan bitmaps with it.
+	// The rule is: checkpoint metadata may only be dropped without its bitmap
+	// when the IMAGE ITSELF is about to be deleted or replaced, which is what
+	// makes DefineDomain's DOMAIN_UNDEFINE_CHECKPOINTS_METADATA safe --
+	// nothing there survives to carry the orphan. This function has seven
+	// callers, most of them ordinary sync paths against images that stay, so
+	// it cannot make that assumption for any of them.
 	//
-	// A running domain still gets the complete deletion. Doing metadata-only
-	// unconditionally would leave bitmaps behind on every ordinary sync,
-	// where the domain IS running and the full delete works.
-	var flags libvirt.DomainCheckpointDeleteFlags
-	if active, activeErr := DomainActive(dom); activeErr == nil && !active {
-		flags |= libvirt.DOMAIN_CHECKPOINT_DELETE_METADATA_ONLY
-	}
-	if err := cp.Delete(flags); err != nil {
+	// The refusal on an inactive domain is therefore left to propagate. It is
+	// a real problem for -invert, which requires the old source shut down and
+	// then tries to drop its chain -- but the fix for that belongs in the
+	// inversion, where the disks' fate is known, and it has to remove the
+	// bitmaps too rather than merely stop mentioning them.
+	if err := cp.Delete(0); err != nil {
 		return fmt.Errorf("delete checkpoint %s: %w", checkpointName, err)
 	}
 	return nil
