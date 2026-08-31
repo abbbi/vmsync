@@ -81,7 +81,11 @@ func (f *optionalValueFlag) Set(s string) error {
 // runLockDir holds both run locks: the source-side one taken in main(), and
 // the target-side one taken in run() over SSH. The same directory on
 // whichever host the lock belongs to.
-const runLockDir = "/run/vmsync-locks"
+//
+// Aliased to util.RunLockDir rather than duplicated: vmsync-agent reads these
+// same files to find out whether a sync it did not start is still running, so
+// the two binaries must not be able to drift apart on the path.
+const runLockDir = util.RunLockDir
 
 // targetLockTimeout bounds acquiring the target-side lock. Short on purpose:
 // it is a single SSH round trip, and a contended lock answers immediately.
@@ -643,6 +647,28 @@ func main() {
 		os.Exit(1)
 	}
 	defer lockFile.Close()
+
+	// Stamp who holds this lock into the lock file itself.
+	//
+	// The lock file is otherwise always empty, and it is the only record whose
+	// lifetime is tied to the process it describes: only the exclusive holder
+	// can write it, the kernel releases the lock with the holder however it
+	// dies, and /run is tmpfs so a reboot clears the whole namespace. That is
+	// what lets vmsync-agent tell "a sync I started and forgot about across a
+	// restart" from "a stale file", without ever probing the lock itself --
+	// probing would mean acquiring it, which is the very skip it would be
+	// trying to detect.
+	//
+	// Best-effort on purpose. This is provenance, not correctness: a failure
+	// here costs an agent one wasted process spawn later, and refusing to sync
+	// because a diagnostic could not be written would be the wrong trade.
+	identity := util.NewRunLockIdentity("sync", cfg.SourceDomain,
+		util.ReplicaHost(cfg.TargetURI, cfg.LocalHostName)+":"+cfg.TargetDomain,
+		"", time.Now().Unix())
+	if err := util.WriteRunLockIdentity(lockFile, identity); err != nil {
+		trace.Warning("could not record this process's identity in its run lock; an agent restarting during this sync may launch a second one, which will stand down harmlessly",
+			"domain", cfg.SourceDomain, "error", err)
+	}
 
 	// -ignore-external-snapshot's whole point is to skip cleanly, not just
 	// sync anyway -- so this has to happen before run() is ever called: its
