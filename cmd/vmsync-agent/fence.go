@@ -33,6 +33,7 @@ import (
 	"vmsync/pkg/inventory"
 	"vmsync/pkg/libvirtsync"
 	"vmsync/pkg/trace"
+	"vmsync/pkg/util"
 )
 
 const (
@@ -64,6 +65,31 @@ const (
 	// refusing to grow without limit.
 	fenceLedgerKept = 1000
 )
+
+// replicaSelfRef is how this host appears in another domain's replication
+// metadata: the "host:domain" a peer's replica_source or fence token names
+// when it means us.
+//
+// It MUST be derived exactly the way the value it is compared against was
+// written, and this function exists so that is enforced by construction
+// rather than by two call sites happening to agree.
+//
+// It did not used to be. The fence check built this from cfg.Hostname alone,
+// while the string it is matched against is stamped by vmsync as
+// util.ReplicaHost(-source-uri, -local-host-name) -- and the agent passes
+// exactly cfg.LibvirtURI and cfg.Hostname for those two (scheduler.go, where
+// plan.SourceURI and plan.LocalHostName are set). ReplicaHost PREFERS the
+// URI's host and ignores the local name entirely whenever the URI has one
+// (pkg/util/util.go), so the two agreed only for a URI with no host --
+// qemu:///system, the default, which is why this was invisible.
+//
+// With a remote -libvirt-uri they disagreed permanently: every fence token
+// naming this host failed to match, verdict.Fence was false forever, and
+// split-brain protection was silently off with nothing logged, because a
+// non-matching token is the ordinary case the check exists to filter out.
+func replicaSelfRef(cfg agentConfig, domain string) string {
+	return libvirtsync.ReplicaEntry(util.ReplicaHost(cfg.LibvirtURI, cfg.Hostname), domain)
+}
 
 // fenceRecord is the durable proof that one fence token was acted on.
 type fenceRecord struct {
@@ -353,7 +379,7 @@ func checkOneFence(ctx context.Context, cfg agentConfig, cached UIConfig, ledger
 		return false
 	}
 
-	self := libvirtsync.ReplicaEntry(cfg.Hostname, d.Name)
+	self := replicaSelfRef(cfg, d.Name)
 	verdict := failover.AssessFence(failover.FenceObservation{
 		Token:        rep.Fence,
 		TargetRole:   rep.TargetRole,

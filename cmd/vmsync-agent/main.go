@@ -55,6 +55,7 @@ import (
 	"vmsync/pkg/inventory"
 	"vmsync/pkg/libvirtsync"
 	"vmsync/pkg/trace"
+	"vmsync/pkg/util"
 	"vmsync/pkg/version"
 )
 
@@ -189,6 +190,22 @@ func main() {
 		cfg.Hostname = h
 	}
 	trace.SetDebug(cfg.Debug)
+
+	// This host has TWO names when -libvirt-uri points somewhere else, and
+	// they are used for different things: -hostname is what the UI knows this
+	// agent as, while replication metadata identifies it by the URI's host,
+	// because util.ReplicaHost prefers that and ignores the local name
+	// whenever the URI has one.
+	//
+	// Not an error -- both names are doing their job -- but it is worth saying
+	// once, because everything about a pair (fence tokens, replica_source,
+	// which row in the console) then keys off a name that is not the one in
+	// the flag. It is also exactly the configuration in which the fence check
+	// used to compare the wrong string and silently never fire.
+	if h := util.ReplicaHost(cfg.LibvirtURI, cfg.Hostname); h != cfg.Hostname {
+		trace.Warning("this agent reports under one name and appears in replication metadata under another, because -libvirt-uri names a remote host",
+			"reports_as", cfg.Hostname, "replica_identity", h, "libvirt_uri", cfg.LibvirtURI)
+	}
 	if cfg.PrometheusDir != "" {
 		cfg.metrics = newAgentMetrics(version.Version, cfg.Hostname, cfg.StandaloneFile != "")
 	}

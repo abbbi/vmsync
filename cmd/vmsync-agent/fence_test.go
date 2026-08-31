@@ -20,7 +20,58 @@ package main
 import (
 	"strconv"
 	"testing"
+
+	"vmsync/pkg/util"
 )
+
+// replicaSelfRef must produce the SAME string vmsync stamps into replication
+// metadata, or every fence token naming this host fails to match and split
+// brain protection is silently off.
+//
+// The two are derived from the same inputs by the same function on purpose:
+// the agent runs vmsync with -source-uri cfg.LibvirtURI and -local-host-name
+// cfg.Hostname (see scheduler.go), and vmsync stamps
+// util.ReplicaHost(-source-uri, -local-host-name). This asserts the agent's
+// side agrees, for a remote URI as well as a local one -- the local case is
+// the one that always worked and hid the bug.
+func TestReplicaSelfRefMatchesWhatVmsyncStamps(t *testing.T) {
+	for _, tc := range []struct {
+		name, uri, hostname, want string
+	}{
+		{
+			// The default, and why this was invisible: with no host in the
+			// URI, ReplicaHost falls through to the local name, so comparing
+			// cfg.Hostname directly happened to be right.
+			"a local uri uses the configured hostname",
+			"qemu:///system", "prod01", "prod01:web01",
+		},
+		{
+			// The broken case. ReplicaHost prefers the URI's host and ignores
+			// the local name entirely, so the old code compared "mgmt01:web01"
+			// against a stamp of "prod01:web01" -- forever.
+			"a remote uri uses the uri's host, not the configured hostname",
+			"qemu+ssh://prod01/system", "mgmt01", "prod01:web01",
+		},
+		{
+			"a remote uri with a port and a user still uses the host",
+			"qemu+ssh://root@prod01:2222/system", "mgmt01", "prod01:web01",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := agentConfig{LibvirtURI: tc.uri, Hostname: tc.hostname}
+			got := replicaSelfRef(cfg, "web01")
+			if got != tc.want {
+				t.Errorf("replicaSelfRef = %q, want %q", got, tc.want)
+			}
+			// The property that actually matters, stated directly: this is
+			// the same derivation vmsync applies to the same two values.
+			stamped := util.ReplicaHost(tc.uri, tc.hostname) + ":web01"
+			if got != stamped {
+				t.Errorf("replicaSelfRef = %q but vmsync stamps %q -- a fence token naming this host would never match", got, stamped)
+			}
+		})
+	}
+}
 
 func TestParseFenceReportReadsAnArmedToken(t *testing.T) {
 	out := []byte(`{"reachable":true,"target_ref":"dr01:web01","target_role":"promoted","target_active":true,` +
