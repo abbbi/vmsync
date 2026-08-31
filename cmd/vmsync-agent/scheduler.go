@@ -246,13 +246,28 @@ func (s *Scheduler) metricsSnapshot() (running int, nextRun map[string]int64) {
 }
 
 // stagger spreads first runs across the interval, deterministically per VM.
+//
+// A 64-bit hash, not 32-bit, and that is the whole point rather than a detail.
+// interval is a time.Duration -- NANOSECONDS -- so an hour is 3.6e12 and a day
+// is 8.64e13, while a 32-bit hash cannot exceed 4294967295, which is 4.29
+// SECONDS. Taking that modulo any interval longer than 4.29s returns the hash
+// unchanged, so this function used to return the same handful of sub-5-second
+// offsets whether the cadence was 30 seconds or 24 hours: every entry became
+// due within seconds of agent start, together, which is exactly what the doc
+// comment on due() says this exists to prevent.
+//
+// fnv.New64a spans 1.8e19, comfortably past any plausible interval, so the
+// modulo distributes across the whole cadence and the bias is one part in
+// millions. Still deterministic per VM, so a given VM keeps its slot across
+// restarts -- though not the SAME slot it had before this fix, since the hash
+// function changed. That is a one-off reshuffle, not a behaviour change.
 func stagger(vm string, interval time.Duration) time.Duration {
-	h := fnv.New32a()
+	h := fnv.New64a()
 	_, _ = h.Write([]byte(vm))
 	if interval <= 0 {
 		return 0
 	}
-	return time.Duration(uint64(h.Sum32()) % uint64(interval))
+	return time.Duration(h.Sum64() % uint64(interval))
 }
 
 // markRunning claims an entry and sets its next slot.
