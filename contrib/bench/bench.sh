@@ -3444,7 +3444,7 @@ stage_invert() {
 	# ends, and this is the one failover verb that takes a remote URI.
 	vmsync_verb_pair "$sc" invert -invert
 	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
-	fo_check "$sc" "invert succeeds against a promoted peer" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
+	fo_check "$sc" "invert succeeds against a promoted peer" "$fo_ok" "exit $RUN_RC -- $(log_reason "$RUN_LOG")"
 
 	# --- both ends' metadata flipped -----------------------------------------
 	local got
@@ -3542,7 +3542,7 @@ stage_invert() {
 	vmsync_verb_pair "$sc" invert-again -invert
 	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "inverting an already-inverted pair succeeds" "$fo_ok" \
-		"exit $RUN_RC -- re-running is the recovery for a half-applied inversion, so it must not fail on a complete one. See $RUN_LOG"
+		"exit $RUN_RC -- re-running is the recovery for a half-applied inversion, so it must not fail on a complete one: $(log_reason "$RUN_LOG")"
 
 	if grep -qi "already inverted" "$RUN_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "and says it had nothing to do" "$fo_ok" \
@@ -3551,6 +3551,25 @@ stage_invert() {
 	invert_cleanup
 	trap - EXIT
 	return 0
+}
+
+# log_reason FILE -- the line from a vmsync log most likely to say why it
+# failed, for putting in an assertion's failure detail.
+#
+# Worth the few lines. "see <path>" is a fine pointer when somebody is sitting
+# at the machine, and useless in a pasted report -- which is how these results
+# actually get read. A stage that fails without quoting the reason costs a
+# whole extra run to diagnose.
+#
+# Prefers the last ERROR/FATAL line, since vmsync's trace output ends with its
+# own summary lines after the real cause; falls back to the last non-empty
+# line. Newlines and commas are squashed because this lands in a CSV field.
+log_reason() {
+	local f="$1" line=""
+	[ -f "$f" ] || { printf 'no log at %s' "$f"; return 0; }
+	line="$(grep -iE 'ERROR|FATAL' "$f" 2>/dev/null | tail -1)"
+	[ -z "$line" ] && line="$(grep -v '^[[:space:]]*$' "$f" 2>/dev/null | tail -1)"
+	printf '%s' "$line" | tr '\n' ' ' | tr ',' ';' | cut -c1-400
 }
 
 # vmsync_verb_pair SCENARIO PHASE ARGS... -- run a vmsync verb that spans BOTH
