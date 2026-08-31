@@ -294,28 +294,31 @@ func operationArgs(cfg agentConfig, schedule []ScheduleEntry, op Operation) ([]s
 		}
 		return args, nil
 
-	case OpReinit:
-		// A one-shot full resync, as its own operation rather than a flag on
-		// the schedule. On the schedule it would be desired state with
+	case OpReinit, OpForceClean:
+		// One-shot full resyncs, as their own operations rather than flags on
+		// the schedule. On the schedule either would be desired state with
 		// nobody to clear it, and every run would delete the target's disks
-		// again -- forever.
+		// again -- forever. -force-clean would additionally undefine the
+		// target domain on every cycle, so the argument is stronger still.
 		//
-		// Unlike every other kind here this is a SYNC, so it runs on the
-		// source and needs that pair's whole transport configuration --
-		// which lives in the schedule, not on the operation. Built from the
-		// same SyncRequest a scheduled run uses, so a reinit differs from an
-		// ordinary sync by exactly one flag and cannot drift from it.
+		// Unlike every other kind here these are SYNCS, so they run on the
+		// source and need that pair's whole transport configuration -- which
+		// lives in the schedule, not on the operation. Built from the same
+		// SyncRequest a scheduled run uses, so they differ from an ordinary
+		// sync by exactly one flag and cannot drift from it.
+		flag := "-reinit"
+		if op.Kind == OpForceClean {
+			flag = "-force-clean"
+		}
 		entry, ok := scheduleEntryFor(schedule, op.VM)
 		if !ok {
-			return nil, fmt.Errorf("reinit operation %s names %s, which this agent has no schedule entry for -- a reinit is a full resync and needs that pair's source, target and transport settings, which live on the schedule. Note a reinit runs on the SOURCE's agent, unlike promote and restore which run on the target's", op.ID, op.VM)
+			return nil, fmt.Errorf("%s operation %s names %s, which this agent has no schedule entry for -- it is a full resync and needs that pair's source, target and transport settings, which live on the schedule. Note it runs on the SOURCE's agent, unlike promote and restore which run on the target's", op.Kind, op.ID, op.VM)
 		}
 		plan, err := buildSyncRequest(cfg, entry)
 		if err != nil {
-			return nil, fmt.Errorf("reinit operation %s: %w", op.ID, err)
+			return nil, fmt.Errorf("%s operation %s: %w", op.Kind, op.ID, err)
 		}
-		// The scheduled sync's own argv plus one flag, so a reinit cannot
-		// drift from the sync it is a one-off variant of.
-		return append(plan.CommandArgs(), "-reinit"), nil
+		return append(plan.CommandArgs(), flag), nil
 	}
 	return nil, fmt.Errorf("operation %s has kind %q, which this agent does not understand", op.ID, op.Kind)
 }

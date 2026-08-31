@@ -116,6 +116,17 @@ const (
 	OpShutdown = "shutdown-domain"
 	OpSetRole  = "set-role"
 	OpReinit   = "reinit"
+	// OpForceClean is a reinit for a target that an ordinary reinit cannot
+	// get past: it undefines the target domain, overrides the promoted and
+	// paused role interlocks, and clears a shut-down source's checkpoint
+	// chain including its bitmaps. Like OpReinit it runs on the SOURCE's
+	// agent, because it is a sync.
+	//
+	// Separate from OpReinit rather than a flag on it so that the audit
+	// trail names what actually happened: these two destroy different
+	// amounts of the target, and after the fact "reinit" would not say
+	// which one ran.
+	OpForceClean = "force-clean"
 	// OpRestore rolls a replica back to one of its restore points, in place.
 	//
 	// The most destructive operation here: it replaces the replica's disks
@@ -387,7 +398,7 @@ func (op Operation) Validate(localPeers []string, now time.Time) error {
 		return fmt.Errorf("operation %s names no vm", op.ID)
 	}
 	switch op.Kind {
-	case OpPromote, OpInvert, OpShutdown, OpSetRole, OpReinit:
+	case OpPromote, OpInvert, OpShutdown, OpSetRole, OpReinit, OpForceClean:
 	case OpRestore:
 		// Checked HERE rather than in operationArgs, because a kind that
 		// passes Validate and then fails argv-building is recorded refused

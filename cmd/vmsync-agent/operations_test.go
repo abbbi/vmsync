@@ -226,6 +226,18 @@ func TestOperationValidateRefusals(t *testing.T) {
 	if err := op.Validate([]string{"prod01:web01"}, opNow); err != nil {
 		t.Errorf("an unexpired operation was refused: %v", err)
 	}
+
+	// Every kind the agent can execute must survive Validate. A kind added to
+	// the executor but forgotten here is refused as "does not understand" --
+	// which reads to an operator like the agent is too old, on an agent that
+	// implements it perfectly well.
+	for _, kind := range []string{OpPromote, OpInvert, OpShutdown, OpSetRole, OpReinit, OpForceClean} {
+		k := promoteOp()
+		k.Kind = kind
+		if err := k.Validate([]string{"prod01:web01"}, opNow); err != nil {
+			t.Errorf("Validate refused kind %q: %v", kind, err)
+		}
+	}
 }
 
 // TestLoadCacheDropsOperations pins the structural half of the replay guard:

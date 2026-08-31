@@ -105,23 +105,38 @@ func TestRestoreArgvIsLocalAndForced(t *testing.T) {
 	}
 }
 
-// A reinit is the only kind here that is a SYNC, so it needs the pair's whole
-// transport configuration -- which lives on the schedule, not on the
-// operation. Refusing when there is no entry is what stops it running a
-// half-configured sync against a production pair.
-func TestReinitRefusesAVMWithNoScheduleEntry(t *testing.T) {
-	cfg := agentConfig{LibvirtURI: "qemu:///system"}
-	op := Operation{ID: "op-2", Kind: OpReinit, VM: "web01"}
+// reinit and force-clean are the only kinds here that are SYNCS, so they need
+// the pair's whole transport configuration -- which lives on the schedule, not
+// on the operation. Refusing when there is no entry is what stops either
+// running a half-configured sync against a production pair.
+//
+// Only the refusal is reachable here: the success path goes through
+// buildSyncRequest, which opens a real libvirt connection and scans the host's
+// domains. Which of the two flags ends up on the argv is therefore not covered
+// by any test, and is checked by reading opexec.go.
+func TestFullResyncKindsRefuseAVMWithNoScheduleEntry(t *testing.T) {
+	for _, kind := range []string{OpReinit, OpForceClean} {
+		t.Run(kind, func(t *testing.T) {
+			cfg := agentConfig{LibvirtURI: "qemu:///system"}
+			op := Operation{ID: "op-2", Kind: kind, VM: "web01"}
 
-	_, err := operationArgs(cfg, nil, op)
-	if err == nil {
-		t.Fatal("a reinit with no schedule entry was accepted")
-	}
-	// The message has to say WHERE it should have been issued: a reinit runs
-	// on the source's agent, unlike promote and restore, and issuing it to
-	// the target is the obvious mistake.
-	if !strings.Contains(err.Error(), "SOURCE") {
-		t.Errorf("refusal %q does not say a reinit runs on the source's agent", err.Error())
+			_, err := operationArgs(cfg, nil, op)
+			if err == nil {
+				t.Fatalf("a %s with no schedule entry was accepted", kind)
+			}
+			// The message has to say WHERE it should have been issued: these
+			// run on the source's agent, unlike promote and restore, and
+			// issuing one to the target is the obvious mistake.
+			if !strings.Contains(err.Error(), "SOURCE") {
+				t.Errorf("refusal %q does not say a %s runs on the source's agent", err.Error(), kind)
+			}
+			// And WHICH kind was refused, so an operator reading the UI can
+			// tell a refused force-clean from a refused reinit -- they are
+			// different amounts of destruction to have asked for.
+			if !strings.Contains(err.Error(), kind) {
+				t.Errorf("refusal %q does not name the operation kind %q", err.Error(), kind)
+			}
+		})
 	}
 }
 

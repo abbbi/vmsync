@@ -522,7 +522,13 @@ func runInvert(ctx context.Context, cfg syncConfig) error {
 	// domain now ends with. Fatal if it fails: proceeding would leave a
 	// pair that cannot complete a single sync.
 	if plan.DropCheckpointsOnOldSource {
-		if err := dropCheckpointsOffline(srcMgr, cfg); err != nil {
+		dom, lookupErr := srcMgr.LookupDomain(cfg.SourceDomain)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		err := dropCheckpointChain(dom, cfg.SourceDomain, cfg.SourceURI, "-invert")
+		dom.Free()
+		if err != nil {
 			return fmt.Errorf("discard %s's stale checkpoint chain before inverting: %w", cfg.SourceDomain, err)
 		}
 		trace.Info("discarded the old source's checkpoint chain", "vm", cfg.SourceDomain)
@@ -588,54 +594,120 @@ func warnAboutReversedDiskPaths(srcMgr, tgtMgr *libvirtsync.Manager, cfg syncCon
 // singleDiskDir reports the one directory holding every qcow2 disk of a
 // domain. False when there are none, or when they span several -- which
 // -target-disk-path cannot express in either direction.
-// dropCheckpointsOffline removes the old source's vmsync checkpoints -- both
-// libvirt's record of them AND the bitmaps they are made of.
+// cleanVerb names whichever flag the operator actually typed, for messages
+// that tell them what to re-run rather than what vmsync calls it internally.
+func cleanVerb(cfg syncConfig) string {
+	if cfg.ForceClean {
+		return "-force-clean"
+	}
+	return "-reinit"
+}
+
+// forceCleanTargetDomain removes the target domain definition, whatever state
+// it is in, so a wedged one cannot block the sync that is about to replace it.
 //
-// Only reachable from -invert, and only ever against a domain that is shut
-// down: AssessInvert refuses to invert a running old source, because the
-// inversion turns it into a replication target and a running target is one
-// scheduled sync from being overwritten under a live workload. So the ordinary
-// deletion -- which merges each bitmap into the next and needs a live qemu --
-// is not available here, and libvirt says so: "cannot delete checkpoint for
-// inactive domain".
+// Tolerant of almost everything by design -- a domain that is already gone, or
+// was never defined, is a success here, because the postcondition this
+// promises is "no target domain", not "a target domain was removed".
 //
-// The offline equivalent is two halves that MUST both happen. Doing only the
-// metadata half is what broke every sync for a pair once already: the images
-// keep bitmaps named after checkpoints libvirt no longer knows about, the next
-// sync restarts its chain at vmsync-cpt-000001, and qemu refuses with "Bitmap
-// already exists" while checkpoint-list shows nothing.
+// The one thing it will NOT do is touch a RUNNING domain. -force-clean
+// overrides the replication-role interlock because a promoted replica is still
+// only data; it does not override this one, because undefining a domain and
+// deleting the disks underneath a live guest corrupts what that guest is
+// actively writing and cannot be undone by re-running anything.
+func forceCleanTargetDomain(tgtMgr *libvirtsync.Manager, cfg syncConfig) error {
+	dom, err := tgtMgr.LookupDomain(cfg.TargetDomain)
+	if err != nil {
+		// Almost certainly "no such domain", which is the desired end state.
+		trace.Info("-force-clean: no target domain to remove", "vm", cfg.TargetDomain)
+		return nil
+	}
+	defer dom.Free()
+
+	active, err := libvirtsync.DomainActive(dom)
+	if err != nil {
+		return fmt.Errorf("determine whether %s is running: %w", cfg.TargetDomain, err)
+	}
+	if active {
+		return fmt.Errorf("%s is RUNNING. -force-clean removes a target domain and replaces its disks, which underneath a live guest corrupts whatever it is writing -- shut it down first. This is the one refusal -force-clean does not override", cfg.TargetDomain)
+	}
+
+	// KEEP_NVRAM because the varstore belongs to the machine rather than to
+	// this replica of it, and CHECKPOINTS_METADATA because libvirt refuses to
+	// undefine an inactive domain carrying checkpoints without it -- which a
+	// target acquires whenever it has previously been a SOURCE, i.e. exactly
+	// the far end of an inverted pair. Same pair of flags, same reasons, as
+	// DefineDomain's own undefine.
+	if err := dom.UndefineFlags(libvirt.DOMAIN_UNDEFINE_KEEP_NVRAM | libvirt.DOMAIN_UNDEFINE_CHECKPOINTS_METADATA); err != nil {
+		return fmt.Errorf("undefine target domain %s: %w", cfg.TargetDomain, err)
+	}
+	trace.Warning("-force-clean: removed the target domain definition; the sync below will define it again from the source",
+		"vm", cfg.TargetDomain)
+	return nil
+}
+
+// dropCheckpointChain removes every vmsync checkpoint from a domain, by
+// whichever of the two mechanisms that domain's state actually permits.
+//
+// The distinction is not cosmetic. A checkpoint IS a persistent bitmap in the
+// qcow2, and deleting one properly means merging its bitmap into the next --
+// which only a live qemu can do. Against a shut-down domain libvirt simply
+// refuses: "cannot delete checkpoint for inactive domain".
+//
+// Callers are -invert (the old source, always shut down) and -reinit /
+// -force-clean (the source, usually running but not necessarily), which is
+// why the choice is made here from the domain's state rather than assumed by
+// each caller.
+func dropCheckpointChain(dom *libvirt.Domain, domainName, uri, verb string) error {
+	active, err := libvirtsync.DomainActive(dom)
+	if err != nil {
+		return fmt.Errorf("determine whether %s is running: %w", domainName, err)
+	}
+	if active {
+		// Running: libvirt merges each bitmap into the next as it deletes,
+		// which is the proper job and needs nothing from us.
+		return libvirtsync.DeleteAllManagedCheckpoints(dom)
+	}
+	return dropCheckpointsOffline(dom, domainName, uri, verb)
+}
+
+// dropCheckpointsOffline is dropCheckpointChain's shut-down half: it removes
+// the domain's vmsync checkpoints -- both libvirt's record of them AND the
+// bitmaps they are made of.
+//
+// It is two halves that MUST both happen. Doing only the metadata half is what
+// broke every sync for a pair once already: the images keep bitmaps named after
+// checkpoints libvirt no longer knows about, the next sync restarts its chain
+// at vmsync-cpt-000001, and qemu refuses with "Bitmap already exists" while
+// checkpoint-list shows nothing. That is the invisible failure this function
+// exists to prevent, so the two halves stay welded together here rather than
+// being offered separately to callers.
 //
 // Bitmaps first, metadata second, deliberately. Interrupted after the bitmaps,
 // libvirt still lists the checkpoints and a later delete tidies up -- visible
 // and recoverable. Interrupted the other way round leaves the invisible
 // breakage that has to be found with qemu-img.
-func dropCheckpointsOffline(srcMgr *libvirtsync.Manager, cfg syncConfig) error {
+func dropCheckpointsOffline(dom *libvirt.Domain, domainName, uri, verb string) error {
 	// qemu-img runs HERE, on the files as this process sees them. That is
-	// only true when the old source is this host -- vmsync's SSH path goes to
+	// only true when the domain is on this host -- vmsync's SSH path goes to
 	// the target, not the source, so there is no way to reach a remote
 	// source's images. Refusing beats the alternative of dropping the
 	// metadata and leaving the bitmaps, which is exactly the corruption this
 	// function exists to avoid.
-	if err := requireLocalURI(cfg.SourceURI, "-source-uri"); err != nil {
-		return fmt.Errorf("%s has a checkpoint chain that must be discarded, and that means editing its disk images, which only works where they are: run -invert on %s's own host with a local -source-uri (this is where -promote and -shutdown-domain already have to run). %w",
-			cfg.SourceDomain, cfg.SourceDomain, err)
+	if err := requireLocalURI(uri, "-source-uri"); err != nil {
+		return fmt.Errorf("%s is shut down and has a checkpoint chain that must be discarded, and discarding it on a stopped domain means editing its disk images, which only works where they are: run %s on %s's own host with a local -source-uri (this is where -promote and -shutdown-domain already have to run). %w",
+			domainName, verb, domainName, err)
 	}
-
-	dom, err := srcMgr.LookupDomain(cfg.SourceDomain)
-	if err != nil {
-		return err
-	}
-	defer dom.Free()
 
 	// INACTIVE, matching every other metadata read: the domain is shut down
 	// by definition here, so this is its persistent definition either way.
 	domXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
 	if err != nil {
-		return fmt.Errorf("read %s's definition: %w", cfg.SourceDomain, err)
+		return fmt.Errorf("read %s's definition: %w", domainName, err)
 	}
 	disks, err := disk.ParseQcowDisks(domXML)
 	if err != nil {
-		return fmt.Errorf("read %s's disks: %w", cfg.SourceDomain, err)
+		return fmt.Errorf("read %s's disks: %w", domainName, err)
 	}
 
 	// --- half one: the bitmaps ----------------------------------------------

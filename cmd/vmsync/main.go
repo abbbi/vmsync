@@ -230,8 +230,13 @@ type syncConfig struct {
 	// See targetFileNewerThanSync for why a tolerance is needed at all.
 	TimestampToleranceSec int
 
-	Start                  bool
-	Reinit                 bool
+	Start  bool
+	Reinit bool
+	// ForceClean is -reinit for a target that is wedged: it additionally
+	// removes the target DOMAIN, overrides the promoted/paused replication
+	// role interlock, and clears a shut-down source's checkpoint chain
+	// bitmaps and all. It never touches a RUNNING target.
+	ForceClean             bool
 	ReinitAfterFailures    int
 	Verify                 string
 	IgnoreExternalSnapshot bool
@@ -300,6 +305,7 @@ func main() {
 	flag.IntVar(&cfg.TimestampToleranceSec, "timestamp-tolerance-sec", 0, "How far a replica disk's mtime may be ahead of the last sync timestamp before the sync refuses, in seconds. These are two DIFFERENT clocks -- the mtime is the target host's, the timestamp is this host's -- so with the default of 0 a target whose clock runs even a second fast fails every incremental sync with an error blaming out-of-band modification. Set this above the drift the error reports to recover without a full -reinit; a value near -30s worth of NTP jitter is reasonable, and fixing NTP is better")
 	flag.BoolVar(&cfg.Start, "start", false, "In case vm is in non-running state, start in paused mode to allow sync")
 	flag.BoolVar(&cfg.Reinit, "reinit", false, "Delete VM on target and restart a full sync process")
+	flag.BoolVar(&cfg.ForceClean, "force-clean", false, "A -reinit for a target that is wedged. Implies -reinit, and additionally: removes the target DOMAIN before syncing rather than redefining it at the end, so a broken definition cannot block the run; overrides the replication_role interlock for a promoted or paused target, DISCARDING its current disks; and clears the source's checkpoint chain even when the source is shut down, removing the qcow2 bitmaps that would otherwise make every later sync fail with \"Bitmap already exists\". It never touches a RUNNING target, and never overrides role=source, which means the pair is configured backwards")
 	flag.StringVar(&cfg.ReplacedDiskAction, "replaced-disk-action", replacedDiskRename, fmt.Sprintf("What to do with a target disk file that is about to be discarded and rebuilt (currently only -reinit does this): %q renames it to <path>%s<unixtime> so its contents survive, %q removes it. Defaults to %q: the target of a reinit may be a former primary whose disks still hold everything written after the last successful sync, and that is unrecoverable once deleted. Renaming needs room for both copies, and the aside files are never reaped automatically", replacedDiskRename, replacedDiskSuffix, replacedDiskDelete, replacedDiskRename))
 	flag.StringVar(&cfg.TargetDiskOwner, "target-disk-owner", util.DiskOwnerAuto, fmt.Sprintf("Who should own the disk files created on the target: %q (default), %q, or an explicit \"user\", \"user:group\" or \":group\". vmsync creates those files by running qemu-img over SSH, so they are owned by that SSH user (root) -- while qemu runs as \"qemu\" on RHEL and \"libvirt-qemu\" on Debian, and cannot open a root-owned disk. libvirt's dynamic_ownership usually hides this, but it is off in plenty of deployments and cannot work at all on NFS with root_squash. %q preserves whatever owned the file before (which is what makes -reinit safe, since it replaces a correctly-owned disk with a fresh root-owned one) and otherwise takes what the target's libvirt qemu.conf sets; it never guesses, and warns instead. %q is the old behaviour", util.DiskOwnerAuto, util.DiskOwnerOff, util.DiskOwnerAuto, util.DiskOwnerOff))
 	flag.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "Reinit automatically after N failures (disabled by default). Count is held on target XML")
@@ -648,6 +654,19 @@ func main() {
 			trace.Info("external snapshot(s) exist on source domain and -ignore-external-snapshot is set, skipping sync", "domain", cfg.SourceDomain, "snapshot count", snapCount)
 			os.Exit(0)
 		}
+	}
+
+	// -force-clean is a -reinit that also removes obstacles, so it turns the
+	// flag on rather than duplicating everything the reinit path already does
+	// -- the disk removal, the restore point sweep, the ownership carry-over.
+	//
+	// Not marked ReinitAutomatic: that flag means "nobody asked for this", and
+	// it is what stops -reinit-after-failures quietly discarding restore
+	// points. Somebody typed this one, so the ordinary rules about what a
+	// deliberate reinit takes with it apply.
+	if cfg.ForceClean && !cfg.Reinit {
+		trace.Warning("-force-clean implies -reinit")
+		cfg.Reinit = true
 	}
 
 	// Consecutive failure count lives in the target domain's own vmsync
@@ -1479,7 +1498,27 @@ func run(cfg syncConfig) (runErr error) {
 		return fmt.Errorf("read target domain replication role: %w", err)
 	}
 	if err := libvirtsync.TargetRoleAllowsSync(targetRole); err != nil {
-		return fmt.Errorf("refusing to sync into %s: %w", cfg.TargetDomain, err)
+		// -force-clean overrides two of the four refusals, and only those two.
+		//
+		// promoted and paused both mean "this replica is in a state a sync
+		// must not blunder into", and getting out of them is exactly what a
+		// deliberate clean is for. Loud rather than silent: a promoted domain
+		// is one somebody failed over TO, so its disks are live data, and the
+		// operator is told precisely what is being discarded.
+		//
+		// source and an unrecognised role are NOT overridden, and that is not
+		// timidity. role=source says this domain is the primary of its pair,
+		// so syncing into it overwrites the original with its own replica --
+		// which is a reversed -source-uri/-target-uri, not a mess to clean,
+		// and no amount of force makes destroying the primary the intent. An
+		// unrecognised role was written by a newer vmsync and fails closed for
+		// the reason it always does.
+		if cfg.ForceClean && (targetRole == libvirtsync.RolePromoted || targetRole == libvirtsync.RolePaused) {
+			trace.Warning("-force-clean: overriding the replication role interlock and DISCARDING this domain's current disks",
+				"vm", cfg.TargetDomain, "role", targetRole, "refusal", err.Error())
+		} else {
+			return fmt.Errorf("refusing to sync into %s: %w", cfg.TargetDomain, err)
+		}
 	}
 	if targetRole != "" {
 		trace.Debug("target replication role permits this sync", "vm", cfg.TargetDomain, "role", targetRole)
@@ -2313,10 +2352,36 @@ func run(cfg syncConfig) (runErr error) {
 
 	if cfg.Reinit {
 		trace.Warning("reinit requested: discarding checkpoint chain and existing target state", "domain", cfg.SourceDomain)
+
+		// -force-clean removes the target DEFINITION as well, before anything
+		// else touches it.
+		//
+		// A plain -reinit deliberately leaves it alone and lets DefineDomain
+		// replace it at the end, so a failed sync still has the old definition
+		// to fall back on. That is the right default and the wrong one for a
+		// domain whose definition is itself the obstacle: a half-applied
+		// redefine, a UUID collision, checkpoint metadata libvirt will not
+		// undefine around, an NVRAM file confusing the plain Undefine path.
+		// This is the flag for when the target is wedged, so the definition
+		// goes too -- and if the sync then fails there is no target domain
+		// left, which is the trade being asked for by name.
+		if cfg.ForceClean {
+			if err := forceCleanTargetDomain(tgtMgr, cfg); err != nil {
+				return fmt.Errorf("force-clean: %w", err)
+			}
+		}
 		if err := libvirtsync.AbortActiveBlockJobs(srcDom, qcowDisks); err != nil {
 			return fmt.Errorf("reinit: abort active block jobs: %w", err)
 		}
-		if err := libvirtsync.DeleteAllManagedCheckpoints(srcDom); err != nil {
+		// Via dropCheckpointChain rather than DeleteAllManagedCheckpoints
+		// directly, so this works on a SHUT-DOWN source too. Deleting a
+		// checkpoint merges its bitmap into the next one, which only a running
+		// qemu can do -- so a reinit of a stopped source used to fail here with
+		// libvirt's "cannot delete checkpoint for inactive domain", which is a
+		// legitimate thing to want (stop the source, reinit, promote). The
+		// offline path removes the bitmaps with qemu-img and then the metadata,
+		// always both.
+		if err := dropCheckpointChain(srcDom, cfg.SourceDomain, cfg.SourceURI, cleanVerb(cfg)); err != nil {
 			return fmt.Errorf("reinit: delete existing checkpoints: %w", err)
 		}
 
@@ -3476,8 +3541,20 @@ func run(cfg syncConfig) (runErr error) {
 			cfg.TargetDomain, currentTargetRole, err)
 	}
 	if currentTargetRole != targetRole {
-		trace.Warning("target replication role changed during this sync but still permits it",
-			"vm", cfg.TargetDomain, "from", targetRole, "to", currentTargetRole)
+		// -force-clean undefined the target domain itself, so the role it
+		// used to carry went with it and this reads "" -- a change this run
+		// caused on purpose, not the concurrent failover the check is looking
+		// for. Reported as what it is, rather than as a race that did not
+		// happen. The redefine below then writes no role at all, which is
+		// what a replica rebuilt from nothing should look like: the next sync
+		// treats an absent role as permission to proceed.
+		if cfg.ForceClean && currentTargetRole == "" {
+			trace.Info("-force-clean removed the target domain, so its previous replication role is gone; it is being redefined without one",
+				"vm", cfg.TargetDomain, "previous_role", targetRole)
+		} else {
+			trace.Warning("target replication role changed during this sync but still permits it",
+				"vm", cfg.TargetDomain, "from", targetRole, "to", currentTargetRole)
+		}
 	}
 
 	trace.Info("Adding metadata information")
