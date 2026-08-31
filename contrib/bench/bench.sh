@@ -265,6 +265,13 @@ esac
 GUEST_DIRTY="${GUEST_DIRTY:-yes}"
 GUEST_DIRTY_PATH="${GUEST_DIRTY_PATH:-/var/tmp/vmsync-bench-dirty}"
 GUEST_DIRTY_MIB="${GUEST_DIRTY_MIB:-64}"
+# How long to wait for the source's guest agent to come up before giving up on
+# it. Stages that need the agent restart the source (or follow a stage that
+# did), and `virsh start` returns while the guest is still booting -- see
+# wait_for_guest_agent. Raise it for a guest that boots slowly; the wait costs
+# nothing when the agent is already answering.
+GUEST_AGENT_TIMEOUT="${GUEST_AGENT_TIMEOUT:-120}"
+[ "$GUEST_AGENT_TIMEOUT" -ge 0 ] 2>/dev/null || die "$CONF: GUEST_AGENT_TIMEOUT must be a non-negative integer"
 
 # --- Stage 8 (verify-long) ---------------------------------------------------
 
@@ -978,6 +985,48 @@ heal_target() {
 # that vmsync can do nothing twenty times. To make the chain mean anything the
 # guest has to actually write between copies, which means running a command
 # INSIDE it -- there is no virsh verb for that, only the QEMU guest agent.
+
+# wait_for_guest_agent [TIMEOUT] -> 0 once the guest agent answers a ping.
+#
+# `virsh start` returns as soon as libvirt has launched qemu, but the agent
+# inside the guest does not exist until that guest has BOOTED -- tens of
+# seconds later. Nothing in libvirt's own domain state distinguishes the two:
+# `virsh domstate` says "running" the instant qemu is up, so a stage that
+# merely checks the domain is running will happily go on to interrogate an
+# agent that is still in the guest's bootloader.
+#
+# That is not hypothetical. Stage 7 shuts the source down to prove the fence
+# works and starts it again on its way out, so every later stage that needs
+# the guest agent asks a guest that has been booting for about a second. Stage
+# 8 used to skip itself with "guest-exec unavailable" in every run that
+# included stage 7 -- reported as a skip, so it looked like a configuration
+# problem on the guest rather than the harness not waiting.
+#
+# guest-ping rather than guest-info: it is the cheapest RPC that proves the
+# agent is answering, and it is enabled wherever the agent runs at all.
+# Costs nothing when the agent is already up -- the first ping answers -- so
+# this is safe to call unconditionally before any guest-agent work.
+wait_for_guest_agent() {
+	local timeout="${1:-${GUEST_AGENT_TIMEOUT:-120}}" start=$SECONDS elapsed=0
+	# Real elapsed time, not a count of sleeps: libvirt blocks its own
+	# agent-command call for seconds when nothing answers, so a loop that
+	# added up only its sleeps would overrun the timeout it advertises by
+	# whatever virsh spent -- exactly in the case this is meant to bound.
+	while [ "$elapsed" -lt "$timeout" ]; do
+		if virsh_uri "$SOURCE_URI" qemu-agent-command "$SOURCE_DOMAIN" \
+			'{"execute":"guest-ping"}' >/dev/null 2>&1; then
+			[ "$elapsed" -gt 0 ] && log "   the guest agent on $SOURCE_DOMAIN answered after ${elapsed}s"
+			return 0
+		fi
+		# Announced once, on the first failure, so a guest that is genuinely
+		# booting explains the pause instead of looking like a hang.
+		[ "$elapsed" -eq 0 ] && log "   waiting up to ${timeout}s for the guest agent on $SOURCE_DOMAIN (it may still be booting)"
+		sleep 5
+		elapsed=$((SECONDS - start))
+	done
+	warn "the guest agent on $SOURCE_DOMAIN did not answer within ${timeout}s"
+	return 1
+}
 
 # guest_exec_available -> true when the agent will accept guest-exec.
 #
@@ -2496,10 +2545,19 @@ stage_verify_long() {
 			results_row "$CSV" verify-long precondition "" "" "" "" "" "" "SKIP source domain not running"
 			return 0
 		fi
-		if [ "$GUEST_DIRTY" = yes ] && ! guest_exec_available; then
-			warn "SKIP stage verify-long: $GUEST_EXEC_WHY"
-			results_row "$CSV" verify-long precondition "" "" "" "" "" "" "SKIP guest-exec unavailable"
-			return 0
+		if [ "$GUEST_DIRTY" = yes ]; then
+			# Waited for, not merely probed: if stage 7 ran earlier in this
+			# same list it restarted the source seconds ago and the agent is
+			# not up yet. On timeout, fall through to guest_exec_available
+			# anyway -- it is the one that produces the message saying
+			# WHICH of the two problems this is (no agent answering at all,
+			# or an agent that answers but blocks guest-exec).
+			wait_for_guest_agent || true
+			if ! guest_exec_available; then
+				warn "SKIP stage verify-long: $GUEST_EXEC_WHY"
+				results_row "$CSV" verify-long precondition "" "" "" "" "" "" "SKIP guest-exec unavailable"
+				return 0
+			fi
 		fi
 		stage_needs_target_shutoff "$CSV" verify-long "stage verify-long" || return 0
 	fi
@@ -2983,6 +3041,10 @@ stage_restore() {
 	# assertion below would pass without proving anything -- so their absence
 	# is recorded as a SKIP rather than quietly weakening the stage.
 	local contents_differ=yes
+	# Same wait as stage 8, for the same reason: any stage in this list may
+	# have restarted the source, and an unwaited agent turns a real assertion
+	# into a silent SKIP.
+	[ "$GUEST_DIRTY" = yes ] && { wait_for_guest_agent || true; }
 	if [ "$GUEST_DIRTY" = yes ] && guest_exec_available; then
 		guest_dirty || warn "guest write failed; the two restore points may end up identical"
 	else
