@@ -57,6 +57,11 @@ const (
 	skipAlreadyRunning  = "already_running"
 	skipInvalidProfile  = "invalid_profile"
 	skipNoTarget        = "no_target"
+	// skipRunLogUnwritable is a launch refused because its record could not be
+	// written. Fail-closed by decision: an unrecorded vmsync is a process
+	// nothing can later account for. Its own reason because the remedy is
+	// unlike every other skip here -- it is a disk, not a schedule.
+	skipRunLogUnwritable = "run_log_unwritable"
 )
 
 var skipReasons = []string{
@@ -65,6 +70,7 @@ var skipReasons = []string{
 	skipAlreadyRunning,
 	skipInvalidProfile,
 	skipNoTarget,
+	skipRunLogUnwritable,
 }
 
 // agentMetrics is what the agent knows about itself.
@@ -83,7 +89,10 @@ type agentMetrics struct {
 	runsOK   atomic.Uint64
 	runsFail atomic.Uint64
 	runsBusy atomic.Uint64
-	skips    map[string]*atomic.Uint64 // fixed keys; never written after construction
+	// runLogWritable starts true: an agent that could not open the run log
+	// never reaches a metrics write, because it refuses to start.
+	runLogWritable atomic.Bool
+	skips          map[string]*atomic.Uint64 // fixed keys; never written after construction
 
 	uiLastContact atomic.Int64 // unix seconds, 0 = never
 	uiFailures    atomic.Uint64
@@ -176,6 +185,7 @@ func newAgentMetrics(version, hostname string, standalone bool) *agentMetrics {
 	for _, r := range skipReasons {
 		m.skips[r] = &atomic.Uint64{}
 	}
+	m.runLogWritable.Store(true)
 	return m
 }
 
@@ -221,6 +231,19 @@ func (m *agentMetrics) runBusy() {
 		return
 	}
 	m.runsBusy.Add(1)
+}
+
+// setRunLogWritable records whether the run log can currently be written.
+//
+// A GAUGE, not only the skip counter beside it, and the difference matters:
+// under the fail-closed contract an unwritable run log stops every sync on
+// this host, and a counter that has stopped incrementing looks exactly like a
+// host with nothing due. One of those is idleness and the other is an outage.
+func (m *agentMetrics) setRunLogWritable(ok bool) {
+	if m == nil {
+		return
+	}
+	m.runLogWritable.Store(ok)
 }
 
 func (m *agentMetrics) uiContacted(at time.Time) {
@@ -375,6 +398,7 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	// succeed. Non-zero means this host shut a production VM down without a
 	// record that survives a restart, so the same fence may be attempted
 	// again -- and it means the ledger's filesystem is in trouble.
+	g("vmsync_agent_run_log_writable", "1 when the run log can be written. At 0 this host launches no syncs at all, because an unrecorded vmsync is refused.", boolGauge(m.runLogWritable.Load()), "")
 	c("vmsync_agent_fences_unrecorded_total", "Fences that proceeded without a durable ledger record, because writing it failed and a split brain is the worse outcome.", m.fencesUnrecorded.Load(), "")
 
 	return b.String()

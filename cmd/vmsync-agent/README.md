@@ -126,7 +126,7 @@ cannot collide with it.)
 | metric | why |
 | --- | --- |
 | `vmsync_agent_scheduled_vms` | VMs configured here, and `_disabled` for entries present but not runnable. |
-| `vmsync_agent_skipped_runs_total{reason}` | Due syncs that did not start: `host_concurrency`, `target_budget`, `already_running`, `invalid_profile`, `no_target`. |
+| `vmsync_agent_skipped_runs_total{reason}` | Due syncs that did not start: `host_concurrency`, `target_replication_slots`, `already_running`, `invalid_profile`, `no_target`. |
 | `vmsync_agent_ui_last_contact_timestamp_seconds` | Last successful exchange with the UI. 0 when there has never been one. |
 | `vmsync_agent_config_age_seconds` | Age of the schedule actually in force. −1 if never fetched. |
 | `vmsync_agent_syncs_running` / `_max_concurrent_syncs` | Current parallelism against the effective ceiling. |
@@ -164,19 +164,43 @@ process each, admitted against two independent limits:
 
 | limit | set by | meaning |
 | --- | --- | --- |
-| `max_concurrent_syncs` | schedule (UI setting, or the standalone file) | jobs at once on this host. Default **4**. |
+| `max_concurrent_syncs` | schedule (UI setting, or the standalone file) | jobs at once on this host, whatever their destination. Default **4**. |
 | `--max-concurrent-syncs` | this agent | host-local **ceiling**; only lowers the above. |
-| `target_host_budget` | schedule | jobs at once *into* a given target host. |
+| `target_replication_slots` | schedule | jobs at once *into* a given target host. **Per agent** — see below. Opt-in: no default, and an absent or `0` entry means no limit. |
 | hard clamp | built in | 128, whatever anything asks for -- a backstop against a mistyped value, not a recommendation. |
+
+The two count different things and protect different machines.
+`max_concurrent_syncs` bounds outbound load — this host's disks, NICs and
+CPU — and applies no matter where the copies are going.
+`target_replication_slots` bounds *fan-in*: how many copies land on one
+target at once.
 
 `--max-concurrent-syncs` deliberately only lowers. How much concurrent I/O
 a hypervisor can absorb depends on its disks, its NICs and what else it is
 running — the host knows that and a control plane does not, so the UI can
 ask for less than the host allows but never more.
 
-The per-target-host budget is the one limit only a UI can compute: an agent
-cannot see that four *other* hosts are also replicating into the same
-target.
+Replication slots are the one limit only a UI can compute: an agent cannot
+see that four *other* hosts are also replicating into the same target.
+
+**They are counted per agent, not estate-wide.** Each agent holds its own
+tally of syncs into each target and the UI serves every agent the same map,
+so `{"dr01": 2}` means *each* agent may have two syncs into `dr01` — with
+five source hosts that is ten concurrent writers, not two. To cap the real
+aggregate, divide by the number of agents replicating into that host and set
+that. Enforcing a true estate-wide total would need the agents to coordinate,
+or the UI to hand out slots, and neither exists today.
+
+Refusals are visible as
+`vmsync_agent_skipped_runs_total{reason="target_replication_slots"}`. A
+refused entry is not deferred, so it retries on the next tick as soon as a
+slot frees.
+
+In `--standalone` mode this is set in the schedule file. Through the UI it
+currently is not settable at all: the estate-settings form writes only the
+shutdown timeout and `max_concurrent_syncs`. The value round-trips safely
+through `settings.json` if it is already there, so editing that file by hand
+works, but there is no form for it yet.
 
 A VM refused admission is not deferred — it retries on the next tick, as
 soon as a slot frees. A VM whose previous run is still going is skipped
@@ -194,6 +218,30 @@ Alongside the schedule, the UI can publish **operations** — a promotion, an
 inversion, a clean shutdown, a role change. They travel in the same document
 but are a different kind of thing, and the agent treats them differently at
 every step.
+
+| kind | runs on | what it does |
+| --- | --- | --- |
+| `promote` | the **target**'s agent | Makes a replica the live copy, optionally arming a fence against the old source. |
+| `invert` | the **target**'s agent | Reverses the pair's direction. |
+| `shutdown-domain` | that domain's agent | Clean shutdown, never a destroy; leaves replication `paused`. |
+| `set-role` | that domain's agent | Writes `replication_role` and nothing else. |
+| `restore` | the **target**'s agent | Rolls a replica back to one of its restore points, in place, and pauses replication into it. |
+| `reinit` | the **source**'s agent | A one-shot full resync. |
+| `force-clean` | the **source**'s agent | A `reinit` that also removes the target domain and overrides the `promoted`/`paused` interlock. See the [main README](../../README.md#when-a-reinit-itself-will-not-go-through). |
+
+The split in that middle column is the one operators get wrong. Most kinds
+act on a domain where it sits, need no credentials and use a local URI. But
+`reinit` and `force-clean` are **syncs**: they need the pair's whole
+transport configuration, which lives on the schedule the *source*'s agent
+holds, so they are issued against the source's row. An agent asked to reinit
+a VM it has no schedule entry for refuses and says so.
+
+`reinit` and `force-clean` are deliberately operations rather than schedule
+settings. On a schedule either would be desired state with nobody to clear
+it — every cycle would delete the target's disks again, forever, and
+`force-clean` would undefine the target domain each time too. They are also
+two kinds rather than one kind with a flag, so the audit trail records which
+of them ran: they destroy different amounts of the target.
 
 The schedule is *desired state*: re-delivering it is harmless, which is what
 lets an agent keep running it through a partition. An operation is an
@@ -318,7 +366,7 @@ the partition-tolerance the control plane is built on. The only thing that
 ever required a UI was the startup path, and `--standalone` skips it.
 
 What you get over a cron job: a real interval per VM, a cap on how many
-syncs run at once, a per-target-host budget so several sources cannot
+syncs run at once, per-target replication slots so several sources cannot
 stampede one target, staggering so everything does not fire on the same
 minute, skip-if-still-running instead of overlapping runs, and each run's
 outcome in the journal. An agent installed this way can be enrolled with a
@@ -359,7 +407,7 @@ optional.
   ],
   "max_concurrent_syncs": 4,
   "shutdown_timeout_sec": 300,
-  "target_host_budget": { "dr01": 2 }
+  "target_replication_slots": { "dr01": 2 }
 }
 ```
 
@@ -373,7 +421,7 @@ optional.
 | `shutdown_timeout_sec` (per entry) | How long THIS guest gets to stop cleanly, in seconds. Omit to inherit the file-level value below. 30-3600; out of range is an error, not a clamp. |
 | `max_concurrent_syncs` | Cap on syncs running at once on this host. Default 4. |
 | `shutdown_timeout_sec` (top level) | Default for every VM with no value of its own. Omit for vmsync's own 300s. |
-| `target_host_budget` | Cap on concurrent syncs *into* a given target host. |
+| `target_replication_slots` | Cap on concurrent syncs *into* a given target host, counted by **this** agent alone. Omit for no limit. |
 
 Note what is **not** in the file: no hostnames to replicate to, no
 credentials, no command line. The pairing comes from each VM's own

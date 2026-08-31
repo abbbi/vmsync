@@ -484,6 +484,31 @@ func (s *Scheduler) runOne(ctx context.Context, entry ScheduleEntry, plan syncPl
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 60 * time.Second
 
+	// Recorded BEFORE the process exists, and the launch does not happen if it
+	// cannot be. Everything except the pid is already known, and the pid
+	// belongs on the exit record.
+	//
+	// Appending afterwards would be worse than useless: it would put a
+	// durable write with an fsync between fork and Wait, and if that fsync
+	// blocked (NFS, a wedged device) cmd.Wait() would never be reached --
+	// cmd.Cancel and WaitDelay are enforced INSIDE Wait, so neither would
+	// engage, the deferred release would never run, and the agent would wedge
+	// with an orphaned child.
+	runID := newRunID()
+	if err := s.cfg.runLog.Append(runLogRecord{
+		Event: runEventLaunch, RunID: runID, Origin: runOriginScheduled,
+		VM: entry.VM, TargetHost: plan.targetHost,
+		Binary: s.cfg.VmsyncPath, Args: redactArgs(args),
+	}); err != nil {
+		// Not deferred: nextRun is left in the past so this retries on the
+		// next tick, the moment the disk frees. Deferring would add an
+		// interval of outage to a condition that may clear in seconds.
+		trace.Error("not starting a scheduled sync: its launch could not be recorded, and an unrecorded vmsync is a process nothing can account for",
+			"vm", entry.VM, "target", plan.targetHost, "error", err)
+		s.metrics.skip(skipRunLogUnwritable)
+		return
+	}
+
 	s.metrics.runStarted(entry.VM, started)
 
 	var out bytes.Buffer
@@ -517,6 +542,33 @@ func (s *Scheduler) runOne(ctx context.Context, entry ScheduleEntry, plan syncPl
 	// It is also not a result worth shipping: it says nothing about the pair,
 	// and 50 of them would push real outcomes off the report's ring
 	// (resultsKept). Counted and journalled, not recorded.
+	// The exit record closes the pair opened above. Best-effort, unlike the
+	// launch: the process has already run, so refusing anything now would
+	// change nothing that has not already happened, and losing this record
+	// leaves an open run the log itself reports rather than a silent gap.
+	code := res.ExitCode
+	outcome := "success"
+	switch {
+	case res.ExitCode == util.ExitBusy:
+		outcome = "busy"
+	case err != nil:
+		outcome = "failure"
+	}
+	exitRec := runLogRecord{
+		Event: runEventExit, RunID: runID, VM: entry.VM,
+		ExitCode: &code, DurationS: res.DurationSecs, Outcome: outcome,
+	}
+	if cmd.Process != nil {
+		exitRec.PID = cmd.Process.Pid
+	}
+	if outcome != "success" {
+		exitRec.LogTail = res.LogTail
+	}
+	if lerr := s.cfg.runLog.Append(exitRec); lerr != nil {
+		trace.Error("could not record how a sync ended; it will show as an open run until this is cleaned up",
+			"vm", entry.VM, "run_id", runID, "error", lerr)
+	}
+
 	if res.ExitCode == util.ExitBusy {
 		trace.Info("a scheduled sync stood down: another vmsync is already working on this domain, and nothing was changed",
 			"vm", entry.VM, "target", plan.targetHost)

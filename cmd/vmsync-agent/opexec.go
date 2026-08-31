@@ -131,7 +131,56 @@ func runOperation(ctx context.Context, cfg agentConfig, schedule []ScheduleEntry
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 
+	// Fail-closed, like a scheduled sync and unlike a fence. An operation that
+	// cannot be recorded must not run, and it does not need the fence's
+	// exemption: it has a clean retry story, since the UI keeps publishing it
+	// until it sees a result.
+	//
+	// Abandon, not Finish. A result here would be terminal and would burn this
+	// operation's id permanently -- and "the disk was full for a moment" is
+	// the case that most deserves another go, which is exactly the reasoning
+	// the ExitBusy path below already follows.
+	runID := newRunID()
+	if lerr := cfg.runLog.Append(runLogRecord{
+		Event: runEventLaunch, RunID: runID, Origin: runOriginOperation,
+		VM: op.VM, OperationID: op.ID,
+		Binary: cfg.VmsyncPath, Args: redactArgs(args),
+	}); lerr != nil {
+		trace.Error("not executing an operation: its launch could not be recorded, and an unrecorded vmsync is a process nothing can account for",
+			"id", op.ID, "kind", op.Kind, "vm", op.VM, "error", lerr)
+		if aerr := ledger.Abandon(op.ID); aerr != nil {
+			trace.Error("could not release the deferred operation's record; it will not be retried and must be reissued", "id", op.ID, "error", aerr)
+		}
+		return
+	}
+
 	runErr := cmd.Run()
+
+	opCode := -1
+	if cmd.ProcessState != nil {
+		opCode = cmd.ProcessState.ExitCode()
+	}
+	opOutcome := "success"
+	switch {
+	case opCode == util.ExitBusy:
+		opOutcome = "busy"
+	case runErr != nil:
+		opOutcome = "failure"
+	}
+	opExit := runLogRecord{
+		Event: runEventExit, RunID: runID, VM: op.VM,
+		ExitCode: &opCode, Outcome: opOutcome,
+	}
+	if cmd.Process != nil {
+		opExit.PID = cmd.Process.Pid
+	}
+	if opOutcome != "success" {
+		opExit.LogTail = tail(out.String(), logTailBytes)
+	}
+	if lerr := cfg.runLog.Append(opExit); lerr != nil {
+		trace.Error("could not record how an operation ended; it will show as an open run until this is cleaned up",
+			"id", op.ID, "run_id", runID, "error", lerr)
+	}
 
 	// Exit 75 (EX_TEMPFAIL) is vmsync saying it stood down without touching
 	// anything, because another vmsync holds the lock for this domain --

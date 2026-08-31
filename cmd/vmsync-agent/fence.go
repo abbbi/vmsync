@@ -491,8 +491,43 @@ func fenceOneDomain(ctx context.Context, cfg agentConfig, cached UIConfig, ledge
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 
+	// EXEMPT from the fail-closed run-log contract every other launch site
+	// obeys: attempted, and the fence proceeds whatever it returns.
+	//
+	// The harm ranking decides it. Everywhere else a refused launch costs one
+	// interval of replication, which the next tick recovers. Here it would
+	// leave one workload live in two places writing to two diverging copies --
+	// unrecoverable, and the precise thing this mechanism exists to prevent.
+	//
+	// Note what this does NOT buy: fenceLedger.Begin above needs strictly more
+	// of the filesystem than an append does (a new inode, a directory write, a
+	// rename), so on a full or read-only state_dir the ledger has already
+	// failed and this exemption changes nothing. It covers failures specific
+	// to runs.jsonl itself.
+	runID := newRunID()
+	if lerr := cfg.runLog.Append(runLogRecord{
+		Event: runEventLaunch, RunID: runID, Origin: runOriginFence,
+		VM: vm, FenceID: rep.Fence.ID,
+		Binary: cfg.VmsyncPath, Args: redactArgs(args),
+	}); lerr != nil {
+		trace.Error("fencing without a run-log record: the record could not be written, and a fence is not refused for that",
+			"vm", vm, "fence_id", rep.Fence.ID, "error", lerr)
+	}
+
 	rec.Attempts = 1
 	err := cmd.Run()
+	fenceCode := -1
+	if cmd.ProcessState != nil {
+		fenceCode = cmd.ProcessState.ExitCode()
+	}
+	fenceOutcome := "success"
+	if err != nil {
+		fenceOutcome = "failure"
+	}
+	_ = cfg.runLog.Append(runLogRecord{
+		Event: runEventExit, RunID: runID, VM: vm,
+		ExitCode: &fenceCode, Outcome: fenceOutcome,
+	})
 	cfg.metrics.fenceActed(err == nil)
 	if err != nil {
 		rec.State, rec.Error = OpStateFailed, err.Error()

@@ -100,6 +100,17 @@ type agentConfig struct {
 	// package-level variable. Nil when -prometheus-dir is unset, and every
 	// method on it is nil-guarded, so no use site needs to branch.
 	metrics *agentMetrics
+
+	// runLog is the durable record of every vmsync this agent starts,
+	// carried here for the same reason metrics is: the scheduler, the
+	// operations loop and the fence loop must all write to one instance.
+	//
+	// Unlike metrics it is NEVER nil in a running agent, and its methods are
+	// not nil-guarded for launches. A launch that cannot be recorded does not
+	// happen (see runLog.Append), so a nil here would silently turn the
+	// fail-closed contract into a no-op -- exactly the class of "reports
+	// success while doing nothing" this agent exists to refuse.
+	runLog *runLog
 }
 
 func main() {
@@ -181,6 +192,28 @@ func main() {
 	if cfg.PrometheusDir != "" {
 		cfg.metrics = newAgentMetrics(version.Version, cfg.Hostname, cfg.StandaloneFile != "")
 	}
+
+	// Opened before anything can launch, and fatal if it cannot be.
+	//
+	// Refusing to start is the right failure here precisely because the
+	// alternative is worse than an outage: an agent that starts without a run
+	// log cannot record what it runs, and under the fail-closed contract it
+	// would then refuse every sync -- looking healthy in every other respect
+	// while replicating nothing. A host that will not start says so.
+	//
+	// The session id ties every record this process writes to this process,
+	// which is what lets a later agent tell "a run I started" from "a run
+	// somebody else's instance started and may still be running".
+	cfg.runLog = newRunLog(cfg.StateDir, newRunID(), cfg.metrics)
+	if err := cfg.runLog.Open(); err != nil {
+		trace.Error("cannot open the run log, refusing to start: every vmsync this agent launches must be recorded before it is started, so without this file nothing can run",
+			"state_dir", cfg.StateDir, "file", runLogFile, "error", err)
+		os.Exit(2)
+	}
+	// Deliberately not deferred. Both exits below are os.Exit, which does not
+	// run deferred functions, so a defer here would be decoration. Nothing is
+	// lost by that: every Append fsyncs before it returns, so there is never
+	// buffered data waiting on a Close.
 
 	runner := run
 	if cfg.StandaloneFile != "" {
