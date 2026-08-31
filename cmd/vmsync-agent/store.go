@@ -277,5 +277,50 @@ func writeJSONAtomic(path string, value any, perm os.FileMode) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("install %s: %w", path, err)
 	}
+	// And flush the DIRECTORY, so the rename itself is durable.
+	//
+	// Syncing the temp file above makes its CONTENTS survive a power loss; it
+	// says nothing about the directory entry that points at them. Without this
+	// the rename can be lost while the data is intact, and the previous file
+	// reappears -- which for operations.json means an operation that already
+	// RAN comes back marked as never seen, and Seen() lets it execute a second
+	// time. For a promote or a restore, twice is not a retry.
+	//
+	// This is the half of the durable-rename idiom that is easy to leave out
+	// because everything works until the machine loses power at the wrong
+	// moment, and then works again afterwards.
+	//
+	// Its result is deliberately IGNORED, and that is not laziness. By this
+	// point the data is written, flushed and renamed -- the write has
+	// succeeded. A failure here means only that the directory entry's
+	// durability could not be confirmed, which leaves us exactly where this
+	// function stood before the fsync was added. Returning an error instead
+	// would tell the caller the write did not happen, and callers act on that:
+	// operationLedger.Begin refuses to execute, fenceLedger's caller now
+	// proceeds unrecorded, and the run log's contract stops launches outright.
+	// Trading an availability outage for an unobtainable durability guarantee
+	// is the wrong way round.
+	//
+	// Not hypothetical: POSIX permits fsync on a directory descriptor to
+	// refuse, and platforms differ on WHICH error they give for it -- Windows
+	// returns access-denied rather than EINVAL, so an errno allowlist here
+	// silently becomes an allowlist of platforms.
+	_ = syncDir(dir)
+	return nil
+}
+
+// syncDir fsyncs a directory so a rename into it is durable.
+//
+// Returns its error for testability and for any future caller that can
+// genuinely act on one; writeJSONAtomic deliberately cannot -- see above.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open state dir %s to flush it: %w", dir, err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("flush state dir %s: %w", dir, err)
+	}
 	return nil
 }

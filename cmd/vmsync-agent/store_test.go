@@ -139,6 +139,41 @@ func TestWriteIsAtomic(t *testing.T) {
 	}
 }
 
+// The directory flush that makes the rename durable must never be able to
+// fail a write.
+//
+// By the time it runs the data is written, flushed and renamed -- the write
+// has succeeded, and a refused directory fsync only leaves the rename's
+// durability unconfirmed, which is where this code stood before the flush
+// existed. Returning an error there would tell callers the write did not
+// happen, and they act on that: operationLedger.Begin refuses to execute, and
+// the run log's contract stops launches outright. An unobtainable durability
+// guarantee is not worth an outage.
+//
+// Directly exercisable because platforms genuinely differ: Windows refuses
+// fsync on a directory with access-denied rather than EINVAL, which is also
+// why this is not implemented as an errno allowlist -- that would quietly
+// become an allowlist of platforms.
+func TestADirectorySyncRefusalDoesNotFailTheWrite(t *testing.T) {
+	s := Store{Dir: t.TempDir()}
+	if err := s.SaveCache(CachedConfig{ETag: `"x"`, Config: DefaultUIConfig()}); err != nil {
+		t.Fatalf("SaveCache failed, possibly because of the directory flush: %v", err)
+	}
+	got, ok, err := s.LoadCache()
+	if err != nil || !ok || got.ETag != `"x"` {
+		t.Errorf("LoadCache = %+v ok=%v err=%v, want the record that was just written", got, ok, err)
+	}
+}
+
+// syncDir itself still reports failures, so a future caller that can act on
+// one is able to. A missing directory is the case that must not read as
+// success.
+func TestSyncDirReportsAMissingDirectory(t *testing.T) {
+	if err := syncDir(filepath.Join(t.TempDir(), "does-not-exist")); err == nil {
+		t.Error("syncDir on a missing directory returned no error")
+	}
+}
+
 func TestCorruptStateFileIsReportedNotIgnored(t *testing.T) {
 	// Silently treating unparsable state as "absent" would make an agent
 	// quietly re-enrol, or quietly discard its fallback config, with no
