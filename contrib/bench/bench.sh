@@ -881,11 +881,17 @@ verify_guard_subtest() {
         elif [ "$RUN_RC" = 0 ]; then
                 warn "FAIL: vmsync accepted an incremental sync into a target whose disk had been modified since the last sync -- the mtime guard did not fire. See $RUN_LOG"
                 results_row "$CSV" verify-guard tamper-result 1 "" "" "" "" "" "FAIL mtime guard did not fire"
-        elif grep -q "Target file on system is newer" "$RUN_LOG" 2>/dev/null; then
+        # Matched on vmsync's own wording, so it breaks when that wording
+        # changes -- which it did: adding -timestamp-tolerance-sec rewrote this
+        # error and left the old phrase matching nothing, so a guard that fired
+        # exactly as intended was reported as "something else went wrong
+        # first". The phrase below is the semantic core rather than the whole
+        # sentence, to survive the next rewording of the surrounding prose.
+        elif grep -q "newer than the last sync timestamp" "$RUN_LOG" 2>/dev/null; then
                 log "   PASS: the mtime guard refused the sync"
                 results_row "$CSV" verify-guard tamper-result 0 "" "" "" "" "" "PASS mtime guard refused the sync"
         else
-                warn "FAIL: the sync failed, but not at the mtime guard -- something else went wrong first. See $RUN_LOG"
+                warn "FAIL: the sync failed, but not at the mtime guard -- something else went wrong first: $(log_reason "$RUN_LOG")"
                 results_row "$CSV" verify-guard tamper-result 1 "" "" "" "" "" "FAIL failed for some other reason"
         fi
 
