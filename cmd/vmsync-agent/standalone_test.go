@@ -43,7 +43,7 @@ func TestLoadStandaloneConfig(t *testing.T) {
 	                 "verify": "online", "target_disk_path": "/data/replicas"}}
 	  ],
 	  "max_concurrent_syncs": 3,
-	  "target_host_budget": {"dr01": 2}
+	  "target_replication_slots": {"dr01": 2}
 	}`)
 
 	cfg, err := loadStandaloneConfig(path)
@@ -60,8 +60,8 @@ func TestLoadStandaloneConfig(t *testing.T) {
 	if e.Profile.Compress != "zstd" || e.Profile.CompressLevel != "5" || e.Profile.IODepth != 16 {
 		t.Errorf("profile = %+v", e.Profile)
 	}
-	if cfg.MaxConcurrentSyncs != 3 || cfg.TargetHostBudget["dr01"] != 2 {
-		t.Errorf("limits = %d / %v", cfg.MaxConcurrentSyncs, cfg.TargetHostBudget)
+	if cfg.MaxConcurrentSyncs != 3 || cfg.TargetReplicationSlots["dr01"] != 2 {
+		t.Errorf("limits = %d / %v", cfg.MaxConcurrentSyncs, cfg.TargetReplicationSlots)
 	}
 	// Normalize fills the intervals the daemon paths need, so the scheduler
 	// sees the same shape whether the config came from a file or the UI.
@@ -164,10 +164,10 @@ func TestValidateStandaloneConfig(t *testing.T) {
 			`verify "vigorously"`,
 		},
 		{
-			"negative budget",
+			"negative replication slots",
 			UIConfig{
-				Schedule:         []ScheduleEntry{{VM: "web01", IntervalSeconds: 900}},
-				TargetHostBudget: map[string]int{"dr01": -1},
+				Schedule:               []ScheduleEntry{{VM: "web01", IntervalSeconds: 900}},
+				TargetReplicationSlots: map[string]int{"dr01": -1},
 			},
 			"cannot be negative",
 		},

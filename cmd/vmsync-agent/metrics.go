@@ -53,7 +53,7 @@ const metricsInterval = 15 * time.Second
 // before it, which is precisely the window an alert covers.
 const (
 	skipHostConcurrency = "host_concurrency"
-	skipTargetBudget    = "target_budget"
+	skipTargetSlots     = "target_replication_slots"
 	skipAlreadyRunning  = "already_running"
 	skipInvalidProfile  = "invalid_profile"
 	skipNoTarget        = "no_target"
@@ -61,7 +61,7 @@ const (
 
 var skipReasons = []string{
 	skipHostConcurrency,
-	skipTargetBudget,
+	skipTargetSlots,
 	skipAlreadyRunning,
 	skipInvalidProfile,
 	skipNoTarget,

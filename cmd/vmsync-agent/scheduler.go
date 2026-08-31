@@ -333,11 +333,13 @@ func (s *Scheduler) admit(vm, targetHost string, cfg UIConfig) bool {
 		s.metrics.skip(skipHostConcurrency)
 		return false
 	}
-	// The per-target-host budget is the limit only the UI can compute: this
-	// agent cannot see that other hosts are also writing to targetHost.
-	if budget, ok := cfg.TargetHostBudget[targetHost]; ok && budget > 0 {
-		if s.hostLoad[targetHost] >= budget {
-			s.metrics.skip(skipTargetBudget)
+	// Replication slots are the limit only the UI can compute: this agent
+	// cannot see that other hosts are also writing to targetHost. Counted
+	// here per agent, so the UI's number is what EACH agent may use, not an
+	// estate-wide total.
+	if slots, ok := cfg.TargetReplicationSlots[targetHost]; ok && slots > 0 {
+		if s.hostLoad[targetHost] >= slots {
+			s.metrics.skip(skipTargetSlots)
 			return false
 		}
 	}

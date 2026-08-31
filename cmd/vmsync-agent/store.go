@@ -106,10 +106,10 @@ type UIConfig struct {
 	// the agent's own default; the agent also clamps this, since a UI is a
 	// separately-versioned program whose answers are input to validate.
 	MaxConcurrentSyncs int `json:"max_concurrent_syncs,omitempty"`
-	// TargetHostBudget caps concurrent syncs INTO a given target host. No
+	// TargetReplicationSlots caps concurrent syncs INTO a given target host. No
 	// single agent can see that four others are writing to the same target,
 	// so this is the one limit only the UI can compute.
-	TargetHostBudget map[string]int `json:"target_host_budget,omitempty"`
+	TargetReplicationSlots map[string]int `json:"target_replication_slots,omitempty"`
 	// ShutdownTimeoutSec is the estate default for a clean guest shutdown.
 	//
 	// Needed here as well as on each operation because the agent shuts

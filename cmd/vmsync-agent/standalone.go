@@ -39,11 +39,10 @@ import (
 // the way was a startup path that insisted on enrolling first. This is that
 // path made optional.
 //
-// The result is a scheduler with parallelism limits, per-target-host
-// budgets, staggering, skip-if-still-running and per-VM outcome logging,
-// for a host that will never have a control plane. An agent installed this
-// way can be enrolled later without changing anything about how it runs
-// syncs.
+// The result is a scheduler with parallelism limits, per-target replication
+// slots, staggering, skip-if-still-running and per-VM outcome logging, for a
+// host that will never have a control plane. An agent installed this way can
+// be enrolled later without changing anything about how it runs syncs.
 func runStandalone(cfg agentConfig) error {
 	uiCfg, err := loadStandaloneConfig(cfg.StandaloneFile)
 	if err != nil {
@@ -186,9 +185,9 @@ func validateStandaloneConfig(cfg UIConfig) error {
 	if cfg.MaxConcurrentSyncs < 0 {
 		return fmt.Errorf("max_concurrent_syncs cannot be negative")
 	}
-	for host, n := range cfg.TargetHostBudget {
+	for host, n := range cfg.TargetReplicationSlots {
 		if n < 0 {
-			return fmt.Errorf("target_host_budget for %s cannot be negative", host)
+			return fmt.Errorf("target_replication_slots for %s cannot be negative", host)
 		}
 	}
 	return nil
