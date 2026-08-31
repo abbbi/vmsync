@@ -218,6 +218,65 @@ func ResolveRootSource(chain []QemuImgInfo, source string) string {
 	return chain[len(chain)-1].Filename
 }
 
+// BitmapNames lists the persistent dirty bitmaps qemu-img reports for an
+// image, in the order it reported them.
+//
+// These are what a libvirt checkpoint actually IS on disk. Deleting a
+// checkpoint normally merges its bitmap into the next one, which only qemu can
+// do and only while the domain runs -- so an offline domain's checkpoints can
+// only be removed by dropping libvirt's metadata and then deleting these by
+// hand. Getting that pair out of step is what leaves an image that refuses
+// every future sync with "Bitmap already exists" while `virsh checkpoint-list`
+// shows nothing at all.
+//
+// Reads the nested shape qemu-img actually emits -- format-specific.data
+// .bitmaps[].name -- defensively at every level, because this is
+// map[string]interface{} from a program's output and a missing key is a normal
+// answer meaning "no bitmaps", not a fault.
+func BitmapNames(info QemuImgInfo) []string {
+	data, ok := info.FormatSpec["data"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	raw, ok := data["bitmaps"].([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, entry := range raw {
+		m, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if name, ok := m["name"].(string); ok && name != "" {
+			out = append(out, name)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// RemoveBitmap deletes one persistent dirty bitmap from an OFFLINE qcow2.
+//
+// The image must not be in use: qemu-img takes a write lock and refuses while
+// a domain has it open, which is the behaviour wanted -- editing an image
+// underneath a running guest would be far worse than the error.
+//
+// -f qcow2 explicitly rather than letting qemu-img probe: probing a file whose
+// contents an attacker could influence is how a raw disk gets treated as
+// something else, and every image vmsync manages is qcow2 by construction.
+func RemoveBitmap(path, name string) error {
+	cmd := exec.Command("qemu-img", "bitmap", "--remove", "-f", "qcow2", path, name)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("qemu-img bitmap --remove %s from %s: %w: %s",
+			name, path, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // CompareImages runs qemu-img compare between refA and refB -- each any
 // qemu-img-recognized image reference (a local file path, or a network URL
 // such as "nbd://host:port/export"). It runs as a local subprocess wherever

@@ -123,3 +123,78 @@ func TestQcowDiskPathDistinguishesDirectoriesAcrossAPair(t *testing.T) {
 		t.Errorf("Dir = %q, want /localdata", path.Dir(newTarget.Path()))
 	}
 }
+
+// BitmapNames reads what a libvirt checkpoint actually IS on disk. The
+// inversion's offline cleanup deletes exactly what this returns, so a wrong
+// answer either leaves a bitmap whose checkpoint is gone -- which blocks every
+// later sync with "Bitmap already exists" -- or removes one belonging to
+// something else.
+func TestBitmapNames(t *testing.T) {
+	// The nested shape qemu-img actually emits.
+	withTwo := QcowFormatSpecFixture([]string{"vmsync-cpt-000001", "vmsync-cpt-000002"})
+	got := BitmapNames(QemuImgInfo{FormatSpec: withTwo})
+	if len(got) != 2 || got[0] != "vmsync-cpt-000001" || got[1] != "vmsync-cpt-000002" {
+		t.Fatalf("BitmapNames = %v, want both bitmaps in order", got)
+	}
+
+	// An ordinary image has no bitmaps key at all. That is "none", not a
+	// fault -- most images vmsync touches are in exactly this state.
+	noKey := map[string]interface{}{"data": map[string]interface{}{"compat": "1.1"}}
+	if got := BitmapNames(QemuImgInfo{FormatSpec: noKey}); got != nil {
+		t.Errorf("BitmapNames = %v for an image with no bitmaps, want nil", got)
+	}
+
+	// A raw image has no format-specific block at all.
+	if got := BitmapNames(QemuImgInfo{}); got != nil {
+		t.Errorf("BitmapNames = %v for an image with no format-specific data, want nil", got)
+	}
+}
+
+func TestBitmapNamesToleratesMalformedEntries(t *testing.T) {
+	// This walks map[string]interface{} decoded from another program's
+	// output. Every level has to be guarded, and a surprise must yield "no
+	// bitmaps" rather than a panic in the middle of an inversion.
+	spec := map[string]interface{}{
+		"data": map[string]interface{}{
+			"bitmaps": []interface{}{
+				"not-an-object",
+				map[string]interface{}{"granularity": 65536},        // no name
+				map[string]interface{}{"name": ""},                  // empty name
+				map[string]interface{}{"name": 42},                  // wrong type
+				map[string]interface{}{"name": "vmsync-cpt-000001"}, // the only good one
+			},
+		},
+	}
+	got := BitmapNames(QemuImgInfo{FormatSpec: spec})
+	if len(got) != 1 || got[0] != "vmsync-cpt-000001" {
+		t.Fatalf("BitmapNames = %v, want just the one well-formed entry", got)
+	}
+
+	// bitmaps present but not a list.
+	bad := map[string]interface{}{"data": map[string]interface{}{"bitmaps": "nonsense"}}
+	if got := BitmapNames(QemuImgInfo{FormatSpec: bad}); got != nil {
+		t.Errorf("BitmapNames = %v, want nil", got)
+	}
+	// data present but not a map.
+	bad2 := map[string]interface{}{"data": "nonsense"}
+	if got := BitmapNames(QemuImgInfo{FormatSpec: bad2}); got != nil {
+		t.Errorf("BitmapNames = %v, want nil", got)
+	}
+}
+
+// QcowFormatSpecFixture builds the format-specific block qemu-img emits for a
+// qcow2 carrying the named persistent bitmaps.
+func QcowFormatSpecFixture(names []string) map[string]interface{} {
+	bitmaps := make([]interface{}, 0, len(names))
+	for _, n := range names {
+		bitmaps = append(bitmaps, map[string]interface{}{
+			"flags":       []interface{}{"auto"},
+			"name":        n,
+			"granularity": float64(65536),
+		})
+	}
+	return map[string]interface{}{
+		"type": "qcow2",
+		"data": map[string]interface{}{"compat": "1.1", "bitmaps": bitmaps},
+	}
+}

@@ -33,6 +33,8 @@ import (
 	"vmsync/pkg/libvirtsync"
 	"vmsync/pkg/trace"
 	"vmsync/pkg/util"
+
+	"libvirt.org/go/libvirt"
 )
 
 // The failover modes run where the domain they act on lives, and refuse a
@@ -520,13 +522,7 @@ func runInvert(ctx context.Context, cfg syncConfig) error {
 	// domain now ends with. Fatal if it fails: proceeding would leave a
 	// pair that cannot complete a single sync.
 	if plan.DropCheckpointsOnOldSource {
-		dom, lookupErr := srcMgr.LookupDomain(cfg.SourceDomain)
-		if lookupErr != nil {
-			return lookupErr
-		}
-		err := libvirtsync.DeleteAllManagedCheckpoints(dom)
-		dom.Free()
-		if err != nil {
+		if err := dropCheckpointsOffline(srcMgr, cfg); err != nil {
 			return fmt.Errorf("discard %s's stale checkpoint chain before inverting: %w", cfg.SourceDomain, err)
 		}
 		trace.Info("discarded the old source's checkpoint chain", "vm", cfg.SourceDomain)
@@ -592,6 +588,87 @@ func warnAboutReversedDiskPaths(srcMgr, tgtMgr *libvirtsync.Manager, cfg syncCon
 // singleDiskDir reports the one directory holding every qcow2 disk of a
 // domain. False when there are none, or when they span several -- which
 // -target-disk-path cannot express in either direction.
+// dropCheckpointsOffline removes the old source's vmsync checkpoints -- both
+// libvirt's record of them AND the bitmaps they are made of.
+//
+// Only reachable from -invert, and only ever against a domain that is shut
+// down: AssessInvert refuses to invert a running old source, because the
+// inversion turns it into a replication target and a running target is one
+// scheduled sync from being overwritten under a live workload. So the ordinary
+// deletion -- which merges each bitmap into the next and needs a live qemu --
+// is not available here, and libvirt says so: "cannot delete checkpoint for
+// inactive domain".
+//
+// The offline equivalent is two halves that MUST both happen. Doing only the
+// metadata half is what broke every sync for a pair once already: the images
+// keep bitmaps named after checkpoints libvirt no longer knows about, the next
+// sync restarts its chain at vmsync-cpt-000001, and qemu refuses with "Bitmap
+// already exists" while checkpoint-list shows nothing.
+//
+// Bitmaps first, metadata second, deliberately. Interrupted after the bitmaps,
+// libvirt still lists the checkpoints and a later delete tidies up -- visible
+// and recoverable. Interrupted the other way round leaves the invisible
+// breakage that has to be found with qemu-img.
+func dropCheckpointsOffline(srcMgr *libvirtsync.Manager, cfg syncConfig) error {
+	// qemu-img runs HERE, on the files as this process sees them. That is
+	// only true when the old source is this host -- vmsync's SSH path goes to
+	// the target, not the source, so there is no way to reach a remote
+	// source's images. Refusing beats the alternative of dropping the
+	// metadata and leaving the bitmaps, which is exactly the corruption this
+	// function exists to avoid.
+	if err := requireLocalURI(cfg.SourceURI, "-source-uri"); err != nil {
+		return fmt.Errorf("%s has a checkpoint chain that must be discarded, and that means editing its disk images, which only works where they are: run -invert on %s's own host with a local -source-uri (this is where -promote and -shutdown-domain already have to run). %w",
+			cfg.SourceDomain, cfg.SourceDomain, err)
+	}
+
+	dom, err := srcMgr.LookupDomain(cfg.SourceDomain)
+	if err != nil {
+		return err
+	}
+	defer dom.Free()
+
+	// INACTIVE, matching every other metadata read: the domain is shut down
+	// by definition here, so this is its persistent definition either way.
+	domXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
+	if err != nil {
+		return fmt.Errorf("read %s's definition: %w", cfg.SourceDomain, err)
+	}
+	disks, err := disk.ParseQcowDisks(domXML)
+	if err != nil {
+		return fmt.Errorf("read %s's disks: %w", cfg.SourceDomain, err)
+	}
+
+	// --- half one: the bitmaps ----------------------------------------------
+	for _, d := range disks {
+		path := d.Path()
+		if path == "" {
+			continue
+		}
+		chain, err := disk.QemuImgInfoChainJSON(path)
+		if err != nil {
+			return fmt.Errorf("inspect %s for checkpoint bitmaps: %w", path, err)
+		}
+		// chain[0] is the image itself; a backing file's own bitmaps are not
+		// this domain's checkpoints and are not ours to remove.
+		for _, name := range disk.BitmapNames(chain[0]) {
+			if !libvirtsync.IsManagedCheckpointName(name) {
+				// Somebody else's bitmap on the same image. Left alone: this
+				// function knows what vmsync's checkpoints are named and has
+				// no business guessing about anything else.
+				trace.Warning("leaving a dirty bitmap that vmsync did not create", "disk", path, "bitmap", name)
+				continue
+			}
+			if err := disk.RemoveBitmap(path, name); err != nil {
+				return err
+			}
+			trace.Info("removed a checkpoint bitmap from an offline image", "disk", path, "bitmap", name)
+		}
+	}
+
+	// --- half two: libvirt's record ------------------------------------------
+	return libvirtsync.DeleteAllManagedCheckpointsMetadataOnly(dom)
+}
+
 func singleDiskDir(mgr *libvirtsync.Manager, domain string) (string, bool) {
 	dom, err := mgr.LookupDomain(domain)
 	if err != nil {

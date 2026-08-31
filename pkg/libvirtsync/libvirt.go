@@ -89,6 +89,23 @@ func ValidateTestFault(name string) error {
 
 const CheckpointPrefix = "vmsync-cpt"
 
+// IsManagedCheckpointName reports whether a name belongs to vmsync's own
+// checkpoint chain.
+//
+// The single definition of "ours", because two things now ask it and they must
+// agree: ListManagedCheckpoints, deciding which checkpoints to report, and the
+// inversion's offline cleanup, deciding which dirty BITMAPS it may delete off
+// a disk image. A disagreement there means either leaving a bitmap whose
+// checkpoint has gone -- which blocks every later sync -- or removing one that
+// belongs to something else entirely.
+//
+// Note what this excludes on purpose: VerifyWindowCheckpointName, which is
+// deliberately not prefixed so it stays invisible to the chain logic. Both
+// callers ignore it identically, which is the intended outcome.
+func IsManagedCheckpointName(name string) bool {
+	return strings.HasPrefix(name, CheckpointPrefix+"-")
+}
+
 // VerifyWindowCheckpointName names the ephemeral, throwaway checkpoint
 // -verify=online creates right when its compare window opens, to find out
 // afterward which regions the guest wrote to during the compare (see
@@ -1836,7 +1853,7 @@ func ListManagedCheckpoints(dom *libvirt.Domain) ([]Checkpoint, error) {
 			if err != nil {
 				return Checkpoint{}, false, fmt.Errorf("get checkpoint name: %w", err)
 			}
-			if !strings.HasPrefix(name, CheckpointPrefix+"-") {
+			if !IsManagedCheckpointName(name) {
 				return Checkpoint{}, false, nil
 			}
 
@@ -2019,13 +2036,54 @@ func DeleteCheckpointIfExists(dom *libvirt.Domain, checkpointName string) error 
 	// callers, most of them ordinary sync paths against images that stay, so
 	// it cannot make that assumption for any of them.
 	//
-	// The refusal on an inactive domain is therefore left to propagate. It is
-	// a real problem for -invert, which requires the old source shut down and
-	// then tries to drop its chain -- but the fix for that belongs in the
-	// inversion, where the disks' fate is known, and it has to remove the
-	// bitmaps too rather than merely stop mentioning them.
+	// The refusal on an inactive domain is therefore left to propagate. The
+	// one caller that legitimately needs to get past it is -invert, and it
+	// uses DeleteAllManagedCheckpointsMetadataOnly below -- which is a
+	// different function precisely so nobody reaches this behaviour without
+	// having read what it costs.
 	if err := cp.Delete(0); err != nil {
 		return fmt.Errorf("delete checkpoint %s: %w", checkpointName, err)
+	}
+	return nil
+}
+
+// DeleteAllManagedCheckpointsMetadataOnly drops libvirt's record of every
+// vmsync checkpoint WITHOUT touching the bitmaps in the images.
+//
+// On its own this corrupts the pair. It leaves each disk carrying a persistent
+// bitmap named after a checkpoint libvirt no longer knows about, so the next
+// sync starts its chain again at vmsync-cpt-000001 and qemu refuses -- "Bitmap
+// already exists" -- for that pair, permanently, with `virsh checkpoint-list`
+// showing nothing that would explain it.
+//
+// It is exported only because an offline domain gives no alternative: deleting
+// a checkpoint properly merges its bitmap into the next one, and only a running
+// qemu can do that. The offline equivalent is this plus disk.RemoveBitmap for
+// every bitmap on every disk, and the CALLER MUST DO BOTH.
+//
+// Bitmaps first, then this. That order matters: bitmaps gone with metadata
+// still present is a visible, recoverable state -- checkpoint-list shows the
+// checkpoints and a later delete cleans up -- whereas metadata gone with
+// bitmaps present is the invisible one that has to be found with qemu-img and
+// unpicked by hand.
+func DeleteAllManagedCheckpointsMetadataOnly(dom *libvirt.Domain) error {
+	existing, err := ListManagedCheckpoints(dom)
+	if err != nil {
+		return err
+	}
+	for _, name := range checkpointDeletionOrder(existing) {
+		cp, err := dom.CheckpointLookupByName(name, 0)
+		if err != nil {
+			if lvErr, ok := err.(libvirt.Error); ok && lvErr.Code == libvirt.ERR_NO_DOMAIN_CHECKPOINT {
+				continue
+			}
+			return fmt.Errorf("lookup checkpoint %s for deletion: %w", name, err)
+		}
+		err = cp.Delete(libvirt.DOMAIN_CHECKPOINT_DELETE_METADATA_ONLY)
+		cp.Free()
+		if err != nil {
+			return fmt.Errorf("delete checkpoint metadata %s: %w", name, err)
+		}
 	}
 	return nil
 }
