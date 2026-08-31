@@ -17,7 +17,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package disk
 
-import "testing"
+import (
+	"path"
+	"testing"
+)
 
 // TestResolveRootSource pins down QcowDisk.RootSource's actual resolution
 // logic -- previously inline in cmd/vmsync/main.go's disk-info loop, with no
@@ -75,5 +78,48 @@ func TestResolveRootSource(t *testing.T) {
 				t.Errorf("ResolveRootSource(%v, %q) = %q, want %q", tt.chain, tt.source, got, tt.want)
 			}
 		})
+	}
+}
+
+// QcowDisk.Path exists because RootSource is empty for every caller except the
+// sync path, and nothing about the field says so. Reading it directly is what
+// silently disabled cmd/vmsync's reversed-disk-path warning: path.Dir("") is
+// "." on both ends of a pair, so the two always compared equal and the warning
+// never fired for anyone.
+func TestQcowDiskPathFallsBackToSourceWhenTheChainIsUnresolved(t *testing.T) {
+	// What ParseQcowDisks produces: Source set, RootSource never populated.
+	unresolved := QcowDisk{Source: "/localdata/web01.qcow2"}
+	if got := unresolved.Path(); got != "/localdata/web01.qcow2" {
+		t.Errorf("Path() = %q, want the domain's own source -- RootSource is empty unless the sync path resolved it", got)
+	}
+
+	// What the sync path produces once it has run qemu-img: the chain's base,
+	// which is the name the target file was created under and stays stable as
+	// more overlays are stacked on top.
+	resolved := QcowDisk{Source: "/localdata/web01.snap1.qcow2", RootSource: "/localdata/web01.qcow2"}
+	if got := resolved.Path(); got != "/localdata/web01.qcow2" {
+		t.Errorf("Path() = %q, want the resolved backing-chain root", got)
+	}
+
+	// Both empty is a malformed disk entry, and "" is the honest answer --
+	// better than a path that looks real.
+	if got := (QcowDisk{}).Path(); got != "" {
+		t.Errorf("Path() = %q for a disk with neither field, want empty", got)
+	}
+}
+
+// The concrete regression: two ends whose disks live in different directories
+// must not look identical just because neither chain has been resolved.
+func TestQcowDiskPathDistinguishesDirectoriesAcrossAPair(t *testing.T) {
+	newSource := QcowDisk{Source: "/data/vmsync-bench/web01.qcow2"}
+	newTarget := QcowDisk{Source: "/localdata/web01.qcow2"}
+
+	if path.Dir(newSource.Path()) == path.Dir(newTarget.Path()) {
+		t.Fatal("two ends with disks in different directories compared equal; this is what suppressed the inversion warning")
+	}
+	// And the value is usable in the warning itself: an operator has to be
+	// told which directory to pass, not merely that something differs.
+	if path.Dir(newTarget.Path()) != "/localdata" {
+		t.Errorf("Dir = %q, want /localdata", path.Dir(newTarget.Path()))
 	}
 }

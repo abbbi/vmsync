@@ -55,6 +55,31 @@ type QcowDisk struct {
 	RootSource string
 }
 
+// Path is where this disk's file actually is: the backing-chain root when it
+// has been resolved, and the domain's own <source file> otherwise.
+//
+// It exists because RootSource is a TRAP. ParseQcowDisks does not populate it
+// -- resolving a backing chain means running qemu-img per disk, which the
+// inventory scan explicitly refuses to pay on every report -- so it is empty
+// for everyone except the sync path, which fills it in itself after doing that
+// work. A caller that parses an XML and reads RootSource gets "", and nothing
+// about the field says so.
+//
+// That has already cost one silent bug: cmd/vmsync's inversion warning about
+// reversed -target-disk-path values compared path.Dir("") against path.Dir("")
+// -- "." on both ends, always equal -- so the warning could never fire, on any
+// pair, and the hazard it exists to flag went unmentioned.
+//
+// Use this instead of reading either field directly, unless you specifically
+// need the currently-active overlay (Source) or specifically know the chain
+// has been resolved.
+func (d QcowDisk) Path() string {
+	if d.RootSource != "" {
+		return d.RootSource
+	}
+	return d.Source
+}
+
 type QemuImgInfo struct {
 	Filename    string                 `json:"filename"`
 	Format      string                 `json:"format"`

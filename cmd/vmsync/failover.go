@@ -608,8 +608,15 @@ func singleDiskDir(mgr *libvirtsync.Manager, domain string) (string, bool) {
 	}
 	dir := ""
 	for _, d := range disks {
+		// Path(), not RootSource: ParseQcowDisks leaves RootSource empty --
+		// only the sync path fills it in, after resolving each chain with
+		// qemu-img. Reading it here gave path.Dir("") = "." for every disk on
+		// both ends, so the two always compared equal and this function's
+		// caller silently decided there was nothing to warn about. The
+		// warning had never fired for anyone.
+		//
 		// path, not filepath: these are paths on a libvirt host.
-		this := path.Dir(d.RootSource)
+		this := path.Dir(d.Path())
 		if dir == "" {
 			dir = this
 			continue

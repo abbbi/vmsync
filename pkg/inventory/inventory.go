@@ -369,11 +369,10 @@ func describe(dom *libvirt.Domain) (Domain, error) {
 	if disks, derr := disk.ParseQcowDisks(xml); derr == nil {
 		paths := make([]string, 0, len(disks))
 		for _, qd := range disks {
-			p := qd.RootSource
-			if p == "" {
-				p = qd.Source
-			}
-			paths = append(paths, p)
+			// Was this same fallback written out inline. It is QcowDisk.Path()
+			// now, so the one place that knew RootSource is empty here is not
+			// also the only place that knows it.
+			paths = append(paths, qd.Path())
 		}
 		d.Disks = inspectDisks(paths)
 		// After the disks, because it is derived from where they are -- the
