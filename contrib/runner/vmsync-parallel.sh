@@ -263,8 +263,16 @@ replicate() {
 
         log "$(date): Total number of VMs to replicate; ${vm_count}, launching ${REPLICATION_CONCURRENCY} tasks"
 
-        # Actual replication
-        exectasks "${cmd_list}" "${PROGRAM}" false "${SOFT_TIMEOUT_PER_VM}" 0 0 0 false .5 "${KEEP_LOGGING}" true "" "" "${REPLICATION_CONCURRENCY}"
+        # Actual replication.
+        #
+        # The trailing '"" "" "" "0;75"' fills positional arguments 15-17 (unused
+        # here) so that argument 18, validExitCodes, can be set. 75 is vmsync's
+        # EX_TEMPFAIL: it stood down without touching anything because another
+        # vmsync already held that domain's lock. This script's own lock (see
+        # the top of the file) exists to make that overlap benign, so it must
+        # not be treated as an error -- without this, every legitimate overlap
+        # is logged as a failure and can reach SendAlert.
+        exectasks "${cmd_list}" "${PROGRAM}" false "${SOFT_TIMEOUT_PER_VM}" 0 0 0 false .5 "${KEEP_LOGGING}" true "" "" "${REPLICATION_CONCURRENCY}" "" "" "" "0;75"
         result=$?
         if [ $result -ne 0 ]; then
                 log "$(date): Global replication state failed" "ERROR"
