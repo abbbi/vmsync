@@ -146,6 +146,21 @@ func (l *fenceLedger) Begin(rec fenceRecord) error {
 
 func (l *fenceLedger) Finish(rec fenceRecord) error { return l.put(rec) }
 
+// put records in memory FIRST and never rolls that back when the disk write
+// fails. That is deliberate here, and it is the opposite of what
+// operationLedger.put does -- see its comment.
+//
+// The difference is what each ledger's caller does on a failed Begin. A fence
+// proceeds anyway (fenceOneDomain, below), because not fencing means one
+// workload live in two places writing to two diverging copies. So the shutdown
+// really is attempted, the in-memory latch really does describe something that
+// happened, and keeping it is what stops the next 60-second sweep attempting
+// it again. An operation, by contrast, refuses to run when its intent cannot
+// be recorded -- so there its latch would describe nothing, and it is undone.
+//
+// The cost is bounded and only spans a restart: the record was never
+// persisted, so a new process does not know the fence happened. See
+// fenceOneDomain for what that exposure actually amounts to.
 func (l *fenceLedger) put(rec fenceRecord) error {
 	l.mu.Lock()
 	l.records[rec.FenceID] = rec
@@ -412,13 +427,38 @@ func fenceOneDomain(ctx context.Context, cfg agentConfig, cached UIConfig, ledge
 		ArmedBy: rep.Fence.ArmedBy,
 	}
 
-	// Intent first, durably. If this write fails nothing is shut down: a
-	// shutdown with no record of it could be performed again on the next
-	// pass, and "again" for a fence means a second unattended shutdown of a
-	// production VM that somebody may have deliberately restarted.
+	// Intent first, durably -- but the fence is NOT conditional on that write
+	// succeeding.
+	//
+	// This used to return here, which was wrong in two compounding ways. The
+	// harm ranking is the first: a shutdown performed twice costs one more
+	// ACPI request to a guest that is already ignoring the first, and
+	// ShutdownDomain never falls back to destroying a domain; a fence that
+	// does not fire leaves one workload live in two places writing to two
+	// diverging copies, which is unrecoverable and is the entire reason this
+	// mechanism exists.
+	//
+	// The second is that refusing did not even buy the protection it claimed.
+	// put() latches in memory before it writes (see its comment), with no
+	// rollback, so a fence refused here was still marked acted-on: every later
+	// sweep took the alreadyActed branch and warned that the fence "was
+	// already acted on -- it will NOT be retried" about a shutdown that never
+	// happened, for the life of the process, unaffected by the disk clearing.
+	// Fencing anyway makes that message true.
+	//
+	// What is genuinely lost is the record surviving a restart, so a new
+	// process may fence the same token again. Bounded: if the shutdown
+	// succeeded the domain is off and replication is `paused`, and the sweep
+	// skips it on both counts, so a repeat needs somebody to restart the VM
+	// and put its role back while the peer is still promoted and armed -- by
+	// which point a real split brain exists and shutting down is correct.
 	if err := ledger.Begin(rec); err != nil {
-		trace.Error("not fencing, because the intent could not be recorded", "vm", vm, "error", err)
-		return
+		// Loud, and counted separately: this is the one path that acts on a
+		// production VM without a durable record of having done so, and an
+		// audit gap must be visible rather than inferred.
+		trace.Error("FENCING WITHOUT A DURABLE RECORD: the intent could not be written, and this fence is proceeding anyway because a split brain is the worse outcome -- if this agent restarts, the same fence may be attempted again",
+			"vm", vm, "peer", peerRef, "fence_id", rep.Fence.ID, "error", err)
+		cfg.metrics.fenceUnrecorded()
 	}
 
 	trace.Warning("FENCING: shutting this domain down because it has been failed over to another host",

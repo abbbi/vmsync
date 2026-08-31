@@ -53,9 +53,26 @@ var ErrLockHeld = errors.New("lock already held by another process")
 // never retry with the same operation id -- while the reason it could not run
 // clears up on its own seconds later.
 //
-// A SYNC does not use it. Contention there is an ordinary skip and exits 0,
-// because a scheduler running every few minutes simply tries again and nothing
-// needs to tell the cases apart.
+// A SYNC uses it too, and used not to. The original reasoning -- contention is
+// an ordinary skip, a scheduler running every few minutes simply tries again,
+// nothing needs to tell the cases apart -- was sound while the scheduler's
+// memory of what it launched was assumed intact. It is not intact across a
+// restart: vmsync-agent holds its in-flight set in memory only, so a new
+// instance knows nothing about a child the previous one started, launches a
+// second vmsync for that domain, and reads the exit code to decide what
+// happened. At 0 it recorded a SUCCESS -- every interval, for as long as the
+// real sync ran -- so the agent's metrics, the console and the journal all
+// reported healthy replication while nothing was being copied.
+//
+// Telling the cases apart is therefore no longer optional, and this is the
+// only signal that can: it comes from the process that actually holds the
+// lock, so unlike anything the agent can infer from /proc or its own files, it
+// cannot be stale or wrong.
+//
+// Consequence for anything else that runs vmsync: a scheduled overlap that was
+// previously indistinguishable from success now exits 75. Callers that treat
+// any non-zero code as an error need to accept it -- see
+// contrib/runner/vmsync-parallel.sh, which passes "0;75" for exactly this.
 const ExitBusy = 75
 
 // safeKeyReplacer makes a lock key filesystem-safe reversibly (percent-

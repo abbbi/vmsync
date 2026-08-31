@@ -33,6 +33,7 @@ import (
 	"vmsync/pkg/inventory"
 	"vmsync/pkg/libvirtsync"
 	"vmsync/pkg/trace"
+	"vmsync/pkg/util"
 )
 
 // SyncResult is the outcome of one scheduled run, reported to the UI so an
@@ -501,6 +502,28 @@ func (s *Scheduler) runOne(ctx context.Context, entry ScheduleEntry, plan syncPl
 		ExitCode:       cmd.ProcessState.ExitCode(),
 		LogTail:        tail(out.String(), logTailBytes),
 	}
+
+	// Exit 75 is vmsync saying it stood down without touching anything,
+	// because another vmsync already holds this domain's lock (util.ExitBusy,
+	// and see its comment for why a sync reports it at all).
+	//
+	// Neither a success nor a failure, and recording it as either is wrong in
+	// a way that matters. As a success -- which it was, while the engine
+	// exited 0 -- an agent restarted during a long sync reported a phantom
+	// healthy run every interval for as long as the real one lasted. As a
+	// failure it would drive -reinit-after-failures toward discarding a
+	// replica because its own previous run was still going.
+	//
+	// It is also not a result worth shipping: it says nothing about the pair,
+	// and 50 of them would push real outcomes off the report's ring
+	// (resultsKept). Counted and journalled, not recorded.
+	if res.ExitCode == util.ExitBusy {
+		trace.Info("a scheduled sync stood down: another vmsync is already working on this domain, and nothing was changed",
+			"vm", entry.VM, "target", plan.targetHost)
+		s.metrics.runBusy()
+		return
+	}
+
 	if err != nil {
 		res.Error = err.Error()
 		trace.Error("scheduled sync failed", "vm", entry.VM, "target", plan.targetHost,

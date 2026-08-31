@@ -261,13 +261,36 @@ func (l *operationLedger) Seen(id string) (OperationResult, bool) {
 
 // Begin records intent and persists it before any work happens.
 func (l *operationLedger) Begin(op Operation, now time.Time) error {
-	return l.put(ledgerEntry{
+	err := l.put(ledgerEntry{
 		ID: op.ID, Kind: op.Kind, VM: op.VM, State: OpStateRunning, AtUnix: now.Unix(),
 		Result: OperationResult{
 			ID: op.ID, Kind: op.Kind, VM: op.VM,
 			State: OpStateRunning, StartedAtUnix: now.Unix(),
 		},
 	})
+	if err != nil {
+		// Undo the in-memory half. put() records there before it writes, so a
+		// failed write used to leave this operation marked `running` having
+		// never started -- and that is not a harmless inconsistency: Seen()
+		// refuses to re-execute ANY recorded id, so the operation could never
+		// be retried, while the UI kept publishing it forever. A later Load()
+		// then relabelled the orphan "the agent stopped while this operation
+		// was in progress", which is a statement about something that never
+		// began.
+		//
+		// writeJSONAtomic renames or fails, so on this path the file still
+		// holds the pre-Begin state and only memory is out of step. Dropping
+		// the entry puts the two back in agreement and lets the next tick try
+		// again, which is what a transient ENOSPC deserves.
+		//
+		// The opposite of fenceLedger.put's deliberate non-rollback, and for
+		// the opposite reason: opexec refuses to execute when this returns an
+		// error, so the latch would describe nothing that happened.
+		l.mu.Lock()
+		delete(l.entries, op.ID)
+		l.mu.Unlock()
+	}
+	return err
 }
 
 // Finish records a terminal outcome.

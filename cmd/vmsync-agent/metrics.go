@@ -82,6 +82,7 @@ type agentMetrics struct {
 
 	runsOK   atomic.Uint64
 	runsFail atomic.Uint64
+	runsBusy atomic.Uint64
 	skips    map[string]*atomic.Uint64 // fixed keys; never written after construction
 
 	uiLastContact atomic.Int64 // unix seconds, 0 = never
@@ -109,9 +110,10 @@ type agentMetrics struct {
 	// after a fence that failed, the VM stays in the set and the metric
 	// stays up. That is the whole point -- the case where nothing was done
 	// about it is exactly the case somebody must be told about.
-	splitBrainVMs map[string]bool
-	fencesActed   atomic.Uint64
-	fencesFailed  atomic.Uint64
+	splitBrainVMs    map[string]bool
+	fencesActed      atomic.Uint64
+	fencesFailed     atomic.Uint64
+	fencesUnrecorded atomic.Uint64
 }
 
 // setSplitBrain replaces the whole set from one complete sweep.
@@ -143,6 +145,22 @@ func (m *agentMetrics) fenceActed(ok bool) {
 	} else {
 		m.fencesFailed.Add(1)
 	}
+}
+
+// fenceUnrecorded counts fences that went ahead without a durable record,
+// because the ledger write failed and a split brain is the worse outcome.
+//
+// Its own series rather than a label on fencesActed/fencesFailed, which
+// describe how the SHUTDOWN went and are incremented only after cmd.Run()
+// returns -- a fence can be unrecorded and still succeed, or be unrecorded and
+// fail, and the two facts are independent. This one says the audit trail has a
+// hole in it, which is a thing an operator must be told directly rather than
+// have to infer from a ledger that is missing an entry it never got to write.
+func (m *agentMetrics) fenceUnrecorded() {
+	if m == nil {
+		return
+	}
+	m.fencesUnrecorded.Add(1)
 }
 
 func newAgentMetrics(version, hostname string, standalone bool) *agentMetrics {
@@ -188,6 +206,21 @@ func (m *agentMetrics) runFinished(ok bool) {
 		return
 	}
 	m.runsFail.Add(1)
+}
+
+// runBusy counts a launch that stood down on lock contention without doing
+// anything (util.ExitBusy).
+//
+// Its own result label rather than folding into success or failure, because
+// it answers a question neither of those can: a rising busy count with a flat
+// success count is a VM whose sync outlasts its interval, or an agent that
+// restarted into a run it did not start. Both look like healthy replication
+// on every other series this agent emits.
+func (m *agentMetrics) runBusy() {
+	if m == nil {
+		return
+	}
+	m.runsBusy.Add(1)
 }
 
 func (m *agentMetrics) uiContacted(at time.Time) {
@@ -257,6 +290,10 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 
 	c("vmsync_agent_sync_runs_total", "Scheduled syncs that finished, by result.", m.runsOK.Load(), `,result="success"`)
 	fmt.Fprintf(&b, "vmsync_agent_sync_runs_total{host=%q,result=\"failure\"} %d\n", host, m.runsFail.Load())
+	// Emitted unconditionally, like every other series here, so it exists at
+	// zero from the first write and increase() works over a window that starts
+	// before the first stand-down.
+	fmt.Fprintf(&b, "vmsync_agent_sync_runs_total{host=%q,result=\"busy\"} %d\n", host, m.runsBusy.Load())
 
 	// The metric the question "is anything actually replicating?" is asked
 	// of. A schedule that never gets a slot, or a profile that never
@@ -334,6 +371,11 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	}
 	c("vmsync_agent_fences_total", "Fences this agent has acted on, by result. A failure here needs a person: fences are never retried automatically.", m.fencesActed.Load(), `,result="success"`)
 	fmt.Fprintf(&b, "vmsync_agent_fences_total{host=%q,result=\"failure\"} %d\n", host, m.fencesFailed.Load())
+	// Independent of the two above: a fence can be unrecorded and still
+	// succeed. Non-zero means this host shut a production VM down without a
+	// record that survives a restart, so the same fence may be attempted
+	// again -- and it means the ledger's filesystem is in trouble.
+	c("vmsync_agent_fences_unrecorded_total", "Fences that proceeded without a durable ledger record, because writing it failed and a split brain is the worse outcome.", m.fencesUnrecorded.Load(), "")
 
 	return b.String()
 }

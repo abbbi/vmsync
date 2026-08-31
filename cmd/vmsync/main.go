@@ -630,8 +630,14 @@ func main() {
 	lockFile, err := util.AcquireRunLock(runLockDir, cfg.SourceDomain)
 	if err != nil {
 		if errors.Is(err, util.ErrLockHeld) {
-			trace.Info("another vmsync is already syncing this domain, skipping", "domain", cfg.SourceDomain, "error", err)
-			os.Exit(0)
+			// ExitBusy, not 0. Nothing was done, and a caller must be able to
+			// tell that apart from a sync that ran. Exiting 0 here is what let
+			// a restarted agent -- whose in-flight bookkeeping is memory-only
+			// -- launch a second vmsync per interval and record each phantom
+			// as a SUCCESS, so metrics, the UI and the journal all showed
+			// healthy replication while nothing was being copied.
+			trace.Info("another vmsync is already syncing this domain, standing down without touching anything", "domain", cfg.SourceDomain, "error", err)
+			os.Exit(util.ExitBusy)
 		}
 		trace.Error("failed to acquire run lock for domain -- this is not lock contention, something is actually broken (permissions, a read-only lock directory, or the lock file being repeatedly replaced)", "domain", cfg.SourceDomain, "error", err)
 		os.Exit(1)
@@ -711,14 +717,16 @@ func main() {
 	// itself, and the sync's failure is already recorded in
 	// vmsync_sync_state).
 	if err := run(cfg); err != nil {
-		// The target-side counterpart of the source-lock skip above. Another
-		// vmsync is already working on this target -- ours stood down before
-		// touching anything, so this is a clean no-op, not a failure: exit 0,
-		// no failure counted, and (see run()'s metrics defer) no metrics
-		// record written.
+		// The target-side counterpart of the source-lock skip above, and it
+		// exits the same way for the same reason: nothing was touched, no
+		// failure counted, and (see run()'s metrics defer) no metrics record
+		// written -- but ExitBusy rather than 0, so the caller can tell "stood
+		// down" from "ran". Left as 0, this is the same phantom-success hole
+		// as the source lock, reached whenever two sources replicate into one
+		// target host.
 		if errors.Is(err, util.ErrLockHeld) {
-			trace.Info("another vmsync is already working on this target, skipping", "vm", cfg.TargetDomain, "error", err)
-			os.Exit(0)
+			trace.Info("another vmsync is already working on this target, standing down without touching anything", "vm", cfg.TargetDomain, "error", err)
+			os.Exit(util.ExitBusy)
 		}
 		// A role refusal is exempt for the same reason run-lock contention is
 		// (see the lock's own comment above): it is not a broken sync. The

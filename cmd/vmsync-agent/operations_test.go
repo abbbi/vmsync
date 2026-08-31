@@ -18,6 +18,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -36,6 +38,45 @@ func promoteOp() Operation {
 // modeForcedLiteral avoids importing pkg/failover here just for a string
 // the wire format carries verbatim.
 const modeForcedLiteral = "forced"
+
+// A Begin whose disk write fails must leave NOTHING behind.
+//
+// put() records in memory before it writes, so a failed write used to leave
+// the operation marked `running` having never started -- and Seen() refuses to
+// re-execute any recorded id, so that operation could never run again while
+// the UI kept publishing it forever. A later Load() then relabelled the orphan
+// "the agent stopped while this operation was in progress", a statement about
+// something that never began. A transient ENOSPC was enough.
+func TestLedgerBeginLeavesNothingBehindWhenItCannotBeWritten(t *testing.T) {
+	// A state dir nested under a regular FILE, so writeJSONAtomic's own
+	// os.MkdirAll fails with ENOTDIR. A merely absent directory would not do
+	// it -- writeJSONAtomic creates one -- and that is worth knowing: the
+	// unwritable cases this guards against are permissions, a full disk and a
+	// read-only mount, never a missing path.
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("a file, not a directory"), 0o600); err != nil {
+		t.Fatalf("set up the blocker file: %v", err)
+	}
+	l := newOperationLedger(filepath.Join(blocker, "state"))
+	op := promoteOp()
+
+	if err := l.Begin(op, opNow); err == nil {
+		t.Fatal("Begin reported success with an unwritable ledger path")
+	}
+	if res, seen := l.Seen(op.ID); seen {
+		t.Errorf("the operation is still recorded as %q after a failed Begin -- Seen() will refuse to retry it, so it can never run", res.State)
+	}
+
+	// And the id is genuinely reusable: a later Begin against a working path
+	// must be able to start the same operation.
+	ok := newOperationLedger(t.TempDir())
+	if err := ok.Begin(op, opNow); err != nil {
+		t.Fatalf("Begin on a working ledger after a failed one: %v", err)
+	}
+	if _, seen := ok.Seen(op.ID); !seen {
+		t.Error("the retried Begin did not record the operation")
+	}
+}
 
 // TestLedgerRecordsIntentBeforeOutcome is the property the whole replay
 // guard rests on. Recording only completion leaves the entire duration of an
