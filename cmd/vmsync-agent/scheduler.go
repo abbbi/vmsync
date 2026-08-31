@@ -170,6 +170,27 @@ func (s *Scheduler) launchDue(ctx context.Context, wg *sync.WaitGroup) {
 			s.metrics.skip(skipAlreadyRunning)
 			continue
 		}
+		// ...and the same question asked of a run THIS agent did not start.
+		//
+		// inFlight is memory-only, so a new process after a restart, a crash
+		// or a package upgrade knows nothing about a vmsync the previous one
+		// launched and which is still going. Without this it launches a second
+		// one every interval for as long as the first runs. That is now
+		// harmless rather than catastrophic -- the engine stands down with
+		// ExitBusy instead of exiting 0 and being recorded as a success -- but
+		// harmless is not free: it spawns a process, takes a concurrency slot
+		// and writes a run-log pair, every interval, for hours.
+		//
+		// Consulted, never obeyed: a foreign run that cannot be confirmed
+		// reads as "not held", the launch goes ahead, and the engine's own
+		// lock makes the real decision. See util.RunLockHeld on why this fails
+		// open.
+		if held, reason := s.foreignRunHolds(entry.VM); held {
+			trace.Info("skipping a scheduled sync: a vmsync started outside this agent is still working on this domain",
+				"vm", entry.VM, "reason", reason)
+			s.metrics.skip(skipForeignRun)
+			continue
+		}
 		if err := entry.Profile.Validate(); err != nil {
 			// Loud and skipped, not fatal: one bad entry must not stop the
 			// rest of the schedule, and the message names the field so it
@@ -225,6 +246,32 @@ func (s *Scheduler) due(entry ScheduleEntry, now time.Time) bool {
 		return false
 	}
 	return !now.Before(next)
+}
+
+// foreignRunHolds reports whether a vmsync THIS agent did not start is still
+// syncing vm.
+//
+// Reads the identity the engine stamps into its own run lock. It never opens
+// that file for writing and never flocks it, because acquiring the lock is the
+// only way to test a flock and acquiring it would produce exactly the
+// contention it is looking for.
+//
+// Every uncertain answer is false. A missing lock file, an empty one (which is
+// what every vmsync before this feature left behind), an unparseable one, an
+// unreadable /proc: all mean "launch, and let the engine decide". The reason
+// string is for the log and is never a reason to refuse.
+func (s *Scheduler) foreignRunHolds(vm string) (bool, string) {
+	id, ok, err := util.ReadRunLockIdentity(util.RunLockDir, vm)
+	if err != nil {
+		// Worth saying out loud -- somebody has put something else in this
+		// path -- but not worth deferring a sync over.
+		trace.Debug("could not read the run lock identity; proceeding as if nothing holds it", "vm", vm, "error", err)
+		return false, ""
+	}
+	if !ok {
+		return false, ""
+	}
+	return util.RunLockHeld(id, s.cfg.VmsyncPath)
 }
 
 // isRunning reports whether this VM's previous run is still going.

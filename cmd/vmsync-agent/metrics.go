@@ -62,6 +62,11 @@ const (
 	// nothing can later account for. Its own reason because the remedy is
 	// unlike every other skip here -- it is a disk, not a schedule.
 	skipRunLogUnwritable = "run_log_unwritable"
+	// skipForeignRun is a due VM whose lock is held by a vmsync this agent did
+	// not start -- almost always its own previous instance's child, still
+	// running across a restart. Distinct from already_running, which is this
+	// process's own bookkeeping: this one is what that bookkeeping cannot see.
+	skipForeignRun = "foreign_run"
 )
 
 var skipReasons = []string{
@@ -71,6 +76,7 @@ var skipReasons = []string{
 	skipInvalidProfile,
 	skipNoTarget,
 	skipRunLogUnwritable,
+	skipForeignRun,
 }
 
 // agentMetrics is what the agent knows about itself.
