@@ -347,10 +347,24 @@ func checkOneFence(ctx context.Context, cfg agentConfig, cached UIConfig, ledger
 	}, self, ledger.Acted(rep.Fence.ID))
 
 	if !verdict.Fence {
-		// Debug, not warning: the overwhelmingly common answer is "no fence
-		// was armed", and logging that at any louder level once a minute per
-		// VM would bury everything else.
-		trace.Debug("fence check: not fencing", "vm", d.Name, "peer", peerRef, "reason", verdict.Reason)
+		// Said only when a fence actually EXISTS and is not being acted on.
+		//
+		// An unarmed token is not a state worth reporting: it is what every
+		// healthy pair looks like, on every sweep, forever. Logging it meant
+		// -debug produced a line per source VM per replica target per cycle
+		// saying nothing had been configured -- which the operator already
+		// knows, since not arming a fence is the default and is what a
+		// promotion does unless explicitly asked otherwise. The lines an
+		// operator turns -debug on to find were buried under it.
+		//
+		// The other refusals are kept, because each describes a fence that
+		// was armed and is deliberately not firing: a token naming another
+		// pair, a peer no longer promoted, a promoted peer that is not
+		// running. Those are the answers to "why did my fence not fire",
+		// which is the question -debug gets used for here.
+		if rep.Fence.Armed() {
+			trace.Debug("fence check: not fencing", "vm", d.Name, "peer", peerRef, "reason", verdict.Reason)
+		}
 
 		// One case among the refusals is NOT benign, and it is the reason
 		// the metric is set here rather than only where a fence fires: an
