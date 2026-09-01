@@ -1401,6 +1401,13 @@ func run(cfg syncConfig) (runErr error) {
 	var metricsMu sync.Mutex
 	diskMetrics := make([]metrics.DiskMetric, 0)
 	var nbdHost, targetNBDHost string
+	// Declared up here with the rest of the metricsMu-guarded state, not
+	// down where the source bridge is actually started: writeMetricsTextfile
+	// closes over it and is defined further up still, so a declaration at
+	// the assignment site is simply not in scope for it. Nil until the
+	// bridge exists, which is the state the signal handler can genuinely
+	// observe -- it can fire before setup gets that far.
+	var sourceBridgeCounters *nbdbridge.ByteCounters
 	// Resolved immediately (rather than deferred until the backup job
 	// actually starts, as this used to be) purely from cfg -- no network
 	// calls, nothing that depends on anything fallible happening first --
@@ -3002,7 +3009,6 @@ func run(cfg syncConfig) (runErr error) {
 	// --compress/--netbuffer are set and the source is reachable via SSH.
 	effectiveSourceHost := nbdHost
 	effectiveSourcePort := cfg.SourceNBDPort
-	var sourceBridgeCounters *nbdbridge.ByteCounters
 	if bridgeCfg.Enabled() && sourceNeedsSSH {
 		// The source has a single shared NBD export (no per-disk ports), so
 		// its bridge port simply sits right next to it.
