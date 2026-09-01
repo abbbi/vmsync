@@ -538,7 +538,11 @@ func runCloneRestorePoint(ctx context.Context, cfg syncConfig, tagName, dest str
 		return fmt.Errorf("restore point %s lists no disks; it may have been written by a newer vmsync", tag)
 	}
 
-	if _, err := client.Run(ctx, "mkdir -p "+util.ShQuote(dest)); err != nil {
+	// Same ownership treatment as a sync's target directory: -clone-restore-point
+	// produces disks somebody may well go on to boot, and a chain of
+	// root-owned directories above them is the same trap. Directories that
+	// already exist are left exactly as they are.
+	if _, err := client.Run(ctx, util.MkdirOwnedCommand(targetDirOwner(ctx, client, cfg), dest)); err != nil {
 		return fmt.Errorf("create %s on the target: %w", dest, err)
 	}
 	for _, name := range status.Disks {

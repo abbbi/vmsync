@@ -1087,6 +1087,49 @@ var targetQemuOwnerOnce struct {
 // can run on the target host itself, where reaching the filesystem is exec
 // and not ssh. Nothing in here needed the concrete type: the two qemu-account
 // helpers it calls already took this same one-method seam.
+// detectTargetQemuOwner works out which account libvirt runs qemu as on the
+// target, once per run: every disk gets the same answer and this costs
+// several SSH round trips.
+//
+// Split out because the DIRECTORIES a disk lives in need the same answer, and
+// they are created long before the disk itself exists -- so the resolution
+// can no longer live inside the function that chowns the file.
+func detectTargetQemuOwner(ctx context.Context, client util.CommandRunner) util.DiskOwner {
+	targetQemuOwnerOnce.Do(func() {
+		targetQemuOwnerOnce.owner = util.ReadQemuConfOwner(ctx, client)
+		if !targetQemuOwnerOnce.owner.Empty() {
+			return
+		}
+		// qemu.conf said nothing, which is the ORDINARY case: every
+		// distribution ships that setting commented out, so this is where a
+		// first-ever sync lands rather than an exotic corner. Fall back to
+		// which well-known qemu account the host actually has.
+		targetQemuOwnerOnce.owner, targetQemuOwnerOnce.candidates =
+			util.DetectQemuAccount(ctx, client)
+	})
+	return targetQemuOwnerOnce.owner
+}
+
+// targetDirOwner is who a newly-created target DIRECTORY should belong to.
+//
+// The same account the disk inside it will get, resolved the same way, minus
+// the "what owned the previous file" evidence -- there is no previous file
+// when a directory is being created for the first time.
+//
+// Returns the zero owner when there is nothing to apply (-target-disk-owner
+// off, or auto that resolved to nothing), and the caller then creates the
+// directory exactly as it always did.
+func targetDirOwner(ctx context.Context, client util.CommandRunner, cfg syncConfig) util.DiskOwner {
+	owner, err := util.ParseDiskOwner(cfg.TargetDiskOwner)
+	if err != nil || owner.IsOff() {
+		return util.DiskOwner{}
+	}
+	if !owner.Empty() {
+		return owner
+	}
+	return detectTargetQemuOwner(ctx, client)
+}
+
 func applyTargetDiskOwner(ctx context.Context, client util.CommandRunner, cfg syncConfig, targetPath string, replaced util.DiskOwner) error {
 	owner, err := util.ParseDiskOwner(cfg.TargetDiskOwner)
 	if err != nil {
@@ -1105,23 +1148,10 @@ func applyTargetDiskOwner(ctx context.Context, client util.CommandRunner, cfg sy
 		} else {
 			// Resolved once per run: every disk gets the same answer, and
 			// this is several SSH round trips.
-			targetQemuOwnerOnce.Do(func() {
-				targetQemuOwnerOnce.owner = util.ReadQemuConfOwner(ctx, client)
-				if !targetQemuOwnerOnce.owner.Empty() {
-					return
-				}
-				// qemu.conf said nothing, which is the ORDINARY case: every
-				// distribution ships that setting commented out, so this is
-				// where a first-ever sync lands rather than an exotic
-				// corner. Fall back to which well-known qemu account the
-				// host actually has.
-				targetQemuOwnerOnce.owner, targetQemuOwnerOnce.candidates =
-					util.DetectQemuAccount(ctx, client)
-			})
+			detectTargetQemuOwner(ctx, client)
 			owner = targetQemuOwnerOnce.owner
 		}
 	}
-
 	if owner.Empty() {
 		switch n := len(targetQemuOwnerOnce.candidates); {
 		case n > 1:
@@ -2567,7 +2597,14 @@ func run(cfg syncConfig) (runErr error) {
 			targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
 			trace.Info("Using target", "path", targetPath, "disk", d.TargetDev)
 			targetDir := path.Dir(targetPath)
-			if _, err := targetSSHClient.Run(ctx, "mkdir -p "+util.ShQuote(targetDir)); err != nil {
+			// Directories this creates get the same owner the disk inside them
+			// will get. Without it they stay owned by the SSH user -- root --
+			// and under a restrictive umask the chain is 0700, so qemu cannot
+			// traverse to a disk it demonstrably owns. Directories that already
+			// exist are never touched: the target commonly lives under
+			// something the operator set up, and re-owning that because a
+			// replica landed inside it would be the worse bug.
+			if _, err := targetSSHClient.Run(ctx, util.MkdirOwnedCommand(targetDirOwner(ctx, targetSSHClient, cfg), targetDir)); err != nil {
 				return fmt.Errorf("create remote target dir %s: %w", targetDir, err)
 			}
 			exists, err := util.RemotePathExists(ctx, targetSSHClient, targetPath)

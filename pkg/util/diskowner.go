@@ -20,6 +20,7 @@ package util
 import (
 	"context"
 	"fmt"
+	"path"
 	"regexp"
 	"strings"
 )
@@ -181,13 +182,101 @@ func ParseQemuConfOwner(conf string) DiskOwner {
 }
 
 // StatOwnerCommand builds the shell command that reports a file's owner.
-func StatOwnerCommand(path string) string {
-	return "stat -c %U:%G " + ShQuote(path) + " 2>/dev/null || true"
+func StatOwnerCommand(p string) string {
+	return "stat -c %U:%G " + ShQuote(p) + " 2>/dev/null || true"
 }
 
 // ChownCommand builds the shell command that applies an owner to a file.
-func ChownCommand(o DiskOwner, path string) string {
-	return "chown " + ShQuote(o.Spec()) + " " + ShQuote(path)
+func ChownCommand(o DiskOwner, p string) string {
+	return "chown " + ShQuote(o.Spec()) + " " + ShQuote(p)
+}
+
+// MkdirOwnedCommand creates a directory and gives the SAME owner to every
+// component it had to create -- and to nothing else.
+//
+// The problem it solves: the disk file is chowned to the account qemu runs
+// as, but the directories above it were left owned by the SSH user, which is
+// root. A root-owned 0755 directory happens to be traversable, so this looks
+// fine on most hosts -- until one has a restrictive umask, `mkdir -p` makes
+// the chain 0700 root-owned, and qemu cannot open a disk it demonstrably
+// owns. The failure surfaces as a permission error on the disk, which is
+// exactly the wrong place to go looking.
+//
+// EXISTING DIRECTORIES ARE NEVER TOUCHED. That is the whole difficulty, and
+// why this is not `install -d -o …` or a chown of the parent: the target path
+// commonly lives under something the operator already set up -- /var/lib/
+// libvirt/images, an NFS mount, a dataset root -- and quietly re-owning that
+// because a replica landed inside it would be a far worse bug than the one
+// being fixed. Only components this command brings into existence are
+// chowned.
+//
+// The path is decomposed HERE, in Go, and the command is a flat sequence of
+// `mkdir <component> && chown …` with no shell loop and no `test`.
+//
+// Two reasons, and the second is the important one:
+//
+//   - A shell loop that does `[ ! -d "$p" ]` and then creates is a
+//     time-of-check-to-time-of-use race. `mkdir` WITHOUT -p is atomic and
+//     already answers the only question being asked: it succeeds exactly
+//     when it created the directory, and fails when something is already
+//     there. Making success the signal removes the race rather than
+//     narrowing it.
+//   - Everything decidable from the path string alone is then decided in Go,
+//     where it is directly testable. What remains in the shell is one
+//     `mkdir` and one `chown` per component, each argument quoted here.
+//
+// Why shell at all: this runs on the TARGET host over SSH, so os.MkdirAll
+// would create the directory on the wrong machine. Every other thing vmsync
+// does to a target -- qemu-img, stat, chown, mv, the reflink copies -- goes
+// through the same one-method CommandRunner seam, and the alternative is a
+// second transport (SFTP) to authenticate and keep in agreement with the
+// first, for one mkdir.
+//
+// A final `mkdir -p` closes the sequence deliberately un-silenced: the
+// per-component ones discard their errors, because "it already exists" is the
+// expected case and indistinguishable from a real failure by exit status
+// alone, so the last one is what reports a genuine problem with its own
+// message.
+//
+// Returns a plain `mkdir -p` when no owner is known (auto that resolved to
+// nothing, or explicitly off), which is exactly the previous behaviour.
+func MkdirOwnedCommand(o DiskOwner, dir string) string {
+	mk := "mkdir -p " + ShQuote(dir)
+	if o.Empty() {
+		return mk
+	}
+	spec := ShQuote(o.Spec())
+	var b strings.Builder
+	for _, c := range ancestorPaths(dir) {
+		q := ShQuote(c)
+		// 2>/dev/null: an existing directory is the ordinary case here, not a
+		// problem worth a line of stderr per component per sync.
+		fmt.Fprintf(&b, "mkdir %s 2>/dev/null && chown %s %s; ", q, spec, q)
+	}
+	b.WriteString(mk)
+	return b.String()
+}
+
+// ancestorPaths lists every component of an absolute path, shallowest first.
+//
+// "/data/replicas/web01" -> ["/data", "/data/replicas", "/data/replicas/web01"]
+//
+// The root itself is never included: it always exists, and a `chown /` that
+// somehow slipped through would be catastrophic rather than merely wrong.
+func ancestorPaths(dir string) []string {
+	clean := path.Clean(dir)
+	if clean == "/" || clean == "." || clean == "" {
+		return nil
+	}
+	var parts []string
+	for p := clean; p != "/" && p != "." && p != ""; p = path.Dir(p) {
+		parts = append(parts, p)
+	}
+	// Collected leaf-first; create shallowest-first.
+	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+		parts[i], parts[j] = parts[j], parts[i]
+	}
+	return parts
 }
 
 // QemuConfPaths are where libvirt's qemu.conf lives, most likely first.
