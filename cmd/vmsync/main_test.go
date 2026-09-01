@@ -24,76 +24,7 @@ import (
 	"time"
 
 	"vmsync/pkg/metrics"
-	"vmsync/pkg/nbdsync"
 )
-
-// TestOverlapsAnyExtent exercises the half-open-interval overlap check used
-// by -verify=online to distinguish a genuine mismatch from one that merely
-// falls inside a region the guest wrote during the compare window.
-func TestOverlapsAnyExtent(t *testing.T) {
-	cases := []struct {
-		name    string
-		m       nbdsync.MismatchRange
-		touched []nbdsync.Extent
-		want    bool
-	}{
-		{
-			name: "fully inside a dirty extent",
-			m:    nbdsync.MismatchRange{Offset: 120, Length: 20}, // [120,140)
-			touched: []nbdsync.Extent{
-				{Offset: 100, Length: 100, Dirty: true}, // [100,200)
-			},
-			want: true,
-		},
-		{
-			name: "fully outside all extents",
-			m:    nbdsync.MismatchRange{Offset: 300, Length: 10}, // [300,310)
-			touched: []nbdsync.Extent{
-				{Offset: 100, Length: 100, Dirty: true}, // [100,200)
-			},
-			want: false,
-		},
-		{
-			name: "partially overlapping at an edge",
-			m:    nbdsync.MismatchRange{Offset: 190, Length: 20}, // [190,210)
-			touched: []nbdsync.Extent{
-				{Offset: 100, Length: 100, Dirty: true}, // [100,200), overlap [190,200)
-			},
-			want: true,
-		},
-		{
-			name: "touching but not overlapping -- mismatch ends exactly where the extent begins",
-			m:    nbdsync.MismatchRange{Offset: 150, Length: 50}, // [150,200)
-			touched: []nbdsync.Extent{
-				{Offset: 200, Length: 50, Dirty: true}, // [200,250)
-			},
-			want: false,
-		},
-		{
-			name: "non-dirty extent covering the same range is skipped",
-			m:    nbdsync.MismatchRange{Offset: 120, Length: 20}, // [120,140)
-			touched: []nbdsync.Extent{
-				{Offset: 100, Length: 100, Dirty: false}, // [100,200), but not dirty
-			},
-			want: false,
-		},
-		{
-			name:    "empty touched slice",
-			m:       nbdsync.MismatchRange{Offset: 0, Length: 10},
-			touched: []nbdsync.Extent{},
-			want:    false,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := overlapsAnyExtent(tc.m, tc.touched)
-			if got != tc.want {
-				t.Fatalf("overlapsAnyExtent(%+v, %+v) = %v, want %v", tc.m, tc.touched, got, tc.want)
-			}
-		})
-	}
-}
 
 // TestOptionalValueFlag verifies the bare/"=value"/"=false" tri-state
 // behavior optionalValueFlag hijacks from flag.Value's IsBoolFlag mechanism
@@ -226,12 +157,12 @@ func TestVerificationRan(t *testing.T) {
 	}{
 		{verify: "", attempted: false, want: false}, // plain sync / -reinit -- the critical case
 		{verify: "", attempted: true, want: false},  // defensive: shouldn't happen in practice
-		{verify: "compare", attempted: false, want: false},
+		{verify: "qemu-img", attempted: false, want: false},
 		{verify: "fast", attempted: false, want: false},
-		{verify: "online", attempted: false, want: false},
-		{verify: "compare", attempted: true, want: true},
+		{verify: "full", attempted: false, want: false},
+		{verify: "qemu-img", attempted: true, want: true},
 		{verify: "fast", attempted: true, want: true},
-		{verify: "online", attempted: true, want: true},
+		{verify: "full", attempted: true, want: true},
 	}
 
 	for _, tc := range cases {

@@ -689,7 +689,7 @@ const mismatchScanGranularity = 4096
 // they actually differ, merging adjacent differing chunks into a single
 // range. Without this, compareTCP would have to report a mismatch anywhere
 // inside a buffer as spanning the buffer's *entire* AIO chunk -- and
-// -verify=online's dirty-bitmap reconciliation (overlapsAnyExtent) discards
+// the former -verify=online's dirty-bitmap reconciliation (since removed) discarded
 // a whole MismatchRange if it overlaps a guest write anywhere in it, so an
 // unrelated write next to real corruption elsewhere in the same wide chunk
 // would silently hide that corruption. Called only after a whole-buffer
@@ -723,7 +723,7 @@ func diffSubRanges(baseOffset uint64, a, b []byte, granularity uint64) []Mismatc
 
 // CompareTCPCollect is CompareTCP, except it scans the entire image even
 // past the first mismatch, returning every mismatched range instead of
-// aborting on the first one. For -verify=online, where a lone mismatch is
+// aborting on the first one. For -verify=full, where a lone mismatch is
 // inconclusive on its own (the guest may have legitimately written there
 // during the compare) and must be cross-referenced against a dirty bitmap
 // afterward -- which needs every mismatch, not just the first. A genuine

@@ -44,9 +44,9 @@ mode; each mode below that adds its own rows on top.
 | `-compress`/`-netbuffer`, direct (default, no `-use-ssh`) | Target | vmsync-bridge-helper, one **per disk** | `0.0.0.0` | `-target-nbd-port + N + i` -- the block right after all `N` plain export ports above |
 | `-compress`/`-netbuffer`, direct, only if source is remote (see Topology above) | Source | vmsync-bridge-helper, one shared | `0.0.0.0` | `-source-nbd-port + 1` |
 | `-compress`/`-netbuffer` + `-use-ssh` | -- | nothing additional -- bulk data tunnels through the SSH port(s) already listed above | -- | -- |
-| `-verify=compare\|fast` | Target | `qemu-nbd`, **read-only**, one per disk | `-target-nbd-bind` | `-target-nbd-port + 2*N + i` -- a third block, after the plain and bridge ranges, so it never collides with either regardless of whether bridging is active |
-| `-verify=compare\|fast` + `-compress`/`-netbuffer`, direct (no `-use-ssh`) | Target | vmsync-bridge-helper, one **per disk**, wrapping the read-only export above | `0.0.0.0` | `-target-nbd-port + 3*N + i` -- a fourth block, right after the read-only export range |
-| `-verify=compare\|fast` + `-compress`/`-netbuffer` + `-use-ssh` | -- | nothing additional -- tunnels through the SSH port(s) already listed above, same as the regular copy's own bridge | -- | -- |
+| `-verify` (any mode) | Target | `qemu-nbd`, **read-only**, one per disk | `-target-nbd-bind` | `-target-nbd-port + 2*N + i` -- a third block, after the plain and bridge ranges, so it never collides with either regardless of whether bridging is active |
+| `-verify` (any mode) + `-compress`/`-netbuffer`, direct (no `-use-ssh`) | Target | vmsync-bridge-helper, one **per disk**, wrapping the read-only export above | `0.0.0.0` | `-target-nbd-port + 3*N + i` -- a fourth block, right after the read-only export range |
+| `-verify` (any mode) + `-compress`/`-netbuffer` + `-use-ssh` | -- | nothing additional -- tunnels through the SSH port(s) already listed above, same as the regular copy's own bridge | -- | -- |
 
 Notes:
 
@@ -56,28 +56,27 @@ Notes:
 - vmsync's own local relay (`StartLocal`, this package) also opens one listener per bridge,
   but always on `127.0.0.1` with an OS-assigned ephemeral port -- never reachable from
   outside the host vmsync runs on, so it's not a firewall concern.
-- `-verify=compare`/`-verify=fast`'s read-only export is dialed directly over plain TCP by
+- `-verify`'s read-only export is dialed directly over plain TCP by
   default, same as the regular copy -- but if `-compress`/`-netbuffer` are set, the
   target-side read of the compare automatically goes through its own vmsync-bridge-helper
   instance too, tunneled via `-use-ssh` under the same conditions the regular copy's bridge
   is. The *source* side of the compare reuses whichever connection (direct or bridged) the
   regular copy's own source read already uses -- see the Topology section above for when
   that applies at all.
-- `-verify=online` uses this exact same target-side port topology (and the same source-side
-  bridge, when configured) as `-verify=compare`/`-verify=fast` -- no new ports of its own.
-  The only thing it changes is on the source: it briefly stops and restarts the source's own
-  backup job (same `-source-nbd-port`, so any source-side bridge keeps working unchanged) to
-  scope a second, ephemeral bitmap for the compare window, instead of suspending the VM.
-  That swap is a same-port operation, not a new listener -- nothing new to open in a
-  firewall for it.
-- **The bridge alone does not speed up a suspend-based `-verify=compare` compare.** By
-  default that mode runs via `qemu-img compare`, which reads one 2MB chunk at a time,
+- All three `-verify` modes use the identical port topology above -- none of them opens a
+  listener the others do not. On the source they all read the primary backup job's own
+  export, still running on `-source-nbd-port`, so any source-side bridge keeps working
+  unchanged and there is nothing extra to open in a firewall. (`-verify=full` used to stop
+  that job and start a second one to scope an ephemeral bitmap; it no longer does, and that
+  was a same-port operation anyway.)
+- **The bridge alone does not speed up a `-verify=qemu-img` compare.** That
+  mode runs `qemu-img compare`, which reads one 2MB chunk at a time,
   synchronously, on both images before advancing -- round-trip-latency-bound, not
   bandwidth-bound, so `-compress`/`-netbuffer` give it nothing to work with (confirmed in
   real testing: no speedup at all). `-use-ssh` still adds real value on its own even with
-  `-verify=compare` -- the compare traffic gets encrypted through the SSH tunnel instead of
-  going out in the clear. Use `-verify=fast` (or `-verify=online`, which always compares
-  this way) to also get the speed benefit: it replaces `qemu-img compare` with vmsync's own
+  `-verify=qemu-img` -- the compare traffic gets encrypted through the SSH tunnel instead of
+  going out in the clear. Use `-verify=fast` or `-verify=full`, which both compare
+  this way, to also get the speed benefit: they replace `qemu-img compare` with vmsync's own
   pipelined NBD reader (`nbdsync.CompareTCP`, same `-io-depth` concurrency as the disk
   copy), which is bandwidth-bound like the copy path and so actually benefits from
   `-compress`/`-netbuffer`. See `-verify`'s own flag help for `-verify=fast`'s one trade-off

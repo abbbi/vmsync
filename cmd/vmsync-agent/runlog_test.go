@@ -167,8 +167,8 @@ func TestRedactArgs(t *testing.T) {
 		},
 		{
 			"the = form is understood",
-			[]string{"-compress=zstd", "-verify=online", "-netbuffer=64M"},
-			[]string{"-compress=zstd", "-verify=online", "-netbuffer=64M"},
+			[]string{"-compress=zstd", "-verify=full", "-netbuffer=64M"},
+			[]string{"-compress=zstd", "-verify=full", "-netbuffer=64M"},
 		},
 		{
 			"a = form uri is redacted too",

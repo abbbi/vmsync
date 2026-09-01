@@ -57,7 +57,7 @@ func TestValidateAcceptsReasonableProfiles(t *testing.T) {
 		{Compress: "zstd", CompressLevel: "3", NetBuffer: "128k,1G", UseSSH: true},
 		{IODepth: 1},
 		{IODepth: maxIODepth},
-		{Verify: "online"},
+		{Verify: "full"},
 		{ReinitAfterFailures: 3},
 		{TargetDiskPath: "/data/replicas"},
 		{SourcePortRange: "auto", TargetPortRange: "20000-20100"},
@@ -121,12 +121,12 @@ func TestCommandArgsUsesEqualsFormForBoolLikeFlags(t *testing.T) {
 		TargetURI: "qemu+ssh://root@hyper02p/system", TargetDomain: "web01",
 		Profile: SyncProfile{
 			Compress: "zstd", CompressLevel: "5",
-			NetBuffer: "128k,1G", UseSSH: true, Verify: "online",
+			NetBuffer: "128k,1G", UseSSH: true, Verify: "full",
 		},
 	}
 	args := req.CommandArgs()
 
-	for _, want := range []string{"-compress=zstd", "-netbuffer=128k,1G", "-verify=online", "-use-ssh"} {
+	for _, want := range []string{"-compress=zstd", "-netbuffer=128k,1G", "-verify=full", "-use-ssh"} {
 		if !slices.Contains(args, want) {
 			t.Errorf("args %v do not contain %q", args, want)
 		}

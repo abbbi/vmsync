@@ -41,7 +41,7 @@ func TestLoadStandaloneConfig(t *testing.T) {
 	     "target_host": "dr01",
 	     "profile": {"compress": "zstd", "compress_level": "5",
 	                 "netbuffer": "128k,1G", "io_depth": 16,
-	                 "verify": "online", "target_disk_path": "/data/replicas"}}
+	                 "verify": "full", "target_disk_path": "/data/replicas"}}
 	  ],
 	  "max_concurrent_syncs": 3,
 	  "target_replication_slots": {"dr01": 2}

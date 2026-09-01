@@ -218,12 +218,16 @@ TAMPER_BAND_END="${TAMPER_BAND_END:-0}" # 0 = up to the disk's virtual size
 # 64 KiB, not 512, and that floor is load-bearing rather than cautious.
 # nbdsync reports mismatches at a 4096-byte granularity (mismatchScanGranularity
 # in pkg/nbdsync/nbd.go), so anything under 4 KiB is indistinguishable from a
-# 4 KiB tamper and buys no coverage at all. Above that, -verify=online discards
-# a whole reported range when ANY byte of it overlaps a region the guest wrote
-# during the compare window (overlapsAnyExtent in cmd/vmsync/main.go), and those
-# regions come from a qcow2 dirty bitmap at qemu's default 64 KiB granularity.
-# A tamper smaller than one granule can therefore be swallowed entire by a
-# single unrelated guest write, which reads as "verify missed it".
+# 4 KiB tamper and buys no coverage at all.
+#
+# The old reason for the 64 KiB floor is gone: -verify used to discard a
+# reported range that overlapped a region the guest had written, and those
+# regions came from a dirty bitmap at qemu's default 64 KiB granularity, so a
+# smaller tamper could be swallowed whole. No mode reconciles against a bitmap
+# any more -- every mode compares against the same frozen snapshot the copy
+# read from, so a tamper of any size is reported. The floor is kept because a
+# tamper at bitmap granularity is still the more realistic corruption shape,
+# not because a smaller one would be missed.
 TAMPER_LENGTH_MIN="${TAMPER_LENGTH_MIN:-65536}"
 TAMPER_LENGTH_MAX="${TAMPER_LENGTH_MAX:-262144}"
 TAMPER_ALIGN="${TAMPER_ALIGN:-4096}"
@@ -278,12 +282,12 @@ GUEST_AGENT_TIMEOUT="${GUEST_AGENT_TIMEOUT:-120}"
 # Copies per MODE, not per stage: each mode gets its own chain, because the
 # -reinit that heals a tamper also destroys the chain (see stage_verify_long).
 VERIFY_LONG_COPIES="${VERIFY_LONG_COPIES:-20}"
-VERIFY_LONG_MODES="${VERIFY_LONG_MODES:-compare fast online}"
+VERIFY_LONG_MODES="${VERIFY_LONG_MODES:-fast full qemu-img}"
 
 for _m in $VERIFY_LONG_MODES; do
 	case "$_m" in
-	compare | fast | online) ;;
-	*) die "$CONF: VERIFY_LONG_MODES may only contain compare, fast or online -- got '$_m'" ;;
+	fast | full | qemu-img) ;;
+	*) die "$CONF: VERIFY_LONG_MODES may only contain fast, full or qemu-img -- got '$_m'" ;;
 	esac
 done
 unset _m
@@ -333,11 +337,11 @@ preflight() {
         command -v awk >/dev/null 2>&1 || die "awk not found"
         command -v ssh >/dev/null 2>&1 || die "ssh not found"
         command -v md5sum >/dev/null 2>&1 || die "md5sum not found -- used to draw reproducible random tamper offsets (see TAMPER_SEED). Set TAMPER_MODE=fixed in $CONF to avoid needing it."
-        # -verify=compare shells out to `qemu-img compare` on the host running
+        # -verify=qemu-img shells out to `qemu-img compare` on the host running
         # vmsync, not on either hypervisor (pkg/disk/disk.go's CompareImages).
         # Missing it locally makes that one mode fail for a reason that has
         # nothing to do with the replica.
-        command -v qemu-img >/dev/null 2>&1 || die "qemu-img not found locally -- -verify=compare runs it on this host to compare the two NBD exports"
+        command -v qemu-img >/dev/null 2>&1 || die "qemu-img not found locally -- -verify=qemu-img runs it on this host to compare the two NBD exports"
 
         domain_exists "$SOURCE_URI" "$SOURCE_DOMAIN" || die "source domain '$SOURCE_DOMAIN' not found via $SOURCE_URI${VIRSH_ERR:+: $VIRSH_ERR}"
         if domain_exists "$TARGET_URI" "$TARGET_DOMAIN"; then
@@ -849,7 +853,7 @@ stage_verify_tamper() {
         verify_guard_subtest "$target_path" "$vsize"
 
         local mode
-        for mode in compare fast online; do
+        for mode in fast full qemu-img; do
                 verify_mode_subtest "$target_path" "$vsize" "$mode" "verify-${mode}" tamper
         done
         return 0
@@ -945,7 +949,7 @@ verify_mode_subtest() {
                         results_row "$CSV" "$scenario" "${phase}-result" 0 "" "" "" "" "" "PASS mismatch detected"
                         ;;
                 RAN_CLEAN)
-                        warn "FAIL: -verify=$mode ran and found NOTHING after the target was corrupted at offset $TAMPER_OFF length $TAMPER_LEN (reproduce with TAMPER_SEED=$TAMPER_SEED). See $RUN_LOG. Note: -verify=online can legitimately discard an in-window mismatch as inconclusive if the guest rewrote that exact region during the compare -- see README.md before treating this as a confirmed bug."
+                        warn "FAIL: -verify=$mode ran and found NOTHING after the target was corrupted at offset $TAMPER_OFF length $TAMPER_LEN (reproduce with TAMPER_SEED=$TAMPER_SEED). See $RUN_LOG. This is now unambiguous: no mode discards a mismatch any more -- every mode compares the target against the same frozen source snapshot the copy read from, so a difference cannot be attributed to guest activity. Treat it as a real miss."
                         results_row "$CSV" "$scenario" "${phase}-result" 1 "" "" "" "" "" "FAIL mismatch NOT detected"
                         ;;
                 *)
@@ -3750,7 +3754,7 @@ stage_pattern() {
 	# down records its reason under that name, and a reason nothing matches
 	# is a reason nobody reads: the verdict would say "nothing recorded"
 	# rather than why the stage skipped.
-	verify) printf '^verify-(guard|compare|fast|online|precondition)$' ;;
+	verify) printf '^verify-(guard|fast|full|qemu-img|precondition)$' ;;
 	reinit) printf '^reinit-after-failures$' ;;
 	snapshot) printf '^ext-snapshot$' ;;
 	define) printf '^define-(uuid-collision|rollback|precondition)$' ;;
@@ -3937,7 +3941,7 @@ generate_report() {
                 echo
                 echo "| mode | phase | exit | wall (s) | result |"
                 echo "|---|---|---|---|---|"
-                awk -F, 'NR>1 && $1 ~ /^verify-(guard|baseline|compare|fast|online)/ { printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $9 }' "$CSV"
+                awk -F, 'NR>1 && $1 ~ /^verify-(guard|baseline|fast|full|qemu-img)/ { printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $9 }' "$CSV"
                 echo
                 echo "## Stage 8: verify after a long incremental chain"
                 echo

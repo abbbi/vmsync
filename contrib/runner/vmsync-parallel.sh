@@ -187,7 +187,7 @@ replicate() {
                 opts="${opts} -reinit"
         fi
         if [ "${VERIFY}" == true ]; then
-                opts="${opts} -verify=online"
+                opts="${opts} -verify=full"
                 ports_increse=2
         fi
 

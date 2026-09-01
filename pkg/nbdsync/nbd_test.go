@@ -514,7 +514,7 @@ func TestCompareTCPCollectFindsAllMismatches(t *testing.T) {
 
 // TestDiffSubRanges is a pure-function regression test for the bug this was
 // extracted to fix: compareTCP used to report any mismatch inside an AIO
-// chunk as spanning the chunk's entire offset/length, which -verify=online's
+// chunk as spanning the chunk's entire offset/length, which the former -verify=online's
 // dirty-bitmap reconciliation (overlapsAnyExtent) would then discard
 // wholesale if a guest write touched the chunk anywhere -- silently hiding
 // real corruption elsewhere in the same wide chunk. Needs no qemu-nbd at

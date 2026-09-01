@@ -61,8 +61,15 @@ type SyncProfile struct {
 	UseSSH bool `json:"use_ssh,omitempty"`
 	// IODepth is how many NBD read/write pairs stay in flight.
 	IODepth int `json:"io_depth,omitempty"`
-	// Verify is "", "compare", "fast" or "online". Note that compare and
-	// fast SUSPEND the source domain; online does not.
+	// Verify is "", "fast", "full" or "qemu-img".
+	//
+	// All three compare the target against the same frozen source snapshot
+	// the copy read from, so all three answer the same question. "fast"
+	// stops at the first difference, "full" reports every one, and
+	// "qemu-img" uses an independent implementation as a tie-breaker.
+	// Only "qemu-img" SUSPENDS the source domain, and only to keep the
+	// source snapshot's scratch space empty across a full-image read --
+	// not because the comparison needs a stopped guest.
 	Verify string `json:"verify,omitempty"`
 	// ReinitAfterFailures forces a full resync after N consecutive failures.
 	ReinitAfterFailures int `json:"reinit_after_failures,omitempty"`
@@ -194,9 +201,9 @@ func (p SyncProfile) Validate() error {
 	}
 
 	switch p.Verify {
-	case "", "compare", "fast", "online":
+	case "", "fast", "full", "qemu-img":
 	default:
-		return fmt.Errorf("verify %q is not one of \"\", \"compare\", \"fast\", \"online\"", p.Verify)
+		return fmt.Errorf("verify %q is not one of \"\", \"fast\", \"full\", \"qemu-img\"", p.Verify)
 	}
 
 	if p.ReinitAfterFailures < 0 || p.ReinitAfterFailures > maxReinitAfterFailures {

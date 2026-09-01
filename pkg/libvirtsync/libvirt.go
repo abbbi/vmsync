@@ -106,10 +106,12 @@ func IsManagedCheckpointName(name string) bool {
 	return strings.HasPrefix(name, CheckpointPrefix+"-")
 }
 
-// VerifyWindowCheckpointName names the ephemeral, throwaway checkpoint
-// -verify=online creates right when its compare window opens, to find out
-// afterward which regions the guest wrote to during the compare (see
-// CreateVerifyWindowCheckpoint). Deliberately NOT prefixed with
+// VerifyWindowCheckpointName names a checkpoint NOTHING CREATES ANY MORE.
+// The former -verify=online (now -verify=full) used to make one per run and
+// that was the near-100%-false-positive bug (see the note where
+// CreateVerifyWindowCheckpoint used to be). The name survives only so
+// DeleteVerifyWindowCheckpoint can clear leftovers from older builds.
+// Deliberately NOT prefixed with
 // CheckpointPrefix+"-": ListManagedCheckpoints (and therefore
 // NextCheckpointName, and -reinit's DeleteAllManagedCheckpoints) only ever
 // look at names starting with "vmsync-cpt-", so this name is permanently
@@ -1951,24 +1953,29 @@ func CreateCheckpoint(dom *libvirt.Domain, checkpointName, parent string, diskTa
 	return cp.Free()
 }
 
-// CreateVerifyWindowCheckpoint creates the ephemeral, domain-wide checkpoint
-// -verify=online uses to detect (after the fact) which regions the guest
-// wrote to during its compare window -- see VerifyWindowCheckpointName.
-// Standalone (parent=""): it has no lineage relationship to the regular
-// vmsync-cpt-NNNNNN chain, and since nothing ever nominates it as another
-// checkpoint's parent, it can never have children either -- not that this
-// matters for deletion order anyway (see checkpointDeletionOrder's own doc
-// comment): it's always safe to delete on its own regardless.
-func CreateVerifyWindowCheckpoint(dom *libvirt.Domain, diskTargets []disk.QcowDisk) error {
-	return CreateCheckpoint(dom, VerifyWindowCheckpointName, "", diskTargets)
-}
+// CreateVerifyWindowCheckpoint is GONE, deliberately, and this note stands
+// in its place so it does not come back.
+//
+// It created a fresh, parentless (therefore empty) checkpoint at the moment
+// the former -verify=online's compare window opened, and the compare then tried to
+// excuse mismatches using that checkpoint's bitmap. The bitmap described
+// only the instant between its own creation and BackupBegin, while every
+// mismatch the compare actually saw came from guest writes during the COPY,
+// minutes or hours earlier. So it exonerated nothing and healthy replicas
+// were reported corrupt -- observed in production as "mismatches=260,
+// selected=0, 260 real".
+//
+// -verify now compares against the primary backup export the copy read from,
+// whose bitmap covers exactly the interval that produces the differences.
+// Nothing creates VerifyWindowCheckpointName any more; only the deletion
+// below survives, to clean up after older builds.
 
 // DeleteVerifyWindowCheckpoint removes the ephemeral verify-window
-// checkpoint if it exists, tolerating the case where it doesn't (already
-// cleaned up, or never created this run). Called both defensively (self-
-// healing a prior crashed -verify=online run, unconditionally, regardless
-// of whether -verify=online is requested this run) and as real cleanup once
-// a -verify=online run's compare window closes.
+// checkpoint if it exists, tolerating the case where it doesn't -- which is
+// now the normal case: nothing creates it. Retained purely to self-heal a
+// leftover from a build that did, either a crashed run of one or the first
+// run after an upgrade. Called defensively regardless of whether -verify is
+// requested this run.
 func DeleteVerifyWindowCheckpoint(dom *libvirt.Domain) error {
 	return DeleteCheckpointIfExists(dom, VerifyWindowCheckpointName)
 }

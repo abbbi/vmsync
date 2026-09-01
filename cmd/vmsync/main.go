@@ -125,6 +125,40 @@ const (
 	// pressure. Not a valid host:domain itself -- it has no colon -- so it
 	// can never be mistaken for one.
 	fenceSourceAuto = "auto"
+
+	// The -verify modes. All three compare the target against the SAME
+	// frozen source export the copy read from, so all three answer the same
+	// question and none can be confused by a running guest. What separates
+	// them is cost and independence, not correctness.
+	//
+	// verifyModeFast stops at the first differing range. Cheapest answer to
+	// "is this replica intact", and the right default for a scheduled run:
+	// once one byte is wrong the replica needs attention regardless of how
+	// many others are.
+	verifyModeFast = "fast"
+	// verifyModeFull scans the whole image and reports every differing
+	// range and the total bytes. Same verdict as fast, more information for
+	// the person who has to act on it: one 4 KiB range is a bad cluster,
+	// hundreds scattered across the image is a bad copy path or bad storage.
+	verifyModeFull = "full"
+	// verifyModeQemuImg shells out to `qemu-img compare` and suspends the
+	// source for the duration. The arbiter: an INDEPENDENT implementation,
+	// so it is the mode to reach for when one of the others reports a
+	// mismatch and the question becomes whether vmsync's own comparator is
+	// the thing at fault.
+	//
+	// It is also the only mode that still suspends, and the reason is not
+	// the one the code gave for years. -verify originally read the source
+	// as a local FILE (disk.CompareImages(d.RootSource, ...)), where a
+	// running guest genuinely would have corrupted the comparison; the
+	// suspend was added in that same commit. A later change repointed the
+	// source at the frozen NBD backup export and left the suspend behind,
+	// so every mode paused production guests to protect a file read that no
+	// longer happened. The suspend survives HERE on its own merits: a
+	// stopped guest issues no writes, so the fleecing scratch behind the
+	// source export stays empty across what is otherwise the longest read
+	// in the tool.
+	verifyModeQemuImg = "qemu-img"
 )
 
 // syncConfig is every value the CLI accepts, parsed once in main() and
@@ -342,7 +376,7 @@ func main() {
 	flag.IntVar(&cfg.IODepth, "io-depth", 8, "Number of NBD read/write pairs to keep in flight simultaneously during the disk copy, defaults to 8")
 	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write sync metrics to this path in Prometheus textfile-collector format. Name should be something like /var/lib/node_exporter/textfile_collector/vmsync_[vmname].prom")
 	flag.BoolVar(&cfg.IgnoreExternalSnapshot, "ignore-external-snapshot", false, "If the source domain currently has any external disk snapshot, skip this run entirely")
-	flag.StringVar(&cfg.Verify, "verify", "", "After syncing, verify target matches source for every disk. Accepts compare|fast|online. See documentation for details. (compare|fast suspend the source domain, online does not)")
+	flag.StringVar(&cfg.Verify, "verify", "", "After syncing, compare every disk on the target against the same frozen source snapshot the copy read from. Accepts fast|full|qemu-img. All three answer the same question and none is confused by a running guest; they differ in cost and independence. \"fast\" stops at the first differing range -- the right choice for a scheduled run. \"full\" scans the whole image and reports how many ranges and bytes differ, which is what tells a bad cluster apart from a bad copy path. \"qemu-img\" runs qemu-img compare instead, an INDEPENDENT implementation, and is the one to reach for when another mode reports a mismatch and you need to know whether to believe it; it is also the only mode that suspends the source, which it does to keep the source snapshot's scratch space empty for the duration, not because the comparison needs it")
 	flag.StringVar(&cfg.UpdateRole, "update-role", "", "Set the replication role recorded in a domain's own vmsync metadata, then exit without syncing anything. Accepts "+strings.Join(libvirtsync.ValidRoles, "|")+" (\"none\" clears it). The domain is addressed with -target-uri/-target-domain regardless of which direction it currently replicates in. vmsync refuses to sync INTO a domain whose role is anything other than \"target\" or unset -- this is what stops a scheduled sync from overwriting a domain that was failed over to and then shut down for maintenance")
 	flag.StringVar(&cfg.RunID, "run-id", "", "Opaque identifier for this run, written into the run lock so a supervising agent can join it to its own record of having started this process. Ignored except as a label; vmsync-agent sets it, and nothing needs it when vmsync is run by hand")
 	flag.StringVar(&cfg.ResultJSON, "result-json", "", "Write this run's degradations to this path as JSON, for a supervising agent to read back. A degradation is something the exit code cannot carry -- a guest left frozen by a failed thaw, or a copy that is crash-consistent because the freeze did not take -- since both can happen to a run that otherwise succeeds. vmsync-agent sets this; nothing needs it when vmsync is run by hand")
@@ -370,7 +404,7 @@ func main() {
 	// own documented behavior). Passing one anyway (e.g. "-compress zstd")
 	// leaves "zstd" as an ordinary positional argument, which stops flag
 	// parsing right there and silently drops every flag typed after it --
-	// including, for example, a trailing -verify=online. vmsync takes no
+	// including, for example, a trailing -verify=full. vmsync takes no
 	// positional arguments at all, so any leftover ones are unambiguously a
 	// mistake -- fail loudly instead of silently ignoring whatever came
 	// after them.
@@ -612,9 +646,10 @@ func main() {
 		os.Exit(2)
 	}
 	switch cfg.Verify {
-	case "", "compare", "fast", "online":
+	case "", verifyModeFast, verifyModeFull, verifyModeQemuImg:
 	default:
-		trace.Error("invalid verify configuration", "error", fmt.Errorf("-verify must be \"compare\", \"fast\", or \"online\" (or omitted to disable verification), got %q", cfg.Verify))
+		trace.Error("invalid verify configuration", "error", fmt.Errorf("-verify must be %q, %q or %q (or omitted to disable verification), got %q",
+			verifyModeFast, verifyModeFull, verifyModeQemuImg, cfg.Verify))
 		os.Exit(2)
 	}
 
@@ -789,26 +824,6 @@ func main() {
 	}
 	// On success, failure_count is already reset to 0 as part of the normal
 	// UpdateSyncMetadata call in run() -- nothing further to do here.
-}
-
-// overlapsAnyExtent reports whether m overlaps any dirty extent in touched
-// -- used by -verify=online to tell a real mismatch (outside anything the
-// guest wrote during the compare window) from one that's merely
-// inconclusive (inside a region the guest touched, so the target simply
-// hasn't caught up with a write that happened during this compare, not
-// evidence of corruption).
-func overlapsAnyExtent(m nbdsync.MismatchRange, touched []nbdsync.Extent) bool {
-	mEnd := m.Offset + m.Length
-	for _, e := range touched {
-		if !e.Dirty {
-			continue
-		}
-		eEnd := e.Offset + e.Length
-		if m.Offset < eEnd && e.Offset < mEnd {
-			return true
-		}
-	}
-	return false
 }
 
 // ErrCallTimedOut distinguishes callWithTimeout giving up on its own
@@ -1192,12 +1207,18 @@ func run(cfg syncConfig) (runErr error) {
 	}()
 
 	// Resolved once, here, instead of re-deriving cfg.Verify's meaning at
-	// every consumer site: verifySuspends covers both suspend-based modes
-	// ("compare" and "fast"), verifyFast/verifyOnline each pick out their
-	// own single mode.
-	verifySuspends := cfg.Verify == "compare" || cfg.Verify == "fast"
-	verifyFast := cfg.Verify == "fast"
-	verifyOnline := cfg.Verify == "online"
+	// every consumer site.
+	//
+	// Only qemu-img suspends, and NOT because suspending affects what is
+	// compared -- see verifyModeQemuImg for why it does not, and for the
+	// history that left every mode suspending long after it stopped
+	// mattering. It suspends because a stopped guest issues no writes, so
+	// the fleecing scratch behind the source export stays empty for the
+	// whole compare. That is worth having on the one mode meant to be run
+	// deliberately, on a full image, as the tie-breaker.
+	verifySuspends := cfg.Verify == verifyModeQemuImg
+	verifyFast := cfg.Verify == verifyModeFast
+	verifyFull := cfg.Verify == verifyModeFull
 
 	var tgtState bool
 	var srcState bool
@@ -1273,14 +1294,6 @@ func run(cfg syncConfig) (runErr error) {
 	var sourceCleanupOnce sync.Once
 	var resumeOnce sync.Once
 	var suspendedForVerify bool
-	// verifyWindowActive/verifyWindowOnce guard the ephemeral verify-window
-	// checkpoint + its own short-lived backup job (see beginVerifyWindow,
-	// defined further down once qcowDisks/backupMu are in scope) the same
-	// way backupActive/abortOnce guard the regular backup job -- only ever
-	// meaningful when -verify=online actually reaches that step.
-	var verifyWindowMu sync.Mutex
-	var verifyWindowActive bool
-	var verifyWindowOnce sync.Once
 	var stopMu sync.Mutex
 	targetStopCommands := make([]string, 0)
 	sourceStopCommands := make([]string, 0)
@@ -1731,11 +1744,12 @@ func run(cfg syncConfig) (runErr error) {
 		return err
 	}
 
-	// Unconditional, regardless of whether -verify=online is requested this
-	// run: self-heals a verify-window checkpoint left behind by a prior
-	// -verify=online invocation that crashed (e.g. SIGKILL) before its own
-	// cleanup ran. Cheap (one lookup, delete only if found), and safe to run
-	// even when -verify=online was never used -- AcquireRunLock already
+	// Unconditional, and now purely an upgrade path: NOTHING creates a
+	// verify-window checkpoint any more. This self-heals one left behind by
+	// an older build -- either a crashed run of one, or simply the first run
+	// after upgrading past the version that made them. Cheap (one lookup,
+	// delete only if found), and safe to run whatever -verify says --
+	// AcquireRunLock already
 	// rules out any concurrent-run hazard for this domain. See
 	// VerifyWindowCheckpointName's own doc comment for why this can never
 	// collide with or confuse the regular checkpoint chain.
@@ -1793,8 +1807,8 @@ func run(cfg syncConfig) (runErr error) {
 				return srcDom.Resume()
 			})
 			if resumeErr != nil {
-				// Unlike abortBackup/cleanupVerifyWindow/the checkpoint
-				// cleanup, this used to have no reconnect fallback at all --
+				// Unlike abortBackup/the checkpoint cleanup, this used to
+				// have no reconnect fallback at all --
 				// despite being the most availability-critical of the four:
 				// a leftover backup job or checkpoint is an annoyance the
 				// next run can clean up or route around, but a source stuck
@@ -1864,74 +1878,6 @@ func run(cfg syncConfig) (runErr error) {
 			}
 		})
 	}
-	// cleanupVerifyWindow tears down the ephemeral verify-window checkpoint
-	// and its own short-lived backup job (see beginVerifyWindow) -- mirrors
-	// abortBackup's shape exactly (sync.Once, callWithTimeout, reconnect-
-	// retry fallback), since it's the same kind of "must not leak this
-	// libvirt-side state past this run" concern. A no-op whenever
-	// verifyWindowActive was never set (i.e. -verify=online never reached
-	// that step this run, including whenever it's not requested at all).
-	//
-	// abortBackup and cleanupVerifyWindow both stop the SAME underlying
-	// backup job (beginVerifyWindow reuses backupActive/backupMu across the
-	// handoff from the regular job to the verify-window one -- see its own
-	// comment), and both run concurrently from the signal handler's
-	// parallel cleanup goroutines. This claims responsibility for that stop
-	// through backupActive/backupMu exactly like abortBackup already does,
-	// rather than calling StopBackup unconditionally: whichever of the two
-	// closures flips backupActive false first is the one that actually
-	// calls it and logs about it, and the other -- seeing it already false
-	// -- skips both. StopBackup's own job-stats-based check would have
-	// made a redundant second call a harmless no-op regardless (when no
-	// job or the same backup job is still running), but this avoids the
-	// redundant call (and the confusing "stopping libvirt backup job" log
-	// line that would come with it) entirely, instead of relying on that
-	// as the only safety net. The checkpoint deletion below
-	// is unconditional either way -- it's this closure's own, unique
-	// responsibility, regardless of which closure happened to stop the job.
-	cleanupVerifyWindow := func(trigger string) {
-		verifyWindowOnce.Do(func() {
-			verifyWindowMu.Lock()
-			active := verifyWindowActive
-			verifyWindowMu.Unlock()
-			if !active {
-				return
-			}
-			trace.Info("removing verify-online window checkpoint", "trigger", trigger)
-
-			backupMu.Lock()
-			shouldStop := backupActive
-			backupActive = false
-			backupMu.Unlock()
-			if shouldStop {
-				stopErr := callOnSrcDom("stop verify-window backup job", func() error {
-					return libvirtsync.StopBackup(srcDom)
-				})
-				if stopErr != nil {
-					trace.Error("failed to stop verify-window backup job", "trigger", trigger, "error", stopErr)
-				}
-			}
-
-			delErr := callOnSrcDom("delete verify-window checkpoint", func() error {
-				return libvirtsync.DeleteVerifyWindowCheckpoint(srcDom)
-			})
-			if delErr != nil {
-				trace.Error("failed to delete verify-window checkpoint on primary connection", "trigger", trigger, "error", delErr)
-				retryErr := callWithTimeout("delete verify-window checkpoint via reconnect", 5*time.Second, func() error {
-					return libvirtsync.DeleteCheckpointViaReconnect(cfg.SourceURI, cfg.SourceDomain, libvirtsync.VerifyWindowCheckpointName)
-				})
-				if retryErr != nil {
-					trace.Error("failed to delete verify-window checkpoint via reconnect", "trigger", trigger, "error", retryErr)
-				}
-			}
-		})
-	}
-	// Registered right away: cleanupVerifyWindow itself checks
-	// verifyWindowActive at the time it actually runs, so this is a no-op
-	// for every run that never reaches (or doesn't use) -verify=online's
-	// beginVerifyWindow step further down, and the real backstop for one
-	// that does but fails or gets interrupted partway through.
-	defer cleanupVerifyWindow("cleanup")
 
 	// pollStopCommands repeatedly drains newly-appended entries from a
 	// stop-command list instead of taking one instant snapshot -- per-disk
@@ -2026,7 +1972,7 @@ func run(cfg syncConfig) (runErr error) {
 	// Without this, a signal landing in that window -- freeze succeeded,
 	// checkpoint creation still in flight -- had no cleanup step that even
 	// knew the guest was frozen, let alone one that thawed it: none of
-	// abortBackup/cleanupVerifyWindow/cleanupTargetNBD/cleanupSourceBridge/
+	// abortBackup/cleanupTargetNBD/cleanupSourceBridge/
 	// resumeSource touch the filesystem-freeze state at all. The result was
 	// a production guest left frozen indefinitely (until an operator
 	// happens to notice and runs virsh fsfreeze-thaw by hand), for
@@ -2176,9 +2122,11 @@ func run(cfg syncConfig) (runErr error) {
 			// concurrently -- worst-case wait is the slowest ONE of them,
 			// not their sum, before the process can actually exit.
 			var cleanupWg sync.WaitGroup
-			cleanupWg.Add(7)
+			// Six, not seven: cleanupVerifyWindow is gone along with the
+			// second backup job it existed to tear down. abortBackup now
+			// covers the only backup job a run ever has.
+			cleanupWg.Add(6)
 			go func() { defer cleanupWg.Done(); abortBackup(sig.String()) }()
-			go func() { defer cleanupWg.Done(); cleanupVerifyWindow(sig.String()) }()
 			go func() { defer cleanupWg.Done(); cleanupTargetNBD(sig.String()) }()
 			go func() { defer cleanupWg.Done(); cleanupSourceBridge(sig.String()) }()
 			go func() { defer cleanupWg.Done(); resumeSource(sig.String()) }()
@@ -3041,80 +2989,6 @@ func run(cfg syncConfig) (runErr error) {
 		metricsMu.Unlock()
 		trace.Info("source nbd port in use", "side", "source", "kind", "bridge_local", "host", "127.0.0.1", "port", localPort)
 	}
-
-	// verifyWindow carries what -verify=online's compare phase needs from
-	// beginVerifyWindow. checkpointName is empty for the plain -verify/
-	// -verify=fast path (runVerify uses that to tell the two modes apart);
-	// non-empty means the compare should reconcile mismatches against that
-	// checkpoint's own dirty bitmap instead of failing on the first one.
-	type verifyWindow struct {
-		checkpointName string
-		cleanup        func()
-	}
-
-	// beginVerifyWindow opens -verify=online's compare window: it stops the
-	// regular sync's backup job, creates the ephemeral verify-window
-	// checkpoint, then starts a SECOND, short-lived backup job scoped to
-	// that checkpoint's bitmap. This second job is necessary, not
-	// incidental -- libvirt's pull-mode backup XML binds exactly one
-	// bitmap (exportbitmap) per disk, fixed at BackupBegin time (see
-	// https://libvirt.org/formatbackup.html), so the already-running first
-	// job (scoped to the regular chain's checkpoint) can never expose the
-	// new checkpoint's bitmap over the same NBD connection -- only a backup
-	// job actually started with that bitmap as its exportbitmap can.
-	// Reuses cfg.SourceNBDBind/cfg.SourceNBDPort (the same host:port the
-	// first job used), so effectiveSourceHost/effectiveSourcePort -- and
-	// any compress/netbuffer bridge already established around them further
-	// up -- stay valid unchanged for the compare phase; nothing about the
-	// bridge needs to be restarted.
-	beginVerifyWindow := func() (verifyWindow, error) {
-		// Only marked inactive once the stop is actually confirmed -- if
-		// StopBackup itself fails, backupActive deliberately stays true, so
-		// the deferred abortBackup("cleanup") still believes there's a job
-		// to retry stopping (with its own reconnect fallback) rather than
-		// silently skipping it because this attempt already (wrongly)
-		// marked it as handled.
-		if err := libvirtsync.StopBackup(srcDom); err != nil {
-			return verifyWindow{}, fmt.Errorf("stop primary backup job before verify window: %w", err)
-		}
-		backupMu.Lock()
-		backupActive = false
-		backupMu.Unlock()
-
-		if err := libvirtsync.DeleteVerifyWindowCheckpoint(srcDom); err != nil {
-			return verifyWindow{}, fmt.Errorf("clean up any leftover verify-window checkpoint: %w", err)
-		}
-		if err := libvirtsync.CreateVerifyWindowCheckpoint(srcDom, qcowDisks); err != nil {
-			return verifyWindow{}, fmt.Errorf("create verify-window checkpoint: %w", err)
-		}
-		verifyWindowMu.Lock()
-		verifyWindowActive = true
-		verifyWindowMu.Unlock()
-
-		// backupActive is set BEFORE calling StartPullBackupTCP for the same
-		// reason as the main backup job's own start above: the RPC can
-		// create the job and open its NBD export server-side before the
-		// client-side call returns, and a signal landing while still
-		// blocked inside it must still see backupActive=true so
-		// cleanupVerifyWindow's own shouldStop check actually attempts to
-		// stop the job, instead of only deleting the verify-window
-		// checkpoint and leaving a real, running backup job (and its NBD
-		// export) orphaned.
-		backupMu.Lock()
-		backupActive = true
-		backupMu.Unlock()
-
-		if err := libvirtsync.StartPullBackupTCP(srcDom, libvirtsync.VerifyWindowCheckpointName, libvirtsync.VerifyWindowCheckpointName, cfg.SourceNBDBind, cfg.SourceNBDPort, qcowDisks); err != nil {
-			cleanupVerifyWindow("verify window setup failed")
-			return verifyWindow{}, fmt.Errorf("start verify-window backup job: %w", err)
-		}
-
-		return verifyWindow{
-			checkpointName: libvirtsync.VerifyWindowCheckpointName,
-			cleanup:        func() { cleanupVerifyWindow("verify-online compare complete") },
-		}, nil
-	}
-
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(qcowDisks))
 	reportWorkerErr := func(err error) {
@@ -3137,11 +3011,11 @@ func run(cfg syncConfig) (runErr error) {
 	}
 
 	// recordDiskMetric appends one metrics.DiskMetric, exactly the
-	// computation syncDisk's own deferred metrics block always did -- shared
-	// so the single-phase path (duration = copy+verify combined, via
-	// syncDisk's defer) and -verify=online's two-phase path (duration =
-	// copy only, recorded right after copyAndCommit -- see its own doc
-	// comment for why) don't each carry their own copy of it.
+	// computation syncDisk's own deferred metrics block always did. Its own
+	// closure rather than inline because it once had two callers: the
+	// single-phase path and -verify's since-removed two-phase one. Kept
+	// factored out -- it is the whole per-disk metric in one place, which is
+	// where the source/target bridge attribution above wants to be read.
 	recordDiskMetric := func(d disk.QcowDisk, diskSize, writtenBytes uint64, targetBridgeCounters *nbdbridge.ByteCounters, duration time.Duration) {
 		if cfg.PrometheusTextfile == "" {
 			return
@@ -3181,11 +3055,13 @@ func run(cfg syncConfig) (runErr error) {
 	}
 
 	// diskPhase1Result carries what runVerify needs from copyAndCommit.
-	// Under -verify=online, these two run as separate goroutine invocations
-	// (see the two-phase fan-out below) with a whole-run barrier between
-	// them, so runVerify can no longer just read copyAndCommit's local
-	// variables via closure capture the way the single-phase syncDisk path
-	// still does.
+	//
+	// A struct rather than closure capture because copyAndCommit and
+	// runVerify are separate closures: syncDisk calls one then the other and
+	// hands the result across. It dates from when the "online" mode ran them in
+	// two separate goroutine invocations either side of a whole-run barrier;
+	// that barrier is gone, but passing the values explicitly is still
+	// clearer than widening what either closure captures.
 	type diskPhase1Result struct {
 		diskStart            time.Time
 		targetPath           string
@@ -3399,14 +3275,15 @@ func run(cfg syncConfig) (runErr error) {
 		return res, nil
 	}
 
-	// runVerify is today's `if cfg.Verify != ""` block, unchanged in behavior
-	// for its original caller (syncDisk, verify.checkpointName always "" there
-	// since cfg.Verify can only ever hold one mode at a time). Under
-	// -verify=online (verify.checkpointName != ""), the compare step
-	// collects every mismatch instead of failing on the first one, then
-	// reconciles them against what the verify-window checkpoint's own
-	// bitmap shows the guest touched during the compare.
-	runVerify := func(i int, d disk.QcowDisk, res diskPhase1Result, verify verifyWindow) (err error) {
+	// runVerify compares one disk, in whichever mode -verify named.
+	//
+	// It opens a READ-ONLY export on the target's committed base and reads
+	// the source through the primary backup job's export -- still open, and
+	// frozen at the instant the copy read from. Both sides are therefore the
+	// same point in time and must be byte-identical; the mode chooses only
+	// how the comparison is performed and how a difference is reported. See
+	// the verifyMode constants.
+	runVerify := func(i int, d disk.QcowDisk, res diskPhase1Result) (err error) {
 		metricsMu.Lock()
 		verificationAttempted = true
 		metricsMu.Unlock()
@@ -3496,46 +3373,56 @@ func run(cfg syncConfig) (runErr error) {
 		// orchestrator host). Using the export instead means this needs
 		// no assumption about which host any file actually lives on,
 		// only the same source/target network reachability the disk
-		// copy itself already requires. Still true under -verify=online:
-		// beginVerifyWindow's second backup job rebinds the exact same
-		// host:port, so effectiveSourceHost/Port need no change here.
+		// copy itself already requires. True for all three modes: each reads
+		// this same still-open primary export.
 		sourceNBDURL := fmt.Sprintf("nbd://%s:%d/%s", effectiveSourceHost, effectiveSourcePort, d.TargetDev)
 		nbdURL := fmt.Sprintf("nbd://%s:%d/", verifyTargetHost, verifyTargetPort)
 
+		// Every mode compares the target against the SAME source export the
+		// copy read from -- the primary backup job, still running. That job
+		// is a frozen point-in-time view, so both sides are source@T0 and
+		// the two must be byte-identical. There is no drift to excuse and no
+		// dirty-bitmap reconciliation anywhere in this function.
+		//
+		// The mode now called "full" used to do something else, under the
+		// name "online": it stopped the primary job, started a SECOND one,
+		// and so compared source@T2 against target@T0, then tried to excuse
+		// the difference using a bitmap.
+		// Every guest write during the copy showed up as a mismatch, and on
+		// a busy guest that was a near-100% false-positive rate. The
+		// exoneration logic existed only to paper over the wrong comparison;
+		// removing the second job removed the need for it entirely.
+		//
+		// What distinguishes online from compare/fast is now ONLY that it
+		// does not suspend the source. It never needed to: see verifySuspends
+		// above, whose stated reason (a running domain's disk is not static)
+		// is about the domain, while every mode reads the frozen export.
+		trace.Info("verify: comparing source and target images", "disk", d.TargetDev,
+			"source", sourceNBDURL, "target", targetPath, "mode", cfg.Verify)
 		var compareErr error
-		if verify.checkpointName != "" {
-			trace.Info("verify-online: comparing source and target images", "disk", d.TargetDev, "source", sourceNBDURL, "target", targetPath)
+		switch {
+		case verifyFull:
+			// Collect rather than abort on the first difference. Any
+			// mismatch is real, so the useful question is no longer whether
+			// the replica is broken but HOW broken. Costs a full scan on an
+			// already-failing disk, which is exactly the trade this mode
+			// exists to make -- fast is there for when it is not wanted.
 			mismatches, cerr := nbdsync.CompareTCPCollect(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, cfg.IODepth)
 			switch {
 			case cerr != nil:
 				compareErr = fmt.Errorf("compare failed: %w", cerr)
-			case len(mismatches) == 0:
-				trace.Info("verify-online: images match", "disk", d.TargetDev)
-			default:
-				touched, _, _, terr := nbdsync.ChangedExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verify.checkpointName, true)
-				if terr != nil {
-					compareErr = fmt.Errorf("dirty-bitmap query failed: %w", terr)
-					break
-				}
-				var real []nbdsync.MismatchRange
+			case len(mismatches) > 0:
+				var diffBytes uint64
 				for _, m := range mismatches {
-					if !overlapsAnyExtent(m, touched) {
-						real = append(real, m)
-					}
+					diffBytes += m.Length
 				}
-				if len(real) > 0 {
-					compareErr = fmt.Errorf("%d real mismatch(es) outside any region the guest touched during the compare window (of %d total detected)", len(real), len(mismatches))
-				} else {
-					trace.Info("verify-online: remaining mismatches all attributable to concurrent guest writes, not corruption", "disk", d.TargetDev, "count", len(mismatches))
-				}
+				compareErr = fmt.Errorf("%d range(s) totalling %d bytes differ from the source snapshot this replica was copied from -- both sides are the same point in time, so this is a real difference and not concurrent guest activity",
+					len(mismatches), diffBytes)
 			}
-		} else {
-			trace.Info("verify: comparing source and target images", "disk", d.TargetDev, "source", sourceNBDURL, "target", targetPath, "fast", verifyFast)
-			if verifyFast {
-				compareErr = nbdsync.CompareTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, cfg.IODepth)
-			} else {
-				compareErr = disk.CompareImages(sourceNBDURL, nbdURL)
-			}
+		case verifyFast:
+			compareErr = nbdsync.CompareTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, cfg.IODepth)
+		default:
+			compareErr = disk.CompareImages(sourceNBDURL, nbdURL)
 		}
 
 		// Best-effort: a read-only export (or its bridge) left behind
@@ -3563,11 +3450,11 @@ func run(cfg syncConfig) (runErr error) {
 
 	// syncDisk is the single-phase path: copy+commit, then (if cfg.Verify != "")
 	// verify against the same already-open backup export, all in one
-	// goroutine per disk with zero cross-disk coordination -- exactly
-	// today's behavior, used whenever -verify=online is NOT set (including
-	// plain syncs and -verify=compare/-verify=fast, which suspend instead of
-	// using a barrier). verifyWindow{} (checkpointName == "") tells
-	// runVerify to use the original compare path, not -verify=online's.
+	// goroutine per disk with zero cross-disk coordination -- now the only
+	// path, for every mode. The mode now called "full" used to take a
+	// two-phase one with a barrier and a second backup job; comparing
+	// against the export the copy actually read from removed the need for
+	// both.
 	// Decided before any disk is copied, so a target that cannot deliver what
 	// -retention promises fails the run here rather than after paying for a
 	// full copy. Returns an inert value when retention is off or the interval
@@ -3608,87 +3495,36 @@ func run(cfg syncConfig) (runErr error) {
 			return err
 		}
 		if cfg.Verify != "" {
-			return runVerify(i, d, res, verifyWindow{})
+			return runVerify(i, d, res)
 		}
 		trace.Info("disk sync complete", "disk", d.TargetDev, "elapsed", time.Since(diskStart).Round(time.Millisecond).String())
 		return nil
 	}
 
-	if !verifyOnline {
-		for i, d := range qcowDisks {
-			i, d := i, d
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if err := syncDisk(i, d); err != nil {
-					reportWorkerErr(err)
-				}
-			}()
-		}
-		trace.Info("waiting for all processes to finish")
-		wg.Wait()
-		close(errCh)
-	} else {
-		// -verify=online: copy+commit for every disk first, then (once,
-		// domain-wide, not per-disk) open the compare window, then compare
-		// every disk in parallel again. See beginVerifyWindow's own doc
-		// comment for why this needs a real barrier instead of just running
-		// per-disk like the path above.
-		phase1Results := make([]diskPhase1Result, len(qcowDisks))
-		for i, d := range qcowDisks {
-			i, d := i, d
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				diskStart := time.Now()
-				res, err := copyAndCommit(i, d)
-				phase1Results[i] = res // each goroutine only ever writes index i -- no race
-				recordDiskMetric(d, res.diskSize, res.writtenBytes, res.targetBridgeCounters, time.Since(diskStart))
-				if err != nil {
-					reportWorkerErr(err)
-					return
-				}
-				// Same point in the sequence as the single-phase path above:
-				// straight after this disk's own copy, before any compare.
-				// rp.take is safe to call from several goroutines at once.
-				if err := rp.take(ctx, util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)); err != nil {
-					reportWorkerErr(err)
-				}
-			}()
-		}
-		trace.Info("waiting for copy+commit phase before opening the verify-online compare window")
-		wg.Wait()
-
-		// First error wins, same contract as the single-phase path: don't
-		// spend a checkpoint (or tear down/rebuild the backup job) on a run
-		// that already failed during copy.
-		select {
-		case err := <-errCh:
-			return err
-		default:
-		}
-
-		verify, err := beginVerifyWindow()
-		if err != nil {
-			return fmt.Errorf("verify-online: open compare window: %w", err)
-		}
-		trace.Info("verify-online: compare window open, comparing all disks", "checkpoint", verify.checkpointName)
-
-		for i, d := range qcowDisks {
-			i, d := i, d
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if err := runVerify(i, d, phase1Results[i], verify); err != nil {
-					reportWorkerErr(err)
-				}
-			}()
-		}
-		trace.Info("waiting for verify-online compare phase to finish")
-		wg.Wait()
-		verify.cleanup()
-		close(errCh)
+	// ONE path for every mode.
+	//
+	// There used to be a second, two-phase path for the mode then called
+	// "online": a barrier across all disks, then a domain-wide "compare
+	// window" that stopped the primary backup job and started another. All
+	// of it existed to serve a comparison
+	// against the wrong point in time. Comparing against the primary export
+	// -- which is still open and still frozen at the instant the copy read
+	// from -- needs no barrier, no second job and no cross-disk coordination,
+	// so each disk copies and verifies in its own goroutine exactly as the
+	// suspend-based modes always have.
+	for i, d := range qcowDisks {
+		i, d := i, d
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := syncDisk(i, d); err != nil {
+				reportWorkerErr(err)
+			}
+		}()
 	}
+	trace.Info("waiting for all processes to finish")
+	wg.Wait()
+	close(errCh)
 
 	for err := range errCh {
 		if err != nil {
