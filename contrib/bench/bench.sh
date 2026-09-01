@@ -857,7 +857,140 @@ stage_verify_tamper() {
         for mode in fast full qemu-img; do
                 verify_mode_subtest "$target_path" "$vsize" "$mode" "verify-${mode}" tamper
         done
+
+        # Then the two cross-checks. The loop above tests each mode on its own
+        # tamper at its own random offset, which is broad coverage across runs;
+        # these two ask a different question -- whether the modes AGREE, with
+        # and without corruption present.
+        verify_cross_check_subtest "$target_path" "$vsize"
+        verify_clean_oracle_subtest "$target_path"
         return 0
+}
+
+# verify_cross_check_subtest PATH VSIZE -- tamper ONCE, ask all three modes
+# about that same state, and require them to agree.
+#
+# The per-mode loop above already proves each mode detects corruption. It
+# cannot prove they agree, because each one gets its own tamper at its own
+# random offset -- three separate questions, never the same one twice. This
+# asks the question that the skip logic actually turns on:
+#
+#   fast and full read through nbdsync's own comparator, which SKIPS ranges
+#   both sides report as NBD_STATE_ZERO (planCompareChunks). qemu-img does
+#   not -- it reads every byte, in a separate implementation vmsync did not
+#   write. So qemu-img is the oracle for the skip logic, and it is only an
+#   oracle if all three are asked about identical bytes.
+#
+# A disagreement here is the signal worth having. fast/full clean while
+# qemu-img reports a mismatch means the skip ate a real difference -- a
+# verify that passes over corruption, which is worse than no verify at all.
+verify_cross_check_subtest() {
+        local path="$1" vsize="$2" mode outcome
+        local -a agreed=()
+
+        log "--- verify cross-check: one tamper, all three modes, expecting all three to agree ---"
+
+        if [ "$DRY_RUN" != yes ]; then
+                stage_needs_target_shutoff "$CSV" verify-cross "verify-cross" || return 0
+                if ! draw_tamper "$vsize"; then
+                        warn "SKIP verify-cross: the configured tamper band does not fit inside a ${vsize}-byte disk"
+                        results_row "$CSV" verify-cross tamper "" "" "" "" "" "" "SKIP tamper band does not fit the disk"
+                        return 0
+                fi
+                log "   corrupting at offset $TAMPER_OFF length $TAMPER_LEN (seed $TAMPER_SEED)"
+                if ! tamper_target "$path" yes; then
+                        results_row "$CSV" verify-cross tamper "" "" "" "" "" "" "SKIP the tamper could not be applied"
+                        heal_target verify-cross heal "$path"
+                        return 0
+                fi
+        fi
+
+        # The tamper survives each failed verify -- nothing heals it until the
+        # end -- so every mode sees the same corrupted replica.
+        for mode in fast full qemu-img; do
+                bench_sync verify-cross "$mode" "-verify=$mode"
+                if [ "$DRY_RUN" = yes ]; then
+                        results_row "$CSV" verify-cross "${mode}-result" DRYRUN "" "" "" "" "" "SKIP dry run"
+                        continue
+                fi
+                outcome="$(verify_outcome "$RUN_PROM")"
+                agreed+=("$mode=$outcome")
+                case "$outcome" in
+                RAN_MISMATCH)
+                        log "   PASS: -verify=$mode reported a mismatch"
+                        results_row "$CSV" verify-cross "${mode}-result" 0 "" "" "" "" "" "PASS mismatch detected"
+                        ;;
+                RAN_CLEAN)
+                        warn "FAIL: -verify=$mode found NOTHING at offset $TAMPER_OFF length $TAMPER_LEN (reproduce with TAMPER_SEED=$TAMPER_SEED). See $RUN_LOG"
+                        results_row "$CSV" verify-cross "${mode}-result" 1 "" "" "" "" "" "FAIL mismatch NOT detected"
+                        ;;
+                *)
+                        warn "FAIL: -verify=$mode never reached its compare, so nothing was verified (exit=$RUN_RC). See $RUN_LOG"
+                        results_row "$CSV" verify-cross "${mode}-result" 1 "" "" "" "" "" "FAIL verification never ran"
+                        ;;
+                esac
+        done
+
+        if [ "$DRY_RUN" != yes ]; then
+                # The cross-check itself, stated as its own assertion so the
+                # report says "the modes disagreed" rather than leaving somebody
+                # to notice it across three rows.
+                local first="" disagree=0 entry
+                for entry in "${agreed[@]}"; do
+                        [ -z "$first" ] && first="${entry#*=}"
+                        [ "${entry#*=}" = "$first" ] || disagree=1
+                done
+                if [ "$disagree" = 0 ] && [ -n "$first" ]; then
+                        log "   PASS: all three modes agree (${agreed[*]})"
+                        results_row "$CSV" verify-cross agreement 0 "" "" "" "" "" "PASS all modes agree: ${agreed[*]}"
+                else
+                        warn "FAIL: the verify modes DISAGREED about the same corrupted replica (${agreed[*]}). qemu-img reads every byte in a separate implementation; fast and full skip ranges both sides report as zero. If qemu-img saw the corruption and they did not, that skip logic (planCompareChunks in pkg/nbdsync) is dropping real differences. Reproduce with TAMPER_SEED=$TAMPER_SEED"
+                        results_row "$CSV" verify-cross agreement 1 "" "" "" "" "" "FAIL modes disagree: ${agreed[*]}"
+                fi
+        fi
+
+        heal_target verify-cross heal "$path"
+}
+
+# verify_clean_oracle_subtest PATH -- after the heal, confirm an INDEPENDENT
+# full-image comparison also calls the replica clean.
+#
+# The cross-check above proves the modes agree when there IS corruption. This
+# proves they agree when there is not: a freshly reinit'd replica compared
+# byte-for-byte by qemu-img, which reads everything and shares no code with
+# nbdsync's comparator.
+#
+# What it catches that nothing else does: a copy path that produces a subtly
+# wrong replica in a region vmsync's own verify happens to skip. Both halves
+# of vmsync could then agree the replica is fine while it is not, and only an
+# outside reader would notice.
+verify_clean_oracle_subtest() {
+        local path="$1" outcome
+
+        log "--- verify clean-oracle: independent qemu-img comparison of the healed replica ---"
+
+        bench_sync verify-oracle clean "-verify=qemu-img"
+
+        if [ "$DRY_RUN" = yes ]; then
+                results_row "$CSV" verify-oracle clean-result DRYRUN "" "" "" "" "" "SKIP dry run"
+                return 0
+        fi
+
+        outcome="$(verify_outcome "$RUN_PROM")"
+        case "$outcome" in
+        RAN_CLEAN)
+                log "   PASS: an independent full-image comparison agrees the replica is intact"
+                results_row "$CSV" verify-oracle clean-result 0 "" "" "" "" "" "PASS independent compare clean"
+                ;;
+        RAN_MISMATCH)
+                warn "FAIL: qemu-img found differences in a replica that was just fully resynced and that vmsync's own verify passed. Either the copy path is producing a wrong replica, or nbdsync's comparator is missing it. Inspect $path by hand. See $RUN_LOG"
+                results_row "$CSV" verify-oracle clean-result 1 "" "" "" "" "" "FAIL independent compare found differences"
+                ;;
+        *)
+                warn "FAIL: the independent comparison never reached its compare (exit=$RUN_RC), so the replica is unconfirmed. See $RUN_LOG"
+                results_row "$CSV" verify-oracle clean-result 1 "" "" "" "" "" "FAIL oracle verification never ran"
+                ;;
+        esac
 }
 
 # verify_guard_subtest PATH VSIZE -- asserts the mtime guard refuses a target
@@ -3897,7 +4030,7 @@ stage_pattern() {
 	# down records its reason under that name, and a reason nothing matches
 	# is a reason nobody reads: the verdict would say "nothing recorded"
 	# rather than why the stage skipped.
-	verify) printf '^verify-(guard|fast|full|qemu-img|precondition)$' ;;
+	verify) printf '^verify-(guard|fast|full|qemu-img|cross|oracle|precondition)$' ;;
 	reinit) printf '^reinit-after-failures$' ;;
 	snapshot) printf '^ext-snapshot$' ;;
 	define) printf '^define-(uuid-collision|rollback|precondition)$' ;;
