@@ -291,6 +291,18 @@ func RemoveBitmap(path, name string) error {
 // comparing a source disk that may still be open by a suspended (not
 // destroyed) qemu process, which would otherwise refuse a second,
 // exclusive-by-default open. Harmless (a no-op) for a network reference.
+// ErrImagesDiffer marks the one CompareImages outcome that is a FINDING
+// about the data rather than a failure to look at it: qemu-img exited 1,
+// meaning it read both images and they differ.
+//
+// Callers need to tell that apart from every other error this can return --
+// qemu-img missing, an export unreachable, a read that failed partway --
+// because the two call for opposite responses. A compare that could not run
+// is an infrastructure problem to retry; a compare that ran and found a
+// difference is a replica to stop trusting, and must never be answered by
+// automation that discards and recopies it.
+var ErrImagesDiffer = errors.New("images differ")
+
 func CompareImages(refA, refB string) error {
 	cmd := exec.Command("qemu-img", "compare", "-U", refA, refB)
 	out, err := cmd.CombinedOutput()
@@ -299,7 +311,7 @@ func CompareImages(refA, refB string) error {
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-		return fmt.Errorf("images differ: %s", strings.TrimSpace(string(out)))
+		return fmt.Errorf("%w: %s", ErrImagesDiffer, strings.TrimSpace(string(out)))
 	}
 	return fmt.Errorf("qemu-img compare %s vs %s: %w: %s", refA, refB, err, strings.TrimSpace(string(out)))
 }

@@ -763,18 +763,25 @@ func main() {
 	// state -- so it survives being tracked from a different host and stays
 	// in one place with the rest of vmsync's bookkeeping.
 	//
-	// Both sides of this are gated on !verifying: a -verify=* run's failure
-	// (a real mismatch, or just a transient hiccup during the compare step)
-	// says nothing about whether the *incremental sync mechanism itself* is
-	// broken, which is what -reinit-after-failures exists to auto-heal --
-	// folding it into the same counter risks auto-discarding the checkpoint
-	// chain in response to a genuine corruption finding instead of
-	// surfacing it for a human to look at, and -verify runs are meant to
-	// run on their own separate cadence from routine syncs anyway, so
-	// mixing their failure signal into this counter conflates two
-	// different schedules.
-	verifying := cfg.Verify != ""
-	if cfg.ReinitAfterFailures > 0 && !verifying {
+	// Exactly ONE thing is exempt from this counter: a verification that ran
+	// and found the images different (isVerifyMismatch). Auto-reinit answers
+	// a failure by discarding the checkpoint chain and recopying, which for
+	// a corruption finding would destroy the evidence before anybody saw it.
+	//
+	// Everything else on a -verify run counts, and that is the fix. This
+	// used to be gated on `cfg.Verify != ""` -- "verification was REQUESTED"
+	// -- which is not the same question at all. It exempted the SSH session
+	// that died, the copy that failed, the preflight refusal, and the
+	// checkpoint-chain inconsistency that contrib/bench/bench.sh's Stage 3
+	// uses as the canonical thing auto-reinit exists to heal. An operator
+	// running -verify on their scheduled syncs, which is the whole point of
+	// having it, therefore had -reinit-after-failures silently doing
+	// nothing: nothing was ever counted, so the threshold was never reached.
+	//
+	// The codebase already draws this line elsewhere -- verificationRan()
+	// exists because cfg.Verify alone stays true for a run that never
+	// reached the compare at all.
+	if cfg.ReinitAfterFailures > 0 {
 		failures, err := libvirtsync.ReadTargetFailureCount(cfg.TargetURI, cfg.TargetDomain)
 		if err != nil {
 			trace.Warning("unable to read failure count from target metadata", "error", err)
@@ -823,7 +830,14 @@ func main() {
 		// slowly become unpromotable because the scheduler kept being told no.
 		// The run still exits 1 and still reports vmsync_sync_state=failure:
 		// what is wrong is only counting it against the domain.
-		if cfg.ReinitAfterFailures > 0 && !verifying && !errors.Is(err, libvirtsync.ErrRoleRefusesSync) {
+		//
+		// A verification that RAN and found a difference is exempt for a
+		// related but distinct reason: it is not a broken sync either, it is
+		// a finding about the data, and the reinit this counter would force
+		// is precisely the wrong response to one. A compare that could not
+		// run is NOT exempt -- that is a broken sync like any other. See
+		// isVerifyMismatch.
+		if cfg.ReinitAfterFailures > 0 && !isVerifyMismatch(err) && !errors.Is(err, libvirtsync.ErrRoleRefusesSync) {
 			if count, rerr := libvirtsync.RecordTargetSyncFailure(cfg.TargetURI, cfg.TargetDomain); rerr != nil {
 				trace.Warning("failed to record sync failure in target metadata", "error", rerr)
 			} else {
@@ -1009,6 +1023,27 @@ func targetFileNewerThanSync(mtime, lastSync string, tolerance time.Duration) (n
 		tolerance = 0
 	}
 	return ahead > tolerance, ahead, nil
+}
+
+// isVerifyMismatch reports whether err is a verification that RAN and found
+// the images genuinely different, as opposed to one that could not be
+// performed.
+//
+// The distinction decides what automation is allowed to do about it, and the
+// two answers are opposite. A compare that could not run -- an SSH session
+// that died, an export that never came up, a stalled pipeline, a cancelled
+// context -- says the sync mechanism is unhealthy, which is exactly what
+// -reinit-after-failures exists to notice and heal. A compare that ran and
+// found a difference says the DATA is suspect, and answering that by
+// automatically discarding the checkpoint chain and recopying would destroy
+// the evidence of a corruption finding before anybody saw it.
+//
+// Both nbdsync and disk raise their own ErrImagesDiffer for exactly this,
+// and -verify=full wraps the same sentinel around its collected result, so
+// all three modes are classified by one rule rather than by which mode
+// happened to run.
+func isVerifyMismatch(err error) bool {
+	return errors.Is(err, nbdsync.ErrImagesDiffer) || errors.Is(err, disk.ErrImagesDiffer)
 }
 
 // syncFloor picks the timestamp a replica disk's mtime is judged against,
@@ -3600,8 +3635,11 @@ func run(cfg syncConfig) (runErr error) {
 				for _, m := range mismatches {
 					diffBytes += m.Length
 				}
-				compareErr = fmt.Errorf("%d range(s) totalling %d bytes differ from the source snapshot this replica was copied from -- both sides are the same point in time, so this is a real difference and not concurrent guest activity",
-					len(mismatches), diffBytes)
+				// Wrapped with the same sentinel the other two comparators
+				// use, so isVerifyMismatch treats all three alike: this is a
+				// finding about the data, not a failure to look at it.
+				compareErr = fmt.Errorf("%w: %d range(s) totalling %d bytes differ from the source snapshot this replica was copied from -- both sides are the same point in time, so this is a real difference and not concurrent guest activity",
+					nbdsync.ErrImagesDiffer, len(mismatches), diffBytes)
 			}
 		case verifyFast:
 			compareErr = nbdsync.CompareTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, cfg.IODepth)

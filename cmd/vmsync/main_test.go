@@ -18,13 +18,17 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"vmsync/pkg/disk"
 	"vmsync/pkg/metrics"
+	"vmsync/pkg/nbdsync"
 )
 
 // TestOptionalValueFlag verifies the bare/"=value"/"=false" tri-state
@@ -530,6 +534,75 @@ func TestSyncFloorNeverTightensTheCheck(t *testing.T) {
 		}
 		if got < 1700000000 {
 			t.Errorf("stamp %d moved the floor down to %d; a lower floor is a STRICTER check and could refuse a replica that passes today", stamp, got)
+		}
+	}
+}
+
+// TestIsVerifyMismatch pins the one distinction -reinit-after-failures now
+// turns on: a verification that RAN and found a difference, versus one that
+// could not be performed.
+//
+// Getting this backwards is destructive in both directions. Classify an
+// infrastructure error as a mismatch and auto-reinit stops noticing a broken
+// sync mechanism -- which is the bug this replaced, where `cfg.Verify != ""`
+// exempted every failure on a -verify run. Classify a real mismatch as
+// infrastructure and auto-reinit answers a corruption finding by discarding
+// the checkpoint chain and recopying, destroying the evidence.
+func TestIsVerifyMismatch(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil is not a mismatch", nil, false},
+
+		// The three comparators, each raising its own sentinel.
+		{"fast: nbdsync found a difference", fmt.Errorf("%w: mismatch at offset=4096 length=4096", nbdsync.ErrImagesDiffer), true},
+		{"qemu-img found a difference", fmt.Errorf("%w: Content mismatch at offset 0", disk.ErrImagesDiffer), true},
+		{"full: collected ranges", fmt.Errorf("%w: 3 range(s) totalling 12288 bytes differ", nbdsync.ErrImagesDiffer), true},
+
+		// It has to survive the wrapping runVerify and the error channel do
+		// to it, or the gate sees a bare error and counts a corruption
+		// finding as a broken sync.
+		{
+			"survives runVerify's own wrapping",
+			fmt.Errorf("verify: disk %s does not match: %w", "vda",
+				fmt.Errorf("%w: mismatch at offset=0 length=4096", nbdsync.ErrImagesDiffer)),
+			true,
+		},
+
+		// Everything below is a compare that could not be performed. All of
+		// these MUST count toward the failure threshold.
+		{"the compare could not connect", errors.New("compare failed: connect target nbd: connection refused"), false},
+		{"the export never came up", errors.New("verify: wait for read-only export 10.0.0.1:20918: timeout"), false},
+		{"the run was cancelled", context.Canceled, false},
+		{"an ssh session died mid-compare", errors.New("open ssh session: context canceled"), false},
+		{"a plain sync failure with no verify involved", errors.New("nbd copy stalled"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isVerifyMismatch(tc.err); got != tc.want {
+				t.Errorf("isVerifyMismatch(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// The regression this change exists to prevent, stated directly: a failure
+// on a -verify run that is NOT a mismatch must be counted.
+//
+// Before this, the gate was `cfg.Verify != ""`, so an operator who ran
+// -verify on their scheduled syncs got no failure counting and no
+// auto-reinit at all -- silently, with the flag still on the command line.
+func TestInfrastructureFailuresOnAVerifyRunAreStillCounted(t *testing.T) {
+	// Representative of what actually goes wrong during a compare, none of
+	// which says anything about whether the images differ.
+	for _, err := range []error{
+		errors.New("compare failed: read source nbd: connection reset by peer"),
+		errors.New("verify: start read-only export for /data/x.qcow2: exit status 1"),
+		errors.New("start verify nbd bridge for vda: dial tcp: i/o timeout"),
+	} {
+		if isVerifyMismatch(err) {
+			t.Errorf("%v was classified as a data finding; it is a broken sync and must count toward -reinit-after-failures", err)
 		}
 	}
 }

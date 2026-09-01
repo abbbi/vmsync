@@ -20,6 +20,7 @@ package nbdsync
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 
 	"strconv"
@@ -692,6 +693,19 @@ func CompareTCP(ctx context.Context, aHost string, aPort int, aExport string, bH
 	return err
 }
 
+// ErrImagesDiffer marks the one compare outcome that is a FINDING about the
+// data rather than a failure to look at it: both sides were read and they do
+// not match.
+//
+// Callers need to tell that apart from every other error a compare can
+// return -- a connection that died, a stalled pipeline, a cancelled context
+// -- because the two call for opposite responses. A compare that could not
+// run is an infrastructure problem to retry; a compare that ran and found a
+// difference is a replica to stop trusting, and must never be answered by
+// automation that discards and recopies it. Only CompareTCP carries this;
+// CompareTCPCollect returns its findings as data instead.
+var ErrImagesDiffer = errors.New("images differ")
+
 // MismatchRange is a byte range where source and target bytes differed.
 // Deliberately distinct from Extent (which carries Dirty/allocation
 // semantics that don't apply here), so a caller can't accidentally conflate
@@ -1079,7 +1093,7 @@ compareLoop:
 			if !match {
 				if !collectMismatches {
 					first := subRanges[0]
-					compareErr = fmt.Errorf("images differ: mismatch at offset=%d length=%d (within chunk offset=%d length=%d)", first.Offset, first.Length, offset, length)
+					compareErr = fmt.Errorf("%w: mismatch at offset=%d length=%d (within chunk offset=%d length=%d)", ErrImagesDiffer, first.Offset, first.Length, offset, length)
 					break compareLoop
 				}
 				mismatches = append(mismatches, subRanges...)
