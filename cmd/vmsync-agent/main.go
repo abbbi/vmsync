@@ -47,7 +47,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -60,6 +59,9 @@ import (
 )
 
 type agentConfig struct {
+	// ConfigPath is the file this configuration came from, kept so a reload
+	// knows what to re-read and so errors can name it.
+	ConfigPath  string
 	UIBase      string
 	EnrolToken  string
 	CAFile      string
@@ -69,7 +71,6 @@ type agentConfig struct {
 	HTTPTimeout time.Duration
 	Once        bool
 	Debug       bool
-	ShowVersion bool
 
 	// Everything below is local host configuration used when running a
 	// scheduled sync. None of it comes from the UI: how to reach another
@@ -114,34 +115,26 @@ type agentConfig struct {
 	runLog *runLog
 }
 
+// Everything else this agent needs now lives in the config file. These four
+// remain because none of them is a SETTING: they select a file, or they say
+// what this one invocation is for.
+//
+// The nineteen that went are not merely relocated. A flag can only be changed
+// by restarting the process, and a daemon whose settings can only be changed
+// by restarting it is one an operator hesitates to touch during an incident --
+// which is when they most need to.
 func main() {
-	var cfg agentConfig
-	flag.StringVar(&cfg.UIBase, "ui", "", "Control-plane UI base address, https:// (required)")
-	flag.StringVar(&cfg.EnrolToken, "enrol-token", "", "Single-use enrolment token generated in the UI for this host. Only needed until enrolment succeeds; it is spent by that call and can be removed afterwards")
-	flag.StringVar(&cfg.CAFile, "ui-ca", "", "PEM bundle to verify the UI's certificate against, for a self-signed or private-CA UI. When unset the system trust store is used. There is deliberately no option to skip verification")
-	flag.StringVar(&cfg.StateDir, "state-dir", "/var/lib/vmsync-agent", "Directory holding the agent's credential and its cached UI configuration")
-	flag.StringVar(&cfg.LibvirtURI, "libvirt-uri", "qemu:///system", "Local libvirt URI to inventory. You should not need to change this: the agent reports the host it runs on")
-	flag.StringVar(&cfg.Hostname, "hostname", "", "Name to report as. Defaults to the system hostname")
-	flag.DurationVar(&cfg.HTTPTimeout, "http-timeout", 2*time.Minute, "Timeout for a single UI request. Must exceed the UI's long-poll hold time, or every config poll ends in a client-side timeout")
-	flag.StringVar(&cfg.VmsyncPath, "vmsync-path", "/usr/local/bin/vmsync", "Path to the vmsync binary this agent runs for scheduled syncs")
-	flag.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "", "Passed through to vmsync as -bridge-helper-path when set")
-	flag.StringVar(&cfg.TargetURIPattern, "target-uri-pattern", "qemu+ssh://%s/system", "How to build a target libvirt URI from a replica target's hostname. %s is the hostname recorded in the VM's own replica_targets metadata")
-	flag.StringVar(&cfg.PrometheusDir, "prometheus-dir", "", "When set, scheduled syncs write <dir>/vmsync_<vm>.prom, keeping the existing metrics pipeline working for agent-driven runs")
-	flag.StringVar(&cfg.SSHUser, "ssh-user", "", "SSH user for reaching target hosts, passed through to vmsync")
-	flag.StringVar(&cfg.SSHKey, "ssh-key", "", "SSH private key for reaching target hosts, passed through to vmsync")
-	flag.IntVar(&cfg.SSHPort, "ssh-port", 0, "SSH port for reaching target hosts (0 leaves vmsync's own default)")
-	flag.StringVar(&cfg.SSHKnownHosts, "ssh-known-hosts", "", "known_hosts file passed through to vmsync")
-	flag.IntVar(&cfg.MaxConcurrentSyncs, "max-concurrent-syncs", 0, "Ceiling on vmsync jobs running at once on this host. 0 leaves it to the schedule (the UI's setting, or max_concurrent_syncs in a --standalone file), which defaults to 4. This flag can only LOWER that number, never raise it: how much concurrent I/O this hypervisor can absorb is its own business, not the control plane's")
-	flag.StringVar(&cfg.StandaloneFile, "standalone", "", "Run as a scheduler only, from this JSON file, with no control plane: no enrolment, no credential, no reporting and no polling. The file holds the same object the UI would otherwise send (see the agent README). Cannot be combined with -ui")
-	flag.BoolVar(&cfg.NoSchedule, "no-schedule", false, "Report only; ignore any schedule the UI sends. Turns this back into a phase-1 read-only agent, which is the safe way to install it on a host before you are ready for it to run syncs")
-	flag.BoolVar(&cfg.NoAutoFence, "no-autofence", false, "Do not shut this host's VMs down when a peer reports it has been failed over to. The split-brain check still runs and still warns -- loudly, every cycle -- but takes no action. For hosts where stopping a VM must stay a human decision")
-	flag.BoolVar(&cfg.Once, "once", false, "Report once and exit, instead of running as a daemon. For verifying a new install")
-	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
-	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
-	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
+	var (
+		configPath     = flag.String("config", "/etc/vmsync/agent.json", "Path to this agent's configuration. Everything except the flags listed here lives in that file; see the agent README")
+		once           = flag.Bool("once", false, "Report once and exit, instead of running as a daemon. For verifying a new install")
+		debug          = flag.Bool("debug", false, `Force debug logging on, whatever "log.debug" says, until this agent is restarted`)
+		enrolTokenFile = flag.String("enrol-token-file", "", "Path to a file holding a single-use enrolment token. Read once and then DELETED, so the token does not outlive its use. Only needed until enrolment succeeds")
+		showVersion    = flag.Bool("v", false, "Show version and exit")
+		showVersionL   = flag.Bool("version", false, "Show version and exit")
+	)
 	flag.Parse()
 
-	if cfg.ShowVersion {
+	if *showVersion || *showVersionL {
 		fmt.Println(version.Version)
 		os.Exit(0)
 	}
@@ -151,48 +144,32 @@ func main() {
 		trace.Error("invalid command line", "error", fmt.Errorf("unexpected extra argument(s) %v", flag.Args()))
 		os.Exit(2)
 	}
-	// -standalone replaces the control plane rather than supplementing it,
-	// so every flag that only means something in relation to a UI is
-	// refused alongside it. Accepting and ignoring them would leave an
-	// operator believing this agent reports somewhere, which is exactly the
-	// belief that gets a host forgotten.
-	if cfg.StandaloneFile != "" {
-		var conflicts []string
-		if cfg.UIBase != "" {
-			conflicts = append(conflicts, "-ui")
-		}
-		if cfg.EnrolToken != "" {
-			conflicts = append(conflicts, "-enrol-token")
-		}
-		if cfg.CAFile != "" {
-			conflicts = append(conflicts, "-ui-ca")
-		}
-		if cfg.Once {
-			conflicts = append(conflicts, "-once")
-		}
-		if cfg.NoSchedule {
-			conflicts = append(conflicts, "-no-schedule")
-		}
-		if len(conflicts) > 0 {
-			trace.Error("invalid configuration", "error", fmt.Errorf("-standalone cannot be combined with %s: it runs the scheduler from a local file with no control plane at all", strings.Join(conflicts, ", ")))
-			os.Exit(2)
-		}
-	} else if cfg.UIBase == "" {
-		trace.Error("invalid configuration", "error", errors.New("-ui is required (or -standalone to schedule from a local file with no control plane)"))
+
+	// Debug is turned on BEFORE the config is read, so that a file which fails
+	// to load can be diagnosed with the flag that exists for diagnosing it.
+	trace.SetDebug(*debug)
+
+	af, warnings, err := LoadAgentFile(*configPath)
+	if err != nil {
+		trace.Error("invalid configuration", "error", err)
 		os.Exit(2)
 	}
-	if cfg.Hostname == "" {
-		h, err := os.Hostname()
-		if err != nil {
-			trace.Error("could not determine hostname; pass -hostname", "error", err)
-			os.Exit(2)
-		}
-		cfg.Hostname = h
+	for _, w := range warnings {
+		trace.Warning("configuration hygiene", "detail", w)
+	}
+
+	cfg, err := resolveAgentConfig(af, *configPath, *once, *debug, *enrolTokenFile)
+	if err != nil {
+		trace.Error("invalid configuration", "error", err)
+		os.Exit(2)
 	}
 	trace.SetDebug(cfg.Debug)
+	if *debug && !af.Log.Debug {
+		trace.Warning(`--debug on the command line overrides "log.debug"; it stays on until this agent is restarted, and a reload cannot turn it off`)
+	}
 
-	// This host has TWO names when -libvirt-uri points somewhere else, and
-	// they are used for different things: -hostname is what the UI knows this
+	// This host has TWO names when libvirt_uri points somewhere else, and
+	// they are used for different things: hostname is what the UI knows this
 	// agent as, while replication metadata identifies it by the URI's host,
 	// because util.ReplicaHost prefers that and ignores the local name
 	// whenever the URI has one.
@@ -200,10 +177,10 @@ func main() {
 	// Not an error -- both names are doing their job -- but it is worth saying
 	// once, because everything about a pair (fence tokens, replica_source,
 	// which row in the console) then keys off a name that is not the one in
-	// the flag. It is also exactly the configuration in which the fence check
+	// the file. It is also exactly the configuration in which the fence check
 	// used to compare the wrong string and silently never fire.
 	if h := util.ReplicaHost(cfg.LibvirtURI, cfg.Hostname); h != cfg.Hostname {
-		trace.Warning("this agent reports under one name and appears in replication metadata under another, because -libvirt-uri names a remote host",
+		trace.Warning("this agent reports under one name and appears in replication metadata under another, because libvirt_uri names a remote host",
 			"reports_as", cfg.Hostname, "replica_identity", h, "libvirt_uri", cfg.LibvirtURI)
 	}
 	if cfg.PrometheusDir != "" {

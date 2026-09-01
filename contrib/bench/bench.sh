@@ -2197,7 +2197,21 @@ stage_failover() {
 # agent_standalone_config VM -> the JSON for a --standalone agent that
 # schedules nothing and exists only to run its fence loop.
 agent_standalone_config() {
+	# No "config_version" here yet: the SCHEDULE document is still decoded as
+	# UIConfig, strictly, and has no such field -- adding one would make every
+	# standalone agent refuse to start. It arrives when file 2 migrates to
+	# ScheduleDoc; the agent's own settings file below already carries one.
 	printf '{\n  "report_interval_seconds": 60,\n  "poll_wait_seconds": 30,\n  "schedule": [\n    { "vm": "%s", "interval_seconds": 86400, "enabled": false, "profile": {} }\n  ]\n}\n' "$1"
+}
+
+# agent_local_config STATE_DIR VMSYNC_BIN -> the agent's own settings file.
+#
+# The agent takes no configuration flags any more: everything except which
+# file to read now lives in this document. Mode is the ABSENCE of a
+# "control_plane" block, which is what makes this a standalone agent -- there
+# is no --standalone flag to pass and no way for the two to disagree.
+agent_local_config() {
+	printf '{\n  "config_version": 1,\n  "state_dir": "%s",\n  "vmsync_path": "%s",\n  "schedule_file": "%s/schedule.json",\n  "log": { "debug": true }\n}\n' "$1" "$2" "$1"
 }
 
 # agent_start HOST IS_LOCAL AGENT_BIN VMSYNC_BIN_THERE VM WORKDIR -> prints
@@ -2211,11 +2225,14 @@ agent_start() {
 	local host="$1" is_local="$2" bin="$3" vmsync_there="$4" vm="$5" dir="$6"
 	agent_standalone_config "$vm" | run_shell_on "$host" "$is_local" \
 		"mkdir -p '$dir' && cat > '$dir/schedule.json'"
+	# The agent's own settings are a second file now, not flags.
+	agent_local_config "$dir" "$vmsync_there" | run_shell_on "$host" "$is_local" \
+		"cat > '$dir/agent.json'"
 	# setsid so the agent survives this ssh session closing, which it
 	# otherwise would not: without it the remote shell's exit takes the
 	# whole process group with it and the fence sweep never happens.
 	run_shell_on "$host" "$is_local" \
-		"setsid nohup '$bin' --standalone '$dir/schedule.json' --state-dir '$dir' --vmsync-path '$vmsync_there' --debug >'$dir/agent.log' 2>&1 < /dev/null & echo \$!"
+		"setsid nohup '$bin' --config '$dir/agent.json' >'$dir/agent.log' 2>&1 < /dev/null & echo \$!"
 }
 
 agent_stop() {
