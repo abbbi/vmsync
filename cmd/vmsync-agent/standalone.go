@@ -102,6 +102,8 @@ func runStandalone(lv *live, reloads *reloader) error {
 		go func() { defer wg.Done(); metricsLoop(ctx, lv, state, sched, cfg.metrics, true) }()
 	}
 	wg.Add(1)
+	// Synchronously, and BEFORE Run -- see the same call in main.go.
+	sched.Reconcile(ctx)
 	go func() { defer wg.Done(); sched.Run(ctx) }()
 
 	// Split-brain protection runs here too. A standalone agent is the case

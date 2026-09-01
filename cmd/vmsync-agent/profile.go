@@ -285,6 +285,11 @@ type SyncRequest struct {
 	// agent-scheduled runs exactly as it does for cron-driven ones.
 	PrometheusTextfile string
 	BridgeHelperPath   string
+	// RunID joins the run lock vmsync writes to this agent's own run-log
+	// entry for having launched it, so an operator holding one can find the
+	// other. Set per launch, not per schedule entry.
+	RunID string
+
 	// LocalHostName is the name this agent reports under, passed so the
 	// references vmsync writes into metadata match what the control plane
 	// correlates pairs by. Without it a local -source-uri records the host
@@ -371,6 +376,13 @@ func (r SyncRequest) CommandArgs() []string {
 	}
 	if r.LocalHostName != "" {
 		args = append(args, "-local-host-name", r.LocalHostName)
+	}
+	// Passed so vmsync stamps it into the run lock it holds. That is what
+	// lets a LATER agent -- one that restarted while this sync was still
+	// going -- match the running process back to the launch record in its own
+	// run log, instead of knowing only that something holds the lock.
+	if r.RunID != "" {
+		args = append(args, "-run-id", r.RunID)
 	}
 	return args
 }

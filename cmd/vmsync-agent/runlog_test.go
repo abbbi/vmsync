@@ -219,7 +219,7 @@ func TestEveryEmittedFlagIsInTheVocabulary(t *testing.T) {
 		"-local-host-name", "-ssh-user", "-ssh-key", "-ssh-port", "-ssh-known-hosts",
 		"-bridge-helper-path", "-compress-level", "-io-depth", "-prometheus-textfile",
 		"-reinit-after-failures", "-retention", "-source-nbd-port", "-target-nbd-port",
-		"-target-disk-path", "-timestamp-tolerance-sec", "-use-ssh",
+		"-target-disk-path", "-timestamp-tolerance-sec", "-use-ssh", "-run-id",
 		"-compress", "-netbuffer", "-verify",
 		"-promote", "-promote-mode", "-promoted-by", "-force-promote", "-fence-source",
 		"-invert", "-reinit", "-force-clean", "-start", "-update-role",

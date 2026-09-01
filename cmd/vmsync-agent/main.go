@@ -308,6 +308,10 @@ func run(lv *live, reloads *reloader) error {
 	if !cfg.NoSchedule {
 		sched = NewScheduler(lv, state)
 		wg.Add(1)
+		// Synchronously, and BEFORE Run: the first launchDue must already know
+		// about anything a previous instance left running, or it fires a
+		// duplicate before this could have looked.
+		sched.Reconcile(ctx)
 		go func() { defer wg.Done(); sched.Run(ctx) }()
 		trace.Info("scheduler running", "vmsync", cfg.VmsyncPath, "target_uri_pattern", cfg.TargetURIPattern)
 	} else {

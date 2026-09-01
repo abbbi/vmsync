@@ -44,13 +44,34 @@ type SyncResult struct {
 	StartedAtUnix  int64  `json:"started_at_unix"`
 	FinishedAtUnix int64  `json:"finished_at_unix"`
 	DurationSecs   int64  `json:"duration_seconds"`
-	ExitCode       int    `json:"exit_code"`
-	Error          string `json:"error,omitempty"`
+	// ExitCode is a POINTER so "never observed" is a different value from
+	// "exited 0". An adopted run -- one a previous instance of this agent
+	// started and this one merely found still going -- is not this process's
+	// child, so its status can never be read; reporting that as 0 would put a
+	// green tick on a run whose outcome nobody knows.
+	ExitCode *int   `json:"exit_code,omitempty"`
+	Error    string `json:"error,omitempty"`
 	// LogTail is the last few lines of vmsync's own output. Bounded on
 	// purpose: enough to see why a run failed, not so much that a chatty
 	// failure loop fills the UI's disk.
 	LogTail string `json:"log_tail,omitempty"`
+
+	// RunID joins this result to the run log on the host, and to the identity
+	// vmsync stamped on its run lock.
+	RunID string `json:"run_id,omitempty"`
+	// Outcome is this agent's own word for how it went, carried rather than
+	// left for the console to re-derive: "busy" in particular is neither a
+	// success nor a failure, and an exit code alone cannot say so.
+	Outcome string `json:"outcome,omitempty"`
 }
+
+// Outcome values. Shared vocabulary with the run log and the console.
+const (
+	outcomeSuccess = "success"
+	outcomeFailure = "failure"
+	outcomeBusy    = "busy"
+	outcomeUnknown = "unknown"
+)
 
 const (
 	// defaultMaxConcurrent is what the agent runs with when nothing has said
@@ -524,6 +545,12 @@ func splitReplicaRef(ref string) (host, domain string) {
 
 // runOne executes a single sync and records its outcome.
 func (s *Scheduler) runOne(ctx context.Context, cfg *agentConfig, entry ScheduleEntry, plan syncPlan) {
+	// Minted BEFORE the argv is built, because it goes INTO the argv: vmsync
+	// stamps it on the run lock, which is what lets a later agent match a
+	// still-running process back to the launch record below rather than
+	// knowing only that something holds that lock.
+	runID := newRunID()
+	plan.RunID = runID
 	args := plan.CommandArgs()
 	started := time.Now()
 
@@ -549,7 +576,9 @@ func (s *Scheduler) runOne(ctx context.Context, cfg *agentConfig, entry Schedule
 	// cmd.Cancel and WaitDelay are enforced INSIDE Wait, so neither would
 	// engage, the deferred release would never run, and the agent would wedge
 	// with an orphaned child.
-	runID := newRunID()
+	//
+	// runID was minted at the top of this function and is already in the argv
+	// above, so the lock vmsync takes and this record carry the same id.
 	if err := cfg.runLog.Append(runLogRecord{
 		Event: runEventLaunch, RunID: runID, Origin: runOriginScheduled,
 		VM: entry.VM, TargetHost: plan.targetHost,
@@ -579,9 +608,14 @@ func (s *Scheduler) runOne(ctx context.Context, cfg *agentConfig, entry Schedule
 		StartedAtUnix:  started.Unix(),
 		FinishedAtUnix: finished.Unix(),
 		DurationSecs:   int64(finished.Sub(started).Seconds()),
-		ExitCode:       cmd.ProcessState.ExitCode(),
 		LogTail:        tail(out.String(), logTailBytes),
+		RunID:          runID,
 	}
+	// This process started the child and waited for it, so the status IS
+	// observed here -- the pointer exists for the adopted case, where it is
+	// not, and for older results decoded from a report.
+	code := cmd.ProcessState.ExitCode()
+	res.ExitCode = &code
 
 	// Exit 75 is vmsync saying it stood down without touching anything,
 	// because another vmsync already holds this domain's lock (util.ExitBusy,
@@ -601,14 +635,14 @@ func (s *Scheduler) runOne(ctx context.Context, cfg *agentConfig, entry Schedule
 	// launch: the process has already run, so refusing anything now would
 	// change nothing that has not already happened, and losing this record
 	// leaves an open run the log itself reports rather than a silent gap.
-	code := res.ExitCode
-	outcome := "success"
+	outcome := outcomeSuccess
 	switch {
-	case res.ExitCode == util.ExitBusy:
-		outcome = "busy"
+	case code == util.ExitBusy:
+		outcome = outcomeBusy
 	case err != nil:
-		outcome = "failure"
+		outcome = outcomeFailure
 	}
+	res.Outcome = outcome
 	exitRec := runLogRecord{
 		Event: runEventExit, RunID: runID, VM: entry.VM,
 		ExitCode: &code, DurationS: res.DurationSecs, Outcome: outcome,
@@ -624,7 +658,7 @@ func (s *Scheduler) runOne(ctx context.Context, cfg *agentConfig, entry Schedule
 			"vm", entry.VM, "run_id", runID, "error", lerr)
 	}
 
-	if res.ExitCode == util.ExitBusy {
+	if code == util.ExitBusy {
 		trace.Info("a scheduled sync stood down: another vmsync is already working on this domain, and nothing was changed",
 			"vm", entry.VM, "target", plan.targetHost)
 		s.metrics.runBusy()
@@ -634,7 +668,7 @@ func (s *Scheduler) runOne(ctx context.Context, cfg *agentConfig, entry Schedule
 	if err != nil {
 		res.Error = err.Error()
 		trace.Error("scheduled sync failed", "vm", entry.VM, "target", plan.targetHost,
-			"exit_code", res.ExitCode, "duration_s", res.DurationSecs, "error", err)
+			"exit_code", code, "duration_s", res.DurationSecs, "error", err)
 		// vmsync's own output goes to the host's log too, not only into the
 		// report. "exit status 1" on its own says nothing about what went
 		// wrong, and the journal on this host is where anyone looks first --

@@ -421,6 +421,7 @@ var agentFlagVocabulary = map[string]argClass{
 	"-source-domain":   argValue,
 	"-target-domain":   argValue,
 	"-local-host-name": argValue,
+	"-run-id":          argValue,
 
 	// ssh
 	"-ssh-user":        argValue,

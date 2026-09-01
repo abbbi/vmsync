@@ -152,6 +152,10 @@ type syncConfig struct {
 	// agent reports under, and an agent can be told to report under a name
 	// that is not os.Hostname().
 	LocalHostName string
+	// RunID is an opaque label a supervising agent passes so it can join the
+	// run lock this process writes to its own record of having launched it.
+	// Never interpreted here.
+	RunID string
 
 	// ReplacedDiskAction selects what happens to a target disk file that is
 	// about to be discarded and rebuilt: replacedDiskRename (the default) or
@@ -334,6 +338,7 @@ func main() {
 	flag.BoolVar(&cfg.IgnoreExternalSnapshot, "ignore-external-snapshot", false, "If the source domain currently has any external disk snapshot, skip this run entirely")
 	flag.StringVar(&cfg.Verify, "verify", "", "After syncing, verify target matches source for every disk. Accepts compare|fast|online. See documentation for details. (compare|fast suspend the source domain, online does not)")
 	flag.StringVar(&cfg.UpdateRole, "update-role", "", "Set the replication role recorded in a domain's own vmsync metadata, then exit without syncing anything. Accepts "+strings.Join(libvirtsync.ValidRoles, "|")+" (\"none\" clears it). The domain is addressed with -target-uri/-target-domain regardless of which direction it currently replicates in. vmsync refuses to sync INTO a domain whose role is anything other than \"target\" or unset -- this is what stops a scheduled sync from overwriting a domain that was failed over to and then shut down for maintenance")
+	flag.StringVar(&cfg.RunID, "run-id", "", "Opaque identifier for this run, written into the run lock so a supervising agent can join it to its own record of having started this process. Ignored except as a label; vmsync-agent sets it, and nothing needs it when vmsync is run by hand")
 	flag.StringVar(&cfg.LocalHostName, "local-host-name", "", "What to call this machine when recording it in replica_source/replica_targets/promoted_from, for a -source-uri or -target-uri that names no host. Defaults to the system hostname. Set it when something else refers to this host by a different name -- vmsync-agent passes its own --hostname here, because the control plane matches these references against the name an agent reports under")
 	flag.BoolVar(&cfg.Promote, "promote", false, "Promote the replica named by -target-uri/-target-domain to serve live: record the promotion and, with -start, boot it. Refuses unless the target actually holds a usable replica. Must be run on the target's own host")
 	flag.BoolVar(&cfg.Invert, "invert", false, "Reverse a pair's direction after a failover: -source-uri/-source-domain name the OLD source, -target-uri/-target-domain the promoted replica. Run on the old source's host")
@@ -664,7 +669,7 @@ func main() {
 	// because a diagnostic could not be written would be the wrong trade.
 	identity := util.NewRunLockIdentity("sync", cfg.SourceDomain,
 		util.ReplicaHost(cfg.TargetURI, cfg.LocalHostName)+":"+cfg.TargetDomain,
-		"", time.Now().Unix())
+		cfg.RunID, time.Now().Unix())
 	if err := util.WriteRunLockIdentity(lockFile, identity); err != nil {
 		trace.Warning("could not record this process's identity in its run lock; an agent restarting during this sync may launch a second one, which will stand down harmlessly",
 			"domain", cfg.SourceDomain, "error", err)
