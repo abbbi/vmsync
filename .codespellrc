@@ -7,3 +7,4 @@ quiet-level = 3
 # actually been run against this repo; the first CI run is what will reveal
 # whether anything needs adding here. Example:
 # ignore-words-list = word1,word2
+ignore-words-list = WantIn
