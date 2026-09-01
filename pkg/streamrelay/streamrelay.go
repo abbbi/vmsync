@@ -295,6 +295,21 @@ func (b *BoundedBuffer) Read(p []byte) (int, error) {
 	if n < len(chunk) {
 		b.chunks[0] = chunk[n:]
 	} else {
+		// Drop the reference before advancing the window. Re-slicing alone
+		// leaves the drained chunk in the backing array, where the GC still
+		// sees it: the array is one object scanned with the type's pointer
+		// bitmap, and it has no notion of where the slice's live window
+		// starts. So the drained bytes stay pinned while curBytes -- which
+		// counts only unread data -- says they are gone, and the type's
+		// "at most maxBytes" promise quietly stops holding.
+		//
+		// Bounded overshoot rather than a leak: the stale prefix is released
+		// at the next growth reallocation, which copies only the live window.
+		// But it is released only when there IS a next append, so a buffer
+		// that fills and then fully drains pins its whole high-water mark for
+		// as long as the relay stays idle -- which for a request/response
+		// protocol like NBD is most of the time.
+		b.chunks[0] = nil
 		b.chunks = b.chunks[1:]
 	}
 	b.curBytes -= n
