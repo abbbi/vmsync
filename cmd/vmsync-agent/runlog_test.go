@@ -196,13 +196,13 @@ func TestRedactArgs(t *testing.T) {
 	}
 }
 
-// An unparseable URI is redacted whole. -target-uri is built by interpolating
+// An unparsable URI is redacted whole. -target-uri is built by interpolating
 // a host into an operator-supplied pattern, so it is not guaranteed to parse,
 // and "there is probably no password in it" is a guess.
 func TestRedactURIFailsClosed(t *testing.T) {
 	got := redactURI("qemu+ssh://[::1/system")
 	if got != argRedacted {
-		t.Errorf("redactURI on an unparseable uri = %q, want %q", got, argRedacted)
+		t.Errorf("redactURI on an unparsable uri = %q, want %q", got, argRedacted)
 	}
 }
 

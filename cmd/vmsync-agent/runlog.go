@@ -540,7 +540,7 @@ func redactArgs(args []string) []string {
 //
 // -target-uri is built by interpolating a host into an operator-supplied
 // pattern, so it is not guaranteed to parse. A parse failure redacts the whole
-// element rather than passing it through: an unparseable string is exactly the
+// element rather than passing it through: an unparsable string is exactly the
 // case where "there is probably no password in it" is a guess.
 func redactURI(raw string) string {
 	u, err := url.Parse(raw)

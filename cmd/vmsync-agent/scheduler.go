@@ -265,7 +265,7 @@ func (s *Scheduler) due(entry ScheduleEntry, now time.Time) bool {
 // contention it is looking for.
 //
 // Every uncertain answer is false. A missing lock file, an empty one (which is
-// what every vmsync before this feature left behind), an unparseable one, an
+// what every vmsync before this feature left behind), an unparsable one, an
 // unreadable /proc: all mean "launch, and let the engine decide". The reason
 // string is for the log and is never a reason to refuse.
 func (s *Scheduler) foreignRunHolds(cfg *agentConfig, vm string) (bool, string) {
