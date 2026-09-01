@@ -1435,7 +1435,13 @@ compareLoop:
 		return mismatches, compareErr
 	}
 
-	trace.Info("nbd compare complete", "device", aExport, "bytes", size, "mismatches", len(mismatches), "elapsed", time.Since(start).Round(time.Millisecond).String())
+	// "bytes" is what was actually read and compared, NOT the image size --
+	// those diverge sharply on a sparse disk now that provably-zero ranges are
+	// skipped, and reporting the image size here made the line read as an
+	// impossible throughput (10 GiB in 14ms). image_bytes keeps the logical
+	// size visible so the ratio between the two is the skip's payoff.
+	trace.Info("nbd compare complete", "device", aExport, "bytes", size-skippedBytes, "image_bytes", size,
+		"mismatches", len(mismatches), "elapsed", time.Since(start).Round(time.Millisecond).String())
 	return mismatches, nil
 }
 
