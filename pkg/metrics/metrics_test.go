@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package metrics
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,5 +130,96 @@ func TestFreezeAndThawAreSeparateSignals(t *testing.T) {
 	if got, _ := sampleFor(text, "vmsync_fsthaw_failed"); got != "0" {
 		t.Errorf("vmsync_fsthaw_failed = %s, want 0: a guest that was never frozen "+
 			"cannot have been left frozen", got)
+	}
+}
+
+// TestPerDiskCompressedBytesAreSummable is the contract the source/target
+// split exists to create.
+//
+// CompressedTransferredBytes used to include the SOURCE bridge, which is one
+// shared listener for the whole run. Adding a run-wide total to every disk
+// meant the obvious query -- sum by (vm) -- counted it once per disk, and
+// per-disk compression ratios were nonsense. This asserts the per-disk
+// series now carries only what is genuinely per-disk.
+func TestPerDiskCompressedBytesAreSummable(t *testing.T) {
+	disks := []DiskMetric{
+		{VM: "db01", Disk: "vda", TransferredBytes: 1000, CompressedTransferredBytes: 300},
+		{VM: "db01", Disk: "vdb", TransferredBytes: 2000, CompressedTransferredBytes: 600},
+	}
+	run := RunMetric{
+		VM: "db01", State: StateSuccess,
+		SourceBridgeReceivedBytes: 5000,
+		SourceBridgeSentBytes:     40,
+	}
+
+	p := filepath.Join(t.TempDir(), "vmsync.prom")
+	if err := WriteTextfile(p, disks, run); err != nil {
+		t.Fatalf("WriteTextfile: %v", err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(b)
+
+	// The per-disk series must total exactly the two disks' own values. If
+	// the source bridge leaked back in, this is 300+5000 and 600+5000.
+	var total uint64
+	for _, line := range strings.Split(text, "\n") {
+		if !strings.HasPrefix(line, "vmsync_compressed_transferred_bytes{") {
+			continue
+		}
+		i := strings.LastIndexByte(line, ' ')
+		if i < 0 {
+			t.Fatalf("unparsable sample: %q", line)
+		}
+		var v uint64
+		if _, err := fmt.Sscanf(line[i+1:], "%d", &v); err != nil {
+			t.Fatalf("unparsable value in %q: %v", line, err)
+		}
+		total += v
+	}
+	if total != 900 {
+		t.Errorf("sum of per-disk compressed bytes = %d, want 900 -- a run-wide "+
+			"total is being added to every disk again", total)
+	}
+}
+
+// TestSourceBridgeIsReportedPerRunAndPerDirection pins the other half: the
+// shared leg is still reported, just not per disk, and the payload direction
+// is labelled so nobody has to guess which of the two is the disk data.
+func TestSourceBridgeIsReportedPerRunAndPerDirection(t *testing.T) {
+	text := writeAndRead(t, RunMetric{
+		VM: "db01", State: StateSuccess,
+		SourceBridgeReceivedBytes: 5000,
+		SourceBridgeSentBytes:     40,
+	})
+
+	for _, want := range []string{
+		`direction="received"} 5000`,
+		`direction="sent"} 40`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %s from:\n%s", want, text)
+		}
+	}
+
+	// The two directions must stay DISTINGUISHABLE, which is the whole point
+	// of the label: on the source side the payload arrives inbound while
+	// Sent is only the NBD request stream, and reading Sent as the payload
+	// was the original bug. A single unlabelled series would let that
+	// mistake back in silently.
+	if strings.Count(text, "vmsync_source_bridge_wire_bytes{") != 2 {
+		t.Errorf("want exactly two labelled samples, got:\n%s", text)
+	}
+}
+
+// A run with no source bridge must emit no series at all, rather than zeros.
+// A zero would read as "the bridge carried nothing", which is a different
+// claim from "there was no bridge on that side".
+func TestNoSourceBridgeEmitsNoSeries(t *testing.T) {
+	text := writeAndRead(t, RunMetric{VM: "db01", State: StateSuccess})
+	if strings.Contains(text, "vmsync_source_bridge_wire_bytes") {
+		t.Errorf("a run with no source bridge still emitted the series:\n%s", text)
 	}
 }

@@ -51,10 +51,14 @@ type DiskMetric struct {
 	DiskSizeBytes    uint64
 	TransferredBytes uint64
 	// CompressedTransferredBytes is the actual bytes that crossed the
-	// network for this disk (the sum of whichever bridge legs -- source
-	// read, target write -- were active). It equals TransferredBytes
+	// network writing this disk to the target. It equals TransferredBytes
 	// whenever neither --compress nor --netbuffer bridged that leg, since
 	// then nothing sat between the plain NBD read and write.
+	//
+	// The TARGET leg only. The source-side bridge is shared by every disk in
+	// a run, so it cannot be attributed to one and is reported on RunMetric
+	// instead -- see SourceBridgeReceivedBytes. This series is therefore
+	// safe to sum across disks, which is the whole reason for the split.
 	CompressedTransferredBytes uint64
 	DurationSeconds            float64
 }
@@ -74,6 +78,24 @@ type RunMetric struct {
 	// carry a reliable "last written" signal node_exporter exposes on its
 	// own, so vmsync has to report it itself.
 	Timestamp int64
+	// SourceBridgeReceivedBytes and SourceBridgeSentBytes are the wire bytes
+	// on the SOURCE-side compression bridge, which exists only when the
+	// source is reached over qemu+ssh.
+	//
+	// Run-level rather than per-disk because the bridge is: one shared
+	// libvirt backup export, one listener, one counter for every disk's
+	// connection. Folding it into DiskMetric -- which is what this replaced
+	// -- made summing the per-disk series count it once per disk, and no
+	// per-disk delta can fix that while the disks sync concurrently through
+	// it.
+	//
+	// Received is the payload direction here, and that is not a detail. The
+	// bridge's Sent counts the outbound leg, which on the source side is the
+	// local NBD client's REQUESTS; the disk data comes back inbound. Reading
+	// Sent -- which this used to do -- measured the command stream and
+	// reported it as transferred data.
+	SourceBridgeReceivedBytes uint64
+	SourceBridgeSentBytes     uint64
 	// FSFreezeFailed is true when the guest filesystems could not be
 	// quiesced, so this copy is only crash-consistent.
 	//
@@ -183,6 +205,19 @@ func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 	fmt.Fprintln(&b, "# TYPE vmsync_external_snapshot_count gauge")
 	fmt.Fprintf(&b, "vmsync_external_snapshot_count{source_host=%q,target_host=%q,vm=%q} %d\n",
 		run.SourceHost, run.TargetHost, run.VM, run.ExternalSnapshotCount)
+
+	// Only when a source bridge was actually in play. Unlike the quiescing
+	// gauges below, a zero here would be a lie rather than a useful
+	// baseline: no bridge means no wire on that side at all, which is a
+	// different thing from a bridge that carried nothing.
+	if run.SourceBridgeReceivedBytes > 0 || run.SourceBridgeSentBytes > 0 {
+		fmt.Fprintln(&b, "# HELP vmsync_source_bridge_wire_bytes Bytes over the source-side compression bridge, present only when the source is reached over qemu+ssh. Run-level, not per-disk: one bridge serves every disk in the run, so this must NOT be added to vmsync_compressed_transferred_bytes. direction=\"received\" is the disk payload being read from the source; direction=\"sent\" is the NBD request stream going the other way.")
+		fmt.Fprintln(&b, "# TYPE vmsync_source_bridge_wire_bytes gauge")
+		fmt.Fprintf(&b, "vmsync_source_bridge_wire_bytes{source_host=%q,target_host=%q,vm=%q,direction=\"received\"} %d\n",
+			run.SourceHost, run.TargetHost, run.VM, run.SourceBridgeReceivedBytes)
+		fmt.Fprintf(&b, "vmsync_source_bridge_wire_bytes{source_host=%q,target_host=%q,vm=%q,direction=\"sent\"} %d\n",
+			run.SourceHost, run.TargetHost, run.VM, run.SourceBridgeSentBytes)
+	}
 
 	// Both freeze and thaw are emitted unconditionally, including as 0, so
 	// the series exist from the first run and an alert can use them before

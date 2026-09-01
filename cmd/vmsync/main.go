@@ -1458,6 +1458,19 @@ func run(cfg syncConfig) (runErr error) {
 		sourceHost, targetHost := nbdHost, targetNBDHost
 		snapshotCount := externalSnapshotCount
 		attempted := verificationAttempted
+		// Read here rather than per disk: the source bridge is one shared
+		// listener for the whole run, so its totals belong to the run.
+		//
+		// Under metricsMu for the same reason as nbdHost above, and it is
+		// the POINTER that needs the lock, not the counters: the counters
+		// are atomic, but sourceBridgeCounters is assigned once by this
+		// goroutine partway through setup, and the signal handler can call
+		// this before that assignment has happened.
+		var srcBridgeRecv, srcBridgeSent uint64
+		if sourceBridgeCounters != nil {
+			srcBridgeRecv = sourceBridgeCounters.ReceivedSnapshot()
+			srcBridgeSent = sourceBridgeCounters.SentSnapshot()
+		}
 		metricsMu.Unlock()
 		now := time.Now().Unix()
 		run := metrics.RunMetric{
@@ -1466,6 +1479,9 @@ func run(cfg syncConfig) (runErr error) {
 			VM:         cfg.SourceDomain,
 			State:      state,
 			Timestamp:  now,
+
+			SourceBridgeReceivedBytes: srcBridgeRecv,
+			SourceBridgeSentBytes:     srcBridgeSent,
 			// Read through the accessor: this can run from the signal
 			// handler's goroutine while thawSource is setting it from
 			// another.
@@ -3010,7 +3026,13 @@ func run(cfg syncConfig) (runErr error) {
 		defer stopLocal()
 		effectiveSourceHost = "127.0.0.1"
 		effectiveSourcePort = localPort
+		// Under metricsMu because writeMetricsTextfile reads this pointer,
+		// and it can run from the signal handler's goroutine at any moment
+		// -- including right now, mid-setup. Guarding only the read would
+		// leave the race intact.
+		metricsMu.Lock()
 		sourceBridgeCounters = counters
+		metricsMu.Unlock()
 		trace.Info("source nbd port in use", "side", "source", "kind", "bridge_local", "host", "127.0.0.1", "port", localPort)
 	}
 
@@ -3118,15 +3140,25 @@ func run(cfg syncConfig) (runErr error) {
 		if cfg.PrometheusTextfile == "" {
 			return
 		}
+		// The TARGET leg only, and that is the fix rather than an omission.
+		//
+		// This used to add sourceBridgeCounters too. Two things were wrong
+		// with that. The source bridge is created ONCE per run (one shared
+		// libvirt backup export, one listener), so its counter is a run-wide
+		// monotonic total -- adding it to every disk meant summing the
+		// per-disk series multi-counted it, once per disk. And a per-disk
+		// delta cannot repair that either: both disk loops fan out one
+		// goroutine per disk, so the windows overlap and each disk's delta
+		// would absorb whatever the others pushed through the shared bridge
+		// meanwhile.
+		//
+		// The target bridge has neither problem: it is created per disk
+		// inside copyAndCommit, so its counter measures exactly this disk.
+		// The source leg is a run-level fact and is reported as one, on
+		// RunMetric.
 		compressedBytes := writtenBytes
-		if targetBridgeCounters != nil || sourceBridgeCounters != nil {
-			compressedBytes = 0
-			if targetBridgeCounters != nil {
-				compressedBytes += targetBridgeCounters.SentSnapshot()
-			}
-			if sourceBridgeCounters != nil {
-				compressedBytes += sourceBridgeCounters.SentSnapshot()
-			}
+		if targetBridgeCounters != nil {
+			compressedBytes = targetBridgeCounters.SentSnapshot()
 		}
 		metricsMu.Lock()
 		diskMetrics = append(diskMetrics, metrics.DiskMetric{
@@ -3325,8 +3357,20 @@ func run(cfg syncConfig) (runErr error) {
 			trace.Info("target nbd bridge compression", "disk", d.TargetDev, "savings", nbdbridge.FormatSavings(logicalBytes, res.targetBridgeCounters.SentSnapshot()))
 		}
 		if sourceBridgeCounters != nil {
+			// ReceivedSnapshot, not Sent: on the source side the payload
+			// arrives INBOUND (the disk data being read), while Sent carries
+			// the NBD request stream. Comparing dirty bytes against Sent --
+			// which this used to do -- divided a disk's worth of data by a
+			// few MiB of requests and reported a compression ratio near 100%.
+			//
+			// Still logged per disk although the counter is run-wide and the
+			// disks run concurrently, so on a multi-disk run this line is a
+			// running total rather than this disk's share. That is tolerable
+			// for a log line and is why the same number is NOT what the
+			// per-disk metric reports; see recordDiskMetric.
 			logicalBytes := nbdbridge.SumLogicalDirtyBytes(extents)
-			trace.Info("source nbd bridge compression", "disk", d.TargetDev, "savings", nbdbridge.FormatSavings(logicalBytes, sourceBridgeCounters.SentSnapshot()))
+			trace.Info("source nbd bridge compression (run-wide, all disks)", "disk", d.TargetDev,
+				"savings", nbdbridge.FormatSavings(logicalBytes, sourceBridgeCounters.ReceivedSnapshot()))
 		}
 
 		trace.Info("Stopping remote daemon", "device", d.TargetDev)
