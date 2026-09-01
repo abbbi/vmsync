@@ -249,6 +249,32 @@ disk_source_path() {
 		| xmllint --xpath "string(//disk[target/@dev='${dev}']/source/@file)" - 2>/dev/null
 }
 
+# disk_backing_depth URI DOMAIN DEV -> how many backing-file levels sit below
+# DOMAIN's <target dev='DEV'> disk, per its own current domain XML: 0 for a
+# flat image, 1 for a single overlay, 2 for an overlay on an overlay, and so
+# on. Prints 0 when the XML cannot be read at all, so a caller that needs to
+# tell "flat" from "unreadable" should check disk_source_path first.
+#
+# Counts the <source/> elements INSIDE backingStore, not the backingStore
+# elements themselves: libvirt emits a <backingStore/> for a flat image too --
+# empty, with no source child -- so counting the containers reports 1 for
+# every disk in existence. Counting sources also covers network- and
+# block-backed chains, whose source carries @dev/@name rather than @file.
+disk_backing_depth() {
+	local uri="$1" domain="$2" dev="$3"
+	local n
+	n="$(virsh_uri "$uri" dumpxml "$domain" 2>/dev/null \
+		| xmllint --xpath "count(//disk[target/@dev='${dev}']//backingStore/source)" - 2>/dev/null)" || n=0
+	# xmllint prints an XPath number, which is a float in some versions
+	# ("2" here, "2.0" there); anything that isn't a plain integer after
+	# that becomes 0 rather than a `[ -gt ]` syntax error at the call site.
+	n="${n%%.*}"
+	case "$n" in
+	'' | *[!0-9]*) n=0 ;;
+	esac
+	printf '%s\n' "$n"
+}
+
 # --- json (vmsync -read-fence) ------------------------------------------------
 
 # json_str JSON FIELD -> the value of a string field, or empty.

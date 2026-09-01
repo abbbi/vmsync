@@ -1328,12 +1328,91 @@ stage_reinit_after_failures() {
 # Requires the SOURCE domain to be running (see require_dom_running's own
 # comment) -- unlike the target, this harness never controls the source's
 # power state, so it skips outright rather than trying to start it.
+
+# Every overlay this stage creates is named with this prefix, and the
+# precondition below recognises leftovers by it. One constant rather than the
+# literal in two places: the two must agree, or the check silently stops
+# seeing exactly the files it exists to find.
+EXTSNAP_PREFIX="vmsync-bench-extsnap-"
+
+# ext_snapshot_precondition -- refuse to start stage 4 against a source disk
+# that is not already flat. 0 to proceed, 1 to abort the stage.
+#
+# This is the only stage that can damage the SOURCE domain, and how much it
+# can damage depends on what it finds already there. Two conditions make it
+# unsafe to begin:
+#
+#   * A pre-existing backing chain. The cleanup below runs `blockcommit
+#     --active --pivot` with neither --base nor --top, so base defaults to
+#     the BOTTOM of the chain: it commits everything into the base image and
+#     pivots there. Against the single overlay this stage creates itself that
+#     is precisely right. Against a chain somebody else created it flattens
+#     their snapshot structure, and there is no undo.
+#
+#   * The source already running on a bench overlay -- the same condition
+#     seen from the other side, and the specific way it happens: a previous
+#     stage 4 died between snapshot-create-as and blockcommit. Continuing
+#     would stack a second overlay on the first, and the `rm -f` at the end
+#     removes only the one this run created, so the leftover would then be
+#     load-bearing under a file the harness deletes.
+#
+# Leftover overlay FILES are a different matter and only get reported: once
+# the checks above have established the live disk is flat, nothing in the
+# source domain's chain can reference them. They are still worth naming --
+# the overlay filename is derived from the bench PID, so a recycled PID makes
+# snapshot-create-as collide with one -- but they are not a reason to refuse
+# to run, and this harness deletes only overlays it created itself rather
+# than guessing at ownership of files on a shared host.
+ext_snapshot_precondition() {
+        local active dir depth stale overlays
+
+        active="$(disk_source_path "$SOURCE_URI" "$SOURCE_DOMAIN" "$TAMPER_DISK_DEV")" || true
+        if [ -z "$active" ]; then
+                warn "FAIL: could not resolve the source path of $SOURCE_DOMAIN's $TAMPER_DISK_DEV disk -- aborting stage 4 rather than running blockcommit against a chain this harness cannot see"
+                results_row "$CSV" ext-snapshot precondition 1 "" "" "" "" "" "FAIL source disk path unresolvable"
+                return 1
+        fi
+
+        case "$active" in
+        *"$EXTSNAP_PREFIX"*)
+                warn "FAIL: $SOURCE_DOMAIN's $TAMPER_DISK_DEV is currently running on a leftover bench overlay ($active) -- an earlier stage 4 died between snapshot-create-as and blockcommit. Aborting: commit it back by hand with 'virsh -c $SOURCE_URI blockcommit $SOURCE_DOMAIN $TAMPER_DISK_DEV --active --pivot --wait' and re-run"
+                results_row "$CSV" ext-snapshot precondition 1 "" "" "" "" "" "FAIL source running on leftover bench overlay"
+                return 1
+                ;;
+        esac
+
+        depth="$(disk_backing_depth "$SOURCE_URI" "$SOURCE_DOMAIN" "$TAMPER_DISK_DEV")"
+        if [ "$depth" -gt 0 ]; then
+                warn "FAIL: $SOURCE_DOMAIN's $TAMPER_DISK_DEV already sits on a ${depth}-level backing chain below $active -- aborting stage 4. Its cleanup passes neither --base nor --top to blockcommit, so it would commit that entire pre-existing chain into the bottom image and pivot to it, flattening a snapshot structure this harness did not create"
+                results_row "$CSV" ext-snapshot precondition 1 "" "" "" "" "" "FAIL pre-existing backing chain (depth=$depth)"
+                return 1
+        fi
+
+        stale="$(virsh_uri "$SOURCE_URI" snapshot-list --domain "$SOURCE_DOMAIN" --name 2>/dev/null | grep "^${EXTSNAP_PREFIX}" || true)"
+        if [ -n "$stale" ]; then
+                warn "FAIL: $SOURCE_DOMAIN still carries snapshot metadata from an earlier stage 4 ($(printf '%s' "$stale" | tr '\n' ' ')) -- the disk itself is flat, so this is stale bookkeeping only, but leaving it would let snapshot-create-as collide on the name. Clear it with 'virsh -c $SOURCE_URI snapshot-delete --domain $SOURCE_DOMAIN --snapshotname NAME --metadata' and re-run"
+                results_row "$CSV" ext-snapshot precondition 1 "" "" "" "" "" "FAIL stale bench snapshot metadata"
+                return 1
+        fi
+
+        dir="$(dirname "$active")"
+        overlays="$(run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "ls -1 '${dir}'/*${EXTSNAP_PREFIX}* 2>/dev/null" || true)"
+        if [ -n "$overlays" ]; then
+                warn "$SOURCE_DOMAIN's disk directory still holds overlay files from interrupted stage 4 runs. Not a failure -- the live disk is flat, so nothing references them -- but the overlay name is derived from the bench PID, and a recycled PID would make snapshot-create-as collide with one of these: $(printf '%s' "$overlays" | tr '\n' ' ')"
+        fi
+
+        log "   precondition OK: $SOURCE_DOMAIN's $TAMPER_DISK_DEV is a flat image ($active) with no bench snapshot metadata left over"
+        results_row "$CSV" ext-snapshot precondition 0 "" "" "" "" "" "PASS source disk flat, no stale bench snapshot metadata"
+        return 0
+}
+
 stage_external_snapshot() {
         log "=== Stage 4: external snapshot lifecycle (sync while a snapshot exists, then after it's removed) ==="
 
         if [ "$DRY_RUN" != yes ]; then
                 stage_needs_target_shutoff "$CSV" ext-snapshot "stage snapshot" || return 0
                 require_dom_running "$SOURCE_URI" "$SOURCE_DOMAIN" "source"
+                ext_snapshot_precondition || return 1
         fi
 
         # A real baseline first (not just "some prior sync, whenever") so the
@@ -1356,7 +1435,7 @@ stage_external_snapshot() {
                 target_path_before="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")" || true
         fi
 
-        local snap_name="vmsync-bench-extsnap-$$"
+        local snap_name="${EXTSNAP_PREFIX}$$"
         local overlay_path=""
         if [ "$DRY_RUN" != yes ]; then
                 log "creating an external, disk-only snapshot '$snap_name' on source disk $TAMPER_DISK_DEV"
@@ -4218,7 +4297,12 @@ generate_report() {
                 echo
                 echo "| mode | phase | exit | wall (s) | result |"
                 echo "|---|---|---|---|---|"
-                awk -F, 'NR>1 && $1 ~ /^verify-(guard|baseline|fast|full|qemu-img)/ { printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $9 }' "$CSV"
+                # Kept in step with stage_pattern's "verify" entry by hand:
+                # a sub-test missing here is not an error anywhere, it just
+                # silently drops out of the report while still counting
+                # toward the stage verdict -- which is how the cross-check
+                # and clean-oracle rows went unlisted when they were added.
+                awk -F, 'NR>1 && $1 ~ /^verify-(guard|baseline|fast|full|qemu-img|cross|oracle|precondition)/ { printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $9 }' "$CSV"
                 echo
                 echo "## Stage 8: verify after a long incremental chain"
                 echo
