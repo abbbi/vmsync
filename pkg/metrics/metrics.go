@@ -74,6 +74,24 @@ type RunMetric struct {
 	// carry a reliable "last written" signal node_exporter exposes on its
 	// own, so vmsync has to report it itself.
 	Timestamp int64
+	// FSFreezeFailed is true when the guest filesystems could not be
+	// quiesced, so this copy is only crash-consistent.
+	//
+	// This duplicates StateFSFreezeFailed on purpose, and is the signal to
+	// alert on. State is an enum, so its values are mutually exclusive and
+	// StateFailure wins: a run that could not freeze AND then failed reports
+	// only the failure, and the crash-consistency of what it did copy is
+	// lost. That is precisely the run where it matters most.
+	FSFreezeFailed bool
+	// FSThawFailed is true when the source guest was left with its
+	// filesystems FROZEN because the thaw did not take.
+	//
+	// Its own signal rather than a State value, because it is orthogonal to
+	// whether the sync worked: the copy can be perfect and the source still
+	// be hung. Folding it into State would force a choice between reporting
+	// the sync's outcome and reporting the guest's, and the guest matters
+	// more.
+	FSThawFailed bool
 	// ExternalSnapshotCount is how many external disk snapshots were present
 	// on the source domain during this run (see
 	// libvirtsync.ExternalSnapshotCount). Libvirt refuses to create a new
@@ -166,6 +184,20 @@ func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 	fmt.Fprintf(&b, "vmsync_external_snapshot_count{source_host=%q,target_host=%q,vm=%q} %d\n",
 		run.SourceHost, run.TargetHost, run.VM, run.ExternalSnapshotCount)
 
+	// Both freeze and thaw are emitted unconditionally, including as 0, so
+	// the series exist from the first run and an alert can use them before
+	// anything has ever gone wrong. A metric that only appears once the bad
+	// thing happens cannot be alerted on over a window that starts before it.
+	fmt.Fprintln(&b, "# HELP vmsync_fsfreeze_failed 1 when the guest filesystems could not be quiesced, so this copy is only crash-consistent rather than application-consistent. Alert on this rather than on vmsync_sync_state=2: state is an enum and a failure outranks it, so a run that could not freeze and then failed reports only the failure.")
+	fmt.Fprintln(&b, "# TYPE vmsync_fsfreeze_failed gauge")
+	fmt.Fprintf(&b, "vmsync_fsfreeze_failed{source_host=%q,target_host=%q,vm=%q} %d\n",
+		run.SourceHost, run.TargetHost, run.VM, boolMetric(run.FSFreezeFailed))
+
+	fmt.Fprintln(&b, "# HELP vmsync_fsthaw_failed 1 when the source guest was left with its filesystems FROZEN because the thaw did not take. The guest blocks on every write until somebody runs virsh domfsthaw against it. Independent of vmsync_sync_state: the copy can be perfect and the source still be hung.")
+	fmt.Fprintln(&b, "# TYPE vmsync_fsthaw_failed gauge")
+	fmt.Fprintf(&b, "vmsync_fsthaw_failed{source_host=%q,target_host=%q,vm=%q} %d\n",
+		run.SourceHost, run.TargetHost, run.VM, boolMetric(run.FSThawFailed))
+
 	fmt.Fprintln(&b, "# HELP vmsync_warning_count Number of WARNING-level log lines emitted during this run.")
 	fmt.Fprintln(&b, "# TYPE vmsync_warning_count gauge")
 	fmt.Fprintf(&b, "vmsync_warning_count{source_host=%q,target_host=%q,vm=%q} %d\n",
@@ -224,4 +256,12 @@ func writeAtomic(path, content string) error {
 		return fmt.Errorf("rename temp metrics file to %s: %w", path, err)
 	}
 	return nil
+}
+
+// boolMetric renders a boolean as prometheus wants it.
+func boolMetric(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

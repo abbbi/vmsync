@@ -708,15 +708,56 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 	return dom.Free()
 }
 
-func ThawFs(srcDom *libvirt.Domain, freezed bool) {
+// thawAttempts and thawRetryDelay bound the retry. Short and few: the caller
+// is often a signal handler on its way out, and a guest agent that has not
+// answered twice a second apart is not going to answer on the third try
+// either -- at which point saying so loudly beats blocking the unwind.
+const (
+	thawAttempts   = 3
+	thawRetryDelay = time.Second
+)
+
+// ThawFs releases a filesystem freeze, and reports whether it failed.
+//
+// Retried, and loud, because the two halves of a freeze are not symmetric. A
+// freeze that fails costs consistency on a copy; a THAW that fails leaves the
+// guest's filesystems frozen, and every write in that guest blocks until
+// somebody thaws it by hand. That is not a degraded backup, it is a hung
+// production VM -- caused by a run that otherwise reports success.
+//
+// The realistic failure is a guest agent that is momentarily busy or was
+// restarted mid-run, which a second attempt clears. Retrying an unfreeze is
+// safe in a way retrying most things is not: FSThaw is idempotent, and
+// thawing something already thawed is a no-op rather than an escalation.
+//
+// Returns true when the filesystems are still frozen after every attempt.
+func ThawFs(srcDom *libvirt.Domain, freezed bool) (failed bool) {
 	if !freezed {
-		return
+		return false
 	}
-	if err := srcDom.FSThaw(nil, 0); err != nil {
-		trace.Warning("Filesystem thaw failed", "error", err)
-	} else {
-		trace.Info("Successfully thawed file systems using guest agent")
+	var lastErr error
+	for attempt := 1; attempt <= thawAttempts; attempt++ {
+		if err := srcDom.FSThaw(nil, 0); err == nil {
+			if attempt > 1 {
+				trace.Warning("thawed the source filesystems, but only after a retry -- the guest agent did not answer the first attempt",
+					"attempts", attempt)
+			} else {
+				trace.Info("Successfully thawed file systems using guest agent")
+			}
+			return false
+		} else {
+			lastErr = err
+			trace.Warning("filesystem thaw attempt failed", "attempt", attempt, "of", thawAttempts, "error", err)
+		}
+		if attempt < thawAttempts {
+			time.Sleep(thawRetryDelay)
+		}
 	}
+	// Error, not Warning. The guest is left with its filesystems frozen: it
+	// will accept no writes until a person runs `virsh domfsthaw` against it.
+	trace.Error("FILESYSTEM THAW FAILED: this guest's filesystems are still FROZEN and it will block on every write until somebody thaws it by hand (virsh domfsthaw). This is not a problem with the copy -- it is a problem with the source VM",
+		"attempts", thawAttempts, "error", lastErr)
+	return true
 }
 
 // shouldRewriteDiskPaths decides whether DefineDomain needs to run

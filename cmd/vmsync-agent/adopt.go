@@ -19,8 +19,10 @@ package main
 
 import (
 	"context"
+	"os"
 	"time"
 
+	"vmsync/pkg/runresult"
 	"vmsync/pkg/trace"
 	"vmsync/pkg/util"
 )
@@ -152,6 +154,34 @@ func (s *Scheduler) watchAdopted(ctx context.Context, cfg *agentConfig, vm, targ
 		}
 		s.mu.Unlock()
 
+		// The one thing about an adopted run that IS knowable.
+		//
+		// Its exit status is gone for good -- this process was never its
+		// parent -- but the run wrote its degradations to a file, and the run
+		// lock carries the id that names it. So a sync that left a guest
+		// frozen still says so, even though nobody can say whether it
+		// otherwise worked.
+		//
+		// Worth the trouble precisely here: an adopted run exists because the
+		// agent restarted mid-sync, which is not what a quiet day looks like.
+		var degraded bool
+		var degradedReason string
+		if p := runResultPath(cfg.StateDir, id.RunID); p != "" {
+			rr, rerr := runresult.Read(p)
+			_ = os.Remove(p)
+			switch v := classifyRunResult(rr, rerr, id.RunID); v.kind {
+			case resultUnreadable:
+				trace.Error("an adopted sync left a result file that could not be read, so any degradation it reported is lost",
+					"vm", vm, "run_id", id.RunID, "error", rerr)
+			case resultDegraded:
+				degraded, degradedReason = true, v.reason
+				trace.Error("an adopted sync left something that needs a person",
+					"vm", vm, "run_id", id.RunID,
+					"fsfreeze_failed", rr.FSFreezeFailed, "fsthaw_failed", rr.FSThawFailed,
+					"action", v.reason)
+			}
+		}
+
 		// UNKNOWN, not success. The exit status of a process this agent did
 		// not start cannot be read, and reporting 0 would put a green tick on
 		// a run nobody observed the end of. The console renders this as its
@@ -171,6 +201,12 @@ func (s *Scheduler) watchAdopted(ctx context.Context, cfg *agentConfig, vm, targ
 			DurationSecs:   int64(time.Since(startedAt).Seconds()),
 			RunID:          id.RunID,
 			Outcome:        outcomeUnknown,
+			// Degraded alongside an UNKNOWN outcome, and the pair is not a
+			// contradiction: the guest is definitely frozen, and how the sync
+			// ended is definitely unknown. Two facts about the same run,
+			// which is exactly why this is not a fourth outcome value.
+			Degraded:       degraded,
+			DegradedReason: degradedReason,
 			// ExitCode stays nil. That is the whole point of it being a
 			// pointer.
 		})

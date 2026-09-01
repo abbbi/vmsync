@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"vmsync/pkg/atomicjson"
 	"vmsync/pkg/failover"
 	"vmsync/pkg/inventory"
 	"vmsync/pkg/libvirtsync"
@@ -211,7 +212,7 @@ func (l *fenceLedger) put(rec fenceRecord) error {
 	}
 	l.mu.Unlock()
 
-	if err := writeJSONAtomic(l.path, snapshot, 0o644); err != nil {
+	if err := atomicjson.Write(l.path, snapshot, 0o644); err != nil {
 		return fmt.Errorf("record fence %s in the ledger: %w", rec.FenceID, err)
 	}
 	return nil

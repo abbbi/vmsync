@@ -18,9 +18,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
+
+	"vmsync/pkg/runresult"
 )
 
 // vmNames is a spread of plausible domain names. Enough of them that a
@@ -134,5 +137,53 @@ func TestTail(t *testing.T) {
 	}
 	if got != "cccc\ndddd" {
 		t.Errorf("tail = %q, want it cut at a line boundary", got)
+	}
+}
+
+// The precedence rules in classifyRunResult, each of which exists because the
+// alternative is a specific wrong thing told to an operator.
+func TestClassifyRunResult(t *testing.T) {
+	const mine = "run-aaa"
+	frozen := runresult.Result{VM: "db01", RunID: mine, FSThawFailed: true}
+
+	for _, tc := range []struct {
+		name     string
+		rr       runresult.Result
+		err      error
+		wantKind string
+	}{
+		{"a clean run", runresult.Result{VM: "db01", RunID: mine}, nil, resultClean},
+		{"a degraded run", frozen, nil, resultDegraded},
+		{
+			// An unreadable file might have said the guest is frozen. Reading
+			// it as clean is the one answer that is certainly wrong.
+			"an unreadable file outranks everything",
+			frozen, errors.New("unexpected end of JSON input"), resultUnreadable,
+		},
+		{
+			// A crash can leave one behind. Blaming this run for another's
+			// frozen guest sends an operator to the wrong VM.
+			"a file from another run is ignored even when it reports a degradation",
+			runresult.Result{VM: "web01", RunID: "run-bbb", FSThawFailed: true}, nil, resultStale,
+		},
+		{
+			// vmsync writes whatever -run-id it was given, and a hand-run
+			// vmsync is given none. Refusing those would drop the report from
+			// every run an operator started themselves.
+			"an empty run id is accepted, not treated as stale",
+			runresult.Result{VM: "db01", FSThawFailed: true}, nil, resultDegraded,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyRunResult(tc.rr, tc.err, mine)
+			if got.kind != tc.wantKind {
+				t.Errorf("kind = %q, want %q", got.kind, tc.wantKind)
+			}
+			// Only a degradation carries a reason, and it must never be empty:
+			// a warning pill with nothing to act on is worse than none.
+			if (got.reason != "") != (tc.wantKind == resultDegraded) {
+				t.Errorf("reason = %q for a %s verdict", got.reason, got.kind)
+			}
+		})
 	}
 }

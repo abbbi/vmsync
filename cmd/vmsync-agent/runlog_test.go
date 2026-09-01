@@ -221,6 +221,7 @@ func TestEveryEmittedFlagIsInTheVocabulary(t *testing.T) {
 		"-bridge-helper-path", "-compress-level", "-io-depth", "-prometheus-textfile",
 		"-reinit-after-failures", "-retention", "-source-nbd-port", "-target-nbd-port",
 		"-target-disk-path", "-timestamp-tolerance-sec", "-use-ssh", "-run-id",
+		"-result-json",
 		"-compress", "-netbuffer", "-verify",
 		"-promote", "-promote-mode", "-promoted-by", "-force-promote", "-fence-source",
 		"-invert", "-reinit", "-force-clean", "-start", "-update-role",
@@ -360,5 +361,37 @@ func TestSyncResultWireFormatDistinguishesUnobserved(t *testing.T) {
 	// to zero -- if that were ever changed to a plain int, this is what fails.
 	if !strings.Contains(string(observed), `"exit_code":0`) {
 		t.Errorf("an observed exit 0 was dropped from the wire:\n%s", observed)
+	}
+}
+
+// The agent's half of the degraded contract. The console has a matching test
+// decoding exactly these shapes; neither side can check the other.
+func TestSyncResultWireFormatCarriesDegraded(t *testing.T) {
+	code := 0
+	const reason = "the guest filesystems are still FROZEN: run virsh domfsthaw db01"
+	b, err := json.Marshal(SyncResult{
+		VM: "db01", ExitCode: &code, Outcome: outcomeSuccess,
+		Degraded: true, DegradedReason: reason,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	for _, want := range []string{`"degraded":true`, `"degraded_reason":"` + reason + `"`, `"outcome":"success"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("wire form is missing %s:\n%s", want, got)
+		}
+	}
+
+	// A clean run must carry NEITHER field. The console decodes reports with
+	// DisallowUnknownFields, so every field the agent emits is a deployment
+	// ordering constraint -- and emitting "degraded":false on every run would
+	// spend that on nothing.
+	clean, err := json.Marshal(SyncResult{VM: "db01", ExitCode: &code, Outcome: outcomeSuccess})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(clean), "degraded") {
+		t.Errorf("a clean run serialised a degraded field:\n%s", clean)
 	}
 }

@@ -44,6 +44,7 @@ import (
 	"vmsync/pkg/portalloc"
 	"vmsync/pkg/remotessh"
 	"vmsync/pkg/restorepoint"
+	"vmsync/pkg/runresult"
 	"vmsync/pkg/trace"
 	"vmsync/pkg/util"
 	"vmsync/pkg/version"
@@ -156,6 +157,11 @@ type syncConfig struct {
 	// run lock this process writes to its own record of having launched it.
 	// Never interpreted here.
 	RunID string
+	// ResultJSON is where to write this run's degradations for a supervising
+	// agent to read back -- see pkg/runresult for why neither the exit code
+	// nor the log tail can carry them. Empty for a run started by hand, which
+	// has nobody to report to.
+	ResultJSON string
 
 	// ReplacedDiskAction selects what happens to a target disk file that is
 	// about to be discarded and rebuilt: replacedDiskRename (the default) or
@@ -339,6 +345,7 @@ func main() {
 	flag.StringVar(&cfg.Verify, "verify", "", "After syncing, verify target matches source for every disk. Accepts compare|fast|online. See documentation for details. (compare|fast suspend the source domain, online does not)")
 	flag.StringVar(&cfg.UpdateRole, "update-role", "", "Set the replication role recorded in a domain's own vmsync metadata, then exit without syncing anything. Accepts "+strings.Join(libvirtsync.ValidRoles, "|")+" (\"none\" clears it). The domain is addressed with -target-uri/-target-domain regardless of which direction it currently replicates in. vmsync refuses to sync INTO a domain whose role is anything other than \"target\" or unset -- this is what stops a scheduled sync from overwriting a domain that was failed over to and then shut down for maintenance")
 	flag.StringVar(&cfg.RunID, "run-id", "", "Opaque identifier for this run, written into the run lock so a supervising agent can join it to its own record of having started this process. Ignored except as a label; vmsync-agent sets it, and nothing needs it when vmsync is run by hand")
+	flag.StringVar(&cfg.ResultJSON, "result-json", "", "Write this run's degradations to this path as JSON, for a supervising agent to read back. A degradation is something the exit code cannot carry -- a guest left frozen by a failed thaw, or a copy that is crash-consistent because the freeze did not take -- since both can happen to a run that otherwise succeeds. vmsync-agent sets this; nothing needs it when vmsync is run by hand")
 	flag.StringVar(&cfg.LocalHostName, "local-host-name", "", "What to call this machine when recording it in replica_source/replica_targets/promoted_from, for a -source-uri or -target-uri that names no host. Defaults to the system hostname. Set it when something else refers to this host by a different name -- vmsync-agent passes its own --hostname here, because the control plane matches these references against the name an agent reports under")
 	flag.BoolVar(&cfg.Promote, "promote", false, "Promote the replica named by -target-uri/-target-domain to serve live: record the promotion and, with -start, boot it. Refuses unless the target actually holds a usable replica. Must be run on the target's own host")
 	flag.BoolVar(&cfg.Invert, "invert", false, "Reverse a pair's direction after a failover: -source-uri/-source-domain name the OLD source, -target-uri/-target-domain the promoted replica. Run on the old source's host")
@@ -1356,7 +1363,40 @@ func run(cfg syncConfig) (runErr error) {
 	var freezeMu sync.Mutex
 	var freezed bool = false
 	var thawOnce sync.Once
-	var fsFreezeFailed bool = false
+	// fsFreezeFailed and fsThawFailed both need the same mutex, for the same
+	// reason: the metrics closure reads them from the SIGNAL HANDLER's
+	// goroutine while this one is still running the sync.
+	//
+	// fsFreezeFailed used to be safe unguarded only because nothing off this
+	// goroutine read it -- the handler passed a literal state and
+	// finalRunState ran on the normal return path. Reporting freeze as its
+	// own metric is what made it shared, so it is guarded now.
+	//
+	// Deliberately kept as two flags: the copy can be perfect and the source
+	// still be hung, and reporting one as the other loses whichever it is not.
+	var freezeFailedMu sync.Mutex
+	var fsFreezeFailed bool
+	var fsThawFailed bool
+	setFreezeFailed := func() {
+		freezeFailedMu.Lock()
+		fsFreezeFailed = true
+		freezeFailedMu.Unlock()
+	}
+	freezeDidFail := func() bool {
+		freezeFailedMu.Lock()
+		defer freezeFailedMu.Unlock()
+		return fsFreezeFailed
+	}
+	setThawFailed := func() {
+		freezeFailedMu.Lock()
+		fsThawFailed = true
+		freezeFailedMu.Unlock()
+	}
+	thawDidFail := func() bool {
+		freezeFailedMu.Lock()
+		defer freezeFailedMu.Unlock()
+		return fsThawFailed
+	}
 	var started bool = false
 	var metricsMu sync.Mutex
 	diskMetrics := make([]metrics.DiskMetric, 0)
@@ -1421,11 +1461,16 @@ func run(cfg syncConfig) (runErr error) {
 		metricsMu.Unlock()
 		now := time.Now().Unix()
 		run := metrics.RunMetric{
-			SourceHost:            sourceHost,
-			TargetHost:            targetHost,
-			VM:                    cfg.SourceDomain,
-			State:                 state,
-			Timestamp:             now,
+			SourceHost: sourceHost,
+			TargetHost: targetHost,
+			VM:         cfg.SourceDomain,
+			State:      state,
+			Timestamp:  now,
+			// Read through the accessor: this can run from the signal
+			// handler's goroutine while thawSource is setting it from
+			// another.
+			FSFreezeFailed:        freezeDidFail(),
+			FSThawFailed:          thawDidFail(),
 			ExternalSnapshotCount: snapshotCount,
 			// trace's own counters, not metricsMu-guarded state -- they're
 			// already safe for concurrent reads on their own (atomics), and
@@ -1452,6 +1497,32 @@ func run(cfg syncConfig) (runErr error) {
 			trace.Warning("failed to write prometheus textfile", "path", cfg.PrometheusTextfile, "error", err)
 		}
 	}
+
+	// writeRunResult tells a supervising agent what the exit code cannot.
+	//
+	// Its own function rather than a branch inside writeMetricsTextfile,
+	// because that one returns early when no -prometheus-textfile is set --
+	// and an operator running no node_exporter must not thereby lose the
+	// report that their guest is still frozen. Called from the same two
+	// places, for the same reason: os.Exit skips defers, and the interrupted
+	// run is one that very plausibly left a guest frozen.
+	writeRunResult := func() {
+		if cfg.ResultJSON == "" {
+			return
+		}
+		res := runresult.Result{
+			VM:             cfg.SourceDomain,
+			RunID:          cfg.RunID,
+			FSFreezeFailed: freezeDidFail(),
+			FSThawFailed:   thawDidFail(),
+		}
+		if err := runresult.Write(cfg.ResultJSON, res); err != nil {
+			// Warning, not Error: this file is how the agent LEARNS about a
+			// degradation, so failing to write it cannot itself be counted as
+			// one. The agent reports the absence in its own words.
+			trace.Warning("failed to write run result", "path", cfg.ResultJSON, "error", err)
+		}
+	}
 	// Registered here, before anything that can fail (SSH setup, checkpoint/
 	// backup calls, per-disk syncs, ...), so a run that never gets anywhere
 	// near the disk loop still reports failure -- otherwise a sync that dies
@@ -1476,7 +1547,11 @@ func run(cfg syncConfig) (runErr error) {
 		interruptedMu.Lock()
 		wasInterrupted := interrupted
 		interruptedMu.Unlock()
-		writeMetricsTextfile(finalRunState(runErr, wasInterrupted, fsFreezeFailed))
+		writeMetricsTextfile(finalRunState(runErr, wasInterrupted, freezeDidFail()))
+		// After the metrics, and NOT skipped for the lock-held case above: a
+		// run that stood down touched no guest, so it has no degradation to
+		// report and the agent already knows what exit 75 means.
+		writeRunResult()
 	}()
 	// Registered immediately after the metrics defer above specifically so it
 	// runs immediately BEFORE it: defers are LIFO, so the later something is
@@ -1951,10 +2026,16 @@ func run(cfg syncConfig) (runErr error) {
 			}
 			trace.Info("thawing source filesystem", "trigger", trigger)
 			if err := callOnSrcDom("thaw source filesystem", func() error {
-				libvirtsync.ThawFs(srcDom, true)
+				if libvirtsync.ThawFs(srcDom, true) {
+					setThawFailed()
+				}
 				return nil
 			}); err != nil {
-				trace.Error("thaw source filesystem timed out", "trigger", trigger, "error", err)
+				// A timeout leaves the guest frozen just as surely as a
+				// refusal does -- the call never completed, so nothing
+				// unfroze it.
+				setThawFailed()
+				trace.Error("thaw source filesystem timed out; this guest may still have its filesystems FROZEN and block on every write until somebody runs virsh domfsthaw against it", "trigger", trigger, "error", err)
 			}
 		})
 	}
@@ -2124,6 +2205,13 @@ func run(cfg syncConfig) (runErr error) {
 			// run is always recorded as a failure, regardless of how far the
 			// sync had gotten.
 			writeMetricsTextfile(metrics.StateFailure)
+			// And the result file, for the same reason -- with more at stake.
+			// The cleanup above has just tried to thaw the guest, and this is
+			// the path where that thaw is most likely to have failed: the
+			// process is already being torn down, possibly because something
+			// is wedged. If it did fail, this file is the only thing that will
+			// ever tell the agent that a production guest was left frozen.
+			writeRunResult()
 			os.Exit(1)
 		case <-doneCh:
 			return
@@ -2765,8 +2853,19 @@ func run(cfg syncConfig) (runErr error) {
 	}
 	if freezeState == libvirt.DOMAIN_RUNNING {
 		if err := srcDom.FSFreeze(nil, 0); err != nil {
-			trace.Warning("Filesystem freeze failed", "error", err)
-			fsFreezeFailed = true
+			// Warning rather than Error, and deliberately not retried: unlike
+			// a failed thaw, this degrades the COPY, not the running guest.
+			// The run goes on and produces a usable crash-consistent
+			// checkpoint. Retrying would delay the checkpoint on every run of
+			// every guest with no agent -- a permanent condition, not a
+			// transient one -- to buy nothing.
+			//
+			// Say what it costs, though. "Filesystem freeze failed" alone
+			// reads as a step that did not happen; what it means is that
+			// everything this checkpoint captures is at the mercy of whatever
+			// the guest had not flushed.
+			trace.Warning("Filesystem freeze failed: this checkpoint is CRASH-CONSISTENT only, not application-consistent -- a database restored from it recovers as if the host had lost power", "error", err)
+			setFreezeFailed()
 		} else {
 			freezeMu.Lock()
 			freezed = true

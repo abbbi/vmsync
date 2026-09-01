@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -32,6 +33,7 @@ import (
 
 	"vmsync/pkg/inventory"
 	"vmsync/pkg/libvirtsync"
+	"vmsync/pkg/runresult"
 	"vmsync/pkg/trace"
 	"vmsync/pkg/util"
 )
@@ -63,6 +65,20 @@ type SyncResult struct {
 	// left for the console to re-derive: "busy" in particular is neither a
 	// success nor a failure, and an exit code alone cannot say so.
 	Outcome string `json:"outcome,omitempty"`
+
+	// Degraded is a run that SUCCEEDED and still needs a person.
+	//
+	// Orthogonal to Outcome, not a fourth value of it, because it can be true
+	// alongside any of them -- and the combination that matters most is
+	// success plus degraded: a guest whose filesystems a failed thaw left
+	// frozen is blocking on every write, while the sync that froze it is
+	// reported as a clean green tick. That is precisely the case an outcome
+	// enum cannot express.
+	Degraded bool `json:"degraded,omitempty"`
+	// DegradedReason is what to tell the operator, phrased as an instruction
+	// rather than a code to look up. Comes from vmsync, which is the only
+	// party that knows which degradation happened.
+	DegradedReason string `json:"degraded_reason,omitempty"`
 }
 
 // Outcome values. Shared vocabulary with the run log and the console.
@@ -556,6 +572,7 @@ func (s *Scheduler) runOne(ctx context.Context, cfg *agentConfig, entry Schedule
 	// knowing only that something holds that lock.
 	runID := newRunID()
 	plan.RunID = runID
+	plan.ResultJSON = runResultPath(cfg.StateDir, runID)
 	args := plan.CommandArgs()
 	started := time.Now()
 
@@ -621,6 +638,44 @@ func (s *Scheduler) runOne(ctx context.Context, cfg *agentConfig, entry Schedule
 	// not, and for older results decoded from a report.
 	code := cmd.ProcessState.ExitCode()
 	res.ExitCode = &code
+
+	// What the exit code could not carry. Read after Wait so the file is
+	// complete: vmsync writes it on its way out, including from its signal
+	// handler, and reading earlier could catch a run that had not degraded
+	// yet.
+	//
+	// Removed either way. These accumulate one per run, and a directory
+	// filling with them on a busy host is a second failure caused by the
+	// mechanism for reporting the first.
+	if plan.ResultJSON != "" {
+		rr, rerr := runresult.Read(plan.ResultJSON)
+		_ = os.Remove(plan.ResultJSON)
+		switch v := classifyRunResult(rr, rerr, runID); v.kind {
+		case resultUnreadable:
+			// Something wrote a file that will not parse. Not fatal to the
+			// run -- it has already happened -- but say so, because the
+			// silent alternative is believing a degraded run was clean.
+			trace.Error("a sync left a result file that could not be read, so any degradation it reported is lost",
+				"vm", entry.VM, "run_id", runID, "error", rerr)
+		case resultStale:
+			// A leftover from some earlier run under a reused name. Ignoring
+			// it is right: attributing another run's frozen guest to this one
+			// sends an operator to the wrong VM.
+			trace.Warning("ignoring a stale sync result file left by a different run",
+				"vm", entry.VM, "run_id", runID, "found_run_id", rr.RunID)
+		case resultDegraded:
+			res.Degraded = true
+			res.DegradedReason = v.reason
+			// Logged at ERROR on this host too, not only shipped to the UI.
+			// A standalone agent has no UI to ship to, and a frozen guest is
+			// not something to find out about on somebody's next dashboard
+			// visit.
+			trace.Error("a scheduled sync succeeded but left something that needs a person",
+				"vm", entry.VM, "target", plan.targetHost, "run_id", runID,
+				"fsfreeze_failed", rr.FSFreezeFailed, "fsthaw_failed", rr.FSThawFailed,
+				"action", v.reason)
+		}
+	}
 
 	// Exit 75 is vmsync saying it stood down without touching anything,
 	// because another vmsync already holds this domain's lock (util.ExitBusy,
@@ -702,3 +757,63 @@ func tail(s string, n int) string {
 	}
 	return s
 }
+
+// What a run's result file turned out to mean.
+const (
+	resultClean      = "clean"
+	resultDegraded   = "degraded"
+	resultStale      = "stale"
+	resultUnreadable = "unreadable"
+)
+
+type resultVerdict struct {
+	kind   string
+	reason string
+}
+
+// classifyRunResult decides what a result file says about the run that just
+// finished, separately from what to log about it.
+//
+// The ordering is the substance, and it is deliberately NOT "degraded first":
+//
+//   - An unreadable file outranks everything. It might have said the guest is
+//     frozen; nobody can know. Treating it as clean is the one answer that is
+//     certainly wrong.
+//   - A file whose RunID is somebody else's outranks its contents. A crash can
+//     leave one behind, and blaming this run for another's frozen guest sends
+//     an operator to the wrong VM -- worse than saying nothing, because it is
+//     confidently wrong.
+//   - An EMPTY RunID is accepted, not treated as stale. vmsync writes whatever
+//     -run-id it was given, and a hand-run vmsync is given none; refusing
+//     those would silently drop the degradation report from every run an
+//     operator started themselves.
+func classifyRunResult(rr runresult.Result, err error, runID string) resultVerdict {
+	switch {
+	case err != nil:
+		return resultVerdict{kind: resultUnreadable}
+	case rr.RunID != "" && rr.RunID != runID:
+		return resultVerdict{kind: resultStale}
+	case rr.Degraded():
+		return resultVerdict{kind: resultDegraded, reason: rr.Reason()}
+	}
+	return resultVerdict{kind: resultClean}
+}
+
+// runResultPath is where one run leaves its degradations for this agent.
+//
+// Named after the RUN, not the VM, for two reasons. Two runs of the same
+// domain -- this one and an overlapping leftover -- can never read each
+// other's file; and an ADOPTED run's path is recoverable, because the run
+// lock carries the run id even though the process was started by a previous
+// instance of this agent. Without that, a restart during a sync would lose
+// the report from precisely the runs most likely to have one.
+func runResultPath(stateDir, runID string) string {
+	if stateDir == "" || runID == "" {
+		return ""
+	}
+	return filepath.Join(stateDir, runResultDir, "run-"+runID+".json")
+}
+
+// runResultDir holds them. Its own subdirectory so a sweep of leftovers
+// cannot touch anything else in the state dir.
+const runResultDir = "results"

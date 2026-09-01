@@ -289,6 +289,10 @@ type SyncRequest struct {
 	// entry for having launched it, so an operator holding one can find the
 	// other. Set per launch, not per schedule entry.
 	RunID string
+	// ResultJSON is where this run should leave its degradations for the
+	// agent to read back once the process has exited. Set per launch, like
+	// RunID, and for the same reason: it names one run, not one schedule.
+	ResultJSON string
 
 	// LocalHostName is the name this agent reports under, passed so the
 	// references vmsync writes into metadata match what the control plane
@@ -383,6 +387,9 @@ func (r SyncRequest) CommandArgs() []string {
 	// run log, instead of knowing only that something holds the lock.
 	if r.RunID != "" {
 		args = append(args, "-run-id", r.RunID)
+	}
+	if r.ResultJSON != "" {
+		args = append(args, "-result-json", r.ResultJSON)
 	}
 	return args
 }

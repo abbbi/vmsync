@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"vmsync/pkg/atomicjson"
 	"vmsync/pkg/restorepoint"
 )
 
@@ -335,7 +336,7 @@ func (l *operationLedger) Abandon(id string) error {
 	}
 	l.mu.Unlock()
 
-	if err := writeJSONAtomic(l.path, snapshot, 0o644); err != nil {
+	if err := atomicjson.Write(l.path, snapshot, 0o644); err != nil {
 		return fmt.Errorf("remove the abandoned record of operation %s from the ledger: %w", id, err)
 	}
 	return nil
@@ -353,7 +354,7 @@ func (l *operationLedger) put(e ledgerEntry) error {
 	// 0644 and atomic, like the config cache: it holds no secret, and the
 	// rename is what stops a crash mid-write from replacing the record of an
 	// in-progress operation with a truncated file.
-	if err := writeJSONAtomic(l.path, snapshot, 0o644); err != nil {
+	if err := atomicjson.Write(l.path, snapshot, 0o644); err != nil {
 		return fmt.Errorf("record operation %s in the ledger: %w", e.ID, err)
 	}
 	return nil
@@ -399,7 +400,7 @@ func (l *operationLedger) Forget(stillPublished map[string]bool) {
 	}
 	// Best-effort: a failure here costs a re-report of something already
 	// acknowledged, which is harmless, so it must not fail the caller.
-	_ = writeJSONAtomic(l.path, snapshot, 0o644)
+	_ = atomicjson.Write(l.path, snapshot, 0o644)
 }
 
 // Validate checks an operation before anything is done with it.

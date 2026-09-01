@@ -23,6 +23,8 @@ import (
 	"reflect"
 	"runtime"
 	"testing"
+
+	"vmsync/pkg/atomicjson"
 )
 
 func TestCredentialsRoundTrip(t *testing.T) {
@@ -169,7 +171,7 @@ func TestADirectorySyncRefusalDoesNotFailTheWrite(t *testing.T) {
 // one is able to. A missing directory is the case that must not read as
 // success.
 func TestSyncDirReportsAMissingDirectory(t *testing.T) {
-	if err := syncDir(filepath.Join(t.TempDir(), "does-not-exist")); err == nil {
+	if err := atomicjson.SyncDir(filepath.Join(t.TempDir(), "does-not-exist")); err == nil {
 		t.Error("syncDir on a missing directory returned no error")
 	}
 }
