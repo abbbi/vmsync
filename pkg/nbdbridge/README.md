@@ -104,7 +104,7 @@ bridgeport = targetport + N, where N is the domain's total disk count -- the bri
 occupy the contiguous block right after all N real export ports). For each accepted
 connection it dials the real, plaintext NBD
 export directly (no external tool -- no socat, no shell -- in between) and relays both
-directions natively (pkg/zstdrelay), instead of shelling out to external
+directions natively (pkg/streamrelay), instead of shelling out to external
 compression/buffering CLI tools -- those buffer on EOF only, which is fundamentally
 incompatible with NBD's long-lived, synchronous, small-message protocol.
 
@@ -172,7 +172,7 @@ and redeploy vmsync-bridge-helper any time you upgrade vmsync itself.
 
 ## Flags
 
-- `-compress=zstd|s2` -- compress bridged NBD traffic, native (`pkg/zstdrelay`), with an
+- `-compress=zstd|s2` -- compress bridged NBD traffic, native (`pkg/streamrelay`), with an
   explicit `Flush()` after every chunk so nothing sits buffered indefinitely. `zstd` gives
   the better ratio; `s2` (Snappy-derived) trades ratio for substantially higher throughput --
   the better fit once compression speed itself, not network bandwidth, is the bottleneck

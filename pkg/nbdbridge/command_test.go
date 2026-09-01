@@ -93,7 +93,7 @@ func TestBuildStartCommand(t *testing.T) {
 		{
 			// BuildStartCommand's own fallback: an empty CompressLevel
 			// defaults to "3" for zstd (its own hardcoded default, distinct
-			// from zstdrelay's).
+			// from streamrelay's).
 			name: "compress with empty level defaults to 3 for zstd",
 			cfg:  Config{HelperPath: helperPath, Compress: true, CompressAlgo: "zstd", CompressLevel: ""},
 			want: []string{

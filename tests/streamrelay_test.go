@@ -15,7 +15,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// This file exercises the pieces of pkg/zstdrelay that
+// This file exercises the pieces of pkg/streamrelay that
 // netbuffer_deadlock_test.go's Relay/RelayFromWire deadlock regressions don't
 // otherwise cover: option parsing (ParseAlgo, ParseByteSize), the
 // CountingWriter/CountingReader wire-traffic counters, BoundedBuffer's
@@ -25,11 +25,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // Relay/RelayFromWire for both supported algorithms.
 //
 // Like netbuffer_deadlock_test.go, this lives under tests/ as package tests
-// and only touches zstdrelay's exported API -- runWithDeadline, itself
+// and only touches streamrelay's exported API -- runWithDeadline, itself
 // defined in netbuffer_deadlock_test.go, is reused here rather than
 // redeclared since both files are part of the same package.
 //
-// NewEncoder returns zstdrelay's unexported flushCloser interface type, and
+// NewEncoder returns streamrelay's unexported flushCloser interface type, and
 // CopyFlushing takes its unexported flushWriter interface type as a
 // parameter. Neither is a problem from here: a value of an unexported
 // interface type can still be held (via :=) and have its (exported) methods
@@ -48,7 +48,7 @@ import (
 	"testing"
 	"time"
 
-	"vmsync/pkg/zstdrelay"
+	"vmsync/pkg/streamrelay"
 )
 
 // TestParseAlgo covers vmsync's -compress=<value> flag parsing: "" defaults
@@ -57,16 +57,16 @@ import (
 func TestParseAlgo(t *testing.T) {
 	cases := []struct {
 		in      string
-		want    zstdrelay.Algo
+		want    streamrelay.Algo
 		wantErr bool
 	}{
-		{"", zstdrelay.AlgoZstd, false},
-		{"zstd", zstdrelay.AlgoZstd, false},
-		{"s2", zstdrelay.AlgoS2, false},
+		{"", streamrelay.AlgoZstd, false},
+		{"zstd", streamrelay.AlgoZstd, false},
+		{"s2", streamrelay.AlgoS2, false},
 		{"bogus", "", true},
 	}
 	for _, tc := range cases {
-		got, err := zstdrelay.ParseAlgo(tc.in)
+		got, err := streamrelay.ParseAlgo(tc.in)
 		if tc.wantErr {
 			if err == nil {
 				t.Errorf("ParseAlgo(%q) = %q, nil, want an error", tc.in, got)
@@ -85,7 +85,7 @@ func TestParseAlgo(t *testing.T) {
 
 // TestParseByteSize covers ParseByteSize's bare-number and suffixed forms.
 // Suffixes are confirmed binary (1024-based, not 1000-based) straight from
-// the source (pkg/zstdrelay/relay.go): multiplier is 1024 per step, not
+// the source (pkg/streamrelay/relay.go): multiplier is 1024 per step, not
 // 1000.
 func TestParseByteSize(t *testing.T) {
 	const (
@@ -114,7 +114,7 @@ func TestParseByteSize(t *testing.T) {
 		{"", 0, true},
 	}
 	for _, tc := range cases {
-		got, err := zstdrelay.ParseByteSize(tc.in)
+		got, err := streamrelay.ParseByteSize(tc.in)
 		if tc.wantErr {
 			if err == nil {
 				t.Errorf("ParseByteSize(%q) = %d, nil, want an error", tc.in, got)
@@ -137,7 +137,7 @@ func TestParseByteSize(t *testing.T) {
 func TestCountingWriter(t *testing.T) {
 	var underlying bytes.Buffer
 	var counter uint64
-	cw := &zstdrelay.CountingWriter{W: &underlying, Counter: &counter}
+	cw := &streamrelay.CountingWriter{W: &underlying, Counter: &counter}
 
 	data := []byte("hello, counting writer")
 	n, err := cw.Write(data)
@@ -161,7 +161,7 @@ func TestCountingWriter(t *testing.T) {
 func TestCountingReader(t *testing.T) {
 	data := []byte("hello, counting reader")
 	var counter uint64
-	cr := &zstdrelay.CountingReader{R: bytes.NewReader(data), Counter: &counter}
+	cr := &streamrelay.CountingReader{R: bytes.NewReader(data), Counter: &counter}
 
 	out := make([]byte, len(data))
 	n, err := io.ReadFull(cr, out)
@@ -187,7 +187,7 @@ func TestCountingReader(t *testing.T) {
 // failures instead of hanging the whole test binary.
 func TestBoundedBuffer(t *testing.T) {
 	t.Run("write then read less than capacity", func(t *testing.T) {
-		b := zstdrelay.NewBoundedBuffer(16)
+		b := streamrelay.NewBoundedBuffer(16)
 		data := []byte("hello")
 
 		err, returned := runWithDeadline(t, 5*time.Second, func() error {
@@ -220,7 +220,7 @@ func TestBoundedBuffer(t *testing.T) {
 	})
 
 	t.Run("write exactly capacity does not block", func(t *testing.T) {
-		b := zstdrelay.NewBoundedBuffer(8)
+		b := streamrelay.NewBoundedBuffer(8)
 		data := []byte("12345678") // exactly maxBytes
 
 		err, returned := runWithDeadline(t, 5*time.Second, func() error {
@@ -236,7 +236,7 @@ func TestBoundedBuffer(t *testing.T) {
 	})
 
 	t.Run("write beyond capacity blocks until a read frees space", func(t *testing.T) {
-		b := zstdrelay.NewBoundedBuffer(8)
+		b := streamrelay.NewBoundedBuffer(8)
 
 		// Fill the buffer completely first.
 		if _, err := b.Write([]byte("12345678")); err != nil {
@@ -280,7 +280,7 @@ func TestBoundedBuffer(t *testing.T) {
 	})
 
 	t.Run("a chunk read via several smaller reads is returned in order, one piece at a time", func(t *testing.T) {
-		b := zstdrelay.NewBoundedBuffer(16)
+		b := streamrelay.NewBoundedBuffer(16)
 		data := []byte("hello world") // 11 bytes, enqueued as a single chunk
 
 		if _, err := b.Write(data); err != nil {
@@ -326,7 +326,7 @@ func TestBoundedBuffer(t *testing.T) {
 	})
 
 	t.Run("a single Write larger than capacity is split across multiple chunks and drained correctly by a concurrent reader", func(t *testing.T) {
-		b := zstdrelay.NewBoundedBuffer(8)
+		b := streamrelay.NewBoundedBuffer(8)
 		data := make([]byte, 30) // well over 3x maxBytes
 		for i := range data {
 			data[i] = byte(i)
@@ -385,7 +385,7 @@ func TestBoundedBuffer(t *testing.T) {
 	})
 
 	t.Run("write after close returns ErrClosedPipe", func(t *testing.T) {
-		b := zstdrelay.NewBoundedBuffer(8)
+		b := streamrelay.NewBoundedBuffer(8)
 		if err := b.Close(); err != nil {
 			t.Fatalf("Close returned error: %v", err)
 		}
@@ -396,7 +396,7 @@ func TestBoundedBuffer(t *testing.T) {
 	})
 
 	t.Run("read after close on a drained buffer returns EOF", func(t *testing.T) {
-		b := zstdrelay.NewBoundedBuffer(8)
+		b := streamrelay.NewBoundedBuffer(8)
 		if err := b.Close(); err != nil {
 			t.Fatalf("Close returned error: %v", err)
 		}
@@ -430,18 +430,18 @@ func TestEncoderDecoderRoundTrip(t *testing.T) {
 
 	cases := []struct {
 		name  string
-		algo  zstdrelay.Algo
+		algo  streamrelay.Algo
 		level string
 	}{
-		{"zstd", zstdrelay.AlgoZstd, "3"},
-		{"s2", zstdrelay.AlgoS2, "better"},
+		{"zstd", streamrelay.AlgoZstd, "3"},
+		{"s2", streamrelay.AlgoS2, "better"},
 	}
 
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			var compressed bytes.Buffer
-			enc, err := zstdrelay.NewEncoder(tc.algo, &compressed, tc.level)
+			enc, err := streamrelay.NewEncoder(tc.algo, &compressed, tc.level)
 			if err != nil {
 				t.Fatalf("NewEncoder(%s): %v", tc.name, err)
 			}
@@ -456,7 +456,7 @@ func TestEncoderDecoderRoundTrip(t *testing.T) {
 				t.Fatalf("encoder Close: %v", err)
 			}
 
-			dec, closeDec, err := zstdrelay.NewDecoder(tc.algo, bytes.NewReader(compressed.Bytes()))
+			dec, closeDec, err := streamrelay.NewDecoder(tc.algo, bytes.NewReader(compressed.Bytes()))
 			if err != nil {
 				t.Fatalf("NewDecoder(%s): %v", tc.name, err)
 			}
@@ -529,7 +529,7 @@ func (failingFlushWriter) Flush() error {
 // explicit Flush() after every nonzero Read (not just once at the end), and
 // propagating a Write error as its own return value.
 //
-// CopyFlushing's dst parameter is zstdrelay's unexported flushWriter
+// CopyFlushing's dst parameter is streamrelay's unexported flushWriter
 // interface type, but that's not an obstacle here: *recordingFlushWriter and
 // failingFlushWriter each satisfy it structurally (Write + Flush), and Go
 // lets any external concrete type satisfy an unexported interface parameter
@@ -540,7 +540,7 @@ func TestCopyFlushing(t *testing.T) {
 		src := &chunkReader{chunks: chunks}
 		dst := &recordingFlushWriter{}
 
-		written, err := zstdrelay.CopyFlushing(dst, src)
+		written, err := streamrelay.CopyFlushing(dst, src)
 		if err != nil {
 			t.Fatalf("CopyFlushing returned error: %v", err)
 		}
@@ -572,7 +572,7 @@ func TestCopyFlushing(t *testing.T) {
 
 	t.Run("write error propagates", func(t *testing.T) {
 		src := bytes.NewReader([]byte("some data that will never make it through"))
-		_, err := zstdrelay.CopyFlushing(failingFlushWriter{}, src)
+		_, err := streamrelay.CopyFlushing(failingFlushWriter{}, src)
 		if err == nil {
 			t.Fatal("CopyFlushing returned a nil error despite the destination failing every write")
 		}
@@ -604,11 +604,11 @@ func TestCopyFlushing(t *testing.T) {
 func TestEncoderDecoderRoundTripMultiFrame(t *testing.T) {
 	cases := []struct {
 		name  string
-		algo  zstdrelay.Algo
+		algo  streamrelay.Algo
 		level string
 	}{
-		{"zstd", zstdrelay.AlgoZstd, "3"},
-		{"s2", zstdrelay.AlgoS2, "better"},
+		{"zstd", streamrelay.AlgoZstd, "3"},
+		{"s2", streamrelay.AlgoS2, "better"},
 	}
 
 	for _, tc := range cases {
@@ -629,11 +629,11 @@ func TestEncoderDecoderRoundTripMultiFrame(t *testing.T) {
 			src := &chunkReader{chunks: chunks}
 
 			var compressed bytes.Buffer
-			enc, err := zstdrelay.NewEncoder(tc.algo, &compressed, tc.level)
+			enc, err := streamrelay.NewEncoder(tc.algo, &compressed, tc.level)
 			if err != nil {
 				t.Fatalf("NewEncoder(%s): %v", tc.name, err)
 			}
-			written, err := zstdrelay.CopyFlushing(enc, src)
+			written, err := streamrelay.CopyFlushing(enc, src)
 			if err != nil {
 				t.Fatalf("CopyFlushing: %v", err)
 			}
@@ -644,7 +644,7 @@ func TestEncoderDecoderRoundTripMultiFrame(t *testing.T) {
 				t.Fatalf("encoder Close: %v", err)
 			}
 
-			dec, closeDec, err := zstdrelay.NewDecoder(tc.algo, bytes.NewReader(compressed.Bytes()))
+			dec, closeDec, err := streamrelay.NewDecoder(tc.algo, bytes.NewReader(compressed.Bytes()))
 			if err != nil {
 				t.Fatalf("NewDecoder(%s): %v", tc.name, err)
 			}
@@ -672,11 +672,11 @@ func TestRelayCompressRoundTrip(t *testing.T) {
 
 	cases := []struct {
 		name  string
-		algo  zstdrelay.Algo
+		algo  streamrelay.Algo
 		level string
 	}{
-		{"zstd", zstdrelay.AlgoZstd, "3"},
-		{"s2", zstdrelay.AlgoS2, "better"},
+		{"zstd", streamrelay.AlgoZstd, "3"},
+		{"s2", streamrelay.AlgoS2, "better"},
 	}
 
 	for _, tc := range cases {
@@ -684,7 +684,7 @@ func TestRelayCompressRoundTrip(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var wire bytes.Buffer
 			err, returned := runWithDeadline(t, 5*time.Second, func() error {
-				return zstdrelay.Relay(&wire, bytes.NewReader(payload), true, tc.algo, tc.level, "", "", nil)
+				return streamrelay.Relay(&wire, bytes.NewReader(payload), true, tc.algo, tc.level, "", "", nil)
 			})
 			if !returned {
 				t.Fatalf("Relay (%s) did not return within 5s", tc.name)
@@ -695,7 +695,7 @@ func TestRelayCompressRoundTrip(t *testing.T) {
 
 			var final bytes.Buffer
 			err, returned = runWithDeadline(t, 5*time.Second, func() error {
-				return zstdrelay.RelayFromWire(&final, bytes.NewReader(wire.Bytes()), true, tc.algo, "", "", nil)
+				return streamrelay.RelayFromWire(&final, bytes.NewReader(wire.Bytes()), true, tc.algo, "", "", nil)
 			})
 			if !returned {
 				t.Fatalf("RelayFromWire (%s) did not return within 5s", tc.name)
@@ -760,7 +760,7 @@ func TestRelayCountsWireBytesOverRealTCPConn(t *testing.T) {
 	var wire bytes.Buffer
 	var sent uint64
 	relayErr, returned := runWithDeadline(t, 5*time.Second, func() error {
-		return zstdrelay.Relay(&wire, src, false, zstdrelay.AlgoZstd, "", "", "", &sent)
+		return streamrelay.Relay(&wire, src, false, streamrelay.AlgoZstd, "", "", "", &sent)
 	})
 	if !returned {
 		t.Fatal("Relay did not return within 5s")
@@ -851,7 +851,7 @@ func TestRelayPassesThroughRealTCPConnsWithoutCounter(t *testing.T) {
 	defer dst.Close()
 
 	relayErr, returned := runWithDeadline(t, 5*time.Second, func() error {
-		return zstdrelay.Relay(dst, src, false, zstdrelay.AlgoZstd, "", "", "", nil)
+		return streamrelay.Relay(dst, src, false, streamrelay.AlgoZstd, "", "", "", nil)
 	})
 	if !returned {
 		t.Fatal("Relay did not return within 5s")

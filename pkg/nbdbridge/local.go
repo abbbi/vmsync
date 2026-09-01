@@ -28,12 +28,12 @@ import (
 
 	"vmsync/pkg/remotessh"
 	"vmsync/pkg/trace"
-	"vmsync/pkg/zstdrelay"
+	"vmsync/pkg/streamrelay"
 )
 
 // ByteCounters tracks bytes actually sent/received over the SSH-tunneled
 // (compressed) leg of a bridged connection, updated concurrently from the
-// relay goroutines via pkg/zstdrelay's CountingWriter/CountingReader, which
+// relay goroutines via pkg/streamrelay's CountingWriter/CountingReader, which
 // operate directly on these exported fields.
 type ByteCounters struct {
 	Sent     uint64
@@ -137,7 +137,7 @@ func StartLocal(ctx context.Context, sshClient *remotessh.Client, remoteBridgeAd
 // NBD client) to remoteBridgeAddr -- a plain direct TCP connection by
 // default, or over the SSH tunnel when cfg.UseSSH is set (see
 // Config.UseSSH) -- compressing/buffering the outbound direction and
-// reversing that for the inbound direction via pkg/zstdrelay -- the same
+// reversing that for the inbound direction via pkg/streamrelay -- the same
 // logic cmd/vmsync-bridge-helper uses on the remote end, so both sides of
 // the bridge can never drift apart in behavior. There's no subprocess left
 // to bind to a context for cancellation (unlike the old CLI-piped version);
@@ -146,7 +146,7 @@ func StartLocal(ctx context.Context, sshClient *remotessh.Client, remoteBridgeAd
 func relayConnection(conn net.Conn, sshClient *remotessh.Client, remoteBridgeAddr string, cfg Config, counters *ByteCounters) error {
 	defer conn.Close()
 
-	algo, err := zstdrelay.ParseAlgo(cfg.CompressAlgo)
+	algo, err := streamrelay.ParseAlgo(cfg.CompressAlgo)
 	if err != nil {
 		return fmt.Errorf("invalid compress algo: %w", err)
 	}
@@ -180,7 +180,7 @@ func relayConnection(conn net.Conn, sshClient *remotessh.Client, remoteBridgeAdd
 	go func() {
 		defer relayWg.Done()
 		reportErr(recoverRelayPanic("outbound relay (conn -> remote)", func() error {
-			err := zstdrelay.Relay(remote, conn, cfg.Compress, algo, cfg.CompressLevel, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Sent)
+			err := streamrelay.Relay(remote, conn, cfg.Compress, algo, cfg.CompressLevel, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Sent)
 			// Half-close the SSH channel once we're done sending, mirroring what
 			// cmd/vmsync-bridge-helper does on its own outbound direction
 			// (tc.CloseWrite() after its stdin hits EOF). Without this, nothing
@@ -202,7 +202,7 @@ func relayConnection(conn net.Conn, sshClient *remotessh.Client, remoteBridgeAdd
 	go func() {
 		defer relayWg.Done()
 		reportErr(recoverRelayPanic("inbound relay (remote -> conn)", func() error {
-			err := zstdrelay.RelayFromWire(conn, remote, cfg.Compress, algo, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Received)
+			err := streamrelay.RelayFromWire(conn, remote, cfg.Compress, algo, cfg.NetBufferBlock, cfg.NetBufferSize, &counters.Received)
 			// Half-close conn once remote is done sending, mirroring the
 			// outbound goroutine's own remote.CloseWrite() above (and
 			// cmd/vmsync-bridge-helper's matching inbound leg). Without

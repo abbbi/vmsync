@@ -40,7 +40,7 @@ import (
 	"testing"
 	"time"
 
-	"vmsync/pkg/zstdrelay"
+	"vmsync/pkg/streamrelay"
 )
 
 // runWithDeadline runs fn in its own goroutine and reports whether it
@@ -296,12 +296,12 @@ func TestHandleConnRelaysBothDirections(t *testing.T) {
 	cases := []struct {
 		name     string
 		compress bool
-		algo     zstdrelay.Algo
+		algo     streamrelay.Algo
 		level    string
 	}{
-		{"uncompressed", false, zstdrelay.AlgoZstd, "3"},
-		{"zstd compressed", true, zstdrelay.AlgoZstd, "3"},
-		{"s2 compressed", true, zstdrelay.AlgoS2, "default"},
+		{"uncompressed", false, streamrelay.AlgoZstd, "3"},
+		{"zstd compressed", true, streamrelay.AlgoZstd, "3"},
+		{"s2 compressed", true, streamrelay.AlgoS2, "default"},
 	}
 
 	for _, tc := range cases {
@@ -337,7 +337,7 @@ func TestHandleConnRelaysBothDirections(t *testing.T) {
 			go func() {
 				var err error
 				if tc.compress {
-					err = zstdrelay.Relay(dialed, bytes.NewReader(request), true, tc.algo, tc.level, "", "", nil)
+					err = streamrelay.Relay(dialed, bytes.NewReader(request), true, tc.algo, tc.level, "", "", nil)
 				} else {
 					_, err = dialed.Write(request)
 				}
@@ -387,7 +387,7 @@ func TestHandleConnRelaysBothDirections(t *testing.T) {
 			go func() {
 				var err error
 				if tc.compress {
-					err = zstdrelay.RelayFromWire(&respBuf, dialed, true, tc.algo, "", "", nil)
+					err = streamrelay.RelayFromWire(&respBuf, dialed, true, tc.algo, "", "", nil)
 				} else {
 					_, err = io.Copy(&respBuf, dialed)
 				}
@@ -473,7 +473,7 @@ func TestHandleConnReturnsOnRealSideInterruption(t *testing.T) {
 		handleConn(accepted, helperConfig{
 			ConnectAddr: realLn.Addr().String(),
 			Compress:    false,
-			Algo:        zstdrelay.AlgoZstd,
+			Algo:        streamrelay.AlgoZstd,
 			Level:       "3",
 		})
 		close(handleDone)

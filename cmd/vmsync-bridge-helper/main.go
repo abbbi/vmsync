@@ -19,7 +19,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // started once (see pkg/nbdbridge/command.go), listens on -listen, and for
 // each accepted connection dials the real, plaintext NBD endpoint (-connect)
 // and relays bytes between the two, optionally compressing and/or buffering
-// the wire-facing side natively via pkg/zstdrelay -- replacing what used to
+// the wire-facing side natively via pkg/streamrelay -- replacing what used to
 // be an external CLI shell pipe, which was proven unable to flush data
 // through a long-lived, synchronous, small-message connection like NBD's.
 //
@@ -39,7 +39,7 @@ import (
 
 	"vmsync/pkg/netbuffer"
 	"vmsync/pkg/version"
-	"vmsync/pkg/zstdrelay"
+	"vmsync/pkg/streamrelay"
 )
 
 // optionalValueFlag implements flag.Value (plus the IsBoolFlag optimization)
@@ -73,8 +73,8 @@ func (f *optionalValueFlag) Set(s string) error {
 // validateCompressLevel checks level is valid for algo. Duplicated from
 // pkg/nbdbridge.ValidateCompressLevel rather than imported, for the same
 // dependency-avoidance reason optionalValueFlag above is duplicated.
-func validateCompressLevel(algo zstdrelay.Algo, level string) error {
-	if algo == zstdrelay.AlgoS2 {
+func validateCompressLevel(algo streamrelay.Algo, level string) error {
+	if algo == streamrelay.AlgoS2 {
 		switch level {
 		case "default", "better", "best":
 			return nil
@@ -115,7 +115,7 @@ type helperConfig struct {
 	// Compress gates the compression stage entirely; Algo and Level are
 	// only consulted when it is true.
 	Compress bool
-	Algo     zstdrelay.Algo
+	Algo     streamrelay.Algo
 	Level    string
 
 	// NetBufferBlock/NetBufferSize are the two halves of
@@ -171,15 +171,15 @@ func main() {
 	})
 
 	compress := compressArg.value != ""
-	var algo zstdrelay.Algo
+	var algo streamrelay.Algo
 	if compress {
 		var err error
-		algo, err = zstdrelay.ParseAlgo(compressArg.value)
+		algo, err = streamrelay.ParseAlgo(compressArg.value)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
 			os.Exit(2)
 		}
-		if !compressLevelExplicit && algo == zstdrelay.AlgoS2 {
+		if !compressLevelExplicit && algo == streamrelay.AlgoS2 {
 			*level = "better"
 		}
 		if err := validateCompressLevel(algo, *level); err != nil {
@@ -286,7 +286,7 @@ func handleConn(conn net.Conn, cfg helperConfig) {
 	go func() {
 		defer wg.Done()
 		reportErr(recoverRelayPanic("inbound relay (conn -> real)", func() error {
-			err := zstdrelay.RelayFromWire(real, conn, cfg.Compress, cfg.Algo, cfg.NetBufferBlock, cfg.NetBufferSize, nil)
+			err := streamrelay.RelayFromWire(real, conn, cfg.Compress, cfg.Algo, cfg.NetBufferBlock, cfg.NetBufferSize, nil)
 			if tc, ok := real.(*net.TCPConn); ok {
 				tc.CloseWrite() // half-close: tell the real server we're done sending
 			}
@@ -307,7 +307,7 @@ func handleConn(conn net.Conn, cfg helperConfig) {
 	go func() {
 		defer wg.Done()
 		reportErr(recoverRelayPanic("outbound relay (real -> conn)", func() error {
-			err := zstdrelay.Relay(conn, real, cfg.Compress, cfg.Algo, cfg.Level, cfg.NetBufferBlock, cfg.NetBufferSize, nil)
+			err := streamrelay.Relay(conn, real, cfg.Compress, cfg.Algo, cfg.Level, cfg.NetBufferBlock, cfg.NetBufferSize, nil)
 			if tc, ok := conn.(*net.TCPConn); ok {
 				tc.CloseWrite()
 			}

@@ -17,7 +17,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 // Package netbuffer parses the --netbuffer/-netbuffer CLI flag value shared
 // by vmsync (pkg/nbdbridge) and cmd/vmsync-bridge-helper. It exists as its
-// own small package, depending on nothing beyond pkg/zstdrelay and the
+// own small package, depending on nothing beyond pkg/streamrelay and the
 // standard library, specifically so cmd/vmsync-bridge-helper -- a minimal,
 // standalone binary deployed to arbitrary remote hosts -- can share this
 // exact, tested parsing logic without also importing pkg/nbdbridge's own
@@ -25,7 +25,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // avoids. Before this package existed, the helper carried its own
 // hand-duplicated copy of this logic, which had already drifted: it was
 // missing the zero-buffer-size rejection below, so a "-netbuffer=X,0" would
-// silently deadlock zstdrelay.BoundedBuffer.Write forever on the first
+// silently deadlock streamrelay.BoundedBuffer.Write forever on the first
 // relayed byte instead of failing at startup like it does through
 // pkg/nbdbridge's own path.
 package netbuffer
@@ -35,7 +35,7 @@ import (
 	"regexp"
 	"strings"
 
-	"vmsync/pkg/zstdrelay"
+	"vmsync/pkg/streamrelay"
 )
 
 var sizeRe = regexp.MustCompile(`(?i)^[0-9]+[bkmgt]?$`)
@@ -62,7 +62,7 @@ func ParseSpec(spec string) (block, size string, err error) {
 	// byte when maxBytes is 0, and nothing can ever be dequeued to clear
 	// it. Reject it here so this is a normal startup error instead of a
 	// silent, permanent hang.
-	if bufBytes, err := zstdrelay.ParseByteSize(parts[1]); err == nil && bufBytes <= 0 {
+	if bufBytes, err := streamrelay.ParseByteSize(parts[1]); err == nil && bufBytes <= 0 {
 		return "", "", fmt.Errorf("wrong buffer size")
 	}
 	return parts[0], parts[1], nil

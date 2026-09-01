@@ -29,7 +29,7 @@ import (
 
 // CheckLocal verifies the tools this bridge needs on the machine running
 // vmsync are present. Compression and buffering are now done natively in Go
-// (pkg/zstdrelay), so there is no local external-binary dependency at all --
+// (pkg/streamrelay), so there is no local external-binary dependency at all --
 // this always succeeds. Kept as a function (rather than removed outright) so
 // call sites don't need to change if that ever stops being true.
 func CheckLocal(cfg Config) error {

@@ -16,7 +16,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 // This file is a regression test for a bug found during a code review of the
-// --netbuffer feature (now fixed in pkg/zstdrelay/relay.go): Relay's drain
+// --netbuffer feature (now fixed in pkg/streamrelay/relay.go): Relay's drain
 // goroutine and RelayFromWire's main copy loop didn't close the shared
 // BoundedBuffer when the *other* side of that direction failed while data
 // was still flowing, so the side still writing into the buffer blocked
@@ -24,8 +24,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // actually running it -- rather than trusting code-reading alone, both for
 // the original bug and for the fix.
 //
-// This lives under tests/ rather than alongside pkg/zstdrelay as an
-// in-package _test.go file because it only exercises zstdrelay's exported
+// This lives under tests/ rather than alongside pkg/streamrelay as an
+// in-package _test.go file because it only exercises streamrelay's exported
 // API (Relay, RelayFromWire, AlgoZstd) -- nothing here needs
 // package-internal access.
 package tests
@@ -38,7 +38,7 @@ import (
 	"testing"
 	"time"
 
-	"vmsync/pkg/zstdrelay"
+	"vmsync/pkg/streamrelay"
 )
 
 // alwaysFailWriter fails every write, simulating a destination connection
@@ -90,7 +90,7 @@ func TestRelayHappyPath(t *testing.T) {
 	var dst bytes.Buffer
 
 	err, returned := runWithDeadline(t, 5*time.Second, func() error {
-		return zstdrelay.Relay(&dst, src, false, zstdrelay.AlgoZstd, "", "64k", "4096", nil)
+		return streamrelay.Relay(&dst, src, false, streamrelay.AlgoZstd, "", "64k", "4096", nil)
 	})
 	if !returned {
 		t.Fatal("Relay (happy path, nothing failing) did not return within 5s -- the test harness itself is broken, unrelated to the bug under test")
@@ -118,7 +118,7 @@ func TestRelayHappyPath(t *testing.T) {
 // not by chance -- not because the buffer merely hasn't filled yet.
 func TestRelayReturnsOnDrainFailure(t *testing.T) {
 	err, returned := runWithDeadline(t, 5*time.Second, func() error {
-		return zstdrelay.Relay(alwaysFailWriter{}, infiniteReader{}, false, zstdrelay.AlgoZstd, "", "64k", "4096", nil)
+		return streamrelay.Relay(alwaysFailWriter{}, infiniteReader{}, false, streamrelay.AlgoZstd, "", "64k", "4096", nil)
 	})
 	if !returned {
 		t.Fatal("Relay did not return within 5s -- the drain-failure deadlock has regressed: the drain goroutine's write failure isn't closing the buffer, so the producer is stuck writing into a full, undrained buffer forever")
@@ -144,7 +144,7 @@ func TestRelayReturnsOnDrainFailure(t *testing.T) {
 // reason.
 func TestRelayFromWireReturnsOnConsumerFailure(t *testing.T) {
 	err, returned := runWithDeadline(t, 5*time.Second, func() error {
-		return zstdrelay.RelayFromWire(alwaysFailWriter{}, infiniteReader{}, false, zstdrelay.AlgoZstd, "64k", "4096", nil)
+		return streamrelay.RelayFromWire(alwaysFailWriter{}, infiniteReader{}, false, streamrelay.AlgoZstd, "64k", "4096", nil)
 	})
 	if !returned {
 		t.Fatal("RelayFromWire did not return within 5s -- the consumer-failure deadlock has regressed: the fill goroutine is left pumping the wire into a full, unconsumed buffer forever")

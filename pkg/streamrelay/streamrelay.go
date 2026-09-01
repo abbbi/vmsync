@@ -15,7 +15,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Package zstdrelay provides the compression/buffering primitives shared by
+// Package streamrelay provides the compression/buffering primitives shared by
 // vmsync's local NBD bridge relay (pkg/nbdbridge) and the remote
 // vmsync-bridge-helper binary (cmd/vmsync-bridge-helper).
 //
@@ -28,7 +28,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // so a subprocess-piped zstd can never relay even the very first handshake
 // byte. This package does compression in-process instead, with an explicit
 // Flush() after every chunk, which the CLI has no equivalent for.
-package zstdrelay
+package streamrelay
 
 import (
 	"fmt"

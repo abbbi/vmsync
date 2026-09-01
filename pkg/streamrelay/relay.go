@@ -15,7 +15,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-package zstdrelay
+package streamrelay
 
 import (
 	"errors"
@@ -28,7 +28,7 @@ import (
 // bytes, returning the value in bytes. Suffixes are case-insensitive and
 // binary (k=1024, m=1024*1024, ...). Deliberately independent of
 // pkg/nbdbridge's ParseNetBufferSpec (which only validates the CLI flag's
-// string format) to avoid an import cycle -- nbdbridge imports zstdrelay,
+// string format) to avoid an import cycle -- nbdbridge imports streamrelay,
 // not the other way around.
 func ParseByteSize(s string) (int, error) {
 	if s == "" {

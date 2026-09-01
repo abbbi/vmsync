@@ -343,10 +343,10 @@ func TestStartLocalStopClosesTheLocalListener(t *testing.T) {
 // netbuffer drain/fill goroutine failed to close its BoundedBuffer when the
 // OTHER side of the same relay direction errored -- a bug the plain
 // "neither enabled" config can never exercise, since that path is a bare
-// io.Copy with no buffer to leak, and the zstdrelay-level regression tests
+// io.Copy with no buffer to leak, and the streamrelay-level regression tests
 // for those two bugs never go through this package's own relayConnection
 // wiring at all. netBufferSize is deliberately small (4096, matching those
-// same zstdrelay-level tests' own reasoning) so the buffer reliably fills
+// same streamrelay-level tests' own reasoning) so the buffer reliably fills
 // within this test's own write loop instead of a regression only showing up
 // once the buffer happens to fill by chance.
 func TestStartLocalDroppedRemoteDoesNotWedgeBridge(t *testing.T) {

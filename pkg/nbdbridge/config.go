@@ -22,7 +22,7 @@ import (
 	"strconv"
 
 	"vmsync/pkg/netbuffer"
-	"vmsync/pkg/zstdrelay"
+	"vmsync/pkg/streamrelay"
 )
 
 // Config describes how NBD traffic should be bridged/compressed between
@@ -34,9 +34,9 @@ type Config struct {
 	Compress bool
 	// CompressLevel's accepted values depend on CompressAlgo: a traditional
 	// numeric zstd level ("1"-"19") for "zstd", or one of "default"/
-	// "better"/"best" for "s2" -- see zstdrelay.NewEncoder.
+	// "better"/"best" for "s2" -- see streamrelay.NewEncoder.
 	CompressLevel  string
-	CompressAlgo   string // "zstd" (default) or "s2" -- see zstdrelay.Algo
+	CompressAlgo   string // "zstd" (default) or "s2" -- see streamrelay.Algo
 	NetBufferBlock string // e.g. "64k"; empty means netbuffer is disabled
 	NetBufferSize  string // e.g. "512M"
 	HelperPath     string // remote path to the vmsync-bridge-helper binary
@@ -69,13 +69,13 @@ func (c Config) Enabled() bool {
 // given compression algorithm (vmsync's -compress=zstd|s2 flag value): zstd
 // takes a traditional numeric level ("1"-"19"), while S2 has no numeric
 // levels at all -- only "default" (fastest, S2's own default), "better", or
-// "best" (see zstdrelay.NewEncoder).
+// "best" (see streamrelay.NewEncoder).
 func ValidateCompressLevel(algo, level string) error {
-	a, err := zstdrelay.ParseAlgo(algo)
+	a, err := streamrelay.ParseAlgo(algo)
 	if err != nil {
 		return err
 	}
-	if a == zstdrelay.AlgoS2 {
+	if a == streamrelay.AlgoS2 {
 		switch level {
 		case "default", "better", "best":
 			return nil
@@ -94,9 +94,9 @@ func ValidateCompressLevel(algo, level string) error {
 }
 
 // ValidateCompressAlgo checks vmsync's -compress=<value> is one
-// pkg/zstdrelay recognizes.
+// pkg/streamrelay recognizes.
 func ValidateCompressAlgo(algo string) error {
-	_, err := zstdrelay.ParseAlgo(algo)
+	_, err := streamrelay.ParseAlgo(algo)
 	return err
 }
 
