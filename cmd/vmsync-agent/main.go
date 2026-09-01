@@ -349,7 +349,7 @@ func run(lv *live, reloads *reloader) error {
 
 	wg.Add(2)
 	go func() { defer wg.Done(); reportLoop(ctx, client, lv, state, sched, ledger, fences) }()
-	go func() { defer wg.Done(); pollLoop(ctx, client, store, state, cfg.metrics) }()
+	go func() { defer wg.Done(); pollLoop(ctx, client, lv, store, state, cfg.metrics) }()
 	wg.Wait()
 	return nil
 }
@@ -473,7 +473,9 @@ func reportLoop(ctx context.Context, client *Client, lv *live, state *sharedStat
 	}
 }
 
-func pollLoop(ctx context.Context, client *Client, store Store, state *sharedState, m *agentMetrics) {
+// lv is taken so the cross-file timeout check below reads the CURRENT
+// http_timeout_sec rather than the one this loop started with.
+func pollLoop(ctx context.Context, client *Client, lv *live, store Store, state *sharedState, m *agentMetrics) {
 	// Backoff applies only to failures. A successful poll returns
 	// immediately into the next one, which is what makes long-polling feel
 	// instant to an operator.
@@ -521,6 +523,30 @@ func pollLoop(ctx context.Context, client *Client, store Store, state *sharedSta
 				backoff = maxBackoff
 			}
 			continue
+		}
+
+		// Complain BEFORE adopting it, and only here -- this branch is reached
+		// only when the document actually changed, since an unchanged one comes
+		// back 304. Warning per poll would repeat every thirty seconds forever.
+		//
+		// Complaints, not refusals: a control plane is a separately-versioned
+		// program, and rejecting its document outright would let a newer UI take
+		// an estate offline over one out-of-range field. The values are still
+		// clamped exactly as before; what is new is that the operator is told.
+		complainAbout(cfg, "control plane")
+
+		// The one rule that spans BOTH files, so neither validator can see it
+		// alone. The UI holds a poll open for poll_wait_seconds; if this
+		// agent's own http_timeout_sec is shorter, every poll ends in a
+		// client-side timeout and no configuration change ever arrives --
+		// while the UI sees a healthy agent asking repeatedly.
+		//
+		// A warning, never a refusal: poll_wait_seconds is the control
+		// plane's to change at any moment, and refusing on it would hand the
+		// UI a lever over its own reachability.
+		if hc := lv.get(); hc.HTTPTimeout > 0 && time.Duration(cfg.PollWaitSeconds)*time.Second >= hc.HTTPTimeout {
+			trace.Warning("the control plane holds polls open at least as long as this agent will wait, so every poll will time out and no configuration change will arrive; raise control_plane.http_timeout_sec above it",
+				"poll_wait_seconds", cfg.PollWaitSeconds, "http_timeout", hc.HTTPTimeout)
 		}
 
 		updated := CachedConfig{ETag: etag, FetchedAtUnix: time.Now().Unix(), Config: cfg}

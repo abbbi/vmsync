@@ -22,6 +22,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
+
+	"vmsync/pkg/trace"
 )
 
 // scheduleDocVersion is the config_version a schedule file must declare.
@@ -118,6 +121,111 @@ func scheduleDocFrom(c UIConfig) ScheduleDoc {
 		MaxConcurrentSyncs:     c.MaxConcurrentSyncs,
 		TargetReplicationSlots: c.TargetReplicationSlots,
 		ShutdownTimeoutSec:     c.ShutdownTimeoutSec,
+	}
+}
+
+// Bounds the wire document is judged against.
+//
+// These are not refusals. The UI is a separately-versioned program, and
+// refusing its document outright would let a newer UI take an estate offline
+// by adding a field or overshooting a range -- so a bad value is clamped or
+// ignored, exactly as before. What changes is that it is no longer SILENT.
+//
+// The failure this closes: an operator sets an interval of 0, or a slot count
+// of -1, and the agent quietly substitutes something else. Nothing is wrong,
+// nothing is logged, and the setting they typed simply never applies. That
+// does not look like a mistake; it looks like the feature not working.
+const (
+	maxPollWaitSeconds       = 600
+	maxReportIntervalSeconds = 3600
+)
+
+// Complaints lists everything wrong with a control-plane-supplied document.
+//
+// Pure and exhaustive, so it can be tested without a UI. Every entry describes
+// what was asked for AND what the agent will do instead, because "invalid
+// interval" tells an operator nothing they can act on.
+func (c UIConfig) Complaints() []string {
+	var out []string
+	add := func(f string, a ...any) { out = append(out, fmt.Sprintf(f, a...)) }
+
+	if c.ReportIntervalSeconds <= 0 {
+		add("report_interval_seconds is %d; using the default of %d", c.ReportIntervalSeconds, DefaultUIConfig().ReportIntervalSeconds)
+	} else if c.ReportIntervalSeconds > maxReportIntervalSeconds {
+		add("report_interval_seconds is %d, which is over the %d cap; this host would look stale to the console between reports", c.ReportIntervalSeconds, maxReportIntervalSeconds)
+	}
+	if c.PollWaitSeconds <= 0 {
+		add("poll_wait_seconds is %d; using the default of %d", c.PollWaitSeconds, DefaultUIConfig().PollWaitSeconds)
+	} else if c.PollWaitSeconds > maxPollWaitSeconds {
+		// Only floored today, never capped. A poll wait longer than the
+		// agent's own HTTP timeout means every poll ends in a client-side
+		// timeout and the agent never sees a config change again.
+		add("poll_wait_seconds is %d, which is over the %d cap; a wait longer than this agent's http_timeout_sec makes every poll time out client-side and no config change would ever arrive", c.PollWaitSeconds, maxPollWaitSeconds)
+	}
+
+	if c.MaxConcurrentSyncs < 0 {
+		add("max_concurrent_syncs is %d; negative is meaningless and the default of %d is being used", c.MaxConcurrentSyncs, defaultMaxConcurrent)
+	} else if c.MaxConcurrentSyncs > hardMaxConcurrent {
+		add("max_concurrent_syncs is %d, clamped to %d", c.MaxConcurrentSyncs, hardMaxConcurrent)
+	}
+
+	for host, n := range c.TargetReplicationSlots {
+		if n < 0 {
+			// admit() tests `slots > 0`, so a negative reads as "no limit" --
+			// the exact opposite of what somebody typing -1 intends.
+			add("target_replication_slots for %s is %d; a negative value is IGNORED, so there is no limit into that host at all", host, n)
+		}
+	}
+
+	if err := validateShutdownTimeoutSec(c.ShutdownTimeoutSec); err != nil && c.ShutdownTimeoutSec != 0 {
+		add("shutdown_timeout_sec %d is out of range and will be clamped: %v", c.ShutdownTimeoutSec, err)
+	}
+
+	seen := map[string]bool{}
+	for i, e := range c.Schedule {
+		where := fmt.Sprintf("schedule entry %d", i+1)
+		if e.VM != "" {
+			where = fmt.Sprintf("schedule entry %d (%s)", i+1, e.VM)
+		}
+		// These three are what launchDue skips SILENTLY -- the only branch in
+		// that loop with neither a log line nor a metric. A VM that never runs
+		// and never says why is the failure this agent exists to make visible.
+		switch {
+		case strings.TrimSpace(e.VM) == "":
+			add("%s has no vm and will never run", where)
+		case e.IntervalSeconds <= 0:
+			add("%s has interval_seconds %d and will never run", where, e.IntervalSeconds)
+		}
+		if e.VM != "" {
+			if seen[e.VM] {
+				add("%s appears more than once; only one entry can ever run, the other is skipped as already running", where)
+			}
+			seen[e.VM] = true
+		}
+		if err := e.Profile.Validate(); err != nil {
+			add("%s has an unusable profile and will be skipped every tick: %v", where, err)
+		}
+		if err := validateShutdownTimeoutSec(e.ShutdownTimeoutSec); err != nil && e.ShutdownTimeoutSec != 0 {
+			add("%s: shutdown_timeout_sec %d is out of range and will be clamped: %v", where, e.ShutdownTimeoutSec, err)
+		}
+	}
+	return out
+}
+
+// ComplainAbout logs everything wrong with a document the control plane sent.
+//
+// Called when a NEW configuration is adopted, not on every poll: the UI
+// answers 304 while nothing has changed, so this fires once per actual change
+// rather than every thirty seconds forever.
+func complainAbout(c UIConfig, source string) {
+	problems := c.Complaints()
+	if len(problems) == 0 {
+		return
+	}
+	trace.Warning("the configuration just received has problems; it has been accepted with the corrections below, because refusing a control plane's document outright would take this host offline over a setting",
+		"source", source, "problems", len(problems))
+	for _, p := range problems {
+		trace.Warning("configuration problem: " + p)
 	}
 }
 

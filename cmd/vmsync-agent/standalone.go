@@ -48,6 +48,10 @@ func runStandalone(lv *live, reloads *reloader) error {
 	if err != nil {
 		return err
 	}
+	// validateStandaloneConfig already refused what it can refuse; this
+	// reports what is merely clamped or ignored, which a hand-written file is
+	// just as capable of containing.
+	complainAbout(uiCfg, cfg.StandaloneFile)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

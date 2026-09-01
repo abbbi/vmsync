@@ -154,6 +154,16 @@ func (c UIConfig) Normalize() UIConfig {
 	if c.PollWaitSeconds <= 0 {
 		c.PollWaitSeconds = d.PollWaitSeconds
 	}
+	// Capped as well as floored. Nothing bounded this before, and a wait
+	// longer than the agent's own HTTP timeout makes every poll end in a
+	// client-side timeout -- after which no configuration change ever
+	// arrives again, silently.
+	if c.PollWaitSeconds > maxPollWaitSeconds {
+		c.PollWaitSeconds = maxPollWaitSeconds
+	}
+	if c.ReportIntervalSeconds > maxReportIntervalSeconds {
+		c.ReportIntervalSeconds = maxReportIntervalSeconds
+	}
 	return c
 }
 

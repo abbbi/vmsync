@@ -140,3 +140,73 @@ func TestScheduleDocRoundTripsEverySetting(t *testing.T) {
 		t.Errorf("round trip lost a setting\n got %+v\nwant %+v", got, in)
 	}
 }
+
+// Every silently-coerced value must now say so. The failure this closes is an
+// operator typing a setting, the agent quietly substituting something else,
+// and nothing anywhere saying the typed value never applied -- which does not
+// look like a mistake, it looks like the feature not working.
+func TestComplaintsNamesEverySilentCoercion(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cfg    UIConfig
+		wantIn string
+	}{
+		{"a zero report interval", UIConfig{ReportIntervalSeconds: 0, PollWaitSeconds: 30}, "report_interval_seconds"},
+		{"a zero poll wait", UIConfig{ReportIntervalSeconds: 60}, "poll_wait_seconds"},
+		{"a poll wait over the cap", UIConfig{ReportIntervalSeconds: 60, PollWaitSeconds: 99999}, "poll_wait_seconds"},
+		{"a negative concurrency limit", UIConfig{ReportIntervalSeconds: 60, PollWaitSeconds: 30, MaxConcurrentSyncs: -1}, "max_concurrent_syncs"},
+		{"a concurrency limit over the clamp", UIConfig{ReportIntervalSeconds: 60, PollWaitSeconds: 30, MaxConcurrentSyncs: 5000}, "clamped"},
+		{
+			// admit() tests `slots > 0`, so a negative reads as "no limit" --
+			// the exact opposite of what -1 is meant to express.
+			"a negative replication slot count",
+			UIConfig{ReportIntervalSeconds: 60, PollWaitSeconds: 30, TargetReplicationSlots: map[string]int{"dr01": -1}},
+			"IGNORED",
+		},
+		{
+			"an entry that can never run",
+			UIConfig{ReportIntervalSeconds: 60, PollWaitSeconds: 30,
+				Schedule: []ScheduleEntry{{VM: "web01", IntervalSeconds: 0, Enabled: true}}},
+			"never run",
+		},
+		{
+			"an entry with no vm",
+			UIConfig{ReportIntervalSeconds: 60, PollWaitSeconds: 30,
+				Schedule: []ScheduleEntry{{IntervalSeconds: 900, Enabled: true}}},
+			"no vm",
+		},
+		{
+			"the same vm twice",
+			UIConfig{ReportIntervalSeconds: 60, PollWaitSeconds: 30,
+				Schedule: []ScheduleEntry{
+					{VM: "web01", IntervalSeconds: 900, Enabled: true},
+					{VM: "web01", IntervalSeconds: 900, Enabled: true},
+				}},
+			"more than once",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.cfg.Complaints()
+			joined := strings.Join(got, "\n")
+			if !strings.Contains(joined, tc.wantIn) {
+				t.Errorf("Complaints() = %v, want something mentioning %q", got, tc.wantIn)
+			}
+		})
+	}
+}
+
+// A sound document must produce silence, or the warnings become noise nobody
+// reads and the whole mechanism is worse than nothing.
+func TestComplaintsIsSilentOnAGoodConfig(t *testing.T) {
+	c := UIConfig{
+		ReportIntervalSeconds:  60,
+		PollWaitSeconds:        30,
+		MaxConcurrentSyncs:     4,
+		TargetReplicationSlots: map[string]int{"dr01": 2},
+		ShutdownTimeoutSec:     300,
+		Schedule:               []ScheduleEntry{{VM: "web01", IntervalSeconds: 900, Enabled: true}},
+	}
+	if got := c.Complaints(); len(got) != 0 {
+		t.Errorf("a valid configuration produced complaints: %v", got)
+	}
+}
