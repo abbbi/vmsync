@@ -19,7 +19,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -124,20 +123,18 @@ func runStandalone(lv *live, reloads *reloader) error {
 // ignored -- which does not look like a mistake, it looks like the
 // scheduler not working.
 func loadStandaloneConfig(path string) (UIConfig, error) {
-	f, err := os.Open(path)
+	// ScheduleDoc, which has no Operations field.
+	//
+	// This used to decode UIConfig, operations and all -- and runStandalone
+	// starts no operations loop, so an "operations" block in a hand-written
+	// file parsed cleanly, was accepted, and then vanished without a word. An
+	// operator could put one there and watch nothing happen, indefinitely.
+	// Now the strict decoder reports it as an unknown key, by name.
+	doc, err := LoadScheduleFile(path)
 	if err != nil {
-		return UIConfig{}, fmt.Errorf("open standalone schedule %s: %w", path, err)
+		return UIConfig{}, err
 	}
-	defer f.Close()
-
-	dec := json.NewDecoder(f)
-	dec.DisallowUnknownFields()
-	var cfg UIConfig
-	if err := dec.Decode(&cfg); err != nil {
-		return UIConfig{}, fmt.Errorf("parse standalone schedule %s: %w", path, err)
-	}
-
-	cfg = cfg.Normalize()
+	cfg := doc.toUIConfig().Normalize()
 	if err := validateStandaloneConfig(cfg); err != nil {
 		return UIConfig{}, fmt.Errorf("standalone schedule %s: %w", path, err)
 	}

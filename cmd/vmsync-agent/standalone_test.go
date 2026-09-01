@@ -35,6 +35,7 @@ func writeStandalone(t *testing.T, body string) string {
 
 func TestLoadStandaloneConfig(t *testing.T) {
 	path := writeStandalone(t, `{
+	  "config_version": 1,
 	  "schedule": [
 	    {"vm": "web01", "interval_seconds": 900, "enabled": true,
 	     "target_host": "dr01",
@@ -76,6 +77,7 @@ func TestLoadStandaloneConfig(t *testing.T) {
 // scheduler not working, which is a much longer afternoon.
 func TestLoadStandaloneConfigRejectsUnknownFields(t *testing.T) {
 	path := writeStandalone(t, `{
+	  "config_version": 1,
 	  "schedule": [{"vm": "web01", "interval_secondss": 900, "enabled": true}]
 	}`)
 	_, err := loadStandaloneConfig(path)

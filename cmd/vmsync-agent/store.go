@@ -183,36 +183,57 @@ func (s Store) SaveCredentials(c Credentials) error {
 // yields the defaults with ok=false, so a caller can tell "never reached
 // the UI" from "reached it and it said this".
 func (s Store) LoadCache() (CachedConfig, bool, error) {
-	var c CachedConfig
-	ok, err := readJSON(s.cachePath(), &c)
-	if !ok || err != nil {
-		return CachedConfig{Config: DefaultUIConfig()}, ok, err
+	data, err := os.ReadFile(s.cachePath())
+	if os.IsNotExist(err) {
+		return CachedConfig{Config: DefaultUIConfig()}, false, nil
 	}
-	c.Config = c.Config.Normalize()
-	// Operations never survive a restart, and this is where that is
-	// enforced -- structurally, rather than by everyone downstream
-	// remembering to.
+	if err != nil {
+		return CachedConfig{Config: DefaultUIConfig()}, false, fmt.Errorf("read %s: %w", s.cachePath(), err)
+	}
+	// Decoded as a ScheduleDoc, which has NO Operations field.
 	//
-	// The cache exists so the SCHEDULE keeps running through a partition,
-	// which is desired state and safe to replay. An operation is the
-	// opposite: replaying one from disk means an agent that was killed
-	// mid-promotion, or simply restarted by a package upgrade, performs a
-	// failover from an instruction nobody re-issued and which may be hours
-	// stale. The ledger guards an operation that already ran; this guards
-	// one that never started.
+	// This used to decode CachedConfig -- which carries them -- and then set
+	// c.Config.Operations = nil immediately afterwards. That line was correct
+	// and well-reasoned, and it was a runtime guard on a type that permitted
+	// exactly what it guarded against, which every future decoder of that
+	// type had to remember. Now the type cannot express an operation at all,
+	// so no edit here can start replaying failovers off a disk.
 	//
-	// A still-current operation is not lost by this -- the UI keeps
-	// publishing until it sees a result, so the next poll delivers it again
-	// over the wire, where acting on it is legitimate.
-	c.Config.Operations = nil
-	return c, true, nil
+	// Lenient about unknown keys, unlike the standalone file: this copy is
+	// written by this same binary, so an unknown key means a downgrade, and
+	// refusing to read it would strand the host with no schedule during
+	// precisely the partition the cache exists for.
+	sd, err := decodeScheduleDoc(data, false, s.cachePath())
+	if err != nil {
+		return CachedConfig{Config: DefaultUIConfig()}, false, err
+	}
+	var env struct {
+		Source ScheduleSource `json:"source"`
+	}
+	// Best-effort: an envelope this cannot read costs one unconditional poll,
+	// not a startup failure.
+	_ = json.Unmarshal(data, &env)
+
+	return CachedConfig{
+		ETag:          env.Source.ETag,
+		FetchedAtUnix: env.Source.FetchedAtUnix,
+		Config:        sd.toUIConfig().Normalize(),
+	}, true, nil
 }
 
 // SaveCache records a configuration the UI confirmed. 0644 rather than
 // 0600: it holds no secret, and being readable makes an incident easier to
 // diagnose from a shell.
 func (s Store) SaveCache(c CachedConfig) error {
-	return writeJSONAtomic(s.cachePath(), c, 0o644)
+	// Written as a StoredSchedule, so operations are dropped on the way OUT
+	// by construction too: there is no field to copy them into. Previously
+	// the whole CachedConfig went to disk, operations and all, and only the
+	// READ side removed them -- which meant a live failover instruction sat
+	// in a 0644 file on the host for as long as the UI kept publishing it.
+	return writeJSONAtomic(s.cachePath(), StoredSchedule{
+		ScheduleDoc: scheduleDocFrom(c.Config),
+		Source:      ScheduleSource{ETag: c.ETag, FetchedAtUnix: c.FetchedAtUnix},
+	}, 0o644)
 }
 
 func readJSON(path string, into any) (bool, error) {
