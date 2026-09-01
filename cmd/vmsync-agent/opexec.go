@@ -45,7 +45,9 @@ const opTickInterval = 5 * time.Second
 // own, so nobody ever removes the flag -- and it is also the machine a
 // failover must run on. Tying the two together would deliver a promotion to
 // a visibly healthy agent that silently ignores it.
-func operationsLoop(ctx context.Context, cfg agentConfig, state *sharedState, ledger *operationLedger) {
+// One snapshot per cycle. An operation that started under one vmsync_path
+// must finish under it -- runOperation takes the value, never the pointer.
+func operationsLoop(ctx context.Context, lv *live, state *sharedState, ledger *operationLedger) {
 	ticker := time.NewTicker(opTickInterval)
 	defer ticker.Stop()
 
@@ -58,6 +60,7 @@ func operationsLoop(ctx context.Context, cfg agentConfig, state *sharedState, le
 		// running concurrently on one host is not a throughput problem to
 		// solve but a situation nobody should be able to create by clicking
 		// twice. A long one blocking the loop is the correct behaviour.
+		cfg := *lv.get()
 		cached := state.get()
 		published := map[string]bool{}
 		for _, op := range cached.Config.Operations {

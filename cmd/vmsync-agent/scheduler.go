@@ -84,7 +84,10 @@ const (
 // site and a partition is an ordinary event, so replication must not stop
 // just because nobody can currently change it.
 type Scheduler struct {
-	cfg   agentConfig
+	// lv, not a captured agentConfig value. A copy taken at construction can
+	// never observe a reload, and the scheduler is the component whose
+	// settings an operator is most likely to change while it runs.
+	lv    *live
 	state *sharedState
 
 	mu       sync.Mutex
@@ -95,14 +98,14 @@ type Scheduler struct {
 	results  []SyncResult
 }
 
-func NewScheduler(cfg agentConfig, state *sharedState) *Scheduler {
+func NewScheduler(lv *live, state *sharedState) *Scheduler {
 	return &Scheduler{
-		cfg:      cfg,
+		lv:       lv,
 		state:    state,
 		nextRun:  map[string]time.Time{},
 		inFlight: map[string]bool{},
 		hostLoad: map[string]int{},
-		metrics:  cfg.metrics,
+		metrics:  lv.get().metrics,
 	}
 }
 
@@ -149,6 +152,11 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 // launchDue starts every entry that is due and admissible right now.
 func (s *Scheduler) launchDue(ctx context.Context, wg *sync.WaitGroup) {
+	// ONE configuration snapshot per tick, threaded through everything this
+	// tick does and captured into each launch. A second get() further down
+	// would give generation N's argv and generation N+1's binary -- and a
+	// sync that started under one ssh_key must finish under it.
+	cfg := s.lv.get()
 	cached := s.state.get()
 	now := time.Now()
 
@@ -185,7 +193,7 @@ func (s *Scheduler) launchDue(ctx context.Context, wg *sync.WaitGroup) {
 		// reads as "not held", the launch goes ahead, and the engine's own
 		// lock makes the real decision. See util.RunLockHeld on why this fails
 		// open.
-		if held, reason := s.foreignRunHolds(entry.VM); held {
+		if held, reason := s.foreignRunHolds(cfg, entry.VM); held {
 			trace.Info("skipping a scheduled sync: a vmsync started outside this agent is still working on this domain",
 				"vm", entry.VM, "reason", reason)
 			s.metrics.skip(skipForeignRun)
@@ -201,14 +209,14 @@ func (s *Scheduler) launchDue(ctx context.Context, wg *sync.WaitGroup) {
 			continue
 		}
 
-		req, err := s.buildRequest(entry)
+		req, err := s.buildRequest(cfg, entry)
 		if err != nil {
 			trace.Error("could not prepare a scheduled sync", "vm", entry.VM, "error", err)
 			s.metrics.skip(skipNoTarget)
 			s.deferEntry(entry, now)
 			continue
 		}
-		if !s.admit(entry.VM, req.targetHost, cached.Config) {
+		if !s.admit(cfg, entry.VM, req.targetHost, cached.Config) {
 			// Not deferred: leaving nextRun in the past means this entry is
 			// retried on the next tick, as soon as a slot frees up.
 			continue
@@ -219,7 +227,7 @@ func (s *Scheduler) launchDue(ctx context.Context, wg *sync.WaitGroup) {
 		go func(entry ScheduleEntry, req syncPlan) {
 			defer wg.Done()
 			defer s.release(entry.VM, req.targetHost)
-			s.runOne(ctx, entry, req)
+			s.runOne(ctx, cfg, entry, req)
 		}(entry, req)
 	}
 }
@@ -260,7 +268,7 @@ func (s *Scheduler) due(entry ScheduleEntry, now time.Time) bool {
 // what every vmsync before this feature left behind), an unparseable one, an
 // unreadable /proc: all mean "launch, and let the engine decide". The reason
 // string is for the log and is never a reason to refuse.
-func (s *Scheduler) foreignRunHolds(vm string) (bool, string) {
+func (s *Scheduler) foreignRunHolds(cfg *agentConfig, vm string) (bool, string) {
 	id, ok, err := util.ReadRunLockIdentity(util.RunLockDir, vm)
 	if err != nil {
 		// Worth saying out loud -- somebody has put something else in this
@@ -271,7 +279,7 @@ func (s *Scheduler) foreignRunHolds(vm string) (bool, string) {
 	if !ok {
 		return false, ""
 	}
-	return util.RunLockHeld(id, s.cfg.VmsyncPath)
+	return util.RunLockHeld(id, cfg.VmsyncPath)
 }
 
 // isRunning reports whether this VM's previous run is still going.
@@ -372,8 +380,8 @@ func effectiveMaxConcurrent(fromConfig, hostLimit int) int {
 	return max
 }
 
-func (s *Scheduler) admit(vm, targetHost string, cfg UIConfig) bool {
-	max := effectiveMaxConcurrent(cfg.MaxConcurrentSyncs, s.cfg.MaxConcurrentSyncs)
+func (s *Scheduler) admit(host *agentConfig, vm, targetHost string, cfg UIConfig) bool {
+	max := effectiveMaxConcurrent(cfg.MaxConcurrentSyncs, host.MaxConcurrentSyncs)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -420,8 +428,8 @@ type syncPlan struct {
 // local libvirt -- not from the UI. A domain name supplied over the network
 // would be a parameter needing validation; one read from local state is not
 // attacker-controlled at all.
-func (s *Scheduler) buildRequest(entry ScheduleEntry) (syncPlan, error) {
-	return buildSyncRequest(s.cfg, entry)
+func (s *Scheduler) buildRequest(cfg *agentConfig, entry ScheduleEntry) (syncPlan, error) {
+	return buildSyncRequest(*cfg, entry)
 }
 
 // buildSyncRequest is buildRequest's body, as a free function.
@@ -515,19 +523,19 @@ func splitReplicaRef(ref string) (host, domain string) {
 }
 
 // runOne executes a single sync and records its outcome.
-func (s *Scheduler) runOne(ctx context.Context, entry ScheduleEntry, plan syncPlan) {
+func (s *Scheduler) runOne(ctx context.Context, cfg *agentConfig, entry ScheduleEntry, plan syncPlan) {
 	args := plan.CommandArgs()
 	started := time.Now()
 
 	trace.Info("starting scheduled sync", "vm", entry.VM, "target", plan.targetHost, "interval_s", entry.IntervalSeconds)
-	trace.Debug("sync command", "vm", entry.VM, "binary", s.cfg.VmsyncPath, "args", strings.Join(args, " "))
+	trace.Debug("sync command", "vm", entry.VM, "binary", cfg.VmsyncPath, "args", strings.Join(args, " "))
 
 	// exec.CommandContext, not a shell: args is an argv, so nothing here is
 	// ever parsed for metacharacters. Cancelling ctx sends SIGKILL by
 	// default, which would rob vmsync of its cleanup -- so Cancel is
 	// overridden to send SIGTERM and WaitDelay gives it time to unwind
 	// before the kill lands.
-	cmd := exec.CommandContext(ctx, s.cfg.VmsyncPath, args...)
+	cmd := exec.CommandContext(ctx, cfg.VmsyncPath, args...)
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 60 * time.Second
 
@@ -542,10 +550,10 @@ func (s *Scheduler) runOne(ctx context.Context, entry ScheduleEntry, plan syncPl
 	// engage, the deferred release would never run, and the agent would wedge
 	// with an orphaned child.
 	runID := newRunID()
-	if err := s.cfg.runLog.Append(runLogRecord{
+	if err := cfg.runLog.Append(runLogRecord{
 		Event: runEventLaunch, RunID: runID, Origin: runOriginScheduled,
 		VM: entry.VM, TargetHost: plan.targetHost,
-		Binary: s.cfg.VmsyncPath, Args: redactArgs(args),
+		Binary: cfg.VmsyncPath, Args: redactArgs(args),
 	}); err != nil {
 		// Not deferred: nextRun is left in the past so this retries on the
 		// next tick, the moment the disk frees. Deferring would add an
@@ -611,7 +619,7 @@ func (s *Scheduler) runOne(ctx context.Context, entry ScheduleEntry, plan syncPl
 	if outcome != "success" {
 		exitRec.LogTail = res.LogTail
 	}
-	if lerr := s.cfg.runLog.Append(exitRec); lerr != nil {
+	if lerr := cfg.runLog.Append(exitRec); lerr != nil {
 		trace.Error("could not record how a sync ended; it will show as an open run until this is cleaned up",
 			"vm", entry.VM, "run_id", runID, "error", lerr)
 	}

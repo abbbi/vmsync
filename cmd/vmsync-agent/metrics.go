@@ -98,6 +98,8 @@ type agentMetrics struct {
 	// runLogWritable starts true: an agent that could not open the run log
 	// never reaches a metrics write, because it refuses to start.
 	runLogWritable atomic.Bool
+	configRejects  atomic.Uint64
+	configGen      atomic.Uint64
 	skips          map[string]*atomic.Uint64 // fixed keys; never written after construction
 
 	uiLastContact atomic.Int64 // unix seconds, 0 = never
@@ -237,6 +239,29 @@ func (m *agentMetrics) runBusy() {
 		return
 	}
 	m.runsBusy.Add(1)
+}
+
+// configRejected counts reloads refused because the new file asked for
+// something a running agent cannot do -- today, moving state_dir or changing
+// mode. Its own series because the remedy is a restart, not an edit: an
+// operator watching only the generation gauge would see it stop advancing and
+// have no idea why.
+func (m *agentMetrics) configRejected() {
+	if m == nil {
+		return
+	}
+	m.configRejects.Add(1)
+}
+
+// setConfigGeneration publishes which configuration is in force, so a scrape
+// can tell an agent that adopted an edit from one that is still running the
+// file as it was at boot -- the difference an operator most wants after
+// changing something and seeing no effect.
+func (m *agentMetrics) setConfigGeneration(gen uint64) {
+	if m == nil {
+		return
+	}
+	m.configGen.Store(gen)
 }
 
 // setRunLogWritable records whether the run log can currently be written.
@@ -404,6 +429,8 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	// succeed. Non-zero means this host shut a production VM down without a
 	// record that survives a restart, so the same fence may be attempted
 	// again -- and it means the ledger's filesystem is in trouble.
+	g("vmsync_agent_config_generation", "Which generation of the configuration file is in force: 0 at startup, +1 per accepted reload.", m.configGen.Load(), "")
+	c("vmsync_agent_config_rejected_total", "Reloads refused because the new file asked for something a running agent cannot do, such as moving state_dir. Needs a restart, not another edit.", m.configRejects.Load(), "")
 	g("vmsync_agent_run_log_writable", "1 when the run log can be written. At 0 this host launches no syncs at all, because an unrecorded vmsync is refused.", boolGauge(m.runLogWritable.Load()), "")
 	c("vmsync_agent_fences_unrecorded_total", "Fences that proceeded without a durable ledger record, because writing it failed and a split brain is the worse outcome.", m.fencesUnrecorded.Load(), "")
 
@@ -466,12 +493,15 @@ func (m *agentMetrics) writeMetrics(dir string, cached CachedConfig, sched *Sche
 // their own -- how long since the UI answered, how overdue a sync is -- so
 // they must be refreshed even when nothing at all is happening, which is
 // exactly the state being alerted on.
-func metricsLoop(ctx context.Context, cfg agentConfig, state *sharedState, sched *Scheduler, m *agentMetrics, scanInventory bool) {
+func metricsLoop(ctx context.Context, lv *live, state *sharedState, sched *Scheduler, m *agentMetrics, scanInventory bool) {
 	ticker := time.NewTicker(metricsInterval)
 	defer ticker.Stop()
 
 	var lastErr string
 	for {
+		// One snapshot per write, so prometheus_dir and the concurrency
+		// ceiling in a single file always come from the same generation.
+		cfg := *lv.get()
 		if scanInventory {
 			if total, byStatus, err := scanDomainStatus(cfg); err == nil {
 				m.setDomains(total, byStatus)

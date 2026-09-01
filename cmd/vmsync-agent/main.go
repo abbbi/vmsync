@@ -59,6 +59,11 @@ import (
 )
 
 type agentConfig struct {
+	// Gen is which generation of the configuration file this is: 0 at
+	// startup, incremented by every accepted reload. Inside the struct rather
+	// than a counter beside it, so a reader that holds a pointer can always
+	// say WHICH configuration it is acting on.
+	Gen uint64
 	// ConfigPath is the file this configuration came from, kept so a reload
 	// knows what to re-read and so errors can name it.
 	ConfigPath  string
@@ -209,17 +214,27 @@ func main() {
 	// lost by that: every Append fsyncs before it returns, so there is never
 	// buffered data waiting on a Close.
 
+	// One live configuration, shared by every loop, replaced wholesale by a
+	// reload. Built here so both entry points get the same handle.
+	lv := newLive(cfg)
+
+	// The digest of the bytes that produced generation 0, so the first poll
+	// does not mistake "unchanged" for "changed".
+	initial, _ := os.ReadFile(*configPath)
+	reloads := newReloader(lv, *configPath, configDigest(initial), *once, *debug)
+
 	runner := run
 	if cfg.StandaloneFile != "" {
 		runner = runStandalone
 	}
-	if err := runner(cfg); err != nil {
+	if err := runner(lv, reloads); err != nil {
 		trace.Error("agent stopped", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfg agentConfig) error {
+func run(lv *live, reloads *reloader) error {
+	cfg := *lv.get()
 	client, err := NewClient(cfg.UIBase, cfg.CAFile, cfg.HTTPTimeout)
 	if err != nil {
 		return err
@@ -239,6 +254,15 @@ func run(cfg agentConfig) error {
 		trace.Info("signal received, shutting down", "signal", sig.String())
 		cancel()
 	}()
+
+	// SIGHUP is a RELOAD, not a shutdown. Registering it matters beyond the
+	// feature: Go terminates on an unhandled SIGHUP, so before this,
+	// `systemctl reload` was `systemctl kill` -- and the natural fallback,
+	// `systemctl kill -s HUP`, signals the whole control group and would take
+	// every in-flight vmsync down without its unwind path.
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	go reloads.Run(ctx, hupCh)
 
 	creds, err := ensureEnrolled(ctx, client, store, cfg)
 	if err != nil {
@@ -282,7 +306,7 @@ func run(cfg agentConfig) error {
 
 	var sched *Scheduler
 	if !cfg.NoSchedule {
-		sched = NewScheduler(cfg, state)
+		sched = NewScheduler(lv, state)
 		wg.Add(1)
 		go func() { defer wg.Done(); sched.Run(ctx) }()
 		trace.Info("scheduler running", "vmsync", cfg.VmsyncPath, "target_uri_pattern", cfg.TargetURIPattern)
@@ -295,7 +319,7 @@ func run(cfg agentConfig) error {
 		// scanInventory false: reportLoop already scans on its own
 		// interval and feeds the counts in, so doing it here too would
 		// double the libvirt work for the same numbers.
-		go func() { defer wg.Done(); metricsLoop(ctx, cfg, state, sched, cfg.metrics, false) }()
+		go func() { defer wg.Done(); metricsLoop(ctx, lv, state, sched, cfg.metrics, false) }()
 	}
 
 	// Started regardless of -no-schedule. That flag means "do not run the
@@ -305,7 +329,7 @@ func run(cfg agentConfig) error {
 	// Tying the two together would deliver a promotion to a visibly healthy
 	// agent that silently ignores it.
 	wg.Add(1)
-	go func() { defer wg.Done(); operationsLoop(ctx, cfg, state, ledger) }()
+	go func() { defer wg.Done(); operationsLoop(ctx, lv, state, ledger) }()
 
 	// Also started regardless of -no-schedule, and for a sharper reason
 	// than the operations loop: a source whose replication was disabled --
@@ -321,10 +345,10 @@ func run(cfg agentConfig) error {
 		return fmt.Errorf("load the fence ledger: %w", err)
 	}
 	wg.Add(1)
-	go func() { defer wg.Done(); fenceLoop(ctx, cfg, state, fences) }()
+	go func() { defer wg.Done(); fenceLoop(ctx, lv, state, fences) }()
 
 	wg.Add(2)
-	go func() { defer wg.Done(); reportLoop(ctx, client, cfg, state, sched, ledger, fences) }()
+	go func() { defer wg.Done(); reportLoop(ctx, client, lv, state, sched, ledger, fences) }()
 	go func() { defer wg.Done(); pollLoop(ctx, client, store, state, cfg.metrics) }()
 	wg.Wait()
 	return nil
@@ -412,8 +436,11 @@ func reportOnce(ctx context.Context, client *Client, cfg agentConfig, cached Cac
 	return nil
 }
 
-func reportLoop(ctx context.Context, client *Client, cfg agentConfig, state *sharedState, sched *Scheduler, ledger *operationLedger, fences *fenceLedger) {
+// One snapshot per report, so a report cannot mix the hostname of one
+// generation with the domains inventoried under another.
+func reportLoop(ctx context.Context, client *Client, lv *live, state *sharedState, sched *Scheduler, ledger *operationLedger, fences *fenceLedger) {
 	for {
+		cfg := *lv.get()
 		cached := state.get()
 		report, err := buildReport(cfg, cached, sched, ledger, fences)
 		if err != nil {

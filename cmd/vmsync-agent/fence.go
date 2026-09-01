@@ -264,12 +264,16 @@ func (l *fenceLedger) LatestByVM() map[string]fenceRecord {
 //     loop is what makes the answer arrive when there is no UI to issue one.
 //     Either way the token is read from the peer's own libvirt, never taken
 //     on the control plane's word.
-func fenceLoop(ctx context.Context, cfg agentConfig, state *sharedState, ledger *fenceLedger) {
+//
+// One configuration snapshot per SWEEP, taken at the top and used for the
+// whole of it. A sweep that started under one libvirt_uri must not finish
+// under another: half its peer queries would name a different host.
+func fenceLoop(ctx context.Context, lv *live, state *sharedState, ledger *fenceLedger) {
 	ticker := time.NewTicker(fenceTickInterval)
 	defer ticker.Stop()
 
 	for {
-		sweepFences(ctx, cfg, state, ledger)
+		sweepFences(ctx, *lv.get(), state, ledger)
 		select {
 		case <-ctx.Done():
 			return

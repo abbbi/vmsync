@@ -43,7 +43,8 @@ import (
 // slots, staggering, skip-if-still-running and per-VM outcome logging, for a
 // host that will never have a control plane. An agent installed this way can
 // be enrolled later without changing anything about how it runs syncs.
-func runStandalone(cfg agentConfig) error {
+func runStandalone(lv *live, reloads *reloader) error {
+	cfg := *lv.get()
 	uiCfg, err := loadStandaloneConfig(cfg.StandaloneFile)
 	if err != nil {
 		return err
@@ -58,6 +59,13 @@ func runStandalone(cfg agentConfig) error {
 		trace.Info("signal received, shutting down", "signal", sig.String())
 		cancel()
 	}()
+
+	// A standalone agent reloads exactly like a control-plane one: the file
+	// is the only way to configure either, so it must be the only way to
+	// reconfigure either.
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	go reloads.Run(ctx, hupCh)
 
 	enabled := 0
 	for _, e := range uiCfg.Schedule {
@@ -84,11 +92,11 @@ func runStandalone(cfg agentConfig) error {
 	state := &sharedState{cached: CachedConfig{Config: uiCfg}}
 
 	var wg sync.WaitGroup
-	sched := NewScheduler(cfg, state)
+	sched := NewScheduler(lv, state)
 	if cfg.metrics != nil {
 		wg.Add(1)
 		// scanInventory true: there is no reportLoop here to do it.
-		go func() { defer wg.Done(); metricsLoop(ctx, cfg, state, sched, cfg.metrics, true) }()
+		go func() { defer wg.Done(); metricsLoop(ctx, lv, state, sched, cfg.metrics, true) }()
 	}
 	wg.Add(1)
 	go func() { defer wg.Done(); sched.Run(ctx) }()
@@ -103,7 +111,7 @@ func runStandalone(cfg agentConfig) error {
 		return fmt.Errorf("load the fence ledger: %w", err)
 	}
 	wg.Add(1)
-	go func() { defer wg.Done(); fenceLoop(ctx, cfg, state, fences) }()
+	go func() { defer wg.Done(); fenceLoop(ctx, lv, state, fences) }()
 
 	wg.Wait()
 	return nil
