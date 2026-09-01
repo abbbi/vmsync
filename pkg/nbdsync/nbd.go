@@ -353,65 +353,106 @@ func zeroRanges(extents []Extent) []Extent {
 	return out
 }
 
-// coveredByZero reports whether [offset, offset+length) lies ENTIRELY inside
-// one of ranges.
+// minSkipBytes is the smallest both-zero run worth interrupting a read for.
 //
-// Entirely, and inside a SINGLE range, deliberately. A chunk that is only
-// partly zero, or that spans two zero ranges with anything between them, is
-// not provably equal on both sides and must be read. Being conservative here
-// costs a read; being clever costs a verify that reports clean over real
-// corruption.
-func coveredByZero(offset, length uint64, ranges []Extent) bool {
-	if length == 0 {
-		return false
-	}
-	end := offset + length
-	for _, r := range ranges {
-		if r.Offset <= offset && offset+length <= r.Offset+r.Length {
-			return true
+// Every skip costs an extra chunk boundary: one more pipeline slot cycle and
+// one more AIO buffer. Below roughly a megabyte the read being avoided is
+// smaller than that overhead, and a fragmented image can have hundreds of
+// tiny holes -- disk1 of a real test VM has eleven 64 KiB holes inside a
+// single megabyte. Splitting on each of those would cost more than reading
+// straight through them.
+const minSkipBytes = 1 << 20
+
+// intersectRanges returns what BOTH inputs cover. Both must be offset-ordered
+// and non-overlapping, which is what zeroRanges produces.
+func intersectRanges(a, b []Extent) []Extent {
+	var out []Extent
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		aStart, aEnd := a[i].Offset, a[i].Offset+a[i].Length
+		bStart, bEnd := b[j].Offset, b[j].Offset+b[j].Length
+		start, end := max(aStart, bStart), min(aEnd, bEnd)
+		if start < end {
+			out = append(out, Extent{Offset: start, Length: end - start, Zero: true})
 		}
-		// Ranges are offset-ordered, so once one starts past this chunk's
-		// end, nothing later can contain it.
-		if r.Offset >= end {
-			break
+		if aEnd < bEnd {
+			i++
+		} else {
+			j++
 		}
 	}
-	return false
+	return out
 }
 
-// planCompareChunks splits [0, size) into bufferSize-capped chunks, dropping
-// any chunk that reads as zeros on BOTH sides.
+// planCompareChunks decides what the compare actually has to read: the whole
+// image, minus the runs that read as zeros on BOTH sides.
 //
-// Why this is safe: NBD_STATE_ZERO is a server's assertion that the range
-// reads as zeros. If both servers assert it for the whole chunk, the two
-// sides are equal by construction and reading them would be reading two
-// identical blocks of zeros across the network to discover that.
+// Built from the DATA rather than by filtering a fixed grid, which is the
+// difference between useful and nearly useless on a sparse disk. A grid drops
+// only chunks that are entirely zero, so one 64 KiB run of data keeps a whole
+// 32 MiB chunk alive: a real 10 GiB replica holding 3 MiB of data still had
+// 192 MiB read. Chunking the non-zero regions instead reads the 3 MiB.
 //
-// Why it is NOT based on NBD_STATE_HOLE, which is the more obvious signal:
-// a hole says "unallocated", and an unallocated cluster in a qcow2 with a
-// backing file reads the BACKING FILE. Two images could both report a hole
-// over a range and still differ. Skipping on HOLE would be a verify that
-// silently passes over exactly the corruption it exists to find.
+// Why skipping is safe: NBD_STATE_ZERO is the server's assertion that a range
+// reads as zeros. Where both servers assert it, the two sides are equal by
+// construction, and reading them would be pulling two identical runs of zeros
+// across a network to discover that.
 //
-// Either side reporting nothing (an empty slice -- a server that does not
-// advertise base:allocation, or a query that failed) degrades to comparing
-// everything, which is the old behaviour and always correct.
-func planCompareChunks(size, bufferSize uint64, aZero, bZero []Extent) (chunks []compareChunk, skipped uint64) {
-	if bufferSize == 0 {
+// Why NOT NBD_STATE_HOLE, which is the more obvious signal: a hole says
+// "unallocated", and an unallocated cluster in a qcow2 that has a backing
+// file reads the BACKING FILE. Two images could both report a hole over a
+// range and genuinely differ, so skipping on HOLE would be a verify that
+// passes silently over exactly the corruption it exists to find. In practice
+// qemu sets ZERO alongside HOLE for these images -- verified against real
+// qemu-img map output -- so the strict test costs nothing.
+//
+// Either side reporting nothing (a server that does not advertise
+// base:allocation, or a query that failed) degrades to comparing everything:
+// the old behaviour, always correct.
+func planCompareChunks(size, bufferSize, minSkip uint64, aZero, bZero []Extent) (chunks []compareChunk, skipped uint64) {
+	if bufferSize == 0 || size == 0 {
 		return nil, 0
 	}
-	for offset := uint64(0); offset < size; {
-		step := bufferSize
-		if remain := size - offset; remain < step {
-			step = remain
+
+	// Only runs big enough to be worth a boundary.
+	var skips []Extent
+	for _, r := range intersectRanges(aZero, bZero) {
+		if r.Length >= minSkip {
+			skips = append(skips, r)
 		}
-		if coveredByZero(offset, step, aZero) && coveredByZero(offset, step, bZero) {
-			skipped += step
-			offset += step
+	}
+
+	emit := func(from, to uint64) {
+		for from < to {
+			step := bufferSize
+			if remain := to - from; remain < step {
+				step = remain
+			}
+			chunks = append(chunks, compareChunk{offset: from, length: step})
+			from += step
+		}
+	}
+
+	pos := uint64(0)
+	for _, s := range skips {
+		start, end := s.Offset, s.Offset+s.Length
+		if end > size {
+			end = size
+		}
+		if start < pos {
+			start = pos
+		}
+		if start >= end {
 			continue
 		}
-		chunks = append(chunks, compareChunk{offset: offset, length: step})
-		offset += step
+		if start > pos {
+			emit(pos, start)
+		}
+		skipped += end - start
+		pos = end
+	}
+	if pos < size {
+		emit(pos, size)
 	}
 	return chunks, skipped
 }
@@ -1041,7 +1082,7 @@ func compareTCP(ctx context.Context, aHost string, aPort int, aExport string, bH
 	// it; a side that cannot answer simply contributes no skips.
 	aZero := zeroRanges(allocationExtents(ctx, a, "source"))
 	bZero := zeroRanges(allocationExtents(ctx, b, "target"))
-	chunks, skippedBytes := planCompareChunks(size, bufferSize, aZero, bZero)
+	chunks, skippedBytes := planCompareChunks(size, bufferSize, minSkipBytes, aZero, bZero)
 	if skippedBytes > 0 {
 		trace.Info("nbd compare: skipping ranges that read as zeros on both sides",
 			"export", aExport, "skipped_bytes", skippedBytes, "total_bytes", size,
