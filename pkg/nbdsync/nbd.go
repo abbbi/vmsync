@@ -119,6 +119,18 @@ type Extent struct {
 	Offset uint64
 	Length uint64
 	Dirty  bool
+	// Zero is NBD_STATE_ZERO: this range READS AS ZEROS. Only meaningful
+	// for a base:allocation scan; always false for a dirty-bitmap one,
+	// where bit 1 carries no such meaning.
+	//
+	// Deliberately distinct from !Dirty, which for base:allocation is
+	// NBD_STATE_HOLE -- "not allocated". The two are not the same and
+	// conflating them is unsafe: an unallocated cluster in a qcow2 that has
+	// a BACKING FILE reads from that backing file, not zeros. Anything that
+	// wants to skip a range on the grounds that both sides must be equal
+	// needs ZERO, which is a protocol guarantee, not HOLE, which is a
+	// statement about storage layout.
+	Zero bool
 }
 
 func ChangedExtentsTCP(ctx context.Context, host string, port int, exportName, checkpointName string, incremental bool) ([]Extent, uint64, uint64, error) {
@@ -204,7 +216,12 @@ func ChangedExtentsTCP(ctx context.Context, host string, port int, exportName, c
 				if data {
 					dirty++
 				}
-				out = append(out, Extent{Offset: offs, Length: uint64(length), Dirty: data})
+				out = append(out, Extent{
+					Offset: offs,
+					Length: uint64(length),
+					Dirty:  data,
+					Zero:   !incremental && flags&nbdStateZero != 0,
+				})
 				offs += uint64(length)
 			}
 			if offs > describedEnd {
@@ -239,11 +256,175 @@ func ChangedExtentsTCP(ctx context.Context, host string, port int, exportName, c
 // treating anything outside that set as skippable, which would silently
 // drop real data behind any future or non-qemu server that ever sets an
 // additional status bit on an otherwise-allocated, non-hole extent.
+// NBD base:allocation status bits. Bit 0 is NBD_STATE_HOLE ("not
+// allocated"), bit 1 is NBD_STATE_ZERO ("reads as zeros").
+const (
+	nbdStateHole uint32 = 1
+	nbdStateZero uint32 = 2
+)
+
+// compareChunk is one unit of the compare pipeline's work.
+type compareChunk struct {
+	offset uint64
+	length uint64
+}
+
+// allocationExtents asks an already-connected handle which of its ranges
+// read as zeros, for planCompareChunks.
+//
+// Best-effort by design: it returns nil on any failure rather than an error.
+// A server that does not advertise base:allocation, or a query that breaks,
+// must cost the compare its optimisation and nothing else -- falling back to
+// reading everything is always correct, and failing the verify because a
+// metadata query did not work would turn a speed-up into an outage.
+//
+// The meta context has to be added BEFORE the connection is made, so the
+// caller arms it at handle setup and this only reads the answer.
+func allocationExtents(ctx context.Context, h *nbd.Libnbd, role string) []Extent {
+	if err := ctx.Err(); err != nil {
+		return nil
+	}
+	size, err := h.GetSize()
+	if err != nil {
+		trace.Debug("nbd compare: no allocation map, comparing everything", "side", role, "error", err)
+		return nil
+	}
+	var out []Extent
+	var offset uint64
+	req := uint64(4294967295)
+	for offset < size {
+		chunk := req
+		if remain := size - offset; remain < chunk {
+			chunk = remain
+		}
+		describedEnd := offset
+		err := h.BlockStatus(chunk, offset, func(meta string, offs uint64, entries []uint32, cbErr *int) int {
+			if cbErr != nil && *cbErr != 0 {
+				return -1
+			}
+			if meta != "base:allocation" {
+				return 0
+			}
+			for i := 0; i+1 < len(entries); i += 2 {
+				length, flags := entries[i], entries[i+1]
+				out = append(out, Extent{
+					Offset: offs,
+					Length: uint64(length),
+					Dirty:  flags&nbdStateHole == 0,
+					Zero:   flags&nbdStateZero != 0,
+				})
+				offs += uint64(length)
+			}
+			if offs > describedEnd {
+				describedEnd = offs
+			}
+			return 0
+		}, nil)
+		if err != nil {
+			trace.Debug("nbd compare: allocation query failed, comparing everything from here", "side", role, "offset", offset, "error", err)
+			return nil
+		}
+		next, err := nextExtentScanOffset(offset, chunk, describedEnd)
+		if err != nil {
+			trace.Debug("nbd compare: allocation query stalled, comparing everything", "side", role, "error", err)
+			return nil
+		}
+		offset = next
+	}
+	return out
+}
+
+// zeroRanges reduces a base:allocation scan to just the ranges that READ AS
+// ZEROS, coalescing anything adjacent so the caller's overlap test stays
+// cheap. Ranges are returned in offset order, which is the order the scan
+// produces them in.
+func zeroRanges(extents []Extent) []Extent {
+	var out []Extent
+	for _, e := range extents {
+		if !e.Zero || e.Length == 0 {
+			continue
+		}
+		if n := len(out); n > 0 && out[n-1].Offset+out[n-1].Length == e.Offset {
+			out[n-1].Length += e.Length
+			continue
+		}
+		out = append(out, Extent{Offset: e.Offset, Length: e.Length, Zero: true})
+	}
+	return out
+}
+
+// coveredByZero reports whether [offset, offset+length) lies ENTIRELY inside
+// one of ranges.
+//
+// Entirely, and inside a SINGLE range, deliberately. A chunk that is only
+// partly zero, or that spans two zero ranges with anything between them, is
+// not provably equal on both sides and must be read. Being conservative here
+// costs a read; being clever costs a verify that reports clean over real
+// corruption.
+func coveredByZero(offset, length uint64, ranges []Extent) bool {
+	if length == 0 {
+		return false
+	}
+	end := offset + length
+	for _, r := range ranges {
+		if r.Offset <= offset && offset+length <= r.Offset+r.Length {
+			return true
+		}
+		// Ranges are offset-ordered, so once one starts past this chunk's
+		// end, nothing later can contain it.
+		if r.Offset >= end {
+			break
+		}
+	}
+	return false
+}
+
+// planCompareChunks splits [0, size) into bufferSize-capped chunks, dropping
+// any chunk that reads as zeros on BOTH sides.
+//
+// Why this is safe: NBD_STATE_ZERO is a server's assertion that the range
+// reads as zeros. If both servers assert it for the whole chunk, the two
+// sides are equal by construction and reading them would be reading two
+// identical blocks of zeros across the network to discover that.
+//
+// Why it is NOT based on NBD_STATE_HOLE, which is the more obvious signal:
+// a hole says "unallocated", and an unallocated cluster in a qcow2 with a
+// backing file reads the BACKING FILE. Two images could both report a hole
+// over a range and still differ. Skipping on HOLE would be a verify that
+// silently passes over exactly the corruption it exists to find.
+//
+// Either side reporting nothing (an empty slice -- a server that does not
+// advertise base:allocation, or a query that failed) degrades to comparing
+// everything, which is the old behaviour and always correct.
+func planCompareChunks(size, bufferSize uint64, aZero, bZero []Extent) (chunks []compareChunk, skipped uint64) {
+	if bufferSize == 0 {
+		return nil, 0
+	}
+	for offset := uint64(0); offset < size; {
+		step := bufferSize
+		if remain := size - offset; remain < step {
+			step = remain
+		}
+		if coveredByZero(offset, step, aZero) && coveredByZero(offset, step, bZero) {
+			skipped += step
+			offset += step
+			continue
+		}
+		chunks = append(chunks, compareChunk{offset: offset, length: step})
+		offset += step
+	}
+	return chunks, skipped
+}
+
 func isDirtyExtent(flags uint32, incremental bool) bool {
 	if incremental {
+		// qemu:dirty-bitmap: bit 0 set means "dirty".
 		return flags&1 != 0
 	}
-	return flags&1 == 0
+	// base:allocation: bit 0 is NBD_STATE_HOLE, so NOT set means allocated
+	// data that has to be copied. Note this is HOLE, not ZERO -- see
+	// Extent.Zero for why the two must not be conflated.
+	return flags&nbdStateHole == 0
 }
 
 // nextExtentScanOffset decides the next BLOCK_STATUS query offset after a
@@ -809,6 +990,14 @@ func compareTCP(ctx context.Context, aHost string, aPort int, aExport string, bH
 	}
 	defer b.Close()
 
+	// Armed before connecting, because a meta context can only be requested
+	// during the handshake. Errors are ignored on purpose: a server that
+	// will not negotiate base:allocation just means allocationExtents finds
+	// nothing later and the compare reads everything, which is correct and
+	// is what it did before this optimisation existed.
+	_ = a.AddMetaContext("base:allocation")
+	_ = b.AddMetaContext("base:allocation")
+
 	if aExport != "" {
 		if err := a.SetExportName(aExport); err != nil {
 			return nil, fmt.Errorf("set source export name %s: %w", aExport, err)
@@ -845,18 +1034,18 @@ func compareTCP(ctx context.Context, aHost string, aPort int, aExport string, bH
 
 	bufferSize := negotiateBufferSize(a, b, "source", "target")
 
-	type compareChunk struct {
-		offset uint64
-		length uint64
-	}
-	var chunks []compareChunk
-	for offset := uint64(0); offset < size; {
-		step := bufferSize
-		if remain := size - offset; remain < step {
-			step = remain
-		}
-		chunks = append(chunks, compareChunk{offset: offset, length: step})
-		offset += step
+	// Skip what provably cannot differ. A full-image compare reads every
+	// byte of BOTH sides, including the large zero regions a sparse disk is
+	// mostly made of -- work the copy path never does, because it is driven
+	// by an extent scan. One cheap metadata query per side buys back all of
+	// it; a side that cannot answer simply contributes no skips.
+	aZero := zeroRanges(allocationExtents(ctx, a, "source"))
+	bZero := zeroRanges(allocationExtents(ctx, b, "target"))
+	chunks, skippedBytes := planCompareChunks(size, bufferSize, aZero, bZero)
+	if skippedBytes > 0 {
+		trace.Info("nbd compare: skipping ranges that read as zeros on both sides",
+			"export", aExport, "skipped_bytes", skippedBytes, "total_bytes", size,
+			"comparing_bytes", size-skippedBytes)
 	}
 
 	pipelineDepth := ioDepth

@@ -74,6 +74,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -1067,5 +1068,150 @@ func TestProgressLogIntervalIsCoarse(t *testing.T) {
 	if progressLogInterval >= noProgressTimeout {
 		t.Errorf("progressLogInterval (%s) must be shorter than noProgressTimeout (%s)",
 			progressLogInterval, noProgressTimeout)
+	}
+}
+
+// zr builds a base:allocation-style extent list from (offset, length, zero)
+// triples, for the planner tests below.
+func zr(triples ...[3]uint64) []Extent {
+	var out []Extent
+	for _, t := range triples {
+		out = append(out, Extent{Offset: t[0], Length: t[1], Zero: t[2] == 1})
+	}
+	return out
+}
+
+// TestPlanCompareChunksSkipsOnlyProvableZeros is the safety test for the
+// allocation-aware compare.
+//
+// Getting this wrong is worse than the slowness it removes: a chunk skipped
+// when the two sides could differ is a verify that reports a corrupt replica
+// clean. Every case below is about NOT skipping something.
+func TestPlanCompareChunksSkipsOnlyProvableZeros(t *testing.T) {
+	const bs = 1024
+
+	for _, tc := range []struct {
+		name        string
+		size        uint64
+		aZero       []Extent
+		bZero       []Extent
+		wantChunks  int
+		wantSkipped uint64
+	}{
+		{
+			// No allocation information from either side -- a server that
+			// will not negotiate base:allocation, or a query that failed.
+			// Must degrade to comparing everything.
+			name: "no information compares everything",
+			size: 4096, wantChunks: 4, wantSkipped: 0,
+		},
+		{
+			// One side alone proves nothing about the other.
+			name: "source zeros alone do not authorise a skip",
+			size: 4096, aZero: zr([3]uint64{0, 4096, 1}),
+			wantChunks: 4, wantSkipped: 0,
+		},
+		{
+			name: "target zeros alone do not authorise a skip",
+			size: 4096, bZero: zr([3]uint64{0, 4096, 1}),
+			wantChunks: 4, wantSkipped: 0,
+		},
+		{
+			name: "both sides zero over the whole image skips all of it",
+			size: 4096,
+			aZero: zr([3]uint64{0, 4096, 1}), bZero: zr([3]uint64{0, 4096, 1}),
+			wantChunks: 0, wantSkipped: 4096,
+		},
+		{
+			// Overlapping but not identical: only the intersection is safe.
+			name: "partial overlap skips only what both cover",
+			size: 4096,
+			aZero: zr([3]uint64{0, 2048, 1}), bZero: zr([3]uint64{1024, 3072, 1}),
+			wantChunks: 3, wantSkipped: 1024,
+		},
+		{
+			// A chunk only PARTLY zero must be read in full. Skipping it
+			// would drop the non-zero half with it.
+			name: "a chunk only partly covered is not skipped",
+			size: 2048,
+			aZero: zr([3]uint64{0, 512, 1}), bZero: zr([3]uint64{0, 512, 1}),
+			wantChunks: 2, wantSkipped: 0,
+		},
+		{
+			// Two adjacent zero ranges are one region; a chunk spanning the
+			// seam is still provably zero and may be skipped.
+			name: "adjacent zero ranges coalesce across a chunk boundary",
+			size: 2048,
+			aZero: zeroRanges(zr([3]uint64{0, 1024, 1}, [3]uint64{1024, 1024, 1})),
+			bZero: zeroRanges(zr([3]uint64{0, 2048, 1})),
+			wantChunks: 0, wantSkipped: 2048,
+		},
+		{
+			// A GAP between two zero ranges is not zero. A chunk spanning it
+			// must be read even though both ends are zero.
+			name: "a gap between zero ranges is never skipped",
+			size: 2048,
+			aZero: zeroRanges(zr([3]uint64{0, 256, 1}, [3]uint64{768, 1280, 1})),
+			bZero: zeroRanges(zr([3]uint64{0, 256, 1}, [3]uint64{768, 1280, 1})),
+			wantChunks: 1, wantSkipped: 1024,
+		},
+		{
+			name: "a trailing partial chunk is sized to the remainder",
+			size: 2500, wantChunks: 3, wantSkipped: 0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chunks, skipped := planCompareChunks(tc.size, bs, tc.aZero, tc.bZero)
+			if len(chunks) != tc.wantChunks {
+				t.Errorf("got %d chunks, want %d: %+v", len(chunks), tc.wantChunks, chunks)
+			}
+			if skipped != tc.wantSkipped {
+				t.Errorf("skipped %d bytes, want %d", skipped, tc.wantSkipped)
+			}
+			// The invariant that matters: everything not skipped is still
+			// covered exactly once, with no gaps and no overlaps.
+			var covered uint64
+			var prevEnd uint64
+			for i, c := range chunks {
+				if c.offset < prevEnd {
+					t.Fatalf("chunk %d at %d overlaps the previous one ending at %d", i, c.offset, prevEnd)
+				}
+				covered += c.length
+				prevEnd = c.offset + c.length
+			}
+			if covered+skipped != tc.size {
+				t.Errorf("compared %d + skipped %d = %d, want the whole image (%d) accounted for",
+					covered, skipped, covered+skipped, tc.size)
+			}
+		})
+	}
+}
+
+// A hole is NOT a zero. An unallocated cluster in a qcow2 with a backing
+// file reads the backing file, so two images can both report a hole over a
+// range and still differ. The planner must key on Zero alone.
+func TestPlanCompareChunksIgnoresHolesThatAreNotZero(t *testing.T) {
+	// Both sides: allocated=false (a hole), but Zero unset.
+	holes := zr([3]uint64{0, 4096, 0})
+	chunks, skipped := planCompareChunks(4096, 1024, zeroRanges(holes), zeroRanges(holes))
+	if skipped != 0 || len(chunks) != 4 {
+		t.Errorf("planner skipped %d bytes over ranges that are merely holes; a hole over a backing "+
+			"file does not read as zeros, so those two sides can differ", skipped)
+	}
+}
+
+func TestZeroRangesCoalesces(t *testing.T) {
+	got := zeroRanges(zr(
+		[3]uint64{0, 100, 1},
+		[3]uint64{100, 100, 1}, // adjacent -> merges
+		[3]uint64{200, 50, 0},  // not zero -> dropped, and breaks adjacency
+		[3]uint64{250, 100, 1},
+	))
+	want := []Extent{
+		{Offset: 0, Length: 200, Zero: true},
+		{Offset: 250, Length: 100, Zero: true},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("zeroRanges = %+v, want %+v", got, want)
 	}
 }
