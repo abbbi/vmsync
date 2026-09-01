@@ -180,7 +180,7 @@ func qemuNBDExport(t *testing.T, path string) int {
 		_ = cmd.Wait()
 	})
 
-	if err := WaitForTCPExport("127.0.0.1", port, 5*time.Second); err != nil {
+	if err := WaitForTCPExport("127.0.0.1", port, "", 5*time.Second); err != nil {
 		t.Fatalf("qemu-nbd for %s on port %d never became ready: %v (stderr: %s)", path, port, err, stderr.String())
 	}
 	return port
@@ -218,7 +218,7 @@ func TestCopyExtentsTCPRoundTrip(t *testing.T) {
 	defer cancel()
 
 	extents := []Extent{{Offset: 0, Length: uint64(size), Dirty: true}}
-	written, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, extents, 4)
+	written, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 4)
 	if err != nil {
 		t.Fatalf("CopyExtentsTCP: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestCopyExtentsTCPRoundTrip(t *testing.T) {
 	// fresh pair of connections to the same two exports -- both functions
 	// get exercised together, agreeing with each other and with the
 	// independent, direct file-content check above.
-	if err := CompareTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, 4); err != nil {
+	if err := CompareTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", 4); err != nil {
 		t.Fatalf("CompareTCP after a successful copy reported a mismatch: %v", err)
 	}
 }
@@ -267,7 +267,7 @@ func TestCopyExtentsTCPSkipsNonDirtyExtents(t *testing.T) {
 		{Offset: 0, Length: chunkSize, Dirty: false},
 		{Offset: chunkSize, Length: chunkSize, Dirty: true},
 	}
-	written, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, extents, 4)
+	written, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 4)
 	if err != nil {
 		t.Fatalf("CopyExtentsTCP: %v", err)
 	}
@@ -329,7 +329,7 @@ func TestCopyExtentsTCPReusesSlotsAcrossManyChunks(t *testing.T) {
 	defer cancel()
 	// ioDepth=2 against 4 chunks guarantees every slot is reused at least
 	// once -- the exact path this test exists to exercise.
-	written, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, extents, 2)
+	written, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 2)
 	if err != nil {
 		t.Fatalf("CopyExtentsTCP: %v", err)
 	}
@@ -385,7 +385,7 @@ func TestCopyExtentsTCPFreesBufferOnSourceReadError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, extents, 4)
+	_, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 4)
 	if err == nil {
 		t.Fatal("CopyExtentsTCP with an out-of-bounds source read returned nil, want an error")
 	}
@@ -419,7 +419,7 @@ func TestCopyExtentsTCPFreesBufferOnTargetWriteError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, extents, 4)
+	_, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 4)
 	if err == nil {
 		t.Fatal("CopyExtentsTCP writing past a smaller target's end returned nil, want an error")
 	}
@@ -441,7 +441,7 @@ func TestCompareTCPIdenticalReturnsNil(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := CompareTCP(ctx, "127.0.0.1", aPort, "", "127.0.0.1", bPort, 4); err != nil {
+	if err := CompareTCP(ctx, "127.0.0.1", aPort, "", "127.0.0.1", bPort, "", 4); err != nil {
 		t.Fatalf("CompareTCP on byte-for-byte identical images returned an error: %v", err)
 	}
 }
@@ -462,7 +462,7 @@ func TestCompareTCPReportsMismatch(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	err := CompareTCP(ctx, "127.0.0.1", aPort, "", "127.0.0.1", bPort, 4)
+	err := CompareTCP(ctx, "127.0.0.1", aPort, "", "127.0.0.1", bPort, "", 4)
 	if err == nil {
 		t.Fatal("CompareTCP on images differing at offset 0 returned nil, want a mismatch error")
 	}
@@ -491,7 +491,7 @@ func TestCompareTCPCollectFindsAllMismatches(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	mismatches, err := CompareTCPCollect(ctx, "127.0.0.1", aPort, "", "127.0.0.1", bPort, 4)
+	mismatches, err := CompareTCPCollect(ctx, "127.0.0.1", aPort, "", "127.0.0.1", bPort, "", 4)
 	if err != nil {
 		t.Fatalf("CompareTCPCollect: %v", err)
 	}
@@ -913,7 +913,7 @@ func TestWaitForTCPExportSucceedsOnceListening(t *testing.T) {
 	// independent one against an export already confirmed ready.
 	port := qemuNBDExport(t, path)
 
-	if err := WaitForTCPExport("127.0.0.1", port, 5*time.Second); err != nil {
+	if err := WaitForTCPExport("127.0.0.1", port, "", 5*time.Second); err != nil {
 		t.Fatalf("WaitForTCPExport against an already-listening export: %v", err)
 	}
 }
@@ -922,7 +922,7 @@ func TestWaitForTCPExportTimesOutWhenNothingListening(t *testing.T) {
 	port := freeTCPPort(t) // reserved and released -- guaranteed nothing is listening on it
 
 	start := time.Now()
-	err := WaitForTCPExport("127.0.0.1", port, 500*time.Millisecond)
+	err := WaitForTCPExport("127.0.0.1", port, "", 500*time.Millisecond)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("WaitForTCPExport succeeded against a port nothing is listening on")
@@ -951,7 +951,7 @@ func TestWaitForTCPExportTimesOutWhenNothingListening(t *testing.T) {
 func TestCopyExtentsTCPReturnsImmediatelyOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := CopyExtentsTCP(ctx, "127.0.0.1", 1, "", "127.0.0.1", 2, nil, 1)
+	_, err := CopyExtentsTCP(ctx, "127.0.0.1", 1, "", "127.0.0.1", 2, "", nil, 1)
 	if err == nil {
 		t.Fatal("CopyExtentsTCP with an already-cancelled context returned a nil error")
 	}
@@ -963,7 +963,7 @@ func TestCopyExtentsTCPReturnsImmediatelyOnCancelledContext(t *testing.T) {
 func TestCompareTCPReturnsImmediatelyOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := CompareTCP(ctx, "127.0.0.1", 1, "", "127.0.0.1", 2, 1)
+	err := CompareTCP(ctx, "127.0.0.1", 1, "", "127.0.0.1", 2, "", 1)
 	if err == nil {
 		t.Fatal("CompareTCP with an already-cancelled context returned a nil error")
 	}

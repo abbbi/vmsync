@@ -57,13 +57,36 @@ const bridgeStateDir = "/run/vmsync-bridge"
 // returns alongside an error was never something any caller could act on,
 // since the whole point of a stop command is to name the pidFile/logFile a
 // caller doesn't otherwise know.
-func StartRemote(ctx context.Context, client *remotessh.Client, bridgePort, realPort int, cfg Config) (stopCmd string, err error) {
+// key identifies WHOSE bridge this is -- a domain, or a domain and device.
+// It is part of the pidfile's name, and that is a correctness requirement
+// rather than a readability one.
+//
+// These files used to be named by port alone, which is host-wide: two runs
+// that landed on the same bridge port shared one pidfile. The start command
+// records the pid BEFORE the helper binds, so the later run would overwrite
+// the earlier one's pid, and the readiness check -- which matches the
+// recorded pid against whoever is actually listening -- could then match the
+// OTHER run's helper and report success. The loser then relayed through a
+// helper connected to a different VM's qemu-nbd, writing its data into
+// another VM's disk. The same clobbered pid also made the stop command's
+// `kill -9 -$(cat ...)` a group kill against a recycled pid.
+//
+// With the key in the name, the loser's readiness check reads its own dead
+// pid, does not match the winner's listener, and fails loudly. That is the
+// whole point: a port collision must be an error, never a silent swap.
+func StartRemote(ctx context.Context, client *remotessh.Client, key string, bridgePort, realPort int, cfg Config) (stopCmd string, err error) {
 	if out, err := client.Run(ctx, "mkdir -p "+util.ShQuote(bridgeStateDir)); err != nil {
 		return "", fmt.Errorf("create bridge state dir %s: %w: %s", bridgeStateDir, err, out)
 	}
 
-	pidFile := path.Join(bridgeStateDir, fmt.Sprintf("vmsync-bridge-%d.pid", bridgePort))
-	logFile := path.Join(bridgeStateDir, fmt.Sprintf("vmsync-bridge-%d.log", bridgePort))
+	// The port stays in the name too: one domain+device legitimately has two
+	// bridges at once (the copy's and -verify's), on different ports.
+	// util.SafeKey rather than raw interpolation -- a domain name may contain
+	// a "/" or a space, and two different domains must never encode to one
+	// filename.
+	base := fmt.Sprintf("vmsync-bridge-%s-%d", util.SafeKey(key), bridgePort)
+	pidFile := path.Join(bridgeStateDir, base+".pid")
+	logFile := path.Join(bridgeStateDir, base+".log")
 
 	startCmd := BuildStartCommand(cfg, bridgePort, realPort, pidFile, logFile)
 	if out, err := client.Run(ctx, startCmd); err != nil {

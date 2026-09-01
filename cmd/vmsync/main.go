@@ -120,6 +120,23 @@ func targetLockKey(targetDomain string) string { return "target-" + targetDomain
 // recorded against a file nobody compares.
 type stampDisk struct{ dev, path string }
 
+// targetExportName names the NBD export a replica disk is served under.
+//
+// It carries the DOMAIN, not just the device, and that is the whole point.
+// The source side has always named its exports; the target side was
+// unnamed, so a connection to a target port got "whatever is listening
+// there". Two runs colliding on a port -- misconfigured to the same base,
+// or handed overlapping blocks by auto-allocation -- could therefore have
+// the loser read from, or WRITE INTO, the winner's disk, with nothing in
+// either process able to notice.
+//
+// With the name, that becomes an NBD handshake failure instead. Port
+// hygiene stops being the thing standing between two VMs' data.
+//
+// The same name is used for the writable copy export and the read-only
+// verify one: they identify the same disk and never share a port.
+func targetExportName(targetDomain, dev string) string { return targetDomain + "-" + dev }
+
 // Accepted values for -replaced-disk-action.
 const (
 	replacedDiskDelete = "delete"
@@ -3180,7 +3197,7 @@ func run(cfg syncConfig) (runErr error) {
 		// The source has a single shared NBD export (no per-disk ports), so
 		// its bridge port simply sits right next to it.
 		sourceBridgePort := cfg.SourceNBDPort + 1
-		stopCmd, err := nbdbridge.StartRemote(ctx, sourceSSHClient, sourceBridgePort, cfg.SourceNBDPort, bridgeCfg)
+		stopCmd, err := nbdbridge.StartRemote(ctx, sourceSSHClient, "src-"+cfg.SourceDomain, sourceBridgePort, cfg.SourceNBDPort, bridgeCfg)
 		if err != nil {
 			return fmt.Errorf("start source nbd bridge: %w", err)
 		}
@@ -3361,11 +3378,16 @@ func run(cfg syncConfig) (runErr error) {
 		if d.DiscardMode != "" {
 			startExportCmd = startExportCmd + " --discard=" + d.DiscardMode
 		}
+		// --export-name so this export is addressable by identity rather
+		// than only by port; see targetExportName.
+		exportName := targetExportName(cfg.TargetDomain, d.TargetDev)
 		startExportCmd = startExportCmd +
 			" --format=qcow2 --bind " +
 			util.ShQuote(cfg.TargetNBDBind) +
 			" --port " +
 			fmt.Sprintf("%d", targetPort) +
+			" --export-name " +
+			util.ShQuote(exportName) +
 			" --pid-file " +
 			util.ShQuote(pidFile) +
 			" "
@@ -3420,7 +3442,7 @@ func run(cfg syncConfig) (runErr error) {
 			// so the bridge ports lay out right after them, as one contiguous
 			// block [TargetNBDPort+N, TargetNBDPort+2N).
 			targetBridgePort := targetPort + len(qcowDisks)
-			bridgeStopCmd, err := nbdbridge.StartRemote(ctx, targetSSHClient, targetBridgePort, targetPort, bridgeCfg)
+			bridgeStopCmd, err := nbdbridge.StartRemote(ctx, targetSSHClient, cfg.TargetDomain+"-"+d.TargetDev, targetBridgePort, targetPort, bridgeCfg)
 			if err != nil {
 				return res, fmt.Errorf("start target nbd bridge for %s: %w", d.TargetDev, err)
 			}
@@ -3442,13 +3464,13 @@ func run(cfg syncConfig) (runErr error) {
 			res.targetBridgeCounters = counters
 			trace.Info("target nbd port in use", "side", "target", "kind", "bridge_local", "disk", d.TargetDev, "host", "127.0.0.1", "port", localPort)
 		} else {
-			if err := nbdsync.WaitForTCPExport(targetNBDHost, targetPort, 10*time.Second); err != nil {
+			if err := nbdsync.WaitForTCPExport(targetNBDHost, targetPort, exportName, 10*time.Second); err != nil {
 				return res, fmt.Errorf("wait for target nbd export %s:%d: %w", targetNBDHost, targetPort, err)
 			}
 		}
 
 		trace.Info("copy extents to remote target", "extents", len(extents), "path", targetPath, "disk_size", res.diskSize)
-		res.writtenBytes, err = nbdsync.CopyExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, effectiveTargetHost, effectiveTargetPort, extents, cfg.IODepth)
+		res.writtenBytes, err = nbdsync.CopyExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, effectiveTargetHost, effectiveTargetPort, exportName, extents, cfg.IODepth)
 		if err != nil {
 			return res, err
 		}
@@ -3517,10 +3539,13 @@ func run(cfg syncConfig) (runErr error) {
 		// released yet.
 		verifyPort := cfg.TargetNBDPort + 2*len(qcowDisks) + i
 		verifyPidFile := path.Join("/tmp", fmt.Sprintf("vmsync-verify-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
+		verifyExportName := targetExportName(cfg.TargetDomain, d.TargetDev)
 		startVerifyCmd := "qemu-nbd --fork --persistent --read-only --format=qcow2 --bind " +
 			util.ShQuote(cfg.TargetNBDBind) +
 			" --port " +
 			fmt.Sprintf("%d", verifyPort) +
+			" --export-name " +
+			util.ShQuote(verifyExportName) +
 			" --pid-file " +
 			util.ShQuote(verifyPidFile) +
 			" " +
@@ -3538,7 +3563,7 @@ func run(cfg syncConfig) (runErr error) {
 		targetStopCommands = append(targetStopCommands, stopVerifyCmd)
 		stopMu.Unlock()
 
-		if err := nbdsync.WaitForTCPExport(targetNBDHost, verifyPort, 10*time.Second); err != nil {
+		if err := nbdsync.WaitForTCPExport(targetNBDHost, verifyPort, verifyExportName, 10*time.Second); err != nil {
 			return fmt.Errorf("verify: wait for read-only export %s:%d: %w", targetNBDHost, verifyPort, err)
 		}
 
@@ -3560,7 +3585,7 @@ func run(cfg syncConfig) (runErr error) {
 			// combination of -compress/-netbuffer/-verify is active.
 			verifyBridgePort := verifyPort + len(qcowDisks)
 			var err error
-			stopVerifyBridgeCmd, err = nbdbridge.StartRemote(ctx, targetSSHClient, verifyBridgePort, verifyPort, bridgeCfg)
+			stopVerifyBridgeCmd, err = nbdbridge.StartRemote(ctx, targetSSHClient, "verify-"+cfg.TargetDomain+"-"+d.TargetDev, verifyBridgePort, verifyPort, bridgeCfg)
 			if err != nil {
 				return fmt.Errorf("start verify nbd bridge for %s: %w", d.TargetDev, err)
 			}
@@ -3626,7 +3651,7 @@ func run(cfg syncConfig) (runErr error) {
 			// the replica is broken but HOW broken. Costs a full scan on an
 			// already-failing disk, which is exactly the trade this mode
 			// exists to make -- fast is there for when it is not wanted.
-			mismatches, cerr := nbdsync.CompareTCPCollect(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, cfg.IODepth)
+			mismatches, cerr := nbdsync.CompareTCPCollect(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, verifyExportName, cfg.IODepth)
 			switch {
 			case cerr != nil:
 				compareErr = fmt.Errorf("compare failed: %w", cerr)
@@ -3642,7 +3667,7 @@ func run(cfg syncConfig) (runErr error) {
 					nbdsync.ErrImagesDiffer, len(mismatches), diffBytes)
 			}
 		case verifyFast:
-			compareErr = nbdsync.CompareTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, cfg.IODepth)
+			compareErr = nbdsync.CompareTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, verifyExportName, cfg.IODepth)
 		default:
 			compareErr = disk.CompareImages(sourceNBDURL, nbdURL)
 		}

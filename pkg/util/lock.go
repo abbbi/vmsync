@@ -85,6 +85,15 @@ const ExitBusy = 75
 // of these escape sequences appearing "naturally" in another key.
 var safeKeyReplacer = strings.NewReplacer("%", "%%", "/", "%2f", " ", "%20")
 
+// SafeKey makes an arbitrary identifier safe as a filename component, using
+// the same reversible encoding the run locks use.
+//
+// Exported because more than one thing now names a per-run file after a
+// domain, and they must all encode it the same way: two schemes would let
+// one component believe two domains are distinct while another treats them
+// as the same file.
+func SafeKey(key string) string { return safeKeyReplacer.Replace(key) }
+
 // AcquireRunLock takes an exclusive, non-blocking advisory lock (flock)
 // scoped to key (e.g. the source domain name), so two vmsync invocations can
 // never run concurrently for the same key -- regardless of what launched

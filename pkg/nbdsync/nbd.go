@@ -304,7 +304,7 @@ func negotiateBufferSize(a, b *nbd.Libnbd, roleA, roleB string) uint64 {
 // report partial progress (e.g. in metrics) on a failed sync. ioDepth is the
 // number of read/write pairs kept in flight simultaneously (see the
 // pipelining comment below); values less than 1 are clamped to 1.
-func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport string, dstHost string, dstPort int, extents []Extent, ioDepth int) (writtenBytes uint64, err error) {
+func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport string, dstHost string, dstPort int, dstExport string, extents []Extent, ioDepth int) (writtenBytes uint64, err error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -329,8 +329,21 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 		return 0, fmt.Errorf("connect source nbd tcp %s:%d: %w", srcHost, srcPort, err)
 	}
 
+	// The target export is NAMED, exactly like the source one above, and
+	// that is a safety property rather than symmetry. A port says only
+	// "something is listening here"; an export name says "this is the export
+	// I meant". Two runs that collide on a target port -- misconfigured to
+	// the same base, or handed overlapping blocks by auto-allocation --
+	// would otherwise have the loser connect to the winner's export and
+	// write one VM's data into another VM's disk. With a name, the NBD
+	// handshake itself refuses.
+	if dstExport != "" {
+		if err := dst.SetExportName(dstExport); err != nil {
+			return 0, fmt.Errorf("set target export name %s: %w", dstExport, err)
+		}
+	}
 	if err := dst.ConnectTcp(dstHost, strconv.Itoa(dstPort)); err != nil {
-		return 0, fmt.Errorf("connect target nbd tcp %s:%d: %w", dstHost, dstPort, err)
+		return 0, fmt.Errorf("connect target nbd tcp %s:%d (export %q): %w", dstHost, dstPort, dstExport, err)
 	}
 
 	buffer_size := negotiateBufferSize(src, dst, "src", "dst")
@@ -688,8 +701,8 @@ copyLoop:
 // be compared. That doubles the memory footprint per slot relative to
 // CopyExtentsTCP for the same ioDepth (2 * ioDepth * negotiated buffer
 // size), which is why ioDepth isn't given a separate, larger default here.
-func CompareTCP(ctx context.Context, aHost string, aPort int, aExport string, bHost string, bPort int, ioDepth int) error {
-	_, err := compareTCP(ctx, aHost, aPort, aExport, bHost, bPort, ioDepth, false)
+func CompareTCP(ctx context.Context, aHost string, aPort int, aExport string, bHost string, bPort int, bExport string, ioDepth int) error {
+	_, err := compareTCP(ctx, aHost, aPort, aExport, bHost, bPort, bExport, ioDepth, false)
 	return err
 }
 
@@ -771,8 +784,8 @@ func diffSubRanges(baseOffset uint64, a, b []byte, granularity uint64) []Mismatc
 // as CompareTCP; mismatches reflects whatever was collected before such an
 // abort, mirroring CopyExtentsTCP's own "return partial progress on error"
 // contract.
-func CompareTCPCollect(ctx context.Context, aHost string, aPort int, aExport string, bHost string, bPort int, ioDepth int) ([]MismatchRange, error) {
-	return compareTCP(ctx, aHost, aPort, aExport, bHost, bPort, ioDepth, true)
+func CompareTCPCollect(ctx context.Context, aHost string, aPort int, aExport string, bHost string, bPort int, bExport string, ioDepth int) ([]MismatchRange, error) {
+	return compareTCP(ctx, aHost, aPort, aExport, bHost, bPort, bExport, ioDepth, true)
 }
 
 // compareTCP is the shared implementation behind CompareTCP and
@@ -780,7 +793,7 @@ func CompareTCPCollect(ctx context.Context, aHost string, aPort int, aExport str
 // CompareTCP's original behavior: the first mismatch aborts immediately and
 // is the sole error. With it true, mismatches are appended to the returned
 // slice and the scan continues to the end of the image.
-func compareTCP(ctx context.Context, aHost string, aPort int, aExport string, bHost string, bPort int, ioDepth int, collectMismatches bool) (mismatches []MismatchRange, err error) {
+func compareTCP(ctx context.Context, aHost string, aPort int, aExport string, bHost string, bPort int, bExport string, ioDepth int, collectMismatches bool) (mismatches []MismatchRange, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -804,8 +817,17 @@ func compareTCP(ctx context.Context, aHost string, aPort int, aExport string, bH
 	if err := a.ConnectTcp(aHost, strconv.Itoa(aPort)); err != nil {
 		return nil, fmt.Errorf("connect source nbd tcp %s:%d: %w", aHost, aPort, err)
 	}
+	// Named like the source side, and for a sharper reason here: a verify
+	// that silently compared against the WRONG VM's disk would report a
+	// mismatch on a healthy replica, or -- worse -- a match against a disk
+	// that is not the one being checked.
+	if bExport != "" {
+		if err := b.SetExportName(bExport); err != nil {
+			return nil, fmt.Errorf("set target export name %s: %w", bExport, err)
+		}
+	}
 	if err := b.ConnectTcp(bHost, strconv.Itoa(bPort)); err != nil {
-		return nil, fmt.Errorf("connect target nbd tcp %s:%d: %w", bHost, bPort, err)
+		return nil, fmt.Errorf("connect target nbd tcp %s:%d (export %q): %w", bHost, bPort, bExport, err)
 	}
 
 	sizeA, err := a.GetSize()
@@ -1187,13 +1209,23 @@ compareLoop:
 	return mismatches, nil
 }
 
-func WaitForTCPExport(host string, port int, timeout time.Duration) error {
+func WaitForTCPExport(host string, port int, exportName string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for {
 		h, err := nbd.Create()
 		if err == nil {
-			err = h.ConnectTcp(host, strconv.Itoa(port))
+			// The NAME is requested, not just the port. A readiness check
+			// that only asks "is something listening" answers yes to
+			// ANOTHER run's export on a port this run failed to bind, and
+			// the caller then writes into that run's disk. Asking for the
+			// name makes the NBD handshake itself refuse.
+			if exportName != "" {
+				err = h.SetExportName(exportName)
+			}
+			if err == nil {
+				err = h.ConnectTcp(host, strconv.Itoa(port))
+			}
 			h.Close()
 			if err == nil {
 				return nil
@@ -1201,7 +1233,7 @@ func WaitForTCPExport(host string, port int, timeout time.Duration) error {
 		}
 		lastErr = err
 		if time.Now().After(deadline) {
-			return fmt.Errorf("nbd export not ready on %s:%d after %s: %w", host, port, timeout, lastErr)
+			return fmt.Errorf("nbd export %q not ready on %s:%d after %s: %w", exportName, host, port, timeout, lastErr)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
