@@ -115,6 +115,9 @@ type runLog struct {
 	mu   sync.Mutex
 	f    *os.File
 	size int64
+	// rotateAt is runLogRotateAt in a running agent. A field only so a test
+	// can use a cap it can actually reach without writing 32 MiB.
+	rotateAt int64
 	// writable is the last observed state, so callers can log on the
 	// TRANSITION rather than every tick. At 10s ticks across fifty VMs,
 	// per-attempt logging would fill the journal of a host whose disk is
@@ -127,6 +130,7 @@ func newRunLog(stateDir, session string, m *agentMetrics) *runLog {
 		path:     filepath.Join(stateDir, runLogFile),
 		session:  session,
 		metrics:  m,
+		rotateAt: runLogRotateAt,
 		writable: true, // until proven otherwise; Open() settles it
 	}
 }
@@ -216,7 +220,7 @@ func (l *runLog) appendLocked(rec runLogRecord) error {
 			return err
 		}
 	}
-	if l.size+int64(len(line)) > runLogRotateAt {
+	if l.size+int64(len(line)) > l.rotateAt {
 		l.rotateLocked()
 	}
 

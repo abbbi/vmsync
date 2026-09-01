@@ -110,6 +110,10 @@ type Scheduler struct {
 	// settings an operator is most likely to change while it runs.
 	lv    *live
 	state *sharedState
+	// lockDir is util.RunLockDir in a running agent. A field only so a test
+	// can point adoption at a temp directory: the constant is a contract
+	// between two binaries and must not become configurable in production.
+	lockDir string
 
 	mu       sync.Mutex
 	nextRun  map[string]time.Time
@@ -123,6 +127,7 @@ func NewScheduler(lv *live, state *sharedState) *Scheduler {
 	return &Scheduler{
 		lv:       lv,
 		state:    state,
+		lockDir:  util.RunLockDir,
 		nextRun:  map[string]time.Time{},
 		inFlight: map[string]bool{},
 		hostLoad: map[string]int{},
@@ -290,7 +295,7 @@ func (s *Scheduler) due(entry ScheduleEntry, now time.Time) bool {
 // unreadable /proc: all mean "launch, and let the engine decide". The reason
 // string is for the log and is never a reason to refuse.
 func (s *Scheduler) foreignRunHolds(cfg *agentConfig, vm string) (bool, string) {
-	id, ok, err := util.ReadRunLockIdentity(util.RunLockDir, vm)
+	id, ok, err := util.ReadRunLockIdentity(s.lockDir, vm)
 	if err != nil {
 		// Worth saying out loud -- somebody has put something else in this
 		// path -- but not worth deferring a sync over.

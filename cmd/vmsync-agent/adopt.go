@@ -61,7 +61,7 @@ func (s *Scheduler) Reconcile(ctx context.Context) {
 		if entry.VM == "" {
 			continue
 		}
-		id, ok, err := util.ReadRunLockIdentity(util.RunLockDir, entry.VM)
+		id, ok, err := util.ReadRunLockIdentity(s.lockDir, entry.VM)
 		if err != nil || !ok {
 			continue
 		}

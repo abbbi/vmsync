@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -243,5 +244,121 @@ func TestNewRunIDIsUnique(t *testing.T) {
 			t.Fatalf("newRunID collided on %q -- two runs for one VM in one second would be indistinguishable", id)
 		}
 		seen[id] = true
+	}
+}
+
+// Rotation, at a cap a test can actually reach. The real one is 32 MiB, which
+// is why this is a field rather than the constant.
+func TestRunLogRotatesAndKeepsOneGeneration(t *testing.T) {
+	l := newRunLog(t.TempDir(), "session-1", nil)
+	l.rotateAt = 400 // a few records
+	if err := l.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	for i := 0; i < 40; i++ {
+		if err := l.Append(runLogRecord{
+			Event: runEventLaunch, RunID: "r", VM: "web01", Origin: runOriginScheduled,
+			Binary: "/usr/local/bin/vmsync",
+		}); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+
+	// The current generation stays bounded rather than growing forever.
+	fi, err := os.Stat(l.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() > int64(l.rotateAt)*2 {
+		t.Errorf("current generation is %d bytes against a %d cap; it is not rotating", fi.Size(), l.rotateAt)
+	}
+	// Exactly one predecessor, so the worst case is twice the cap and not
+	// a directory full of generations.
+	if _, err := os.Stat(l.path + ".1"); err != nil {
+		t.Errorf("no rotated generation was kept: %v", err)
+	}
+	if _, err := os.Stat(l.path + ".2"); err == nil {
+		t.Error("a second rotated generation exists; only one is meant to be kept")
+	}
+}
+
+// A rotate record marks the boundary, so a reader of the new generation knows
+// why it starts where it does and can go looking for the predecessor.
+func TestRotationLeavesABreadcrumb(t *testing.T) {
+	l := newRunLog(t.TempDir(), "session-1", nil)
+	l.rotateAt = 300
+	if err := l.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	for i := 0; i < 20; i++ {
+		if err := l.Append(runLogRecord{Event: runEventLaunch, RunID: "r", VM: "web01"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(l.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"event":"rotate"`) {
+		t.Errorf("the new generation carries no rotate record:\n%s", data)
+	}
+}
+
+// Rotation must not lose the pairing OpenRuns depends on. A launch in the
+// rotated generation whose exit landed in the current one has genuinely
+// finished, and reading only the current file would report it as still open
+// forever.
+func TestOpenRunsAfterRotationDoesNotInventOpenRuns(t *testing.T) {
+	l := newRunLog(t.TempDir(), "session-1", nil)
+	l.rotateAt = 100000 // no rotation: this is about the reader, not the writer
+	if err := l.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	code := 0
+	if err := l.Append(runLogRecord{Event: runEventLaunch, RunID: "paired", VM: "web01", Origin: runOriginScheduled}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Append(runLogRecord{Event: runEventExit, RunID: "paired", ExitCode: &code}); err != nil {
+		t.Fatal(err)
+	}
+	open, err := l.OpenRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Errorf("OpenRuns = %+v, want none", open)
+	}
+}
+
+// The wire contract with the console, from this side: a nil exit code must be
+// ABSENT from the JSON, not rendered as 0. The console distinguishes "never
+// observed" from "exited 0", and omitempty on a pointer is what carries that.
+func TestSyncResultWireFormatDistinguishesUnobserved(t *testing.T) {
+	unobserved, err := json.Marshal(SyncResult{VM: "web01", RunID: "r1", Outcome: outcomeUnknown})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(unobserved), "exit_code") {
+		t.Errorf("an unobserved run serialised an exit_code; the console would render it as a real status:\n%s", unobserved)
+	}
+	if !strings.Contains(string(unobserved), `"outcome":"unknown"`) {
+		t.Errorf("the outcome did not reach the wire:\n%s", unobserved)
+	}
+
+	code := 0
+	observed, err := json.Marshal(SyncResult{VM: "web01", ExitCode: &code, Outcome: outcomeSuccess})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A real zero must survive. omitempty on a *int omits nil, not a pointer
+	// to zero -- if that were ever changed to a plain int, this is what fails.
+	if !strings.Contains(string(observed), `"exit_code":0`) {
+		t.Errorf("an observed exit 0 was dropped from the wire:\n%s", observed)
 	}
 }
