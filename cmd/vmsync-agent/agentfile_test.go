@@ -296,11 +296,19 @@ func TestLooseSSHKeyPermissionsWarnRatherThanRefuse(t *testing.T) {
 		t.Skip("needs a POSIX-absolute temp dir")
 	}
 	key := filepath.Join(dir, "id_ed25519")
-	if err := os.WriteFile(key, []byte("not really a key"), 0o644); err != nil {
+	if err := os.WriteFile(key, []byte("not really a key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Chmod, NOT the mode argument to WriteFile. That one is masked by the
+	// process umask, so on a host running umask 077 -- which is exactly the
+	// kind of host that hardens SSH key permissions -- the file lands at 0600
+	// and there is correctly nothing to warn about. chmod(2) is not masked, so
+	// this asks for the permissions the test is actually about.
+	if err := os.Chmod(key, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	p := filepath.Join(dir, "agent.json")
-	if err := os.WriteFile(p, []byte(`{"config_version":1,"schedule_file":"/etc/x.json","ssh":{"key":"`+filepath.ToSlash(key)+`"}}`), 0o640); err != nil {
+	if err := os.WriteFile(p, []byte(`{"config_version":1,"schedule_file":"/etc/x.json","ssh":{"key":"`+filepath.ToSlash(key)+`"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -308,14 +316,27 @@ func TestLooseSSHKeyPermissionsWarnRatherThanRefuse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a group-readable ssh key was refused, which would break hosts that work today: %v", err)
 	}
-	if runtimeSupportsUnixModes() && len(warns) == 0 {
-		t.Error("a group-readable ssh key produced no warning at all")
+	if !runtimeSupportsUnixModes() {
+		t.Skip("this filesystem does not carry Unix permission bits")
+	}
+	// Named specifically: "some warning was produced" would pass on a warning
+	// about an entirely different file.
+	var found bool
+	for _, w := range warns {
+		if strings.Contains(w, key) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no warning mentions the group-readable ssh key %s; got %v", key, warns)
 	}
 }
 
-// Windows does not carry Unix permission bits through os.WriteFile, so the
-// permission-derived warnings cannot be asserted there. Named rather than
-// inlined so the skip is a statement about the platform, not about the rule.
+// Reports whether this filesystem carries Unix permission bits at all, so the
+// skip is a statement about the platform rather than about the rule. Uses
+// Chmod rather than a create mode for the same reason the test above does:
+// the create mode is masked by umask and would make this answer "no" on a
+// perfectly capable host.
 func runtimeSupportsUnixModes() bool {
 	f, err := os.CreateTemp("", "modeprobe")
 	if err != nil {
