@@ -983,3 +983,89 @@ func TestChangedExtentsTCPReturnsImmediatelyOnCancelledContext(t *testing.T) {
 		t.Errorf("ChangedExtentsTCP with an already-cancelled context returned %v, want it to be context.Canceled", err)
 	}
 }
+
+// TestDueForProgressLog pins the throttle both long-running pipelines share.
+//
+// Driven as a pure time comparison, like TestStalled above: needs no
+// qemu-nbd, and no real minute of waiting.
+//
+// The `done` case is the one worth having. Without it a copy or compare that
+// finishes shortly after a tick would never log its own completion, so the
+// last line an operator saw would be a stale percentage and the operation
+// would look like it stopped partway rather than finished.
+func TestDueForProgressLog(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name    string
+		lastLog time.Time
+		now     time.Time
+		done    bool
+		want    bool
+	}{
+		{
+			name:    "a second in is far too soon",
+			lastLog: base,
+			now:     base.Add(time.Second),
+			want:    false,
+		},
+		{
+			name:    "just under the interval stays quiet",
+			lastLog: base,
+			now:     base.Add(progressLogInterval - time.Millisecond),
+			want:    false,
+		},
+		{
+			name:    "exactly at the interval logs",
+			lastLog: base,
+			now:     base.Add(progressLogInterval),
+			want:    true,
+		},
+		{
+			name:    "well past the interval logs",
+			lastLog: base,
+			now:     base.Add(progressLogInterval + time.Hour),
+			want:    true,
+		},
+		{
+			name:    "done forces a line however recent the last one was",
+			lastLog: base,
+			now:     base,
+			done:    true,
+			want:    true,
+		},
+		{
+			name:    "not done and no time elapsed stays quiet",
+			lastLog: base,
+			now:     base,
+			want:    false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dueForProgressLog(tc.lastLog, tc.now, tc.done); got != tc.want {
+				t.Errorf("dueForProgressLog(%v, %v, done=%v) = %v, want %v",
+					tc.lastLog, tc.now, tc.done, got, tc.want)
+			}
+		})
+	}
+}
+
+// The interval is a deliberate choice, not an accident of tuning: a sync
+// runs for tens of minutes, so a per-second line is thousands of entries
+// that bury everything else in a journal at exactly the moment somebody is
+// reading it to find out what went wrong. Guarded so a well-meaning "make
+// progress more responsive" change has to argue with this comment first.
+func TestProgressLogIntervalIsCoarse(t *testing.T) {
+	if progressLogInterval < 30*time.Second {
+		t.Errorf("progressLogInterval = %s; anything under 30s makes a long sync's log unreadable, "+
+			"which is the problem this constant was introduced to fix", progressLogInterval)
+	}
+	// And it must stay well inside the stall timeout, or a healthy-but-slow
+	// operation could trip the stall check before it ever reports progress.
+	if progressLogInterval >= noProgressTimeout {
+		t.Errorf("progressLogInterval (%s) must be shorter than noProgressTimeout (%s)",
+			progressLogInterval, noProgressTimeout)
+	}
+}

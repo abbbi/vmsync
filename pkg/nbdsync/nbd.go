@@ -88,6 +88,32 @@ func stalled(lastProgress, now time.Time, timeout time.Duration) bool {
 	return now.Sub(lastProgress) >= timeout
 }
 
+// progressLogInterval is how often the copy and compare pipelines report how
+// far along they are.
+//
+// One shared constant so the two cannot drift apart: an operator watching a
+// sync should not have to learn that one phase reports every second and the
+// next says nothing for half an hour.
+//
+// A minute rather than a second. These runs are measured in tens of minutes
+// against multi-gigabyte disks, so per-second lines are not progress -- they
+// are thousands of entries that push everything else out of a journal and
+// make the log unreadable exactly when something has gone wrong and somebody
+// is reading it. A minute is frequent enough to tell "moving" from "wedged"
+// (and the 120s noProgressTimeout above is what actually catches wedged),
+// and rare enough that an hour-long sync leaves sixty lines.
+const progressLogInterval = time.Minute
+
+// dueForProgressLog reports whether a progress line should be emitted now.
+//
+// done forces one regardless of the interval, so every operation logs its
+// own completion state rather than potentially stopping at the last tick --
+// a copy that finishes 3 seconds after a log would otherwise never report
+// 100%.
+func dueForProgressLog(lastLog, now time.Time, done bool) bool {
+	return done || now.Sub(lastLog) >= progressLogInterval
+}
+
 type Extent struct {
 	Offset uint64
 	Length uint64
@@ -376,7 +402,7 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 
 	logProgress := func() {
 		now := time.Now()
-		if now.Sub(lastLog) < time.Second && writtenBytes != totalBytes {
+		if !dueForProgressLog(lastLog, now, writtenBytes == totalBytes) {
 			return
 		}
 		elapsed := now.Sub(start).Seconds()
@@ -840,7 +866,45 @@ func compareTCP(ctx context.Context, aHost string, aPort int, aExport string, bH
 
 	start := time.Now()
 	lastProgress := start
+	lastLog := start
+	var comparedBytes uint64
 	var compareErr error
+
+	// A full-image compare reads every byte of both sides and can run for
+	// tens of minutes. Without this it said nothing at all between the
+	// "comparing source and target images" line and its verdict, so a
+	// half-hour silence looked identical whether it was working, crawling,
+	// or wedged -- and the run it was part of looked hung.
+	//
+	// Reports bytes rather than chunks: chunk count is an internal detail,
+	// while bytes against the image size is the same shape the copy phase
+	// reports and can be compared against it directly. Mismatches so far are
+	// included when collecting, because "still going, and already 200 ranges
+	// differ" is worth knowing an hour before the verdict.
+	logCompareProgress := func(done bool) {
+		now := time.Now()
+		if !dueForProgressLog(lastLog, now, done) {
+			return
+		}
+		elapsed := now.Sub(start).Seconds()
+		if elapsed <= 0 {
+			elapsed = 0.001
+		}
+		percent := 100.0
+		if size > 0 {
+			percent = (float64(comparedBytes) / float64(size)) * 100.0
+		}
+		mibPerSec := (float64(comparedBytes) / (1024.0 * 1024.0)) / elapsed
+		if collectMismatches {
+			trace.Info(fmt.Sprintf("nbd: compare progress (%s)  %.2f%% (%d/%d bytes) %.2f MiB/s, %d mismatching range(s) so far",
+				aExport, percent, comparedBytes, size, mibPerSec, len(mismatches)))
+			lastLog = now
+			return
+		}
+		trace.Info(fmt.Sprintf("nbd: compare progress (%s)  %.2f%% (%d/%d bytes) %.2f MiB/s",
+			aExport, percent, comparedBytes, size, mibPerSec))
+		lastLog = now
+	}
 
 compareLoop:
 	for nextChunk < len(chunks) || anyOutstanding() {
@@ -1008,6 +1072,10 @@ compareLoop:
 			slots[i].bufB.Free()
 			slots[i].stateA = sideIdle
 			slots[i].stateB = sideIdle
+			// Counted whether or not the chunk matched: this measures how
+			// much of the image has been examined, not how much of it was
+			// good.
+			comparedBytes += length
 			if !match {
 				if !collectMismatches {
 					first := subRanges[0]
@@ -1016,6 +1084,7 @@ compareLoop:
 				}
 				mismatches = append(mismatches, subRanges...)
 			}
+			logCompareProgress(comparedBytes == size)
 		}
 	}
 
