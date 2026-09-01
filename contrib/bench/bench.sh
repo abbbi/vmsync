@@ -68,14 +68,15 @@ Options:
                              4  snapshot      9  retention
                              5  define       10  restore
                                              11  invert
+                                             12  wedge
                            Runs in whichever order LIST gives them, not a
                            fixed canonical one.
                            (default: matrix,verify,reinit,snapshot,retention;
                            retention is last because it reinitialises the
                            target, and it skips cleanly where the target
                            filesystem cannot reflink. define, failover,
-                           fence-agent, verify-long, restore and invert are
-                           opt-in, see below)
+                           fence-agent, verify-long, restore, invert and wedge
+                           are opt-in, see below)
   --dry-run               print every vmsync command line; touch nothing
                            (no ssh/qemu-io/vmsync calls actually made)
   -h, --help              this text
@@ -2512,7 +2513,7 @@ stage_fence_agent() {
 # excluded by name, so every restore point check was being folded into the
 # matrix verdict, and its one FAIL would have failed Stage 1 on any run that
 # included both.
-NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$)'
+NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$)'
 
 # stage_pattern STAGE -> the regex matching that stage's scenario column.
 # --- Stage 8: verify after a long incremental chain --------------------------
@@ -3331,6 +3332,148 @@ rp_status_field() {
 		| head -1 | tr -d '[:space:]'
 }
 
+
+# --- Stage 12: a failed run must not wedge the next one ----------------------
+
+# The regression this exists for, seen in production 2026-09-01: a run copied
+# every disk successfully and then FAILED afterwards -- a failed -verify, in
+# that case -- and every subsequent run then refused with
+#
+#   target file ... has an mtime ... newer than the last sync timestamp
+#
+# ...blaming an out-of-band writer that did not exist. last_sync_timestamp is
+# written only by the whole-run success path, so the failed run left the disks
+# freshly written and the timestamp stale, and each later refusal happened
+# BEFORE the copy that would have moved it on. One failed verify wedged the
+# pair permanently.
+#
+# The fix (replica_written_at, see docs/design/verify.md F2) records when
+# vmsync last wrote each replica disk, independently of whether the run went
+# on to succeed, stat'd on the TARGET's own clock so the comparison is
+# same-clock and exact.
+#
+# This CANNOT be a unit test. It needs a real failed run that genuinely wrote
+# to a real replica, and then a second real run to prove it is not refused --
+# the whole bug lives in state persisted between two processes.
+#
+# -test=failure-define is what makes a run fail AFTER the copy has landed: it
+# fails the target's redefine, which is the last step, so the disks are
+# written and last_sync_timestamp is never recorded. That is precisely the
+# shape of the original incident, reached deterministically instead of by
+# corrupting anything.
+stage_wedge() {
+	log "=== Stage 12: a failed run must not wedge the next one ==="
+
+	if [ "$DRY_RUN" = yes ]; then
+		bench_sync wedge baseline -reinit
+		bench_sync wedge failing-run "-test=failure-define"
+		bench_sync wedge recovery
+		results_row "$CSV" wedge result DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+
+	stage_needs_target_shutoff "$CSV" wedge "stage wedge" || return 0
+
+	# The failing run has to WRITE, or there is no advanced mtime and nothing
+	# to wedge: an incremental with a clean dirty bitmap returns before it
+	# touches the base. So the guest must dirty its own disk first, which
+	# needs a running source with a usable agent -- the same requirement, and
+	# the same skip, as stage verify-long.
+	local src_state
+	src_state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN")" || src_state="unknown"
+	if [ "$src_state" != running ]; then
+		warn "SKIP stage wedge: source domain '$SOURCE_DOMAIN' is '$src_state', but the failing run has to copy something for there to be a wedge to test"
+		results_row "$CSV" wedge precondition "" "" "" "" "" "" "SKIP source domain not running"
+		return 0
+	fi
+	if ! guest_exec_available; then
+		warn "SKIP stage wedge: $GUEST_EXEC_WHY -- without guest writes the failing run copies nothing, leaves the mtime untouched, and this stage would report a green result having tested nothing"
+		results_row "$CSV" wedge precondition "" "" "" "" "" "" "SKIP guest-exec unavailable"
+		return 0
+	fi
+
+	# Baseline, so the pair is clean and the target carries a
+	# last_sync_timestamp for the failing run to leave behind.
+	bench_sync wedge baseline -reinit
+	if [ "$RUN_RC" != 0 ]; then
+		warn "baseline full sync for the wedge test failed (see $RUN_LOG) -- aborting stage 12$(bench_sync_hint)"
+		return 1
+	fi
+
+	local sync_before
+	sync_before="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_sync_timestamp)"
+	if [ -z "$sync_before" ]; then
+		warn "the target carries no last_sync_timestamp after a successful baseline -- something is wrong upstream of this stage"
+		results_row "$CSV" wedge precondition 1 "" "" "" "" "" "FAIL no last_sync_timestamp after baseline"
+		return 1
+	fi
+	log "--- last_sync_timestamp after baseline: $sync_before ---"
+
+	guest_dirty || {
+		warn "could not dirty the source guest's disk -- the failing run below would copy nothing, so this stage would prove nothing"
+		results_row "$CSV" wedge precondition "" "" "" "" "" "" "SKIP guest_dirty failed"
+		return 0
+	}
+
+	# The failing run: copies, commits, then fails on the redefine.
+	log "--- running a sync that copies successfully and then fails (expect: non-zero exit) ---"
+	bench_sync wedge failing-run "-test=failure-define"
+	if [ "$RUN_RC" = 0 ]; then
+		warn "FAIL: -test=failure-define exited 0 -- the fault did not fire, so nothing below is testing a failed run"
+		results_row "$CSV" wedge failing-run 1 "" "" "" "" "" "FAIL fault injection did not fail the run"
+		return 1
+	fi
+
+	# What the failed run must and must not have left behind.
+	local sync_after written_at w_ok=1 s_ok=1
+	sync_after="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_sync_timestamp)"
+	written_at="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replica_written_at)"
+
+	[ -n "$written_at" ] && w_ok=0
+	if [ "$w_ok" = 0 ]; then
+		log "   PASS: the failed run recorded replica_written_at='$written_at'"
+		results_row "$CSV" wedge written-at 0 "" "" "" "" "" "PASS replica_written_at recorded by a failed run"
+	else
+		warn "FAIL: the failed run recorded no replica_written_at, so the next run has nothing but the stale last_sync_timestamp to compare against -- the wedge is still there. See $RUN_LOG"
+		results_row "$CSV" wedge written-at 1 "" "" "" "" "" "FAIL no replica_written_at after a failed run"
+	fi
+
+	# It must NOT have advanced: last_sync_timestamp means "a run completed",
+	# and this one did not. Advancing it would turn a replication stall into a
+	# replica that failover believes is good.
+	[ "$sync_after" = "$sync_before" ] && s_ok=0
+	if [ "$s_ok" = 0 ]; then
+		log "   PASS: last_sync_timestamp still '$sync_after' -- unchanged by the failed run"
+		results_row "$CSV" wedge last-sync-held 0 "" "" "" "" "" "PASS last_sync_timestamp not advanced by a failed run"
+	else
+		warn "FAIL: last_sync_timestamp moved from '$sync_before' to '$sync_after' on a run that FAILED -- failover reads that field as evidence a sync landed, so this replica now looks promotable when it is not"
+		results_row "$CSV" wedge last-sync-held 1 "" "" "" "" "" "FAIL last_sync_timestamp advanced by a failed run"
+	fi
+
+	# The actual regression: the NEXT run must not be refused.
+	log "--- running again (expect: not refused by the out-of-band-write check) ---"
+	bench_sync wedge recovery
+	if grep -q "newer than the last sync timestamp" "$RUN_LOG" 2>/dev/null; then
+		warn "FAIL: the run after a failed one was REFUSED by the out-of-band-write check -- this is the wedge, unfixed. See $RUN_LOG"
+		results_row "$CSV" wedge recovery 1 "" "" "" "" "" "FAIL next run refused after a failed run"
+		return 1
+	fi
+	if [ "$RUN_RC" != 0 ]; then
+		# Refusal is what this stage is about; any OTHER failure is still a
+		# failure, but naming it separately keeps the report honest about
+		# which thing broke.
+		warn "the run after a failed one did not succeed, though it was NOT refused by the mtime check (see $RUN_LOG)$(bench_sync_hint)"
+		results_row "$CSV" wedge recovery 1 "" "" "" "" "" "FAIL next run failed for some other reason"
+		return 1
+	fi
+	log "   PASS: the run after a failed one was not refused"
+	results_row "$CSV" wedge recovery 0 "" "" "" "" "" "PASS next run not refused"
+
+	if [ "$w_ok" != 0 ] || [ "$s_ok" != 0 ]; then
+		return 1
+	fi
+	return 0
+}
 # --- Stage 11: -invert (reversing a pair's direction) ------------------------
 #
 # Nothing benched inversion before this, which is why it earns a stage: it is
@@ -3764,6 +3907,7 @@ stage_pattern() {
 	retention) printf '^retention$' ;;
 	restore) printf '^restore$' ;;
 	invert) printf '^invert$' ;;
+	wedge) printf '^wedge$' ;;
 	*) printf '$^' ;; # matches nothing
 	esac
 }
@@ -4074,7 +4218,8 @@ for s in "${stage_list[@]}"; do
         retention) stage_retention || stage_rc=$? ;;
         restore) stage_restore || stage_rc=$? ;;
         invert) stage_invert || stage_rc=$? ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert)" ;;
+        wedge) stage_wedge || stage_rc=$? ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
                 warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."
