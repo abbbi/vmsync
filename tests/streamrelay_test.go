@@ -409,6 +409,40 @@ func TestBoundedBuffer(t *testing.T) {
 			t.Fatalf("Read on a closed, empty buffer returned n=%d, want 0", n)
 		}
 	})
+
+	// The case the drained one above does NOT cover, and the one that loses
+	// data when it is wrong: closed with bytes STILL QUEUED.
+	//
+	// Close's own doc promises "Read returns io.EOF once any already-queued
+	// data has been drained" -- once drained, not before. This is not a
+	// theoretical distinction. Relay's drain goroutine and its producer race
+	// on exactly this: the producer calls Close as soon as src hits EOF, and
+	// if that lands before the drain goroutine's first Read, a Read that
+	// reports EOF while holding data silently discards the whole transfer.
+	// io.Copy treats EOF as success, so Relay then returns nil having
+	// delivered nothing -- a sync that reports success and copied no bytes.
+	t.Run("read after close still drains queued data", func(t *testing.T) {
+		b := streamrelay.NewBoundedBuffer(64)
+		payload := []byte("queued before the close")
+		if _, err := b.Write(payload); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		if err := b.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		// io.ReadAll rather than a single Read, so this also pins that EOF
+		// arrives only AFTER the queue empties rather than partway through.
+		got, err := io.ReadAll(b)
+		if err != nil {
+			t.Fatalf("ReadAll after Close: %v", err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("after Close the buffer yielded %q, want %q -- data queued before "+
+				"Close was discarded, which in Relay is a transfer that reports success "+
+				"and delivers nothing", got, payload)
+		}
+	})
 }
 
 // TestEncoderDecoderRoundTrip checks NewEncoder/NewDecoder directly (rather
@@ -435,6 +469,13 @@ func TestEncoderDecoderRoundTrip(t *testing.T) {
 	}{
 		{"zstd", streamrelay.AlgoZstd, "3"},
 		{"s2", streamrelay.AlgoS2, "better"},
+		// s2 at "best" was the one encoder branch no Go test ever
+		// constructed, while nbdbridge.ValidateCompressLevel accepts it and
+		// contrib/bench/scenarios.conf drives it. The realistic failure is a
+		// loud construction error at bridge connect rather than a bad
+		// replica, so this earns its place purely by costing one line in a
+		// table that already exists.
+		{"s2-best", streamrelay.AlgoS2, "best"},
 	}
 
 	for _, tc := range cases {
@@ -512,18 +553,37 @@ func (w *recordingFlushWriter) Flush() error {
 	return nil
 }
 
-// failingFlushWriter is a flushWriter fake whose Write always fails,
-// simulating a broken destination -- used to confirm CopyFlushing surfaces a
-// Write error as its own return value rather than swallowing it.
-type failingFlushWriter struct{}
+// The two ways a destination can break. Sentinels rather than fresh
+// errors.New calls at each use, so the tests can assert with errors.Is
+// instead of matching on message text.
+var (
+	errSimulatedWrite = errors.New("simulated write failure")
+	errSimulatedFlush = errors.New("simulated flush failure")
+)
 
-func (failingFlushWriter) Write(p []byte) (int, error) {
-	return 0, errors.New("simulated write failure")
+// failingFlushWriter is a flushWriter fake that breaks on demand: a non-nil
+// writeErr fails every Write, a non-nil flushErr fails every Flush, and both
+// nil is a writer that simply works.
+//
+// It counts Writes so a test can assert CopyFlushing STOPPED, not merely
+// that it returned an error -- a loop that keeps pumping a dead destination
+// and reports the first failure at the end is a different bug with the same
+// return value.
+type failingFlushWriter struct {
+	writeErr error
+	flushErr error
+	writes   int
 }
 
-func (failingFlushWriter) Flush() error {
-	return nil
+func (w *failingFlushWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	return len(p), nil
 }
+
+func (w *failingFlushWriter) Flush() error { return w.flushErr }
 
 // TestCopyFlushing checks CopyFlushing's two documented behaviors: an
 // explicit Flush() after every nonzero Read (not just once at the end), and
@@ -572,12 +632,50 @@ func TestCopyFlushing(t *testing.T) {
 
 	t.Run("write error propagates", func(t *testing.T) {
 		src := bytes.NewReader([]byte("some data that will never make it through"))
-		_, err := streamrelay.CopyFlushing(failingFlushWriter{}, src)
+		_, err := streamrelay.CopyFlushing(&failingFlushWriter{writeErr: errSimulatedWrite}, src)
 		if err == nil {
 			t.Fatal("CopyFlushing returned a nil error despite the destination failing every write")
 		}
-		if !strings.Contains(err.Error(), "simulated write failure") {
-			t.Fatalf("CopyFlushing returned %q, want it to surface the destination's real failure (\"simulated write failure\")", err)
+		if !errors.Is(err, errSimulatedWrite) {
+			t.Fatalf("CopyFlushing returned %q, want it to surface the destination's real failure", err)
+		}
+	})
+
+	// The branch that actually fires in production, and the one that had no
+	// test. On a compressed relay dst is a zstd or s2 encoder, and per this
+	// package's own doc a small chunk handed to Write just lands in the
+	// encoder's internal buffer -- CopyFlushing reads at most 32KB while
+	// those buffers are larger, so Write performs no I/O at all and cannot
+	// notice a dead socket. Flush is what pushes bytes out, so Flush is
+	// where a broken destination first surfaces. The already-covered Write
+	// branch is the one that stays quiet.
+	//
+	// Getting this wrong is not a silent bad replica -- both encoders latch
+	// a write error -- but a failure reported late and against the wrong
+	// operation, after a buffer's worth of data has been pumped into a
+	// socket that is already gone.
+	t.Run("flush error propagates and stops the copy", func(t *testing.T) {
+		src := &chunkReader{chunks: [][]byte{[]byte("abc"), []byte("de"), []byte("fghij")}}
+		dst := &failingFlushWriter{flushErr: errSimulatedFlush}
+
+		written, err := streamrelay.CopyFlushing(dst, src)
+		if err == nil {
+			t.Fatal("CopyFlushing returned nil despite every Flush failing")
+		}
+		if !errors.Is(err, errSimulatedFlush) {
+			t.Fatalf("CopyFlushing returned %q, want the destination's flush failure", err)
+		}
+		// Stopped at the first failure rather than draining the source.
+		if dst.writes != 1 {
+			t.Errorf("destination saw %d writes, want 1 -- CopyFlushing kept pumping after a failed flush", dst.writes)
+		}
+		if src.i != 1 {
+			t.Errorf("source was read %d times, want 1 -- CopyFlushing kept reading after a failed flush", src.i)
+		}
+		// The count still reflects what really reached dst.Write before the
+		// flush refused, so a caller can tell how far it got.
+		if written != 3 {
+			t.Errorf("written = %d, want 3 (the first chunk did reach Write)", written)
 		}
 	})
 }

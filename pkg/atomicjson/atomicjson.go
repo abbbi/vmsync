@@ -102,18 +102,29 @@ func Write(path string, value any, perm os.FileMode) error {
 	// durability could not be confirmed, which leaves us exactly where this
 	// function stood before the fsync was added. Returning an error instead
 	// would tell the caller the write did not happen, and callers act on that:
-	// operationLedger.Begin refuses to execute, fenceLedger's caller now
-	// proceeds unrecorded, and the run log's contract stops launches outright.
-	// Trading an availability outage for an unobtainable durability guarantee
-	// is the wrong way round.
+	// operationLedger.Begin refuses to execute, and fenceLedger's caller
+	// proceeds unrecorded. Trading an availability outage for an unobtainable
+	// durability guarantee is the wrong way round.
 	//
 	// Not hypothetical: POSIX permits fsync on a directory descriptor to
 	// refuse, and platforms differ on WHICH error they give for it -- Windows
 	// returns access-denied rather than EINVAL, so an errno allowlist here
 	// silently becomes an allowlist of platforms.
-	_ = SyncDir(dir)
+	//
+	// Called through syncDir rather than SyncDir directly so a test can stage
+	// the refusal. On Linux -- the deployment target -- fsync on a directory
+	// succeeds, so a test that merely calls Write proves nothing about this
+	// branch: without the seam, deleting the "_ =" and returning the error
+	// keeps the whole suite green while turning a durability non-guarantee
+	// into an availability outage. That edit is exactly what a linter
+	// complaining about an unchecked error would propose.
+	_ = syncDir(dir)
 	return nil
 }
+
+// syncDir is SyncDir, indirected only so a test can make it fail. Never
+// reassigned outside a test.
+var syncDir = SyncDir
 
 // SyncDir fsyncs a directory so a rename into it is durable.
 //
