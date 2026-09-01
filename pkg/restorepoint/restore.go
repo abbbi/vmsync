@@ -171,8 +171,11 @@ func ReplicaPresentCommand(replicaDir string, disks []string) string {
 // pkg/libvirtsync/duplicated_names_test.go, which lives on that side precisely
 // so the check costs no build-time dependency here.
 const (
-	FieldLastCheckpoint      = "last_checkpoint"
-	FieldLastSync            = "last_sync_timestamp"
+	FieldLastCheckpoint = "last_checkpoint"
+	FieldLastSync       = "last_sync_timestamp"
+	// Mirrors libvirtsync.MetadataFieldReplicaWrittenAt; kept in step by
+	// pkg/libvirtsync/duplicated_names_test.go.
+	FieldReplicaWrittenAt    = "replica_written_at"
 	FieldFailureCount        = "failure_count"
 	FieldCheckpointAt        = "checkpoint_at"
 	FieldSourceStoppedAtSync = "source_stopped_at_sync"
@@ -306,6 +309,21 @@ func MetadataPlan(s Status, r Provenance) (updates map[string]string, removals [
 	} else {
 		removals = append(removals, FieldCheckpointAt)
 	}
+	// Unconditional, unlike the fields above: a restore replaces the
+	// replica's contents wholesale, so any recorded per-disk write time
+	// describes data that no longer exists. The sidecar cannot attest a
+	// replacement for it either -- it records when the restore point was
+	// TAKEN, not when these files were written back.
+	//
+	// Removing it is a no-regression change, not a fix: the preflight then
+	// falls back to last_sync_timestamp, which this same function has just
+	// set to the restore point's TakenAt -- an old value, older than the
+	// mtime the restore itself just gave these files. So the first sync
+	// after an operator resumes a restored replica still refuses, exactly
+	// as it does today. Stamping the post-restore mtimes would fix that,
+	// but it needs a dev-to-file map this package does not have (it works
+	// from sidecar basenames) and belongs in its own change.
+	removals = append(removals, FieldReplicaWrittenAt)
 	return updates, removals
 }
 

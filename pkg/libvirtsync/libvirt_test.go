@@ -754,7 +754,7 @@ func TestAllMetadataFieldsNoBlock(t *testing.T) {
 func TestUpdateSyncMetadata(t *testing.T) {
 	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
 	before := time.Now().Unix()
-	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "source-host.example.org", "sourcevm", "", 1700000000, false)
+	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "source-host.example.org", "sourcevm", "", 1700000000, false, "")
 	after := time.Now().Unix()
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
@@ -824,7 +824,7 @@ func TestUpdateSyncMetadataDoesNotInheritSourceSideFields(t *testing.T) {
 		t.Fatalf("building source xml: %v", err)
 	}
 
-	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", "", 1700000000, false)
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", "", 1700000000, false, "")
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
@@ -865,7 +865,7 @@ func TestUpdateSyncMetadataPreservesTheTargetsOwnRole(t *testing.T) {
 		t.Fatalf("building source xml: %v", err)
 	}
 
-	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", RoleTarget, 1700000000, false)
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", RoleTarget, 1700000000, false, "")
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
@@ -880,7 +880,7 @@ func TestUpdateSyncMetadataPreservesTheTargetsOwnRole(t *testing.T) {
 func TestUpdateSyncMetadataRecordsWhetherTheSourceWasStopped(t *testing.T) {
 	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
 
-	stopped, err := UpdateSyncMetadata(base, "vmsync-cpt-000001", "src", "testvm", "", 1700000000, true)
+	stopped, err := UpdateSyncMetadata(base, "vmsync-cpt-000001", "src", "testvm", "", 1700000000, true, "")
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata: %v", err)
 	}
@@ -890,7 +890,7 @@ func TestUpdateSyncMetadataRecordsWhetherTheSourceWasStopped(t *testing.T) {
 
 	// A later incremental from a RUNNING source must clear it, or the
 	// replica keeps claiming a completeness it no longer has.
-	running, err := UpdateSyncMetadata(stopped, "vmsync-cpt-000002", "src", "testvm", "", 1700000100, false)
+	running, err := UpdateSyncMetadata(stopped, "vmsync-cpt-000002", "src", "testvm", "", 1700000100, false, "")
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata: %v", err)
 	}
@@ -2487,5 +2487,60 @@ func TestElementDropWarningStillCatchesRealLosses(t *testing.T) {
 	}
 	if kept := filterExpected(missing, MetadataFieldReplicaTargets); len(kept) == 0 {
 		t.Error("filtering unrelated expected removals silenced a genuine loss")
+	}
+}
+
+// TestUpdateSyncMetadataCarriesTheReplicaWriteRecord: the value the caller
+// measured has to reach the target's definition, or the field only ever
+// exists on runs that FAILED -- and a successful run would silently erase
+// what the previous failed one recorded.
+func TestUpdateSyncMetadataCarriesTheReplicaWriteRecord(t *testing.T) {
+	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
+
+	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "src-host", "testvm", "", 1700000000, false, "vda=1756000000,vdb=1756000005")
+	if err != nil {
+		t.Fatalf("UpdateSyncMetadata() error = %v", err)
+	}
+	got, err := ParseMetadata(out, MetadataFieldReplicaWrittenAt)
+	if err != nil {
+		t.Fatalf("ParseMetadata: %v", err)
+	}
+	if got != "vda=1756000000,vdb=1756000005" {
+		t.Errorf("replica_written_at = %q, want the value passed in", got)
+	}
+}
+
+// TestUpdateSyncMetadataDoesNotInheritTheSourcesReplicaWriteRecord is the
+// half that is easy to miss, and the reason this field is set-or-REMOVED
+// rather than merely set when non-empty.
+//
+// UpdateSyncMetadata transforms the SOURCE's XML into what the target gets
+// defined as. A source can legitimately still carry a replica_written_at
+// from an earlier life as somebody's replica -- an inverted pair, a promoted
+// domain now replicating onward. Merely omitting the key when there is
+// nothing to write would stamp the SOURCE's value onto this target, and the
+// next run would then compare this host's disks against mtimes taken on a
+// different host at a different time. Refusing forever, or worse, accepting
+// forever.
+func TestUpdateSyncMetadataDoesNotInheritTheSourcesReplicaWriteRecord(t *testing.T) {
+	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
+	srcXML, err := SetMetadataFields(base, map[string]string{
+		MetadataFieldReplicationRole:  RoleSource,
+		MetadataFieldReplicaWrittenAt: "vda=1600000000",
+	})
+	if err != nil {
+		t.Fatalf("seed the source: %v", err)
+	}
+
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", "", 1700000000, false, "")
+	if err != nil {
+		t.Fatalf("UpdateSyncMetadata() error = %v", err)
+	}
+	got, err := ParseMetadata(out, MetadataFieldReplicaWrittenAt)
+	if err != nil {
+		t.Fatalf("ParseMetadata: %v", err)
+	}
+	if got != "" {
+		t.Errorf("the target inherited the source's replica_written_at (%q); it must be removed, not merely left unset", got)
 	}
 }

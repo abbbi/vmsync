@@ -19,6 +19,7 @@ package main
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -445,5 +446,90 @@ func TestTargetFileNewerThanSyncTreatsANegativeToleranceAsZero(t *testing.T) {
 	}
 	if newer {
 		t.Error("a negative tolerance made an equal timestamp count as newer")
+	}
+}
+
+// TestSyncFloor pins the property that makes replica_written_at safe to
+// introduce at all: max() can only ever RELAX the out-of-band check.
+//
+// A change whose entire purpose is removing a spurious refusal must not be
+// able to create one. Every case below is checked against that, not just
+// against the expected value.
+func TestSyncFloor(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		lastSync      string
+		writtenAt     int64
+		haveWrittenAt bool
+		wantFloor     string
+		wantFromWA    bool
+	}{
+		{
+			// A replica written by a vmsync that predates the field, or a
+			// disk this build never stamped. Must behave exactly as before.
+			name:     "no stamp falls back to last_sync",
+			lastSync: "1700000000", haveWrittenAt: false,
+			wantFloor: "1700000000", wantFromWA: false,
+		},
+		{
+			// The direction that caused the bug: the target's clock runs
+			// ahead, so a healthy replica's mtime exceeds last_sync. The
+			// stamp is larger, wins, and makes the comparison same-clock.
+			name:     "target clock ahead: the stamp wins and the check becomes exact",
+			lastSync: "1700000000", writtenAt: 1700000030, haveWrittenAt: true,
+			wantFloor: "1700000030", wantFromWA: true,
+		},
+		{
+			// The permissive direction. last_sync wins; the check is exactly
+			// as strict as it has always been, never stricter.
+			name:     "target clock behind: last_sync wins, no new refusal",
+			lastSync: "1700000030", writtenAt: 1700000000, haveWrittenAt: true,
+			wantFloor: "1700000030", wantFromWA: false,
+		},
+		{
+			name:     "equal values keep the compatibility floor",
+			lastSync: "1700000000", writtenAt: 1700000000, haveWrittenAt: true,
+			wantFloor: "1700000000", wantFromWA: false,
+		},
+		{
+			// A usable stamp beats a value nothing can compare against.
+			name:     "unparsable last_sync yields to a real stamp",
+			lastSync: "not-a-timestamp", writtenAt: 1700000000, haveWrittenAt: true,
+			wantFloor: "1700000000", wantFromWA: true,
+		},
+		{
+			// ...but with no stamp it is passed through unchanged, so
+			// targetFileNewerThanSync reports the parse error itself rather
+			// than this function hiding it.
+			name:     "unparsable last_sync with no stamp is passed through",
+			lastSync: "not-a-timestamp", haveWrittenAt: false,
+			wantFloor: "not-a-timestamp", wantFromWA: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			floor, fromWA := syncFloor(tc.lastSync, tc.writtenAt, tc.haveWrittenAt)
+			if floor != tc.wantFloor || fromWA != tc.wantFromWA {
+				t.Errorf("syncFloor(%q, %d, %v) = (%q, %v), want (%q, %v)",
+					tc.lastSync, tc.writtenAt, tc.haveWrittenAt, floor, fromWA, tc.wantFloor, tc.wantFromWA)
+			}
+		})
+	}
+}
+
+// The invariant stated as a property rather than a table: for any parsable
+// last_sync, introducing a stamp must never move the floor DOWN, because a
+// lower floor is a stricter check and could refuse a replica that today
+// passes.
+func TestSyncFloorNeverTightensTheCheck(t *testing.T) {
+	const lastSync = "1700000000"
+	for _, stamp := range []int64{0, 1, 1699999999, 1700000000, 1700000001, 1800000000} {
+		floor, _ := syncFloor(lastSync, stamp, true)
+		got, err := strconv.ParseInt(floor, 10, 64)
+		if err != nil {
+			t.Fatalf("syncFloor produced an unparsable floor %q", floor)
+		}
+		if got < 1700000000 {
+			t.Errorf("stamp %d moved the floor down to %d; a lower floor is a STRICTER check and could refuse a replica that passes today", stamp, got)
+		}
 	}
 }

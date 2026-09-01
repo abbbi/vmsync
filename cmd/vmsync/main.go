@@ -110,6 +110,16 @@ const clockSkewWarnAt = 30 * time.Second
 // would otherwise contend with itself.
 func targetLockKey(targetDomain string) string { return "target-" + targetDomain }
 
+// stampDisk pairs a replica disk's libvirt target dev with the file on the
+// target host that holds it.
+//
+// The pairing is computed in ONE loop, and both the write side (the
+// replica_written_at stamp) and the read side (the preflight's per-disk
+// comparison) derive their paths from it, so the two provably name the same
+// files. Two independent derivations of the same path is how a stamp ends up
+// recorded against a file nobody compares.
+type stampDisk struct{ dev, path string }
+
 // Accepted values for -replaced-disk-action.
 const (
 	replacedDiskDelete = "delete"
@@ -350,7 +360,7 @@ func main() {
 	flag.BoolVar(&cfg.SSHInsecure, "ssh-insecure-host-key", false, "disable host key verification (not recommended)")
 	flag.StringVar(&cfg.KnownHosts, "ssh-known-hosts", "", "known_hosts file path (defaults to ~/.ssh/known_hosts)")
 	flag.IntVar(&cfg.SSHTimeoutSec, "ssh-timeout-sec", 10, "ssh connection timeout in seconds")
-	flag.IntVar(&cfg.TimestampToleranceSec, "timestamp-tolerance-sec", 0, "How far a replica disk's mtime may be ahead of the last sync timestamp before the sync refuses, in seconds. These are two DIFFERENT clocks -- the mtime is the target host's, the timestamp is this host's -- so with the default of 0 a target whose clock runs even a second fast fails every incremental sync with an error blaming out-of-band modification. Set this above the drift the error reports to recover without a full -reinit; a value near -30s worth of NTP jitter is reasonable, and fixing NTP is better")
+	flag.IntVar(&cfg.TimestampToleranceSec, "timestamp-tolerance-sec", 0, "How far a replica disk's mtime may be ahead of the recorded sync time before the sync refuses, in seconds. Mostly no longer needed: vmsync now records replica_written_at per disk, stat'd on the TARGET host, so where that exists both sides of the comparison come from the same clock and drift cannot trigger it. It still matters for a replica written by an older vmsync, where the only record is last_sync_timestamp taken on THIS host's clock -- a target running even a second fast then fails every incremental sync with an error blaming out-of-band modification. Set this above the drift the error reports to recover without a full -reinit, and pass it for ONE run rather than persisting it: that run records replica_written_at for every disk it writes even if it then fails, which is enough to make every later comparison exact. Fixing NTP is still the real repair")
 	flag.BoolVar(&cfg.Start, "start", false, "In case vm is in non-running state, start in paused mode to allow sync")
 	flag.BoolVar(&cfg.Reinit, "reinit", false, "Delete VM on target and restart a full sync process")
 	flag.BoolVar(&cfg.ForceClean, "force-clean", false, "A -reinit for a target that is wedged. Implies -reinit, and additionally: removes the target DOMAIN before syncing rather than redefining it at the end, so a broken definition cannot block the run; overrides the replication_role interlock for a promoted or paused target, DISCARDING its current disks; and clears the source's checkpoint chain even when the source is shut down, removing the qcow2 bitmaps that would otherwise make every later sync fail with \"Bitmap already exists\". It never touches a RUNNING target, and never overrides role=source, which means the pair is configured backwards")
@@ -1001,6 +1011,50 @@ func targetFileNewerThanSync(mtime, lastSync string, tolerance time.Duration) (n
 	return ahead > tolerance, ahead, nil
 }
 
+// syncFloor picks the timestamp a replica disk's mtime is judged against,
+// and reports whether it came from replica_written_at.
+//
+// MAX, never "replica_written_at always wins", and the reason is a property
+// rather than a preference: max can only ever make the check MORE
+// permissive. A change whose whole purpose is removing a spurious refusal
+// must not be able to create one, and max makes that provable in a line.
+//
+// The two floors differ in which clock they were taken on, which is what
+// decides the outcome in each direction of skew:
+//
+//   - Target clock AHEAD of this host's. The only direction that ever
+//     produced a false refusal, because it is the only one where a healthy
+//     replica's mtime exceeds last_sync_timestamp. Here replica_written_at
+//     is the larger value and wins, and it was stat'd on the same clock as
+//     the mtime -- so the comparison becomes exact and the NTP false
+//     positive that -timestamp-tolerance-sec exists for is simply gone.
+//   - Target clock BEHIND. last_sync_timestamp wins, leaving a window as
+//     wide as the skew in which an out-of-band write goes unnoticed. That is
+//     the permissive direction, which never refused anything, and the skew
+//     is sub-second under working NTP -- vmsync warns past 30s on its own.
+//     Anyone running -timestamp-tolerance-sec=60 has already accepted a
+//     blind spot sixty times larger, deliberately.
+//
+// So: replica_written_at is the accurate floor, last_sync_timestamp is a
+// compatibility floor that can only relax the check. A replica that predates
+// the field, or a disk with no entry, keeps exactly today's behaviour.
+func syncFloor(lastSync string, writtenAt int64, haveWrittenAt bool) (floor string, fromWrittenAt bool) {
+	if !haveWrittenAt {
+		return lastSync, false
+	}
+	s, err := strconv.ParseInt(strings.TrimSpace(lastSync), 10, 64)
+	if err != nil {
+		// An unparsable last_sync is targetFileNewerThanSync's error to
+		// report, not this function's to hide -- but a usable stamp is
+		// strictly better than a value that cannot be compared at all.
+		return strconv.FormatInt(writtenAt, 10), true
+	}
+	if writtenAt > s {
+		return strconv.FormatInt(writtenAt, 10), true
+	}
+	return lastSync, false
+}
+
 // listeningPorts asks a host which TCP ports are currently in LISTEN state,
 // running portalloc.ListeningCommand over SSH or locally depending on
 // remote. The same "ss" dependency the bridge's own readiness check already
@@ -1291,6 +1345,13 @@ func run(cfg syncConfig) (runErr error) {
 	var backupMu sync.Mutex
 	var backupActive bool = false
 	var targetCleanupOnce sync.Once
+	// stampDisks pairs each replica disk's libvirt target dev with the file
+	// on the target host holding it, so replica_written_at is keyed by the
+	// same expression on the write side as the preflight uses on the read
+	// side. Populated once the disk list is known; read from the signal
+	// handler's goroutine too, hence the mutex.
+	var stampMu sync.Mutex
+	var stampDisks []stampDisk
 	var sourceCleanupOnce sync.Once
 	var resumeOnce sync.Once
 	var suspendedForVerify bool
@@ -1950,6 +2011,88 @@ func run(cfg syncConfig) (runErr error) {
 			})
 		})
 	}
+	// measureReplicaWrittenAt stats every replica disk this run is
+	// responsible for and renders the replica_written_at value describing
+	// them (see libvirtsync.MetadataFieldReplicaWrittenAt).
+	//
+	// context.Background(), NEVER run()'s ctx. reportWorkerErr cancels ctx
+	// BEFORE it pushes the error, and wg.Wait() returns strictly after that,
+	// so on every failure path -- which is precisely what this stamp exists
+	// for -- ctx is already done by the time this runs. remotessh.Client.Run
+	// answers a done ctx before it even opens a session, so with ctx this
+	// would fail ~100% of the time in its primary case and appear to work in
+	// every success-path test. Same reason cleanupTargetNBD above and
+	// cleanupSourceBridge below abandon ctx.
+	//
+	// Returns "" for "nothing to record", which the writer treats as a
+	// no-op. Never fails the run: a missing stamp costs precision on the
+	// next run's check, and replacing a real failure with this one would be
+	// a strictly worse trade.
+	measureReplicaWrittenAt := func(trigger string) string {
+		stampMu.Lock()
+		disks := append([]stampDisk(nil), stampDisks...)
+		stampMu.Unlock()
+		if len(disks) == 0 {
+			return ""
+		}
+		sshClientMu.Lock()
+		client := targetSSHClient
+		sshClientMu.Unlock()
+		if client == nil {
+			return ""
+		}
+
+		paths := make([]string, 0, len(disks))
+		devByPath := make(map[string]string, len(disks))
+		for _, d := range disks {
+			paths = append(paths, d.path)
+			devByPath[d.path] = d.dev
+		}
+		sctx, scancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer scancel()
+		out, err := client.Run(sctx, util.StatMTimesCommand(paths))
+		if err != nil {
+			trace.Warning("could not read the replica disks' modification times, so this run will not record when it wrote them; if it fails, the next run's out-of-band-write check may refuse it",
+				"trigger", trigger, "error", err, "output", out)
+			return ""
+		}
+		byDev := make(map[string]int64, len(disks))
+		for p, mtime := range util.ParseStatMTimes(out) {
+			if dev, ok := devByPath[p]; ok {
+				byDev[dev] = mtime
+			}
+		}
+		return util.FormatReplicaWrittenAt(byDev)
+	}
+
+	// recordReplicaWrittenAt writes the stamp onto the TARGET domain,
+	// best-effort.
+	//
+	// A narrow metadata merge, not a DefineDomain: this can run against a
+	// target that is promoted and RUNNING, and rewriting a live domain's
+	// whole definition from a typed round-trip is how configuration goes
+	// missing. No removals, so failure_count is untouched.
+	recordReplicaWrittenAt := func(trigger, value string) {
+		if value == "" {
+			return
+		}
+		exists, err := libvirtsync.DomainExists(tgtMgr.Conn, cfg.TargetDomain)
+		if err != nil || !exists {
+			// A first full sync, or -reinit/-force-clean having undefined
+			// the target: there is nothing to write to yet, and the run's
+			// own DefineDomain carries the value instead. Not a warning --
+			// this is the ordinary shape of a first run.
+			trace.Debug("no target domain to record the replica write against yet", "trigger", trigger, "vm", cfg.TargetDomain)
+			return
+		}
+		if err := libvirtsync.SetDomainMetadataFields(tgtMgr, cfg.TargetDomain, map[string]string{
+			libvirtsync.MetadataFieldReplicaWrittenAt: value,
+		}); err != nil {
+			trace.Warning("could not record when this run wrote the replica disks; if this run fails, the next one's out-of-band-write check may refuse it",
+				"trigger", trigger, "vm", cfg.TargetDomain, "error", err)
+		}
+	}
+
 	cleanupSourceBridge := func(trigger string) {
 		sourceCleanupOnce.Do(func() {
 			sshClientMu.Lock()
@@ -2170,6 +2313,23 @@ func run(cfg syncConfig) (runErr error) {
 			// process could otherwise sit there forever despite a clean
 			// signal handler. Exit directly instead.
 			trace.Warning("cleanup complete, forcing process exit", "signal", sig.String())
+			// Record what was written to the replica, for the same reason as
+			// the two writes below: os.Exit skips run() entirely, so the
+			// stamp taken there never happens on this path. An interrupted
+			// run has usually written disks -- vmsync-agent SIGTERMs every
+			// scheduled sync on shutdown or reload -- and without this the
+			// next run refuses on a fresh mtime nothing accounts for.
+			//
+			// The cleanup goroutines above have already killed every target
+			// export, so nothing there still holds a replica disk open.
+			//
+			// PARTIAL BY DESIGN: this handler deliberately does not wait for
+			// the disk goroutines, so a disk still inside qemu-img commit
+			// right now is not recorded. That under-records -- the next run
+			// may still refuse, exactly as it does today -- and never
+			// over-records, which is the safe direction. See
+			// MetadataFieldReplicaWrittenAt.
+			recordReplicaWrittenAt(sig.String(), measureReplicaWrittenAt(sig.String()))
 			// Mirrors the deferred metrics write further up in run() --
 			// duplicated here for the same reason as the checkpoint cleanup
 			// above: os.Exit below skips that defer entirely. An interrupted
@@ -2762,23 +2922,47 @@ func run(cfg syncConfig) (runErr error) {
 				trace.Warning("empty or unparsable target domain metadata entry, cannot verify timestamp", "error", timestampParseErr)
 			} else {
 				trace.Info("Target domain metadata", "timestamp", metadataEntryTimestamp)
+				// Per-disk record of when vmsync itself last wrote each
+				// replica file, on the TARGET's own clock. Absent on a
+				// replica written by an older vmsync, and absent per disk
+				// for anything that build never stamped -- both fall back to
+				// last_sync_timestamp, i.e. to exactly today's behaviour.
+				writtenAtRaw, wErr := libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldReplicaWrittenAt)
+				if wErr != nil {
+					trace.Warning("could not read when this replica was last written; falling back to the last sync timestamp, which is a different clock and may refuse a healthy replica", "error", wErr)
+				}
+				writtenAt := util.ParseReplicaWrittenAt(writtenAtRaw)
 				for _, d := range qcowDisks {
 					targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
+					// Deliberately still one stat per disk, and still a hard
+					// error: on an incremental sync a MISSING target file is
+					// a real problem, and the tolerant batch form used for
+					// writing the stamp would swallow it.
 					out, err := targetSSHClient.Run(ctx, "stat -c '%Y' "+util.ShQuote(targetPath))
 					if err != nil {
 						return fmt.Errorf("%w: %s", err, out)
 					}
-					newer, aheadBy, cmpErr := targetFileNewerThanSync(out, metadataEntryTimestamp, time.Duration(cfg.TimestampToleranceSec)*time.Second)
+					stamp, haveStamp := writtenAt[d.TargetDev]
+					floor, fromWrittenAt := syncFloor(metadataEntryTimestamp, stamp, haveStamp)
+					newer, aheadBy, cmpErr := targetFileNewerThanSync(out, floor, time.Duration(cfg.TimestampToleranceSec)*time.Second)
 					if cmpErr != nil {
 						return fmt.Errorf("comparing %s against the last sync timestamp: %w", targetPath, cmpErr)
+					}
+					if newer && fromWrittenAt {
+						// Both sides came from the target's own clock, so
+						// drift is ruled out and the tolerance would only
+						// hide a real finding. Say so, rather than repeating
+						// the cross-clock advice that no longer applies.
+						return fmt.Errorf("target file %s has an mtime %s newer than the last sync timestamp recorded for this replica (replica_written_at %s=%d) -- BOTH of those come from the target host's own clock, so this is not clock drift: something wrote to this replica since vmsync last did. Find that writer; raising -timestamp-tolerance-sec would only hide it",
+							targetPath, aheadBy, d.TargetDev, stamp)
 					}
 					if newer {
 						// The skew is named, because the number is what tells
 						// the two causes apart: a few seconds is two hosts'
 						// clocks disagreeing, and hours is somebody having
 						// written to the replica.
-						return fmt.Errorf("target file %s has an mtime %s newer than the last sync timestamp, beyond the %ds tolerance -- either something wrote to the replica between syncs, or this host's clock and the target's disagree by that much (they are different clocks: the mtime is the target's, last_sync_timestamp is this host's). If it is clock drift, fix NTP or raise -timestamp-tolerance-sec above %d",
-							targetPath, aheadBy, cfg.TimestampToleranceSec, int64(aheadBy.Seconds()))
+						return fmt.Errorf("target file %s has an mtime %s newer than the last sync timestamp, beyond the %ds tolerance -- either something wrote to the replica between syncs, or this host's clock and the target's disagree by that much (they are different clocks: the mtime is the target's, last_sync_timestamp is this host's). If it is clock drift, fix NTP or raise -timestamp-tolerance-sec above %d. This replica carries no per-disk replica_written_at for %s yet, so the comparison is still cross-clock; one successful sync records one and makes it exact",
+							targetPath, aheadBy, cfg.TimestampToleranceSec, int64(aheadBy.Seconds()), d.TargetDev)
 					}
 				}
 				trace.Info("Successfully verified target file timestamps")
@@ -3462,10 +3646,19 @@ func run(cfg syncConfig) (runErr error) {
 	//
 	// Declared ahead of the closures rather than beside the loop that uses
 	// it, because syncDisk below captures it.
+	// One loop, two consumers: the restore-point paths and the dev-to-path
+	// pairing replica_written_at is keyed by. Deriving the path twice is how
+	// a stamp ends up recorded against a file the preflight never stats.
 	targetDiskPaths := make([]string, 0, len(qcowDisks))
+	stamps := make([]stampDisk, 0, len(qcowDisks))
 	for _, d := range qcowDisks {
-		targetDiskPaths = append(targetDiskPaths, util.SetTargetPath(cfg.TargetDiskPath, d.RootSource))
+		p := util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
+		targetDiskPaths = append(targetDiskPaths, p)
+		stamps = append(stamps, stampDisk{dev: d.TargetDev, path: p})
 	}
+	stampMu.Lock()
+	stampDisks = stamps
+	stampMu.Unlock()
 	rp, err := newRestorePoints(ctx, cfg.RetentionPolicy, targetSSHClient, targetDiskPaths, checkpointName, checkpointAt)
 	if err != nil {
 		return err
@@ -3525,6 +3718,31 @@ func run(cfg syncConfig) (runErr error) {
 	trace.Info("waiting for all processes to finish")
 	wg.Wait()
 	close(errCh)
+
+	// Record what this run wrote to the replica -- BEFORE the drain below,
+	// which returns on the first worker error.
+	//
+	// That ordering is the entire fix. last_sync_timestamp is written only
+	// by UpdateSyncMetadata, far below and only on full success, so a run
+	// that copied the disks and then failed -- a failed -verify, most often
+	// -- left every replica disk with a fresh mtime and the recorded
+	// timestamp untouched. The next run's preflight then saw a disk newer
+	// than the last sync and refused, blaming an out-of-band writer that did
+	// not exist, and refused again every run after that because each refusal
+	// happens before the copy that would have moved the timestamp on.
+	//
+	// cleanupTargetNBD first, and not for tidiness: on a FULL sync qemu-nbd
+	// exports the base file itself, and on a failed copy copyAndCommit's own
+	// inline stop was never reached, so a live daemon could still be
+	// completing queued writes into the very file about to be stat'd. It is
+	// idempotent (targetCleanupOnce), so the deferred call further up simply
+	// becomes a no-op and this costs nothing. Nothing past this point
+	// registers another target export or writes a replica disk -- rp.commit
+	// renames a staging directory and writes a sidecar, DefineDomain touches
+	// XML only -- so this is the last moment a replica disk can change.
+	cleanupTargetNBD("stamp")
+	replicaWrittenAt := measureReplicaWrittenAt("post-copy")
+	recordReplicaWrittenAt("post-copy", replicaWrittenAt)
 
 	for err := range errCh {
 		if err != nil {
@@ -3620,7 +3838,7 @@ func run(cfg syncConfig) (runErr error) {
 
 	trace.Info("Adding metadata information")
 	var newXML string
-	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint, util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName), cfg.SourceDomain, currentTargetRole, checkpointAt.Unix(), sourceStoppedAtCheckpoint)
+	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint, util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName), cfg.SourceDomain, currentTargetRole, checkpointAt.Unix(), sourceStoppedAtCheckpoint, replicaWrittenAt)
 	if err != nil {
 		// UpdateSyncMetadata is a pure in-memory XML transformation -- no
 		// network or libvirt call involved -- so a failure here is almost

@@ -263,6 +263,41 @@ const (
 	MetadataFieldRestoredAt   = "restored_at"
 	MetadataFieldRestoredBy   = "restored_by"
 
+	// MetadataFieldReplicaWrittenAt records when vmsync itself last wrote
+	// each replica disk: "vda=<unix>,vdb=<unix>", per disk, keyed by target
+	// dev. Written on the TARGET.
+	//
+	// It exists because last_sync_timestamp is only written when a whole run
+	// SUCCEEDS. A run that copied the disks and then failed -- a failed
+	// -verify being much the commonest case -- left every replica disk with
+	// a fresh mtime and the recorded timestamp untouched, so the next run's
+	// out-of-band-modification check saw a disk newer than the last sync and
+	// refused. Forever, since each refusal happens before the copy that
+	// would have fixed it. One failed verify wedged the pair.
+	//
+	// The values come from `stat` on the TARGET host, which is the same
+	// clock the mtime they are compared against comes from. Where a stamp
+	// exists the comparison is therefore exact rather than cross-clock,
+	// which is what -timestamp-tolerance-sec exists to paper over.
+	//
+	// WHAT IT DOES NOT COVER: a run KILLED mid-flight. The signal handler
+	// stamps what it can, but it deliberately does not wait for the disk
+	// goroutines, so a disk still inside `qemu-img commit` when the signal
+	// lands is not recorded. That under-records, never over-records -- the
+	// next run may still refuse, exactly as it does today, and never
+	// wrongly accepts.
+	//
+	// A promoted domain keeps its last stamp deliberately: the role gate
+	// refuses a sync into it long before the timestamp check runs, so
+	// clearing it would buy nothing and lose the record.
+	//
+	// Being listed in metadataFieldOrder is for stable XML ordering ONLY --
+	// buildMetadataEntry emits unknown fields too. What actually keeps this
+	// field correct across a domain's life is the set-or-remove in
+	// UpdateSyncMetadata plus the strip lists in RecordReplicaTarget,
+	// pkg/failover's invert removals and pkg/restorepoint's MetadataPlan.
+	MetadataFieldReplicaWrittenAt = "replica_written_at"
+
 	// MetadataFieldCheckpointAt is when the checkpoint the replica's
 	// contents correspond to was created -- the START of the copy that
 	// produced them, not its end.
@@ -366,6 +401,7 @@ var metadataFieldOrder = []string{
 	MetadataFieldReplicationRole,
 	MetadataFieldLastCheckpoint,
 	MetadataFieldLastSync,
+	MetadataFieldReplicaWrittenAt,
 	MetadataFieldFailureCount,
 	MetadataFieldReplicaSource,
 	MetadataFieldReplicaTargets,
@@ -1104,7 +1140,18 @@ func SetMetadataFields(domainXML string, updates map[string]string, removeFields
 // sync; empty means the target had no role, and the field is then removed
 // rather than inherited, preserving the property that vmsync never assigns
 // a role on its own.
-func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetRole string, checkpointAtUnix int64, sourceStopped bool) (string, error) {
+// replicaWrittenAt is this run's per-disk write record (see
+// MetadataFieldReplicaWrittenAt), or "" when there is none.
+//
+// SET-OR-REMOVE, never merely omitted, and that is not symmetry for its own
+// sake. This function transforms the SOURCE's XML into what the target will
+// be defined as, so a field it does not mention is whatever the SOURCE
+// happened to carry -- and a source can legitimately still carry a stale
+// replica_written_at from an earlier life as somebody's replica. Omitting
+// the key would stamp that onto this target, so the next run would compare
+// this host's disks against mtimes taken on a different host at a different
+// time.
+func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetRole string, checkpointAtUnix int64, sourceStopped bool, replicaWrittenAt string) (string, error) {
 	updates := map[string]string{
 		MetadataFieldLastCheckpoint: checkpoint,
 		MetadataFieldLastSync:       strconv.FormatInt(time.Now().Unix(), 10),
@@ -1130,6 +1177,13 @@ func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetR
 		updates[MetadataFieldSourceStoppedAtSync] = "1"
 	} else {
 		remove = append(remove, MetadataFieldSourceStoppedAtSync)
+	}
+	// Same shape, and see the parameter's own note above for why the
+	// removal branch is load-bearing rather than tidiness.
+	if replicaWrittenAt != "" {
+		updates[MetadataFieldReplicaWrittenAt] = replicaWrittenAt
+	} else {
+		remove = append(remove, MetadataFieldReplicaWrittenAt)
 	}
 	if targetRole == "" {
 		remove = append(remove, MetadataFieldReplicationRole)
@@ -1181,8 +1235,8 @@ func appendReplicaTarget(list, entry string) string {
 // definition (sourceDomainName, looked up on mgr) to add targetHost:
 // targetDomain to its replica_targets metadata list (deduplicated -- a
 // repeat sync to the same target is a no-op), and strips
-// last_checkpoint/last_sync_timestamp/failure_count from it if present:
-// those three fields describe a domain's state as a replication TARGET,
+// last_checkpoint/last_sync_timestamp/failure_count/replica_written_at from
+// it if present: those fields describe a domain's state as a replication TARGET,
 // and are meaningless -- and actively misleading to a human or external
 // tool reading this domain's XML -- once it's acting as a SOURCE instead,
 // which this call establishes it as. This is the one place vmsync ever
@@ -1215,7 +1269,13 @@ func RecordReplicaTarget(mgr *Manager, sourceDomainName, targetHost, targetDomai
 		MetadataFieldReplicaTargets:   updatedList,
 		MetadataFieldLastReplicatedAt: strconv.FormatInt(at.Unix(), 10),
 		MetadataFieldLastReplicatedTo: entry,
-	}, MetadataFieldLastCheckpoint, MetadataFieldLastSync, MetadataFieldFailureCount)
+		// replica_written_at joins the strip list for exactly the reason the
+		// other three are on it: it describes a domain's life as somebody's
+		// TARGET, and this domain is acting as a SOURCE. Left behind it is
+		// meaningless to anyone reading the XML, and worse, it is what
+		// UpdateSyncMetadata would inherit onto a real replica.
+	}, MetadataFieldLastCheckpoint, MetadataFieldLastSync, MetadataFieldFailureCount,
+		MetadataFieldReplicaWrittenAt)
 }
 
 // ReadTargetFailureCount reconnects to the target and returns the

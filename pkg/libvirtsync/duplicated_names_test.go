@@ -48,6 +48,7 @@ func TestFailoverFieldNamesMatch(t *testing.T) {
 		{MetadataFieldReplicaTargets, failover.FieldReplicaTargets, "replica_targets"},
 		{MetadataFieldLastCheckpoint, failover.FieldLastCheckpoint, "last_checkpoint"},
 		{MetadataFieldLastSync, failover.FieldLastSync, "last_sync_timestamp"},
+		{MetadataFieldReplicaWrittenAt, failover.FieldReplicaWrittenAt, "replica_written_at"},
 		{MetadataFieldFailureCount, failover.FieldFailureCount, "failure_count"},
 		{MetadataFieldPromotedAt, failover.FieldPromotedAt, "promoted_at"},
 		{MetadataFieldPromotedBy, failover.FieldPromotedBy, "promoted_by"},
@@ -81,6 +82,7 @@ func TestRestorePointFieldNamesMatch(t *testing.T) {
 	for _, c := range []struct{ mine, theirs, what string }{
 		{MetadataFieldLastCheckpoint, restorepoint.FieldLastCheckpoint, "last_checkpoint"},
 		{MetadataFieldLastSync, restorepoint.FieldLastSync, "last_sync_timestamp"},
+		{MetadataFieldReplicaWrittenAt, restorepoint.FieldReplicaWrittenAt, "replica_written_at"},
 		{MetadataFieldFailureCount, restorepoint.FieldFailureCount, "failure_count"},
 		{MetadataFieldCheckpointAt, restorepoint.FieldCheckpointAt, "checkpoint_at"},
 		{MetadataFieldSourceStoppedAtSync, restorepoint.FieldSourceStoppedAtSync, "source_stopped_at_sync"},
