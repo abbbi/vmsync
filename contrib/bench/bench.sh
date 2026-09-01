@@ -2197,11 +2197,10 @@ stage_failover() {
 # agent_standalone_config VM -> the JSON for a --standalone agent that
 # schedules nothing and exists only to run its fence loop.
 agent_standalone_config() {
-	# No "config_version" here yet: the SCHEDULE document is still decoded as
-	# UIConfig, strictly, and has no such field -- adding one would make every
-	# standalone agent refuse to start. It arrives when file 2 migrates to
-	# ScheduleDoc; the agent's own settings file below already carries one.
-	printf '{\n  "report_interval_seconds": 60,\n  "poll_wait_seconds": 30,\n  "schedule": [\n    { "vm": "%s", "interval_seconds": 86400, "enabled": false, "profile": {} }\n  ]\n}\n' "$1"
+	# "config_version" is REQUIRED in a hand-written schedule: the standalone
+	# decoder is strict, so a file without one is refused rather than assumed
+	# to be current.
+	printf '{\n  "config_version": 1,\n  "report_interval_seconds": 60,\n  "poll_wait_seconds": 30,\n  "schedule": [\n    { "vm": "%s", "interval_seconds": 86400, "enabled": false, "profile": {} }\n  ]\n}\n' "$1"
 }
 
 # agent_local_config STATE_DIR VMSYNC_BIN -> the agent's own settings file.
