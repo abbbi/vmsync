@@ -1,5 +1,5 @@
 /*
-	Copyright (C) 2026  Michael Ablassmeier <abi@grinser.de>
+	Copyright (C) 2026  Orsiris de Jong <ozy@netpower.fr>
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -27,4 +27,4 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // point of checking.
 package version
 
-const Version = "0.40-2026082501-beta"
+const Version = "0.50-2026090201-beta"
