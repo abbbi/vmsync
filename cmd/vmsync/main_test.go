@@ -316,21 +316,25 @@ func TestRefuseReinitIfTargetRunning(t *testing.T) {
 // whatever else the operator put there; reserve too many and a range that
 // should fit is rejected.
 //
-// The layout is five blocks of N at fixed offsets -- exports [T, +N),
+// The layout is four blocks of N at fixed offsets -- exports [T, +N),
 // their bridges [+N, +2N), verify exports [+2N, +3N), verify bridges
-// [+3N, +4N), checksum exports [+4N, +5N). Each block sits at its own fixed
-// offset whether or not the ones before it are in use (see runVerify's own
-// comment for why the verify export's port must not depend on the write
-// export's), so verification alone still reserves through 3N with the bridge
-// block left idle, and the checksum check -- which is ON by default --
-// reserves through 5N.
+// [+3N, +4N). The verify block sits at +2N whether or not bridging is on
+// (see runVerify's own comment for why it must not depend on the write
+// export's port), so verification alone still reserves through 3N with the
+// bridge block left idle.
+//
+// The integrity check, which is ON by default, is deliberately absent from
+// this function and so from this test: the pre-commit check exports over a
+// Unix socket and the digest-based -verify reuses the verify export at +2N,
+// so neither costs a port. TestChecksumCheckCostsNoPorts below states that
+// as its own assertion, so that adding a port to either path fails a test
+// rather than quietly widening every run's reservation.
 func TestTargetPortsNeeded(t *testing.T) {
 	cases := []struct {
 		name     string
 		disks    int
 		bridging bool
 		verify   bool
-		checksum bool
 		want     int
 	}{
 		{name: "plain sync, one disk", disks: 1, want: 1},
@@ -338,33 +342,71 @@ func TestTargetPortsNeeded(t *testing.T) {
 		{name: "bridged sync reserves the bridge block too", disks: 3, bridging: true, want: 6},
 		{name: "verify without bridging still reaches +3N", disks: 3, verify: true, want: 9},
 		{name: "verify with bridging reserves all four blocks", disks: 3, bridging: true, verify: true, want: 12},
-		{name: "single disk, bridging and verify", disks: 1, bridging: true, verify: true, want: 4},
-		// The checksum block is the highest, so once it is on the span
-		// reaches 5N regardless of what is or is not enabled below it.
-		{name: "checksum alone still reaches +5N", disks: 3, checksum: true, want: 15},
-		{name: "checksum with bridging", disks: 3, bridging: true, checksum: true, want: 15},
-		{name: "everything on", disks: 3, bridging: true, verify: true, checksum: true, want: 15},
-		{name: "single disk, everything on", disks: 1, bridging: true, verify: true, checksum: true, want: 5},
+		{name: "single disk, everything on", disks: 1, bridging: true, verify: true, want: 4},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := targetPortsNeeded(tc.disks, tc.bridging, tc.verify, tc.checksum); got != tc.want {
-				t.Errorf("targetPortsNeeded(%d, bridging=%v, verifying=%v, checksumming=%v) = %d, want %d",
-					tc.disks, tc.bridging, tc.verify, tc.checksum, got, tc.want)
+			if got := targetPortsNeeded(tc.disks, tc.bridging, tc.verify); got != tc.want {
+				t.Errorf("targetPortsNeeded(%d, bridging=%v, verifying=%v) = %d, want %d",
+					tc.disks, tc.bridging, tc.verify, got, tc.want)
 			}
 		})
 	}
 
-	// The highest offset any code path binds at is base+5N-1, so the
+	// The highest offset any code path binds at is base+4N-1, so the
 	// reservation for a fully-enabled run must cover exactly that and no
 	// more -- a direct restatement of the invariant, independent of the
 	// table above.
 	const disks = 4
-	need := targetPortsNeeded(disks, true, true, true)
-	highestBound := 5*disks - 1
+	need := targetPortsNeeded(disks, true, true)
+	highestBound := 4*disks - 1
 	if need != highestBound+1 {
-		t.Errorf("targetPortsNeeded(%d, true, true, true) = %d, but the highest offset bound is base+%d, so %d ports are required",
+		t.Errorf("targetPortsNeeded(%d, true, true) = %d, but the highest offset bound is base+%d, so %d ports are required",
 			disks, need, highestBound, highestBound+1)
+	}
+}
+
+// The integrity check must not cost a single port, in either of its forms,
+// and this states it as an assertion rather than leaving it to a comment.
+//
+// It is worth pinning because the temptation to give the pre-commit export a
+// TCP port of its own is real -- it is what every other export here does --
+// and doing so would widen EVERY run's reservation by N whether or not the
+// check ran, shrinking how many concurrent runs an auto-allocated range can
+// hold. The Unix socket is what avoids that, and the digest-based -verify
+// reuses the export -verify already pays for.
+func TestChecksumCheckCostsNoPorts(t *testing.T) {
+	const disks = 3
+	for _, tc := range []struct {
+		name             string
+		bridging, verify bool
+	}{
+		{"plain", false, false},
+		{"bridged", true, false},
+		{"verifying", false, true},
+		{"bridged and verifying", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// targetPortsNeeded takes no checksum parameter at all, which is
+			// the point: there is no combination of flags under which the
+			// check changes the answer. If a port is ever added for it, this
+			// function's signature has to change and this test stops
+			// compiling -- which is the alarm.
+			got := targetPortsNeeded(disks, tc.bridging, tc.verify)
+			want := disks
+			switch {
+			case tc.verify && tc.bridging:
+				want = 4 * disks
+			case tc.verify:
+				want = 3 * disks
+			case tc.bridging:
+				want = 2 * disks
+			}
+			if got != want {
+				t.Errorf("targetPortsNeeded(%d, %v, %v) = %d, want %d -- the integrity check must not add ports",
+					disks, tc.bridging, tc.verify, got, want)
+			}
+		})
 	}
 }
 

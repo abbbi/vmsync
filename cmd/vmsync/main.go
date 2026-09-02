@@ -1168,36 +1168,26 @@ func formatRemoteStderr(stderr string) string {
 // targetPortsNeeded returns how many consecutive ports a run occupies on
 // the TARGET host, given its disk count and which optional stages are on.
 //
-// The layout is five contiguous blocks of N, each present or not, but
+// The layout is four contiguous blocks of N, each present or not, but
 // always at the same offset -- copyAndCommit puts the qemu-nbd exports at
 // [T, T+N) and their bridges at [T+N, T+2N); runVerify puts the read-only
-// verify exports at [T+2N, T+3N) and their bridges at [T+3N, T+4N); and the
-// pre-commit checksum check puts its own read-only export at [T+4N, T+5N).
-// Each block sits at its fixed offset whether or not the ones before it are
-// in use, so verification alone still reserves through 3N with the second
-// block left idle. That is deliberate in the existing code (it keeps the
-// verify export's port independent of the write export's, which has just
-// been killed and may not have released yet), and this function must mirror
-// it exactly or a run will bind outside the range it reserved.
+// verify exports at [T+2N, T+3N) and their bridges at [T+3N, T+4N). The
+// verify block sits at +2N whether or not bridging is on, so verification
+// alone still reserves through 3N with the second block left idle. That is
+// deliberate in the existing code (it keeps the verify export's port
+// independent of the write export's, which has just been killed and may not
+// have released yet), and this function must mirror it exactly or a run
+// will bind outside the range it reserved.
 //
-// The checksum block is APPENDED at +4N rather than inserted before the
-// verify blocks, and that ordering is not cosmetic: renumbering the existing
-// blocks would move the verify export's port out from under any operator who
-// has already reserved or firewalled a range.
-//
-// It needs a block of its own for exactly the reason the verify block does
-// -- it starts a fresh read-only export moments after the write export on
-// the same disk was killed, and reusing that port races its release. It
-// needs no bridge block: the exchange is a few bytes per megabyte carried
-// over the existing SSH command channel, not an NBD stream, so there is
-// nothing for a bridge to compress.
-func targetPortsNeeded(disks int, bridging, verifying, checksumming bool) int {
+// The integrity check deliberately does NOT appear here, in either of its
+// two forms. The pre-commit check exports over a UNIX SOCKET, so it needs
+// no port at all; the digest-based -verify reuses the verify export already
+// counted at +2N. Neither adds to a run's reservation, which is what keeps
+// a check that is on by default from silently widening every run's port
+// span -- and from shrinking how many runs an auto-allocated range can
+// hold.
+func targetPortsNeeded(disks int, bridging, verifying bool) int {
 	switch {
-	case checksumming:
-		// The highest block in use decides the span, and the checksum block
-		// is the highest there is; the blocks below it are reserved whether
-		// or not their stage runs.
-		return 5 * disks
 	case verifying && bridging:
 		return 4 * disks
 	case verifying:
@@ -2706,7 +2696,7 @@ func run(cfg syncConfig) (runErr error) {
 	{
 		bridging := bridgeCfg.Enabled()
 		srcNeed := sourcePortsNeeded(bridging)
-		tgtNeed := targetPortsNeeded(len(qcowDisks), bridging, cfg.Verify != "", checksumEnabled)
+		tgtNeed := targetPortsNeeded(len(qcowDisks), bridging, cfg.Verify != "")
 		// Skewed per target domain so two syncs of different vms into the
 		// same target host tend to land on different blocks; see
 		// portalloc.SelectBase.
@@ -3350,6 +3340,51 @@ func run(cfg syncConfig) (runErr error) {
 		return nil
 	}
 
+	// askTargetDigests has vmsync-bridge-helper hash the given ranges off an
+	// export on the target host, and returns the digests it reports.
+	//
+	// Shared by the two callers that need it -- the pre-commit integrity
+	// check and the digest-based -verify -- because the interesting part is
+	// identical for both and getting it subtly different in two places is
+	// how one of them ends up misreporting version skew as corruption. What
+	// differs between them is only which export and which ranges, so those
+	// are the parameters.
+	//
+	// nbdAddr is where the export can be reached FROM THE TARGET HOST, never
+	// a local bridge address: either a Unix socket path (the pre-commit
+	// check, which needs no port at all) or 127.0.0.1:<target port> (the
+	// verify export, which is on TCP because vmsync reads it too). The
+	// helper reaching it locally is the whole reason this is cheap.
+	askTargetDigests := func(dev string, nbdAddr string, exportName string, plan []blockdigest.Block) ([]blockdigest.Block, error) {
+		header := blockdigest.DefaultHeader(blockdigest.MaxRangeLength(plan))
+		var request bytes.Buffer
+		if err := blockdigest.WriteRequest(&request, header, blockdigest.RangesFromBlocks(plan)); err != nil {
+			return nil, fmt.Errorf("checksum: build request for %s: %w", dev, err)
+		}
+
+		// No bridge is involved: the exchange is a few bytes per megabyte
+		// over this SSH command channel, so there is nothing for one to
+		// compress.
+		helperCmd := util.ShQuote(cfg.BridgeHelperPath) +
+			" -checksum -nbd " + util.ShQuote(nbdAddr) +
+			" -export " + util.ShQuote(exportName)
+
+		stdout, stderr, err := targetSSHClient.RunWithInput(ctx, helperCmd, request.Bytes())
+		if err != nil {
+			return nil, fmt.Errorf("checksum: run %s on the target for %s: %w%s -- pass -no-checksum to run without digest checks if the helper is not deployed there yet",
+				cfg.BridgeHelperPath, dev, err, formatRemoteStderr(stderr))
+		}
+
+		respHeader, blocks, err := blockdigest.ReadResponse(strings.NewReader(stdout))
+		if err != nil {
+			return nil, fmt.Errorf("checksum: read the target's digests for %s: %w%s", dev, err, formatRemoteStderr(stderr))
+		}
+		if err := respHeader.Check(header); err != nil {
+			return nil, fmt.Errorf("checksum: %s: %w", dev, err)
+		}
+		return blocks, nil
+	}
+
 	// verifyWrittenDigests is the pre-commit integrity check: it compares
 	// the digests the copy collected as it read the source against digests
 	// the TARGET computes for itself, and returns an error if they differ.
@@ -3382,11 +3417,22 @@ func run(cfg syncConfig) (runErr error) {
 			return nil
 		}
 
-		// The fifth contiguous block, [TargetNBDPort+4N, +5N). Its own
-		// block for the same reason the verify block has one: this starts a
-		// fresh export moments after the write export on this very disk was
-		// killed, and reusing that port races its release.
-		port := cfg.TargetNBDPort + 4*len(qcowDisks) + i
+		// A UNIX SOCKET, not a TCP port, and that is the whole reason this
+		// check costs no ports at all.
+		//
+		// This export exists solely to be read by vmsync-bridge-helper
+		// running on this same host. It is never reached across the network,
+		// so binding it to TCP would spend a port out of the run's
+		// reservation -- growing every run's span by N whether or not the
+		// check is even enabled -- and would additionally publish an export
+		// full of guest data on the network for nobody's benefit. A socket
+		// also sidesteps the release race that forced the verify export onto
+		// its own block at +2N: sockets are named per disk and per domain, so
+		// nothing can collide with a port that was just killed.
+		//
+		// Keyed by domain and device, like the pidfile, so two runs against
+		// different VMs on one target host cannot collide.
+		sockPath := path.Join("/tmp", fmt.Sprintf("vmsync-checksum-%s-%s.sock", cfg.TargetDomain, d.TargetDev))
 		pidFile := path.Join("/tmp", fmt.Sprintf("vmsync-checksum-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
 		exportName := targetExportName(cfg.TargetDomain, d.TargetDev)
 
@@ -3400,10 +3446,14 @@ func run(cfg syncConfig) (runErr error) {
 		// device. Deliberately NOT set on the write export: paying O_DIRECT
 		// on every byte copied, to benefit a check that reads back only the
 		// delta, is the wrong trade.
-		startCmd := "qemu-nbd --fork --persistent --read-only --cache=none --format=qcow2 --bind " +
-			util.ShQuote(cfg.TargetNBDBind) +
-			" --port " +
-			fmt.Sprintf("%d", port) +
+		//
+		// rm -f before starting: qemu-nbd refuses to bind a socket path that
+		// already exists, and a previous run killed with -9 leaves one
+		// behind. Removing a stale socket is safe in a way removing a stale
+		// pidfile is not -- there is no PID to be reused by anything else.
+		startCmd := "rm -f " + util.ShQuote(sockPath) + "; " +
+			"qemu-nbd --fork --persistent --read-only --cache=none --format=qcow2 --socket " +
+			util.ShQuote(sockPath) +
 			" --export-name " +
 			util.ShQuote(exportName) +
 			" --pid-file " +
@@ -3417,8 +3467,9 @@ func run(cfg syncConfig) (runErr error) {
 		// replayable from the interrupt-cleanup path after the inline stop
 		// below has already run it, and without removing the pidfile that
 		// replay could SIGKILL whatever unrelated process the OS has since
-		// reused the PID for.
-		stopCmd := "kill -9 $(cat " + util.ShQuote(pidFile) + ") || true; rm -f " + util.ShQuote(pidFile)
+		// reused the PID for. The socket goes too -- qemu-nbd unlinks it on
+		// a clean exit but not on the kill -9 above.
+		stopCmd := "kill -9 $(cat " + util.ShQuote(pidFile) + ") || true; rm -f " + util.ShQuote(pidFile) + " " + util.ShQuote(sockPath)
 		stopMu.Lock()
 		targetStopCommands = append(targetStopCommands, stopCmd)
 		stopMu.Unlock()
@@ -3433,40 +3484,15 @@ func run(cfg syncConfig) (runErr error) {
 			}
 		}()
 
-		header := blockdigest.DefaultHeader(blockdigest.MaxRangeLength(sourceDigests))
-		var request bytes.Buffer
-		if err := blockdigest.WriteRequest(&request, header, blockdigest.RangesFromBlocks(sourceDigests)); err != nil {
-			return fmt.Errorf("checksum: build request for %s: %w", d.TargetDev, err)
-		}
-
-		// The helper reads the export over LOOPBACK on the target host --
-		// 127.0.0.1, not cfg.TargetNBDBind, which may be a wildcard and in
-		// any case names where the export listens rather than how to reach
-		// it from the same machine. No bridge is involved: the exchange is
-		// a few bytes per megabyte over this SSH command channel, so there
-		// is nothing for one to compress.
-		helperCmd := util.ShQuote(cfg.BridgeHelperPath) +
-			" -checksum -nbd " + util.ShQuote(fmt.Sprintf("127.0.0.1:%d", port)) +
-			" -export " + util.ShQuote(exportName)
 		trace.Info("checksum: asking the target to hash what this run wrote",
 			"disk", d.TargetDev, "image", imagePath, "blocks", len(sourceDigests),
-			"bytes", blockdigest.TotalBytes(sourceDigests), "algo", header.Algo)
-
-		stdout, stderr, err := targetSSHClient.RunWithInput(ctx, helperCmd, request.Bytes())
+			"bytes", blockdigest.TotalBytes(sourceDigests), "algo", blockdigest.DefaultAlgo)
+		targetBlocks, err := askTargetDigests(d.TargetDev, sockPath, exportName, sourceDigests)
 		if err != nil {
-			return fmt.Errorf("checksum: run %s on the target for %s: %w%s -- pass -no-checksum to sync without the integrity check if the helper is not deployed there yet",
-				cfg.BridgeHelperPath, d.TargetDev, err, formatRemoteStderr(stderr))
+			return err
 		}
 
-		respHeader, targetDigests, err := blockdigest.ReadResponse(strings.NewReader(stdout))
-		if err != nil {
-			return fmt.Errorf("checksum: read the target's digests for %s: %w%s", d.TargetDev, err, formatRemoteStderr(stderr))
-		}
-		if err := respHeader.Check(header); err != nil {
-			return fmt.Errorf("checksum: %s: %w", d.TargetDev, err)
-		}
-
-		mismatches, err := blockdigest.Compare(sourceDigests, targetDigests)
+		mismatches, err := blockdigest.Compare(sourceDigests, targetBlocks)
 		if err != nil {
 			return fmt.Errorf("checksum: %s: %w", d.TargetDev, err)
 		}
@@ -3860,7 +3886,15 @@ func run(cfg syncConfig) (runErr error) {
 		verifyPort := cfg.TargetNBDPort + 2*len(qcowDisks) + i
 		verifyPidFile := path.Join("/tmp", fmt.Sprintf("vmsync-verify-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
 		verifyExportName := targetExportName(cfg.TargetDomain, d.TargetDev)
-		startVerifyCmd := "qemu-nbd --fork --persistent --read-only --format=qcow2 --bind " +
+		// --cache=none (O_DIRECT) for the same reason the pre-commit checksum
+		// export sets it: without it this read is served from the host page
+		// cache, which still holds the pages the sync just wrote. That would
+		// make -verify confirm what qemu believes it wrote rather than what
+		// is actually stored -- so a replica whose on-disk bytes had rotted
+		// since the write would pass. A fresh qemu-nbd process has a cold
+		// internal cache but the page cache is shared, so bypassing it is
+		// the only way the bytes come off the device.
+		startVerifyCmd := "qemu-nbd --fork --persistent --read-only --cache=none --format=qcow2 --bind " +
 			util.ShQuote(cfg.TargetNBDBind) +
 			" --port " +
 			fmt.Sprintf("%d", verifyPort) +
@@ -3965,6 +3999,82 @@ func run(cfg syncConfig) (runErr error) {
 			"source", sourceNBDURL, "target", targetPath, "mode", cfg.Verify)
 		var compareErr error
 		switch {
+		case checksumEnabled && (verifyFull || verifyFast):
+			// The digest path. vmsync hashes the source; the helper hashes
+			// the same ranges on the target host; only digests cross the
+			// wire. What that removes is the dominant cost of a verify: on
+			// the common topology (vmsync on the source, so that read is
+			// local) a byte compare's whole expense is pulling the target's
+			// image over the network, and this replaces it with a few bytes
+			// per megabyte.
+			//
+			// -verify=qemu-img is deliberately excluded. It is the
+			// independent oracle -- a separate implementation reading every
+			// byte -- and re-expressing it through vmsync's own digest code
+			// would make it agree with vmsync by construction, which is
+			// precisely the property that makes it worth having.
+			//
+			// fast and full converge here: the helper computes every digest
+			// in one pass, so fast loses its stop-at-first-difference
+			// early-out. That costs nothing on a healthy replica (there is
+			// no difference to stop at, so it read everything anyway) and
+			// only makes an already-failing verify slower. The two still
+			// differ in what they report.
+			sourceDigests, derr := nbdsync.SourceDigestsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, verifyExportName, cfg.IODepth)
+			switch {
+			case derr != nil:
+				compareErr = fmt.Errorf("hashing the source failed: %w", derr)
+			case len(sourceDigests) == 0:
+				// Every range read as zeros on both sides, so there is
+				// nothing left that could differ. Not a skipped check: the
+				// allocation maps already answered it.
+				trace.Info("verify: nothing to hash -- every range reads as zeros on both sides", "disk", d.TargetDev)
+			default:
+				trace.Info("verify: asking the target to hash the same ranges",
+					"disk", d.TargetDev, "blocks", len(sourceDigests),
+					"bytes", blockdigest.TotalBytes(sourceDigests), "algo", blockdigest.DefaultAlgo)
+				// The EXISTING verify export at verifyPort -- the block at
+				// +2N that -verify already reserves. The digest path adds no
+				// port of its own: vmsync needs that export on TCP anyway
+				// (it reads base:allocation through it, possibly bridged
+				// from another host), and the helper simply reaches the same
+				// export over loopback.
+				targetBlocks, aerr := askTargetDigests(d.TargetDev, fmt.Sprintf("127.0.0.1:%d", verifyPort), verifyExportName, sourceDigests)
+				if aerr != nil {
+					// A format or plan problem, or a helper that would not
+					// run. NOT wrapped in ErrImagesDiffer: the comparison
+					// could not be performed, which is a broken sync rather
+					// than a finding about the data, and isVerifyMismatch
+					// must not exempt it from failure_count.
+					compareErr = aerr
+					break
+				}
+				mismatches, cerr := blockdigest.Compare(sourceDigests, targetBlocks)
+				switch {
+				case cerr != nil:
+					compareErr = cerr
+				case len(mismatches) > 0:
+					var diffBytes uint64
+					for _, m := range mismatches {
+						diffBytes += m.Length
+					}
+					if verifyFull {
+						// full's remit is HOW broken, so name every block.
+						for _, m := range mismatches {
+							trace.Error("verify: block differs", "disk", d.TargetDev,
+								"offset", m.Offset, "length", m.Length,
+								"source_digest", fmt.Sprintf("%#x", m.Want),
+								"target_digest", fmt.Sprintf("%#x", m.Got))
+						}
+					}
+					// Wrapped with the same sentinel the byte comparators
+					// use, so isVerifyMismatch treats all of them alike:
+					// this is a finding about the data, not a failure to
+					// look at it.
+					compareErr = fmt.Errorf("%w: %d block(s) totalling %d bytes differ from the source snapshot this replica was copied from (%s) -- both sides are the same point in time, so this is a real difference and not concurrent guest activity",
+						nbdsync.ErrImagesDiffer, len(mismatches), diffBytes, blockdigest.SummarizeMismatches(mismatches))
+				}
+			}
 		case verifyFull:
 			// Collect rather than abort on the first difference. Any
 			// mismatch is real, so the useful question is no longer whether

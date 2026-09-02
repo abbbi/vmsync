@@ -94,6 +94,20 @@ func NewServer(data []byte, export string) (*Server, error) {
 	return s, nil
 }
 
+// NewUnixServer is NewServer over a Unix socket at path, which is the
+// transport the pre-commit integrity check actually uses -- that export is
+// read only by a process on the same host, so it is never bound to a TCP
+// port at all.
+func NewUnixServer(path string, data []byte, export string) (*Server, error) {
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	s := &Server{ln: ln, data: data, export: export}
+	go s.acceptLoop()
+	return s, nil
+}
+
 // Addr is the host:port to hand to a client.
 func (s *Server) Addr() string { return s.ln.Addr().String() }
 

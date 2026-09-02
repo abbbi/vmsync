@@ -1073,6 +1073,271 @@ func CompareTCPCollect(ctx context.Context, aHost string, aPort int, aExport str
 	return compareTCP(ctx, aHost, aPort, aExport, bHost, bPort, bExport, ioDepth, true)
 }
 
+// SourceDigestsTCP reads the SOURCE export and returns one digest per chunk
+// of the same allocation-aware plan compareTCP would have compared.
+//
+// This is the source half of a digest-based verify. Instead of pulling the
+// target's entire image across the network to compare it byte for byte,
+// vmsync hashes the source here and vmsync-bridge-helper hashes the same
+// ranges on the target host; only the digests cross the wire. On the common
+// topology -- vmsync running on the source, so this read is local -- that
+// turns a full verify from "transfer the whole replica" into "read the
+// source locally, exchange a few bytes per megabyte".
+//
+// Both exports are connected, but only A is read. B is opened solely for its
+// base:allocation map, which costs a handful of metadata round trips and is
+// what makes the skip logic safe: a range is skipped only when BOTH sides
+// report it as reading zeros. Skipping on the source alone would miss the
+// case that matters most -- a hole on the source against real data on the
+// target is a genuine mismatch.
+//
+// The returned blocks carry the exact chunk boundaries that were hashed, and
+// the caller sends those verbatim to the target (see pkg/blockdigest): with
+// the boundaries stated rather than recomputed on each side, there is no
+// plan for the two to disagree about.
+//
+// Deliberately duplicates compareTCP's connect-and-plan preamble rather than
+// factoring it out. The two diverge immediately afterwards -- one side read
+// and hashed here, two sides read and memcmp'd there -- and the shared part
+// is a dozen straight-line calls, against a refactor of a cgo AIO function
+// whose buffer-lifetime discipline is the subtlest code in this package.
+func SourceDigestsTCP(ctx context.Context, aHost string, aPort int, aExport string, bHost string, bPort int, bExport string, ioDepth int) (digests []blockdigest.Block, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	a, err := nbd.Create()
+	if err != nil {
+		return nil, fmt.Errorf("create source nbd handle: %w", err)
+	}
+	defer a.Close()
+	b, err := nbd.Create()
+	if err != nil {
+		return nil, fmt.Errorf("create target nbd handle: %w", err)
+	}
+	defer b.Close()
+
+	if aExport != "" {
+		if err := a.SetExportName(aExport); err != nil {
+			return nil, fmt.Errorf("set source export name %s: %w", aExport, err)
+		}
+	}
+	if err := a.ConnectTcp(aHost, strconv.Itoa(aPort)); err != nil {
+		return nil, fmt.Errorf("connect source nbd tcp %s:%d: %w", aHost, aPort, err)
+	}
+	if bExport != "" {
+		if err := b.SetExportName(bExport); err != nil {
+			return nil, fmt.Errorf("set target export name %s: %w", bExport, err)
+		}
+	}
+	if err := b.ConnectTcp(bHost, strconv.Itoa(bPort)); err != nil {
+		return nil, fmt.Errorf("connect target nbd tcp %s:%d (export %q): %w", bHost, bPort, bExport, err)
+	}
+
+	sizeA, err := a.GetSize()
+	if err != nil {
+		return nil, fmt.Errorf("nbd get source size: %w", err)
+	}
+	sizeB, err := b.GetSize()
+	if err != nil {
+		return nil, fmt.Errorf("nbd get target size: %w", err)
+	}
+	if sizeA != sizeB {
+		return nil, fmt.Errorf("image size mismatch: source=%d target=%d", sizeA, sizeB)
+	}
+	size := sizeA
+
+	bufferSize := negotiateBufferSize(a, b, "source", "target")
+	aZero := zeroRanges(allocationExtents(ctx, a, "source"))
+	bZero := zeroRanges(allocationExtents(ctx, b, "target"))
+	chunks, skippedBytes := planCompareChunks(size, bufferSize, minSkipBytes, aZero, bZero)
+	if skippedBytes > 0 {
+		trace.Info("nbd digest: skipping ranges that read as zeros on both sides",
+			"export", aExport, "skipped_bytes", skippedBytes, "total_bytes", size,
+			"hashing_bytes", size-skippedBytes)
+	}
+	if len(chunks) == 0 {
+		return nil, nil
+	}
+
+	pipelineDepth := ioDepth
+	if pipelineDepth < 1 {
+		pipelineDepth = 1
+	}
+
+	const (
+		slotFree = iota
+		slotReading
+	)
+	type slot struct {
+		state  int
+		buf    nbd.AioBuffer
+		offset uint64
+		length uint64
+		cookie uint64
+		opErr  int
+	}
+	slots := make([]slot, pipelineDepth)
+
+	start := time.Now()
+	lastProgress := start
+	nextChunk := 0
+	reading := 0
+	var hashedBytes uint64
+
+	// Same reason compareTCP and CopyExtentsTCP carry their abort reason out
+	// in a variable instead of returning from inside the loop: every exit
+	// path has to reach the drain below, because libnbd requires a buffer
+	// passed to AioPread to stay valid until its command is confirmed
+	// complete, and other slots can still be genuinely in flight.
+	var digestErr error
+
+digestLoop:
+	for nextChunk < len(chunks) || reading > 0 {
+		select {
+		case <-ctx.Done():
+			digestErr = fmt.Errorf("nbd digest cancelled: %w", ctx.Err())
+			break digestLoop
+		default:
+		}
+		if stalled(lastProgress, time.Now(), noProgressTimeout) {
+			digestErr = fmt.Errorf("nbd digest stalled: no read completed in over %s -- source connection may be half-open", noProgressTimeout)
+			break digestLoop
+		}
+
+		for i := range slots {
+			if slots[i].state != slotFree || nextChunk >= len(chunks) {
+				continue
+			}
+			c := chunks[nextChunk]
+			nextChunk++
+			idx := i
+			slots[idx].offset = c.offset
+			slots[idx].length = c.length
+			slots[idx].opErr = 0
+			slots[idx].buf = nbd.MakeAioBuffer(uint(c.length))
+			cookie, err := a.AioPread(slots[idx].buf, c.offset, &nbd.AioPreadOptargs{
+				CompletionCallbackSet: true,
+				CompletionCallback: func(errp *int) int {
+					if errp != nil {
+						slots[idx].opErr = *errp
+					}
+					return 0
+				},
+			})
+			if err != nil {
+				// Never issued, so libnbd never took ownership of this
+				// buffer -- freeing it immediately is safe.
+				slots[idx].buf.Free()
+				digestErr = fmt.Errorf("source nbd aio_pread offset=%d len=%d: %w", c.offset, c.length, err)
+				break digestLoop
+			}
+			slots[idx].cookie = cookie
+			slots[idx].state = slotReading
+			reading++
+		}
+
+		if reading > 0 {
+			if _, err := a.Poll(10); err != nil {
+				digestErr = fmt.Errorf("source nbd poll: %w", err)
+				break digestLoop
+			}
+		}
+
+		for i := range slots {
+			if slots[i].state != slotReading {
+				continue
+			}
+			done, err := a.AioCommandCompleted(slots[i].cookie)
+			if err != nil {
+				digestErr = fmt.Errorf("source nbd aio command check offset=%d: %w", slots[i].offset, err)
+				break digestLoop
+			}
+			if !done {
+				continue
+			}
+			lastProgress = time.Now()
+			reading--
+			if slots[i].opErr != 0 {
+				// Confirmed complete even though it failed, so per libnbd's
+				// contract the buffer is safe to free now.
+				slots[i].buf.Free()
+				slots[i].state = slotFree
+				digestErr = fmt.Errorf("source nbd pread offset=%d len=%d: errno %d", slots[i].offset, slots[i].length, slots[i].opErr)
+				break digestLoop
+			}
+			// Slice() aliases libnbd's own buffer, so hashing costs no copy.
+			// Done here, while the read is confirmed complete and before the
+			// buffer is freed -- the only window where the contents are both
+			// valid and ours to look at.
+			digests = append(digests, blockdigest.Block{
+				Offset: slots[i].offset,
+				Length: slots[i].length,
+				Digest: blockdigest.Sum(slots[i].buf.Slice()),
+			})
+			hashedBytes += slots[i].length
+			slots[i].buf.Free()
+			slots[i].state = slotFree
+		}
+	}
+
+	// Identical drain to CopyExtentsTCP's, and for the identical reason: a
+	// buffer whose command was never confirmed one way or the other must not
+	// be freed, because libnbd may still write into it.
+	drainDeadline := time.Now().Add(30 * time.Second)
+	for {
+		pending := false
+		for i := range slots {
+			if slots[i].state == slotFree {
+				continue
+			}
+			done, derr := a.AioCommandCompleted(slots[i].cookie)
+			if derr != nil {
+				trace.Warning("nbd digest: could not confirm in-flight command completion during cleanup, freeing buffer anyway", "offset", slots[i].offset, "error", derr)
+				slots[i].buf.Free()
+				slots[i].state = slotFree
+				continue
+			}
+			if done {
+				// Deliberately NOT hashed. This completion is only being
+				// observed here because the loop above broke out on some
+				// other slot's error, so this function is about to return a
+				// failure and a partial digest list would be worse than
+				// none: the caller would compare it against a longer plan
+				// and report a plan mismatch instead of the real error.
+				slots[i].buf.Free()
+				slots[i].state = slotFree
+				continue
+			}
+			pending = true
+		}
+		if !pending {
+			break
+		}
+		if time.Now().After(drainDeadline) {
+			trace.Warning("nbd digest: timed out waiting for in-flight commands to settle during cleanup, abandoning remaining buffers without freeing them to avoid a use-after-free if they later complete")
+			for i := range slots {
+				slots[i].state = slotFree
+			}
+			break
+		}
+		a.Poll(10)
+	}
+
+	if digestErr != nil {
+		return nil, digestErr
+	}
+
+	// Sorted by offset: the pipeline completes chunks out of order, and the
+	// caller puts this list on the wire, where a stable order is what makes
+	// two runs' requests comparable by eye.
+	sort.Slice(digests, func(i, j int) bool { return digests[i].Offset < digests[j].Offset })
+
+	elapsed := time.Since(start)
+	trace.Info("nbd digest complete", "device", aExport, "blocks", len(digests), "bytes", hashedBytes,
+		"image_bytes", size, "algo", blockdigest.DefaultAlgo, "elapsed", elapsed.Round(time.Millisecond).String())
+	return digests, nil
+}
+
 // compareTCP is the shared implementation behind CompareTCP and
 // CompareTCPCollect. With collectMismatches false, it's byte-for-byte
 // CompareTCP's original behavior: the first mismatch aborts immediately and

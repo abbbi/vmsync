@@ -58,6 +58,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -116,14 +117,35 @@ type Client struct {
 	timeout time.Duration
 }
 
+// networkFor picks the transport from the shape of addr: a leading "/" (a
+// filesystem path) or "@" (a Linux abstract socket) means a Unix socket,
+// anything else is TCP host:port.
+//
+// A heuristic, but an unambiguous one -- a TCP address is host:port and can
+// never begin with either character -- and it keeps callers, including the
+// helper's own -nbd flag, to a single address argument instead of a flag
+// pair plus the rule for which one wins.
+func networkFor(addr string) string {
+	if strings.HasPrefix(addr, "/") || strings.HasPrefix(addr, "@") {
+		return "unix"
+	}
+	return "tcp"
+}
+
 // Dial connects to addr, negotiates the named export and returns a client
 // positioned in the transmission phase.
 //
+// addr is either a TCP host:port or a Unix socket path (see networkFor).
+// The Unix case is the one the pre-commit integrity check uses: that export
+// exists solely to be read by this process on the same host, so binding it
+// to a TCP port would spend a port from the run's reservation and publish an
+// export full of guest data on the network for no reason at all.
+//
 // export may be empty, which asks for the server's default export. Every
 // export vmsync creates is named (see targetExportName in cmd/vmsync), and
-// naming is a safety property rather than tidiness -- a port says only that
-// something is listening, a name says it is the export that was meant -- so
-// callers inside vmsync should always pass one.
+// naming is a safety property rather than tidiness -- an address says only
+// that something is listening, a name says it is the export that was meant
+// -- so callers inside vmsync should always pass one.
 //
 // timeout bounds each individual socket operation, not the call as a whole:
 // a checksum pass reads far more than one round trip, and a deadline over
@@ -131,7 +153,7 @@ type Client struct {
 // the session as a whole.
 func Dial(ctx context.Context, addr, export string, timeout time.Duration) (*Client, error) {
 	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", addr)
+	conn, err := d.DialContext(ctx, networkFor(addr), addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial nbd %s: %w", addr, err)
 	}

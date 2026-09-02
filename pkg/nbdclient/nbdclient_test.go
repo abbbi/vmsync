@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -488,4 +490,68 @@ func TestCloseSendsDisconnect(t *testing.T) {
 	// Close is idempotent enough not to panic; the second one errors on the
 	// already-closed socket, which is fine and must not be a panic.
 	_ = c.Close()
+}
+
+func TestNetworkFor(t *testing.T) {
+	for _, tc := range []struct{ addr, want string }{
+		{"127.0.0.1:10809", "tcp"},
+		{"target01:20809", "tcp"},
+		{"[::1]:10809", "tcp"},
+		{"/tmp/vmsync-checksum-vm-vda.sock", "unix"},
+		{"/var/run/vmsync/x.sock", "unix"},
+		{"@abstract-name", "unix"},
+	} {
+		if got := networkFor(tc.addr); got != tc.want {
+			t.Errorf("networkFor(%q) = %q, want %q", tc.addr, got, tc.want)
+		}
+	}
+}
+
+// The transport the pre-commit integrity check actually uses. It gets its
+// own test rather than being assumed equivalent to TCP, because the
+// handshake and reply framing are the same code but the dial is not, and a
+// Unix path silently dialled as TCP fails in a way that reads like a
+// missing export.
+func TestDialAndReadOverUnixSocket(t *testing.T) {
+	// Windows supports AF_UNIX but path-length and cleanup semantics differ;
+	// this is a Linux-targeted path, so skip rather than fail elsewhere.
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skipf("unix socket test not run on %s", runtime.GOOS)
+	}
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "nbd.sock")
+
+	data := pattern(8192)
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	o := &fakeOpts{data: data, wantExport: "vm-vda", gotExport: make(chan string, 4), gotReads: make(chan string, 64)}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go serveFake(conn, o)
+		}
+	}()
+
+	c, err := Dial(context.Background(), sock, "vm-vda", 5*time.Second)
+	if err != nil {
+		t.Fatalf("Dial over unix socket: %v", err)
+	}
+	defer c.Close()
+
+	if got := c.Size(); got != uint64(len(data)) {
+		t.Errorf("Size() = %d, want %d", got, len(data))
+	}
+	buf := make([]byte, 4096)
+	if err := c.ReadAt(buf, 2048); err != nil {
+		t.Fatalf("ReadAt over unix socket: %v", err)
+	}
+	if string(buf) != string(data[2048:2048+4096]) {
+		t.Error("unix socket read returned wrong bytes")
+	}
 }

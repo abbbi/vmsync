@@ -97,7 +97,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
 	"strconv"
 
 	"github.com/cespare/xxhash/v2"
@@ -191,9 +190,10 @@ func DefaultHeader(blockSize uint64) Header {
 // extent starts and so line up with no fixed grid. Restating those
 // boundaries rather than having each side derive them means there is no plan
 // to disagree about, which is a stronger guarantee than two sides computing
-// a matching one. It is also why the responder must NOT run PlanBlocks over
-// them: canonicalising the ranges would silently hash different bytes than
-// the requester did, and every run would report a mismatch.
+// a matching one. It is also why the responder must NOT canonicalise them --
+// sorting, coalescing or re-splitting onto a fixed grid would silently hash
+// different bytes than the requester did, and every run would report a
+// mismatch.
 //
 // A range longer than max is refused rather than split: the responder sizes
 // one buffer from it, and the requester has already promised in its header
@@ -308,7 +308,7 @@ type Range struct {
 	Length uint64
 }
 
-// Block is one unit of digest: a range plus its hash. PlanBlocks leaves
+// Block is one unit of digest: a range plus its hash. BlocksFromRanges leaves
 // Digest zero for a caller to fill in as it hashes.
 type Block struct {
 	Offset uint64
@@ -322,94 +322,6 @@ type Mismatch struct {
 	Length uint64
 	Want   uint64
 	Got    uint64
-}
-
-// PlanBlocks turns a set of ranges into a canonical list of blocks to
-// digest: sorted by offset, overlapping and touching ranges coalesced, then
-// each split on absolute multiples of blockSize.
-//
-// NOT used by the sync path. That path hashes the copy's own chunks and
-// states their boundaries in the request, so there is no plan to derive on
-// either side (see BlocksFromRanges). This exists for a caller that has no
-// copy to piggyback on and therefore genuinely needs both ends to agree on
-// a grid from the ranges alone -- the verify path, where the source is read
-// separately rather than as a side effect of writing it.
-//
-// Canonical is the load-bearing word for such a caller. A single byte of
-// disagreement about where blocks begin turns every comparison into a
-// mismatch. Splitting on an ABSOLUTE grid rather than relative to each
-// range's start is what prevents it: a given disk offset always lands in
-// the same block no matter how the extents covering it happened to be
-// coalesced.
-//
-// Only the written ranges are covered. Hashing whole aligned blocks that
-// merely INTERSECT a written range would pull in neighbouring bytes this run
-// never touched, and since the target's export serves a flattened view
-// (overlay where written, base elsewhere) those bytes come from the base --
-// so any pre-existing drift there would be reported as damage from this run.
-// Restricting the plan to exactly what was written keeps the check answering
-// "did this run land correctly" rather than the much broader "is this whole
-// region correct", which is what a periodic -verify is for.
-//
-// A zero blockSize means DefaultBlockSize. Zero-length ranges are dropped
-// rather than producing zero-length blocks.
-func PlanBlocks(ranges []Range, blockSize uint64) []Block {
-	if blockSize == 0 {
-		blockSize = DefaultBlockSize
-	}
-	merged := coalesce(ranges)
-	var blocks []Block
-	for _, r := range merged {
-		off := r.Offset
-		end := r.Offset + r.Length
-		for off < end {
-			// Distance to the next absolute grid boundary above off. When
-			// off is already on a boundary this is a full blockSize.
-			next := off - off%blockSize + blockSize
-			if next > end {
-				next = end
-			}
-			blocks = append(blocks, Block{Offset: off, Length: next - off})
-			off = next
-		}
-	}
-	return blocks
-}
-
-// coalesce sorts and merges ranges, dropping empties. Touching ranges (one
-// ending exactly where the next begins) merge too: they describe one
-// contiguous region, and merging them makes the plan independent of how the
-// extent list happened to be chopped up.
-func coalesce(ranges []Range) []Range {
-	in := make([]Range, 0, len(ranges))
-	for _, r := range ranges {
-		if r.Length == 0 {
-			continue
-		}
-		in = append(in, r)
-	}
-	if len(in) == 0 {
-		return nil
-	}
-	sort.Slice(in, func(i, j int) bool {
-		if in[i].Offset != in[j].Offset {
-			return in[i].Offset < in[j].Offset
-		}
-		return in[i].Length < in[j].Length
-	})
-	out := []Range{in[0]}
-	for _, r := range in[1:] {
-		last := &out[len(out)-1]
-		lastEnd := last.Offset + last.Length
-		if r.Offset <= lastEnd {
-			if end := r.Offset + r.Length; end > lastEnd {
-				last.Length = end - last.Offset
-			}
-			continue
-		}
-		out = append(out, r)
-	}
-	return out
 }
 
 // TotalBytes is how many bytes a plan covers, which is what the check reads
@@ -637,7 +549,9 @@ func splitExactly(text string, want int) ([]string, error) {
 //
 // Returns ErrPlanMismatch if they do not describe the same blocks, and
 // otherwise the blocks whose digests differ -- empty meaning the check
-// passed. Both lists must be in PlanBlocks order, which both producers use.
+// passed. Both lists must be in the same order, which they are by
+// construction: the requester states the order, and the responder returns
+// its digests in exactly the order it was asked.
 func Compare(want, got []Block) ([]Mismatch, error) {
 	if len(want) != len(got) {
 		return nil, fmt.Errorf("%w: %d blocks expected, %d reported", ErrPlanMismatch, len(want), len(got))

@@ -20,7 +20,6 @@ package blockdigest
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"strings"
 	"testing"
 
@@ -37,178 +36,6 @@ func blocksEqual(a, b []Block) bool {
 		}
 	}
 	return true
-}
-
-func fmtBlocks(bs []Block) string {
-	var sb strings.Builder
-	for i, b := range bs {
-		if i > 0 {
-			sb.WriteString(" ")
-		}
-		fmt.Fprintf(&sb, "%d+%d", b.Offset, b.Length)
-	}
-	if sb.Len() == 0 {
-		return "<none>"
-	}
-	return sb.String()
-}
-
-// --- planning ---------------------------------------------------------------
-
-func TestPlanBlocksSplitsOnAbsoluteGrid(t *testing.T) {
-	const bs = 1 << 20
-	tests := []struct {
-		name string
-		in   []Range
-		want []Block
-	}{
-		{
-			name: "aligned range of exactly one block",
-			in:   []Range{{0, bs}},
-			want: []Block{{Offset: 0, Length: bs}},
-		},
-		{
-			name: "aligned range of several blocks",
-			in:   []Range{{0, 3 * bs}},
-			want: []Block{{0, bs, 0}, {bs, bs, 0}, {2 * bs, bs, 0}},
-		},
-		{
-			// The defining property: a range starting mid-block produces a
-			// SHORT first block so that every following block starts on the
-			// absolute grid. Splitting relative to the range start would
-			// give 1 MiB blocks at 1.5 MiB, 2.5 MiB, ... and two passes that
-			// coalesced extents differently would disagree.
-			name: "unaligned start yields a short leading block",
-			in:   []Range{{bs + bs/2, bs}},
-			want: []Block{
-				{bs + bs/2, bs / 2, 0},
-				{2 * bs, bs / 2, 0},
-			},
-		},
-		{
-			// [0.5 MiB, 2.75 MiB): short block at each end, whole blocks
-			// in between.
-			name: "unaligned start and end",
-			in:   []Range{{bs / 2, 2*bs + bs/4}},
-			want: []Block{
-				{bs / 2, bs / 2, 0},     // 0.5M -> 1M
-				{bs, bs, 0},             // 1M   -> 2M
-				{2 * bs, 3 * bs / 4, 0}, // 2M   -> 2.75M
-			},
-		},
-		{
-			name: "range smaller than a block, inside one cell",
-			in:   []Range{{bs + 100, 200}},
-			want: []Block{{bs + 100, 200, 0}},
-		},
-		{
-			name: "range smaller than a block but crossing a boundary",
-			in:   []Range{{bs - 100, 200}},
-			want: []Block{{bs - 100, 100, 0}, {bs, 100, 0}},
-		},
-		{
-			name: "zero-length ranges are dropped",
-			in:   []Range{{0, 0}, {bs, 0}},
-			want: nil,
-		},
-		{
-			name: "no ranges",
-			in:   nil,
-			want: nil,
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := PlanBlocks(tc.in, bs)
-			if !blocksEqual(got, tc.want) {
-				t.Errorf("PlanBlocks = %s, want %s", fmtBlocks(got), fmtBlocks(tc.want))
-			}
-		})
-	}
-}
-
-// Every block must sit inside one grid cell, be non-empty, never exceed
-// blockSize, and not overlap its neighbour. Checked as a property over an
-// awkward input rather than a hand-written expectation.
-func TestPlanBlocksInvariants(t *testing.T) {
-	const bs = 64 << 10
-	in := []Range{
-		{0, 17},
-		{bs - 1, 3},
-		{5 * bs, 4 * bs},
-		{100*bs + 7, 2*bs + 11},
-	}
-	blocks := PlanBlocks(in, bs)
-	if len(blocks) == 0 {
-		t.Fatal("no blocks planned")
-	}
-	for i, b := range blocks {
-		if b.Length == 0 {
-			t.Errorf("block %d has zero length", i)
-		}
-		if b.Length > bs {
-			t.Errorf("block %d length %d exceeds block size %d", i, b.Length, bs)
-		}
-		if b.Offset/bs != (b.Offset+b.Length-1)/bs {
-			t.Errorf("block %d (%d+%d) straddles a %d boundary", i, b.Offset, b.Length, bs)
-		}
-		if i > 0 {
-			prev := blocks[i-1]
-			if b.Offset < prev.Offset+prev.Length {
-				t.Errorf("block %d (%d) overlaps previous (%d+%d)", i, b.Offset, prev.Offset, prev.Length)
-			}
-		}
-	}
-}
-
-// The plan must cover exactly the written bytes -- no more (or the check
-// would judge bytes this run never wrote) and no less.
-func TestPlanBlocksCoversExactlyTheWrittenBytes(t *testing.T) {
-	const bs = 1 << 20
-	in := []Range{{bs / 2, bs}, {10 * bs, 3*bs + 5}}
-	var want uint64
-	for _, r := range in {
-		want += r.Length
-	}
-	if got := TotalBytes(PlanBlocks(in, bs)); got != want {
-		t.Errorf("planned %d bytes, want %d", got, want)
-	}
-}
-
-func TestPlanBlocksCoalescesAndSorts(t *testing.T) {
-	const bs = 1 << 20
-	// Deliberately out of order, with a touching pair and an overlapping
-	// pair. All of it describes [0, 2*bs), which must plan as two full
-	// blocks -- not as four partial ones reflecting the input's chopping.
-	in := []Range{
-		{bs, bs},         // second half, given first
-		{0, bs / 2},      // start
-		{bs / 2, bs / 2}, // touches the previous exactly
-		{bs / 4, bs / 2}, // overlaps both
-	}
-	want := []Block{{0, bs, 0}, {bs, bs, 0}}
-	if got := PlanBlocks(in, bs); !blocksEqual(got, want) {
-		t.Errorf("PlanBlocks = %s, want %s", fmtBlocks(got), fmtBlocks(want))
-	}
-}
-
-// The whole feature rests on both sides planning identically from the same
-// extents. Feeding the same set in two different orders must produce the
-// same plan.
-func TestPlanBlocksIsOrderIndependent(t *testing.T) {
-	const bs = 1 << 20
-	a := []Range{{0, 100}, {5 * bs, bs}, {3*bs + 7, 2 * bs}}
-	b := []Range{{3*bs + 7, 2 * bs}, {0, 100}, {5 * bs, bs}}
-	if pa, pb := PlanBlocks(a, bs), PlanBlocks(b, bs); !blocksEqual(pa, pb) {
-		t.Errorf("plans differ by input order:\n a = %s\n b = %s", fmtBlocks(pa), fmtBlocks(pb))
-	}
-}
-
-func TestPlanBlocksZeroBlockSizeUsesDefault(t *testing.T) {
-	in := []Range{{0, 3 * DefaultBlockSize}}
-	if got, want := PlanBlocks(in, 0), PlanBlocks(in, DefaultBlockSize); !blocksEqual(got, want) {
-		t.Error("zero block size did not fall back to DefaultBlockSize")
-	}
 }
 
 // --- verbatim blocks (the sync path) ----------------------------------------
@@ -768,19 +595,39 @@ func TestSummarizeMismatches(t *testing.T) {
 
 // --- end to end -------------------------------------------------------------
 
-// Over the actual mechanism: plan, hash on the "source", hash a
-// deliberately damaged copy on the "target", pass the result through the
-// wire format, and confirm the damaged block -- and only it -- is reported.
+// chunked mimics what the requester actually sends: a span broken into
+// chunk-sized ranges, the way CopyExtentsTCP's own buffer-sized chunks and
+// SourceDigestsTCP's compare-plan chunks both arrive.
+func chunked(offset, length, chunk uint64) []Range {
+	var out []Range
+	for length > 0 {
+		n := chunk
+		if length < n {
+			n = length
+		}
+		out = append(out, Range{Offset: offset, Length: n})
+		offset += n
+		length -= n
+	}
+	return out
+}
+
+// Over the actual mechanism: hash on the "source", hash a deliberately
+// damaged copy on the "target", pass the result through the wire format, and
+// confirm the damaged block -- and only it -- is reported.
 func TestEndToEndDetectsASingleCorruptedBlock(t *testing.T) {
 	const bs = 4096
 	source := make([]byte, 16*bs)
 	for i := range source {
 		source[i] = byte(i * 31)
 	}
-	written := []Range{{0, uint64(len(source))}}
+	written := chunked(0, uint64(len(source)), bs)
 	h := DefaultHeader(bs)
 
-	want := PlanBlocks(written, bs)
+	want, err := BlocksFromRanges(written, bs)
+	if err != nil {
+		t.Fatalf("BlocksFromRanges: %v", err)
+	}
 	for i := range want {
 		want[i].Digest = Sum(source[want[i].Offset : want[i].Offset+want[i].Length])
 	}
@@ -789,8 +636,8 @@ func TestEndToEndDetectsASingleCorruptedBlock(t *testing.T) {
 	copy(target, source)
 	target[5*bs+17] ^= 0x01 // one flipped bit inside block 5
 
-	// The target side re-derives the plan from the same ranges rather than
-	// being handed it, which is what the real helper does.
+	// The target side takes the ranges verbatim off the wire rather than
+	// being handed the block list, which is what the real helper does.
 	var req bytes.Buffer
 	if err := WriteRequest(&req, h, written); err != nil {
 		t.Fatalf("WriteRequest: %v", err)
@@ -802,7 +649,10 @@ func TestEndToEndDetectsASingleCorruptedBlock(t *testing.T) {
 	if err := reqH.Check(h); err != nil {
 		t.Fatalf("request header Check: %v", err)
 	}
-	got := PlanBlocks(reqRanges, reqH.BlockSize)
+	got, err := BlocksFromRanges(reqRanges, reqH.BlockSize)
+	if err != nil {
+		t.Fatalf("BlocksFromRanges: %v", err)
+	}
 	for i := range got {
 		got[i].Digest = Sum(target[got[i].Offset : got[i].Offset+got[i].Length])
 	}
@@ -839,12 +689,15 @@ func TestBlockSizeSkewIsCaughtByTheHeaderNotByCompare(t *testing.T) {
 	for i := range data {
 		data[i] = byte(i)
 	}
-	written := []Range{{0, uint64(len(data))}}
-
 	vmsyncHeader := DefaultHeader(4096)
 	helperHeader := DefaultHeader(8192) // stale helper, different default
 
-	helperBlocks := PlanBlocks(written, helperHeader.BlockSize)
+	// A stale helper chunking at its own granularity rather than the one it
+	// was asked for.
+	helperBlocks, err := BlocksFromRanges(chunked(0, uint64(len(data)), helperHeader.BlockSize), helperHeader.BlockSize)
+	if err != nil {
+		t.Fatalf("BlocksFromRanges: %v", err)
+	}
 	for i := range helperBlocks {
 		b := helperBlocks[i]
 		helperBlocks[i].Digest = Sum(data[b.Offset : b.Offset+b.Length])
