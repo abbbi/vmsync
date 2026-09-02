@@ -351,7 +351,45 @@ preflight() {
                 warn "could not query target domain '$TARGET_DOMAIN' via $TARGET_URI: $VIRSH_ERR"
         fi
         [ -n "$TARGET_DISK_PATH" ] || warn "TARGET_DISK_PATH is empty -- target disk path resolution (used for tampering) is only reliable when the source has no active external snapshot. Recommended: always set TARGET_DISK_PATH in $CONF."
+
+        preflight_bridge_helper
         log "preflight OK"
+}
+
+# preflight_bridge_helper reports what vmsync-bridge-helper is on the target
+# and whether its version matches the vmsync under test.
+#
+# Reported rather than fatal, because a missing helper is legitimate: it only
+# blocks -compress/-netbuffer, and BENCH_SYNC_ARGS="" is the documented way to
+# run without them.
+#
+# But it is worth saying out loud, because the consequence changed. The
+# pre-commit integrity check is now on by default and needs that binary at an
+# EXACTLY matching version -- so a stale helper does not fail anything, it
+# silently turns the check off for every run in the report. A harness that
+# quietly certifies an integrity check which never executed is worse than one
+# that never claimed to test it, and stage 13a is the only other place that
+# would notice.
+preflight_bridge_helper() {
+	local helper vmsync_version helper_version
+	helper="${BRIDGE_HELPER_PATH:-/usr/local/bin/vmsync-bridge-helper}"
+
+	if ! ssh_host_cmd "$TARGET_HOST" "test -x '$helper'" >/dev/null 2>&1; then
+		warn "vmsync-bridge-helper is not present (or not executable) at $helper on $TARGET_HOST. -compress/-netbuffer cannot run, and the pre-commit integrity check will be SKIPPED on every sync -- it is on by default but needs that binary. Deploy it, set BRIDGE_HELPER_PATH in $CONF, or set BENCH_SYNC_ARGS=\"\" to stop asking for compression."
+		return 0
+	fi
+
+	vmsync_version="$("$VMSYNC_BIN" -version 2>/dev/null | tr -d '[:space:]')"
+	helper_version="$(ssh_host_cmd "$TARGET_HOST" "'$helper' -version" 2>/dev/null | tr -d '[:space:]')"
+
+	if [ -z "$helper_version" ]; then
+		warn "vmsync-bridge-helper at $helper on $TARGET_HOST exists but would not report a version, so the integrity check may be skipped on every sync. Check it runs there by hand."
+	elif [ -n "$vmsync_version" ] && [ "$helper_version" != "$vmsync_version" ]; then
+		warn "version skew: vmsync is $vmsync_version but vmsync-bridge-helper at $helper on $TARGET_HOST is $helper_version. vmsync refuses to use a mismatched helper, so the pre-commit integrity check will be SKIPPED on every sync in this report (and stage 13 cannot test it). Rebuild and redeploy the helper."
+	else
+		log "preflight: vmsync-bridge-helper $helper_version at $helper on $TARGET_HOST matches vmsync -- integrity check available"
+	fi
+	return 0
 }
 
 # --- vmsync invocation -----------------------------------------------------
@@ -581,7 +619,23 @@ build_scenario_name() {
 # global array SCEN_ARGS with the vmsync flags for this combination.
 build_scenario_args() {
         local compress="$1" netbuf="$2" use_ssh="$3" iodepth="$4"
-        SCEN_ARGS=(-io-depth "$iodepth")
+        # -no-checksum on EVERY cell of the transport matrix, deliberately.
+        #
+        # The pre-commit integrity check is on by default whenever a matching
+        # vmsync-bridge-helper is on the target -- which, on any host this
+        # matrix can run on, is always, since the compressed cells require
+        # that same binary. Left enabled it would add a qemu-nbd start, a
+        # local read of every written byte on the target, a hash and a stop to
+        # each of this stage's 1170 invocations. That does two unwanted
+        # things: it inflates a -reinit cell by roughly a disk-sized target
+        # read, and it mixes the cost of an integrity check into numbers whose
+        # entire purpose is comparing TRANSPORT settings against each other
+        # and against previous runs of this same matrix.
+        #
+        # The check gets its own stage (--stages checksum) where its cost and
+        # its behaviour are what is being measured, rather than noise on top
+        # of something else.
+        SCEN_ARGS=(-io-depth "$iodepth" -no-checksum)
         if [ "$compress" != off ]; then
                 local algo="${compress%%:*}" level="${compress#*:}"
                 SCEN_ARGS+=("-compress=$algo" "-compress-level=$level")
@@ -858,7 +912,21 @@ stage_verify_tamper() {
                 verify_mode_subtest "$target_path" "$vsize" "$mode" "verify-${mode}" tamper
         done
 
-        # Then the two cross-checks. The loop above tests each mode on its own
+        # The loop above reaches the DIGEST comparator for fast and full,
+        # because bench_sync passes -compress and a matching helper on the
+        # target turns the digest exchange on. That leaves
+        # CompareTCP/CompareTCPCollect -- the byte comparators, which are
+        # still exactly what -no-checksum selects and were the only
+        # implementation until the digest path existed -- covered by nothing.
+        #
+        # Two more tampers rather than six: qemu-img shells out to a separate
+        # implementation and is unaffected by checksumming either way, so
+        # re-running it would cost a tamper cycle to test the same code twice.
+        for mode in fast full; do
+                verify_mode_subtest "$target_path" "$vsize" "$mode" "verify-${mode}-bytes" tamper -no-checksum
+        done
+
+        # Then the two cross-checks. The loops above test each mode on its own
         # tamper at its own random offset, which is broad coverage across runs;
         # these two ask a different question -- whether the modes AGREE, with
         # and without corruption present.
@@ -1043,16 +1111,25 @@ verify_guard_subtest() {
         heal_target verify-guard tamper-heal "$path"
 }
 
-# verify_mode_subtest PATH VSIZE MODE SCENARIO PHASE -- asserts -verify=MODE
-# detects a corruption the mtime guard cannot see.
+# verify_mode_subtest PATH VSIZE MODE SCENARIO PHASE [EXTRA_ARGS...] --
+# asserts -verify=MODE detects a corruption the mtime guard cannot see.
 #
 # SCENARIO and PHASE are passed rather than derived because two stages call
 # this: stage 2 once per mode, and stage 8 several times per mode. SCENARIO is
 # what stage_pattern matches on, and PHASE has to be unique within a run or the
 # per-run log and Prometheus files (named ${SCENARIO}.${PHASE}) overwrite each
 # other and the failing attempt's evidence is gone.
+#
+# EXTRA_ARGS exists for exactly one caller: stage 2 passes -no-checksum to
+# reach the BYTE comparator. -verify=fast/full now have two implementations
+# behind them -- nbdsync's digest exchange when a matching helper is present
+# (the default), and CompareTCP/CompareTCPCollect when it is not -- and
+# whichever one bench does not ask for is exercised by nothing at all. The
+# assertion is identical for both, so the same subtest serves.
 verify_mode_subtest() {
         local path="$1" vsize="$2" mode="$3" scenario="$4" phase="$5" outcome
+        shift 5
+        local -a extra=("$@")
 
         log "--- verify=$mode: tampering ${path:-<unresolved in --dry-run>} with the mtime preserved ---"
 
@@ -1071,7 +1148,11 @@ verify_mode_subtest() {
                 fi
         fi
 
-        bench_sync "$scenario" "$phase" "-verify=$mode"
+        if [ ${#extra[@]} -gt 0 ]; then
+                bench_sync "$scenario" "$phase" "-verify=$mode" "${extra[@]}"
+        else
+                bench_sync "$scenario" "$phase" "-verify=$mode"
+        fi
 
         if [ "$DRY_RUN" = yes ]; then
                 results_row "$CSV" "$scenario" "${phase}-result" DRYRUN "" "" "" "" "" "SKIP dry run"
@@ -3545,6 +3626,307 @@ rp_status_field() {
 }
 
 
+# --- Stage 13: pre-commit integrity check ------------------------------------
+#
+# The check hashes every chunk the copy reads, has vmsync-bridge-helper hash
+# the same ranges back off the target, and refuses to commit an incremental
+# sync's overlay if they disagree. It is ON by default whenever a matching
+# helper is present, which makes it the single most important thing in this
+# harness to have a NEGATIVE test for: a check that silently never fires is
+# indistinguishable from a check that works, and every other stage would keep
+# reporting PASS either way.
+#
+# Corrupting the data itself is not an option here. The check reads the target
+# back between the copy and the commit, inside one vmsync process, so there is
+# no moment an outside tamper could land in. What CAN be substituted from
+# outside is the helper: vmsync invokes it by path (-bridge-helper-path), so a
+# wrapper script that runs the real binary and then edits its reply exercises
+# the whole comparison -- request, response, header check, digest comparison,
+# and the failure handling -- without needing a fault injected into vmsync.
+#
+# Four sub-tests, each asking a question the others cannot:
+#
+#   13a checksum/clean   -- an ordinary sync says the check RAN and matched.
+#                           Without this, the three below could all pass on a
+#                           run where the check never happened.
+#   13b checksum/mismatch-- a helper reporting one wrong digest must fail the
+#                           run, and the overlay must be GONE while the base
+#                           keeps its previous contents.
+#   13c checksum/stale   -- a helper too old to emit a format header must be
+#                           reported as version skew, NOT as a corrupt
+#                           replica. This is the distinction that decides
+#                           whether an estate reinits a healthy 50 GiB VM on
+#                           false evidence after a partial upgrade.
+#   13d checksum/off     -- -no-checksum must actually skip it, so the flag is
+#                           a real escape hatch rather than a no-op.
+#
+# Not in the default stage list: 13b deliberately fails a sync, and all four
+# temporarily replace the helper on the target host.
+
+# CHECKSUM_SHIM_DIR holds the wrapper scripts on the TARGET host. Under /tmp
+# rather than beside the real helper: this must never risk overwriting the
+# operator's actual deployed binary, and vmsync is pointed at the wrapper by
+# flag rather than the wrapper being installed over anything.
+CHECKSUM_SHIM_DIR="/tmp/vmsync-bench-checksum-shim"
+
+# checksum_real_helper -> the helper path vmsync would use by default, which
+# is what the shims wrap.
+checksum_real_helper() {
+	printf '%s\n' "${BRIDGE_HELPER_PATH:-/usr/local/bin/vmsync-bridge-helper}"
+}
+
+# checksum_install_shim NAME AWK_PROGRAM -- writes a wrapper at
+# $CHECKSUM_SHIM_DIR/NAME that runs the real helper and pipes its stdout
+# through AWK_PROGRAM, then prints the wrapper's path.
+#
+# Only -checksum invocations are rewritten. The same binary also serves the
+# bridge relay for -compress, and mangling that would break the transfer
+# instead of the check -- so anything without -checksum is exec'd through
+# untouched.
+checksum_install_shim() {
+	local name="$1" awk_prog="$2" real
+	real="$(checksum_real_helper)"
+
+	# Written with a quoted heredoc through run_shell_on so the target's
+	# shell sees the script verbatim -- no local expansion of $@, $1 or the
+	# awk program's own $2/$3 field references.
+	#
+	# "no" rather than a TARGET_LOCAL: there is no such setting, because this
+	# harness runs alongside the SOURCE (SOURCE_LOCAL, default yes) and reaches
+	# the target over ssh in every other place too.
+	run_shell_on "$TARGET_HOST" no "mkdir -p '$CHECKSUM_SHIM_DIR' && cat > '$CHECKSUM_SHIM_DIR/$name' <<'VMSYNC_SHIM_EOF'
+#!/bin/sh
+for a in \"\$@\"; do
+	if [ \"\$a\" = -checksum ]; then
+		exec $real \"\$@\" | awk '$awk_prog'
+	fi
+done
+exec $real \"\$@\"
+VMSYNC_SHIM_EOF
+chmod +x '$CHECKSUM_SHIM_DIR/$name'" >/dev/null || return 1
+
+	printf '%s\n' "$CHECKSUM_SHIM_DIR/$name"
+}
+
+checksum_remove_shims() {
+	[ "$DRY_RUN" = yes ] && return 0
+	run_shell_on "$TARGET_HOST" no "rm -rf '$CHECKSUM_SHIM_DIR'" >/dev/null 2>&1 || true
+}
+
+# checksum_target_digest_of PATH -> a digest of the target replica's guest
+# content, used to prove a refused run left the base alone.
+#
+# qemu-img's own map output rather than a checksum of the file: two qcow2
+# files with identical guest content differ byte for byte, and this only has
+# to detect "the base changed", for which the allocation map plus the disk
+# size is enough and is far cheaper than reading the image.
+checksum_target_digest_of() {
+	ssh_host_cmd "$TARGET_HOST" "qemu-img map --output=json -U '$1' 2>/dev/null | md5sum" 2>/dev/null | awk '{print $1}'
+}
+
+stage_checksum() {
+	log "=== Stage 13: pre-commit integrity check (digest exchange with the target) ==="
+
+	local target_path=""
+	if [ "$DRY_RUN" != yes ]; then
+		stage_needs_target_shutoff "$CSV" checksum "stage checksum" || return 0
+		if ! command -v awk >/dev/null 2>&1; then
+			warn "SKIP stage 13: awk is required to build the helper shims"
+			results_row "$CSV" checksum precondition "" "" "" "" "" "" "SKIP awk unavailable"
+			return 0
+		fi
+	fi
+
+	# A baseline full sync first, so every sub-test below runs as an
+	# INCREMENTAL. That is not incidental: the overlay-is-discarded behaviour
+	# 13b asserts exists only on an incremental, because a full sync writes
+	# the base directly and has nothing to discard.
+	bench_sync checksum baseline -reinit
+	if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
+		warn "baseline full sync failed (see $RUN_LOG) -- aborting stage 13$(bench_sync_hint)"
+		return 1
+	fi
+	if [ "$DRY_RUN" != yes ]; then
+		target_path="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")" || true
+	fi
+
+	# Everything below installs shims on the target; make sure they go away
+	# whichever way this stage ends.
+	trap 'checksum_remove_shims' RETURN
+
+	checksum_clean_subtest
+	checksum_mismatch_subtest "$target_path"
+	checksum_stale_helper_subtest
+	checksum_disabled_subtest
+	return 0
+}
+
+# 13a: the check must actually run on an ordinary sync and report a match.
+#
+# The load-bearing sub-test. If the check is silently disabled -- no helper,
+# a version mismatch, a flag typo -- then 13b and 13c would pass for the wrong
+# reason and this harness would certify an integrity check that does nothing.
+checksum_clean_subtest() {
+	log "--- 13a checksum/clean: an ordinary incremental must run the check and match ---"
+
+	bench_sync checksum clean
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" checksum clean-result DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+
+	if [ "$RUN_RC" != 0 ]; then
+		warn "FAIL: an ordinary incremental sync failed with the integrity check enabled (exit=$RUN_RC) -- see $RUN_LOG"
+		results_row "$CSV" checksum clean-result 1 "" "" "" "" "" "FAIL clean sync failed"
+	elif grep -q 'pre-commit integrity check SKIPPED' "$RUN_LOG" 2>/dev/null; then
+		warn "FAIL: the integrity check was SKIPPED, so nothing in this stage tests it. vmsync needs a vmsync-bridge-helper on $TARGET_HOST whose -version matches the vmsync being tested; see the log line for which it was. $RUN_LOG"
+		results_row "$CSV" checksum clean-result 1 "" "" "" "" "" "FAIL check skipped (helper missing or version-mismatched)"
+	elif grep -q 'checksum: target contents match what was sent' "$RUN_LOG" 2>/dev/null; then
+		log "   PASS: the check ran and the target's digests matched"
+		results_row "$CSV" checksum clean-result 0 "" "" "" "" "" "PASS check ran and matched"
+	elif grep -q 'checksum: nothing written, skipping' "$RUN_LOG" 2>/dev/null; then
+		# No drift since the baseline, so there was nothing to hash. Honest
+		# rather than a pass: the check did not run, and saying so is what
+		# keeps this sub-test's own PASS meaningful.
+		warn "SKIP: no dirty extents since the baseline, so the check had nothing to verify. Re-run with some guest activity, or write to the source between syncs"
+		results_row "$CSV" checksum clean-result "" "" "" "" "" "" "SKIP nothing written to check"
+	else
+		warn "FAIL: the sync succeeded but said nothing about the integrity check either way -- neither a match, a skip, nor an empty delta. See $RUN_LOG"
+		results_row "$CSV" checksum clean-result 1 "" "" "" "" "" "FAIL no checksum outcome in the log"
+	fi
+}
+
+# 13b: a helper reporting one wrong digest must fail the run, remove the
+# overlay, and leave the base as it was.
+checksum_mismatch_subtest() {
+	local base_path="$1" shim before after
+
+	log "--- 13b checksum/mismatch: a single falsified digest must refuse the commit ---"
+
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" checksum mismatch-result DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+
+	# Flip the digest on the FIRST data line only. One wrong block is the
+	# case that actually matters -- a wholesale corruption would be caught by
+	# almost anything, while a single block is what a real bad write looks
+	# like. NR==1 is the format header and must pass through untouched, or
+	# this would test the header path (13c) instead of the digest path.
+	shim="$(checksum_install_shim mismatch 'NR==1 {print; next} NR==2 {print $1, $2, ($3+1); next} {print}')" || {
+		warn "SKIP 13b: could not install the helper shim on $TARGET_HOST"
+		results_row "$CSV" checksum mismatch-result "" "" "" "" "" "" "SKIP shim install failed"
+		return 0
+	}
+
+	before="$(checksum_target_digest_of "$base_path")"
+
+	bench_sync checksum mismatch -bridge-helper-path "$shim"
+
+	after="$(checksum_target_digest_of "$base_path")"
+
+	if [ "$RUN_RC" = 0 ]; then
+		warn "FAIL: the sync SUCCEEDED although the target reported a digest that does not match what was sent. The pre-commit integrity check did not fire, so a bad write would be committed silently. See $RUN_LOG"
+		results_row "$CSV" checksum mismatch-result 1 "" "" "" "" "" "FAIL falsified digest not detected"
+		return 0
+	fi
+
+	if ! grep -q 'do not match the bytes sent' "$RUN_LOG" 2>/dev/null; then
+		warn "FAIL: the sync failed, but not with a digest mismatch -- so it failed for some other reason and this sub-test proved nothing. See $RUN_LOG"
+		results_row "$CSV" checksum mismatch-result 1 "" "" "" "" "" "FAIL failed for another reason"
+		return 0
+	fi
+
+	# The overlay must be gone. Its name is the base plus "_" plus the parent
+	# checkpoint, so match on the prefix rather than trying to predict which
+	# checkpoint this run used.
+	local leftovers
+	leftovers="$(ssh_host_cmd "$TARGET_HOST" "ls -1 '${base_path}'_* 2>/dev/null" 2>/dev/null || true)"
+
+	if [ -n "$leftovers" ]; then
+		warn "FAIL: the check refused the commit but LEFT the overlay behind: $(printf '%s' "$leftovers" | tr '\n' ' ') -- every failed run would leak a delta-sized file. See $RUN_LOG"
+		results_row "$CSV" checksum mismatch-result 1 "" "" "" "" "" "FAIL overlay leaked on refusal"
+	elif [ -n "$before" ] && [ "$before" != "$after" ]; then
+		warn "FAIL: the check refused the commit but the base image CHANGED anyway (allocation map digest $before -> $after). A refused run must leave the replica exactly as it was. See $RUN_LOG"
+		results_row "$CSV" checksum mismatch-result 1 "" "" "" "" "" "FAIL base changed despite refusal"
+	else
+		log "   PASS: the run failed on the digest mismatch, the overlay is gone, and the base is unchanged"
+		results_row "$CSV" checksum mismatch-result 0 "" "" "" "" "" "PASS mismatch refused, overlay removed, base intact"
+	fi
+}
+
+# 13c: a helper too old to speak the format must be reported as SKEW, never as
+# corruption.
+#
+# The most consequential distinction in the whole feature. Both failures stop
+# the run, so a test that only checked the exit code would pass either way --
+# what matters is which conclusion an operator draws. Told "version skew" they
+# redeploy a binary; told "your replica does not match" they may reinit a
+# perfectly good 50 GiB VM on evidence that was never about the data.
+checksum_stale_helper_subtest() {
+	local shim
+
+	log "--- 13c checksum/stale: a headerless reply must read as version skew, not corruption ---"
+
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" checksum stale-result DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+
+	# Drop the format header, which is exactly what a helper predating it
+	# would produce: bare digest lines and nothing else.
+	shim="$(checksum_install_shim stale 'NR==1 {next} {print}')" || {
+		warn "SKIP 13c: could not install the helper shim on $TARGET_HOST"
+		results_row "$CSV" checksum stale-result "" "" "" "" "" "" "SKIP shim install failed"
+		return 0
+	}
+
+	bench_sync checksum stale -bridge-helper-path "$shim"
+
+	if [ "$RUN_RC" = 0 ]; then
+		warn "FAIL: the sync SUCCEEDED against a helper whose reply had no format header -- the version check is not being applied, so a mismatched helper's digests would be trusted. See $RUN_LOG"
+		results_row "$CSV" checksum stale-result 1 "" "" "" "" "" "FAIL headerless reply accepted"
+	elif grep -q 'do not match the bytes sent' "$RUN_LOG" 2>/dev/null; then
+		warn "FAIL: a stale helper was reported as a DATA MISMATCH. This is the false-corruption case the format header exists to prevent: an operator would conclude the replica is bad and reinit it, when the only problem is an out-of-date binary on $TARGET_HOST. See $RUN_LOG"
+		results_row "$CSV" checksum stale-result 1 "" "" "" "" "" "FAIL skew reported as corruption"
+	elif grep -q 'digest format mismatch' "$RUN_LOG" 2>/dev/null; then
+		log "   PASS: reported as a format/version mismatch rather than as a corrupt replica"
+		results_row "$CSV" checksum stale-result 0 "" "" "" "" "" "PASS skew reported as skew"
+	else
+		warn "FAIL: the run failed, but named neither a format mismatch nor a data mismatch, so it is unclear what an operator would conclude. See $RUN_LOG"
+		results_row "$CSV" checksum stale-result 1 "" "" "" "" "" "FAIL failed with an unclear reason"
+	fi
+}
+
+# 13d: -no-checksum must genuinely skip the check.
+#
+# Cheap, and it guards the escape hatch. The check is on by default and
+# requires a helper, so -no-checksum is what an operator reaches for when it
+# is in the way; a flag that quietly does nothing would leave them stuck.
+checksum_disabled_subtest() {
+	log "--- 13d checksum/off: -no-checksum must skip the check ---"
+
+	bench_sync checksum off -no-checksum
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" checksum off-result DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+
+	if [ "$RUN_RC" != 0 ]; then
+		warn "FAIL: -no-checksum made the sync fail (exit=$RUN_RC) -- see $RUN_LOG"
+		results_row "$CSV" checksum off-result 1 "" "" "" "" "" "FAIL sync failed with -no-checksum"
+	elif grep -q 'checksum: asking the target to hash' "$RUN_LOG" 2>/dev/null; then
+		warn "FAIL: -no-checksum was passed but the target was asked for digests anyway -- the flag is not being honoured. See $RUN_LOG"
+		results_row "$CSV" checksum off-result 1 "" "" "" "" "" "FAIL flag ignored"
+	elif grep -q 'disabled by -no-checksum' "$RUN_LOG" 2>/dev/null; then
+		log "   PASS: the check was skipped and the run said why"
+		results_row "$CSV" checksum off-result 0 "" "" "" "" "" "PASS check disabled by flag"
+	else
+		warn "FAIL: -no-checksum neither ran the check nor said it was disabled, so what happened is unclear. See $RUN_LOG"
+		results_row "$CSV" checksum off-result 1 "" "" "" "" "" "FAIL no explanation in the log"
+	fi
+}
+
 # --- Stage 12: a failed run must not wedge the next one ----------------------
 
 # The regression this exists for, seen in production 2026-09-01: a run copied
@@ -4109,7 +4491,8 @@ stage_pattern() {
 	# down records its reason under that name, and a reason nothing matches
 	# is a reason nobody reads: the verdict would say "nothing recorded"
 	# rather than why the stage skipped.
-	verify) printf '^verify-(guard|fast|full|qemu-img|cross|oracle|precondition)$' ;;
+	verify) printf '^verify-(guard|fast|full|qemu-img|fast-bytes|full-bytes|cross|oracle|precondition)$' ;;
+	checksum) printf '^checksum$' ;;
 	reinit) printf '^reinit-after-failures$' ;;
 	snapshot) printf '^ext-snapshot$' ;;
 	define) printf '^define-(uuid-collision|rollback|precondition)$' ;;
@@ -4302,7 +4685,17 @@ generate_report() {
                 # silently drops out of the report while still counting
                 # toward the stage verdict -- which is how the cross-check
                 # and clean-oracle rows went unlisted when they were added.
-                awk -F, 'NR>1 && $1 ~ /^verify-(guard|baseline|fast|full|qemu-img|cross|oracle|precondition)/ { printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $9 }' "$CSV"
+                awk -F, 'NR>1 && $1 ~ /^verify-(guard|baseline|fast|full|qemu-img|fast-bytes|full-bytes|cross|oracle|precondition)/ { printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $9 }' "$CSV"
+                echo
+                echo "## Stage 13: pre-commit integrity check"
+                echo
+                if awk -F, 'NR>1 && $1=="checksum" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| check | exit | wall (s) | result |"
+                        echo "|---|---|---|---|"
+                        awk -F, 'NR>1 && $1=="checksum" { printf "| %s | %s | %s | %s |\n", $2, $3, $4, $9 }' "$CSV"
+                else
+                        echo "_not run (opt in with \`--stages checksum\`; sub-test 13b deliberately fails a sync, and all four temporarily install helper shims on the target)_"
+                fi
                 echo
                 echo "## Stage 8: verify after a long incremental chain"
                 echo
@@ -4426,6 +4819,7 @@ for s in "${stage_list[@]}"; do
         case "$s" in
         matrix) stage_matrix || stage_rc=$? ;;
         verify) stage_verify_tamper || stage_rc=$? ;;
+        checksum) stage_checksum || stage_rc=$? ;;
         reinit) stage_reinit_after_failures || stage_rc=$? ;;
         snapshot) stage_external_snapshot || stage_rc=$? ;;
         define) stage_define_domain || stage_rc=$? ;;
@@ -4436,7 +4830,7 @@ for s in "${stage_list[@]}"; do
         restore) stage_restore || stage_rc=$? ;;
         invert) stage_invert || stage_rc=$? ;;
         wedge) stage_wedge || stage_rc=$? ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge)" ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
                 warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."
