@@ -3737,6 +3737,24 @@ checksum_remove_shims() {
 	run_shell_on "$TARGET_HOST" no "rm -rf '$CHECKSUM_SHIM_DIR'" >/dev/null 2>&1 || true
 }
 
+# checksum_write_args -- echoes the extra vmsync args a sub-test needs so its
+# sync actually WRITES something, and dirties the guest first when that is the
+# route being used.
+#
+# The whole stage depends on this: with nothing to copy, the check never runs
+# at all (see CHECKSUM_INCREMENTAL). Printing the args rather than running the
+# sync keeps the four sub-tests free to add their own flags.
+checksum_write_args() {
+	if [ "$CHECKSUM_INCREMENTAL" = yes ]; then
+		# A failure to dirty is not fatal -- the sync still runs, and the
+		# sub-test's own "did the check happen" assertion is what reports
+		# the resulting no-op honestly.
+		guest_dirty || warn "could not dirty the guest; this sub-test's sync may find nothing to copy"
+		return 0
+	fi
+	printf '%s\n' -reinit
+}
+
 # checksum_target_digest_of PATH -> a digest of the target replica's guest
 # content, used to prove a refused run left the base alone.
 #
@@ -3761,10 +3779,34 @@ stage_checksum() {
 		fi
 	fi
 
-	# A baseline full sync first, so every sub-test below runs as an
-	# INCREMENTAL. That is not incidental: the overlay-is-discarded behaviour
-	# 13b asserts exists only on an incremental, because a full sync writes
-	# the base directly and has nothing to discard.
+	# CHECKSUM_INCREMENTAL decides how every sub-test below gets vmsync to
+	# WRITE something, and that turned out to be the whole difficulty of this
+	# stage.
+	#
+	# The check only runs when a copy actually happened: copyAndCommit returns
+	# early at "No changed extents selected, skipping copy" before the overlay
+	# is even created, so on an idle source an incremental sync is a complete
+	# no-op -- no digests, no exchange, the helper never invoked, and nothing
+	# in the log either way. The first version of this stage assumed a
+	# baseline-then-incremental pair would produce a delta, and against a
+	# quiet test VM all three of its interesting sub-tests silently tested
+	# nothing.
+	#
+	# So: dirty the guest when the agent allows it, which gives a genuine
+	# incremental and is the only way to reach the overlay-is-discarded
+	# behaviour 13b wants. Failing that, fall back to -reinit, which always
+	# writes the whole disk and still exercises the digest exchange, the
+	# version check and the refusal -- just against a base image rather than
+	# an overlay. Slower and narrower, but a real test rather than a vacuous
+	# pass.
+	CHECKSUM_INCREMENTAL=no
+	if [ "$DRY_RUN" != yes ] && [ "$GUEST_DIRTY" = yes ] && guest_exec_available; then
+		CHECKSUM_INCREMENTAL=yes
+		log "guest-exec is available: sub-tests will dirty the guest and run genuine incrementals"
+	elif [ "$DRY_RUN" != yes ]; then
+		warn "sub-tests will use -reinit instead of incrementals: ${GUEST_EXEC_WHY:-guest dirtying is disabled (GUEST_DIRTY=no)}. The digest exchange, the version check and the refusal are all still tested; what is NOT is that a refused INCREMENTAL discards its overlay and leaves the base intact, which needs a real delta."
+	fi
+
 	bench_sync checksum baseline -reinit
 	if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
 		warn "baseline full sync failed (see $RUN_LOG) -- aborting stage 13$(bench_sync_hint)"
@@ -3791,9 +3833,15 @@ stage_checksum() {
 # a version mismatch, a flag typo -- then 13b and 13c would pass for the wrong
 # reason and this harness would certify an integrity check that does nothing.
 checksum_clean_subtest() {
-	log "--- 13a checksum/clean: an ordinary incremental must run the check and match ---"
+	log "--- 13a checksum/clean: an ordinary sync must run the check and match ---"
 
-	bench_sync checksum clean
+	local -a extra
+	mapfile -t extra < <(checksum_write_args)
+	if [ ${#extra[@]} -gt 0 ]; then
+		bench_sync checksum clean "${extra[@]}"
+	else
+		bench_sync checksum clean
+	fi
 	if [ "$DRY_RUN" = yes ]; then
 		results_row "$CSV" checksum clean-result DRYRUN "" "" "" "" "" "SKIP dry run"
 		return 0
@@ -3809,13 +3857,20 @@ checksum_clean_subtest() {
 		log "   PASS: the check ran and the target's digests matched"
 		results_row "$CSV" checksum clean-result 0 "" "" "" "" "" "PASS check ran and matched"
 	elif grep -q 'checksum: nothing written, skipping' "$RUN_LOG" 2>/dev/null; then
-		# No drift since the baseline, so there was nothing to hash. Honest
-		# rather than a pass: the check did not run, and saying so is what
-		# keeps this sub-test's own PASS meaningful.
-		warn "SKIP: no dirty extents since the baseline, so the check had nothing to verify. Re-run with some guest activity, or write to the source between syncs"
+		# The copy ran but wrote nothing. Honest rather than a pass: the
+		# check did not verify anything, and saying so is what keeps this
+		# sub-test's own PASS meaningful.
+		warn "SKIP: the copy found nothing to write, so the check had nothing to verify. See $RUN_LOG"
 		results_row "$CSV" checksum clean-result "" "" "" "" "" "" "SKIP nothing written to check"
+	elif grep -q 'No changed extents selected, skipping copy' "$RUN_LOG" 2>/dev/null; then
+		# The sync returned before the copy even started, which is earlier
+		# than the check lives -- so the log says nothing about it at all.
+		# Named separately from the case above because the remedy differs:
+		# this one is "the source is not changing", not "the check is broken".
+		warn "SKIP: the sync found no changed extents and returned before any copy, so the check was never reached. Enable guest dirtying (GUEST_DIRTY=yes plus a working guest agent) or accept the -reinit fallback. See $RUN_LOG"
+		results_row "$CSV" checksum clean-result "" "" "" "" "" "" "SKIP no changed extents, copy never ran"
 	else
-		warn "FAIL: the sync succeeded but said nothing about the integrity check either way -- neither a match, a skip, nor an empty delta. See $RUN_LOG"
+		warn "FAIL: the sync succeeded but said nothing about the integrity check either way -- neither a match, a skip, nor an absent delta. See $RUN_LOG"
 		results_row "$CSV" checksum clean-result 1 "" "" "" "" "" "FAIL no checksum outcome in the log"
 	fi
 }
@@ -3845,9 +3900,24 @@ checksum_mismatch_subtest() {
 
 	before="$(checksum_target_digest_of "$base_path")"
 
-	bench_sync checksum mismatch -bridge-helper-path "$shim"
+	local -a extra
+	mapfile -t extra < <(checksum_write_args)
+	if [ ${#extra[@]} -gt 0 ]; then
+		bench_sync checksum mismatch -bridge-helper-path "$shim" "${extra[@]}"
+	else
+		bench_sync checksum mismatch -bridge-helper-path "$shim"
+	fi
 
 	after="$(checksum_target_digest_of "$base_path")"
+
+	# Distinguish "the check did not fire" from "there was nothing to check".
+	# Both leave RUN_RC at 0, and calling the second a FAIL would blame the
+	# integrity check for an idle source.
+	if grep -qE 'No changed extents selected, skipping copy|checksum: nothing written, skipping' "$RUN_LOG" 2>/dev/null; then
+		warn "SKIP: this sync wrote nothing, so there were no digests to falsify and the check was never exercised. See $RUN_LOG"
+		results_row "$CSV" checksum mismatch-result "" "" "" "" "" "" "SKIP nothing written, check not exercised"
+		return 0
+	fi
 
 	if [ "$RUN_RC" = 0 ]; then
 		warn "FAIL: the sync SUCCEEDED although the target reported a digest that does not match what was sent. The pre-commit integrity check did not fire, so a bad write would be committed silently. See $RUN_LOG"
@@ -3858,6 +3928,17 @@ checksum_mismatch_subtest() {
 	if ! grep -q 'do not match the bytes sent' "$RUN_LOG" 2>/dev/null; then
 		warn "FAIL: the sync failed, but not with a digest mismatch -- so it failed for some other reason and this sub-test proved nothing. See $RUN_LOG"
 		results_row "$CSV" checksum mismatch-result 1 "" "" "" "" "" "FAIL failed for another reason"
+		return 0
+	fi
+
+	# Anything past here is INCREMENTAL-only. On the -reinit fallback there is
+	# no overlay to discard and the base is legitimately rewritten from
+	# scratch, so both remaining assertions would be meaningless -- and the
+	# base-unchanged one would fail outright, blaming the check for doing
+	# exactly what a full sync is supposed to do.
+	if [ "$CHECKSUM_INCREMENTAL" != yes ]; then
+		log "   PASS: the run failed on the digest mismatch (full-sync mode: no overlay to discard, so that half is untested here)"
+		results_row "$CSV" checksum mismatch-result 0 "" "" "" "" "" "PASS mismatch refused (full sync; overlay discard untested)"
 		return 0
 	fi
 
@@ -3905,7 +3986,19 @@ checksum_stale_helper_subtest() {
 		return 0
 	}
 
-	bench_sync checksum stale -bridge-helper-path "$shim"
+	local -a extra
+	mapfile -t extra < <(checksum_write_args)
+	if [ ${#extra[@]} -gt 0 ]; then
+		bench_sync checksum stale -bridge-helper-path "$shim" "${extra[@]}"
+	else
+		bench_sync checksum stale -bridge-helper-path "$shim"
+	fi
+
+	if grep -qE 'No changed extents selected, skipping copy|checksum: nothing written, skipping' "$RUN_LOG" 2>/dev/null; then
+		warn "SKIP: this sync wrote nothing, so no digest exchange happened and the header was never read. See $RUN_LOG"
+		results_row "$CSV" checksum stale-result "" "" "" "" "" "" "SKIP nothing written, header not exercised"
+		return 0
+	fi
 
 	if [ "$RUN_RC" = 0 ]; then
 		warn "FAIL: the sync SUCCEEDED against a helper whose reply had no format header -- the version check is not being applied, so a mismatched helper's digests would be trusted. See $RUN_LOG"
@@ -3930,7 +4023,15 @@ checksum_stale_helper_subtest() {
 checksum_disabled_subtest() {
 	log "--- 13d checksum/off: -no-checksum must skip the check ---"
 
-	bench_sync checksum off -no-checksum
+	# Needs a writing sync like the others: "-no-checksum was honoured" is
+	# only meaningful on a run that would otherwise have done the exchange.
+	local -a extra
+	mapfile -t extra < <(checksum_write_args)
+	if [ ${#extra[@]} -gt 0 ]; then
+		bench_sync checksum off -no-checksum "${extra[@]}"
+	else
+		bench_sync checksum off -no-checksum
+	fi
 	if [ "$DRY_RUN" = yes ]; then
 		results_row "$CSV" checksum off-result DRYRUN "" "" "" "" "" "SKIP dry run"
 		return 0
