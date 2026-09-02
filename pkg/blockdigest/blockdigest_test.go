@@ -716,3 +716,46 @@ func TestBlockSizeSkewIsCaughtByTheHeaderNotByCompare(t *testing.T) {
 		t.Fatalf("err = %v, want ErrFormatMismatch before any digest comparison", err)
 	}
 }
+
+// A missing header must name the side that actually failed to send one.
+//
+// readHeader serves both directions, and it used to say
+// "vmsync-bridge-helper produced no output" unconditionally. So a helper
+// whose own stdin arrived empty reported that IT had produced nothing --
+// which reads as a broken helper when the truth is a caller that never sent
+// the request. That misattribution cost real diagnosis time on a bench run
+// where a wrapper script was double-invoking the helper and draining its
+// stdin.
+func TestMissingHeaderNamesTheRightPeer(t *testing.T) {
+	// A response is what the HELPER sends, so an empty one is the helper's
+	// silence.
+	_, _, err := ReadResponse(strings.NewReader(""))
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if !strings.Contains(err.Error(), "vmsync-bridge-helper sent nothing") {
+		t.Errorf("ReadResponse err = %v, want it to blame vmsync-bridge-helper", err)
+	}
+
+	// A request is what VMSYNC sends, so an empty one is vmsync's silence --
+	// and must not blame the helper.
+	_, _, err = ReadRequest(strings.NewReader(""))
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if !strings.Contains(err.Error(), "vmsync sent nothing") {
+		t.Errorf("ReadRequest err = %v, want it to blame vmsync", err)
+	}
+	if strings.Contains(err.Error(), "vmsync-bridge-helper") {
+		t.Errorf("ReadRequest err = %v, must NOT blame the helper for an empty request", err)
+	}
+
+	// Same for a line that is present but is not a header.
+	_, _, err = ReadRequest(strings.NewReader("sh: something went wrong\n"))
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if strings.Contains(err.Error(), "vmsync-bridge-helper") {
+		t.Errorf("ReadRequest err = %v, must not blame the helper for junk in a request", err)
+	}
+}

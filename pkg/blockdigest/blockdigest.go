@@ -371,7 +371,7 @@ func WriteRequest(w io.Writer, h Header, ranges []Range) error {
 // prevent.
 func ReadRequest(r io.Reader) (Header, []Range, error) {
 	sc := newScanner(r)
-	h, err := readHeader(sc)
+	h, err := readHeader(sc, peerVmsync)
 	if err != nil {
 		return Header{}, nil, err
 	}
@@ -430,7 +430,7 @@ func WriteResponse(w io.Writer, h Header, blocks []Block) error {
 // turn "the helper is missing" into "zero blocks, all agreed".
 func ReadResponse(r io.Reader) (Header, []Block, error) {
 	sc := newScanner(r)
-	h, err := readHeader(sc)
+	h, err := readHeader(sc, peerHelper)
 	if err != nil {
 		return Header{}, nil, err
 	}
@@ -486,7 +486,24 @@ func writeHeader(w io.Writer, h Header) error {
 // likely cause is a helper too old to emit one, or a shell diagnostic where
 // the helper's output should have been, and both are answered by looking at
 // that text.
-func readHeader(sc *bufio.Scanner) (Header, error) {
+// peer names whoever produced the stream being parsed, so a missing or
+// malformed header blames the right side.
+//
+// Worth a parameter rather than one fixed string. readHeader serves both
+// directions -- ReadResponse parses what the helper sent, ReadRequest parses
+// what vmsync sent -- and a single wording cannot be right for both. It said
+// "vmsync-bridge-helper produced no output" unconditionally, so a helper
+// whose own stdin arrived empty reported that IT had produced nothing, which
+// reads as a broken helper when the truth was a caller that never sent the
+// request. That message cost real time to see past once already.
+type peer string
+
+const (
+	peerHelper peer = "vmsync-bridge-helper"
+	peerVmsync peer = "vmsync"
+)
+
+func readHeader(sc *bufio.Scanner, from peer) (Header, error) {
 	for sc.Scan() {
 		text := sc.Text()
 		if text == "" {
@@ -494,8 +511,8 @@ func readHeader(sc *bufio.Scanner) (Header, error) {
 		}
 		fields, err := splitExactly(text, 4)
 		if err != nil || fields[0] != FormatMagic {
-			return Header{}, fmt.Errorf("%w: expected a %q header line, got %q -- if this is vmsync-bridge-helper output, the helper is too old or did not run",
-				ErrFormatMismatch, FormatMagic, text)
+			return Header{}, fmt.Errorf("%w: expected a %q header line from %s, got %q -- either %s is too old to send one, or that is not %s output at all",
+				ErrFormatMismatch, FormatMagic, from, text, from, from)
 		}
 		version, err := strconv.Atoi(fields[1])
 		if err != nil {
@@ -510,7 +527,7 @@ func readHeader(sc *bufio.Scanner) (Header, error) {
 	if err := sc.Err(); err != nil {
 		return Header{}, fmt.Errorf("read digest header: %w", err)
 	}
-	return Header{}, fmt.Errorf("%w: no header line at all -- vmsync-bridge-helper produced no output", ErrFormatMismatch)
+	return Header{}, fmt.Errorf("%w: no header line at all -- %s sent nothing", ErrFormatMismatch, from)
 }
 
 // splitExactly splits text on runs of spaces and tabs and insists on exactly
