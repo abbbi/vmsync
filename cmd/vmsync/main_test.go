@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"vmsync/pkg/disk"
+	"vmsync/pkg/libvirtsync"
 	"vmsync/pkg/metrics"
 	"vmsync/pkg/nbdsync"
 )
@@ -656,4 +657,100 @@ func TestInfrastructureFailuresOnAVerifyRunAreStillCounted(t *testing.T) {
 			t.Errorf("%v was classified as a data finding; it is a broken sync and must count toward -reinit-after-failures", err)
 		}
 	}
+}
+
+// TestPlanCheckpointRecovery covers the decision that removes a checkpoint
+// from a live chain, which is the most consequential thing in this file.
+//
+// The situation it recovers from: the source's chain and the target's record
+// of it advance by two different libvirt calls, and only the second can fail
+// on its own. A run that copied successfully and then failed its
+// DomainDefineXML left the source at cpt-000002 with the target still saying
+// cpt-000001, and every later incremental refused with "checkpoint
+// inconsistency detected" until somebody ran -reinit. pending_checkpoint is
+// the write-ahead record that makes the state recognisable rather than
+// something to infer.
+func TestPlanCheckpointRecovery(t *testing.T) {
+	chain := func(names ...string) []libvirtsync.Checkpoint {
+		out := make([]libvirtsync.Checkpoint, 0, len(names))
+		parent := ""
+		for _, n := range names {
+			out = append(out, libvirtsync.Checkpoint{Name: n, Parent: parent})
+			parent = n
+		}
+		return out
+	}
+
+	t.Run("no pending record leaves the chain alone", func(t *testing.T) {
+		got, err := planCheckpointRecovery("", "vmsync-cpt-000001", chain("vmsync-cpt-000001"))
+		if err != nil || got != "" {
+			t.Errorf("got %q, %v; want no deletion and no error", got, err)
+		}
+	})
+
+	// The wedge itself: the source advanced, the target never accepted.
+	t.Run("pending is the tip and was never accepted -> delete it", func(t *testing.T) {
+		got, err := planCheckpointRecovery(
+			"vmsync-cpt-000002", "vmsync-cpt-000001",
+			chain("vmsync-cpt-000001", "vmsync-cpt-000002"))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "vmsync-cpt-000002" {
+			t.Errorf("got %q, want vmsync-cpt-000002 deleted", got)
+		}
+	})
+
+	// Died between recording the intent and creating the checkpoint. The
+	// source never advanced, so there is nothing to undo -- and nothing to
+	// refuse over either.
+	t.Run("pending names a checkpoint the source does not have -> nothing", func(t *testing.T) {
+		got, err := planCheckpointRecovery(
+			"vmsync-cpt-000002", "vmsync-cpt-000001",
+			chain("vmsync-cpt-000001"))
+		if err != nil || got != "" {
+			t.Errorf("got %q, %v; want no deletion and no error", got, err)
+		}
+	})
+
+	// The define landed and the clear did not -- impossible while both are
+	// one atomic define, but it must not delete a checkpoint the target has
+	// accepted.
+	t.Run("pending equals the accepted checkpoint -> never delete it", func(t *testing.T) {
+		got, err := planCheckpointRecovery(
+			"vmsync-cpt-000002", "vmsync-cpt-000002",
+			chain("vmsync-cpt-000001", "vmsync-cpt-000002"))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "" {
+			t.Errorf("got %q, want nothing deleted -- that checkpoint IS the accepted one", got)
+		}
+	})
+
+	// Only ever the tip. Deleting the newest merges its bitmap into the
+	// active tracking, which is exactly the state before it existed;
+	// deleting a mid-chain one is a different operation that later
+	// checkpoints depend on.
+	t.Run("pending is mid-chain -> refuse rather than improvise", func(t *testing.T) {
+		got, err := planCheckpointRecovery(
+			"vmsync-cpt-000002", "vmsync-cpt-000001",
+			chain("vmsync-cpt-000001", "vmsync-cpt-000002", "vmsync-cpt-000003"))
+		if err == nil {
+			t.Fatalf("got %q with no error; want a refusal", got)
+		}
+		if got != "" {
+			t.Errorf("got %q alongside an error; want no deletion named", got)
+		}
+		if !strings.Contains(err.Error(), "vmsync-cpt-000003") {
+			t.Errorf("err = %v, want it to name the newer checkpoint that makes this unsafe", err)
+		}
+	})
+
+	t.Run("first-ever sync: pending set against an empty chain -> nothing", func(t *testing.T) {
+		got, err := planCheckpointRecovery("vmsync-cpt-000001", "", nil)
+		if err != nil || got != "" {
+			t.Errorf("got %q, %v; want no deletion and no error", got, err)
+		}
+	})
 }

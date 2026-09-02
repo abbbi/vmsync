@@ -1012,6 +1012,60 @@ func unverifiableCheckpointMetadataError(targetDomain, parent string, checkpoint
 // responsibility (called separately, earlier, against the same field) --
 // this function's only job is judging an actual disagreement between two
 // non-empty values.
+// planCheckpointRecovery decides what to do about a pending_checkpoint the
+// previous run left on the target, given what the source's chain actually
+// holds. Returns the checkpoint to delete ("" for none), or an error meaning
+// refuse the run.
+//
+// Pure, and separate from the doing, because this is the decision that
+// removes a checkpoint from a live chain -- it should be readable and
+// testable without a hypervisor.
+//
+// Every branch is decided by comparing a RECORD against the source's actual
+// chain. Nothing here infers intent from divergence: that was the rejected
+// design, because "the source is one ahead" has more than one cause and
+// guessing wrong either discards a valid baseline or adopts one the target
+// only partly holds.
+func planCheckpointRecovery(pending, lastAccepted string, existing []libvirtsync.Checkpoint) (deleteName string, err error) {
+	if pending == "" {
+		return "", nil
+	}
+	if pending == lastAccepted {
+		// The define landed and the clear did not. Cannot happen while both
+		// are one atomic DomainDefineXML, but if it ever does there is
+		// nothing orphaned -- the target accepted this checkpoint. The
+		// intent write later in this run overwrites the stale field.
+		return "", nil
+	}
+
+	found := false
+	for _, c := range existing {
+		if c.Name == pending {
+			found = true
+			break
+		}
+	}
+	if !found {
+		// The previous run died between recording the intent and creating
+		// the checkpoint. The source never advanced, so there is nothing to
+		// undo.
+		return "", nil
+	}
+
+	// Only ever the TIP. Deleting the newest checkpoint merges its bitmap
+	// into the active tracking, which is exactly the state before it
+	// existed. Deleting a mid-chain one is a different operation that later
+	// checkpoints depend on, and reaching here with something newer means
+	// the chain advanced past a checkpoint the target never accepted --
+	// which this design is supposed to make impossible, so refuse rather
+	// than improvise.
+	if tip := existing[len(existing)-1]; tip.Name != pending {
+		return "", fmt.Errorf("checkpoint %s was recorded as pending on target %q but is no longer the newest on the source (%s is) -- the chain advanced past a checkpoint the target never accepted, which vmsync does not do on its own. Inspect the source's checkpoints before syncing again; -force-clean plus a full resync is the blunt recovery",
+			pending, lastAccepted, tip.Name)
+	}
+	return pending, nil
+}
+
 func checkpointChainConsistent(metadataEntryCheckpoint, parent string) bool {
 	if metadataEntryCheckpoint == "" {
 		return true
@@ -2993,6 +3047,10 @@ func run(cfg syncConfig) (runErr error) {
 	tgtDom, err := tgtMgr.LookupDomain(cfg.TargetDomain)
 	var metadataEntryCheckpoint string
 	var metadataEntryTimestamp string
+	// The checkpoint a previous run recorded that it was about to advance
+	// to, but which the target never accepted. Empty on every healthy
+	// replica; see MetadataFieldPendingCheckpoint.
+	var metadataEntryPendingCheckpoint string
 	if err != nil {
 		if parent == "" {
 			trace.Info("Domain does not exist on target system")
@@ -3054,6 +3112,15 @@ func run(cfg syncConfig) (runErr error) {
 			var checkpointParseErr, timestampParseErr error
 			metadataEntryCheckpoint, checkpointParseErr = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastCheckpoint)
 			metadataEntryTimestamp, timestampParseErr = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastSync)
+			// Absent on any replica written before this field existed, and
+			// on every healthy one -- it is only set between recording the
+			// intent to advance and the target accepting it. A parse failure
+			// is therefore not worth failing the run over: treated as
+			// absent, which is the pre-existing behaviour.
+			metadataEntryPendingCheckpoint, _ = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldPendingCheckpoint)
+			if metadataEntryPendingCheckpoint != "" {
+				trace.Info("Target domain metadata", "pending_checkpoint", metadataEntryPendingCheckpoint)
+			}
 			if checkpointParseErr != nil || metadataEntryCheckpoint == "" {
 				if err := unverifiableCheckpointMetadataError(cfg.TargetDomain, parent, checkpointParseErr, metadataEntryCheckpoint); err != nil {
 					return err
@@ -3112,6 +3179,50 @@ func run(cfg syncConfig) (runErr error) {
 				trace.Info("Successfully verified target file timestamps")
 			}
 		}
+	}
+
+	// Undo a previous run that advanced the source's chain but never got the
+	// target to accept it. Must come BEFORE the consistency check below,
+	// which is what would otherwise refuse -- and before CreateCheckpoint,
+	// since deleting the tip changes what the next checkpoint is called.
+	if orphan, planErr := planCheckpointRecovery(metadataEntryPendingCheckpoint, metadataEntryCheckpoint, existing); planErr != nil {
+		return planErr
+	} else if orphan != "" {
+		trace.Warning("a previous run advanced the source's checkpoint chain but never recorded it on the target; removing that checkpoint and recopying from the last one the target accepted",
+			"orphaned_checkpoint", orphan, "last_accepted", metadataEntryCheckpoint)
+
+		// NOT best-effort, unlike cleanupOrphanedCheckpoint's own use of
+		// this call. That one runs on an already-failing run, where leaving
+		// an orphan behind is a degradation worth logging and moving past.
+		// This one runs at the START of a run that is about to advance the
+		// chain again: proceeding with the orphan still present would stack
+		// a second divergence on the first.
+		//
+		// The realistic failure is a source domain that is not running.
+		// DeleteCheckpointIfExists is deliberately never metadata-only, so
+		// the delete needs qemu to merge the dirty bitmap, and libvirt
+		// refuses that on an inactive domain. There is no safe fallback --
+		// dropping the metadata alone is precisely what leaves an orphaned
+		// bitmap and makes every later sync fail with "Bitmap already
+		// exists" -- so name the remedy instead of improvising one.
+		if err := libvirtsync.DeleteCheckpointIfExists(srcDom, orphan); err != nil {
+			return fmt.Errorf("cannot remove checkpoint %s, which the source holds but the target never accepted: %w -- deleting it merges its dirty bitmap, which qemu only does while the domain is RUNNING, so start %s and sync again, or use -force-clean to clear the chain and recopy in full. Do not delete the checkpoint metadata by hand: without its bitmap every later sync fails with \"Bitmap already exists\"",
+				orphan, err, cfg.SourceDomain)
+		}
+
+		// Re-derive the chain: the tip just changed, so checkpointName and
+		// parent computed above are both stale.
+		existing, err = libvirtsync.ListManagedCheckpoints(srcDom)
+		if err != nil {
+			return fmt.Errorf("re-list source checkpoints after removing %s: %w", orphan, err)
+		}
+		checkpointMu.Lock()
+		checkpointName, parent, err = libvirtsync.NextCheckpointName(existing)
+		checkpointMu.Unlock()
+		if err != nil {
+			return fmt.Errorf("recompute checkpoint name after removing %s: %w", orphan, err)
+		}
+		trace.Info("checkpoint chain rewound to the last accepted checkpoint", "checkpoint", checkpointName, "parent", parent)
 	}
 
 	if parent == "" {
@@ -3205,6 +3316,33 @@ func run(cfg syncConfig) (runErr error) {
 	} else {
 		trace.Warning("could not read the source domain's state at checkpoint time; this replica will not claim a verified zero data-loss window", "vm", cfg.SourceDomain, "error", stateErr)
 	}
+	// Record the intent BEFORE advancing the source's chain, so the target
+	// carries a note of what it is about to be asked to accept. See
+	// MetadataFieldPendingCheckpoint for why the order is the mechanism: if
+	// this write fails the run stops here, with the source's chain untouched
+	// and nothing to reconcile.
+	//
+	// Only for an incremental against an existing target. A full sync has no
+	// parent to diverge from -- if it fails, the next run is another full
+	// sync regardless -- and on a -reinit the target domain may not exist
+	// yet, so there is nowhere to write. Same existence test
+	// recordReplicaWrittenAt makes, and for the same reason.
+	if parent != "" {
+		targetExists, existsErr := libvirtsync.DomainExists(tgtMgr.Conn, cfg.TargetDomain)
+		if existsErr != nil {
+			thawSource("checking the target domain before recording the pending checkpoint failed")
+			return fmt.Errorf("check whether target domain %s exists before advancing the source's chain: %w", cfg.TargetDomain, existsErr)
+		}
+		if targetExists {
+			if err := libvirtsync.SetDomainMetadataFields(tgtMgr, cfg.TargetDomain, map[string]string{
+				libvirtsync.MetadataFieldPendingCheckpoint: checkpointName,
+			}); err != nil {
+				thawSource("recording the pending checkpoint failed")
+				return fmt.Errorf("record pending checkpoint %s on target %s before advancing the source's chain: %w -- refusing to advance, so the pair stays consistent", checkpointName, cfg.TargetDomain, err)
+			}
+		}
+	}
+
 	if err := libvirtsync.CreateCheckpoint(srcDom, checkpointName, parent, qcowDisks); err != nil {
 		// A full sync (parent == "") has no earlier checkpoint to fall back
 		// on -- without a checkpoint at all there's no bitmap to establish a

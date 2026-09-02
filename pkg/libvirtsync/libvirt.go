@@ -298,6 +298,49 @@ const (
 	// pkg/failover's invert removals and pkg/restorepoint's MetadataPlan.
 	MetadataFieldReplicaWrittenAt = "replica_written_at"
 
+	// MetadataFieldPendingCheckpoint is the checkpoint the SOURCE is about
+	// to advance to, recorded on the target BEFORE the source's chain
+	// actually advances, and cleared once the target accepts it.
+	//
+	// It exists because the source's chain and the target's record of that
+	// chain are advanced by two different writes, at two different times, by
+	// two different libvirt calls -- and the second one can fail on its own.
+	// CreateCheckpoint adds the checkpoint to the source; only
+	// UpdateSyncMetadata -> DefineDomain (one DomainDefineXML at the very
+	// end of the run) sets MetadataFieldLastCheckpoint on the target. A run
+	// that copied successfully and then failed that define left the source at
+	// cpt-000002 and the target still saying cpt-000001, and every later
+	// incremental refused with "checkpoint inconsistency detected" until
+	// somebody ran -reinit. That is a wedge, and it is a different one from
+	// the mtime wedge MetadataFieldReplicaWrittenAt fixed.
+	//
+	// Write-ahead is what closes it, and the ORDER is the whole mechanism:
+	//
+	//   - written first, so if this write fails the run aborts before the
+	//     source's chain has moved and there is nothing to reconcile;
+	//   - written with SetDomainMetadataFields, a narrow namespaced
+	//     SetMetadata that is a DIFFERENT libvirt call from the full
+	//     redefine that fails -- demonstrably so, since replica_written_at
+	//     lands on exactly the runs whose DefineDomain does not;
+	//   - cleared by UpdateSyncMetadata, so acceptance and clearing are one
+	//     atomic define: never both set, never neither.
+	//
+	// The next run then reads a RECORD rather than inferring from divergence.
+	// If this names a checkpoint the source has and the target never
+	// accepted, that checkpoint is the chain's tip and is deleted (bitmap
+	// and all, see DeleteCheckpointIfExists) and the sync recopies from the
+	// last accepted one. Recopying from the older baseline is a superset of
+	// whatever the failed run managed to write, which matters because the
+	// copy is per-disk and concurrent: a run can commit vda's overlay and
+	// die before vdb's, so ADOPTING the newer checkpoint would declare a
+	// baseline the target only partly holds.
+	//
+	// Same care as MetadataFieldReplicaWrittenAt about where it must be
+	// stripped: UpdateSyncMetadata merges into the SOURCE's XML, so a source
+	// that was once somebody's replica must not carry a stale value onto a
+	// target. See the strip lists named in that field's comment.
+	MetadataFieldPendingCheckpoint = "pending_checkpoint"
+
 	// MetadataFieldCheckpointAt is when the checkpoint the replica's
 	// contents correspond to was created -- the START of the copy that
 	// produced them, not its end.
@@ -400,6 +443,7 @@ var ValidRoles = []string{RoleSource, RoleTarget, RolePromoted, RolePaused, Role
 var metadataFieldOrder = []string{
 	MetadataFieldReplicationRole,
 	MetadataFieldLastCheckpoint,
+	MetadataFieldPendingCheckpoint,
 	MetadataFieldLastSync,
 	MetadataFieldReplicaWrittenAt,
 	MetadataFieldFailureCount,
@@ -1160,6 +1204,11 @@ func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetR
 		MetadataFieldCheckpointAt:   strconv.FormatInt(checkpointAtUnix, 10),
 	}
 	remove := []string{
+		// A successful define means the target has accepted last_checkpoint,
+		// so nothing is pending. Cleared HERE rather than in a separate
+		// write so that accepting and clearing are one atomic
+		// DomainDefineXML: never both set, never neither.
+		MetadataFieldPendingCheckpoint,
 		MetadataFieldReplicaTargets,
 		MetadataFieldPromotedAt,
 		MetadataFieldPromotedBy,
@@ -1275,7 +1324,7 @@ func RecordReplicaTarget(mgr *Manager, sourceDomainName, targetHost, targetDomai
 		// meaningless to anyone reading the XML, and worse, it is what
 		// UpdateSyncMetadata would inherit onto a real replica.
 	}, MetadataFieldLastCheckpoint, MetadataFieldLastSync, MetadataFieldFailureCount,
-		MetadataFieldReplicaWrittenAt)
+		MetadataFieldReplicaWrittenAt, MetadataFieldPendingCheckpoint)
 }
 
 // ReadTargetFailureCount reconnects to the target and returns the

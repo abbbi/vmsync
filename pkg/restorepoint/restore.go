@@ -175,7 +175,9 @@ const (
 	FieldLastSync       = "last_sync_timestamp"
 	// Mirrors libvirtsync.MetadataFieldReplicaWrittenAt; kept in step by
 	// pkg/libvirtsync/duplicated_names_test.go.
-	FieldReplicaWrittenAt    = "replica_written_at"
+	FieldReplicaWrittenAt = "replica_written_at"
+	// Mirrors libvirtsync.MetadataFieldPendingCheckpoint; same pinning.
+	FieldPendingCheckpoint   = "pending_checkpoint"
 	FieldFailureCount        = "failure_count"
 	FieldCheckpointAt        = "checkpoint_at"
 	FieldSourceStoppedAtSync = "source_stopped_at_sync"
@@ -324,6 +326,12 @@ func MetadataPlan(s Status, r Provenance) (updates map[string]string, removals [
 	// but it needs a dev-to-file map this package does not have (it works
 	// from sidecar basenames) and belongs in its own change.
 	removals = append(removals, FieldReplicaWrittenAt)
+	// Same reasoning: a restore rewinds last_checkpoint, so a pending
+	// record from before it describes an advance that no longer relates to
+	// this replica. Left in place, the next sync would read it as an
+	// orphaned checkpoint to delete -- and the checkpoint it names may be
+	// perfectly valid.
+	removals = append(removals, FieldPendingCheckpoint)
 	return updates, removals
 }
 

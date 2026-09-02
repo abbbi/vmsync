@@ -406,11 +406,13 @@ const (
 	// Mirrors libvirtsync.MetadataFieldReplicaWrittenAt; kept in step by
 	// pkg/libvirtsync/duplicated_names_test.go.
 	FieldReplicaWrittenAt = "replica_written_at"
-	FieldFailureCount     = "failure_count"
-	FieldPromotedAt       = "promoted_at"
-	FieldPromotedBy       = "promoted_by"
-	FieldPromotedFrom     = "promoted_from"
-	FieldPromotionMode    = "promotion_mode"
+	// Mirrors libvirtsync.MetadataFieldPendingCheckpoint; same pinning.
+	FieldPendingCheckpoint = "pending_checkpoint"
+	FieldFailureCount      = "failure_count"
+	FieldPromotedAt        = "promoted_at"
+	FieldPromotedBy        = "promoted_by"
+	FieldPromotedFrom      = "promoted_from"
+	FieldPromotionMode     = "promotion_mode"
 
 	// The fence a promotion armed, written on the PROMOTED domain. See
 	// fence.go for why the decision is armed rather than inferred.
@@ -485,6 +487,7 @@ func AssessInvert(st PairState) (InvertPlan, error) {
 			FieldLastCheckpoint,
 			FieldLastSync,
 			FieldReplicaWrittenAt,
+			FieldPendingCheckpoint,
 			FieldFailureCount,
 			FieldPromotedAt, FieldPromotedBy, FieldPromotedFrom, FieldPromotionMode,
 			FieldFenceID, FieldFenceSource, FieldFenceArmedAt, FieldFenceArmedBy,
@@ -502,6 +505,7 @@ func AssessInvert(st PairState) (InvertPlan, error) {
 			FieldLastCheckpoint,
 			FieldLastSync,
 			FieldReplicaWrittenAt,
+			FieldPendingCheckpoint,
 			FieldFailureCount,
 			FieldPromotedAt, FieldPromotedBy, FieldPromotedFrom, FieldPromotionMode,
 			FieldFenceID, FieldFenceSource, FieldFenceArmedAt, FieldFenceArmedBy,
