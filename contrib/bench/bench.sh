@@ -62,28 +62,28 @@ Options:
   --only PATTERN          only run Stage 1 scenarios whose name matches
                            PATTERN (a bash glob, e.g. "compress-zstd-*")
   --stages LIST           comma-separated subset of, in stage-number order:
-                             1  matrix        6  failover
-                             2  verify        7  fence-agent
-                             3  reinit        8  verify-long
-                             4  snapshot      9  retention
-                             5  define       10  restore
-                                             11  invert
-                                             12  wedge
+                             1  matrix        8  verify-long
+                             2  verify        9  retention
+                             3  reinit       10  restore
+                             4  snapshot     11  invert
+                             5  define       12  wedge
+                             6  failover     13  checksum
+                             7  fence-agent
                            Runs in whichever order LIST gives them, not a
                            fixed canonical one.
                            (default: matrix,verify,reinit,snapshot,retention;
                            retention is last because it reinitialises the
                            target, and it skips cleanly where the target
                            filesystem cannot reflink. define, failover,
-                           fence-agent, verify-long, restore, invert and wedge
-                           are opt-in, see below)
+                           fence-agent, verify-long, restore, invert, wedge
+                           and checksum are opt-in, see below)
   --dry-run               print every vmsync command line; touch nothing
                            (no ssh/qemu-io/vmsync calls actually made)
   -h, --help              this text
 
-Stages 2, 3, 4, 9, 10 and 11 each start with their own baseline -reinit full
-sync, so none of them actually require Stage 1 (or any prior sync) to have
-run first -- each is safe to run standalone via --stages. Stage 4
+Stages 2, 3, 4, 9, 10, 11 and 13 each start with their own baseline -reinit
+full sync, so none of them actually require Stage 1 (or any prior sync) to
+have run first -- each is safe to run standalone via --stages. Stage 4
 additionally requires the SOURCE domain to be running.
 
 Stage 5 (define) is NOT included by default -- pass --stages ...,define
@@ -134,6 +134,30 @@ It has to: -invert refuses while the old source is running, since the
 inversion would make it a replication target, and asserting that refusal is
 part of what the stage tests. It shuts the source down gracefully, never
 destroys it, and starts it again whatever happened.
+
+Stage 12 (wedge) is opt-in: it makes one sync fail on purpose, then proves
+the NEXT sync still succeeds -- that a failed run leaves nothing behind
+(stale export, uncommitted overlay, half-written metadata) that would refuse
+the run after it.
+
+Stage 13 (checksum) is opt-in and covers the pre-commit integrity check --
+the digest exchange with vmsync-bridge-helper that refuses to commit an
+incremental sync's overlay when the target's bytes do not match what was
+sent. It is the one stage written mainly as a NEGATIVE test, because that
+check is ON by default and a check that silently never fires looks exactly
+like a check that works: every other stage here would keep reporting PASS
+either way. Four sub-tests: an ordinary sync must report the check ran and
+matched; a helper reporting one falsified digest must fail the run, remove
+the overlay and leave the base untouched; a helper too old to send a format
+header must be reported as version skew rather than as a corrupt replica;
+and -no-checksum must genuinely skip the check. The corruption cannot be
+applied from outside (the check reads the target back inside one vmsync
+process), so the stage installs a wrapper script under /tmp on the TARGET
+host that runs the real helper and edits its reply -- removed on the way out
+whichever way the stage ends. It is opt-in because one sub-test deliberately
+fails a sync, and because it substitutes the helper binary vmsync is pointed
+at. Stage 1 passes -no-checksum on every cell so its transport numbers are
+not carrying this check's cost; this stage is where that cost belongs.
 EOF
 }
 
