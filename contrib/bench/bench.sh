@@ -1683,6 +1683,42 @@ domain_definition_xml() {
         virsh_uri "$1" dumpxml --inactive "$2" 2>/dev/null
 }
 
+# domain_definition_body URI DOMAIN -> DOMAIN's inactive XML with the
+# <metadata> element removed.
+#
+# This is what stage 5b compares, and the reason is that the previous raw
+# comparison had become a guaranteed false failure. vmsync records
+# replica_written_at on the TARGET domain after the copy and BEFORE
+# DefineDomain runs (cmd/vmsync/main.go), deliberately -- F2 exists so that a
+# run which wrote bytes and then failed still says so, which is what keeps
+# the next run's out-of-band-write check from wedging. So on a
+# -test=failure-define run the target's metadata legitimately changes between
+# a "before" snapshot taken outside vmsync and the state DefineDomain
+# captures and correctly rolls back to. The rollback was right; the assertion
+# was comparing against a document that no longer existed.
+#
+# Removing the whole element rather than just vmsync's namespaced child: the
+# child is nested and namespace-prefixed, which is real XML surgery in awk,
+# while the whole element is two unambiguous lines. What that gives up is
+# noticing another tool's metadata disappearing across a rollback -- which
+# cannot happen here, since the harness requires a dedicated disposable
+# target that only vmsync manages. The assertion this leaves is the one 5b
+# actually cares about: the domain DEFINITION -- disks, devices, uuid, name
+# -- is what makes a promoted replica boot correctly, and vmsync rewrites its
+# own metadata on every run regardless.
+#
+# Handles both <metadata>...</metadata> and a self-closing <metadata/>, since
+# an empty element before the run and a populated one after it would
+# otherwise differ by that very line.
+domain_definition_body() {
+        domain_definition_xml "$1" "$2" | awk '
+                /^[[:space:]]*<metadata[[:space:]]*\/>[[:space:]]*$/ { next }
+                /^[[:space:]]*<metadata>[[:space:]]*$/ { skip = 1 }
+                skip != 1 { print }
+                /^[[:space:]]*<\/metadata>[[:space:]]*$/ { skip = 0 }
+        '
+}
+
 stage_define_domain_uuid_collision() {
         log "--- Stage 5a: DefineDomain uuid-collision retry ---"
 
@@ -1816,9 +1852,13 @@ stage_define_domain_rollback() {
 
         # Captured the same way DefineDomain captures it (DOMAIN_XML_INACTIVE),
         # so "restored to what it was" compares the same document vmsync
-        # actually saved and would put back.
+        # actually saved and would put back -- minus the <metadata> element,
+        # which vmsync legitimately rewrites mid-run and which therefore
+        # cannot be part of this assertion. See domain_definition_body for the
+        # full reasoning; comparing the raw dumps made this a guaranteed false
+        # failure from the moment replica_written_at was added.
         local xml_before
-        xml_before="$(domain_definition_xml "$TARGET_URI" "$TARGET_DOMAIN")"
+        xml_before="$(domain_definition_body "$TARGET_URI" "$TARGET_DOMAIN")"
         [ -n "$xml_before" ] || { warn "could not capture target domain XML before the rollback test -- aborting stage 5b"; return 1; }
 
         # The target must already exist for this to test anything: DefineDomain
@@ -1831,7 +1871,7 @@ stage_define_domain_rollback() {
         grep -q "undefine existing target domain" "$RUN_LOG" 2>/dev/null && undefine_failed=yes
 
         local xml_after
-        xml_after="$(domain_definition_xml "$TARGET_URI" "$TARGET_DOMAIN")"
+        xml_after="$(domain_definition_body "$TARGET_URI" "$TARGET_DOMAIN")"
 
         if [ "$RUN_RC" = 0 ]; then
                 warn "FAIL: -test=$VMSYNC_TEST_FAILURE_DEFINE was passed but the run still exited 0 -- the injected failure did not take effect. Is $VMSYNC_BIN old enough not to know the flag? See $RUN_LOG"
@@ -1852,7 +1892,22 @@ stage_define_domain_rollback() {
                 log "   PASS: the redefine failed, the rollback ran, and the target's definition matches what it was before"
                 results_row "$CSV" define-rollback result 0 "" "" "" "" "" "PASS rollback restored prior definition"
         else
-                warn "FAIL: the rollback ran but the target's definition differs from what it was before -- it did not fully restore it. Diff the two dumps by hand; this is the failure mode that matters, because a replica defined from a half-restored document is one that boots wrong on the day it is promoted (see $RUN_LOG)"
+                # Save both documents and show the difference rather than
+                # telling the operator to "diff the two dumps by hand" -- there
+                # was nothing on disk to diff, so that instruction cost a whole
+                # extra run to act on. Whatever survives the metadata strip is
+                # a genuine finding and worth reading immediately.
+                local before_file="$RUN_DIR/logs/define-rollback.xml-before"
+                local after_file="$RUN_DIR/logs/define-rollback.xml-after"
+                printf '%s\n' "$xml_before" >"$before_file"
+                printf '%s\n' "$xml_after" >"$after_file"
+                warn "FAIL: the rollback ran but the target's definition differs from what it was before -- it did not fully restore it. This is the failure mode that matters, because a replica defined from a half-restored document is one that boots wrong on the day it is promoted (see $RUN_LOG)"
+                if command -v diff >/dev/null 2>&1; then
+                        warn "the difference (vmsync's own <metadata> already excluded), before -> after:"
+                        diff -u "$before_file" "$after_file" | head -40 >&2 || true
+                else
+                        warn "dumps saved for comparison: $before_file and $after_file"
+                fi
                 results_row "$CSV" define-rollback result 1 "" "" "" "" "" "FAIL target definition differs from before the run"
         fi
 
