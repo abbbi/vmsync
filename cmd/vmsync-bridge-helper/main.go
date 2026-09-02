@@ -1,5 +1,5 @@
 /*
-	Copyright (C) 2026  Michael Ablassmeier <abi@grinser.de>
+	Copyright (C) 2026  Orsiris de Jong <ozy@netpower.fr>
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -15,31 +15,47 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// vmsync-bridge-helper is vmsync's remote-side NBD bridge process. It is
-// started once (see pkg/nbdbridge/command.go), listens on -listen, and for
-// each accepted connection dials the real, plaintext NBD endpoint (-connect)
-// and relays bytes between the two, optionally compressing and/or buffering
-// the wire-facing side natively via pkg/streamrelay -- replacing what used to
-// be an external CLI shell pipe, which was proven unable to flush data
-// through a long-lived, synchronous, small-message connection like NBD's.
+// vmsync-bridge-helper is vmsync's remote-side agent on the target host. It
+// has two entirely separate modes.
 //
-// This binary must be deployed to any target host --compress/--netbuffer
-// will run against by the user themselves (e.g. via scp or configuration
-// management) -- vmsync does not upload it. See -bridge-helper-path in
-// `vmsync`'s own flags.
+// The bridge relay (the default) is a long-lived process, started once (see
+// pkg/nbdbridge/command.go), listening on -listen; for each accepted
+// connection it dials the real, plaintext NBD endpoint (-connect) and relays
+// bytes between the two, optionally compressing and/or buffering the
+// wire-facing side natively via pkg/streamrelay -- replacing what used to be
+// an external CLI shell pipe, which was proven unable to flush data through
+// a long-lived, synchronous, small-message connection like NBD's.
+//
+// The digest pass (-checksum) is a one-shot command, run over SSH and gone:
+// it reads a digest request on stdin, hashes the ranges it names off a local
+// qemu-nbd export, and writes a digest response on stdout. It never listens
+// and shares no state with the relay. This is the target half of vmsync's
+// pre-commit integrity check -- computing the digests HERE, on the host that
+// already holds the bytes, is what keeps the check affordable: a few bytes
+// per megabyte cross the network instead of the megabyte. See checksum.go.
+//
+// This binary must be deployed to any target host by the user themselves
+// (e.g. via scp or configuration management) -- vmsync does not upload it.
+// See -bridge-helper-path in `vmsync`'s own flags. It is required for
+// --compress/--netbuffer, and because those are the only features that have
+// ever required it, vmsync treats one of them being in use as its only
+// evidence that this binary is present: without them the integrity check is
+// skipped rather than attempted and failed.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net"
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"vmsync/pkg/netbuffer"
-	"vmsync/pkg/version"
 	"vmsync/pkg/streamrelay"
+	"vmsync/pkg/version"
 )
 
 // optionalValueFlag implements flag.Value (plus the IsBoolFlag optimization)
@@ -133,6 +149,13 @@ func main() {
 	flag.Var(&compressArg, "compress", "Same syntax as vmsync")
 	level := flag.String("compress-level", "3", "Same syntax as vmsync")
 	flag.Var(&netBufferArg, "netbuffer", "Same syntax as vmsync")
+	// Checksum mode. One-shot and unrelated to the relay: it reads a range
+	// plan on stdin, hashes those ranges off a local qemu-nbd export, and
+	// prints one digest line per block. See checksum.go.
+	checksumMode := flag.Bool("checksum", false, "Run one digest pass instead of the bridge relay: read a digest request on stdin, hash the ranges it names off -nbd/-export, write a digest response on stdout. Requires -nbd and -export; -listen/-connect are not used. The digest algorithm and block size come from the request itself, so there is nothing to configure here and nothing that can disagree with vmsync")
+	checksumNBD := flag.String("nbd", "", "With -checksum: host:port of the qemu-nbd export to hash. Normally a loopback address, since the point of computing digests here is that the bytes are already on this host")
+	checksumExport := flag.String("export", "", "With -checksum: NBD export name to ask for. Required, and not merely for symmetry -- asking by name is what makes a stale export from an earlier run fail the handshake instead of being hashed as if it were this disk")
+	checksumTimeout := flag.Duration("nbd-timeout", time.Minute, "With -checksum: deadline for each individual NBD socket operation. Not a deadline for the whole pass, which legitimately takes many round trips on a large disk")
 	showVersion := flag.Bool("v", false, "Show version and exit")
 	showVersionLong := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
@@ -152,6 +175,35 @@ func main() {
 	if flag.NArg() > 0 {
 		fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: unexpected extra argument(s) %v -- if you meant to pass a value to -compress or -netbuffer, use -compress=value / -netbuffer=value (with an \"=\"), not a space\n", flag.Args())
 		os.Exit(2)
+	}
+
+	if *checksumMode {
+		// Refuse the mixed invocation rather than quietly ignoring the
+		// relay flags. A caller that passed -listen alongside -checksum has
+		// a wrong idea of what this process will do, and silently doing the
+		// other thing is how that stays undiscovered.
+		if *listenAddr != "" || *connectAddr != "" {
+			fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -checksum runs one checksum pass and never relays, so -listen/-connect must not be given with it")
+			os.Exit(2)
+		}
+		if *checksumNBD == "" {
+			fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -checksum requires -nbd")
+			os.Exit(2)
+		}
+		if *checksumExport == "" {
+			fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -checksum requires -export")
+			os.Exit(2)
+		}
+		cfg := checksumConfig{
+			NBDAddr: *checksumNBD,
+			Export:  *checksumExport,
+			Timeout: *checksumTimeout,
+		}
+		if err := runChecksum(context.Background(), cfg, os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	if *listenAddr == "" {

@@ -1,4 +1,5 @@
 /*
+	Copyright (C) 2026  Orsiris de Jong <ozy@netpower.fr>
 	Copyright (C) 2026  Michael Ablassmeier <abi@grinser.de>
 
 This program is free software: you can redistribute it and/or modify
@@ -18,6 +19,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -35,6 +37,7 @@ import (
 	"syscall"
 	"time"
 
+	"vmsync/pkg/blockdigest"
 	"vmsync/pkg/disk"
 	"vmsync/pkg/failover"
 	"vmsync/pkg/libvirtsync"
@@ -317,6 +320,26 @@ type syncConfig struct {
 	IgnoreExternalSnapshot bool
 	IODepth                int
 
+	// NoChecksum disables the pre-commit integrity check, which is ON by
+	// default -- hence the negative name. Phrased as an opt-OUT because the
+	// check is what makes a successful run mean "these bytes are on the
+	// target" rather than "the writes were issued and nothing complained",
+	// and a default nobody has to know about is the only kind that protects
+	// the estate that never reads the flag list.
+	//
+	// Not the whole decision on its own: the check also needs a matching
+	// vmsync-bridge-helper on the target, and is skipped with a warning when
+	// there isn't one -- a missing helper must not break a sync that never
+	// asked to bridge. See checksumEnabled in run(), the single place that
+	// resolves it.
+	//
+	// Deliberately a bool rather than -checksum=<algo>. The digest algorithm
+	// is a wire-compatibility property of a matched vmsync/vmsync-bridge-helper
+	// pair (see pkg/blockdigest), not a preference: exposing it would invite
+	// tuning a value whose only requirement is that both sides agree, and
+	// would multiply the bench matrix by an axis nobody needs.
+	NoChecksum bool
+
 	Compress         string
 	CompressLevel    string
 	NetBuffer        string
@@ -401,6 +424,7 @@ func main() {
 	flag.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/local/bin/vmsync-bridge-helper", "Remote path to the vmsync-bridge-helper binary. Defaults to /usr/local/bin")
 	flag.BoolVar(&cfg.UseSSH, "use-ssh", false, "When --compress/--netbuffer is set, route the bridged NBD traffic through the existing SSH connection as an encrypted tunnel")
 	flag.IntVar(&cfg.IODepth, "io-depth", 8, "Number of NBD read/write pairs to keep in flight simultaneously during the disk copy, defaults to 8")
+	flag.BoolVar(&cfg.NoChecksum, "no-checksum", false, "Disable the pre-commit integrity check, which is ON by default. Normally every chunk read from the source is hashed as it passes, vmsync-bridge-helper hashes the same ranges back off the target, and an incremental sync's overlay is removed instead of committed if they disagree -- so a run that succeeds means the bytes are on the target, not merely that the writes were issued. The digests cost no extra I/O on either side and only a few bytes per megabyte on the wire. The only requirement is a matching vmsync-bridge-helper binary on the target (same binary and -bridge-helper-path as -compress/-netbuffer use, but no compression, buffering or bridge port is involved -- it is run as a one-shot command). If it is absent or a different version, the check is skipped with a warning rather than failing the sync; pass this flag to state that intent explicitly and silence the warning")
 	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write sync metrics to this path in Prometheus textfile-collector format. Name should be something like /var/lib/node_exporter/textfile_collector/vmsync_[vmname].prom")
 	flag.BoolVar(&cfg.IgnoreExternalSnapshot, "ignore-external-snapshot", false, "If the source domain currently has any external disk snapshot, skip this run entirely")
 	flag.StringVar(&cfg.Verify, "verify", "", "After syncing, compare every disk on the target against the same frozen source snapshot the copy read from. Accepts fast|full|qemu-img. All three answer the same question and none is confused by a running guest; they differ in cost and independence. \"fast\" stops at the first differing range -- the right choice for a scheduled run. \"full\" scans the whole image and reports how many ranges and bytes differ, which is what tells a bad cluster apart from a bad copy path. \"qemu-img\" runs qemu-img compare instead, an INDEPENDENT implementation, and is the one to reach for when another mode reports a mismatch and you need to know whether to believe it; it is also the only mode that suspends the source, which it does to keep the source snapshot's scratch space empty for the duration, not because the comparison needs it")
@@ -1127,21 +1151,53 @@ func listeningPorts(ctx context.Context, remote bool, client *remotessh.Client) 
 	return portalloc.ParseListening(string(out)), nil
 }
 
+// formatRemoteStderr renders a remote command's stderr for appending to an
+// error message, or "" when there was none.
+//
+// Its own function so that the empty case is handled in one place: a bare
+// ": " with nothing after it, on the many runs where the remote command says
+// nothing on stderr, reads as a truncated message and invites a hunt for the
+// missing half.
+func formatRemoteStderr(stderr string) string {
+	if strings.TrimSpace(stderr) == "" {
+		return ""
+	}
+	return " (remote stderr: " + strings.TrimSpace(stderr) + ")"
+}
+
 // targetPortsNeeded returns how many consecutive ports a run occupies on
 // the TARGET host, given its disk count and which optional stages are on.
 //
-// The layout is four contiguous blocks of N, each present or not, but
+// The layout is five contiguous blocks of N, each present or not, but
 // always at the same offset -- copyAndCommit puts the qemu-nbd exports at
 // [T, T+N) and their bridges at [T+N, T+2N); runVerify puts the read-only
-// verify exports at [T+2N, T+3N) and their bridges at [T+3N, T+4N). The
-// verify block sits at +2N whether or not bridging is on, so verification
-// alone still reserves through 3N with the second block left idle. That is
-// deliberate in the existing code (it keeps the verify export's port
-// independent of the write export's, which has just been killed and may not
-// have released yet), and this function must mirror it exactly or a run
-// will bind outside the range it reserved.
-func targetPortsNeeded(disks int, bridging, verifying bool) int {
+// verify exports at [T+2N, T+3N) and their bridges at [T+3N, T+4N); and the
+// pre-commit checksum check puts its own read-only export at [T+4N, T+5N).
+// Each block sits at its fixed offset whether or not the ones before it are
+// in use, so verification alone still reserves through 3N with the second
+// block left idle. That is deliberate in the existing code (it keeps the
+// verify export's port independent of the write export's, which has just
+// been killed and may not have released yet), and this function must mirror
+// it exactly or a run will bind outside the range it reserved.
+//
+// The checksum block is APPENDED at +4N rather than inserted before the
+// verify blocks, and that ordering is not cosmetic: renumbering the existing
+// blocks would move the verify export's port out from under any operator who
+// has already reserved or firewalled a range.
+//
+// It needs a block of its own for exactly the reason the verify block does
+// -- it starts a fresh read-only export moments after the write export on
+// the same disk was killed, and reusing that port races its release. It
+// needs no bridge block: the exchange is a few bytes per megabyte carried
+// over the existing SSH command channel, not an NBD stream, so there is
+// nothing for a bridge to compress.
+func targetPortsNeeded(disks int, bridging, verifying, checksumming bool) int {
 	switch {
+	case checksumming:
+		// The highest block in use decides the span, and the checksum block
+		// is the highest there is; the blocks below it are reserved whether
+		// or not their stage runs.
+		return 5 * disks
 	case verifying && bridging:
 		return 4 * disks
 	case verifying:
@@ -1744,6 +1800,7 @@ func run(cfg syncConfig) (runErr error) {
 	if err := nbdbridge.CheckLocal(bridgeCfg); err != nil {
 		return err
 	}
+
 	if bridgeCfg.Enabled() {
 		if util.UriUsesSSH(cfg.SourceURI) && cfg.SourceNBDHost != "" {
 			if uriHost := util.HostFromURIOrLocal(cfg.SourceURI); cfg.SourceNBDHost != uriHost {
@@ -2520,6 +2577,53 @@ func run(cfg syncConfig) (runErr error) {
 	sshClientMu.Unlock()
 	defer targetSSHClient.Close()
 
+	// checksumEnabled is THE decision about the pre-commit integrity check
+	// for this run, resolved once, here.
+	//
+	// Resolved in one place rather than re-derived at each use, and that is
+	// not tidiness: the port layout reserves a block for this check, and the
+	// copy and the check itself each consult it. Three copies of a predicate
+	// that must agree is precisely how a run ends up binding outside the
+	// range it reserved -- the hazard targetPortsNeeded's own comment exists
+	// to warn about. It sits here because this is the earliest point where
+	// both things it depends on exist: the flag, and an SSH connection to
+	// the target to ask about the helper.
+	//
+	// Note what it does NOT depend on: -compress/-netbuffer. The check runs
+	// vmsync-bridge-helper as a ONE-SHOT command over SSH, so it needs no
+	// relay running, no bridge port and no compression -- only the binary
+	// present at -bridge-helper-path. Tying it to bridging would have denied
+	// the check to every estate that deploys the helper but syncs over a
+	// fast local link, purely because bridging is where that binary was
+	// historically needed. Asking the target directly costs two cheap SSH
+	// commands per run and answers the actual question.
+	checksumEnabled := false
+	switch {
+	case cfg.NoChecksum:
+		trace.Info("checksum: pre-commit integrity check disabled by -no-checksum")
+	case bridgeCfg.Enabled():
+		// nbdbridge.CheckRemote below hard-fails on a helper that is missing
+		// or version-mismatched, so on a bridged run there is nothing to
+		// probe for: either the helper is good or the run does not proceed.
+		// Skipping the probe here avoids asking the same two questions twice.
+		checksumEnabled = true
+		trace.Info("checksum: pre-commit integrity check enabled", "algo", blockdigest.DefaultAlgo, "helper", cfg.BridgeHelperPath)
+	default:
+		st := nbdbridge.ProbeHelper(ctx, targetSSHClient, bridgeCfg, targetSSHConfig.Address)
+		if st.Usable {
+			checksumEnabled = true
+			trace.Info("checksum: pre-commit integrity check enabled", "algo", blockdigest.DefaultAlgo, "helper", cfg.BridgeHelperPath, "helper_version", st.Version)
+		} else {
+			// Not an error: nothing about this run asked for the helper, so a
+			// missing or mismatched one means no check rather than no sync.
+			// Said out loud every time, because a silently absent integrity
+			// check is worse than none -- an operator who believes it ran
+			// would trust a replica it never looked at.
+			trace.Warning("checksum: pre-commit integrity check SKIPPED -- vmsync-bridge-helper "+st.Reason,
+				"remedy", "deploy a matching vmsync-bridge-helper on the target to enable it, or pass -no-checksum to state that intent and silence this")
+		}
+	}
+
 	// Take the TARGET-side run lock before anything touches the target.
 	//
 	// The lock in main() is on the SOURCE host, keyed by the source domain,
@@ -2602,7 +2706,7 @@ func run(cfg syncConfig) (runErr error) {
 	{
 		bridging := bridgeCfg.Enabled()
 		srcNeed := sourcePortsNeeded(bridging)
-		tgtNeed := targetPortsNeeded(len(qcowDisks), bridging, cfg.Verify != "")
+		tgtNeed := targetPortsNeeded(len(qcowDisks), bridging, cfg.Verify != "", checksumEnabled)
 		// Skewed per target domain so two syncs of different vms into the
 		// same target host tend to land on different blocks; see
 		// portalloc.SelectBase.
@@ -3246,6 +3350,148 @@ func run(cfg syncConfig) (runErr error) {
 		return nil
 	}
 
+	// verifyWrittenDigests is the pre-commit integrity check: it compares
+	// the digests the copy collected as it read the source against digests
+	// the TARGET computes for itself, and returns an error if they differ.
+	//
+	// The asymmetry is what makes this affordable. The source digests were
+	// free -- CopyExtentsTCP hashed bytes already sitting in its buffers, no
+	// extra I/O. The target digests are computed on the target host by
+	// vmsync-bridge-helper, so what crosses the network is one short line
+	// per chunk rather than the chunk: about 41 KB for a 10 GiB disk, where
+	// pulling the data back to hash it here would have roughly doubled a
+	// full sync.
+	//
+	// Three outcomes, deliberately distinct, because they call for opposite
+	// responses (the same distinction F3 drew for -verify):
+	//
+	//   - ErrFormatMismatch: vmsync and the helper are different versions,
+	//     or the helper is not deployed. A deployment problem. It must never
+	//     read as a corrupt replica, which is exactly what it would if the
+	//     exchange were bare digests -- hence the header.
+	//   - ErrPlanMismatch: the helper answered about different blocks than
+	//     it was asked about. A bug or a truncated transfer, not evidence.
+	//   - a non-empty mismatch list: the bytes on the target differ from the
+	//     bytes sent. The only one that condemns the replica.
+	verifyWrittenDigests := func(i int, d disk.QcowDisk, imagePath string, incremental bool, sourceDigests []blockdigest.Block) error {
+		if len(sourceDigests) == 0 {
+			// Nothing was written, so there is nothing to check and no
+			// reason to start an export. An incremental run that found no
+			// dirty extents lands here routinely.
+			trace.Info("checksum: nothing written, skipping the pre-commit check", "disk", d.TargetDev)
+			return nil
+		}
+
+		// The fifth contiguous block, [TargetNBDPort+4N, +5N). Its own
+		// block for the same reason the verify block has one: this starts a
+		// fresh export moments after the write export on this very disk was
+		// killed, and reusing that port races its release.
+		port := cfg.TargetNBDPort + 4*len(qcowDisks) + i
+		pidFile := path.Join("/tmp", fmt.Sprintf("vmsync-checksum-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
+		exportName := targetExportName(cfg.TargetDomain, d.TargetDev)
+
+		// --cache=none is the point of re-exporting at all rather than
+		// reading back through the still-open write export. Without it the
+		// read is served from qemu's block-layer cache and the host page
+		// cache, so it would confirm what qemu believes it wrote and prove
+		// nothing about what reached storage -- and "corruption after the
+		// write" is precisely the gap nothing else in vmsync covers.
+		// O_DIRECT on a cold process is what makes the read come off the
+		// device. Deliberately NOT set on the write export: paying O_DIRECT
+		// on every byte copied, to benefit a check that reads back only the
+		// delta, is the wrong trade.
+		startCmd := "qemu-nbd --fork --persistent --read-only --cache=none --format=qcow2 --bind " +
+			util.ShQuote(cfg.TargetNBDBind) +
+			" --port " +
+			fmt.Sprintf("%d", port) +
+			" --export-name " +
+			util.ShQuote(exportName) +
+			" --pid-file " +
+			util.ShQuote(pidFile) +
+			" " +
+			util.ShQuote(imagePath)
+		if err := runTargetCommand(startCmd, fmt.Sprintf("start read-only checksum export for %s", imagePath)); err != nil {
+			return err
+		}
+		// Same rm -f-after-kill reasoning as the other stop strings: this is
+		// replayable from the interrupt-cleanup path after the inline stop
+		// below has already run it, and without removing the pidfile that
+		// replay could SIGKILL whatever unrelated process the OS has since
+		// reused the PID for.
+		stopCmd := "kill -9 $(cat " + util.ShQuote(pidFile) + ") || true; rm -f " + util.ShQuote(pidFile)
+		stopMu.Lock()
+		targetStopCommands = append(targetStopCommands, stopCmd)
+		stopMu.Unlock()
+		defer func() {
+			// context.Background(), never ctx: reportWorkerErr cancels ctx
+			// before pushing an error, so on a failing run ctx is already
+			// dead by the time this runs and the export would be left
+			// holding the image open -- blocking the commit and, on a
+			// -reinit, the rm of the disk file.
+			if _, err := targetSSHClient.Run(context.Background(), stopCmd); err != nil {
+				trace.Warning("checksum: could not stop the read-only checksum export", "disk", d.TargetDev, "error", err)
+			}
+		}()
+
+		header := blockdigest.DefaultHeader(blockdigest.MaxRangeLength(sourceDigests))
+		var request bytes.Buffer
+		if err := blockdigest.WriteRequest(&request, header, blockdigest.RangesFromBlocks(sourceDigests)); err != nil {
+			return fmt.Errorf("checksum: build request for %s: %w", d.TargetDev, err)
+		}
+
+		// The helper reads the export over LOOPBACK on the target host --
+		// 127.0.0.1, not cfg.TargetNBDBind, which may be a wildcard and in
+		// any case names where the export listens rather than how to reach
+		// it from the same machine. No bridge is involved: the exchange is
+		// a few bytes per megabyte over this SSH command channel, so there
+		// is nothing for one to compress.
+		helperCmd := util.ShQuote(cfg.BridgeHelperPath) +
+			" -checksum -nbd " + util.ShQuote(fmt.Sprintf("127.0.0.1:%d", port)) +
+			" -export " + util.ShQuote(exportName)
+		trace.Info("checksum: asking the target to hash what this run wrote",
+			"disk", d.TargetDev, "image", imagePath, "blocks", len(sourceDigests),
+			"bytes", blockdigest.TotalBytes(sourceDigests), "algo", header.Algo)
+
+		stdout, stderr, err := targetSSHClient.RunWithInput(ctx, helperCmd, request.Bytes())
+		if err != nil {
+			return fmt.Errorf("checksum: run %s on the target for %s: %w%s -- pass -no-checksum to sync without the integrity check if the helper is not deployed there yet",
+				cfg.BridgeHelperPath, d.TargetDev, err, formatRemoteStderr(stderr))
+		}
+
+		respHeader, targetDigests, err := blockdigest.ReadResponse(strings.NewReader(stdout))
+		if err != nil {
+			return fmt.Errorf("checksum: read the target's digests for %s: %w%s", d.TargetDev, err, formatRemoteStderr(stderr))
+		}
+		if err := respHeader.Check(header); err != nil {
+			return fmt.Errorf("checksum: %s: %w", d.TargetDev, err)
+		}
+
+		mismatches, err := blockdigest.Compare(sourceDigests, targetDigests)
+		if err != nil {
+			return fmt.Errorf("checksum: %s: %w", d.TargetDev, err)
+		}
+		if len(mismatches) > 0 {
+			// What the operator can conclude differs by mode, so say which.
+			// An incremental run's base is still intact and the overlay is
+			// simply never committed. A full sync wrote the base directly,
+			// so there is nothing to roll back -- the run fails, the replica
+			// is not marked synced, and it needs another -reinit.
+			remedy := "the replica's base image is untouched -- this run's overlay is removed instead of committed, so the replica still holds its last good contents"
+			if !incremental {
+				remedy = "this was a full sync writing the base directly, so there is no overlay to discard: the replica is NOT trustworthy and needs another -reinit"
+			}
+			trace.Error("checksum: the target's contents differ from what was sent",
+				"disk", d.TargetDev, "image", imagePath,
+				"detail", blockdigest.SummarizeMismatches(mismatches))
+			return fmt.Errorf("checksum: %s: the bytes on the target do not match the bytes sent: %s (%s)",
+				d.TargetDev, blockdigest.SummarizeMismatches(mismatches), remedy)
+		}
+
+		trace.Info("checksum: target contents match what was sent",
+			"disk", d.TargetDev, "blocks", len(sourceDigests), "bytes", blockdigest.TotalBytes(sourceDigests))
+		return nil
+	}
+
 	// recordDiskMetric appends one metrics.DiskMetric, exactly the
 	// computation syncDisk's own deferred metrics block always did. Its own
 	// closure rather than inline because it once had two callers: the
@@ -3350,6 +3596,51 @@ func run(cfg syncConfig) (runErr error) {
 		}
 		if err := runTargetCommand(createCmd, fmt.Sprintf("create remote qcow2 %s", targetPathInc)); err != nil {
 			return res, err
+		}
+
+		// The incremental overlay is this run's scratch space, and until it is
+		// committed it is worth exactly nothing: every byte in it is also
+		// still readable from the source. So remove it on any path out of
+		// here that is NOT a successful commit -- a failed copy, a failed
+		// export stop, a checksum mismatch, or a cancelled context.
+		//
+		// One case is deliberately exempt: a FAILED qemu-img commit. Every
+		// other failure leaves the base untouched, which is what makes the
+		// overlay worthless. A half-finished commit does not -- the base may
+		// already be partly written, and the overlay is then the only record
+		// of the delta and the only way to retry by hand. So commitAttempted
+		// is set before the commit runs, not after it succeeds: the flag
+		// means "the base is no longer known-untouched", and from that
+		// moment the overlay is evidence rather than scratch.
+		//
+		// Registered immediately after creation (not before -- there would
+		// be nothing to remove) and skipped once commitAttempted is set, so
+		// the success path keeps using the existing rm below and pays no
+		// extra SSH round trip here.
+		//
+		// Before this existed, every failing incremental left a delta-sized
+		// qcow2 behind on the target. Whether it was ever reclaimed came
+		// down to whether the checkpoint chain had advanced: the name is
+		// targetPath + "_" + bitmapForRead, so a retry against the same
+		// parent checkpoint would recreate and overwrite it, but a retry
+		// against a new one writes a different filename and orphans the old
+		// file permanently. Persistent failures therefore accumulated them.
+		//
+		// context.Background(), never ctx: reportWorkerErr cancels ctx
+		// before pushing an error, so on precisely the failing runs this
+		// exists for, ctx is already dead by the time it runs.
+		commitAttempted := false
+		if incrementalMode {
+			defer func() {
+				if commitAttempted {
+					return
+				}
+				trace.Info("Removing uncommitted temporary image", "image", targetPathInc, "disk", d.TargetDev)
+				if out, err := targetSSHClient.Run(context.Background(), "rm -f "+util.ShQuote(targetPathInc)); err != nil {
+					trace.Warning("could not remove the uncommitted temporary image; it holds this run's delta and nothing else, so it is safe to delete by hand",
+						"image", targetPathInc, "disk", d.TargetDev, "error", err, "output", out)
+				}
+			}()
 		}
 
 		// Give the base image an owner qemu can actually open.
@@ -3470,7 +3761,8 @@ func run(cfg syncConfig) (runErr error) {
 		}
 
 		trace.Info("copy extents to remote target", "extents", len(extents), "path", targetPath, "disk_size", res.diskSize)
-		res.writtenBytes, err = nbdsync.CopyExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, effectiveTargetHost, effectiveTargetPort, exportName, extents, cfg.IODepth)
+		var sourceDigests []blockdigest.Block
+		res.writtenBytes, sourceDigests, err = nbdsync.CopyExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, effectiveTargetHost, effectiveTargetPort, exportName, extents, cfg.IODepth, checksumEnabled)
 		if err != nil {
 			return res, err
 		}
@@ -3501,11 +3793,39 @@ func run(cfg syncConfig) (runErr error) {
 			return res, err
 		}
 
+		// The pre-commit integrity check. Placed here, after the write
+		// export is stopped and before the commit, because that is the one
+		// window where both halves of what it needs are true: the bytes are
+		// on the target's storage, and in incremental mode the replica's
+		// BASE is still untouched -- so a mismatch costs an overlay rather
+		// than a replica.
+		//
+		// The image checked is the overlay on an incremental run and the
+		// base itself on a full one. A full sync has no overlay to discard,
+		// so a mismatch there cannot be undone; the run still fails loudly,
+		// which is the whole value -- the alternative is not knowing.
+		if checksumEnabled {
+			checkPath := targetPath
+			if incrementalMode {
+				checkPath = targetPathInc
+			}
+			if err := verifyWrittenDigests(i, d, checkPath, incrementalMode, sourceDigests); err != nil {
+				return res, err
+			}
+		}
+
 		if incrementalMode {
 			trace.Info("Committing changes to base", "image", targetPath)
 			commitCmd := "qemu-img commit -b " + util.ShQuote(targetPath) + " " + util.ShQuote(targetPathInc)
+			// Set BEFORE the commit runs, not after it succeeds. From here on
+			// the base is no longer known-untouched, so the overlay stops
+			// being disposable scratch and becomes the only record of this
+			// delta -- see the deferred cleanup where it was created. A
+			// commit that fails halfway must leave it in place for a manual
+			// retry, not have it swept up on the way out.
+			commitAttempted = true
 			if err := runTargetCommand(commitCmd, fmt.Sprintf("committing changes for %s", targetPathInc)); err != nil {
-				return res, err
+				return res, fmt.Errorf("%w -- the temporary image %s has been LEFT IN PLACE deliberately: the base may be partly committed, so that overlay is the only remaining record of this run's delta. Inspect both before removing it", err, targetPathInc)
 			}
 			trace.Info("Removing temporary", "image", targetPathInc)
 			if err := runTargetCommand("rm -f "+util.ShQuote(targetPathInc), fmt.Sprintf("removing target image %s", targetPathInc)); err != nil {

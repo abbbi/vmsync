@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package remotessh
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -320,6 +321,79 @@ func (c *Client) DialTCP(addr string) (net.Conn, error) {
 		return nil, errors.New("ssh client is not connected")
 	}
 	return c.client.Dial("tcp", addr)
+}
+
+// RunWithInput runs command with stdin fed from input, returning stdout and
+// stderr SEPARATELY.
+//
+// Both differences from Run matter, and both exist for the digest exchange
+// (see pkg/blockdigest). That exchange sends a request on stdin, which Run
+// cannot do at all; and its reply is parsed, which Run's CombinedOutput
+// would corrupt the moment the remote command wrote a single warning to
+// stderr -- the diagnostic would be interleaved into the data stream and
+// read as a malformed digest line. Keeping the two streams apart means a
+// remote warning stays diagnosable instead of becoming a parse error, and a
+// parse error genuinely means the data was wrong.
+//
+// stderr is returned rather than logged here so the caller can fold it into
+// its own error message, which is where the operator will actually look.
+func (c *Client) RunWithInput(ctx context.Context, command string, input []byte) (stdout string, stderr string, err error) {
+	if c == nil || c.client == nil {
+		return "", "", errors.New("ssh client is not connected")
+	}
+
+	type sessionResult struct {
+		session *ssh.Session
+		err     error
+	}
+	sessCh := make(chan sessionResult, 1)
+	go func() {
+		session, err := c.client.NewSession()
+		sessCh <- sessionResult{session: session, err: err}
+	}()
+
+	var session *ssh.Session
+	select {
+	case <-ctx.Done():
+		go func() {
+			if r := <-sessCh; r.session != nil {
+				r.session.Close()
+			}
+		}()
+		return "", "", fmt.Errorf("open ssh session: %w", ctx.Err())
+	case r := <-sessCh:
+		if r.err != nil {
+			return "", "", fmt.Errorf("open ssh session: %w", r.err)
+		}
+		session = r.session
+	}
+	defer session.Close()
+
+	var outBuf, errBuf bytes.Buffer
+	session.Stdout = &outBuf
+	session.Stderr = &errBuf
+	// A plain bytes.Reader rather than an explicit StdinPipe: x/crypto/ssh
+	// copies from session.Stdin and closes the remote's stdin when it is
+	// exhausted, which is exactly the EOF a one-shot command needs to stop
+	// reading. Driving a StdinPipe by hand would mean owning that close, and
+	// forgetting it deadlocks both ends.
+	session.Stdin = bytes.NewReader(input)
+
+	ch := make(chan error, 1)
+	go func() { ch <- session.Run(command) }()
+
+	select {
+	case <-ctx.Done():
+		_ = session.Close()
+		return "", "", ctx.Err()
+	case runErr := <-ch:
+		stdout = outBuf.String()
+		stderr = strings.TrimSpace(errBuf.String())
+		if runErr != nil {
+			return stdout, stderr, fmt.Errorf("ssh run command %q: %w", command, runErr)
+		}
+		return stdout, stderr, nil
+	}
 }
 
 func (c *Client) Run(ctx context.Context, command string) (string, error) {

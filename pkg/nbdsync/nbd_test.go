@@ -80,6 +80,8 @@ import (
 	"testing"
 	"time"
 
+	"vmsync/pkg/blockdigest"
+
 	nbd "libguestfs.org/libnbd"
 )
 
@@ -203,6 +205,93 @@ func mismatchesCover(mismatches []MismatchRange, byteOffset uint64) bool {
 	return false
 }
 
+// The digests CopyExtentsTCP collects must describe exactly the bytes it
+// read, verified against an independent hash of the source file rather than
+// against anything the copy itself computed.
+//
+// This is the source half of the pre-commit integrity check. If it is wrong,
+// the check condemns healthy replicas -- so it is checked against the file
+// on disk, three ways: every digest matches a hash of that range of the
+// file, the digests cover exactly the copied bytes and nothing else, and
+// they come back sorted and non-overlapping.
+func TestCopyExtentsTCPCollectsDigestsOfWhatItRead(t *testing.T) {
+	requireQemuNBD(t)
+	dir := t.TempDir()
+
+	const size = 3 * 1024 * 1024
+	srcContent := patternBytes(size)
+	srcPath := writeRawFile(t, dir, "src.raw", srcContent)
+	dstPath := writeRawFile(t, dir, "dst.raw", make([]byte, size))
+
+	srcPort := qemuNBDExport(t, srcPath)
+	dstPort := qemuNBDExport(t, dstPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Two separate dirty extents with a gap, so "covers exactly the copied
+	// bytes" is a real assertion rather than trivially the whole disk.
+	const chunk = 1024 * 1024
+	extents := []Extent{
+		{Offset: 0, Length: chunk, Dirty: true},
+		{Offset: chunk, Length: chunk, Dirty: false},
+		{Offset: 2 * chunk, Length: chunk, Dirty: true},
+	}
+	written, digests, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 4, true)
+	if err != nil {
+		t.Fatalf("CopyExtentsTCP: %v", err)
+	}
+	if written != 2*chunk {
+		t.Fatalf("wrote %d bytes, want %d", written, 2*chunk)
+	}
+	if len(digests) == 0 {
+		t.Fatal("collectDigests was set but no digests came back")
+	}
+
+	// Every digest must match an independent hash of that range of the file.
+	for i, b := range digests {
+		if b.Offset+b.Length > uint64(len(srcContent)) {
+			t.Fatalf("digest %d covers %d+%d, past the end of a %d-byte source", i, b.Offset, b.Length, len(srcContent))
+		}
+		if want := blockdigest.Sum(srcContent[b.Offset : b.Offset+b.Length]); b.Digest != want {
+			t.Errorf("digest %d (%d+%d) = %#x, want %#x from the source file itself", i, b.Offset, b.Length, b.Digest, want)
+		}
+	}
+
+	// Sorted and non-overlapping: the AIO pipeline completes chunks out of
+	// order, so this is the property that says the sort actually ran.
+	for i := 1; i < len(digests); i++ {
+		prev, cur := digests[i-1], digests[i]
+		if cur.Offset < prev.Offset {
+			t.Errorf("digests are not sorted: block %d starts at %d, after %d", i, cur.Offset, prev.Offset)
+		}
+		if cur.Offset < prev.Offset+prev.Length {
+			t.Errorf("digest %d (%d+%d) overlaps the previous (%d+%d)", i, cur.Offset, cur.Length, prev.Offset, prev.Length)
+		}
+	}
+
+	// Covering exactly the copied bytes matters in both directions: fewer
+	// would leave part of the write unchecked, more would judge bytes this
+	// run never wrote (which, against the target's flattened view, means
+	// reporting pre-existing drift as damage from this run).
+	if got := blockdigest.TotalBytes(digests); got != written {
+		t.Errorf("digests cover %d bytes but the copy wrote %d", got, written)
+	}
+	for _, b := range digests {
+		if b.Offset >= chunk && b.Offset < 2*chunk {
+			t.Errorf("digest at %d falls inside the clean extent, which was never copied", b.Offset)
+		}
+	}
+
+	// And no digests at all when it is not asked for -- the check has to be
+	// genuinely off, not merely unused.
+	if _, none, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 4, false); err != nil {
+		t.Fatalf("second copy: %v", err)
+	} else if none != nil {
+		t.Errorf("collectDigests was false but %d digests came back", len(none))
+	}
+}
+
 func TestCopyExtentsTCPRoundTrip(t *testing.T) {
 	requireQemuNBD(t)
 	dir := t.TempDir()
@@ -219,7 +308,7 @@ func TestCopyExtentsTCPRoundTrip(t *testing.T) {
 	defer cancel()
 
 	extents := []Extent{{Offset: 0, Length: uint64(size), Dirty: true}}
-	written, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 4)
+	written, _, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 4, false)
 	if err != nil {
 		t.Fatalf("CopyExtentsTCP: %v", err)
 	}
@@ -268,7 +357,7 @@ func TestCopyExtentsTCPSkipsNonDirtyExtents(t *testing.T) {
 		{Offset: 0, Length: chunkSize, Dirty: false},
 		{Offset: chunkSize, Length: chunkSize, Dirty: true},
 	}
-	written, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 4)
+	written, _, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 4, false)
 	if err != nil {
 		t.Fatalf("CopyExtentsTCP: %v", err)
 	}
@@ -330,7 +419,7 @@ func TestCopyExtentsTCPReusesSlotsAcrossManyChunks(t *testing.T) {
 	defer cancel()
 	// ioDepth=2 against 4 chunks guarantees every slot is reused at least
 	// once -- the exact path this test exists to exercise.
-	written, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 2)
+	written, _, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 2, false)
 	if err != nil {
 		t.Fatalf("CopyExtentsTCP: %v", err)
 	}
@@ -386,7 +475,7 @@ func TestCopyExtentsTCPFreesBufferOnSourceReadError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 4)
+	_, _, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 4, false)
 	if err == nil {
 		t.Fatal("CopyExtentsTCP with an out-of-bounds source read returned nil, want an error")
 	}
@@ -420,7 +509,7 @@ func TestCopyExtentsTCPFreesBufferOnTargetWriteError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 4)
+	_, _, err := CopyExtentsTCP(ctx, "127.0.0.1", srcPort, "", "127.0.0.1", dstPort, "", extents, 4, false)
 	if err == nil {
 		t.Fatal("CopyExtentsTCP writing past a smaller target's end returned nil, want an error")
 	}
@@ -952,7 +1041,7 @@ func TestWaitForTCPExportTimesOutWhenNothingListening(t *testing.T) {
 func TestCopyExtentsTCPReturnsImmediatelyOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := CopyExtentsTCP(ctx, "127.0.0.1", 1, "", "127.0.0.1", 2, "", nil, 1)
+	_, _, err := CopyExtentsTCP(ctx, "127.0.0.1", 1, "", "127.0.0.1", 2, "", nil, 1, false)
 	if err == nil {
 		t.Fatal("CopyExtentsTCP with an already-cancelled context returned a nil error")
 	}

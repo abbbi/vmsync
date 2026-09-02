@@ -19,8 +19,11 @@ package nbdbridge
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+
+	"vmsync/pkg/version"
 )
 
 func TestCheckLocalAlwaysReturnsNil(t *testing.T) {
@@ -83,5 +86,130 @@ func TestCheckRemoteEnabledWithNilClientErrorsWithoutPanicking(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "somehost") {
 		t.Errorf("CheckRemote error %q does not mention the host it was checking", err.Error())
+	}
+}
+
+// fakeRunner is a CommandRunner that answers a scripted reply per command
+// substring, which is all ProbeHelper needs -- it issues exactly two
+// commands and both are recognisable by a fragment.
+//
+// This is why ProbeHelper takes the narrow CommandRunner interface rather
+// than *remotessh.Client: the two questions it asks are pure logic over two
+// command results, and before it was extracted they were inline in
+// CheckRemote, reachable only with a real SSH server and therefore never
+// tested at all.
+type fakeRunner struct {
+	testX      string // reply to "test -x ..."
+	testXErr   error
+	version    string // reply to "... -version"
+	versionErr error
+	commands   []string
+}
+
+func (f *fakeRunner) Run(ctx context.Context, command string) (string, error) {
+	f.commands = append(f.commands, command)
+	if strings.Contains(command, "test -x") {
+		return f.testX, f.testXErr
+	}
+	return f.version, f.versionErr
+}
+
+func TestProbeHelper(t *testing.T) {
+	cfg := Config{HelperPath: "/usr/local/bin/vmsync-bridge-helper"}
+
+	t.Run("present and matching is usable", func(t *testing.T) {
+		f := &fakeRunner{version: version.Version}
+		st := ProbeHelper(context.Background(), f, cfg, "target01")
+		if !st.Usable {
+			t.Fatalf("Usable = false, reason %q", st.Reason)
+		}
+		if !st.Present {
+			t.Error("Present = false for a usable helper")
+		}
+		if st.Version != version.Version {
+			t.Errorf("Version = %q, want %q", st.Version, version.Version)
+		}
+		if st.Reason != "" {
+			t.Errorf("Reason = %q, want empty when usable", st.Reason)
+		}
+	})
+
+	t.Run("trailing whitespace on the version is tolerated", func(t *testing.T) {
+		// The helper prints with fmt.Println and the reply arrives through
+		// SSH; a stray newline must not read as a version mismatch.
+		f := &fakeRunner{version: "  " + version.Version + "\n"}
+		if st := ProbeHelper(context.Background(), f, cfg, "target01"); !st.Usable {
+			t.Errorf("Usable = false for a whitespace-padded version: %q", st.Reason)
+		}
+	})
+
+	t.Run("missing binary is not present and names the path and host", func(t *testing.T) {
+		f := &fakeRunner{testXErr: errors.New("exit status 1")}
+		st := ProbeHelper(context.Background(), f, cfg, "target01")
+		if st.Present || st.Usable {
+			t.Fatalf("Present=%v Usable=%v for a missing binary", st.Present, st.Usable)
+		}
+		if !strings.Contains(st.Reason, cfg.HelperPath) || !strings.Contains(st.Reason, "target01") {
+			t.Errorf("Reason = %q, want it to name the path and the host", st.Reason)
+		}
+		// Must not have bothered asking for a version.
+		if len(f.commands) != 1 {
+			t.Errorf("issued %d commands, want 1 -- no version query after test -x failed: %v", len(f.commands), f.commands)
+		}
+	})
+
+	t.Run("version mismatch is present but not usable", func(t *testing.T) {
+		f := &fakeRunner{version: "0.1-ancient"}
+		st := ProbeHelper(context.Background(), f, cfg, "target01")
+		if !st.Present {
+			t.Error("Present = false for a binary that exists but is the wrong version")
+		}
+		if st.Usable {
+			t.Fatal("Usable = true for a version mismatch")
+		}
+		// Both versions belong in the message: the operator has to know
+		// which of the two deployments to move.
+		if !strings.Contains(st.Reason, "0.1-ancient") || !strings.Contains(st.Reason, version.Version) {
+			t.Errorf("Reason = %q, want both versions named", st.Reason)
+		}
+	})
+
+	t.Run("unaskable version is present but not usable", func(t *testing.T) {
+		f := &fakeRunner{versionErr: errors.New("exit status 2")}
+		st := ProbeHelper(context.Background(), f, cfg, "target01")
+		if !st.Present {
+			t.Error("Present = false although test -x succeeded")
+		}
+		if st.Usable {
+			t.Fatal("Usable = true although the version could not be determined")
+		}
+		if st.Reason == "" {
+			t.Error("Reason is empty for an unusable helper")
+		}
+	})
+
+	t.Run("probes the configured path, quoted", func(t *testing.T) {
+		spaced := Config{HelperPath: "/opt/vm sync/vmsync-bridge-helper"}
+		f := &fakeRunner{version: version.Version}
+		ProbeHelper(context.Background(), f, spaced, "target01")
+		if len(f.commands) != 2 {
+			t.Fatalf("issued %d commands, want 2: %v", len(f.commands), f.commands)
+		}
+		for _, c := range f.commands {
+			// Unquoted, a path with a space would split into two arguments
+			// and the probe would test the wrong thing.
+			if !strings.Contains(c, "'/opt/vm sync/vmsync-bridge-helper'") {
+				t.Errorf("command %q does not contain the shell-quoted helper path", c)
+			}
+		}
+	})
+}
+
+// CheckRemote must stay a no-op when bridging is off, even now that the
+// integrity check probes the same helper independently: an unbridged run
+// that cannot use the helper is not a failed run.
+func TestCheckRemoteStillNoOpWhenBridgingDisabled(t *testing.T) {
+	if err := CheckRemote(context.Background(), nil, Config{HelperPath: "/nonexistent"}, "target01"); err != nil {
+		t.Errorf("CheckRemote with bridging disabled = %v, want nil (and it must not dereference the nil client)", err)
 	}
 }

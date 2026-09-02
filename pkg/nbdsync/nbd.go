@@ -23,9 +23,11 @@ import (
 	"errors"
 	"fmt"
 
+	"sort"
 	"strconv"
 	"time"
 
+	"vmsync/pkg/blockdigest"
 	"vmsync/pkg/trace"
 
 	nbd "libguestfs.org/libnbd"
@@ -526,29 +528,51 @@ func negotiateBufferSize(a, b *nbd.Libnbd, roleA, roleB string) uint64 {
 // report partial progress (e.g. in metrics) on a failed sync. ioDepth is the
 // number of read/write pairs kept in flight simultaneously (see the
 // pipelining comment below); values less than 1 are clamped to 1.
-func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport string, dstHost string, dstPort int, dstExport string, extents []Extent, ioDepth int) (writtenBytes uint64, err error) {
+//
+// When collectDigests is set, every chunk read from the source is also
+// hashed on its way past, and the digests come back as the second return
+// value for the pre-commit integrity check to compare against the target.
+// The cost is one pass of hashing over bytes already sitting in a buffer --
+// no extra I/O, and at XXH64's ~13 GiB/s an order of magnitude clear of any
+// link this runs over.
+//
+// The digest units are the copy's OWN chunks, deliberately, rather than a
+// fixed grid. Chunks are buffer_size-capped within each extent and complete
+// out of order under the pipeline below, so neither their boundaries nor
+// their ordering line up with an absolute block grid. Re-chunking the copy
+// onto such a grid would mean up to 32x more NBD requests (buffer_size is
+// commonly 32 MiB against a 1 MiB grid) for no benefit, because the caller
+// sends the target the explicit block list that comes back from here. With
+// the boundaries stated rather than recomputed, there is no plan for the two
+// sides to disagree about -- which is a stronger guarantee than both of them
+// deriving a matching one, and it costs only a slightly longer request.
+//
+// Out-of-order completion is fine for the same reason: each chunk is hashed
+// whole and independently, so nothing depends on the order they arrive in.
+// The result is sorted by offset before returning.
+func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport string, dstHost string, dstPort int, dstExport string, extents []Extent, ioDepth int, collectDigests bool) (writtenBytes uint64, digests []blockdigest.Block, err error) {
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	src, err := nbd.Create()
 	if err != nil {
-		return 0, fmt.Errorf("create source nbd handle: %w", err)
+		return 0, nil, fmt.Errorf("create source nbd handle: %w", err)
 	}
 	defer src.Close()
 
 	dst, err := nbd.Create()
 	if err != nil {
-		return 0, fmt.Errorf("create target nbd handle: %w", err)
+		return 0, nil, fmt.Errorf("create target nbd handle: %w", err)
 	}
 	defer dst.Close()
 
 	if srcExport != "" {
 		if err := src.SetExportName(srcExport); err != nil {
-			return 0, fmt.Errorf("set source export name %s: %w", srcExport, err)
+			return 0, nil, fmt.Errorf("set source export name %s: %w", srcExport, err)
 		}
 	}
 	if err := src.ConnectTcp(srcHost, strconv.Itoa(srcPort)); err != nil {
-		return 0, fmt.Errorf("connect source nbd tcp %s:%d: %w", srcHost, srcPort, err)
+		return 0, nil, fmt.Errorf("connect source nbd tcp %s:%d: %w", srcHost, srcPort, err)
 	}
 
 	// The target export is NAMED, exactly like the source one above, and
@@ -561,11 +585,11 @@ func CopyExtentsTCP(ctx context.Context, srcHost string, srcPort int, srcExport 
 	// handshake itself refuses.
 	if dstExport != "" {
 		if err := dst.SetExportName(dstExport); err != nil {
-			return 0, fmt.Errorf("set target export name %s: %w", dstExport, err)
+			return 0, nil, fmt.Errorf("set target export name %s: %w", dstExport, err)
 		}
 	}
 	if err := dst.ConnectTcp(dstHost, strconv.Itoa(dstPort)); err != nil {
-		return 0, fmt.Errorf("connect target nbd tcp %s:%d (export %q): %w", dstHost, dstPort, dstExport, err)
+		return 0, nil, fmt.Errorf("connect target nbd tcp %s:%d (export %q): %w", dstHost, dstPort, dstExport, err)
 	}
 
 	buffer_size := negotiateBufferSize(src, dst, "src", "dst")
@@ -751,6 +775,27 @@ copyLoop:
 				copyErr = fmt.Errorf("source nbd pread offset=%d len=%d: errno %d", slots[i].offset, slots[i].length, slots[i].opErr)
 				break copyLoop
 			}
+			// Hash the chunk here, in the window where the read is
+			// confirmed complete and the write has not yet been issued.
+			// That window is the only safe one: before it the buffer's
+			// contents are undefined, and from AioPwrite onward libnbd owns
+			// the buffer again until its own completion, so reading it then
+			// would race whatever libnbd is doing with that memory.
+			//
+			// One chunk, one digest, hashed whole -- so it does not matter
+			// that slots complete out of order.
+			//
+			// Slice() rather than any copying accessor, matching compareTCP's
+			// own use below: it aliases libnbd's C buffer, so hashing adds no
+			// memcpy of the delta on top of the copy that is already
+			// happening.
+			if collectDigests {
+				digests = append(digests, blockdigest.Block{
+					Offset: slots[i].offset,
+					Length: slots[i].length,
+					Digest: blockdigest.Sum(slots[i].buf.Slice()),
+				})
+			}
 			idx := i
 			slots[idx].opErr = 0
 			cookie, err := dst.AioPwrite(slots[idx].buf, slots[idx].offset, &nbd.AioPwriteOptargs{
@@ -881,19 +926,37 @@ copyLoop:
 	}
 
 	if copyErr != nil {
-		return writtenBytes, copyErr
+		// Digests from a failed copy describe an incomplete write and must
+		// never be compared against anything -- returning them would invite
+		// a caller to treat a partial plan as a verdict. The caller is about
+		// to fail the run regardless; writtenBytes is still reported because
+		// metrics document partial progress, but a digest list only means
+		// something when the copy it describes finished.
+		return writtenBytes, nil, copyErr
 	}
 
 	if err := dst.Flush(nil); err != nil {
-		return writtenBytes, fmt.Errorf("flush target nbd: %w", err)
+		return writtenBytes, nil, fmt.Errorf("flush target nbd: %w", err)
 	}
+
+	// Sorted by offset so the request the caller sends is in a stable,
+	// readable order -- the pipeline completes chunks out of order, and a
+	// digest list that shuffles run to run would be needlessly hard to
+	// compare by eye in a log.
+	if collectDigests {
+		sort.Slice(digests, func(i, j int) bool { return digests[i].Offset < digests[j].Offset })
+	}
+
 	elapsed := time.Since(start)
 	avgMibPerSec := 0.0
 	if elapsed.Seconds() > 0 {
 		avgMibPerSec = (float64(writtenBytes) / (1024.0 * 1024.0)) / elapsed.Seconds()
 	}
 	trace.Info("nbd copy complete", "written_bytes", writtenBytes, "device", srcExport, "elapsed", elapsed.Round(time.Millisecond).String(), "avg_mib_per_sec", fmt.Sprintf("%.2f", avgMibPerSec))
-	return writtenBytes, nil
+	if collectDigests {
+		trace.Info("nbd copy: source digests collected", "device", srcExport, "algo", blockdigest.DefaultAlgo, "blocks", len(digests), "bytes", blockdigest.TotalBytes(digests))
+	}
+	return writtenBytes, digests, nil
 }
 
 // CompareTCP does a full, byte-for-byte comparison of two NBD exports (a and

@@ -36,6 +36,68 @@ func CheckLocal(cfg Config) error {
 	return nil
 }
 
+// CommandRunner is the single method ProbeHelper needs, so it can be given
+// a *remotessh.Client in production and a stub in a test. Narrow on purpose:
+// CheckRemote below needs more of the client than this (DialTCP,
+// LoopbackSelfAddress) and so still takes the concrete type.
+type CommandRunner interface {
+	Run(ctx context.Context, command string) (string, error)
+}
+
+// HelperStatus is what ProbeHelper found out about the target's
+// vmsync-bridge-helper.
+type HelperStatus struct {
+	// Present means the binary exists at cfg.HelperPath and is executable.
+	Present bool
+	// Version is what the helper reported; empty when it could not be asked.
+	Version string
+	// Usable means Present AND the reported version matches this vmsync's.
+	// The only field a caller deciding whether to use the helper should
+	// consult.
+	Usable bool
+	// Reason explains !Usable in a form ready to drop into either a log line
+	// or an error message. Empty when Usable.
+	Reason string
+}
+
+// ProbeHelper reports whether the target's vmsync-bridge-helper is present,
+// executable and version-matched, WITHOUT failing.
+//
+// Split out of CheckRemote because two callers need the same two questions
+// answered and want opposite things done about the answer. CheckRemote is a
+// precondition for bridging: no helper means the run cannot do what was
+// asked, so it errors. The pre-commit integrity check is the other way
+// round: it is on by default, so a missing helper must not break a sync
+// nobody asked to bridge -- it just means no check, and a log line saying so.
+//
+// The version equality is not fussiness. The helper is deployed by hand and
+// vmsync never uploads it, so its version drifts silently; and since the
+// digest exchange is a wire format between the two binaries (see
+// pkg/blockdigest), a mismatched pair is exactly the case whose digests would
+// disagree everywhere and read as a corrupt replica. Refusing to use a
+// mismatched helper at all is a stronger guard than detecting it afterwards.
+func ProbeHelper(ctx context.Context, client CommandRunner, cfg Config, host string) HelperStatus {
+	if out, err := client.Run(ctx, "test -x "+util.ShQuote(cfg.HelperPath)); err != nil {
+		return HelperStatus{Reason: fmt.Sprintf("not found (or not executable) at %s on %s: %v: %s", cfg.HelperPath, host, err, out)}
+	}
+	helperVersion, err := client.Run(ctx, util.ShQuote(cfg.HelperPath)+" -version")
+	if err != nil {
+		return HelperStatus{
+			Present: true,
+			Reason:  fmt.Sprintf("version could not be determined at %s on %s: %v: %s", cfg.HelperPath, host, err, helperVersion),
+		}
+	}
+	helperVersion = strings.TrimSpace(helperVersion)
+	if helperVersion != version.Version {
+		return HelperStatus{
+			Present: true,
+			Version: helperVersion,
+			Reason:  fmt.Sprintf("at %s on %s is version %q, but this vmsync is version %q", cfg.HelperPath, host, helperVersion, version.Version),
+		}
+	}
+	return HelperStatus{Present: true, Version: helperVersion, Usable: true}
+}
+
 // CheckRemote verifies the remote side of the bridge is usable on host,
 // reached through client. It is a no-op when bridging isn't requested.
 func CheckRemote(ctx context.Context, client *remotessh.Client, cfg Config, host string) error {
@@ -43,29 +105,22 @@ func CheckRemote(ctx context.Context, client *remotessh.Client, cfg Config, host
 		return nil
 	}
 
-	if out, err := client.Run(ctx, "test -x "+util.ShQuote(cfg.HelperPath)); err != nil {
-		return fmt.Errorf("vmsync-bridge-helper not found (or not executable) at %s on %s: %w: %s\n"+
+	// Both failures below were once checked inline here; they now come from
+	// ProbeHelper so that the integrity check's own, non-fatal use of the
+	// same two questions cannot drift from this one.
+	st := ProbeHelper(ctx, client, cfg, host)
+	if !st.Present {
+		return fmt.Errorf("vmsync-bridge-helper %s\n"+
 			"build cmd/vmsync-bridge-helper and deploy it there yourself, or pass -bridge-helper-path "+
-			"to point at wherever you've placed it", cfg.HelperPath, host, err, out)
+			"to point at wherever you've placed it", st.Reason)
 	}
-
-	// vmsync-bridge-helper is deployed to host manually, ahead of time, by
-	// the user -- vmsync never uploads it (see its own doc comment) -- so
-	// its version can silently drift from this vmsync binary's, with no
-	// natural point at which that would otherwise surface: an out-of-date
-	// helper still starts, still accepts connections, and any protocol or
-	// flag-handling difference between versions would only show up as a
-	// confusing failure (or worse, a silent one) deep inside a running
-	// sync. Check it up front, before any sync work starts, the same way
-	// the executability check above already does for a missing binary.
-	helperVersion, err := client.Run(ctx, util.ShQuote(cfg.HelperPath)+" -version")
-	if err != nil {
-		return fmt.Errorf("unable to determine vmsync-bridge-helper version at %s on %s: %w: %s", cfg.HelperPath, host, err, helperVersion)
-	}
-	helperVersion = strings.TrimSpace(helperVersion)
-	if helperVersion != version.Version {
-		return fmt.Errorf("vmsync-bridge-helper at %s on %s is version %q, but this vmsync is version %q -- "+
-			"rebuild and redeploy vmsync-bridge-helper so both match before syncing", cfg.HelperPath, host, helperVersion, version.Version)
+	if !st.Usable {
+		// An out-of-date helper still starts and still accepts connections,
+		// so any protocol or flag-handling difference between versions would
+		// otherwise only show up as a confusing failure (or worse, a silent
+		// one) deep inside a running sync. Fail up front instead.
+		return fmt.Errorf("vmsync-bridge-helper %s -- "+
+			"rebuild and redeploy vmsync-bridge-helper so both match before syncing", st.Reason)
 	}
 
 	// Bridging bypasses SSH tunneling for the bridged connection entirely by
