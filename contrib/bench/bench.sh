@@ -3905,11 +3905,40 @@ checksum_install_shim() {
 	# "no" rather than a TARGET_LOCAL: there is no such setting, because this
 	# harness runs alongside the SOURCE (SOURCE_LOCAL, default yes) and reaches
 	# the target over ssh in every other place too.
+	#
+	# Three things in the script below are deliberate, and the first two were
+	# learned the hard way:
+	#
+	# NOT "exec real | awk". exec applies to the LEFT SUBSHELL of a pipeline,
+	# not to the shim, so control returned and the trailing exec ran the
+	# helper a SECOND time -- against a stdin the first invocation had already
+	# drained. Over ssh stdin is an unseekable pipe, so the second read got
+	# EOF and the helper died with "no header line at all", which looked
+	# exactly like a broken helper rather than a broken shim.
+	#
+	# A temp file rather than a pipe, so the helper's exit status is the
+	# shim's. In "real | awk" the pipeline's status is awk's, and awk always
+	# succeeds -- a genuinely failing helper would surface as an empty but
+	# well-formed response, which vmsync reports as a plan mismatch instead
+	# of the real error. pipefail would fix it too but is not POSIX sh.
+	#
+	# An explicit exit after handling -checksum, so nothing can fall through
+	# to the pass-through exec below.
 	run_shell_on "$TARGET_HOST" no "mkdir -p '$CHECKSUM_SHIM_DIR' && cat > '$CHECKSUM_SHIM_DIR/$name' <<'VMSYNC_SHIM_EOF'
 #!/bin/sh
 for a in \"\$@\"; do
 	if [ \"\$a\" = -checksum ]; then
-		exec $real \"\$@\" | awk '$awk_prog'
+		out=\$(mktemp) || exit 1
+		$real \"\$@\" >\"\$out\"
+		rc=\$?
+		if [ \"\$rc\" -ne 0 ]; then
+			rm -f \"\$out\"
+			exit \"\$rc\"
+		fi
+		awk '$awk_prog' <\"\$out\"
+		rc=\$?
+		rm -f \"\$out\"
+		exit \"\$rc\"
 	fi
 done
 exec $real \"\$@\"
