@@ -1073,35 +1073,38 @@ func CompareTCPCollect(ctx context.Context, aHost string, aPort int, aExport str
 	return compareTCP(ctx, aHost, aPort, aExport, bHost, bPort, bExport, ioDepth, true)
 }
 
-// SourceDigestsTCP reads the SOURCE export and returns one digest per chunk
-// of the same allocation-aware plan compareTCP would have compared.
+// CompareChunkPlanTCP returns the chunk boundaries a digest-based verify
+// should hash, which are the same ones compareTCP would have compared.
 //
-// This is the source half of a digest-based verify. Instead of pulling the
-// target's entire image across the network to compare it byte for byte,
-// vmsync hashes the source here and vmsync-bridge-helper hashes the same
-// ranges on the target host; only the digests cross the wire. On the common
-// topology -- vmsync running on the source, so this read is local -- that
-// turns a full verify from "transfer the whole replica" into "read the
-// source locally, exchange a few bytes per megabyte".
+// Metadata only: it connects to both exports, checks their sizes agree,
+// negotiates a buffer size and queries base:allocation on each side, then
+// returns the resulting chunks with their digests left zero. No image data
+// is read, so this costs a handful of round trips regardless of disk size.
 //
-// Both exports are connected, but only A is read. B is opened solely for its
-// base:allocation map, which costs a handful of metadata round trips and is
-// what makes the skip logic safe: a range is skipped only when BOTH sides
-// report it as reading zeros. Skipping on the source alone would miss the
-// case that matters most -- a hole on the source against real data on the
-// target is a genuine mismatch.
+// It exists as a separate step from the hashing SO THAT BOTH SIDES CAN HASH
+// AT ONCE. The first version of this path computed the source digests and
+// only then asked the target for its own, which made a verify cost
+// source-read PLUS target-read -- serialising two reads that the byte
+// comparator it replaced had always overlapped in one AIO pipeline. That
+// traded away parallelism to save network, and on a link fast enough that
+// disk is the wall it was a straight loss: the digests saved the transfer
+// and the serialisation gave the saving back. With the plan settled first,
+// the two hashes are independent and a verify costs max(source, target).
 //
-// The returned blocks carry the exact chunk boundaries that were hashed, and
-// the caller sends those verbatim to the target (see pkg/blockdigest): with
-// the boundaries stated rather than recomputed on each side, there is no
-// plan for the two to disagree about.
+// Both exports are consulted because the skip logic needs both. A range is
+// skipped only when BOTH sides report it as reading zeros; skipping on the
+// source alone would miss the case that matters most, a hole on the source
+// against real data on the target.
+//
+// The returned blocks are also what gets sent to the target verbatim (see
+// pkg/blockdigest): with the boundaries stated rather than recomputed on
+// each side, there is no plan for the two to disagree about.
 //
 // Deliberately duplicates compareTCP's connect-and-plan preamble rather than
-// factoring it out. The two diverge immediately afterwards -- one side read
-// and hashed here, two sides read and memcmp'd there -- and the shared part
-// is a dozen straight-line calls, against a refactor of a cgo AIO function
-// whose buffer-lifetime discipline is the subtlest code in this package.
-func SourceDigestsTCP(ctx context.Context, aHost string, aPort int, aExport string, bHost string, bPort int, bExport string, ioDepth int) (digests []blockdigest.Block, err error) {
+// factoring it out. The two diverge immediately afterwards, and the shared
+// part is a dozen straight-line calls, against a refactor of a cgo AIO
+// function whose buffer-lifetime discipline is the subtlest code here.
+func CompareChunkPlanTCP(ctx context.Context, aHost string, aPort int, aExport string, bHost string, bPort int, bExport string) (plan []blockdigest.Block, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1155,9 +1158,54 @@ func SourceDigestsTCP(ctx context.Context, aHost string, aPort int, aExport stri
 			"export", aExport, "skipped_bytes", skippedBytes, "total_bytes", size,
 			"hashing_bytes", size-skippedBytes)
 	}
-	if len(chunks) == 0 {
+	plan = make([]blockdigest.Block, 0, len(chunks))
+	for _, c := range chunks {
+		plan = append(plan, blockdigest.Block{Offset: c.offset, Length: c.length})
+	}
+	return plan, nil
+}
+
+// HashRangesTCP reads exactly the ranges in plan off ONE export and returns
+// them with their digests filled in.
+//
+// One side, one connection: the caller runs two of these -- or one of these
+// and one vmsync-bridge-helper pass -- concurrently, which is what makes a
+// digest verify cost max(source, target) rather than their sum. Nothing here
+// touches the other side, so the two cannot contend for a qemu-nbd export
+// that only accepts one client at a time.
+//
+// The plan's digests are ignored on input; the returned slice is a fresh copy
+// in the SAME ORDER, because that order is what the comparison is matched on
+// and what the wire format preserves.
+func HashRangesTCP(ctx context.Context, host string, port int, export string, plan []blockdigest.Block, ioDepth int) (digests []blockdigest.Block, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(plan) == 0 {
 		return nil, nil
 	}
+
+	a, err := nbd.Create()
+	if err != nil {
+		return nil, fmt.Errorf("create nbd handle: %w", err)
+	}
+	defer a.Close()
+	if export != "" {
+		if err := a.SetExportName(export); err != nil {
+			return nil, fmt.Errorf("set export name %s: %w", export, err)
+		}
+	}
+	if err := a.ConnectTcp(host, strconv.Itoa(port)); err != nil {
+		return nil, fmt.Errorf("connect nbd tcp %s:%d (export %q): %w", host, port, export, err)
+	}
+
+	// blk, not b: in this package b is conventionally the second NBD handle,
+	// and this function deliberately has only one.
+	chunks := make([]compareChunk, 0, len(plan))
+	for _, blk := range plan {
+		chunks = append(chunks, compareChunk{offset: blk.Offset, length: blk.Length})
+	}
+	aExport := export
 
 	pipelineDepth := ioDepth
 	if pipelineDepth < 1 {
@@ -1169,8 +1217,15 @@ func SourceDigestsTCP(ctx context.Context, aHost string, aPort int, aExport stri
 		slotReading
 	)
 	type slot struct {
-		state  int
-		buf    nbd.AioBuffer
+		state int
+		buf   nbd.AioBuffer
+		// idx is the slot's position in plan, carried through the pipeline
+		// so a completion can write its digest straight back to that index.
+		// The alternative -- append as they finish, then sort by offset --
+		// would only reproduce plan order because plan happens to be sorted;
+		// indexing makes the guarantee structural instead of incidental, and
+		// the order IS the thing the comparison is matched on.
+		idx    int
 		offset uint64
 		length uint64
 		cookie uint64
@@ -1178,6 +1233,7 @@ func SourceDigestsTCP(ctx context.Context, aHost string, aPort int, aExport stri
 	}
 	slots := make([]slot, pipelineDepth)
 
+	digests = make([]blockdigest.Block, len(plan))
 	start := time.Now()
 	lastProgress := start
 	nextChunk := 0
@@ -1209,8 +1265,9 @@ digestLoop:
 				continue
 			}
 			c := chunks[nextChunk]
-			nextChunk++
 			idx := i
+			slots[idx].idx = nextChunk
+			nextChunk++
 			slots[idx].offset = c.offset
 			slots[idx].length = c.length
 			slots[idx].opErr = 0
@@ -1269,11 +1326,11 @@ digestLoop:
 			// Done here, while the read is confirmed complete and before the
 			// buffer is freed -- the only window where the contents are both
 			// valid and ours to look at.
-			digests = append(digests, blockdigest.Block{
+			digests[slots[i].idx] = blockdigest.Block{
 				Offset: slots[i].offset,
 				Length: slots[i].length,
 				Digest: blockdigest.Sum(slots[i].buf.Slice()),
-			})
+			}
 			hashedBytes += slots[i].length
 			slots[i].buf.Free()
 			slots[i].state = slotFree
@@ -1327,14 +1384,19 @@ digestLoop:
 		return nil, digestErr
 	}
 
-	// Sorted by offset: the pipeline completes chunks out of order, and the
-	// caller puts this list on the wire, where a stable order is what makes
-	// two runs' requests comparable by eye.
-	sort.Slice(digests, func(i, j int) bool { return digests[i].Offset < digests[j].Offset })
-
+	// No sort: every completion wrote to its own plan index, so digests is
+	// already in plan order by construction.
 	elapsed := time.Since(start)
-	trace.Info("nbd digest complete", "device", aExport, "blocks", len(digests), "bytes", hashedBytes,
-		"image_bytes", size, "algo", blockdigest.DefaultAlgo, "elapsed", elapsed.Round(time.Millisecond).String())
+	mibPerSec := 0.0
+	if elapsed.Seconds() > 0 {
+		mibPerSec = (float64(hashedBytes) / (1024.0 * 1024.0)) / elapsed.Seconds()
+	}
+	// The elapsed time here is the thing to look at when a verify is slower
+	// than expected: compared against the run's total verify time it says
+	// which side is the wall -- this read, or the target's own hashing pass.
+	trace.Info("nbd digest complete", "export", aExport, "blocks", len(digests), "bytes", hashedBytes,
+		"algo", blockdigest.DefaultAlgo, "elapsed", elapsed.Round(time.Millisecond).String(),
+		"mib_per_sec", fmt.Sprintf("%.2f", mibPerSec))
 	return digests, nil
 }
 

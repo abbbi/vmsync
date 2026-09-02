@@ -597,7 +597,7 @@ func TestSummarizeMismatches(t *testing.T) {
 
 // chunked mimics what the requester actually sends: a span broken into
 // chunk-sized ranges, the way CopyExtentsTCP's own buffer-sized chunks and
-// SourceDigestsTCP's compare-plan chunks both arrive.
+// CompareChunkPlanTCP's compare-plan chunks both arrive.
 func chunked(offset, length, chunk uint64) []Range {
 	var out []Range
 	for length > 0 {

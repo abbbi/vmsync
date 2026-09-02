@@ -4020,33 +4020,71 @@ func run(cfg syncConfig) (runErr error) {
 			// no difference to stop at, so it read everything anyway) and
 			// only makes an already-failing verify slower. The two still
 			// differ in what they report.
-			sourceDigests, derr := nbdsync.SourceDigestsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, verifyExportName, cfg.IODepth)
+			// The plan first, on its own, because it is metadata only and
+			// both sides need it before either can start. Settling it up
+			// front is what lets the two hashing passes run AT THE SAME
+			// TIME: a digest verify then costs max(source, target) instead
+			// of their sum, which is what the byte comparator it replaces
+			// always did by reading both sides in one pipeline.
+			plan, perr := nbdsync.CompareChunkPlanTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, verifyExportName)
 			switch {
-			case derr != nil:
-				compareErr = fmt.Errorf("hashing the source failed: %w", derr)
-			case len(sourceDigests) == 0:
+			case perr != nil:
+				compareErr = fmt.Errorf("planning the comparison failed: %w", perr)
+			case len(plan) == 0:
 				// Every range read as zeros on both sides, so there is
 				// nothing left that could differ. Not a skipped check: the
 				// allocation maps already answered it.
 				trace.Info("verify: nothing to hash -- every range reads as zeros on both sides", "disk", d.TargetDev)
 			default:
-				trace.Info("verify: asking the target to hash the same ranges",
-					"disk", d.TargetDev, "blocks", len(sourceDigests),
-					"bytes", blockdigest.TotalBytes(sourceDigests), "algo", blockdigest.DefaultAlgo)
-				// The EXISTING verify export at verifyPort -- the block at
-				// +2N that -verify already reserves. The digest path adds no
-				// port of its own: vmsync needs that export on TCP anyway
-				// (it reads base:allocation through it, possibly bridged
-				// from another host), and the helper simply reaches the same
-				// export over loopback.
-				targetBlocks, aerr := askTargetDigests(d.TargetDev, fmt.Sprintf("127.0.0.1:%d", verifyPort), verifyExportName, sourceDigests)
-				if aerr != nil {
+				trace.Info("verify: hashing both sides in parallel",
+					"disk", d.TargetDev, "blocks", len(plan),
+					"bytes", blockdigest.TotalBytes(plan), "algo", blockdigest.DefaultAlgo)
+
+				// Both passes touch only their own side -- vmsync reads the
+				// source export, the helper reads the target's -- so they
+				// cannot contend for the single client slot qemu-nbd allows
+				// by default. CompareChunkPlanTCP's own target connection is
+				// already closed by the time it returns, which is what makes
+				// that true.
+				var (
+					wg            sync.WaitGroup
+					sourceDigests []blockdigest.Block
+					targetBlocks  []blockdigest.Block
+					sourceErr     error
+					targetErr     error
+				)
+				wg.Add(2)
+				go func() {
+					defer wg.Done()
+					sourceDigests, sourceErr = nbdsync.HashRangesTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, plan, cfg.IODepth)
+				}()
+				go func() {
+					defer wg.Done()
+					// The EXISTING verify export at verifyPort -- the block
+					// at +2N that -verify already reserves. The digest path
+					// adds no port of its own: vmsync needs that export on
+					// TCP anyway (it read base:allocation through it above,
+					// possibly bridged from another host), and the helper
+					// reaches the same export over loopback.
+					targetBlocks, targetErr = askTargetDigests(d.TargetDev, fmt.Sprintf("127.0.0.1:%d", verifyPort), verifyExportName, plan)
+				}()
+				wg.Wait()
+
+				// Source error first, deliberately. If the source read
+				// failed there is nothing to compare against, and reporting
+				// the target's error instead would point at the replica for
+				// a problem on the other side.
+				if sourceErr != nil {
+					compareErr = fmt.Errorf("hashing the source failed: %w", sourceErr)
+					break
+				}
+				if targetErr != nil {
 					// A format or plan problem, or a helper that would not
 					// run. NOT wrapped in ErrImagesDiffer: the comparison
 					// could not be performed, which is a broken sync rather
 					// than a finding about the data, and isVerifyMismatch
 					// must not exempt it from failure_count.
-					compareErr = aerr
+					compareErr = targetErr
 					break
 				}
 				mismatches, cerr := blockdigest.Compare(sourceDigests, targetBlocks)

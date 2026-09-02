@@ -292,6 +292,119 @@ func TestCopyExtentsTCPCollectsDigestsOfWhatItRead(t *testing.T) {
 	}
 }
 
+// HashRangesTCP is the core of a digest verify, so it gets checked against
+// an independent hash of the file rather than against anything the package
+// itself computed.
+//
+// Two properties matter equally. The digests must be right, and the returned
+// order must equal the PLAN's order -- not offset order, and not completion
+// order. The AIO pipeline finishes chunks out of order, and the comparison
+// against the target is matched positionally, so a reordering here would
+// report every block as differing on a perfectly healthy replica.
+func TestHashRangesTCPPreservesPlanOrderAndDigests(t *testing.T) {
+	requireQemuNBD(t)
+	dir := t.TempDir()
+
+	const size = 3 * 1024 * 1024
+	content := patternBytes(size)
+	port := qemuNBDExport(t, writeRawFile(t, dir, "src.raw", content))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Deliberately NOT in offset order, and deliberately uneven in length,
+	// so "returned in plan order" is distinguishable from "returned sorted".
+	plan := []blockdigest.Block{
+		{Offset: 2 * 1024 * 1024, Length: 512 * 1024},
+		{Offset: 0, Length: 1024 * 1024},
+		{Offset: 1536 * 1024, Length: 4096},
+		{Offset: 1024 * 1024, Length: 512 * 1024},
+	}
+
+	got, err := HashRangesTCP(ctx, "127.0.0.1", port, "", plan, 4)
+	if err != nil {
+		t.Fatalf("HashRangesTCP: %v", err)
+	}
+	if len(got) != len(plan) {
+		t.Fatalf("got %d digests for a %d-block plan", len(got), len(plan))
+	}
+	for i, want := range plan {
+		if got[i].Offset != want.Offset || got[i].Length != want.Length {
+			t.Errorf("block %d = %d+%d, want the plan's %d+%d -- order was not preserved",
+				i, got[i].Offset, got[i].Length, want.Offset, want.Length)
+			continue
+		}
+		if d := blockdigest.Sum(content[want.Offset : want.Offset+want.Length]); got[i].Digest != d {
+			t.Errorf("block %d (%d+%d) digest = %#x, want %#x from the file itself",
+				i, want.Offset, want.Length, got[i].Digest, d)
+		}
+	}
+
+	// An empty plan must not even connect, so a verify with nothing to
+	// compare does not depend on the export existing.
+	if d, err := HashRangesTCP(ctx, "127.0.0.1", 1, "", nil, 4); err != nil || d != nil {
+		t.Errorf("HashRangesTCP(empty plan) = %v, %v; want nil, nil without dialling", d, err)
+	}
+}
+
+// The two halves must agree: a plan from CompareChunkPlanTCP, hashed on both
+// sides with HashRangesTCP, must match for identical images and localise the
+// damage for a tampered one. This is a digest verify end to end, minus the
+// helper (which is exercised in cmd/vmsync-bridge-helper's own tests).
+func TestCompareChunkPlanAndHashRangesAgreeEndToEnd(t *testing.T) {
+	requireQemuNBD(t)
+	dir := t.TempDir()
+
+	const size = 3 * 1024 * 1024
+	content := patternBytes(size)
+	aPort := qemuNBDExport(t, writeRawFile(t, dir, "a.raw", content))
+
+	tampered := make([]byte, size)
+	copy(tampered, content)
+	const badOffset = 2*1024*1024 + 4096
+	tampered[badOffset] ^= 0xff
+	bPort := qemuNBDExport(t, writeRawFile(t, dir, "b.raw", tampered))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	plan, err := CompareChunkPlanTCP(ctx, "127.0.0.1", aPort, "", "127.0.0.1", bPort, "")
+	if err != nil {
+		t.Fatalf("CompareChunkPlanTCP: %v", err)
+	}
+	if len(plan) == 0 {
+		t.Fatal("empty plan for two fully-allocated images")
+	}
+
+	aDigests, err := HashRangesTCP(ctx, "127.0.0.1", aPort, "", plan, 4)
+	if err != nil {
+		t.Fatalf("HashRangesTCP(a): %v", err)
+	}
+	bDigests, err := HashRangesTCP(ctx, "127.0.0.1", bPort, "", plan, 4)
+	if err != nil {
+		t.Fatalf("HashRangesTCP(b): %v", err)
+	}
+
+	mismatches, err := blockdigest.Compare(aDigests, bDigests)
+	if err != nil {
+		t.Fatalf("Compare: %v", err)
+	}
+	if len(mismatches) != 1 {
+		t.Fatalf("got %d mismatches for a single tampered byte, want 1: %v", len(mismatches), mismatches)
+	}
+	m := mismatches[0]
+	if badOffset < m.Offset || badOffset >= m.Offset+m.Length {
+		t.Errorf("mismatch reported at %d+%d, which does not cover the tampered byte at %d",
+			m.Offset, m.Length, badOffset)
+	}
+
+	// And the same plan over the same image must compare clean, so the
+	// mismatch above is the tamper and not an artefact of the plan.
+	if clean, err := blockdigest.Compare(aDigests, aDigests); err != nil || len(clean) != 0 {
+		t.Errorf("comparing a digest list against itself gave %v, %v", clean, err)
+	}
+}
+
 func TestCopyExtentsTCPRoundTrip(t *testing.T) {
 	requireQemuNBD(t)
 	dir := t.TempDir()
