@@ -3972,7 +3972,24 @@ func run(cfg syncConfig) (runErr error) {
 		// copy itself already requires. True for all three modes: each reads
 		// this same still-open primary export.
 		sourceNBDURL := fmt.Sprintf("nbd://%s:%d/%s", effectiveSourceHost, effectiveSourcePort, d.TargetDev)
-		nbdURL := fmt.Sprintf("nbd://%s:%d/", verifyTargetHost, verifyTargetPort)
+		// The export NAME belongs in this URL, and leaving it out broke
+		// -verify=qemu-img outright.
+		//
+		// The read-only verify export is started with --export-name (see
+		// startVerifyCmd), so a client asking for the default, unnamed export
+		// is refused by the NBD handshake. qemu-img compare then exits 2 --
+		// "could not open image" -- in a couple of seconds, having compared
+		// nothing.
+		//
+		// Every other comparator here takes verifyExportName as a parameter;
+		// this is the only one that formats its own URL, which is exactly why
+		// naming the exports (F10) missed it. What kept it hidden is that
+		// vmsync_verification_state mirrors the run state rather than saying
+		// WHY a verify run failed, so bench's tamper tests read "the run
+		// failed" as "a mismatch was found" and scored a comparator that
+		// could not connect as a pass. Only the clean-oracle sub-test, which
+		// is the one that expects a CLEAN result, could catch it.
+		nbdURL := fmt.Sprintf("nbd://%s:%d/%s", verifyTargetHost, verifyTargetPort, verifyExportName)
 
 		// Every mode compares the target against the SAME source export the
 		// copy read from -- the primary backup job, still running. That job
