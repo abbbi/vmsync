@@ -75,6 +75,39 @@ func ParseAlgo(s string) (Algo, error) {
 	}
 }
 
+// DefaultLevel is the compression level to use for algo when the operator
+// named none.
+//
+// It exists because a single flag default cannot be correct for both
+// algorithms: "3" is a valid zstd level and an invalid s2 mode, "better" is
+// the reverse. -compress-level therefore declares NO default at all and
+// resolves through here once the algorithm is known, which is also what
+// stops --help from printing a value that one of the two would refuse.
+//
+// "better" rather than s2's own "default" mode: bare -compress selects s2,
+// so this is what an operator who asks for compression without tuning it
+// gets, and s2's fastest mode gives up more ratio than that choice implies.
+// Note NewEncoder below still maps "" to s2's own default -- it is the
+// low-level API and takes the library's meaning of an empty level; callers
+// coming from a flag should resolve through here first.
+func DefaultLevel(algo Algo) string {
+	if algo == AlgoS2 {
+		return "better"
+	}
+	return "3"
+}
+
+// ResolveLevel returns level unchanged, or DefaultLevel(algo) when it is
+// empty. The single place "the operator did not choose" turns into a
+// concrete level, shared by vmsync, vmsync-bridge-helper and the bridge
+// start command so the three cannot disagree about it.
+func ResolveLevel(algo Algo, level string) string {
+	if level == "" {
+		return DefaultLevel(algo)
+	}
+	return level
+}
+
 // flushCloser is satisfied by both *zstd.Encoder and *s2.Writer -- both
 // expose this same Write/Flush/Close shape, letting Relay use either
 // interchangeably without caring which. Flush pushes everything written so

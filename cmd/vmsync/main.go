@@ -48,6 +48,7 @@ import (
 	"vmsync/pkg/remotessh"
 	"vmsync/pkg/restorepoint"
 	"vmsync/pkg/runresult"
+	"vmsync/pkg/streamrelay"
 	"vmsync/pkg/trace"
 	"vmsync/pkg/util"
 	"vmsync/pkg/version"
@@ -419,7 +420,14 @@ func main() {
 	fenceSourceArg := optionalValueFlag{bareDefault: fenceSourceAuto}
 	netBufferArg := optionalValueFlag{bareDefault: "128k,1G"}
 	flag.Var(&compressArg, "compress", "Compress NBD traffic between hosts. Bare -compress (no value) defaults to \"s2\"); ACCEPTS \"zstd\" or \"s2\". Requires vmsync-bridge-helper binary on target")
-	flag.StringVar(&cfg.CompressLevel, "compress-level", "3", "Compression level/mode to use when -compress is set. For -compress=zstd: a number 1-19 (default 3 when not set explicitly). For -compress=s2 (which has no numeric levels, including bare -compress, which defaults to s2): one of \"default\" (s2's own fastest mode), \"better\" (default here when not set explicitly), or \"best\".")
+	// No flag default, deliberately: one literal cannot be right for both
+	// algorithms. "3" is a valid zstd level and an invalid s2 mode, "better"
+	// is the reverse -- so whichever were declared, --help would print a
+	// value the other algorithm refuses outright. Left empty, Go omits the
+	// "(default ...)" clause altogether and the text below states both,
+	// which is the only accurate thing to say before -compress is known.
+	// streamrelay.ResolveLevel turns empty into the right one.
+	flag.StringVar(&cfg.CompressLevel, "compress-level", "", "Compression level/mode to use when -compress is set. For -compress=zstd: a number 1-19, defaulting to 3. For -compress=s2 (which has no numeric levels, and is what bare -compress selects): one of \"default\" (s2's own fastest mode), \"better\" (the default here) or \"best\". Left unset it resolves per algorithm, so there is no single default to print.")
 	flag.Var(&netBufferArg, "netbuffer", "Buffer NBD bridge traffic through a bounded in-memory buffer to smooth throughput, formatted as <blocksize>,<buffersize> (e.g. 64k,512M). Defaults to \"128k,1G\". Requires vmsync-bridge-helper binary on target")
 	flag.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/local/bin/vmsync-bridge-helper", "Remote path to the vmsync-bridge-helper binary. Defaults to /usr/local/bin")
 	flag.BoolVar(&cfg.UseSSH, "use-ssh", false, "When --compress/--netbuffer is set, route the bridged NBD traffic through the existing SSH connection as an encrypted tunnel")
@@ -463,17 +471,6 @@ func main() {
 		trace.Error("invalid command line", "error", fmt.Errorf("unexpected extra argument(s) %v -- if you meant to pass a value to -compress or -netbuffer, use -compress=value / -netbuffer=value (with an \"=\"), not a space", flag.Args()))
 		os.Exit(2)
 	}
-
-	// Tracks whether --compress-level was actually passed on the command
-	// line, as opposed to just carrying its zstd-oriented flag default
-	// ("3") -- needed below to swap in s2's own default ("better") instead
-	// when -compress=s2 and the user didn't ask for a specific level.
-	compressLevelExplicit := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "compress-level" {
-			compressLevelExplicit = true
-		}
-	})
 
 	if cfg.ShowVersion {
 		trace.Info(fmt.Sprintf("vmsync Version: %s", version.Version))
@@ -665,9 +662,10 @@ func main() {
 			trace.Error("invalid compress configuration", "error", err)
 			os.Exit(2)
 		}
-		if !compressLevelExplicit && cfg.Compress == "s2" {
-			cfg.CompressLevel = "better"
-		}
+		// Empty means "the operator did not choose", so resolve it to this
+		// algorithm's default before validating -- otherwise an unset level
+		// would be rejected as not a zstd number.
+		cfg.CompressLevel = streamrelay.ResolveLevel(streamrelay.Algo(cfg.Compress), cfg.CompressLevel)
 		if err := nbdbridge.ValidateCompressLevel(cfg.Compress, cfg.CompressLevel); err != nil {
 			trace.Error("invalid compress-level configuration", "error", err)
 			os.Exit(2)

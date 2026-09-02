@@ -147,7 +147,9 @@ func main() {
 	compressArg := optionalValueFlag{bareDefault: "s2"}
 	netBufferArg := optionalValueFlag{bareDefault: "128k,1G"}
 	flag.Var(&compressArg, "compress", "Same syntax as vmsync")
-	level := flag.String("compress-level", "3", "Same syntax as vmsync")
+	// Empty default for the same reason vmsync's is empty: no single literal
+	// is valid for both algorithms. Resolved per algorithm below.
+	level := flag.String("compress-level", "", "Same syntax as vmsync: a number 1-19 for zstd (default 3), or default|better|best for s2 (default better). Resolves per algorithm when unset")
 	flag.Var(&netBufferArg, "netbuffer", "Same syntax as vmsync")
 	// Checksum mode. One-shot and unrelated to the relay: it reads a range
 	// plan on stdin, hashes those ranges off a local qemu-nbd export, and
@@ -215,13 +217,6 @@ func main() {
 		os.Exit(2)
 	}
 
-	compressLevelExplicit := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "compress-level" {
-			compressLevelExplicit = true
-		}
-	})
-
 	compress := compressArg.value != ""
 	var algo streamrelay.Algo
 	if compress {
@@ -231,9 +226,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
 			os.Exit(2)
 		}
-		if !compressLevelExplicit && algo == streamrelay.AlgoS2 {
-			*level = "better"
-		}
+		// Same resolution as vmsync's own, through the same function: this
+		// process is started BY vmsync (see nbdbridge.BuildStartCommand), so
+		// the two disagreeing about an unset level would mean a relay
+		// compressing at one setting while the operator was told another.
+		*level = streamrelay.ResolveLevel(algo, *level)
 		if err := validateCompressLevel(algo, *level); err != nil {
 			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
 			os.Exit(2)

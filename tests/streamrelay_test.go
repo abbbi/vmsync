@@ -976,3 +976,55 @@ func TestRelayPassesThroughRealTCPConnsWithoutCounter(t *testing.T) {
 var (
 	_ io.Reader = (*chunkReader)(nil)
 )
+
+// TestDefaultAndResolveLevel pins the per-algorithm level defaults, which
+// exist because a single -compress-level flag default cannot be correct for
+// both algorithms: "3" is a valid zstd level and an invalid s2 mode, and
+// "better" is the reverse.
+func TestDefaultAndResolveLevel(t *testing.T) {
+	if got, want := streamrelay.DefaultLevel(streamrelay.AlgoS2), "better"; got != want {
+		t.Errorf("DefaultLevel(s2) = %q, want %q", got, want)
+	}
+	if got, want := streamrelay.DefaultLevel(streamrelay.AlgoZstd), "3"; got != want {
+		t.Errorf("DefaultLevel(zstd) = %q, want %q", got, want)
+	}
+
+	// An explicit level always wins, including one that happens to equal the
+	// other algorithm's default -- ResolveLevel decides "was anything
+	// chosen", never "is this choice sensible". Validation is a separate
+	// step, and conflating them here would silently rewrite an operator's
+	// input.
+	for _, tc := range []struct {
+		algo  streamrelay.Algo
+		given string
+		want  string
+	}{
+		{streamrelay.AlgoS2, "", "better"},
+		{streamrelay.AlgoS2, "best", "best"},
+		{streamrelay.AlgoS2, "default", "default"},
+		{streamrelay.AlgoZstd, "", "3"},
+		{streamrelay.AlgoZstd, "19", "19"},
+		{streamrelay.AlgoZstd, "better", "better"}, // kept, then refused by validation
+	} {
+		if got := streamrelay.ResolveLevel(tc.algo, tc.given); got != tc.want {
+			t.Errorf("ResolveLevel(%q, %q) = %q, want %q", tc.algo, tc.given, got, tc.want)
+		}
+	}
+}
+
+// The invariant the whole change exists for: whatever ResolveLevel returns
+// for an unset level must be ACCEPTED by that algorithm.
+//
+// This is the bug class, stated as a test. Before this, -compress-level
+// declared "3" and --help said so, which is a level s2 rejects outright --
+// so the one combination an operator reaches by typing bare -compress was
+// exactly the one the printed default would have broken. Anyone tempted to
+// give the flag a literal default again fails here.
+func TestResolvedDefaultLevelIsAcceptedByItsOwnAlgorithm(t *testing.T) {
+	for _, algo := range []streamrelay.Algo{streamrelay.AlgoS2, streamrelay.AlgoZstd} {
+		level := streamrelay.ResolveLevel(algo, "")
+		if _, err := streamrelay.NewEncoder(algo, io.Discard, level); err != nil {
+			t.Errorf("the default level %q for %q is not usable by its own encoder: %v", level, algo, err)
+		}
+	}
+}

@@ -27,8 +27,8 @@ import (
 	"sync/atomic"
 
 	"vmsync/pkg/remotessh"
-	"vmsync/pkg/trace"
 	"vmsync/pkg/streamrelay"
+	"vmsync/pkg/trace"
 )
 
 // ByteCounters tracks bytes actually sent/received over the SSH-tunneled
