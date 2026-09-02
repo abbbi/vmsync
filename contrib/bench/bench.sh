@@ -87,12 +87,16 @@ have run first -- each is safe to run standalone via --stages. Stage 4
 additionally requires the SOURCE domain to be running.
 
 Stage 5 (define) is NOT included by default -- pass --stages ...,define
-explicitly. Its first half (5a) leaves a throwaway domain on the target
-briefly to force a UUID collision; its second half (5b) runs one sync with
-vmsync's own -test=failure-define, making the target redefine fail so the
-rollback to the previous definition can be checked. Both are no more
-destructive to the target VM than -reinit already is, and neither touches
-host-level networking any more, but they are deliberate failure injection
+explicitly. 5a leaves a throwaway domain on the target briefly to force a
+UUID collision; 5b runs one sync with vmsync's own -test=failure-define,
+making the target redefine fail so the rollback to the previous definition
+can be checked; 5c then checks that the same rollback left vmsync's OWN
+metadata intact, which 5b's comparison deliberately excludes (vmsync rewrites
+that metadata mid-run, so comparing it raw made 5b a false failure) -- a
+restored definition whose checkpoint and replica_source were wiped is a
+replica the next sync cannot continue and a promotion cannot describe. All
+three are no more destructive to the target VM than -reinit already is, and
+none touches host-level networking, but they are deliberate failure injection
 rather than measurement. See this file's own Stage 5 comment.
 
 Stage 6 (failover) is also NOT included by default. It promotes the target,
@@ -1710,6 +1714,38 @@ domain_definition_xml() {
 # Handles both <metadata>...</metadata> and a self-closing <metadata/>, since
 # an empty element before the run and a populated one after it would
 # otherwise differ by that very line.
+# DEFINE_REQUIRED_META_FIELDS: the vmsync metadata fields
+# libvirtsync.UpdateSyncMetadata sets UNCONDITIONALLY on every target replica.
+#
+# A literal list rather than one derived from vmsync's own output, for the
+# same reason cmd/vmsync-agent's flag-vocabulary test keeps one: deriving both
+# sides from the same source would prove nothing. A field dropped from vmsync
+# without being dropped here is exactly what should fail.
+#
+# Deliberately excludes the conditional ones. replication_role,
+# source_stopped_at_sync and replica_written_at are each set or removed
+# depending on the run, so requiring them outright would make this stage fail
+# on a state that is perfectly correct.
+DEFINE_REQUIRED_META_FIELDS="last_checkpoint last_sync_timestamp failure_count replica_source checkpoint_at"
+
+# vmsync_meta_snapshot URI DOMAIN -> "field=value" lines for every field 5c
+# cares about, present or not.
+#
+# Absent fields are emitted with an empty value rather than skipped, so a
+# field that DISAPPEARS between two snapshots is a visible change rather than
+# a shorter list.
+vmsync_meta_snapshot() {
+	local uri="$1" domain="$2" f
+	for f in $DEFINE_REQUIRED_META_FIELDS replication_role replica_written_at; do
+		printf '%s=%s\n' "$f" "$(vmsync_meta_field "$uri" "$domain" "$f")"
+	done
+}
+
+# meta_snapshot_field SNAPSHOT FIELD -> that field's value out of a snapshot.
+meta_snapshot_field() {
+	printf '%s\n' "$1" | sed -n "s/^${2}=//p" | head -1
+}
+
 domain_definition_body() {
         domain_definition_xml "$1" "$2" | awk '
                 /^[[:space:]]*<metadata[[:space:]]*\/>[[:space:]]*$/ { next }
@@ -1839,6 +1875,9 @@ stage_define_domain_rollback() {
                 bench_sync define-rollback baseline -reinit
                 bench_sync define-rollback trigger -reinit "-test=$VMSYNC_TEST_FAILURE_DEFINE"
                 results_row "$CSV" define-rollback result DRYRUN "" "" "" "" "" "SKIP dry run"
+                # Called even here, so --dry-run lists every check this stage
+                # would perform rather than silently omitting 5c.
+                define_metadata_subtest "" ""
                 return 0
         fi
 
@@ -1861,6 +1900,13 @@ stage_define_domain_rollback() {
         xml_before="$(domain_definition_body "$TARGET_URI" "$TARGET_DOMAIN")"
         [ -n "$xml_before" ] || { warn "could not capture target domain XML before the rollback test -- aborting stage 5b"; return 1; }
 
+        # Captured here, in 5b's window, because 5c has to compare the state
+        # BEFORE the failed define against the state immediately after the
+        # rollback -- and 5b's own heal at the end of this function rewrites
+        # the metadata, so a check run afterwards could never see it.
+        local meta_before
+        meta_before="$(vmsync_meta_snapshot "$TARGET_URI" "$TARGET_DOMAIN")"
+
         # The target must already exist for this to test anything: DefineDomain
         # only undefines, and therefore only has something to roll back to,
         # when it does. The baseline above is what guarantees that.
@@ -1872,6 +1918,12 @@ stage_define_domain_rollback() {
 
         local xml_after
         xml_after="$(domain_definition_body "$TARGET_URI" "$TARGET_DOMAIN")"
+
+        # 5c, run here for the timing reason above. Its verdict is recorded
+        # under its own scenario name, so stripping <metadata> out of 5b's
+        # comparison cannot quietly take vmsync's metadata out of the stage's
+        # coverage along with it.
+        define_metadata_subtest "$meta_before" "$(vmsync_meta_snapshot "$TARGET_URI" "$TARGET_DOMAIN")"
 
         if [ "$RUN_RC" = 0 ]; then
                 warn "FAIL: -test=$VMSYNC_TEST_FAILURE_DEFINE was passed but the run still exited 0 -- the injected failure did not take effect. Is $VMSYNC_BIN old enough not to know the flag? See $RUN_LOG"
@@ -1918,6 +1970,86 @@ stage_define_domain_rollback() {
         # a target that looks synced and is not.
         heal_target define-rollback heal "$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")"
         return 0
+}
+
+# define_metadata_subtest BEFORE AFTER -- Stage 5c: vmsync's own metadata must
+# survive a rolled-back redefine.
+#
+# This exists because 5b deliberately stops looking at it. 5b compares the
+# domain DEFINITION with <metadata> stripped out, since vmsync rewrites its
+# own metadata mid-run and comparing it raw made 5b a guaranteed false
+# failure. But "not part of 5b's comparison" must not become "not tested at
+# all": the whole point of the rollback is that a failed redefine leaves the
+# replica exactly as usable as it was, and a replica whose vmsync metadata was
+# wiped is NOT usable -- the next sync cannot find its checkpoint, and
+# promotion has no record of what this domain is or what it was replicating.
+#
+# Four assertions, in the order their failures would matter:
+#
+#   1. The block still exists at all. The coarsest form of "the rollback did
+#      not delete it", and the one that would bite hardest.
+#   2. Every unconditionally-set field is still present.
+#   3. Those fields are UNCHANGED. This is the sharp one: they are written
+#      through DefineDomain, which 5b just made fail, so a run that committed
+#      them anyway would mean the failure was not atomic.
+#   4. replica_written_at is present, and is allowed to differ. vmsync records
+#      it BEFORE DefineDomain precisely so a run that wrote bytes and then
+#      failed still says so (F2) -- so a new value here is correct, and its
+#      ABSENCE would be the bug.
+define_metadata_subtest() {
+	local before="$1" after="$2" field bval aval
+	local failures=0 details=""
+
+	log "--- Stage 5c: vmsync metadata must survive the rolled-back redefine ---"
+
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" define-metadata result DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+
+	# The baseline sync must have produced metadata in the first place, or
+	# every assertion below passes vacuously against two empty snapshots.
+	for field in $DEFINE_REQUIRED_META_FIELDS; do
+		if [ -z "$(meta_snapshot_field "$before" "$field")" ]; then
+			warn "SKIP 5c: the baseline sync left no $field on the target, so there is no metadata whose survival could be tested. Check the baseline in $RUN_LOG"
+			results_row "$CSV" define-metadata result "" "" "" "" "" "" "SKIP no baseline metadata to test"
+			return 0
+		fi
+	done
+
+	if ! has_vmsync_metadata "$TARGET_URI" "$TARGET_DOMAIN"; then
+		warn "FAIL: the rollback left the target with NO vmsync metadata at all. The domain definition may be restored, but the replica is unusable: the next sync cannot find its checkpoint and a promotion has no record of what it was replicating. See $RUN_LOG"
+		results_row "$CSV" define-metadata result 1 "" "" "" "" "" "FAIL vmsync metadata deleted by the rollback"
+		return 0
+	fi
+
+	for field in $DEFINE_REQUIRED_META_FIELDS; do
+		bval="$(meta_snapshot_field "$before" "$field")"
+		aval="$(meta_snapshot_field "$after" "$field")"
+		if [ -z "$aval" ]; then
+			failures=$((failures + 1))
+			details="${details}${details:+; }$field disappeared"
+		elif [ "$aval" != "$bval" ]; then
+			# Written through DefineDomain, which failed -- so a changed
+			# value means the failed define committed part of its work.
+			failures=$((failures + 1))
+			details="${details}${details:+; }$field changed from '$bval' to '$aval' although the redefine failed"
+		fi
+	done
+
+	# Present, not unchanged: a new timestamp here is the correct outcome.
+	if [ -z "$(meta_snapshot_field "$after" replica_written_at)" ]; then
+		failures=$((failures + 1))
+		details="${details}${details:+; }replica_written_at is absent although this run wrote the replica disks -- the next run's out-of-band-write check may now refuse it"
+	fi
+
+	if [ "$failures" = 0 ]; then
+		log "   PASS: vmsync's metadata survived the rollback intact (${DEFINE_REQUIRED_META_FIELDS// /, } unchanged, replica_written_at recorded)"
+		results_row "$CSV" define-metadata result 0 "" "" "" "" "" "PASS vmsync metadata intact after rollback"
+	else
+		warn "FAIL: $failures problem(s) with vmsync's metadata after the rollback -- ${details}. See $RUN_LOG"
+		results_row "$CSV" define-metadata result 1 "" "" "" "" "" "FAIL ${details//,/;}"
+	fi
 }
 
 stage_define_domain() {
@@ -4675,7 +4807,7 @@ stage_pattern() {
 	checksum) printf '^checksum$' ;;
 	reinit) printf '^reinit-after-failures$' ;;
 	snapshot) printf '^ext-snapshot$' ;;
-	define) printf '^define-(uuid-collision|rollback|precondition)$' ;;
+	define) printf '^define-(uuid-collision|rollback|metadata|precondition)$' ;;
 	failover) printf '^failover$' ;;
 	fence-agent) printf '^fence-agent$' ;;
 	verify-long) printf '^verify-long$' ;;
@@ -4916,7 +5048,7 @@ generate_report() {
                 echo
                 echo "| test | phase | exit | wall (s) | notes |"
                 echo "|---|---|---|---|---|"
-                awk -F, 'NR>1 && ($1=="define-uuid-collision" || $1=="define-rollback") { printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $9 }' "$CSV"
+                awk -F, 'NR>1 && ($1=="define-uuid-collision" || $1=="define-rollback" || $1=="define-metadata") { printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $9 }' "$CSV"
                 echo
                 echo "## Stage 6: failover, fencing, and the way back"
                 echo
