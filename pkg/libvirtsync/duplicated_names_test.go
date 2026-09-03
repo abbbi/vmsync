@@ -50,6 +50,8 @@ func TestFailoverFieldNamesMatch(t *testing.T) {
 		{MetadataFieldLastSync, failover.FieldLastSync, "last_sync_timestamp"},
 		{MetadataFieldReplicaWrittenAt, failover.FieldReplicaWrittenAt, "replica_written_at"},
 		{MetadataFieldPendingCheckpoint, failover.FieldPendingCheckpoint, "pending_checkpoint"},
+		{MetadataFieldVerifyState, failover.FieldVerifyState, "verify_state"},
+		{MetadataFieldVerifyFailedAt, failover.FieldVerifyFailedAt, "verify_failed_at"},
 		{MetadataFieldFailureCount, failover.FieldFailureCount, "failure_count"},
 		{MetadataFieldPromotedAt, failover.FieldPromotedAt, "promoted_at"},
 		{MetadataFieldPromotedBy, failover.FieldPromotedBy, "promoted_by"},
@@ -85,6 +87,8 @@ func TestRestorePointFieldNamesMatch(t *testing.T) {
 		{MetadataFieldLastSync, restorepoint.FieldLastSync, "last_sync_timestamp"},
 		{MetadataFieldReplicaWrittenAt, restorepoint.FieldReplicaWrittenAt, "replica_written_at"},
 		{MetadataFieldPendingCheckpoint, restorepoint.FieldPendingCheckpoint, "pending_checkpoint"},
+		{MetadataFieldVerifyState, restorepoint.FieldVerifyState, "verify_state"},
+		{MetadataFieldVerifyFailedAt, restorepoint.FieldVerifyFailedAt, "verify_failed_at"},
 		{MetadataFieldFailureCount, restorepoint.FieldFailureCount, "failure_count"},
 		{MetadataFieldCheckpointAt, restorepoint.FieldCheckpointAt, "checkpoint_at"},
 		{MetadataFieldSourceStoppedAtSync, restorepoint.FieldSourceStoppedAtSync, "source_stopped_at_sync"},
@@ -96,6 +100,9 @@ func TestRestorePointFieldNamesMatch(t *testing.T) {
 		if c.mine != c.theirs {
 			t.Errorf("%s: libvirtsync says %q, pkg/restorepoint says %q", c.what, c.mine, c.theirs)
 		}
+	}
+	if VerifyStateFailed != failover.VerifyStateFailedValue {
+		t.Errorf("VerifyStateFailed = %q but failover.VerifyStateFailedValue = %q", VerifyStateFailed, failover.VerifyStateFailedValue)
 	}
 	if RolePaused != restorepoint.RolePausedValue {
 		t.Errorf("paused role: libvirtsync says %q, pkg/restorepoint says %q", RolePaused, restorepoint.RolePausedValue)

@@ -315,9 +315,47 @@ type syncConfig struct {
 	// removes the target DOMAIN, overrides the promoted/paused replication
 	// role interlock, and clears a shut-down source's checkpoint chain
 	// bitmaps and all. It never touches a RUNNING target.
-	ForceClean             bool
-	ReinitAfterFailures    int
-	Verify                 string
+	ForceClean          bool
+	ReinitAfterFailures int
+	// VerifyFailureReinit turns a -verify mismatch into one automatic repair
+	// attempt: recopy the replica in full, then verify it again. If that
+	// second verify also fails, the run stops and the replica is recorded as
+	// faulty (see MetadataFieldVerifyState) rather than being retried a third
+	// time.
+	//
+	// Opt-in, and it has to be. A mismatch is by definition the moment vmsync
+	// has been shown to be wrong about the replica, and the automatic response
+	// to that is to destroy the replica's disks and copy them again -- which
+	// is right when the cause was a bad write, and wrong when the cause was
+	// something that will corrupt the recopy too. An operator who has not
+	// asked for that should be told, not have it done for them.
+	//
+	// One attempt, never a loop. A ladder that retried would turn a stable
+	// hardware fault into an unbounded rewrite of the same disks, and each
+	// pass destroys the evidence the previous one produced. Two data points --
+	// "failed" and "failed again after a full recopy" -- is what distinguishes
+	// a transient write error from a real one, and a third adds nothing.
+	//
+	// It is also the flag TargetVerifyStateAllowsSync names as the way past a
+	// recorded failure, because it is the only path that recopies AND proves
+	// the result before clearing the record.
+	VerifyFailureReinit bool
+	// VerifyRepairAttempt marks THIS invocation as the repair pass, as
+	// distinct from VerifyFailureReinit, which only says a repair is
+	// permitted. The two are separate because they answer different
+	// questions and one run can have both, either, or neither:
+	// VerifyFailureReinit is policy read from the command line and is true
+	// for every run of a pair configured to self-repair, while this is a fact
+	// about the current process, set by the ladder in main() and never by a
+	// flag.
+	//
+	// It exists so the repair pass can be recognised where the difference
+	// matters -- the restore-point sweep must name the real reason it is
+	// keeping them, and the log must say plainly that this is the second and
+	// final attempt -- rather than being inferred from the policy flag, which
+	// would misreport an ordinary run of a self-repairing pair.
+	VerifyRepairAttempt bool
+	Verify              string
 	IgnoreExternalSnapshot bool
 	IODepth                int
 
@@ -408,6 +446,7 @@ func main() {
 	flag.StringVar(&cfg.ReplacedDiskAction, "replaced-disk-action", replacedDiskRename, fmt.Sprintf("What to do with a target disk file that is about to be discarded and rebuilt (currently only -reinit does this): %q renames it to <path>%s<unixtime> so its contents survive, %q removes it. Defaults to %q: the target of a reinit may be a former primary whose disks still hold everything written after the last successful sync, and that is unrecoverable once deleted. Renaming needs room for both copies, and the aside files are never reaped automatically", replacedDiskRename, replacedDiskSuffix, replacedDiskDelete, replacedDiskRename))
 	flag.StringVar(&cfg.TargetDiskOwner, "target-disk-owner", util.DiskOwnerAuto, fmt.Sprintf("Who should own the disk files created on the target: %q (default), %q, or an explicit \"user\", \"user:group\" or \":group\". vmsync creates those files by running qemu-img over SSH, so they are owned by that SSH user (root) -- while qemu runs as \"qemu\" on RHEL and \"libvirt-qemu\" on Debian, and cannot open a root-owned disk. libvirt's dynamic_ownership usually hides this, but it is off in plenty of deployments and cannot work at all on NFS with root_squash. %q preserves whatever owned the file before (which is what makes -reinit safe, since it replaces a correctly-owned disk with a fresh root-owned one) and otherwise takes what the target's libvirt qemu.conf sets; it never guesses, and warns instead. %q is the old behaviour", util.DiskOwnerAuto, util.DiskOwnerOff, util.DiskOwnerAuto, util.DiskOwnerOff))
 	flag.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "Reinit automatically after N failures (disabled by default). Count is held on target XML")
+	flag.BoolVar(&cfg.VerifyFailureReinit, "verify-failure-reinit", false, "When -verify finds the replica differing from its source, recopy it in full and verify it AGAIN, once. If the second verify also fails, the replica is recorded as faulty on its own domain XML: later syncs into it are refused, and a promotion reports it as untrustworthy, until a human clears it with another -verify-failure-reinit or discards the replica with -force-clean. Off by default, because the automatic response to \"the replica does not match\" is to destroy its disks and copy them again, which is right when the cause was a bad write and wrong when the cause will corrupt the recopy too. Never retried beyond that one attempt: \"failed, and failed again after a full recopy\" already distinguishes a transient error from a real one, and each pass destroys the previous one's evidence. Requires -verify")
 	flag.StringVar(&cfg.Retention, "retention", "", "Keep point-in-time copies of the replica on the target, as COUNT,INTERVAL -- for example 24,3h for twenty-four copies at least three hours apart, so a sync that faithfully replicated an already-damaged source can be stepped back from. The COUNT is the guarantee; the window it covers is not, because vmsync does not decide when it runs: the interval is a floor (\"take one if at least this long has passed\"), so a pair syncing every 4h gets 4h spacing and a pause leaves a gap. Copies are made with reflink, share storage with the replica, and cost almost nothing until they diverge -- but the target filesystem must support it (XFS with reflink=1, or btrfs), and this is refused at startup where it does not. Disabled by default")
 	flag.BoolVar(&cfg.ListRestorePoints, "list-restore-points", false, "List the restore points kept on the target and stop. Needs -target-uri and -target-disk-path; reads the target filesystem only, and touches neither the replica nor libvirt")
 	flag.StringVar(&cfg.CloneRestorePoint, "clone-restore-point", "", "Copy one restore point's disks to the directory given by -clone-to, and stop. Takes a tag from -list-restore-points. This is how to answer \"is that copy clean?\": boot a throwaway domain from the clone. It changes nothing about the replica, its metadata, or its role -- restoring in place is a different operation and is deliberately not this one")
@@ -701,6 +740,16 @@ func main() {
 			verifyModeFast, verifyModeFull, verifyModeQemuImg, cfg.Verify))
 		os.Exit(2)
 	}
+	// Refused rather than ignored. Ignoring it would leave an operator
+	// believing their replicas repair themselves automatically, which is
+	// exactly the belief that makes a silent no-op expensive: the flag would
+	// sit in a systemd unit for months and be discovered the night it was
+	// needed. It is also how a recorded failure gets cleared, so without
+	// -verify it could clear a finding it never re-proved.
+	if cfg.VerifyFailureReinit && cfg.Verify == "" {
+		trace.Error("invalid verify configuration", "error", errors.New("-verify-failure-reinit needs -verify: it reacts to a verification failure, and without a verification there is nothing for it to react to"))
+		os.Exit(2)
+	}
 
 	trace.SetDebug(cfg.Debug)
 
@@ -845,7 +894,33 @@ func main() {
 	// problem writing the failure counter, not a problem with the sync
 	// itself, and the sync's failure is already recorded in
 	// vmsync_sync_state).
-	if err := run(cfg); err != nil {
+	// Plain assignment, not ":=": err is already declared at this scope by the
+	// run-lock acquisition above.
+	err = run(cfg)
+	// The verify-failure ladder: one full recopy, one more verify, then stop.
+	//
+	// Placed here, around run() rather than inside it, because a repair IS an
+	// ordinary vmsync run -- a -reinit with -verify -- and the alternative is
+	// threading a second copy-and-compare through the middle of a function
+	// that has already set up, torn down and reported on one. run() takes its
+	// config by value, releases its target lock and unregisters its signal
+	// handler on return (defer targetLock.Close(), defer signal.Stop), so a
+	// second call starts from a clean slate. What it does NOT do is start over
+	// silently: the first attempt has already written its own metrics record
+	// and, if it found a mismatch, the finding on the target domain.
+	//
+	// Triggered on the error rather than on the folded verification outcome,
+	// which is a real if narrow asymmetry: on a multi-disk run where one disk
+	// mismatched and another failed for an unrelated reason, the drain may
+	// return the unrelated error, so the finding is recorded (correctly) but
+	// the ladder does not fire. That is the safe direction. A run that was
+	// both wrong about the data and broken in its mechanism is a poor
+	// candidate for an automatic full recopy, and the record left behind means
+	// the next scheduled run picks the repair up anyway.
+	if err != nil && cfg.VerifyFailureReinit && isVerifyMismatch(err) {
+		err = repairAfterVerifyFailure(cfg, err)
+	}
+	if err != nil {
 		// The target-side counterpart of the source-lock skip above, and it
 		// exits the same way for the same reason: nothing was touched, no
 		// failure counted, and (see run()'s metrics defer) no metrics record
@@ -876,7 +951,19 @@ func main() {
 		// is precisely the wrong response to one. A compare that could not
 		// run is NOT exempt -- that is a broken sync like any other. See
 		// isVerifyMismatch.
-		if cfg.ReinitAfterFailures > 0 && !isVerifyMismatch(err) && !errors.Is(err, libvirtsync.ErrRoleRefusesSync) {
+		//
+		// A recorded-verification-failure refusal is exempt for the role
+		// gate's reason exactly: it is an administrative state, the reinit this
+		// counter would force is refused by that same gate, so the count could
+		// only climb without ever triggering anything. Worse here than for a
+		// role, in fact -- a non-zero failure_count is itself reported by
+		// evidenceProblems, so the counter would pile a "may be stale" verdict
+		// on top of the "may be wrong" one that is the actual finding, and an
+		// operator reading the promotion assessment would see two problems
+		// where there is one. See ErrVerifyStateRefusesSync.
+		if cfg.ReinitAfterFailures > 0 && !isVerifyMismatch(err) &&
+			!errors.Is(err, libvirtsync.ErrRoleRefusesSync) &&
+			!errors.Is(err, libvirtsync.ErrVerifyStateRefusesSync) {
 			if count, rerr := libvirtsync.RecordTargetSyncFailure(cfg.TargetURI, cfg.TargetDomain); rerr != nil {
 				trace.Warning("failed to record sync failure in target metadata", "error", rerr)
 			} else {
@@ -1145,6 +1232,92 @@ func targetFileNewerThanSync(mtime, lastSync string, tolerance time.Duration) (n
 		tolerance = 0
 	}
 	return ahead > tolerance, ahead, nil
+}
+
+// repairLockRetries and repairLockWait cover one specific, self-inflicted
+// race: the first attempt's target-side run lock is held by a remote shell
+// blocking on stdin, and closing the SSH session (heldCommand.Close) does not
+// wait for that shell to exit. `flock -n` in the repair attempt can therefore
+// find the lock still held -- by its own predecessor, a moment after it let
+// go. run()'s startup does enough work before reaching the lock that this is
+// unlikely rather than routine, which is precisely why it must be handled
+// here: an intermittent "another vmsync is already working on this target"
+// after a corruption finding is the least debuggable outcome available.
+//
+// Small numbers on purpose. A channel teardown takes milliseconds, so if the
+// lock is still held after this it belongs to a genuinely different process
+// and waiting longer only delays reporting the finding.
+const (
+	repairLockRetries = 3
+	repairLockWait    = 2 * time.Second
+)
+
+// repairAfterVerifyFailure runs the second and final attempt: a full recopy
+// of the replica, verified again.
+//
+// firstErr is the mismatch that triggered it, and it is what comes back from
+// every path that does not end in a proven-good replica -- including the paths
+// where the repair could not be attempted at all. That is deliberate. The
+// operator's problem is that a replica did not match its source; a lock this
+// process could not take is at most an explanation for why nothing was done
+// about it, and returning that instead would hand main() an ErrLockHeld and
+// exit ExitBusy, reporting "stood down, nothing to see" for a run that found
+// corruption. Wrapped with %w so isVerifyMismatch still classifies it and the
+// finding stays exempt from failure_count.
+//
+// Returns nil only when the repair completed AND its own -verify passed, at
+// which point run()'s UpdateSyncMetadata has already removed the recorded
+// finding as part of an ordinary successful sync.
+func repairAfterVerifyFailure(cfg syncConfig, firstErr error) error {
+	trace.Error("-verify-failure-reinit: verification found this replica differing from its source, attempting ONE full recopy and a second verification",
+		"vm", cfg.TargetDomain, "finding", firstErr.Error(),
+		"note", "the replica's current disks are kept according to -replaced-disk-action (renamed aside by default), and its restore points are kept regardless, because they predate the finding")
+
+	cfg.Reinit = true
+	// Not "nobody asked for this" in the literal sense -- somebody passed
+	// -verify-failure-reinit -- but the flag's actual job is to stop a reinit
+	// discarding the restore points, and here that matters more than anywhere
+	// else it fires: those copies predate a replica now known to be wrong, so
+	// they are the only candidates for a clean one. See
+	// sweepRestorePointsForReinit.
+	cfg.ReinitAutomatic = true
+	cfg.VerifyRepairAttempt = true
+
+	var err error
+	for attempt := 1; ; attempt++ {
+		err = run(cfg)
+		if !errors.Is(err, util.ErrLockHeld) || attempt >= repairLockRetries {
+			break
+		}
+		trace.Warning("-verify-failure-reinit: the target-side run lock is still held, most likely by the failed attempt's own lock holder not having exited yet; retrying",
+			"vm", cfg.TargetDomain, "attempt", attempt, "of", repairLockRetries, "waiting", repairLockWait.String())
+		time.Sleep(repairLockWait)
+	}
+
+	switch {
+	case err == nil:
+		trace.Info("-verify-failure-reinit: the full recopy verified clean, so the recorded verification failure has been cleared and this replica is trustworthy again",
+			"vm", cfg.TargetDomain)
+		return nil
+	case isVerifyMismatch(err):
+		// The whole point of the ladder. Two independent copies of the same
+		// source produced a replica that did not match it, which is no longer
+		// consistent with a transient write error. Not retried a third time:
+		// each pass destroys the previous one's evidence, and a stable fault
+		// would be rewritten forever.
+		trace.Error("-verify-failure-reinit: the replica FAILED verification AGAIN after a full recopy -- this is not a transient write error, and vmsync will not try a third time. Replication into this domain is now refused until a human intervenes",
+			"vm", cfg.TargetDomain, "first", firstErr.Error(), "second", err.Error(),
+			"next", "compare the two runs' compare output for whether the same blocks differed; check the target's storage first, then the source's. -force-clean discards the replica and starts over once the cause is known")
+		return fmt.Errorf("the replica failed verification, and failed it again after a full recopy: %w (the recopy reported: %v)", firstErr, err)
+	default:
+		// The repair could not be carried out -- the copy itself broke, the
+		// lock was held, the target went away. Says nothing new about the
+		// data, so the original finding is what is reported, and the record
+		// on the target is already there to make the next run try again.
+		trace.Error("-verify-failure-reinit: the repair attempt could not be completed, so the replica remains recorded as having failed verification; the next run will attempt the repair again",
+			"vm", cfg.TargetDomain, "finding", firstErr.Error(), "repair_error", err.Error())
+		return fmt.Errorf("the replica failed verification and the repair attempt could not be completed: %w (the repair attempt reported: %v)", firstErr, err)
+	}
 }
 
 // isVerifyMismatch reports whether err is a verification that RAN and found
@@ -1980,6 +2153,59 @@ func run(cfg syncConfig) (runErr error) {
 		trace.Debug("target replication role permits this sync", "vm", cfg.TargetDomain, "role", targetRole)
 	}
 
+	// The verification interlock, immediately after the role one and for the
+	// same structural reason: before -reinit's disk removal, before anything
+	// writes to the target.
+	//
+	// Refusing is what gives the finding a lifetime. A successful sync
+	// rebuilds the target's definition from the SOURCE's XML, so an ordinary
+	// incremental tonight would silently erase a mismatch recorded this
+	// morning and hand the next promotion a replica with a clean record. See
+	// TargetVerifyStateAllowsSync for why a plain -reinit is refused too.
+	targetVerifyState, targetVerifyFailedAt, err := libvirtsync.ReadVerifyState(tgtMgr, cfg.TargetDomain)
+	if err != nil {
+		return fmt.Errorf("read target domain verification state: %w", err)
+	}
+	if err := libvirtsync.TargetVerifyStateAllowsSync(targetVerifyState, targetVerifyFailedAt); err != nil {
+		switch {
+		case cfg.VerifyFailureReinit:
+			// The designed recovery. What clears the record is the -verify at
+			// the end of THIS run passing, and nothing else: the record is
+			// removed by UpdateSyncMetadata, which only runs on a fully
+			// successful sync, so a run that copies and then fails to verify
+			// leaves the finding exactly where it was (and rewrites it with a
+			// fresh timestamp).
+			//
+			// Note this permits an ordinary INCREMENTAL past the refusal, not
+			// only the ladder's recopy, and that is deliberate rather than an
+			// oversight: -verify compares the whole image against the source,
+			// not just the extents this run happened to write, so an
+			// incremental that verifies clean has proven the entire replica
+			// matches. For a pair configured to self-repair, tonight's
+			// ordinary run can therefore clear yesterday's finding on its own
+			// -- and the expensive full recopy is spent only when a verify
+			// genuinely fails again.
+			what := "this run must pass -verify before the record is cleared"
+			if cfg.VerifyRepairAttempt {
+				what = "this is the repair pass: a full recopy, which must itself pass -verify before the record is cleared"
+			}
+			trace.Warning("-verify-failure-reinit: proceeding past a recorded verification failure -- "+what,
+				"vm", cfg.TargetDomain, "finding", err.Error())
+		case cfg.ForceClean:
+			// The blunt override, allowed for the same reason it overrides a
+			// promoted/paused role: -force-clean's entire purpose is getting
+			// out of a state an ordinary run must not blunder into. Logged as
+			// an ERROR, not a warning -- this is the one path that throws away
+			// a finding about real data without replacing it with a new one,
+			// so if a promotion later goes wrong this line is what explains
+			// why nothing warned about it.
+			trace.Error("-force-clean: DISCARDING a recorded verification failure without re-verifying; this replica's contents were known not to match its source, and after this run nothing will say so",
+				"vm", cfg.TargetDomain, "finding", err.Error())
+		default:
+			return fmt.Errorf("refusing to sync into %s: %w", cfg.TargetDomain, err)
+		}
+	}
+
 	srcDom, err := srcMgr.LookupDomain(cfg.SourceDomain)
 	if err != nil {
 		return err
@@ -2306,6 +2532,54 @@ func run(cfg syncConfig) (runErr error) {
 			trace.Warning("could not record when this run wrote the replica disks; if this run fails, the next one's out-of-band-write check may refuse it",
 				"trigger", trigger, "vm", cfg.TargetDomain, "error", err)
 		}
+	}
+
+	// recordVerifyFailure persists the one finding in this program that has to
+	// outlive the process: a comparison that RAN and found the replica's
+	// contents differing from the source's.
+	//
+	// Everything else vmsync learns about a failed run is recoverable by
+	// running it again -- a dropped ssh connection, a busy target, a wedged
+	// export. This is not. The bytes on the replica are wrong, running again
+	// does not by itself establish that they stopped being wrong, and the next
+	// promotion has no way to find out. Hence a record on the target itself,
+	// read back by TargetVerifyStateAllowsSync (which refuses the next sync)
+	// and by failover.evidenceProblems (which refuses the promotion).
+	//
+	// Only the verdict, deliberately. Which blocks differed is already in this
+	// run's log, in far more detail than a metadata field could hold, and
+	// duplicating it here would create a second copy to keep honest across
+	// reinits and restores. The log is the diagnosis; this is the flag.
+	//
+	// A write failure here is returned, not warned about: unlike
+	// recordReplicaWrittenAt -- whose worst case is a spurious out-of-band-write
+	// refusal on the next run, which is conservative -- failing to write THIS
+	// leaves a known-bad replica indistinguishable from a good one.
+	recordVerifyFailure := func() error {
+		exists, err := libvirtsync.DomainExists(tgtMgr.Conn, cfg.TargetDomain)
+		if err != nil {
+			return fmt.Errorf("check whether target domain %s exists in order to record the verification failure: %w", cfg.TargetDomain, err)
+		}
+		if !exists {
+			// A first full sync that failed verify: the run never reached
+			// DefineDomain, so there is no replica definition for a promotion
+			// to pick up and nothing to warn it away from. The disks that were
+			// written are orphans with no domain pointing at them.
+			trace.Warning("verification failed on a target domain that does not exist yet, so the finding cannot be recorded on it; the next run will sync from scratch regardless",
+				"vm", cfg.TargetDomain)
+			return nil
+		}
+		if err := libvirtsync.SetDomainMetadataFields(tgtMgr, cfg.TargetDomain, map[string]string{
+			libvirtsync.MetadataFieldVerifyState:    libvirtsync.VerifyStateFailed,
+			libvirtsync.MetadataFieldVerifyFailedAt: strconv.FormatInt(time.Now().Unix(), 10),
+		}); err != nil {
+			return err
+		}
+		trace.Error("recorded a verification FAILURE on the target: this replica's contents do not match its source, so it is not trustworthy for a promotion and vmsync will refuse to sync into it until the finding is cleared",
+			"vm", cfg.TargetDomain,
+			"evidence", "the compare output earlier in this log names the blocks that differed; this record holds only the verdict",
+			"recovery", "-verify-failure-reinit recopies and then re-verifies before clearing this; -force-clean discards the replica outright")
+		return nil
 	}
 
 	cleanupSourceBridge := func(trigger string) {
@@ -4547,10 +4821,53 @@ func run(cfg syncConfig) (runErr error) {
 	replicaWrittenAt := measureReplicaWrittenAt("post-copy")
 	recordReplicaWrittenAt("post-copy", replicaWrittenAt)
 
+	// Written here for the same reason recordReplicaWrittenAt is: the drain
+	// below returns on the first worker error, and a verify mismatch IS one of
+	// those errors. Recording after the drain would mean never recording it.
+	//
+	// Keyed on verificationOutcome rather than on the error about to escape,
+	// because those are not the same question -- the folded outcome
+	// distinguishes a compare that ran and found a difference from one that
+	// could not run at all, which is exactly the distinction that must not be
+	// persisted as a verdict about the data. Same predicate the metric uses,
+	// so a run that reports vmsync_verification_state=1 is precisely a run
+	// that leaves this record behind.
+	//
+	// A pre-commit checksum mismatch deliberately does NOT land here. It
+	// aborts before the commit, so the base still holds the previous
+	// generation: that replica is stale, not wrong, and condemning it would
+	// refuse every future sync over something that was never damaged. The one
+	// case where a checksum failure can leave the base half-written is a commit
+	// that itself failed, and that path leaves the overlay in place on purpose
+	// -- which evidenceProblems already distrusts.
+	metricsMu.Lock()
+	verifyMismatched := verificationOutcome == metrics.CheckStateMismatch
+	metricsMu.Unlock()
+	var verifyRecordErr error
+	if verifyMismatched {
+		verifyRecordErr = recordVerifyFailure()
+	}
+
 	for err := range errCh {
 		if err != nil {
+			if verifyRecordErr != nil {
+				// Both facts in one message. The mismatch tells the operator
+				// the replica is wrong; this tells them nothing will stop the
+				// next sync from overwriting the evidence and moving on.
+				return fmt.Errorf("%w -- AND the verification failure could not be recorded on the target (%v), so no future run will refuse to sync into this replica on account of it: treat it as untrustworthy until it has been verified again", err, verifyRecordErr)
+			}
 			return err
 		}
+	}
+	if verifyRecordErr != nil {
+		// Unreachable as written: verificationOutcome reaches Mismatch only via
+		// runVerify's deferred fold, which runs on a path that also returns the
+		// error, so the drain above has already returned. Kept because the
+		// consequence of the invariant breaking is not a lost log line -- it is
+		// falling through to the redefine below, which rebuilds the target's
+		// definition from the SOURCE's XML and would erase the very finding
+		// this run just failed to write.
+		return fmt.Errorf("verification found this replica differing from its source, and the finding could not be recorded on the target: %w -- refusing to continue, because completing this run would redefine the target and discard the finding", verifyRecordErr)
 	}
 
 	// Every disk finished copying (and verifying, if requested) without

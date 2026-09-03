@@ -200,7 +200,11 @@ TAMPER_LENGTH=4096
 # final heal -- 64 with these defaults, three of them full resyncs. Trim
 # VERIFY_LONG_MODES to a single mode if that is too much for one sitting.
 VERIFY_LONG_COPIES=20
-VERIFY_LONG_MODES="compare fast online"
+# fast/full/qemu-img -- the names -verify actually takes. This line used to say
+# "compare fast online", two of which were renamed out of vmsync some time ago,
+# and bench.sh validates the list at startup: copying this file as the missing-
+# config error tells you to therefore died on its own example.
+VERIFY_LONG_MODES="fast full qemu-img"
 
 # --- dirtying the guest's own disk ------------------------------------------
 #

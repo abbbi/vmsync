@@ -192,6 +192,17 @@ perfectly controlled; if you need a fixed, reproducible incremental
 workload, write a known amount of data from inside the guest yourself
 between runs.
 
+Stage 1 passes **`-no-checksum`** on every cell. The pre-commit integrity
+check is on by default whenever a matching `vmsync-bridge-helper` is on the
+target — which, on any host this matrix can run on, is always, since the
+compressed cells need that same binary. Left enabled it would add a
+`qemu-nbd` start, a local read of every written byte on the target, a hash
+and a stop to each of the stage's invocations: enough to inflate a `-reinit`
+cell by roughly a disk-sized target read, and to mix the cost of an integrity
+check into numbers whose whole purpose is comparing *transport* settings
+against each other and against previous runs of this same matrix. The check
+gets its own stage instead (see Stage 13).
+
 **Stage 2 (verify + tamper)** runs *four* sub-tests, not three, because two
 different protections are involved and conflating them is how this stage
 spent a long time reporting `PASS` without ever exercising `-verify` at all.
@@ -209,12 +220,41 @@ The two checks cover disjoint threats, so both are now tested by name:
 - **`verify-guard`** tampers and leaves the mtime alone, asserting the guard
   refuses the sync *and* that no verification metric was emitted. That is
   the "somebody wrote to the replica through the filesystem" case.
-- **`verify-compare` / `verify-fast` / `verify-online`** tamper, restore the
-  original mtime, and assert the compare ran and reported a mismatch. That
-  is the "contents diverged with nothing visible at the filesystem layer"
-  case — a bad sector, a silent write error, a scrub miscompare. **Bit rot
-  does not touch mtime**, so restoring it is not a way around the guard; it
-  is the only way to construct the scenario `-verify` exists for.
+- **`verify-fast` / `verify-full` / `verify-qemu-img`** each tamper, restore
+  the original mtime, and assert the compare ran and reported a mismatch.
+  That is the "contents diverged with nothing visible at the filesystem
+  layer" case — a bad sector, a silent write error, a scrub miscompare.
+  **Bit rot does not touch mtime**, so restoring it is not a way around the
+  guard; it is the only way to construct the scenario `-verify` exists for.
+  Each gets its own tamper at its own random offset, so repeated runs sample
+  the disk broadly.
+- **`verify-fast-bytes`** and **`verify-full-bytes`** repeat `fast` and `full`
+  with `-no-checksum`, because `-verify=fast`/`full` now have **two**
+  implementations behind them. When a matching helper is on the target the
+  digest exchange runs (vmsync hashes the source, the helper hashes the
+  target, only digests cross the wire); with `-no-checksum` the original byte
+  comparators `CompareTCP`/`CompareTCPCollect` run instead. Since
+  `bench_sync` passes `-compress`, the loop above always reaches the digest
+  path — so without these two the byte comparators would be exercised by
+  nothing at all. `qemu-img` is deliberately not repeated: it shells out to a
+  separate implementation and is unaffected by checksumming either way, so a
+  second run would spend a tamper cycle testing the same code twice.
+- **`verify-cross`** tampers **once** and asks all three modes about that
+  same corrupted replica, asserting they agree. This is the one that tests
+  the comparator rather than the modes: `fast` and `full` read through
+  vmsync's own code, which skips ranges both sides report as
+  `NBD_STATE_ZERO`, while `qemu-img` reads every byte in an implementation
+  vmsync did not write. `qemu-img` is therefore an *oracle* for that skip
+  logic — but only when all three are asked about identical bytes, which the
+  per-mode loop above deliberately does not do. `fast`/`full` reporting clean
+  while `qemu-img` reports a mismatch means the skip is dropping real
+  differences: a verify that passes over corruption, which is worse than no
+  verify at all.
+- **`verify-oracle`** is the other half: after the heal, an independent
+  full-image `qemu-img` comparison of a freshly resynced replica, asserting
+  it is clean. Catches a copy path producing a subtly wrong replica in a
+  region vmsync's own verify happens to skip — where both halves of vmsync
+  would agree the replica is fine and only an outside reader would notice.
 
 The verify sub-tests key on `vmsync_verification_state`, which vmsync emits
 only for a run that actually reached its compare. Its *presence* answers
@@ -225,19 +265,17 @@ All three modes run against an
 identically-configured baseline sync, so they are directly comparable
 to each other regardless of whatever Stage 1 scenario ran last — see
 [Transport](#transport-every-stage-but-the-matrix) for what that
-configuration is. One
-caveat specific to `-verify=online`: unlike `compare`/`fast`, it never
-suspends the source, and cross-references any mismatch it finds against
-what the guest wrote to the *source* during the compare window, discarding
-mismatches inside touched regions as inconclusive rather than failing on
-them. Since this harness tampers the *target* independently of source
-guest activity, that reconciliation should not swallow it — but if the
-running guest happens to legitimately rewrite the exact same region during
-that window, `-verify=online` could correctly and legitimately report no
-mismatch this round. `bench.conf`'s tamper band should sit somewhere
-the guest is unlikely to be actively rewriting, to keep this rare; the
-harness logs a specific warning distinguishing this from an actual
-detection bug when it happens.
+configuration is. There is no
+mode-specific caveat here any more. All three modes compare the target
+against the same frozen source snapshot the copy read from, so a reported
+difference cannot be explained away by guest activity and no mode discards
+one. A tamper that goes undetected is a real miss, whichever mode was
+running.
+
+(This paragraph used to carry a long warning about `-verify=full`
+reconciling mismatches against a dirty bitmap and legitimately reporting
+nothing if the guest rewrote the tampered region. That reconciliation is
+gone, along with the mode name.)
 
 ### Where the corruption goes
 
@@ -256,14 +294,18 @@ hashed with `md5sum` rather than using `$RANDOM` or `awk`'s `srand()`,
 neither of which is reproducible across hosts or implementations — and a
 failure you cannot replay is one you cannot investigate.
 
-`TAMPER_LENGTH_MIN` defaults to 64KiB, and that floor is arithmetic rather
-than caution. vmsync reports mismatches at a 4096-byte granularity, so
-anything smaller than that is indistinguishable from a 4KiB tamper. Above
-that, `-verify=online` discards a whole reported range when *any* byte of it
-overlaps a region the guest wrote during the compare window, and those
-regions come from a dirty bitmap at qemu's default 64KiB granularity — so a
-tamper smaller than one granule can be swallowed whole by an unrelated guest
-write and read as "verify missed it".
+`TAMPER_LENGTH_MIN` defaults to 64KiB. The hard part of that floor is
+arithmetic: vmsync reports mismatches at a 4096-byte granularity, so
+anything smaller is indistinguishable from a 4KiB tamper and buys no
+coverage.
+
+The 64KiB figure itself is now convention rather than necessity. It came
+from the dirty-bitmap reconciliation `-verify=full` used to do, which
+discarded a reported range that overlapped anything the guest had written,
+at qemu's default 64KiB bitmap granularity — so a smaller tamper could be
+swallowed whole. No mode reconciles against a bitmap any more. The floor
+stays because corruption at bitmap granularity is the more realistic shape
+to test, not because a smaller tamper would be missed.
 
 Set `TAMPER_MODE=fixed` to go back to a single `TAMPER_OFFSET`/`TAMPER_LENGTH`.
 
@@ -289,8 +331,35 @@ source disk. Unlike every other stage, this one requires the **source**
 domain to be running (removing an external snapshot via a live
 `blockcommit --active --pivot` is itself a running-domain operation, and
 it's also vmsync's own realistic use case of replicating a live VM) — it
-refuses to run, with a clear message, against a source that isn't. The
-sequence is: a baseline full sync (`-reinit`); create a real external
+refuses to run, with a clear message, against a source that isn't.
+
+It also refuses to run against a source disk that is not already **flat**,
+recorded as the `ext-snapshot/precondition` row. Its cleanup step runs
+`blockcommit --active --pivot` with neither `--base` nor `--top`, so `base`
+defaults to the bottom of the chain: everything is committed into the base
+image and the domain pivots there. Against the single overlay this stage
+creates itself that is exactly the intended behaviour; against a chain
+somebody else created it would flatten their snapshot structure with no
+undo. So the stage aborts, without touching anything, when the source disk
+already has a backing chain, when the source is currently running on a
+leftover `vmsync-bench-extsnap-*` overlay (an earlier stage 4 that died
+between `snapshot-create-as` and `blockcommit`), or when stale bench
+snapshot metadata is still registered on the domain. Each case prints the
+exact `virsh` command that resolves it.
+
+Leftover overlay **files** are only reported, never removed: once those
+checks have established the live disk is flat, nothing in the source
+domain's chain references them. They are still named in the warning,
+because the overlay filename is derived from the bench PID and a recycled
+PID would make `snapshot-create-as` collide with one — and because the
+stage's own cleanup deletes only the overlay it created, rather than
+guessing at ownership of files on a shared host. Clear them by hand:
+
+```bash
+rm -f /path/to/images/*.vmsync-bench-extsnap-*
+```
+
+The sequence is: a baseline full sync (`-reinit`); create a real external
 disk-only snapshot on the source (`virsh snapshot-create-as
 --disk-only --atomic`); sync+verify while it exists, checking three
 things — the sync/verify itself still succeeds, vmsync actually saw the
@@ -340,10 +409,58 @@ before this stage existed, nothing exercised it end to end. Two sub-tests:
   closure compiles. The stage then checks that the run failed, that vmsync
   logged restoring the previous definition, and that the target's
   definition (`virsh dumpxml --inactive`) is byte-identical to what it was
-  before.
+  before — **with the `<metadata>` element excluded from that comparison**.
 
   That last check is the one that matters: a replica defined from a
   half-restored document is one that boots wrong on the day it is promoted.
+
+  **Why metadata is excluded.** vmsync records `replica_written_at` on the
+  target after the copy and *before* `DefineDomain` runs, deliberately: that
+  field exists so a run which wrote bytes and then failed still says so,
+  which is what keeps the next run's out-of-band-write check from wedging.
+  So on a `-test=failure-define` run the target's metadata legitimately
+  differs from a snapshot taken outside vmsync, and the rollback correctly
+  restores the state that includes it. Comparing the raw dumps therefore made
+  5b a *guaranteed* false failure from the moment that field was added — the
+  rollback was right and the assertion was comparing against a document that
+  had already, deliberately, ceased to exist. What 5b asserts now is the
+  domain **definition**: disks, devices, uuid, name — the things a promoted
+  replica actually boots from. When a difference does survive the strip, both
+  documents are written to `logs/define-rollback.xml-{before,after}` and the
+  diff is printed, rather than the old advice to "diff the two dumps by hand"
+  with nothing on disk to diff.
+
+- **5c** is the other half of that exclusion, and exists so it cannot become
+  a blind spot. "Not part of 5b's comparison" must not mean "not tested": the
+  point of the rollback is that a failed redefine leaves the replica as
+  usable as it was, and a replica whose vmsync metadata was wiped is **not**
+  usable — the next sync cannot find its checkpoint, and a promotion has no
+  record of what the domain is or what it was replicating.
+
+  It runs inside 5b's window, between the failed redefine and 5b's healing
+  resync (which would otherwise rewrite the metadata before anything could
+  look at it), and asserts four things in the order their failures would
+  matter:
+
+  1. a vmsync metadata block still exists at all;
+  2. every unconditionally-set field is still present
+     (`last_checkpoint`, `last_sync_timestamp`, `failure_count`,
+     `replica_source`, `checkpoint_at`);
+  3. those fields are **unchanged** — the sharp one, since they are written
+     *through* `DefineDomain`, so a committed change would mean the injected
+     failure was not atomic;
+  4. `replica_written_at` is **present**, and is allowed to differ. A new
+     value is the correct outcome; its absence is the bug.
+
+  The required-field list is a literal in `bench.sh`, not derived from
+  vmsync's output — deriving both sides from one source would prove nothing,
+  and a field dropped from vmsync without being dropped here is exactly what
+  should fail. Conditional fields (`replication_role`,
+  `source_stopped_at_sync`) are deliberately not required, since each is set
+  or removed depending on the run.
+
+  If the baseline sync left no metadata to begin with, 5c reports `SKIP`
+  rather than passing vacuously against two empty snapshots.
 
   **Why fault injection rather than breaking something externally.** 5b
   used to watch the log for the undefine and then cut the target's SSH with
@@ -710,6 +827,110 @@ a replication **target**, which is worse to leave behind than a promoted target
 — every later stage and every scheduled run in the estate syncs *from* that
 domain. The trap clears both ends' metadata and heals with a full resync, but
 the risk is real enough to be asked for rather than assumed.
+
+### Stage 13 (`checksum`), opt-in
+
+The pre-commit integrity check hashes every chunk the copy reads, has
+`vmsync-bridge-helper` hash the same ranges back off the target, and refuses
+to commit an incremental sync's overlay if they disagree. It is **on by
+default** whenever a matching helper is present.
+
+That default is what makes a negative test essential rather than nice to
+have: **a check that silently never fires is indistinguishable from a check
+that works**, and every other stage in this harness would keep reporting
+`PASS` either way.
+
+Corrupting the data itself is not an option. The check reads the target back
+between the copy and the commit, inside one vmsync process, so there is no
+moment an outside tamper could land in. What *can* be substituted is the
+helper — vmsync invokes it by path — so this stage installs a wrapper script
+on the target that runs the real binary and then edits its reply. That
+exercises the whole comparison (request, response, header check, digest
+comparison, failure handling) without needing a fault injected into vmsync.
+
+Four sub-tests:
+
+- **`clean`** — an ordinary incremental must report that the check *ran and
+  matched*. The load-bearing one: if the check is silently off (no helper, a
+  version mismatch), the three below would pass for the wrong reason. It
+  reports `SKIP` rather than `PASS` when there was no drift to hash, so the
+  pass keeps meaning something.
+- **`mismatch`** — a helper reporting one falsified digest must fail the run,
+  the overlay must be **gone**, and the base image must be unchanged. One
+  wrong block rather than wholesale corruption, because a single block is
+  what a real bad write looks like and is the case a weak check would miss.
+- **`stale`** — a helper too old to emit the format header must be reported
+  as **version skew, not corruption**. The most consequential distinction in
+  the feature: both failures stop the run, so an exit-code check would pass
+  either way. What matters is the conclusion an operator draws — told "skew"
+  they redeploy a binary; told "your replica does not match" they may reinit
+  a perfectly good 50 GiB VM on evidence that was never about the data.
+- **`off`** — `-no-checksum` must genuinely skip the check, so the escape
+  hatch is real rather than a no-op.
+
+Not in the default stage list: `mismatch` deliberately fails a sync, and all
+four temporarily install helper shims under `/tmp` on the target host (removed
+on the way out, whichever way the stage ends).
+
+Preflight now also reports the helper's path and version, and warns when it is
+missing or version-skewed — because in that state the check is skipped on
+every run in the report, and only Stage 13a would otherwise notice.
+
+### Stage 14 (`verify-failure`), opt-in
+
+Stage 2 proves `-verify` **notices** a corrupted replica. This stage proves the
+notice **outlives the process that made it**, which is a different property and
+the one that actually protects an estate.
+
+The gap it closes: a successful sync rebuilds the target's definition from the
+*source's* XML, so every target-only field it does not explicitly write is
+lost. A mismatch found at 02:00 was therefore erased by the ordinary
+incremental at 03:00, and the promotion at 09:00 saw a replica with a clean
+record. Nothing was untrue — the finding was in a log — but nothing that
+*decides* anything could see it.
+
+Four assertions, in the order the state moves:
+
+- **`mismatch`** — the finding must be written to the target domain as
+  `verify_state=failed` plus a `verify_failed_at` unix timestamp. The
+  load-bearing sub-test: with nothing recorded, the two refusals below would
+  "pass" by refusing nothing, and the stage would certify an interlock that
+  does not exist.
+- **`refuse-sync`** — an ordinary sync must be **refused** while the record
+  stands, the refusal must not consume the record, and it must **not** count
+  toward `-reinit-after-failures`. The exemption matters for a reason easy to
+  miss: a non-zero failure count is itself reported by a promotion assessment,
+  so counting this would stack a *may be stale* verdict on top of the *may be
+  wrong* one that is the real finding.
+- **`refuse-reinit`** — a plain `-reinit` must be refused **too**. The
+  non-obvious half: a reinit does recopy every byte, so it looks like a repair,
+  but it never verifies the result — permitting it would take the domain from
+  *known bad* to *assumed good, unverified* while deleting the record that said
+  otherwise.
+- **`repair`** — `-verify-failure-reinit` must recopy, re-verify, and clear the
+  record only on a **passing** verify. This one drives the whole ladder
+  unaided: the run it starts is an *incremental*, which copies only what the
+  source's dirty bitmap says changed, and the source never wrote to the
+  tampered offset — so this run's own verify fails, and the recopy-and-
+  re-verify fires for real.
+
+Not in the default stage list: three of the four sub-tests deliberately fail a
+sync. Its baseline is `-force-clean` rather than `-reinit`, because a re-run
+after a previous attempt left a record behind would otherwise be refused by the
+very interlock under test.
+
+**Not covered**, deliberately: the branch where the repair's own verify *also*
+fails, so vmsync gives up and leaves the replica faulty. The tamper this stage
+uses is healed by the very recopy the repair performs, so the second verify
+passes — that is the `repair` sub-test. Reaching the give-up branch would need
+a `-test` fault able to force a corruption verdict, and no verify fault exists
+today (only `failure-define`).
+
+One consequence worth knowing: `heal_target`, which undoes every tamper in this
+harness, now uses `-force-clean` rather than `-reinit`, because every tamper
+sub-test leaves a `verify_state` record behind and a plain `-reinit` is refused.
+That means the heal path no longer exercises the refusal — which is exactly why
+Stage 14 asserts it rather than assuming it.
 
 ## Files
 

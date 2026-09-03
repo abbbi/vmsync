@@ -68,23 +68,26 @@ Options:
                              4  snapshot     11  invert
                              5  define       12  wedge
                              6  failover     13  checksum
-                             7  fence-agent
+                             7  fence-agent  14  verify-failure
                            Runs in whichever order LIST gives them, not a
                            fixed canonical one.
                            (default: matrix,verify,reinit,snapshot,retention;
                            retention is last because it reinitialises the
                            target, and it skips cleanly where the target
                            filesystem cannot reflink. define, failover,
-                           fence-agent, verify-long, restore, invert, wedge
-                           and checksum are opt-in, see below)
+                           fence-agent, verify-long, restore, invert, wedge,
+                           checksum and verify-failure are opt-in, see below)
   --dry-run               print every vmsync command line; touch nothing
                            (no ssh/qemu-io/vmsync calls actually made)
   -h, --help              this text
 
-Stages 2, 3, 4, 9, 10, 11 and 13 each start with their own baseline -reinit
-full sync, so none of them actually require Stage 1 (or any prior sync) to
-have run first -- each is safe to run standalone via --stages. Stage 4
-additionally requires the SOURCE domain to be running.
+Stages 2, 3, 4, 9, 10, 11, 13 and 14 each start with their own baseline full
+sync, so none of them actually require Stage 1 (or any prior sync) to have run
+first -- each is safe to run standalone via --stages. Stage 4 additionally
+requires the SOURCE domain to be running. (Stage 14's baseline is -force-clean
+rather than -reinit, because a re-run after a previous attempt left a
+verification failure recorded would otherwise be refused by the very interlock
+it tests.)
 
 Stage 5 (define) is NOT included by default -- pass --stages ...,define
 explicitly. 5a leaves a throwaway domain on the target briefly to force a
@@ -162,6 +165,23 @@ whichever way the stage ends. It is opt-in because one sub-test deliberately
 fails a sync, and because it substitutes the helper binary vmsync is pointed
 at. Stage 1 passes -no-checksum on every cell so its transport numbers are
 not carrying this check's cost; this stage is where that cost belongs.
+
+Stage 14 (verify-failure) is opt-in and tests what happens AFTER -verify finds
+a difference -- stage 2 proves the difference is noticed, this proves the
+notice outlives the process. It corrupts the replica, then asserts four things
+in the order the state moves: the finding is written to the target domain
+(verify_state/verify_failed_at); an ordinary sync is refused while it stands,
+without being counted toward -reinit-after-failures; a plain -reinit is
+refused too (it recopies but never verifies, so allowing it would move the
+replica from "known bad" to "assumed good" while erasing the record); and
+-verify-failure-reinit repairs it, with only a PASSING verify clearing the
+record. That last sub-test drives the whole ladder unaided: the run it starts
+is an incremental, which does not touch the tampered offset, so its own verify
+fails and the recopy-and-re-verify fires for real. Opt-in because three
+sub-tests deliberately fail a sync. NOT covered: the branch where the repair's
+verify also fails and vmsync gives up -- the tamper is healed by the very
+recopy the repair performs, so reaching it would need a -test fault that can
+force a corruption verdict, which does not exist today.
 EOF
 }
 
@@ -1207,9 +1227,31 @@ verify_mode_subtest() {
 
 # heal_target SCENARIO PHASE PATH -- undoes a tamper with a full resync.
 #
-# -reinit specifically, and unconditionally. An incremental sync would NOT fix
-# this: it re-copies only blocks the SOURCE's dirty bitmap says changed, and the
-# source never wrote to the offset that was corrupted on the target.
+# A full recopy specifically, and unconditionally. An incremental sync would NOT
+# fix this: it re-copies only blocks the SOURCE's dirty bitmap says changed, and
+# the source never wrote to the offset that was corrupted on the target.
+#
+# -force-clean rather than the plain -reinit this used to pass, and that is a
+# consequence of the feature stage 14 tests rather than a preference. A -verify
+# that RAN and found a difference now records verify_state=failed on the target
+# domain, and a domain carrying that record REFUSES an ordinary sync and a plain
+# -reinit alike -- deliberately, because a reinit recopies without proving the
+# result, so allowing it would move the replica from "known bad" to "assumed
+# good, unverified" while erasing the record that said otherwise. Every tamper
+# sub-test above leaves exactly that record behind, so the heal has to be one of
+# the two things that gets past it.
+#
+# -force-clean and not -verify-failure-reinit, of the two: this harness KNOWS it
+# corrupted the replica itself, so it is discarding a finding it created rather
+# than investigating one, and -verify-failure-reinit would additionally spend a
+# full-image compare per heal to re-prove a replica nothing doubts. Against a
+# running source it does what -reinit did (the chain is rebuilt either way); its
+# extra powers -- removing the target definition first, clearing a shut-down
+# source's bitmaps -- do not change the end state here.
+#
+# Note this means the heal path no longer exercises the refusal, so nothing here
+# would notice if it broke. That is stage 14's job, which asserts a plain
+# -reinit IS refused rather than assuming it.
 #
 # One of only two die()s left inside a stage, and deliberately so. Everywhere
 # else a stage now returns non-zero so the report still prints, but a heal that
@@ -1218,8 +1260,8 @@ verify_mode_subtest() {
 # report is the smaller loss.
 heal_target() {
         local scenario="$1" phase="$2" path="$3"
-        log "   healing target with a full resync (-reinit)"
-        bench_sync "$scenario" "$phase" -reinit
+        log "   healing target with a full resync (-force-clean, which also discards the verify_state record the tamper produced)"
+        bench_sync "$scenario" "$phase" -force-clean
         if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
                 die "heal-after-tamper resync for $scenario/$phase did not succeed (see $RUN_LOG) -- STOP and inspect $path by hand before trusting this target replica or continuing"
         fi
@@ -3017,7 +3059,13 @@ stage_fence_agent() {
 # excluded by name, so every restore point check was being folded into the
 # matrix verdict, and its one FAIL would have failed Stage 1 on any run that
 # included both.
-NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$)'
+#
+# "checksum" was doing it too, and worse than retention did: stage 13 fails a
+# sync ON PURPOSE (13b's falsified digest must be refused), so any run passing
+# --stages matrix,checksum reported Stage 1 as FAILED on the strength of a
+# deliberate refusal in another stage. Stage 14's rows are already covered by
+# the ^verify- prefix.
+NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$)'
 
 # stage_pattern STAGE -> the regex matching that stage's scenario column.
 # --- Stage 8: verify after a long incremental chain --------------------------
@@ -4296,6 +4344,246 @@ checksum_disabled_subtest() {
 # written and last_sync_timestamp is never recorded. That is precisely the
 # shape of the original incident, reached deterministically instead of by
 # corrupting anything.
+# --- Stage 14: the recorded verification failure -----------------------------
+#
+# Stage 2 proves -verify NOTICES a corrupted replica. This stage proves the
+# notice OUTLIVES the run that made it, which is a separate property and the
+# one that actually protects an estate.
+#
+# The gap it closes: a successful sync rebuilds the target's definition from the
+# SOURCE's XML, so every target-only field it does not explicitly write is lost.
+# A mismatch found at 02:00 was therefore erased by the ordinary incremental at
+# 03:00, and the promotion at 09:00 saw a replica with a clean record. Nobody
+# was lied to exactly once -- the finding was in a log -- but nothing that
+# decides anything could see it.
+#
+# So four assertions, in the order the state moves:
+#   14a the finding is written to the target domain
+#   14b an ordinary sync is REFUSED while it stands, and does not count as a
+#       sync failure
+#   14c a plain -reinit is refused too -- the non-obvious half, because a
+#       reinit does recopy everything and so looks like a repair, but it never
+#       verifies the result, so allowing it would move the replica from "known
+#       bad" to "assumed good" while erasing the record that said otherwise
+#   14d -verify-failure-reinit repairs it, and only a PASSING verify clears it
+#
+# NOT covered, deliberately and worth knowing: the branch where the repair's own
+# verify fails too, so vmsync gives up and leaves the replica faulty. Reaching
+# it needs a verify that fails on demand, and the tamper this stage uses is
+# healed by the very recopy the repair performs -- so the second verify passes,
+# which is 14d. It would need a -test fault (there is no verify fault today,
+# only failure-define), and that means production code able to force a
+# corruption verdict. Left as a decision rather than assumed.
+stage_verify_failure() {
+	log "=== Stage 14: a verification failure must outlive the run that found it ==="
+
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" verify-failure precondition DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+
+	stage_needs_target_shutoff "$CSV" verify-failure "stage verify-failure" || return 0
+
+	# -force-clean, not -reinit: this stage may be re-run after a previous
+	# attempt left the record in place, and a plain -reinit would then be
+	# refused by the very interlock under test -- so the baseline would fail
+	# for the reason the stage exists to prove, which reads as a broken
+	# harness rather than a working feature.
+	bench_sync verify-failure baseline -force-clean
+	if [ "$RUN_RC" != 0 ]; then
+		warn "baseline full sync failed (see $RUN_LOG) -- aborting stage 14$(bench_sync_hint)"
+		return 1
+	fi
+
+	local target_path vsize
+	target_path="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")" || true
+	[ -n "$target_path" ] || { warn "could not resolve target disk path for dev='$TAMPER_DISK_DEV' -- check TAMPER_DISK_DEV in $CONF"; return 1; }
+	vsize="$(target_virtual_size "$target_path")" || true
+	[ -n "$vsize" ] && [ "$vsize" -gt 0 ] 2>/dev/null \
+		|| { warn "could not read the virtual size of $target_path on $TARGET_HOST -- needed to keep a tamper inside the disk"; return 1; }
+
+	# Whatever happens below, leave the pair clean: a stage that exits with the
+	# replica still corrupted AND recorded faulty would make every later stage
+	# measure this stage's damage. heal_target uses -force-clean, which is one
+	# of the two things that gets past the record.
+	trap 'heal_target verify-failure final-heal "$target_path"' RETURN
+
+	if ! draw_tamper "$vsize"; then
+		warn "SKIP stage 14: the configured tamper band does not fit inside a ${vsize}-byte disk"
+		results_row "$CSV" verify-failure precondition "" "" "" "" "" "" "SKIP tamper band does not fit the disk"
+		return 0
+	fi
+	log "   corrupting at offset $TAMPER_OFF length $TAMPER_LEN (seed $TAMPER_SEED)"
+	if ! tamper_target "$target_path" yes; then
+		results_row "$CSV" verify-failure precondition "" "" "" "" "" "" "SKIP the tamper could not be applied"
+		return 0
+	fi
+
+	verify_failure_record_subtest || return 0
+	verify_failure_refuses_sync_subtest
+	verify_failure_refuses_reinit_subtest
+	verify_failure_repair_subtest
+	return 0
+}
+
+# 14a: a -verify that ran and found a difference must record it on the target.
+#
+# The load-bearing sub-test. If nothing is written here, 14b/14c would "pass"
+# by refusing nothing at all, and this stage would certify an interlock that
+# does not exist. Returns non-zero to stop the stage, since every assertion
+# below is about a record this one proves is there.
+verify_failure_record_subtest() {
+	log "--- 14a verify-failure/record: the mismatch must be written to the target domain ---"
+
+	bench_sync verify-failure mismatch -verify=fast
+	local outcome state failed_at
+	outcome="$(verify_outcome "$RUN_PROM")"
+	if [ "$outcome" != RAN_MISMATCH ]; then
+		warn "FAIL: -verify=fast did not report a mismatch after the target was corrupted at offset $TAMPER_OFF length $TAMPER_LEN (outcome=$outcome, exit=$RUN_RC, reproduce with TAMPER_SEED=$TAMPER_SEED). Nothing below can be tested without a finding to record. See $RUN_LOG"
+		results_row "$CSV" verify-failure mismatch-result 1 "" "" "" "" "" "FAIL no mismatch to record"
+		return 1
+	fi
+
+	state="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" verify_state)"
+	failed_at="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" verify_failed_at)"
+	if [ "$state" != failed ]; then
+		warn "FAIL: -verify found a mismatch but the target carries verify_state='$state' (wanted 'failed'). The finding died with the process: tonight's incremental will overwrite it and a promotion will see a clean replica. See $RUN_LOG"
+		results_row "$CSV" verify-failure mismatch-result 1 "" "" "" "" "" "FAIL verify_state not recorded"
+		return 1
+	fi
+	# Present and numeric. The date is what turns the record into a decision --
+	# "failed 20 minutes ago" and "failed in March" are not the same call --
+	# and a non-numeric value would render as garbage in the refusal message.
+	if [ -z "$failed_at" ] || ! [ "$failed_at" -gt 0 ] 2>/dev/null; then
+		warn "FAIL: verify_state was recorded but verify_failed_at='$failed_at' is not a unix timestamp, so neither the refusal nor a promotion assessment can say WHEN the replica went bad. See $RUN_LOG"
+		results_row "$CSV" verify-failure mismatch-result 1 "" "" "" "" "" "FAIL verify_failed_at missing or not a timestamp"
+		return 1
+	fi
+
+	log "   PASS: the finding was recorded (verify_state=failed, verify_failed_at=$failed_at)"
+	results_row "$CSV" verify-failure mismatch-result 0 "" "" "" "" "" "PASS finding recorded on the target"
+	return 0
+}
+
+# 14b: an ordinary sync must be refused while the record stands, and must not
+# be counted as a sync failure.
+#
+# The refusal is what gives the record a lifetime -- without it the next sync
+# rebuilds the definition and the finding is gone. The failure_count exemption
+# matters for a reason that is easy to miss: a non-zero count is ITSELF reported
+# by a promotion assessment, so counting this would stack a "may be stale"
+# verdict on top of the "may be wrong" one that is the real finding, and an
+# operator would see two problems where there is one.
+verify_failure_refuses_sync_subtest() {
+	log "--- 14b verify-failure/refuses-sync: an ordinary sync must be refused ---"
+
+	# -reinit-after-failures so the counter is live at all: vmsync only records
+	# a failure when it is set.
+	bench_sync verify-failure refuse-sync -verify=fast -reinit-after-failures=5
+	local state failures=0 details=""
+	if [ "$RUN_RC" = 0 ]; then
+		failures=$((failures + 1))
+		details="the sync SUCCEEDED against a replica recorded as having failed verification, so the finding has been erased"
+	elif ! grep -q 'does not permit syncing into this domain' "$RUN_LOG" 2>/dev/null; then
+		failures=$((failures + 1))
+		details="the sync failed (exit=$RUN_RC) but not with the recorded-verification-failure refusal, so it may have been stopped by something unrelated"
+	fi
+	# The refusal must not consume the record it is protecting.
+	state="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" verify_state)"
+	if [ "$state" != failed ]; then
+		failures=$((failures + 1))
+		details="${details}${details:+; }the refusal left verify_state='$state', so it cleared the very record it exists to enforce"
+	fi
+	if grep -q 'recorded sync failure in target metadata' "$RUN_LOG" 2>/dev/null; then
+		failures=$((failures + 1))
+		details="${details}${details:+; }the refusal was counted toward -reinit-after-failures, which can only climb (the reinit it would force is refused by this same gate) and blocks promotion on a replica whose real problem is already recorded"
+	fi
+
+	if [ "$failures" = 0 ]; then
+		log "   PASS: the sync was refused, the record survived, and nothing was counted against the domain"
+		results_row "$CSV" verify-failure refuse-sync-result 0 "" "" "" "" "" "PASS ordinary sync refused"
+	else
+		warn "FAIL: $details. See $RUN_LOG"
+		results_row "$CSV" verify-failure refuse-sync-result 1 "" "" "" "" "" "FAIL $failures check(s) failed"
+	fi
+}
+
+# 14c: a plain -reinit must be refused too.
+#
+# The half that looks wrong until it is spelled out. A reinit DOES recopy every
+# byte, so it plausibly repairs the replica -- but it never verifies the result,
+# so permitting it would take the domain from "known bad" to "assumed good,
+# unverified" while deleting the record that said otherwise. That is precisely
+# the state a promotion assessment exists to distrust, and it is why the two
+# ways past are the one that re-proves the replica and the one that says out
+# loud it is discarding a finding.
+verify_failure_refuses_reinit_subtest() {
+	log "--- 14c verify-failure/refuses-reinit: a plain -reinit must be refused as well ---"
+
+	bench_sync verify-failure refuse-reinit -reinit -verify=fast
+	local state failures=0 details=""
+	if [ "$RUN_RC" = 0 ]; then
+		failures=$((failures + 1))
+		details="a plain -reinit SUCCEEDED, so the replica is now unverified with no record that it ever failed"
+	elif ! grep -q 'does not permit syncing into this domain' "$RUN_LOG" 2>/dev/null; then
+		failures=$((failures + 1))
+		details="the -reinit failed (exit=$RUN_RC) but not with the recorded-verification-failure refusal"
+	fi
+	state="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" verify_state)"
+	if [ "$state" != failed ]; then
+		failures=$((failures + 1))
+		details="${details}${details:+; }the refused -reinit left verify_state='$state'"
+	fi
+
+	if [ "$failures" = 0 ]; then
+		log "   PASS: the plain -reinit was refused and the record survived"
+		results_row "$CSV" verify-failure refuse-reinit-result 0 "" "" "" "" "" "PASS plain -reinit refused"
+	else
+		warn "FAIL: $details. See $RUN_LOG"
+		results_row "$CSV" verify-failure refuse-reinit-result 1 "" "" "" "" "" "FAIL $failures check(s) failed"
+	fi
+}
+
+# 14d: -verify-failure-reinit must repair the replica and clear the record.
+#
+# This one exercises the whole ladder rather than just the override, and it does
+# so without any help from the harness. The record is present, so the run is
+# allowed past it -- but the run itself is an ordinary INCREMENTAL, and an
+# incremental copies only what the source's dirty bitmap says changed. The
+# source never wrote to the tampered offset, so the corruption is still there
+# and this run's own verify fails. That is what fires the ladder: a full recopy
+# (which does overwrite the tampered bytes) and a second verify, which passes.
+#
+# So a pass here means: the override worked, the first verify failed, the recopy
+# ran, the second verify passed, and only then was the record cleared.
+verify_failure_repair_subtest() {
+	log "--- 14d verify-failure/repair: -verify-failure-reinit must recopy, re-verify, and only then clear ---"
+
+	bench_sync verify-failure repair -verify=fast -verify-failure-reinit
+	local state failures=0 details=""
+	if [ "$RUN_RC" != 0 ]; then
+		failures=$((failures + 1))
+		details="the repair run failed (exit=$RUN_RC) although a full recopy overwrites the tampered bytes and should verify clean"
+	fi
+	if ! grep -q 'attempting ONE full recopy and a second verification' "$RUN_LOG" 2>/dev/null; then
+		failures=$((failures + 1))
+		details="${details}${details:+; }the ladder never fired -- the run got past the record but nothing recopied, so a pass here would mean the flag is a plain override rather than a repair"
+	fi
+	state="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" verify_state)"
+	if [ -n "$state" ]; then
+		failures=$((failures + 1))
+		details="${details}${details:+; }the repair verified clean but left verify_state='$state', so this replica stays unsyncable forever and only -force-clean can free it"
+	fi
+
+	if [ "$failures" = 0 ]; then
+		log "   PASS: the ladder recopied, re-verified, and cleared the record"
+		results_row "$CSV" verify-failure repair-result 0 "" "" "" "" "" "PASS repaired and record cleared"
+	else
+		warn "FAIL: $details. See $RUN_LOG"
+		results_row "$CSV" verify-failure repair-result 1 "" "" "" "" "" "FAIL $failures check(s) failed"
+	fi
+}
+
 stage_wedge() {
 	log "=== Stage 12: a failed run must not wedge the next one ==="
 
@@ -4844,6 +5132,9 @@ stage_pattern() {
 	restore) printf '^restore$' ;;
 	invert) printf '^invert$' ;;
 	wedge) printf '^wedge$' ;;
+	# Anchored to the exact scenario name for stage 2's reason: a bare
+	# ^verify- would fold all of stage 2's rows into this stage's verdict.
+	verify-failure) printf '^verify-failure$' ;;
 	*) printf '$^' ;; # matches nothing
 	esac
 }
@@ -5038,6 +5329,20 @@ generate_report() {
                         echo "_not run (opt in with \`--stages checksum\`; sub-test 13b deliberately fails a sync, and all four temporarily install helper shims on the target)_"
                 fi
                 echo
+                echo "## Stage 14: a verification failure outliving its run"
+                echo
+                # Exact match on the scenario, so this cannot pick up stage 2's
+                # or stage 8's verify- rows -- and stage 2's own awk above
+                # cannot pick up these, since "failure" matches none of its
+                # named sub-tests.
+                if awk -F, 'NR>1 && $1=="verify-failure" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| check | exit | wall (s) | result |"
+                        echo "|---|---|---|---|"
+                        awk -F, 'NR>1 && $1=="verify-failure" { printf "| %s | %s | %s | %s |\n", $2, $3, $4, $9 }' "$CSV"
+                else
+                        echo "_not run (opt in with \`--stages verify-failure\`; it corrupts the replica and three of its four sub-tests deliberately fail a sync)_"
+                fi
+                echo
                 echo "## Stage 8: verify after a long incremental chain"
                 echo
                 if awk -F, 'NR>1 && $1=="verify-long" { found=1 } END { exit !found }' "$CSV"; then
@@ -5171,7 +5476,8 @@ for s in "${stage_list[@]}"; do
         restore) stage_restore || stage_rc=$? ;;
         invert) stage_invert || stage_rc=$? ;;
         wedge) stage_wedge || stage_rc=$? ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge)" ;;
+        verify-failure) stage_verify_failure || stage_rc=$? ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
                 warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."

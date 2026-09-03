@@ -222,7 +222,7 @@ func TestEveryEmittedFlagIsInTheVocabulary(t *testing.T) {
 		"-reinit-after-failures", "-retention", "-source-nbd-port", "-target-nbd-port",
 		"-target-disk-path", "-timestamp-tolerance-sec", "-use-ssh", "-no-checksum", "-run-id",
 		"-result-json",
-		"-compress", "-netbuffer", "-verify",
+		"-compress", "-netbuffer", "-verify", "-verify-failure-reinit",
 		"-promote", "-promote-mode", "-promoted-by", "-force-promote", "-fence-source",
 		"-invert", "-reinit", "-force-clean", "-start", "-update-role",
 		"-restore-restore-point", "-restored-by", "-force-restore",

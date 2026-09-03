@@ -341,6 +341,42 @@ const (
 	// target. See the strip lists named in that field's comment.
 	MetadataFieldPendingCheckpoint = "pending_checkpoint"
 
+	// MetadataFieldVerifyState and MetadataFieldVerifyFailedAt record that
+	// -verify found this replica's contents differing from its source, so
+	// that the finding outlives the run that made it.
+	//
+	// Presence IS the state: absent means no recorded failure, and the only
+	// value written is VerifyStateFailed. A "passed" value would be worse
+	// than nothing -- it would go stale the moment the replica changed and
+	// invite reading it as fresh assurance.
+	//
+	// Deliberately only the VERDICT and the date. The diagnosis -- how many
+	// blocks, which offsets, scattered or contiguous -- goes to the log,
+	// where an operator investigating actually looks. Putting a block count
+	// here would invite policy being written against it ("only pause if
+	// more than N"), and domain XML is the wrong place for a decision that
+	// wants a human.
+	//
+	// Written by SetDomainMetadataFields (the narrow merge), because a
+	// mismatch fails the run and the full-redefine path never executes.
+	// Cleared UNCONDITIONALLY by UpdateSyncMetadata -- which needs no
+	// parameter, and that is a consequence of how the finding is kept alive:
+	// a domain carrying this refuses to sync at all
+	// (TargetVerifyStateAllowsSync), so no successful sync can occur while
+	// it is set. Any run that reaches UpdateSyncMetadata therefore either
+	// verified and passed, or came through the recovery paths that are meant
+	// to clear it. Removing rather than omitting also stops a source that
+	// was once somebody's replica stamping a stale failure onto a healthy
+	// target -- the same hazard replica_written_at documents.
+	//
+	// The durability of the record depends on that refusal being complete.
+	// That is the accepted cost of this shape: get the refusal wrong, or add
+	// a path around it later, and findings are lost silently instead of
+	// loudly. The metrics and the log keep the history regardless; what is
+	// lost is only the enforcement.
+	MetadataFieldVerifyState    = "verify_state"
+	MetadataFieldVerifyFailedAt = "verify_failed_at"
+
 	// MetadataFieldCheckpointAt is when the checkpoint the replica's
 	// contents correspond to was created -- the START of the copy that
 	// produced them, not its end.
@@ -444,6 +480,8 @@ var metadataFieldOrder = []string{
 	MetadataFieldReplicationRole,
 	MetadataFieldLastCheckpoint,
 	MetadataFieldPendingCheckpoint,
+	MetadataFieldVerifyState,
+	MetadataFieldVerifyFailedAt,
 	MetadataFieldLastSync,
 	MetadataFieldReplicaWrittenAt,
 	MetadataFieldFailureCount,
@@ -1208,6 +1246,12 @@ func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetR
 		// so nothing is pending. Cleared HERE rather than in a separate
 		// write so that accepting and clearing are one atomic
 		// DomainDefineXML: never both set, never neither.
+		// Cleared on every successful sync. Safe without a parameter because
+		// a domain carrying a verify failure refuses to sync at all, so any
+		// run reaching here either verified and passed or came through a
+		// recovery path meant to clear it. See MetadataFieldVerifyState.
+		MetadataFieldVerifyState,
+		MetadataFieldVerifyFailedAt,
 		MetadataFieldPendingCheckpoint,
 		MetadataFieldReplicaTargets,
 		MetadataFieldPromotedAt,
@@ -1324,7 +1368,8 @@ func RecordReplicaTarget(mgr *Manager, sourceDomainName, targetHost, targetDomai
 		// meaningless to anyone reading the XML, and worse, it is what
 		// UpdateSyncMetadata would inherit onto a real replica.
 	}, MetadataFieldLastCheckpoint, MetadataFieldLastSync, MetadataFieldFailureCount,
-		MetadataFieldReplicaWrittenAt, MetadataFieldPendingCheckpoint)
+		MetadataFieldReplicaWrittenAt, MetadataFieldPendingCheckpoint,
+		MetadataFieldVerifyState, MetadataFieldVerifyFailedAt)
 }
 
 // ReadTargetFailureCount reconnects to the target and returns the
@@ -1433,6 +1478,52 @@ func TargetRoleAllowsSync(role string) error {
 // reasoning: another vmsync holding the lock is not a broken sync either.
 var ErrRoleRefusesSync = errors.New("replication role does not permit syncing into this domain")
 
+// VerifyStateFailed is the only value MetadataFieldVerifyState ever takes.
+// See that field for why presence is the state.
+const VerifyStateFailed = "failed"
+
+// ErrVerifyStateRefusesSync reports that this domain carries a recorded
+// verification failure, so vmsync will not sync into it.
+//
+// Its own sentinel rather than reusing ErrRoleRefusesSync, because callers
+// treat them alike in one respect and must not in another: both are
+// administrative refusals exempt from failure_count, but only this one is
+// cleared by proving the replica again.
+var ErrVerifyStateRefusesSync = errors.New("a recorded verification failure does not permit syncing into this domain")
+
+// TargetVerifyStateAllowsSync refuses a sync into a domain whose last
+// verification found its contents differing from the source.
+//
+// Refusing is what keeps the finding alive. A successful sync rebuilds the
+// target's definition from the SOURCE's XML (see UpdateSyncMetadata), so any
+// target-only field it does not explicitly write is lost -- which would have
+// meant tonight's ordinary incremental quietly erasing a verify failure
+// recorded this morning, and the promotion gate then seeing a clean replica.
+//
+// It also refuses a plain -reinit, which is the less obvious half. A reinit
+// does recopy everything, so it plausibly REPAIRS the replica -- but it does
+// not verify it, so allowing it would move the domain from "known bad" to
+// "assumed good, unverified" while clearing the record that said otherwise.
+// That is precisely the state evidenceProblems exists to distrust.
+//
+// Two deliberate acts get past it: -verify-failure-reinit, which recopies
+// and then proves the result before clearing anything, and -force-clean,
+// which is already the documented override for a wedged target and logs that
+// it discarded a finding.
+func TargetVerifyStateAllowsSync(verifyState, failedAt string) error {
+	if verifyState == "" {
+		return nil
+	}
+	when := "at an unrecorded time"
+	if failedAt != "" {
+		if unix, err := strconv.ParseInt(failedAt, 10, 64); err == nil {
+			when = "on " + time.Unix(unix, 0).UTC().Format(time.RFC3339)
+		}
+	}
+	return fmt.Errorf("%w: -verify found this replica's contents differing from its source %s, and the finding has not been cleared -- the replica is NOT trustworthy for a promotion. See that run's log for which blocks differed (this metadata deliberately records only the verdict). Recover with -verify-failure-reinit, which recopies and then re-verifies before clearing this, or override with -force-clean if you have decided the replica is disposable",
+		ErrVerifyStateRefusesSync, when)
+}
+
 // TargetRoleAllowsRestore is TargetRoleAllowsSync's counterpart for putting a
 // restore point back over a replica in place.
 //
@@ -1510,6 +1601,42 @@ func ReadReplicationRole(mgr *Manager, domainName string) (string, error) {
 		return "", nil
 	}
 	return role, nil
+}
+
+// ReadVerifyState returns the verify_state and verify_failed_at recorded on a
+// domain, both "" when there is no recorded verification failure -- which is
+// the case for every healthy replica. A domain that does not exist is likewise
+// reported as empty with a nil error, for the same reason
+// ReadReplicationRole does it: nothing has been verified into it yet.
+//
+// Both fields come out of ONE XML read, not two. Read separately they could
+// straddle a concurrent write and report a state with no timestamp, or a
+// timestamp for a finding that had just been cleared -- and this pair is read
+// specifically to decide whether to refuse a sync, so a torn read of it is a
+// wrong answer to the only question being asked.
+func ReadVerifyState(mgr *Manager, domainName string) (verifyState, failedAt string, err error) {
+	dom, err := mgr.Conn.LookupDomainByName(domainName)
+	if err != nil {
+		if lvErr, ok := err.(libvirt.Error); ok && lvErr.Code == libvirt.ERR_NO_DOMAIN {
+			return "", "", nil
+		}
+		return "", "", fmt.Errorf("look up domain %s to read its verification state: %w", domainName, err)
+	}
+	defer dom.Free()
+
+	// DOMAIN_XML_INACTIVE, as everywhere else that reads these fields: they
+	// live in the persistent definition.
+	domXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
+	if err != nil {
+		return "", "", fmt.Errorf("read domain %s xml to get its verification state: %w", domainName, err)
+	}
+	// A parse error means the field is absent, matching ReadReplicationRole.
+	// Absent is the overwhelmingly common case here -- it is what every
+	// replica that has never failed a verify looks like -- so it must not be
+	// an error condition.
+	verifyState, _ = ParseMetadata(domXML, MetadataFieldVerifyState)
+	failedAt, _ = ParseMetadata(domXML, MetadataFieldVerifyFailedAt)
+	return verifyState, failedAt, nil
 }
 
 // SetReplicationRole records role as domainName's replication_role,

@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -89,6 +90,21 @@ type SyncProfile struct {
 	// source snapshot's scratch space empty across a full-image read --
 	// not because the comparison needs a stopped guest.
 	Verify string `json:"verify,omitempty"`
+	// VerifyFailureReinit answers a verification failure with one full recopy
+	// and a second verification. If that also fails, the replica is recorded
+	// as faulty on its own domain XML: later syncs into it are refused and a
+	// promotion reports it as untrustworthy until a human clears it.
+	//
+	// Worth setting for a scheduled pair even though it is off by default in
+	// vmsync itself, and the reason is the scheduling. A one-off run has an
+	// operator watching who can decide what to do about a mismatch; a
+	// scheduled one does not, and without this its next run would sync
+	// straight over the finding -- so the choice is between an automatic
+	// repair attempt and a replica that quietly stops being verified.
+	//
+	// Requires Verify. Rejected at validation otherwise rather than ignored,
+	// so a profile cannot promise a repair it will never attempt.
+	VerifyFailureReinit bool `json:"verify_failure_reinit,omitempty"`
 	// ReinitAfterFailures forces a full resync after N consecutive failures.
 	ReinitAfterFailures int `json:"reinit_after_failures,omitempty"`
 	// TargetDiskPath is where the replica's disks live on the target host.
@@ -222,6 +238,15 @@ func (p SyncProfile) Validate() error {
 	case "", "fast", "full", "qemu-img":
 	default:
 		return fmt.Errorf("verify %q is not one of \"\", \"fast\", \"full\", \"qemu-img\"", p.Verify)
+	}
+
+	// Rejected rather than ignored, matching vmsync's own startup check. A
+	// profile is written once and runs unattended for months, so a setting
+	// that silently does nothing is discovered at the worst possible moment
+	// -- and this one would also be trusted to CLEAR a recorded failure it
+	// never re-proved.
+	if p.VerifyFailureReinit && p.Verify == "" {
+		return errors.New("verify_failure_reinit needs verify to be set: it reacts to a verification failure, and without a verification there is nothing for it to react to")
 	}
 
 	if p.ReinitAfterFailures < 0 || p.ReinitAfterFailures > maxReinitAfterFailures {
@@ -395,6 +420,9 @@ func (r SyncRequest) CommandArgs() []string {
 	}
 	if p.Verify != "" {
 		args = append(args, "-verify="+p.Verify)
+	}
+	if p.VerifyFailureReinit {
+		args = append(args, "-verify-failure-reinit")
 	}
 	if p.ReinitAfterFailures > 0 {
 		args = append(args, "-reinit-after-failures", strconv.Itoa(p.ReinitAfterFailures))

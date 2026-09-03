@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Roles, mirroring pkg/libvirtsync's own constants. Duplicated rather than
@@ -96,6 +97,17 @@ type TargetState struct {
 	RestoredFrom string
 	// Active is the domain's current runtime state.
 	Active bool
+	// VerifyState is a recorded verification failure (see
+	// libvirtsync.MetadataFieldVerifyState), empty for a replica with no such
+	// finding -- which is almost all of them.
+	//
+	// Unlike everything else here it is not about whether the sync
+	// MECHANISM worked. FailureCount says the last attempt did not finish;
+	// this says an attempt finished and the resulting replica did not match
+	// its source. A promotion needs to know the difference: the first means
+	// the replica may be stale, the second means it may be wrong.
+	VerifyState    string
+	VerifyFailedAt int64
 	// SourceStoppedAtSync records that the SOURCE domain was already shut
 	// off when the checkpoint behind this replica was taken.
 	//
@@ -302,6 +314,22 @@ func evidenceProblems(st TargetState) []string {
 	if st.FailureCount > 0 {
 		problems = append(problems, fmt.Sprintf("failure_count is %d, so the last sync attempt did not succeed", st.FailureCount))
 	}
+	// The one problem here that is about the replica's CONTENTS rather than
+	// about whether replication ran. Everything above says the replica may
+	// be stale or incomplete; this says a comparison against its own source
+	// found it different -- so promoting it serves data that was already
+	// known not to match.
+	//
+	// Without this, a replica that failed verify last night promoted with a
+	// clean bill of health today, which is the single most valuable reason
+	// to persist the verdict at all.
+	if st.VerifyState != "" {
+		when := "at an unrecorded time"
+		if st.VerifyFailedAt > 0 {
+			when = "on " + time.Unix(st.VerifyFailedAt, 0).UTC().Format(time.RFC3339)
+		}
+		problems = append(problems, fmt.Sprintf("verification found this replica's contents differing from its source %s and the finding has not been cleared, so the replica is known not to match (see that run's log for which blocks)", when))
+	}
 	return problems
 }
 
@@ -408,6 +436,14 @@ const (
 	FieldReplicaWrittenAt = "replica_written_at"
 	// Mirrors libvirtsync.MetadataFieldPendingCheckpoint; same pinning.
 	FieldPendingCheckpoint = "pending_checkpoint"
+	// Mirrors libvirtsync.MetadataFieldVerifyState/VerifyFailedAt; same pinning.
+	FieldVerifyState    = "verify_state"
+	FieldVerifyFailedAt = "verify_failed_at"
+
+	// VerifyStateFailedValue is libvirtsync.VerifyStateFailed, duplicated for
+	// the same reason the roles are: importing libvirtsync would drag in
+	// libvirt and defeat this package being testable without it.
+	VerifyStateFailedValue = "failed"
 	FieldFailureCount      = "failure_count"
 	FieldPromotedAt        = "promoted_at"
 	FieldPromotedBy        = "promoted_by"
@@ -488,6 +524,7 @@ func AssessInvert(st PairState) (InvertPlan, error) {
 			FieldLastSync,
 			FieldReplicaWrittenAt,
 			FieldPendingCheckpoint,
+			FieldVerifyState, FieldVerifyFailedAt,
 			FieldFailureCount,
 			FieldPromotedAt, FieldPromotedBy, FieldPromotedFrom, FieldPromotionMode,
 			FieldFenceID, FieldFenceSource, FieldFenceArmedAt, FieldFenceArmedBy,
@@ -506,6 +543,7 @@ func AssessInvert(st PairState) (InvertPlan, error) {
 			FieldLastSync,
 			FieldReplicaWrittenAt,
 			FieldPendingCheckpoint,
+			FieldVerifyState, FieldVerifyFailedAt,
 			FieldFailureCount,
 			FieldPromotedAt, FieldPromotedBy, FieldPromotedFrom, FieldPromotionMode,
 			FieldFenceID, FieldFenceSource, FieldFenceArmedAt, FieldFenceArmedBy,

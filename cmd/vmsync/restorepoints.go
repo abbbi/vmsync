@@ -284,7 +284,18 @@ func sweepRestorePointsForReinit(ctx context.Context, cfg syncConfig, runner rem
 		// rebuild shares no extents with them, so from now on they are charged
 		// at their full independent size rather than as deltas against the
 		// live replica.
-		trace.Warning("reinit: keeping the existing restore points, because this reinit was forced by -reinit-after-failures rather than asked for -- repeated sync failures are exactly when an older copy is worth having. They stay listed and stay under retention, but they no longer share storage with the replica being rebuilt, so they now cost their full size",
+		//
+		// The cause is named rather than assumed: two different things force
+		// an automatic reinit now, and an operator reading this line is being
+		// told why their history survived a reinit, so it has to be true.
+		// VerifyRepairAttempt and not VerifyFailureReinit, because the latter
+		// is set on every run of a self-repairing pair -- including one whose
+		// reinit was forced by the failure counter instead.
+		why := "this reinit was forced by -reinit-after-failures rather than asked for -- repeated sync failures are exactly when an older copy is worth having"
+		if cfg.VerifyRepairAttempt {
+			why = "this reinit is -verify-failure-reinit repairing a replica that FAILED verification -- these copies predate the finding, so they are the only candidates for a clean one and discarding them here would destroy the very thing the finding calls for"
+		}
+		trace.Warning("reinit: keeping the existing restore points, because "+why+". They stay listed and stay under retention, but they no longer share storage with the replica being rebuilt, so they now cost their full size",
 			"kept", len(listing.Points), "dir", root)
 		return nil
 	}

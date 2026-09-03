@@ -446,6 +446,7 @@ var agentFlagVocabulary = map[string]argClass{
 	"-target-disk-path":        argValue,
 	"-timestamp-tolerance-sec": argValue,
 	"-no-checksum":             argFlagOnly,
+	"-verify-failure-reinit":   argFlagOnly,
 	"-use-ssh":                 argFlagOnly,
 
 	// operations

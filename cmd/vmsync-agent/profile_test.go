@@ -271,3 +271,59 @@ func TestNoChecksumIsEmittedOnlyWhenAsked(t *testing.T) {
 		}
 	})
 }
+
+// -verify-failure-reinit must be emitted only when asked for, and a profile
+// asking for it without a verify mode must be REFUSED rather than quietly
+// stripped.
+//
+// The refusal is the half worth pinning. This flag is what clears a recorded
+// verification failure -- vmsync lets it past the refusal that a failed
+// replica otherwise imposes -- so a profile that enabled it with no
+// verification would hold the key to the interlock while being unable to
+// prove anything. Silently dropping it instead would be worse than refusing:
+// a schedule would claim to self-repair for months and only be found out on
+// the night it mattered.
+func TestVerifyFailureReinitIsEmittedOnlyWhenAsked(t *testing.T) {
+	base := SyncRequest{
+		SourceURI: "qemu:///system", SourceDomain: "web01",
+		TargetURI: "qemu+ssh://root@h/system", TargetDomain: "web01",
+	}
+
+	t.Run("absent from the profile emits nothing", func(t *testing.T) {
+		if args := base.CommandArgs(); slices.Contains(args, "-verify-failure-reinit") {
+			t.Errorf("args %v contain -verify-failure-reinit although the profile never mentioned it", args)
+		}
+	})
+
+	t.Run("asked for, it is emitted as a bare flag", func(t *testing.T) {
+		req := base
+		req.SyncProfile = SyncProfile{Verify: "full", VerifyFailureReinit: true}
+		args := req.CommandArgs()
+		if !slices.Contains(args, "-verify-failure-reinit") {
+			t.Fatalf("args %v are missing -verify-failure-reinit for a profile that set it", args)
+		}
+		// Same trap as -no-checksum: a value argument here would be read by
+		// vmsync as a positional and stop flag parsing dead.
+		for i, a := range args {
+			if a == "-verify-failure-reinit" && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				t.Errorf("-verify-failure-reinit was followed by %q; it takes no value", args[i+1])
+			}
+		}
+	})
+
+	t.Run("without a verify mode the profile is refused", func(t *testing.T) {
+		p := SyncProfile{VerifyFailureReinit: true}
+		if err := p.Validate(); err == nil {
+			t.Error("Validate accepted verify_failure_reinit with no verify mode; it would hold the key to the verification interlock while being unable to prove anything")
+		}
+	})
+
+	t.Run("with a verify mode the profile is valid", func(t *testing.T) {
+		for _, mode := range []string{"fast", "full", "qemu-img"} {
+			p := SyncProfile{Verify: mode, VerifyFailureReinit: true}
+			if err := p.Validate(); err != nil {
+				t.Errorf("Validate rejected verify=%s with verify_failure_reinit: %v", mode, err)
+			}
+		}
+	})
+}

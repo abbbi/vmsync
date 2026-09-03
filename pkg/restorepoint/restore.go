@@ -177,7 +177,10 @@ const (
 	// pkg/libvirtsync/duplicated_names_test.go.
 	FieldReplicaWrittenAt = "replica_written_at"
 	// Mirrors libvirtsync.MetadataFieldPendingCheckpoint; same pinning.
-	FieldPendingCheckpoint   = "pending_checkpoint"
+	FieldPendingCheckpoint = "pending_checkpoint"
+	// Mirrors libvirtsync.MetadataFieldVerifyState/VerifyFailedAt; same pinning.
+	FieldVerifyState         = "verify_state"
+	FieldVerifyFailedAt      = "verify_failed_at"
 	FieldFailureCount        = "failure_count"
 	FieldCheckpointAt        = "checkpoint_at"
 	FieldSourceStoppedAtSync = "source_stopped_at_sync"
@@ -332,6 +335,11 @@ func MetadataPlan(s Status, r Provenance) (updates map[string]string, removals [
 	// orphaned checkpoint to delete -- and the checkpoint it names may be
 	// perfectly valid.
 	removals = append(removals, FieldPendingCheckpoint)
+	// A restore replaces the replica's contents wholesale, so a verify
+	// failure recorded against the contents it just discarded no longer
+	// describes this replica. Left in place it would refuse every later sync
+	// over a finding about data that is gone.
+	removals = append(removals, FieldVerifyState, FieldVerifyFailedAt)
 	return updates, removals
 }
 

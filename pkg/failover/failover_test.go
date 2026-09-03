@@ -20,6 +20,7 @@ package failover
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 const nowUnix = 1_800_000_000
@@ -426,4 +427,74 @@ func contains(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// A recorded verification failure must block a promotion.
+//
+// This is the single most valuable effect of persisting the verdict at all.
+// Everything else evidenceProblems checks says the replica may be STALE or
+// incomplete -- no checkpoint, no timestamp, an uncommitted overlay, a
+// non-zero failure_count. This one says an attempt finished and the
+// resulting replica did not match its source: the replica may be WRONG.
+// Without it, a replica that failed verify last night promoted with a clean
+// bill of health today, which is the worst possible moment to find out.
+func TestVerifyFailureBlocksPromotion(t *testing.T) {
+	t.Run("a healthy replica has no problems", func(t *testing.T) {
+		if problems := evidenceProblems(healthyTarget()); len(problems) != 0 {
+			t.Fatalf("healthy target reported problems: %v", problems)
+		}
+	})
+
+	t.Run("a recorded failure is a problem", func(t *testing.T) {
+		st := healthyTarget()
+		st.VerifyState = VerifyStateFailedValue
+		st.VerifyFailedAt = nowUnix - 3600
+
+		problems := evidenceProblems(st)
+		if len(problems) != 1 {
+			t.Fatalf("got %d problems, want exactly 1: %v", len(problems), problems)
+		}
+		// The message has to distinguish "wrong" from "stale", or an
+		// operator reads it as another way of saying the sync is behind.
+		if !strings.Contains(problems[0], "differing from its source") {
+			t.Errorf("problem = %q, want it to say the contents differ", problems[0])
+		}
+		// And point at where the diagnosis actually is, since this metadata
+		// deliberately records only the verdict.
+		if !strings.Contains(problems[0], "log") {
+			t.Errorf("problem = %q, want it to point at the log for which blocks differed", problems[0])
+		}
+		// The date matters: "failed 20 minutes ago" and "failed in March"
+		// are different decisions.
+		if !strings.Contains(problems[0], time.Unix(nowUnix-3600, 0).UTC().Format("2006-01-02")) {
+			t.Errorf("problem = %q, want it to name when the failure was recorded", problems[0])
+		}
+	})
+
+	t.Run("a failure with no date still blocks", func(t *testing.T) {
+		st := healthyTarget()
+		st.VerifyState = VerifyStateFailedValue
+		// VerifyFailedAt deliberately left zero: a replica written by a
+		// vmsync that recorded the state but not the date must still be
+		// distrusted, not waved through for lack of a timestamp.
+		problems := evidenceProblems(st)
+		if len(problems) != 1 {
+			t.Fatalf("got %d problems, want 1: %v", len(problems), problems)
+		}
+		if !strings.Contains(problems[0], "unrecorded time") {
+			t.Errorf("problem = %q, want it to admit the time is unknown", problems[0])
+		}
+	})
+
+	t.Run("it is independent of failure_count", func(t *testing.T) {
+		// Different facts, and both must be reported. failure_count says
+		// the last attempt did not finish; this says one did and produced a
+		// replica that does not match.
+		st := healthyTarget()
+		st.VerifyState = VerifyStateFailedValue
+		st.FailureCount = 3
+		if problems := evidenceProblems(st); len(problems) != 2 {
+			t.Errorf("got %d problems, want both reported: %v", len(problems), problems)
+		}
+	})
 }
