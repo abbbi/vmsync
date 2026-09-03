@@ -3039,11 +3039,17 @@ stage_fence_agent() {
 		"source is '$state' after ${waited}s -- see $agent_dir/agent.log on $SOURCE_HOST"
 
 	# --- and left it in the right state ---------------------------------------
+	#
+	# 'fenced', not 'paused'. The two used to be the same word, which is what
+	# made this assertion weak: it could not tell a domain a fence had stopped
+	# from one an operator had suspended by hand, so it passed on either. They
+	# are separate roles now -- nobody CHOSE this one -- and the check asserts
+	# the specific one, which is the only version of it worth having.
 	if [ "$state" = shutoff ]; then
 		local src_role
 		src_role="$(vmsync_meta_field "$SOURCE_URI" "$SOURCE_DOMAIN" replication_role)"
-		if [ "$src_role" = paused ]; then fo_ok=0; else fo_ok=1; fi
-		fo_check "$sc" "the fenced source is left paused, not merely stopped" "$fo_ok" \
+		if [ "$src_role" = fenced ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the fenced source is left fenced not merely stopped" "$fo_ok" \
 			"got role '$src_role' -- without this the next sync would start it replicating again"
 
 		# The ledger is what makes a fence single-use. Its presence here is

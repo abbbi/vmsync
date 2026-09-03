@@ -74,6 +74,7 @@ func TestFailoverRoleNamesMatch(t *testing.T) {
 		{RoleTarget, failover.RoleTarget, "target"},
 		{RolePromoted, failover.RolePromoted, "promoted"},
 		{RolePaused, failover.RolePaused, "paused"},
+		{RoleFenced, failover.RoleFenced, "fenced"},
 	} {
 		if c.mine != c.theirs {
 			t.Errorf("role %s: libvirtsync says %q, pkg/failover says %q", c.what, c.mine, c.theirs)

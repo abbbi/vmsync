@@ -397,10 +397,15 @@ type syncConfig struct {
 	Promote        bool
 	Invert         bool
 	ShutdownDomain bool
-	ReadFence      bool
-	PromoteMode    string
-	PromotedBy     string
-	ForcePromote   bool
+	// FenceDomain is -shutdown-domain carried out by an automatic fence; it
+	// records RoleFenced instead of RolePaused. Its own mode rather than a
+	// modifier, because a fence is its own operation -- a peer of -promote and
+	// -invert. See runFenceDomain.
+	FenceDomain  bool
+	ReadFence    bool
+	PromoteMode  string
+	PromotedBy   string
+	ForcePromote bool
 	// FenceSource arms a fence against the displaced source: "auto" to take
 	// it from the target's own replica_source, an explicit "host:domain", or
 	// empty to arm nothing. Empty is the default because a promotion that
@@ -482,6 +487,7 @@ func main() {
 	flag.BoolVar(&cfg.Promote, "promote", false, "Promote the replica named by -target-uri/-target-domain to serve live: record the promotion and, with -start, boot it. Refuses unless the target actually holds a usable replica. Must be run on the target's own host")
 	flag.BoolVar(&cfg.Invert, "invert", false, "Reverse a pair's direction after a failover: -source-uri/-source-domain name the OLD source, -target-uri/-target-domain the promoted replica. Run on the old source's host")
 	flag.BoolVar(&cfg.ShutdownDomain, "shutdown-domain", false, "Shut the domain named by -target-uri/-target-domain down cleanly and pause its replication. The source half of a planned failover; must be run on that domain's own host")
+	flag.BoolVar(&cfg.FenceDomain, "fence-domain", false, "Shut the domain named by -target-uri/-target-domain down because a PEER WAS PROMOTED over it, and mark its replication role fenced. What -shutdown-domain does, differing only in what it records: paused means a person chose to stop replicating, fenced means nobody here chose anything and a peer took over. Normally run by vmsync-agent's fence loop rather than by hand. Like -shutdown-domain it never destroys a guest that ignores ACPI -- but unlike it, the role is recorded even when the shutdown fails, because at that moment a live domain and a promoted peer are a split brain and the role is all that refuses a sync into it")
 	flag.BoolVar(&cfg.ReadFence, "read-fence", false, "Ask the peer named by -target-uri/-target-domain whether its promotion armed a fence against this host, and print the answer as JSON. Reads only; changes nothing anywhere. Unlike the other failover modes this one accepts a REMOTE uri, because asking the other site is the entire operation. An unreachable peer is reported as unreachable rather than as an absence of fencing")
 	flag.StringVar(&cfg.PromoteMode, "promote-mode", string(failover.ModeForced), fmt.Sprintf("How this promotion came about, recorded on the domain: %q when the source was cleanly shut down first (no data lost), %q when it was never reached", failover.ModePlanned, failover.ModeForced))
 	flag.StringVar(&cfg.PromotedBy, "promoted-by", "", "Who is performing this promotion, recorded on the domain for attribution")
@@ -550,6 +556,7 @@ func main() {
 			{cfg.Promote, "-promote"},
 			{cfg.Invert, "-invert"},
 			{cfg.ShutdownDomain, "-shutdown-domain"},
+			{cfg.FenceDomain, "-fence-domain"},
 			{cfg.ReadFence, "-read-fence"},
 			{cfg.UpdateRole != "", "-update-role"},
 			{cfg.ListRestorePoints, "-list-restore-points"},
@@ -578,6 +585,8 @@ func main() {
 				err = runInvert(ctx, cfg)
 			case cfg.ShutdownDomain:
 				err = runShutdownDomain(ctx, cfg)
+			case cfg.FenceDomain:
+				err = runFenceDomain(ctx, cfg)
 			case cfg.ReadFence:
 				err = runReadFence(cfg)
 			case cfg.ListRestorePoints:
@@ -2137,13 +2146,19 @@ func run(cfg syncConfig) (runErr error) {
 		return fmt.Errorf("read target domain replication role: %w", err)
 	}
 	if err := libvirtsync.TargetRoleAllowsSync(targetRole); err != nil {
-		// -force-clean overrides two of the four refusals, and only those two.
+		// -force-clean overrides three of the five refusals, and only those.
 		//
-		// promoted and paused both mean "this replica is in a state a sync
-		// must not blunder into", and getting out of them is exactly what a
-		// deliberate clean is for. Loud rather than silent: a promoted domain
+		// promoted, paused and fenced all mean "this replica is in a state a
+		// sync must not blunder into", and getting out of them is exactly what
+		// a deliberate clean is for. Loud rather than silent: a promoted domain
 		// is one somebody failed over TO, so its disks are live data, and the
 		// operator is told precisely what is being discarded.
+		//
+		// fenced belongs here for a reason worth stating, because leaving it
+		// out is the natural mistake: a fenced domain is the one an operator is
+		// MOST likely to need to clean up, since it got there without anybody
+		// choosing it. Omitting it would make the state that nobody asked for
+		// also the state nobody can get out of.
 		//
 		// source and an unrecognised role are NOT overridden, and that is not
 		// timidity. role=source says this domain is the primary of its pair,
@@ -2152,7 +2167,7 @@ func run(cfg syncConfig) (runErr error) {
 		// and no amount of force makes destroying the primary the intent. An
 		// unrecognised role was written by a newer vmsync and fails closed for
 		// the reason it always does.
-		if cfg.ForceClean && (targetRole == libvirtsync.RolePromoted || targetRole == libvirtsync.RolePaused) {
+		if cfg.ForceClean && (targetRole == libvirtsync.RolePromoted || targetRole == libvirtsync.RolePaused || targetRole == libvirtsync.RoleFenced) {
 			trace.Warning("-force-clean: overriding the replication role interlock and DISCARDING this domain's current disks",
 				"vm", cfg.TargetDomain, "role", targetRole, "refusal", err.Error())
 		} else {

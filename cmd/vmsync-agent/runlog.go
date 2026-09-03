@@ -466,6 +466,7 @@ var agentFlagVocabulary = map[string]argClass{
 
 	// fencing
 	"-shutdown-domain":      argFlagOnly,
+	"-fence-domain":         argFlagOnly,
 	"-shutdown-timeout-sec": argValue,
 	"-read-fence":           argFlagOnly,
 

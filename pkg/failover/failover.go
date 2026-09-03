@@ -43,6 +43,9 @@ const (
 	RoleTarget   = "target"
 	RolePromoted = "promoted"
 	RolePaused   = "paused"
+	// RoleFenced is libvirtsync.RoleFenced: a domain an automatic fence
+	// stopped. Promotable, unlike what its name suggests -- see AssessPromote.
+	RoleFenced = "fenced"
 )
 
 // Mode is how a promotion reached the point of being performed.
@@ -231,10 +234,18 @@ func AssessPromote(st TargetState, opt PromoteOptions) (PromotePlan, error) {
 		return PromotePlan{}, fmt.Errorf(
 			"domain is marked replication_role=%q, meaning it is the SOURCE of a replication pair, not a replica -- promoting it is meaningless and suggests the pair is the wrong way round",
 			RoleSource)
-	case RoleTarget, RolePaused, "":
+	case RoleTarget, RolePaused, RoleFenced, "":
 		// Proceed. paused is deliberately allowed: pausing replication and
 		// then failing over is an ordinary sequence, and refusing it would
 		// turn paused into a trap at the worst possible moment.
+		//
+		// fenced is allowed for a sharper reason. A fence acts on the evidence
+		// that a peer was promoted, and that evidence can be wrong -- a
+		// mistaken failover, a DR drill somebody forgot to unwind, a partition
+		// that has since healed. Refusing to promote a fenced domain would
+		// make a wrong fence unrecoverable through the one control an operator
+		// has, which is the same trap the paused case above describes, reached
+		// by a route nobody chose.
 	default:
 		return PromotePlan{}, fmt.Errorf(
 			"domain has an unrecognized replication_role=%q -- refusing to promote a domain whose role this vmsync build does not understand (it was most likely written by a newer version)",

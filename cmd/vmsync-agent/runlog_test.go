@@ -226,7 +226,7 @@ func TestEveryEmittedFlagIsInTheVocabulary(t *testing.T) {
 		"-promote", "-promote-mode", "-promoted-by", "-force-promote", "-fence-source",
 		"-invert", "-reinit", "-force-clean", "-start", "-update-role",
 		"-restore-restore-point", "-restored-by", "-force-restore",
-		"-shutdown-domain", "-shutdown-timeout-sec", "-read-fence",
+		"-shutdown-domain", "-fence-domain", "-shutdown-timeout-sec", "-read-fence",
 	} {
 		if _, ok := agentFlagVocabulary[f]; !ok {
 			t.Errorf("%s is emitted by a builder but missing from agentFlagVocabulary, so its value would be redacted from the run log", f)

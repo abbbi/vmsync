@@ -513,6 +513,31 @@ const (
 	// progress. Refused like the others, but says "deliberately stopped"
 	// rather than "direction is wrong" or "this is live now".
 	RolePaused = "paused"
+	// RoleFenced marks a domain an automatic FENCE stopped, because its peer
+	// was promoted and this copy had been displaced.
+	//
+	// Distinct from RolePaused, which it used to share, and the difference is
+	// what an operator does next. `paused` means a person suspended
+	// replication and will resume it when they are ready. `fenced` means
+	// nobody chose this: a peer took over, and the pair's direction has
+	// probably reversed -- so the usual next step is -invert, not "resume".
+	// Collapsing the two lost that, and lost it exactly where it was most
+	// wanted; vmsync_ui carried a WasFenced heuristic that existed solely to
+	// guess which of the two had happened, because "both end up paused with
+	// nothing in libvirt telling them apart".
+	//
+	// It can also be recorded while the domain is STILL RUNNING, which
+	// `paused` never legitimately is. A fence that could not stop its guest
+	// (ACPI ignored, and vmsync never escalates to destroying a domain) writes
+	// this anyway -- at that moment it is the only thing refusing a sync into
+	// a live split brain, so it is needed most in the case where the shutdown
+	// failed. See runFenceDomain.
+	//
+	// A fenced domain is still PROMOTABLE, deliberately: a fence acts on the
+	// evidence of a peer's promotion, and that evidence can be wrong -- a
+	// mistaken failover, a drill, a partition that healed. Refusing to promote
+	// it would make a wrong fence unrecoverable.
+	RoleFenced = "fenced"
 	// RoleNone is not a stored value: it is the argument that CLEARS the
 	// field, returning a domain to the no-role-recorded state.
 	RoleNone = "none"
@@ -520,7 +545,12 @@ const (
 
 // ValidRoles lists the values SetReplicationRole accepts, in the order a
 // CLI help message should present them.
-var ValidRoles = []string{RoleSource, RoleTarget, RolePromoted, RolePaused, RoleNone}
+//
+// RoleFenced is settable by hand as well as written by the fence, so an
+// operator can record one they carried out themselves -- and, more usefully,
+// so `-update-role=fenced` exists as the honest way to say what happened
+// rather than reaching for `paused` because it was the only word available.
+var ValidRoles = []string{RoleSource, RoleTarget, RolePromoted, RolePaused, RoleFenced, RoleNone}
 
 // metadataFieldOrder fixes the field order vmsync writes its own metadata
 // entries in, purely for stable/readable XML output.
@@ -1501,6 +1531,13 @@ func TargetRoleAllowsSync(role string) error {
 		return fmt.Errorf("%w: target domain is marked replication_role=%q, meaning it was failed over to and is now serving live -- refusing to overwrite it with a replica from the old source, whether or not it happens to be running at this moment; run -update-role=%s to deliberately turn it back into a replication target (its current disk contents will be discarded)", ErrRoleRefusesSync, RolePromoted, RoleTarget)
 	case RolePaused:
 		return fmt.Errorf("%w: target domain is marked replication_role=%q, so replication into it is administratively suspended -- run -update-role=%s to resume", ErrRoleRefusesSync, RolePaused, RoleTarget)
+	case RoleFenced:
+		// Its own message, not RolePaused's. Both refuse, but they call for
+		// opposite things: a paused replica is waiting for its operator to
+		// resume it, while a fenced one was displaced by a peer that is now
+		// serving -- so resuming the sync in the SAME direction is very likely
+		// the wrong repair, and would overwrite the copy that took over.
+		return fmt.Errorf("%w: target domain is marked replication_role=%q, meaning a fence stopped it because a peer was promoted over it -- syncing into it now would resume replication in a direction that may already have reversed. If the failover stands, run -invert to reverse the pair; if the fence was wrong, run -update-role=%s to make this a replication target again", ErrRoleRefusesSync, RoleFenced, RoleTarget)
 	default:
 		return fmt.Errorf("%w: target domain has an unrecognized replication_role=%q -- refusing to sync into a domain whose role this vmsync build does not understand (it was most likely written by a newer version; upgrade, or run -update-role=%s to override)", ErrRoleRefusesSync, role, RoleTarget)
 	}
@@ -1595,7 +1632,7 @@ func TargetVerifyStateAllowsSync(verifyState, failedAt string) error {
 // testable without libvirt.
 func TargetRoleAllowsRestore(role string) error {
 	switch role {
-	case "", RoleTarget, RolePaused:
+	case "", RoleTarget, RolePaused, RoleFenced:
 		return nil
 	case RoleSource:
 		return fmt.Errorf("target domain is marked replication_role=%q, meaning it is the SOURCE of a replication pair -- restoring a restore point over it would overwrite the original with an old copy of its own replica; check that -target-uri/-target-domain name the replica and not the source", RoleSource)
@@ -1615,7 +1652,7 @@ func TargetRoleAllowsRestore(role string) error {
 // never passed at all) can never be mistaken for a request to clear.
 func ValidateRole(role string) error {
 	switch role {
-	case RoleSource, RoleTarget, RolePromoted, RolePaused, RoleNone:
+	case RoleSource, RoleTarget, RolePromoted, RolePaused, RoleFenced, RoleNone:
 		return nil
 	default:
 		return fmt.Errorf("invalid replication role %q: must be one of %s", role, strings.Join(ValidRoles, ", "))

@@ -345,9 +345,11 @@ func sweepFences(ctx context.Context, cfg agentConfig, state *sharedState, ledge
 		switch d.Role {
 		case libvirtsync.RoleSource, "":
 		default:
-			// paused (already fenced, or administratively stopped), promoted
-			// (this host is the one that took over), target (not serving).
-			// None of them is a source that could still be writing.
+			// fenced (a fence already stopped this one), paused
+			// (administratively stopped), promoted (this host is the one that
+			// took over), target (not serving). None of them is a source that
+			// could still be writing. fenced landing here is what stops a
+			// domain being swept again every minute after it has been fenced.
 			continue
 		}
 		for _, ref := range d.ReplicaTargets {
@@ -479,7 +481,7 @@ func fenceOneDomain(ctx context.Context, cfg agentConfig, cached UIConfig, ledge
 	//
 	// What is genuinely lost is the record surviving a restart, so a new
 	// process may fence the same token again. Bounded: if the shutdown
-	// succeeded the domain is off and replication is `paused`, and the sweep
+	// succeeded the domain is off and its role is `fenced`, and the sweep
 	// skips it on both counts, so a repeat needs somebody to restart the VM
 	// and put its role back while the peer is still promoted and armed -- by
 	// which point a real split brain exists and shutting down is correct.
@@ -506,14 +508,20 @@ func fenceOneDomain(ctx context.Context, cfg agentConfig, cached UIConfig, ledge
 	cctx, cancel := context.WithTimeout(ctx, shutdownProcessBound(guestSec))
 	defer cancel()
 
-	// The existing -shutdown-domain mode, unchanged: a clean guest shutdown
-	// that never falls back to destroying the domain, followed by
-	// replication being set to paused. Reused rather than reimplemented so
-	// that a fenced domain ends in exactly the state a deliberate planned
-	// failover would leave it in -- there is no second, subtly different
-	// shutdown path to keep in step.
+	// -fence-domain: the same clean guest shutdown -shutdown-domain performs,
+	// never falling back to destroying the domain, followed by the
+	// replication role being recorded. They share one implementation
+	// (shutdownAndMark) so there is no second, subtly different shutdown path
+	// to keep in step; they differ only in the role written, which is the one
+	// thing only the caller knows. A planned failover records `paused` -- a
+	// person chose it. This records `fenced` -- nobody here chose anything,
+	// and the operator who finds it needs to know a peer took over.
+	//
+	// It also records that role even if the shutdown FAILS, which matters most
+	// here: the peer is already serving, so a guest that ignores ACPI leaves a
+	// live split brain, and the role is then the only thing refusing a sync.
 	args := []string{
-		"-shutdown-domain", "-target-uri", cfg.LibvirtURI, "-target-domain", vm,
+		"-fence-domain", "-target-uri", cfg.LibvirtURI, "-target-domain", vm,
 		"-shutdown-timeout-sec", strconv.Itoa(guestSec),
 	}
 	cmd := exec.CommandContext(cctx, cfg.VmsyncPath, args...)

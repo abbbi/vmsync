@@ -421,11 +421,35 @@ func inspectReplicaDisks(mgr *libvirtsync.Manager, domainName string) (present b
 // runShutdownDomain stops a domain cleanly and marks its replication
 // paused, on the host it runs on.
 //
-// The source half of a planned failover. Separate from -promote so each
-// half runs where its credentials already reach; see requireLocalURI.
+// The source half of a PLANNED failover: a person decided this, and paused
+// says so. Separate from -promote so each half runs where its credentials
+// already reach; see requireLocalURI.
 func runShutdownDomain(ctx context.Context, cfg syncConfig) error {
+	return shutdownAndMark(ctx, cfg, "-shutdown-domain", libvirtsync.RolePaused)
+}
+
+// runFenceDomain is the same shutdown carried out by an automatic FENCE, and
+// it records RoleFenced instead.
+//
+// Its own mode rather than a modifier on -shutdown-domain, because a fence is
+// its own operation -- a peer of -promote and -invert, not a variant of a
+// planned shutdown. The two differ in the one thing only the caller can know:
+// whether a person chose this. Everything they DO is identical, which is why
+// they share shutdownAndMark rather than being told apart by a flag inside it;
+// vmsync-agent's fence path calls this instead of reimplementing a second,
+// subtly different shutdown.
+func runFenceDomain(ctx context.Context, cfg syncConfig) error {
+	return shutdownAndMark(ctx, cfg, "-fence-domain", libvirtsync.RoleFenced)
+}
+
+// shutdownAndMark stops a domain and records why its replication stopped.
+//
+// role is the whole difference between the two callers, and it is a parameter
+// rather than a branch so that neither mode can drift from the other in
+// anything else.
+func shutdownAndMark(ctx context.Context, cfg syncConfig, mode, role string) error {
 	if cfg.TargetURI == "" || cfg.TargetDomain == "" {
-		return fmt.Errorf("-shutdown-domain needs -target-uri and -target-domain naming the domain to stop")
+		return fmt.Errorf("%s needs -target-uri and -target-domain naming the domain to stop", mode)
 	}
 	if err := requireLocalURI(cfg.TargetURI, "-target-uri"); err != nil {
 		return err
@@ -465,28 +489,33 @@ func runShutdownDomain(ctx context.Context, cfg syncConfig) error {
 			"vm", cfg.TargetDomain, "error", shutdownErr)
 	}
 
-	// paused, not target: this domain has just stopped serving, but nothing
-	// has yet decided it is expendable. Marking it a target here would
+	// paused/fenced, never target: this domain has just stopped serving, but
+	// nothing has yet decided it is expendable. Marking it a target here would
 	// invite a sync to overwrite it before anyone made that call, and the
 	// data it holds is the entire reason a planned failover is preferred
 	// over a forced one. Inversion is where it becomes a target, deliberately.
-	previous, err := libvirtsync.SetReplicationRole(mgr, cfg.TargetDomain, libvirtsync.RolePaused)
+	//
+	// Which of the two is recorded is the caller's to say, and it is the only
+	// thing that differs between them: paused means a person chose this and
+	// will resume when ready, fenced means a peer took over and nobody here
+	// chose anything.
+	previous, err := libvirtsync.SetReplicationRole(mgr, cfg.TargetDomain, role)
 	if err != nil {
 		if shutdownErr != nil {
 			// Both halves failed. Report both: "the fence did not stop it" and
 			// "nothing records that" are separate emergencies, and an operator
 			// told only the second would not know the domain is still live.
 			return fmt.Errorf("domain %s could not be shut down (%v) AND its replication role could not be set to %s: %w -- this domain may still be RUNNING while its peer is promoted, with nothing recorded to stop replication resuming",
-				cfg.TargetDomain, shutdownErr, libvirtsync.RolePaused, err)
+				cfg.TargetDomain, shutdownErr, role, err)
 		}
-		return fmt.Errorf("domain %s was shut down but its replication role could not be set to %s: %w", cfg.TargetDomain, libvirtsync.RolePaused, err)
+		return fmt.Errorf("domain %s was shut down but its replication role could not be set to %s: %w", cfg.TargetDomain, role, err)
 	}
 	if shutdownErr != nil {
 		// The role is recorded, but the fence still failed at its actual job.
 		return fmt.Errorf("domain %s was marked %s but could NOT be shut down: %w -- it may still be running while its peer serves; stop it by hand",
-			cfg.TargetDomain, libvirtsync.RolePaused, shutdownErr)
+			cfg.TargetDomain, role, shutdownErr)
 	}
-	trace.Info("domain shut down and replication paused", "vm", cfg.TargetDomain, "previous_role", previous)
+	trace.Info("domain shut down and replication stopped", "vm", cfg.TargetDomain, "role", role, "previous_role", previous)
 	return nil
 }
 

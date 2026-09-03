@@ -211,13 +211,19 @@ type ReportDomain struct {
 	// Fenced is what THIS agent did about a fence naming this domain, from
 	// its own durable ledger.
 	//
-	// The half of the picture nothing else can supply. A fence that worked
-	// leaves a domain that is merely `paused` -- indistinguishable, from
-	// metadata alone, from one an operator paused deliberately. A fence that
-	// FAILED leaves no trace in libvirt at all: just a VM still running
-	// beside a promoted copy, which looks exactly like a failover nobody has
-	// got to yet. Without this the console sees consequences and never
-	// causes.
+	// The half of the picture metadata alone cannot supply.
+	//
+	// It used to be both halves: a fence that worked left a domain merely
+	// `paused`, indistinguishable from one an operator had paused
+	// deliberately, so this was the only way to tell them apart. The `fenced`
+	// role now says that much directly.
+	//
+	// What remains is the part no role can carry: whether the fence actually
+	// WORKED. `fenced` is recorded either way -- deliberately, since a fence
+	// that could not stop its guest is exactly when a role refusing syncs
+	// matters most -- so only this ledger separates "stopped it" from "tried
+	// and it is still running beside a promoted copy". Without it the console
+	// would see a fenced domain and not know which.
 	Fenced *ReportFenced `json:"fenced,omitempty"`
 	// Disks is what this domain occupies on this host's storage: the
 	// allocated figure, not the apparent one, because that is what a copy

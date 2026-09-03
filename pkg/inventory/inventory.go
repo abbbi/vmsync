@@ -239,6 +239,15 @@ func Assess(d Domain, now time.Time, cadence time.Duration) Assessment {
 		a.Status = StatusPaused
 		a.Reasons = append(a.Reasons, "replication administratively paused (replication_role=paused)")
 		return a
+	case libvirtsync.RoleFenced:
+		// Reported as paused because the consequence is the same -- nothing is
+		// replicating into it, and that is expected rather than broken -- but
+		// with its own reason, because the cause and the fix are not the same
+		// at all. Somebody paused a paused domain and will unpause it; nobody
+		// chose this one, a peer took over, and the usual repair is -invert.
+		a.Status = StatusPaused
+		a.Reasons = append(a.Reasons, "stopped by an automatic fence after a peer was promoted over it (replication_role=fenced); run -invert if the failover stands, or -update-role=target if the fence was wrong")
+		return a
 	case libvirtsync.RolePromoted:
 		a.Status = StatusPromoted
 		a.Reasons = append(a.Reasons, "promoted to live after a failover (replication_role=promoted); no longer receiving replication")
