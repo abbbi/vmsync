@@ -188,6 +188,7 @@ func TestCommandArgsOmitsWhatWasNotAskedFor(t *testing.T) {
 
 	for _, absent := range []string{
 		"-compress", "-compress=", "-compress-level", "-netbuffer", "-netbuffer=",
+		"-no-checksum",
 		"-use-ssh", "-io-depth", "-verify", "-verify=", "-reinit-after-failures",
 		"-target-disk-path", "-ssh-user", "-ssh-key", "-ssh-port", "-ssh-known-hosts",
 		"-source-nbd-port", "-target-nbd-port", "-prometheus-textfile",
@@ -225,4 +226,48 @@ func TestCommandArgsPassesAwkwardValuesThroughVerbatim(t *testing.T) {
 	if err := (SyncProfile{TargetDiskPath: nasty}).Validate(); err == nil {
 		t.Error("Validate accepted a target_disk_path containing shell metacharacters")
 	}
+}
+
+// The pre-commit integrity check is ON by vmsync's own default, so the agent
+// must emit -no-checksum only when a profile explicitly asks for it.
+//
+// The direction that matters is the silent one: a profile written before this
+// field existed, or one that simply does not mention it, must leave the check
+// running. If the field were positive ("checksum": false) an absent value
+// would be indistinguishable from a deliberate disable, and every existing
+// profile would quietly turn a safety feature off.
+func TestNoChecksumIsEmittedOnlyWhenAsked(t *testing.T) {
+	base := SyncRequest{
+		SourceURI: "qemu:///system", SourceDomain: "web01",
+		TargetURI: "qemu+ssh://root@h/system", TargetDomain: "web01",
+	}
+
+	t.Run("absent from the profile leaves the check on", func(t *testing.T) {
+		if args := base.CommandArgs(); slices.Contains(args, "-no-checksum") {
+			t.Errorf("args %v contain -no-checksum although the profile never mentioned it", args)
+		}
+	})
+
+	t.Run("explicitly disabled emits the flag", func(t *testing.T) {
+		req := base
+		req.SyncProfile = SyncProfile{NoChecksum: true}
+		args := req.CommandArgs()
+		if !slices.Contains(args, "-no-checksum") {
+			t.Errorf("args %v are missing -no-checksum for a profile that set it", args)
+		}
+		// A bare flag: it must not acquire a value argument, which would be
+		// parsed by vmsync as a positional and stop flag parsing dead.
+		for i, a := range args {
+			if a == "-no-checksum" && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				t.Errorf("-no-checksum was followed by %q; it takes no value", args[i+1])
+			}
+		}
+	})
+
+	t.Run("a profile that disables it is still valid", func(t *testing.T) {
+		p := SyncProfile{NoChecksum: true}
+		if err := p.Validate(); err != nil {
+			t.Errorf("Validate rejected a profile that only disables the checksum: %v", err)
+		}
+	})
 }

@@ -61,6 +61,24 @@ type SyncProfile struct {
 	UseSSH bool `json:"use_ssh,omitempty"`
 	// IODepth is how many NBD read/write pairs stay in flight.
 	IODepth int `json:"io_depth,omitempty"`
+	// NoChecksum disables the pre-commit integrity check, which is on by
+	// default: every chunk the copy reads is hashed as it passes,
+	// vmsync-bridge-helper hashes the same ranges back off the target, and an
+	// incremental sync's overlay is removed instead of committed if they
+	// disagree.
+	//
+	// Negative, like vmsync's own -no-checksum, so omitting it leaves the
+	// check ON -- which is the point of a default nobody has to know about.
+	// A positive "checksum": false would need a pointer to tell "absent"
+	// from "explicitly disabled", and every profile written before this
+	// field existed would then have to be read as disabling it.
+	//
+	// Worth setting only where the target cannot carry a matching helper.
+	// Where one is simply absent vmsync already skips the check with a
+	// warning rather than failing the sync, so this flag is for stating that
+	// intent deliberately -- and for silencing the warning that says an
+	// integrity check is not running.
+	NoChecksum bool `json:"no_checksum,omitempty"`
 	// Verify is "", "fast", "full" or "qemu-img".
 	//
 	// All three compare the target against the same frozen source snapshot
@@ -369,6 +387,11 @@ func (r SyncRequest) CommandArgs() []string {
 	}
 	if p.IODepth > 0 {
 		args = append(args, "-io-depth", strconv.Itoa(p.IODepth))
+	}
+	// Emitted only when true, so a profile that says nothing about it leaves
+	// vmsync's own default (the check enabled) in force.
+	if p.NoChecksum {
+		args = append(args, "-no-checksum")
 	}
 	if p.Verify != "" {
 		args = append(args, "-verify="+p.Verify)

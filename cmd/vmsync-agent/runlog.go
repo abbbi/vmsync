@@ -445,6 +445,7 @@ var agentFlagVocabulary = map[string]argClass{
 	"-target-nbd-port":         argValue,
 	"-target-disk-path":        argValue,
 	"-timestamp-tolerance-sec": argValue,
+	"-no-checksum":             argFlagOnly,
 	"-use-ssh":                 argFlagOnly,
 
 	// operations
