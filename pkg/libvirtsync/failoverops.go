@@ -182,6 +182,22 @@ func ShutdownDomain(ctx context.Context, mgr *Manager, domainName string, timeou
 
 	trace.Info("asking domain to shut down", "vm", domainName, "timeout", timeout)
 	if err := dom.ShutdownFlags(libvirt.DOMAIN_SHUTDOWN_DEFAULT); err != nil {
+		// Convergent here too, and this is a race that really happens rather
+		// than a theoretical one: the domain can reach SHUTOFF between the
+		// GetState above and this request -- a guest that was already
+		// shutting down, or a peer's fence that got there first -- and libvirt
+		// answers a shutdown request on a stopped domain with
+		// ERR_OPERATION_INVALID. Reporting that as a failure contradicts the
+		// state check ten lines up, which treats an already-stopped domain as
+		// success precisely because this operation is meant to be repeatable.
+		//
+		// The state is re-read rather than the error code matched: what the
+		// caller needs to know is whether the domain is down, and that is a
+		// better question than which errno explained the refusal.
+		if state, _, serr := dom.GetState(); serr == nil && state == libvirt.DOMAIN_SHUTOFF {
+			trace.Info("domain stopped while the shutdown request was being made, which is the outcome that was wanted", "vm", domainName, "request_error", err)
+			return nil
+		}
 		return fmt.Errorf("request shutdown of domain %s: %w", domainName, err)
 	}
 

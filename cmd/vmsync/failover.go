@@ -437,8 +437,32 @@ func runShutdownDomain(ctx context.Context, cfg syncConfig) error {
 	}
 	defer mgr.Close()
 
-	if err := libvirtsync.ShutdownDomain(ctx, mgr, cfg.TargetDomain, time.Duration(cfg.ShutdownTimeoutSec)*time.Second); err != nil {
-		return err
+	// The role is recorded even when the shutdown FAILS, and unconditionally
+	// -- for a fence and for a planned failover alike.
+	//
+	// The old code returned on any shutdown error, which read as caution and
+	// was the opposite. Every caller of this mode is asking for one thing:
+	// stop this domain and suspend its replication. There is no reason to make
+	// half of that conditional on the other half succeeding, in an operation
+	// whose whole documented shape is convergence (see ShutdownDomain: "the
+	// one thing a caller does after a partial failure is run it again").
+	//
+	// It matters most where it was skipped. When vmsync-agent fences, this
+	// domain's peer has already been promoted and is serving; a shutdown that
+	// then fails leaves a live split brain, and the replication role is the
+	// only thing stopping a sync resuming into or out of it. The agent also
+	// latches the fence as acted-on BEFORE launching this, so nothing retried
+	// it -- the outcome was a live displaced source, no role recorded, and a
+	// fence that would never fire again.
+	//
+	// A timeout is not "nothing happened", either. The ACPI request was
+	// delivered and waited on; a guest that ignores it for the timeout may
+	// still stop moments later, at which point a missing role would simply be
+	// wrong. Recording it is the convergent answer in both directions.
+	shutdownErr := libvirtsync.ShutdownDomain(ctx, mgr, cfg.TargetDomain, time.Duration(cfg.ShutdownTimeoutSec)*time.Second)
+	if shutdownErr != nil {
+		trace.Error("this domain could not be shut down -- recording its replication role anyway, because if this was a fence its peer is already serving and the role is the only thing stopping replication resuming into a split brain. STOP THIS DOMAIN BY HAND",
+			"vm", cfg.TargetDomain, "error", shutdownErr)
 	}
 
 	// paused, not target: this domain has just stopped serving, but nothing
@@ -448,7 +472,19 @@ func runShutdownDomain(ctx context.Context, cfg syncConfig) error {
 	// over a forced one. Inversion is where it becomes a target, deliberately.
 	previous, err := libvirtsync.SetReplicationRole(mgr, cfg.TargetDomain, libvirtsync.RolePaused)
 	if err != nil {
+		if shutdownErr != nil {
+			// Both halves failed. Report both: "the fence did not stop it" and
+			// "nothing records that" are separate emergencies, and an operator
+			// told only the second would not know the domain is still live.
+			return fmt.Errorf("domain %s could not be shut down (%v) AND its replication role could not be set to %s: %w -- this domain may still be RUNNING while its peer is promoted, with nothing recorded to stop replication resuming",
+				cfg.TargetDomain, shutdownErr, libvirtsync.RolePaused, err)
+		}
 		return fmt.Errorf("domain %s was shut down but its replication role could not be set to %s: %w", cfg.TargetDomain, libvirtsync.RolePaused, err)
+	}
+	if shutdownErr != nil {
+		// The role is recorded, but the fence still failed at its actual job.
+		return fmt.Errorf("domain %s was marked %s but could NOT be shut down: %w -- it may still be running while its peer serves; stop it by hand",
+			cfg.TargetDomain, libvirtsync.RolePaused, shutdownErr)
 	}
 	trace.Info("domain shut down and replication paused", "vm", cfg.TargetDomain, "previous_role", previous)
 	return nil
