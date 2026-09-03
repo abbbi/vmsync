@@ -2261,8 +2261,10 @@ fo_check() {
 		results_row "$CSV" "$scenario" "${label// /_}" 0 "" "" "" "" "" "PASS"
 	else
 		warn "FAIL: $label${detail:+ -- $detail}"
-		# NOTES must not contain a comma (plain CSV, see results_row).
-		results_row "$CSV" "$scenario" "${label// /_}" 1 "" "" "" "" "" "FAIL ${detail//,/;}"
+		# Commas are stripped by results_row itself now -- including from the
+		# label, which is what used to make a failing check disappear from the
+		# stage verdict entirely. Nothing to remember here.
+		results_row "$CSV" "$scenario" "${label// /_}" 1 "" "" "" "" "" "FAIL $detail"
 		FAILOVER_FAILURES=$((FAILOVER_FAILURES + 1))
 	fi
 }

@@ -338,10 +338,29 @@ results_init() {
 }
 
 # results_row FILE SCENARIO PHASE EXIT WALL_SECONDS TRANSFERRED COMPRESSED DISK MODE NOTES
-# NOTES must never contain a literal comma -- this is a plain CSV, not a
-# quoted/escaped one, kept deliberately simple since every caller in this
-# harness controls its own note text.
+#
+# No field may contain a literal comma, and that is enforced HERE rather than
+# asked of every call site -- because asking did not work. This is a plain CSV
+# with no quoting or escaping, so a comma inside a field shifts every field
+# after it, and stage_verdict reads the notes from a fixed column ($9 in its
+# awk). The two failure modes are not equally visible:
+#
+#   - a comma in NOTES (the last field) merely truncates what the report
+#     shows, since $9 still holds the text up to that comma and still begins
+#     PASS/FAIL/SKIP. Harmless enough that several callers do it.
+#   - a comma anywhere EARLIER moves the notes out of $9 entirely, so the row
+#     counts as neither pass nor fail and vanishes from the verdict.
+#
+# The second is how stage 7 printed "FAIL: the fenced source is left paused,
+# not merely stopped" and then reported "PASS -- 8 checks passed": that label
+# became the phase column, its comma split the row, and the FAIL disappeared.
+# A second label in the same stage did the same thing to a PASS, which is why
+# the count was 8 rather than 9. The rule had been written in a comment beside
+# one call site and was broken by the argument two lines above it.
 results_row() {
 	local file="$1"; shift
-	printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$@" >> "$file"
+	local -a fields=()
+	local f
+	for f in "$@"; do fields+=("${f//,/;}"); done
+	printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "${fields[@]}" >> "$file"
 }
