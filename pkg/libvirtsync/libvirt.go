@@ -67,11 +67,59 @@ const (
 	// TestFaultFailureDefine makes the target's redefine fail, exercising
 	// DefineDomain's rollback to the previous definition.
 	TestFaultFailureDefine = "failure-define"
+	// The two corruption faults, named for WHEN they fire, because that is the
+	// only thing separating them and each one defeats a different check.
+	// Neither can be staged from outside the process.
+
+	// TestFaultCorruptBeforeChecksum writes garbage into the image the copy
+	// just wrote -- the fleecing overlay on an incremental, the base on a full
+	// sync -- in the window after the write export is stopped and before the
+	// pre-commit digest check reads it back. The digest check is expected to
+	// CATCH it: the run fails, the overlay is discarded, and the replica's base
+	// is left untouched.
+	//
+	// This is the only way to test that check against genuinely corrupted
+	// bytes. contrib/bench/bench.sh's stage 13b gets there with a shim that
+	// falsifies the helper's REPLY, which proves vmsync reacts to a
+	// mismatching answer -- not that the check detects wrong bytes. A vmsync
+	// hashing the wrong ranges, or a helper hashing the overlay's backing file
+	// instead of the overlay, would pass that shim test and fail this one.
+	//
+	// The corruption is placed inside a range the copy actually WROTE, not at
+	// a fixed offset. The check only hashes what was written, so a fixed
+	// offset would fall outside the plan on any small incremental, sail
+	// through, and commit -- a silent pass for a check that never looked.
+	//
+	// Requires the check to be enabled and running (see checksumEnabled in
+	// run()): with it off there is nothing to catch the corruption, so the
+	// fault would just commit damage.
+	TestFaultCorruptBeforeChecksum = "corrupt-before-checksum"
+
+	// TestFaultCorruptAfterCommit writes garbage over the replica AFTER the
+	// copy has been committed and the digest check has passed, and before
+	// -verify reads it back -- so every -verify run under this fault reports a
+	// genuine mismatch.
+	//
+	// The only way to reach the branch where a verification failure is
+	// answered by a full recopy that then fails verification AGAIN, which is
+	// what makes vmsync stop and mark the replica faulty. Corruption staged
+	// beforehand cannot get there: the recopy overwrites it, which is
+	// precisely the recopy's job.
+	//
+	// It also models the one corruption class nothing upstream can see. The
+	// digest check proves the bytes arrived; the mtime guard catches a write
+	// through the filesystem. Neither can see storage that went bad AFTER a
+	// write was confirmed, which is the whole reason -verify re-reads with
+	// --cache=none.
+	//
+	// Refused without -verify (see the flag's own validation): without a
+	// comparison to fail, this is not a test, it is just damage.
+	TestFaultCorruptAfterCommit = "corrupt-after-commit"
 )
 
 // TestFaults is every accepted -test value, for validation and for the flag's
 // own help text.
-var TestFaults = []string{TestFaultFailureDefine}
+var TestFaults = []string{TestFaultFailureDefine, TestFaultCorruptBeforeChecksum, TestFaultCorruptAfterCommit}
 
 // ValidateTestFault reports whether name is an injectable fault. "" is valid
 // and means no injection.

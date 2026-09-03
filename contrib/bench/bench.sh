@@ -153,18 +153,27 @@ incremental sync's overlay when the target's bytes do not match what was
 sent. It is the one stage written mainly as a NEGATIVE test, because that
 check is ON by default and a check that silently never fires looks exactly
 like a check that works: every other stage here would keep reporting PASS
-either way. Four sub-tests: an ordinary sync must report the check ran and
+either way. Five sub-tests: an ordinary sync must report the check ran and
 matched; a helper reporting one falsified digest must fail the run, remove
 the overlay and leave the base untouched; a helper too old to send a format
 header must be reported as version skew rather than as a corrupt replica;
-and -no-checksum must genuinely skip the check. The corruption cannot be
-applied from outside (the check reads the target back inside one vmsync
-process), so the stage installs a wrapper script under /tmp on the TARGET
-host that runs the real helper and edits its reply -- removed on the way out
-whichever way the stage ends. It is opt-in because one sub-test deliberately
-fails a sync, and because it substitutes the helper binary vmsync is pointed
-at. Stage 1 passes -no-checksum on every cell so its transport numbers are
-not carrying this check's cost; this stage is where that cost belongs.
+-no-checksum must genuinely skip the check; and -- the one that makes the
+falsified-digest test mean anything -- GENUINELY corrupt bytes must be caught,
+with the corruption proven absent from the base afterwards at the exact offset
+it was written to. Neither corruption can be applied from outside, since the
+check reads the target back inside one vmsync process: the falsified reply
+comes from a wrapper script installed under /tmp on the TARGET host that runs
+the real helper and edits its answer (removed on the way out whichever way the
+stage ends), and the real corruption comes from vmsync's own
+-test=corrupt-before-checksum, which writes into the image between the copy
+finishing and the check reading it back. The difference matters, because a
+vmsync hashing the wrong ranges or a helper hashing the overlay's backing file
+would pass the shim test and fail the real one. Opt-in because two sub-tests
+deliberately fail a sync, one substitutes the helper binary vmsync is pointed
+at, and one corrupts real bytes (healing after itself where that leaves the
+base damaged). Stage 1 passes -no-checksum on every cell so its transport
+numbers are not carrying this check's cost; this stage is where that cost
+belongs.
 
 Stage 14 (verify-failure) is opt-in and tests what happens AFTER -verify finds
 a difference -- stage 2 proves the difference is noticed, this proves the
@@ -175,13 +184,14 @@ without being counted toward -reinit-after-failures; a plain -reinit is
 refused too (it recopies but never verifies, so allowing it would move the
 replica from "known bad" to "assumed good" while erasing the record); and
 -verify-failure-reinit repairs it, with only a PASSING verify clearing the
-record. That last sub-test drives the whole ladder unaided: the run it starts
+record. That fourth sub-test drives the whole ladder unaided: the run it starts
 is an incremental, which does not touch the tampered offset, so its own verify
-fails and the recopy-and-re-verify fires for real. Opt-in because three
-sub-tests deliberately fail a sync. NOT covered: the branch where the repair's
-verify also fails and vmsync gives up -- the tamper is healed by the very
-recopy the repair performs, so reaching it would need a -test fault that can
-force a corruption verdict, which does not exist today.
+fails and the recopy-and-re-verify fires for real. A fifth then covers the
+branch a tamper cannot reach -- the repair's own verify failing, so vmsync
+stops rather than trying a third time -- using -test=corrupt-after-commit, which
+corrupts the replica after each copy is committed and so fails both rungs of
+the ladder. Opt-in because four of the five sub-tests deliberately fail a sync,
+and one of them deliberately corrupts the replica.
 EOF
 }
 
@@ -4088,6 +4098,10 @@ stage_checksum() {
 	checksum_mismatch_subtest "$target_path"
 	checksum_stale_helper_subtest
 	checksum_disabled_subtest
+	# Last, because it is the only sub-test whose corruption is REAL: on the
+	# -reinit fallback there is no overlay to discard, so it leaves the base
+	# damaged and heals after itself.
+	checksum_real_corruption_subtest "$target_path"
 	return 0
 }
 
@@ -4224,6 +4238,124 @@ checksum_mismatch_subtest() {
 	fi
 }
 
+# 13e: the check must catch REAL corruption, not just a falsified reply.
+#
+# The sub-test that makes 13b mean something. 13b edits the helper's ANSWER, so
+# it proves vmsync refuses a commit when told the digests disagree -- the
+# plumbing. It cannot prove the check would notice actual wrong bytes, and the
+# ways it could fail to are not exotic: vmsync hashing ranges other than the
+# ones it wrote, the helper hashing the overlay's BACKING file instead of the
+# overlay, an off-by-one in the range plan. Every one of those passes 13b and
+# commits corruption in production.
+#
+# So this one corrupts the bytes for real, via -test=corrupt-before-checksum,
+# which vmsync injects in the window between the copy finishing and the digest
+# check reading it back -- a window nothing outside the process can reach. It
+# writes inside a range the run actually wrote, because the check only hashes
+# those: a fixed offset would fall outside the plan on any small incremental
+# and sail through unnoticed, which would look like a pass.
+#
+# The assertion this adds over 13b is the important one: the corrupted bytes
+# must NOT be in the base afterwards. That is checked directly, by reading the
+# exact offset vmsync logged back off the base and requiring the pattern NOT to
+# be there -- stronger than 13b's allocation-map digest, which would miss an
+# in-place overwrite of already-allocated clusters.
+checksum_real_corruption_subtest() {
+	local base_path="$1" off len line heal=no
+
+	log "--- 13e checksum/real-corruption: genuinely wrong bytes on the target must be caught ---"
+
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" checksum real-corruption-result DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+
+	local -a extra
+	mapfile -t extra < <(checksum_write_args)
+	if [ ${#extra[@]} -gt 0 ]; then
+		bench_sync checksum real-corruption -test=corrupt-before-checksum "${extra[@]}"
+	else
+		bench_sync checksum real-corruption -test=corrupt-before-checksum
+	fi
+
+	# Same distinction 13b draws, and for the same reason: an idle source that
+	# copied nothing is not a failure of the integrity check. vmsync refuses
+	# the fault outright in that case, so the message is its own.
+	if grep -qE 'No changed extents selected, skipping copy|checksum: nothing written, skipping|there is no hashed range to corrupt' "$RUN_LOG" 2>/dev/null; then
+		warn "SKIP: this sync wrote nothing, so there was no hashed range to corrupt and the check was never exercised. See $RUN_LOG"
+		results_row "$CSV" checksum real-corruption-result "" "" "" "" "" "" "SKIP nothing written, check not exercised"
+		return 0
+	fi
+	if grep -q 'needs qemu-io on the target host' "$RUN_LOG" 2>/dev/null; then
+		warn "SKIP: the target host has no qemu-io, so the fault could not be injected. See $RUN_LOG"
+		results_row "$CSV" checksum real-corruption-result "" "" "" "" "" "" "SKIP qemu-io missing on the target"
+		return 0
+	fi
+
+	if [ "$RUN_RC" = 0 ]; then
+		warn "FAIL: the sync SUCCEEDED although vmsync had written garbage into the image it was about to check. This is the failure 13b cannot see: the check reacts to a falsified REPLY but does not notice genuinely wrong BYTES, so a real bad write would be committed silently. See $RUN_LOG"
+		results_row "$CSV" checksum real-corruption-result 1 "" "" "" "" "" "FAIL real corruption not detected"
+		return 0
+	fi
+	if ! grep -q 'do not match the bytes sent' "$RUN_LOG" 2>/dev/null; then
+		warn "FAIL: the sync failed, but not with a digest mismatch -- so it failed for some other reason and this sub-test proved nothing. See $RUN_LOG"
+		results_row "$CSV" checksum real-corruption-result 1 "" "" "" "" "" "FAIL failed for another reason"
+		return 0
+	fi
+
+	# Everything past here is INCREMENTAL-only, exactly as in 13b: the -reinit
+	# fallback writes the base directly, so there is no overlay to discard and
+	# the base is legitimately left corrupted. That case heals on the way out.
+	if [ "$CHECKSUM_INCREMENTAL" != yes ]; then
+		log "   PASS: real corruption was detected (full-sync mode: no overlay, so the base is genuinely damaged and will be healed)"
+		results_row "$CSV" checksum real-corruption-result 0 "" "" "" "" "" "PASS real corruption detected (full sync; base damaged, healed)"
+		heal_target checksum real-corruption-heal "$base_path"
+		return 0
+	fi
+
+	# The offset vmsync chose, taken from its own log rather than guessed: it
+	# comes from the digest plan and is different every run. Filtered to the
+	# overlay belonging to THIS base, so a multi-disk VM does not have another
+	# disk's offset checked against this file.
+	line="$(grep 'deliberately corrupting' "$RUN_LOG" 2>/dev/null | grep -F "image=${base_path}_" | head -1 || true)"
+	if [ -z "$line" ]; then
+		warn "SKIP: the run refused the commit, but no injection line for ${base_path}'s overlay was found in the log, so the base cannot be checked at the corrupted offset. See $RUN_LOG"
+		results_row "$CSV" checksum real-corruption-result 0 "" "" "" "" "" "PASS real corruption detected (base offset not locatable in log)"
+		return 0
+	fi
+	off="$(printf '%s' "$line" | sed -n 's/.*[[:space:]]offset=\([0-9]*\).*/\1/p')"
+	len="$(printf '%s' "$line" | sed -n 's/.*[[:space:]]length=\([0-9]*\).*/\1/p')"
+
+	local leftovers
+	leftovers="$(ssh_host_cmd "$TARGET_HOST" "ls -1 '${base_path}'_* 2>/dev/null" 2>/dev/null || true)"
+
+	if [ -n "$leftovers" ]; then
+		warn "FAIL: the check refused the commit but LEFT the overlay behind: $(printf '%s' "$leftovers" | tr '\n' ' ') -- every failed run would leak a delta-sized file. See $RUN_LOG"
+		results_row "$CSV" checksum real-corruption-result 1 "" "" "" "" "" "FAIL overlay leaked on refusal"
+		return 0
+	fi
+
+	# The direct assertion. `read -P` SUCCEEDS when the data matches the
+	# pattern, so success here means the corruption reached the base and the
+	# refusal did not protect it -- which is why the test is inverted.
+	if [ -n "$off" ] && [ -n "$len" ] && ssh_host_cmd "$TARGET_HOST" qemu-io -r -t none -f qcow2 \
+		-c "'read -P 0xa5 ${off} ${len}'" "'${base_path}'" >/dev/null 2>&1; then
+		warn "FAIL: the check refused the commit, but the corrupted pattern IS PRESENT in the base at offset $off length $len -- the refusal did not stop the bad bytes reaching the replica, which is the one thing it exists to do. See $RUN_LOG"
+		results_row "$CSV" checksum real-corruption-result 1 "" "" "" "" "" "FAIL corruption reached the base despite refusal"
+		heal=yes
+	else
+		log "   PASS: real corruption was detected, the overlay is gone, and the base does not contain it at offset $off"
+		results_row "$CSV" checksum real-corruption-result 0 "" "" "" "" "" "PASS real corruption refused, overlay removed, base clean at the corrupted offset"
+	fi
+
+	# Only when the replica may actually be damaged. On the passing path the
+	# base was just proven untouched at the one offset that was written to, so
+	# a full resync would cost a copy to fix nothing.
+	if [ "$heal" = yes ]; then
+		heal_target checksum real-corruption-heal "$base_path"
+	fi
+}
+
 # 13c: a helper too old to speak the format must be reported as SKEW, never as
 # corruption.
 #
@@ -4357,7 +4489,7 @@ checksum_disabled_subtest() {
 # was lied to exactly once -- the finding was in a log -- but nothing that
 # decides anything could see it.
 #
-# So four assertions, in the order the state moves:
+# So five assertions, in the order the state moves:
 #   14a the finding is written to the target domain
 #   14b an ordinary sync is REFUSED while it stands, and does not count as a
 #       sync failure
@@ -4366,14 +4498,14 @@ checksum_disabled_subtest() {
 #       verifies the result, so allowing it would move the replica from "known
 #       bad" to "assumed good" while erasing the record that said otherwise
 #   14d -verify-failure-reinit repairs it, and only a PASSING verify clears it
+#   14e when the repair's OWN verify fails, vmsync stops rather than trying a
+#       third time, and leaves the replica faulty for a human
 #
-# NOT covered, deliberately and worth knowing: the branch where the repair's own
-# verify fails too, so vmsync gives up and leaves the replica faulty. Reaching
-# it needs a verify that fails on demand, and the tamper this stage uses is
-# healed by the very recopy the repair performs -- so the second verify passes,
-# which is 14d. It would need a -test fault (there is no verify fault today,
-# only failure-define), and that means production code able to force a
-# corruption verdict. Left as a decision rather than assumed.
+# 14a-14d run off the tamper this stage applies; 14e cannot, because the repair
+# recopies the whole replica and so heals any corruption staged from outside --
+# that is what makes 14d pass. It brings its own fault instead
+# (-test=corrupt-after-commit), which fires after each copy is committed, so both
+# rungs of the ladder fail.
 stage_verify_failure() {
 	log "=== Stage 14: a verification failure must outlive the run that found it ==="
 
@@ -4423,6 +4555,10 @@ stage_verify_failure() {
 	verify_failure_refuses_sync_subtest
 	verify_failure_refuses_reinit_subtest
 	verify_failure_repair_subtest
+	# Last, because it is the only sub-test that does not depend on the tamper
+	# applied above -- it brings its own fault -- and because it deliberately
+	# ends with the replica faulty for the RETURN trap to clean up.
+	verify_failure_gives_up_subtest
 	return 0
 }
 
@@ -4581,6 +4717,57 @@ verify_failure_repair_subtest() {
 	else
 		warn "FAIL: $details. See $RUN_LOG"
 		results_row "$CSV" verify-failure repair-result 1 "" "" "" "" "" "FAIL $failures check(s) failed"
+	fi
+}
+
+# 14e: after the repair's OWN verify fails, vmsync must stop and leave the
+# replica faulty -- not try a third time.
+#
+# The headline behaviour of the whole feature, and the one sub-test that cannot
+# be staged with a tamper. Corruption applied from outside is overwritten by
+# the repair's full recopy, which is precisely the recopy's job -- so the second
+# verify passes and 14d is what you get instead. Reaching this branch needs a
+# fault that fires again on the recopy, from inside the process, which is what
+# -test=corrupt-after-commit is: it writes over the replica AFTER the copy has been
+# committed and confirmed, on every run, incremental or full.
+#
+# So this run does the whole ladder with both rungs failing: copy, corrupt,
+# verify fails, record; full recopy, corrupt again, verify fails again, give up.
+verify_failure_gives_up_subtest() {
+	log "--- 14e verify-failure/gives-up: a repair that also fails verification must stop, not retry ---"
+
+	bench_sync verify-failure gives-up -test=corrupt-after-commit -verify=fast -verify-failure-reinit
+	local state failures=0 details=""
+
+	if [ "$RUN_RC" = 0 ]; then
+		failures=$((failures + 1))
+		details="the run SUCCEEDED although every verify under -test=corrupt-after-commit finds a genuine difference -- either the fault did not fire or the mismatch was not treated as one"
+	fi
+	# The distinctive marker of the give-up branch. Without it the run may have
+	# failed in the "repair could not be completed" branch instead, which is a
+	# different outcome: that one blames the mechanism, this one concludes the
+	# data is wrong twice over.
+	if ! grep -q 'FAILED verification AGAIN after a full recopy' "$RUN_LOG" 2>/dev/null; then
+		failures=$((failures + 1))
+		details="${details}${details:+; }the run did not reach the give-up branch -- it failed for some other reason, so the 'do not try a third time' decision is untested"
+	fi
+	if ! grep -q 'will not try a third time' "$RUN_LOG" 2>/dev/null; then
+		failures=$((failures + 1))
+		details="${details}${details:+; }nothing said the ladder had stopped, so an operator reading this log has no way to know a third attempt is not coming"
+	fi
+	# And the state a human has to find afterwards.
+	state="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" verify_state)"
+	if [ "$state" != failed ]; then
+		failures=$((failures + 1))
+		details="${details}${details:+; }the replica failed verification twice but carries verify_state='$state' -- nothing will refuse the next sync into it, and a promotion will see it as clean"
+	fi
+
+	if [ "$failures" = 0 ]; then
+		log "   PASS: the repair's verify failed too, vmsync stopped after one attempt, and the replica is recorded faulty"
+		results_row "$CSV" verify-failure gives-up-result 0 "" "" "" "" "" "PASS gave up after one repair, replica left faulty"
+	else
+		warn "FAIL: $details. See $RUN_LOG"
+		results_row "$CSV" verify-failure gives-up-result 1 "" "" "" "" "" "FAIL $failures check(s) failed"
 	fi
 }
 

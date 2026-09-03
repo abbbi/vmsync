@@ -867,10 +867,30 @@ Four sub-tests:
   a perfectly good 50 GiB VM on evidence that was never about the data.
 - **`off`** — `-no-checksum` must genuinely skip the check, so the escape
   hatch is real rather than a no-op.
+- **`real-corruption`** — the sub-test that makes `mismatch` mean something.
+  `mismatch` edits the helper's **answer**, so it proves vmsync refuses a
+  commit when *told* the digests disagree — the plumbing. It cannot prove the
+  check would notice actual wrong bytes, and the ways it could fail to are not
+  exotic: vmsync hashing ranges other than the ones it wrote, the helper
+  hashing the overlay's *backing* file instead of the overlay, an off-by-one
+  in the range plan. Every one of those passes `mismatch` and commits
+  corruption in production. So this one corrupts the bytes for real, via
+  vmsync's own `-test=corrupt-before-checksum`, and then asserts the thing
+  that actually matters: the corrupted pattern is **not in the base**
+  afterwards — read back off the base at the exact offset vmsync logged, which
+  is stronger than `mismatch`'s allocation-map digest (that would miss an
+  in-place overwrite of already-allocated clusters).
 
-Not in the default stage list: `mismatch` deliberately fails a sync, and all
-four temporarily install helper shims under `/tmp` on the target host (removed
-on the way out, whichever way the stage ends).
+  The fault writes inside a range the run actually wrote, taken from the
+  digest plan, because the check only hashes those. A fixed offset would fall
+  outside the plan on any small incremental, sail through unhashed, and read
+  as a pass for a check that never looked.
+
+Not in the default stage list: two sub-tests deliberately fail a sync, three
+temporarily install helper shims under `/tmp` on the target host (removed on
+the way out, whichever way the stage ends), and `real-corruption` corrupts
+real bytes — healing after itself in the `-reinit` fallback case, where there
+is no overlay to discard and the base is genuinely left damaged.
 
 Preflight now also reports the helper's path and version, and warns when it is
 missing or version-skewed — because in that state the check is skipped on
@@ -914,17 +934,26 @@ Four assertions, in the order the state moves:
   tampered offset — so this run's own verify fails, and the recopy-and-
   re-verify fires for real.
 
-Not in the default stage list: three of the four sub-tests deliberately fail a
-sync. Its baseline is `-force-clean` rather than `-reinit`, because a re-run
-after a previous attempt left a record behind would otherwise be refused by the
-very interlock under test.
+- **`gives-up`** — when the repair's **own** verify fails too, vmsync must stop
+  rather than try a third time, and leave the replica recorded faulty for a
+  human. The headline behaviour of the feature, and the one sub-test a tamper
+  cannot stage: corruption applied from outside is overwritten by the repair's
+  full recopy — that is what the recopy is *for* — so the second verify passes
+  and you get `repair` instead, whatever you corrupt. This one brings its own
+  fault, `-test=corrupt-after-commit`, which writes over the replica **after** each
+  copy is committed and confirmed, on every run, incremental or full. So both
+  rungs of the ladder fail: copy, corrupt, verify fails, record; full recopy,
+  corrupt again, verify fails again, give up. It asserts the give-up branch
+  specifically (not the "repair could not be completed" one, which blames the
+  mechanism rather than the data), that the log says a third attempt is not
+  coming, and that the record is there afterwards.
 
-**Not covered**, deliberately: the branch where the repair's own verify *also*
-fails, so vmsync gives up and leaves the replica faulty. The tamper this stage
-uses is healed by the very recopy the repair performs, so the second verify
-passes — that is the `repair` sub-test. Reaching the give-up branch would need
-a `-test` fault able to force a corruption verdict, and no verify fault exists
-today (only `failure-define`).
+Not in the default stage list: four of the five sub-tests deliberately fail a
+sync, and one deliberately corrupts the replica. Its baseline is `-force-clean`
+rather than `-reinit`, because a re-run after a previous attempt left a record
+behind would otherwise be refused by the very interlock under test. Every
+sub-test's damage is undone by a `heal_target` on the way out, whichever way
+the stage ends.
 
 One consequence worth knowing: `heal_target`, which undoes every tamper in this
 harness, now uses `-force-clean` rather than `-reinit`, because every tamper
