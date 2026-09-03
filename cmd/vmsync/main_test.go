@@ -754,3 +754,59 @@ func TestPlanCheckpointRecovery(t *testing.T) {
 		}
 	})
 }
+
+// TestMergeCheckState pins the precedence a multi-disk run folds its
+// per-disk conclusions with.
+//
+// The interesting case is the third: one disk's contents differ and
+// another's could not be checked. The run must report the DIFFERENCE. That
+// is a definite, actionable fact about the replica, while "could not check"
+// only says the rest is unknown -- so reporting the unknown would bury the
+// finding, which is the same mistake as reporting a failed comparison as a
+// detection.
+func TestMergeCheckState(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		current, next int
+		want          int
+	}{
+		{"both passed", metrics.CheckStatePassed, metrics.CheckStatePassed, metrics.CheckStatePassed},
+		{"a mismatch wins over a pass", metrics.CheckStatePassed, metrics.CheckStateMismatch, metrics.CheckStateMismatch},
+		{"a mismatch wins over not-performed", metrics.CheckStateNotPerformed, metrics.CheckStateMismatch, metrics.CheckStateMismatch},
+		{"and in the other order", metrics.CheckStateMismatch, metrics.CheckStateNotPerformed, metrics.CheckStateMismatch},
+		{"not-performed wins over a pass", metrics.CheckStatePassed, metrics.CheckStateNotPerformed, metrics.CheckStateNotPerformed},
+		{"not-performed with itself", metrics.CheckStateNotPerformed, metrics.CheckStateNotPerformed, metrics.CheckStateNotPerformed},
+		{"a mismatch stays a mismatch", metrics.CheckStateMismatch, metrics.CheckStateMismatch, metrics.CheckStateMismatch},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mergeCheckState(tc.current, tc.next); got != tc.want {
+				t.Errorf("mergeCheckState(%d, %d) = %d, want %d", tc.current, tc.next, got, tc.want)
+			}
+		})
+	}
+
+	// Folding must be order-independent: disks complete concurrently, so
+	// the run's conclusion cannot depend on which goroutine finishes first.
+	all := []int{metrics.CheckStatePassed, metrics.CheckStateMismatch, metrics.CheckStateNotPerformed}
+	for _, a := range all {
+		for _, b := range all {
+			if mergeCheckState(a, b) != mergeCheckState(b, a) {
+				t.Errorf("mergeCheckState is not commutative for (%d, %d)", a, b)
+			}
+		}
+	}
+}
+
+// A checksum mismatch must be recognisable as one through the wrapping the
+// error picks up on its way out, so the metric reports 1 (the data differs)
+// rather than 2 (could not check).
+func TestChecksumMismatchIsIdentifiableThroughWrapping(t *testing.T) {
+	wrapped := fmt.Errorf("checksum: %s: %w -- detail here", "vda", errChecksumMismatch)
+	if !errors.Is(wrapped, errChecksumMismatch) {
+		t.Error("a wrapped checksum mismatch is not identifiable with errors.Is")
+	}
+	// And an unrelated failure must NOT look like one.
+	if errors.Is(fmt.Errorf("checksum: run helper: %w", errors.New("ssh died")), errChecksumMismatch) {
+		t.Error("an unrelated checksum failure matched errChecksumMismatch")
+	}
+}

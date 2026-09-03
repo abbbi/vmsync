@@ -41,6 +41,49 @@ const (
 	StateFSFreezeFailed = 2
 )
 
+// CheckState* are the values VerificationState and ChecksumState take.
+//
+// They answer "what may an operator conclude about this replica", not "what
+// went wrong" -- and that distinction is the whole point. The two outcomes
+// below demand opposite responses: a difference found means act on the
+// replica, a check that could not run means the replica's state is simply
+// unknown and the tooling needs fixing.
+//
+// VerificationState used to mirror RunMetric.State, so both collapsed onto
+// 1. That is not a theoretical loss. A -verify=qemu-img that could not open
+// its export at all -- it was asking for an unnamed export against a named
+// one, and exited before comparing a byte -- reported 1 on every run, and
+// the bench stage that tampers a replica and expects a detection scored
+// three consecutive PASSes on a comparator that had never compared
+// anything. Only the sub-test expecting a CLEAN result could tell.
+//
+// Deliberately NOT split by cause. A failed SSH, a missing helper, a version
+// skew, an export that would not start and a source read error are one
+// conclusion, and enumerating them would mean classifying every error site
+// while changing nothing an operator does. Transience is a duration, not a
+// state: express it with Prometheus's own `for:` clause, which fires only
+// while the condition holds continuously --
+//
+//	expr: vmsync_verification_state == 2
+//	for:  24h
+//
+// -- so a blip resets on the next successful run and a real outage always
+// fires, with no extra series and nothing to carry between runs.
+const (
+	// CheckStatePassed: the check ran and the two sides agreed.
+	CheckStatePassed = 0
+	// CheckStateMismatch: the check ran and found a difference. The only
+	// value that says anything about the DATA.
+	CheckStateMismatch = 1
+	// CheckStateNotPerformed: the check could not be carried out, so this
+	// replica's state is unknown. For the checksum this also covers being
+	// skipped -- which is the dangerous one, because it is otherwise
+	// completely silent: a helper that is missing or version-skewed turns a
+	// default-on integrity check off for every run on that host while each
+	// sync still reports success.
+	CheckStateNotPerformed = 2
+)
+
 // DiskMetric holds one disk's sync result, ready to be rendered into the
 // Prometheus text exposition format for a node_exporter textfile collector.
 type DiskMetric struct {
@@ -138,15 +181,33 @@ type RunMetric struct {
 	// vmsync_verification_state 0, which would be indistinguishable from
 	// "verified and passed."
 	VerificationRan bool
-	// VerificationState mirrors State: a -verify run fails as a whole (see
-	// cmd/vmsync's per-disk compare) on any mismatch, so this needs no
-	// tracking of its own beyond the overall run outcome.
+	// VerificationState is one of the CheckState* values: did -verify find
+	// a difference, or could it not run at all?
+	//
+	// It used to mirror State, which made it a duplicate of vmsync_sync_state
+	// carrying no information of its own -- and, worse, made "the replica
+	// differs from its source" indistinguishable from "the comparator could
+	// not connect". See the CheckState* comment for what that cost.
 	VerificationState int
 	// VerificationTimestamp is the Unix time (seconds) this run's
 	// verification finished, success or failure -- same staleness-detection
 	// purpose as Timestamp, but specific to when a disk was last actually
 	// byte-compared against its source, not just synced.
 	VerificationTimestamp int64
+
+	// ChecksumRan gates whether the checksum series are rendered at all,
+	// the same way VerificationRan does for verification. Always true when
+	// the pre-commit integrity check was reached, INCLUDING when it was
+	// skipped -- being skipped is the state most worth exporting, so it
+	// must not be the state that omits the metric.
+	ChecksumRan bool
+	// ChecksumState is one of the CheckState* values for the pre-commit
+	// integrity check.
+	ChecksumState int
+	// ChecksumBytes is how many bytes this run had digested and compared.
+	// Zero on a run that wrote nothing, which is ordinary for an
+	// incremental against an idle source.
+	ChecksumBytes uint64
 }
 
 // WriteTextfile renders disks and run in the Prometheus text exposition
@@ -248,7 +309,7 @@ func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 	// verified anything must not emit these at all, rather than a
 	// misleadingly-successful-looking 0.
 	if run.VerificationRan {
-		fmt.Fprintln(&b, "# HELP vmsync_verification_state Mirrors vmsync_sync_state for the same run (0=success, 1=failure, 2=succeeded but guest filesystem freeze failed). Only present for runs that had -verify set.")
+		fmt.Fprintln(&b, "# HELP vmsync_verification_state What -verify concluded about this replica: 0=ran and matched, 1=ran and found a difference (the replica is wrong), 2=could not be performed (the replica's state is unknown; fix the tooling). Only present for runs that had -verify set. Alert on 2 with a `for:` clause to ignore transient failures.")
 		fmt.Fprintln(&b, "# TYPE vmsync_verification_state gauge")
 		fmt.Fprintf(&b, "vmsync_verification_state{source_host=%q,target_host=%q,vm=%q} %d\n",
 			run.SourceHost, run.TargetHost, run.VM, run.VerificationState)
@@ -257,6 +318,23 @@ func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 		fmt.Fprintln(&b, "# TYPE vmsync_verification_timestamp_seconds gauge")
 		fmt.Fprintf(&b, "vmsync_verification_timestamp_seconds{source_host=%q,target_host=%q,vm=%q} %d\n",
 			run.SourceHost, run.TargetHost, run.VM, run.VerificationTimestamp)
+	}
+
+	// The pre-commit integrity check. Rendered whenever the run reached the
+	// point of deciding about it -- INCLUDING when it was skipped, which is
+	// the state most worth exporting and the one nothing else surfaces: a
+	// helper that is missing or version-skewed disables a default-on check
+	// for every run on that host while each sync still reports success.
+	if run.ChecksumRan {
+		fmt.Fprintln(&b, "# HELP vmsync_checksum_state What the pre-commit integrity check concluded: 0=ran and matched, 1=ran and the target's bytes differ from what was sent, 2=could not be performed or was skipped (no matching vmsync-bridge-helper, or -no-checksum). Alert on 2 with a `for:` clause to ignore transient failures.")
+		fmt.Fprintln(&b, "# TYPE vmsync_checksum_state gauge")
+		fmt.Fprintf(&b, "vmsync_checksum_state{source_host=%q,target_host=%q,vm=%q} %d\n",
+			run.SourceHost, run.TargetHost, run.VM, run.ChecksumState)
+
+		fmt.Fprintln(&b, "# HELP vmsync_checksum_bytes Bytes this run digested and compared against the target. Zero when the run wrote nothing, which is ordinary for an incremental against an idle source.")
+		fmt.Fprintln(&b, "# TYPE vmsync_checksum_bytes gauge")
+		fmt.Fprintf(&b, "vmsync_checksum_bytes{source_host=%q,target_host=%q,vm=%q} %d\n",
+			run.SourceHost, run.TargetHost, run.VM, run.ChecksumBytes)
 	}
 
 	return writeAtomic(path, b.String())

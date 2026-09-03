@@ -223,3 +223,107 @@ func TestNoSourceBridgeEmitsNoSeries(t *testing.T) {
 		t.Errorf("a run with no source bridge still emitted the series:\n%s", text)
 	}
 }
+
+// The distinction the CheckState* values exist for: "the replica differs"
+// and "the check could not run" must be different numbers.
+//
+// They used to be the same one -- VerificationState mirrored State, so any
+// failing verify reported 1. That is what let a -verify=qemu-img which could
+// not even open its export (it asked for an unnamed export against a named
+// one, and exited before comparing a byte) report a mismatch on every run,
+// and score three consecutive PASSes in a bench stage whose whole job is
+// detecting a tampered replica.
+func TestVerificationStateSeparatesMismatchFromCouldNotRun(t *testing.T) {
+	mismatch := writeAndRead(t, RunMetric{
+		VM: "web01", State: StateFailure,
+		VerificationRan: true, VerificationState: CheckStateMismatch,
+	})
+	if v, ok := sampleFor(mismatch, "vmsync_verification_state"); !ok || v != "1" {
+		t.Errorf("a found difference did not render as 1:\n%s", mismatch)
+	}
+
+	couldNotRun := writeAndRead(t, RunMetric{
+		VM: "web01", State: StateFailure,
+		VerificationRan: true, VerificationState: CheckStateNotPerformed,
+	})
+	if v, ok := sampleFor(couldNotRun, "vmsync_verification_state"); !ok || v != "2" {
+		t.Errorf("an unperformable check did not render as 2:\n%s", couldNotRun)
+	}
+
+	// Both runs FAILED overall, so if this series still mirrored State the
+	// two would be indistinguishable. That they differ is the whole point.
+	if mismatch == couldNotRun {
+		t.Error("a data mismatch and a check that could not run rendered identically")
+	}
+}
+
+// A passing verify on a run that later fails for some unrelated reason must
+// still report that verification passed: the series says what was learned
+// about the replica, not whether the process exited zero.
+func TestVerificationStateIsIndependentOfRunState(t *testing.T) {
+	text := writeAndRead(t, RunMetric{
+		VM: "web01", State: StateFailure,
+		VerificationRan: true, VerificationState: CheckStatePassed,
+	})
+	if v, ok := sampleFor(text, "vmsync_verification_state"); !ok || v != "0" {
+		t.Errorf("a passing verify on a failed run did not render as 0:\n%s", text)
+	}
+	if v, _ := sampleFor(text, "vmsync_sync_state"); v != "1" {
+		t.Errorf("the run state should still be 1:\n%s", text)
+	}
+}
+
+// The checksum series must be emitted for a SKIPPED check.
+//
+// This is the state the metric exists for and the easiest one to lose: a
+// helper that is missing or version-skewed turns a default-on integrity
+// check off for every run on that host, while each sync still reports
+// success. If "skipped" were the case that omitted the series, the only
+// signal would be a log line nobody scrapes.
+func TestChecksumSkippedStillEmitsTheSeries(t *testing.T) {
+	text := writeAndRead(t, RunMetric{
+		VM: "web01", State: StateSuccess,
+		ChecksumRan: true, ChecksumState: CheckStateNotPerformed, ChecksumBytes: 0,
+	})
+	if v, ok := sampleFor(text, "vmsync_checksum_state"); !ok || v != "2" {
+		t.Errorf("a skipped checksum did not render as 2:\n%s", text)
+	}
+	if v, ok := sampleFor(text, "vmsync_checksum_bytes"); !ok || v != "0" {
+		t.Errorf("a skipped checksum should still report zero bytes checked:\n%s", text)
+	}
+}
+
+func TestChecksumStatesRender(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state int
+		bytes uint64
+		want  string
+	}{
+		{"passed", CheckStatePassed, 131072, "0"},
+		{"mismatch", CheckStateMismatch, 131072, "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			text := writeAndRead(t, RunMetric{
+				VM: "web01", ChecksumRan: true, ChecksumState: tc.state, ChecksumBytes: tc.bytes,
+			})
+			if v, ok := sampleFor(text, "vmsync_checksum_state"); !ok || v != tc.want {
+				t.Errorf("want %q in:\n%s", tc.want, text)
+			}
+			if v, _ := sampleFor(text, "vmsync_checksum_bytes"); v != "131072" {
+				t.Errorf("checked bytes not reported:\n%s", text)
+			}
+		})
+	}
+}
+
+// A run that never got as far as deciding about the check emits nothing,
+// rather than a misleading zero that would read as "checked and clean".
+func TestChecksumNotReachedEmitsNoSeries(t *testing.T) {
+	text := writeAndRead(t, RunMetric{VM: "web01", State: StateFailure})
+	for _, unwanted := range []string{"vmsync_checksum_state", "vmsync_checksum_bytes"} {
+		if strings.Contains(text, unwanted) {
+			t.Errorf("%s was emitted for a run that never reached the checksum decision:\n%s", unwanted, text)
+		}
+	}
+}

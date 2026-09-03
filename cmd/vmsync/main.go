@@ -1012,6 +1012,35 @@ func unverifiableCheckpointMetadataError(targetDomain, parent string, checkpoint
 // responsibility (called separately, earlier, against the same field) --
 // this function's only job is judging an actual disagreement between two
 // non-empty values.
+// errChecksumMismatch marks a pre-commit integrity check that RAN and found
+// the target's bytes differing from what was sent.
+//
+// A sentinel rather than a message match, and the same distinction
+// nbdsync.ErrImagesDiffer draws for -verify: this is the one checksum
+// failure that is evidence about the DATA. Every other way the check can
+// fail -- a helper that would not run, version skew, a plan disagreement --
+// means the check could not be carried out, which says nothing about the
+// replica and must not be reported as if it did.
+var errChecksumMismatch = errors.New("checksum mismatch")
+
+// mergeCheckState folds one disk's check outcome into the run's, for the
+// CheckState* values a whole run reports.
+//
+// Precedence is mismatch > not-performed > passed, and the first of those is
+// the interesting one. If one disk's contents differ and another's could not
+// be checked at all, the run reports the DIFFERENCE: that is a definite,
+// actionable fact about the replica, while "could not check" only means the
+// rest is unknown. Reporting the unknown would bury the finding.
+func mergeCheckState(current, next int) int {
+	if current == metrics.CheckStateMismatch || next == metrics.CheckStateMismatch {
+		return metrics.CheckStateMismatch
+	}
+	if current == metrics.CheckStateNotPerformed || next == metrics.CheckStateNotPerformed {
+		return metrics.CheckStateNotPerformed
+	}
+	return metrics.CheckStatePassed
+}
+
 // planCheckpointRecovery decides what to do about a pending_checkpoint the
 // previous run left on the target, given what the source's chain actually
 // holds. Returns the checkpoint to delete ("" for none), or an error meaning
@@ -1666,6 +1695,26 @@ func run(cfg syncConfig) (runErr error) {
 	// still fails the whole run via the existing state/runErr handling.
 	var verificationAttempted bool
 
+	// What -verify and the pre-commit integrity check each CONCLUDED, as
+	// opposed to whether the run as a whole succeeded. Both are folded
+	// across disks with mergeCheckState and read at metrics-write time.
+	//
+	// Tracked separately from runErr on purpose. runErr is whatever failed
+	// last, which on a multi-disk run may be some unrelated later error --
+	// while these have to say what was learned about the DATA. The
+	// verification one especially: it used to be derived from the run state,
+	// which made "the replica differs" and "the comparator could not run"
+	// the same number, and a -verify=qemu-img that never compared a byte
+	// scored as three successful detections in bench.
+	//
+	// Guarded by metricsMu like verificationAttempted and diskMetrics: disks
+	// verify concurrently, and the signal handler can read these while a
+	// syncDisk goroutine is still writing them.
+	verificationOutcome := metrics.CheckStatePassed
+	checksumOutcome := metrics.CheckStatePassed
+	var checksumDecided bool
+	var checksumBytes uint64
+
 	// writeMetricsTextfile is called from two places: the deferred call
 	// below (the normal return path, any outcome) and the signal handler
 	// further down (which calls os.Exit directly on a forced shutdown --
@@ -1689,6 +1738,13 @@ func run(cfg syncConfig) (runErr error) {
 		sourceHost, targetHost := nbdHost, targetNBDHost
 		snapshotCount := externalSnapshotCount
 		attempted := verificationAttempted
+		// Read under the same lock as everything else here: disks verify and
+		// checksum concurrently, and the signal handler can reach this while
+		// a syncDisk goroutine is still folding its outcome in.
+		verifyOutcome := verificationOutcome
+		checksumRan := checksumDecided
+		checksumState := checksumOutcome
+		checksumChecked := checksumBytes
 		// Read here rather than per disk: the source bridge is one shared
 		// listener for the whole run, so its totals belong to the run.
 		//
@@ -1736,9 +1792,17 @@ func run(cfg syncConfig) (runErr error) {
 			// whole run via state/runErr as before -- this only changes
 			// whether the verification metrics are emitted at all, not
 			// what the overall run's own failure means.
-			VerificationRan:       verificationRan(cfg.Verify, attempted),
-			VerificationState:     state,
+			VerificationRan: verificationRan(cfg.Verify, attempted),
+			// What verification CONCLUDED, not whether the run succeeded.
+			// These are different questions, and deriving this from the run
+			// state (which is what it used to do) collapsed "the replica
+			// differs" onto "the comparator could not run".
+			VerificationState:     verifyOutcome,
 			VerificationTimestamp: now,
+
+			ChecksumRan:   checksumRan,
+			ChecksumState: checksumState,
+			ChecksumBytes: checksumChecked,
 		}
 		if err := metrics.WriteTextfile(cfg.PrometheusTextfile, disksSnapshot, run); err != nil {
 			trace.Warning("failed to write prometheus textfile", "path", cfg.PrometheusTextfile, "error", err)
@@ -2666,6 +2730,18 @@ func run(cfg syncConfig) (runErr error) {
 		}
 	}
 
+	// From here the checksum metric exists whatever happens next --
+	// including the case it exists FOR. A skipped check is otherwise
+	// completely silent: the sync reports success and nothing says the
+	// integrity check never ran, which is exactly how a stale helper turns
+	// a default-on safety feature off across an estate unnoticed.
+	metricsMu.Lock()
+	checksumDecided = true
+	if !checksumEnabled {
+		checksumOutcome = metrics.CheckStateNotPerformed
+	}
+	metricsMu.Unlock()
+
 	// Take the TARGET-side run lock before anything touches the target.
 	//
 	// The lock in main() is on the SOURCE host, keyed by the source domain,
@@ -3544,7 +3620,32 @@ func run(cfg syncConfig) (runErr error) {
 	//     it was asked about. A bug or a truncated transfer, not evidence.
 	//   - a non-empty mismatch list: the bytes on the target differ from the
 	//     bytes sent. The only one that condemns the replica.
-	verifyWrittenDigests := func(i int, d disk.QcowDisk, imagePath string, incremental bool, sourceDigests []blockdigest.Block) error {
+	verifyWrittenDigests := func(i int, d disk.QcowDisk, imagePath string, incremental bool, sourceDigests []blockdigest.Block) (checkErr error) {
+		// Fold this disk's conclusion into the run's. Anything that is not
+		// a clean pass or a data mismatch means the check could not be
+		// carried out -- a helper that would not run, version skew, a plan
+		// disagreement -- which is a different fact from "the bytes differ"
+		// and must not be reported as one.
+		defer func() {
+			outcome := metrics.CheckStatePassed
+			switch {
+			case checkErr == nil:
+			case errors.Is(checkErr, errChecksumMismatch):
+				outcome = metrics.CheckStateMismatch
+			default:
+				// Format skew, a plan disagreement, a helper that would not
+				// run, an export that would not start: all "could not
+				// check", none of them evidence about the data.
+				outcome = metrics.CheckStateNotPerformed
+			}
+			metricsMu.Lock()
+			checksumOutcome = mergeCheckState(checksumOutcome, outcome)
+			if checkErr == nil {
+				checksumBytes += blockdigest.TotalBytes(sourceDigests)
+			}
+			metricsMu.Unlock()
+		}()
+
 		if len(sourceDigests) == 0 {
 			// Nothing was written, so there is nothing to check and no
 			// reason to start an export. An incremental run that found no
@@ -3645,8 +3746,8 @@ func run(cfg syncConfig) (runErr error) {
 			trace.Error("checksum: the target's contents differ from what was sent",
 				"disk", d.TargetDev, "image", imagePath,
 				"detail", blockdigest.SummarizeMismatches(mismatches))
-			return fmt.Errorf("checksum: %s: the bytes on the target do not match the bytes sent: %s (%s)",
-				d.TargetDev, blockdigest.SummarizeMismatches(mismatches), remedy)
+			return fmt.Errorf("checksum: %s: %w -- the bytes on the target do not match the bytes sent: %s (%s)",
+				d.TargetDev, errChecksumMismatch, blockdigest.SummarizeMismatches(mismatches), remedy)
 		}
 
 		trace.Info("checksum: target contents match what was sent",
@@ -4010,6 +4111,24 @@ func run(cfg syncConfig) (runErr error) {
 		metricsMu.Lock()
 		verificationAttempted = true
 		metricsMu.Unlock()
+
+		// The conclusion, folded across disks. isVerifyMismatch is the same
+		// predicate F3 uses to decide what counts toward failure_count, so
+		// the metric and the failure accounting can never disagree about
+		// which kind of failure this was.
+		defer func() {
+			outcome := metrics.CheckStatePassed
+			switch {
+			case err == nil:
+			case isVerifyMismatch(err):
+				outcome = metrics.CheckStateMismatch
+			default:
+				outcome = metrics.CheckStateNotPerformed
+			}
+			metricsMu.Lock()
+			verificationOutcome = mergeCheckState(verificationOutcome, outcome)
+			metricsMu.Unlock()
+		}()
 
 		targetPath := res.targetPath
 
