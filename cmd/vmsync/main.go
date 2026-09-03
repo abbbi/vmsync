@@ -4129,6 +4129,126 @@ func run(cfg syncConfig) (runErr error) {
 		targetBridgeCounters *nbdbridge.ByteCounters
 	}
 
+	// corruptReplicaForTest implements -test=corrupt-after-commit: it writes a
+	// recognisable pattern over the start of the replica AFTER the copy has
+	// been committed and confirmed, so the -verify that follows finds a real
+	// difference against a source that really does differ from it.
+	//
+	// WHERE it writes is the whole design. Three placements were possible and
+	// only this one does the job:
+	//
+	//   - Into the incremental's temporary overlay BEFORE the pre-commit digest
+	//     check: that check catches it and aborts the run before the commit, so
+	//     -verify never runs. A test of the digest check, not of verify.
+	//   - Into the overlay after that check but before the commit: works, but
+	//     the overlay exists ONLY on an incremental (see incrementalMode) --
+	//     and the repair attempt this fault exists to drive is a FULL recopy,
+	//     which has no overlay. The fault would silently stop firing at exactly
+	//     the point it is needed.
+	//   - Into the committed base, here. Uniform across full and incremental,
+	//     independent of whether the digest check ran at all, and it models the
+	//     one corruption class nothing upstream can see: storage that went bad
+	//     after a write was confirmed.
+	//
+	// WHEN matters too, and less obviously. This runs inside syncDisk, so it
+	// completes before wg.Wait() and therefore before
+	// measureReplicaWrittenAt("post-copy") stamps replica_written_at. That
+	// ordering is load-bearing: the write bumps the file's mtime, and if the
+	// stamp were taken first, the NEXT run would refuse at the
+	// out-of-band-modification guard instead of reaching its compare -- which
+	// is a different refusal, at a different stage, and would be scored as
+	// though the replica had been verified. contrib/bench/bench.sh's
+	// tamper_target restores the mtime by hand for exactly this reason; in
+	// process the ordering does it for free.
+	//
+	// After the restore point is taken, also deliberately: those copies stay
+	// clean, which is both more realistic (rot happens after the snapshot) and
+	// what makes them usable as the known-good candidates a faulty replica's
+	// operator actually needs.
+	// injectTestCorruption writes a recognisable pattern into a qcow2 on the
+	// target, at a GUEST offset, and confirms it reached the device. Shared by
+	// both corruption faults, which differ only in which image they hit and
+	// when.
+	//
+	// qemu-io and not dd, and the difference is not stylistic: the replica is
+	// always qcow2 (see the qemu-img create calls above), so a file-offset
+	// write lands in the qcow2 HEADER or in whatever metadata happens to live
+	// there, and the image stops opening at all. qemu-nbd would then fail to
+	// export it, no comparison would run, and the outcome would be "could not
+	// be performed" rather than the mismatch the fault exists to produce --
+	// the opposite of the test. Reaching a given guest offset with dd would
+	// mean parsing `qemu-img map` for its host offset first, and would still
+	// have nowhere to write if that cluster were unallocated.
+	injectTestCorruption := func(fault, what, imagePath string, off, length uint64) error {
+		// Recognisable in a hexdump. An image region that already held nothing
+		// but this byte would make the fault a no-op; that surfaces as a loud
+		// test failure rather than a silent pass.
+		const pattern = "0xa5"
+
+		trace.Warning("-test="+fault+": deliberately corrupting "+what+". This run is EXPECTED to fail, and its result means nothing as a replication",
+			"image", imagePath, "offset", off, "length", length, "pattern", pattern)
+
+		// An explicit flush, not just the write. qemu-io's default cache mode
+		// is writeback, so the write lands in the host page cache and reaches
+		// the device whenever the kernel gets round to it -- while BOTH
+		// read-back exports (the digest check's and runVerify's) deliberately
+		// open with --cache=none and read through that cache to the device.
+		// Without the flush, a fault sitting in dirty pages would be invisible
+		// to the very check it exists to defeat, intermittently and depending
+		// on host memory pressure. qemu-io does flush on close in practice; a
+		// test whose whole value is determinism should not rest on "in
+		// practice".
+		writeCmd := fmt.Sprintf("qemu-io -f qcow2 -c %s -c flush %s",
+			util.ShQuote(fmt.Sprintf("write -P %s %d %d", pattern, off, length)),
+			util.ShQuote(imagePath))
+		if err := runTargetCommand(writeCmd, fmt.Sprintf("injecting test corruption into %s", imagePath)); err != nil {
+			return fmt.Errorf("-test=%s: %w -- the fault could not be injected, so this run would check an image nothing had corrupted and report a PASS that means nothing", fault, err)
+		}
+		// Read it back the way the check under test will: -t none, so this
+		// confirms the pattern is on the DEVICE and not merely in the page
+		// cache it just wrote through. A cached read-back would happily
+		// confirm a fault the check then could not see.
+		//
+		// The read-back at all, because a qemu-io write that reports success
+		// but lands elsewhere or gets swallowed would otherwise turn into "the
+		// check missed a corruption" -- a false FAIL against vmsync for a
+		// fault that was never applied. Same reasoning as tamper_target's.
+		//
+		// O_DIRECT needs an aligned request. Both call sites pass 4096 bytes
+		// at an offset that is at least 4 KiB aligned; and if O_DIRECT did not
+		// work on this target's filesystem, those read-back exports would
+		// already be broken, so this depends on nothing new.
+		readCmd := fmt.Sprintf("qemu-io -r -t none -f qcow2 -c %s %s",
+			util.ShQuote(fmt.Sprintf("read -P %s %d %d", pattern, off, length)),
+			util.ShQuote(imagePath))
+		if err := runTargetCommand(readCmd, fmt.Sprintf("confirming test corruption reached the device in %s", imagePath)); err != nil {
+			return fmt.Errorf("-test=%s: %w -- the injected pattern did not read back off the device, so the fault did not take and nothing below would be testing what it claims", fault, err)
+		}
+		return nil
+	}
+
+	// testCorruptLen is one 4 KiB sector, the smallest shape a real bad write
+	// takes, and large enough for every check involved: both the pre-commit
+	// digest check and -verify=fast/full digest in 1 MiB blocks, so a 4 KiB
+	// difference changes the block's digest, and the byte comparators see it
+	// directly.
+	const testCorruptLen = 4096
+
+	corruptReplicaForTest := func(d disk.QcowDisk, targetPath string) error {
+		// Offset 0. Not arbitrary: in bounds for any disk vmsync can sync, and
+		// the one region guaranteed to be ALLOCATED on a partitioned disk --
+		// which matters because the compare skips ranges the source reports as
+		// zero (see F11), so a fault written into a hole would be skipped and
+		// read as "verify missed it".
+		//
+		// Unlike the pre-checksum fault, this one does NOT need to land in a
+		// range this run wrote: -verify compares the whole image, not just
+		// this run's delta.
+		return injectTestCorruption(libvirtsync.TestFaultCorruptAfterCommit,
+			"the replica AFTER the copy was committed and the digest check passed -- this replica's contents are now genuinely wrong, and this run's -verify is expected to fail",
+			targetPath, 0, testCorruptLen)
+	}
+
 	// copyAndCommit is exactly today's copy+commit logic (nothing about its
 	// behavior changes), just returning what runVerify/metrics need instead
 	// of leaving them as syncDisk-local variables.
@@ -4457,126 +4577,6 @@ func run(cfg syncConfig) (runErr error) {
 		}
 
 		return res, nil
-	}
-
-	// corruptReplicaForTest implements -test=corrupt-after-commit: it writes a
-	// recognisable pattern over the start of the replica AFTER the copy has
-	// been committed and confirmed, so the -verify that follows finds a real
-	// difference against a source that really does differ from it.
-	//
-	// WHERE it writes is the whole design. Three placements were possible and
-	// only this one does the job:
-	//
-	//   - Into the incremental's temporary overlay BEFORE the pre-commit digest
-	//     check: that check catches it and aborts the run before the commit, so
-	//     -verify never runs. A test of the digest check, not of verify.
-	//   - Into the overlay after that check but before the commit: works, but
-	//     the overlay exists ONLY on an incremental (see incrementalMode) --
-	//     and the repair attempt this fault exists to drive is a FULL recopy,
-	//     which has no overlay. The fault would silently stop firing at exactly
-	//     the point it is needed.
-	//   - Into the committed base, here. Uniform across full and incremental,
-	//     independent of whether the digest check ran at all, and it models the
-	//     one corruption class nothing upstream can see: storage that went bad
-	//     after a write was confirmed.
-	//
-	// WHEN matters too, and less obviously. This runs inside syncDisk, so it
-	// completes before wg.Wait() and therefore before
-	// measureReplicaWrittenAt("post-copy") stamps replica_written_at. That
-	// ordering is load-bearing: the write bumps the file's mtime, and if the
-	// stamp were taken first, the NEXT run would refuse at the
-	// out-of-band-modification guard instead of reaching its compare -- which
-	// is a different refusal, at a different stage, and would be scored as
-	// though the replica had been verified. contrib/bench/bench.sh's
-	// tamper_target restores the mtime by hand for exactly this reason; in
-	// process the ordering does it for free.
-	//
-	// After the restore point is taken, also deliberately: those copies stay
-	// clean, which is both more realistic (rot happens after the snapshot) and
-	// what makes them usable as the known-good candidates a faulty replica's
-	// operator actually needs.
-	// injectTestCorruption writes a recognisable pattern into a qcow2 on the
-	// target, at a GUEST offset, and confirms it reached the device. Shared by
-	// both corruption faults, which differ only in which image they hit and
-	// when.
-	//
-	// qemu-io and not dd, and the difference is not stylistic: the replica is
-	// always qcow2 (see the qemu-img create calls above), so a file-offset
-	// write lands in the qcow2 HEADER or in whatever metadata happens to live
-	// there, and the image stops opening at all. qemu-nbd would then fail to
-	// export it, no comparison would run, and the outcome would be "could not
-	// be performed" rather than the mismatch the fault exists to produce --
-	// the opposite of the test. Reaching a given guest offset with dd would
-	// mean parsing `qemu-img map` for its host offset first, and would still
-	// have nowhere to write if that cluster were unallocated.
-	injectTestCorruption := func(fault, what, imagePath string, off, length uint64) error {
-		// Recognisable in a hexdump. An image region that already held nothing
-		// but this byte would make the fault a no-op; that surfaces as a loud
-		// test failure rather than a silent pass.
-		const pattern = "0xa5"
-
-		trace.Warning("-test="+fault+": deliberately corrupting "+what+". This run is EXPECTED to fail, and its result means nothing as a replication",
-			"image", imagePath, "offset", off, "length", length, "pattern", pattern)
-
-		// An explicit flush, not just the write. qemu-io's default cache mode
-		// is writeback, so the write lands in the host page cache and reaches
-		// the device whenever the kernel gets round to it -- while BOTH
-		// read-back exports (the digest check's and runVerify's) deliberately
-		// open with --cache=none and read through that cache to the device.
-		// Without the flush, a fault sitting in dirty pages would be invisible
-		// to the very check it exists to defeat, intermittently and depending
-		// on host memory pressure. qemu-io does flush on close in practice; a
-		// test whose whole value is determinism should not rest on "in
-		// practice".
-		writeCmd := fmt.Sprintf("qemu-io -f qcow2 -c %s -c flush %s",
-			util.ShQuote(fmt.Sprintf("write -P %s %d %d", pattern, off, length)),
-			util.ShQuote(imagePath))
-		if err := runTargetCommand(writeCmd, fmt.Sprintf("injecting test corruption into %s", imagePath)); err != nil {
-			return fmt.Errorf("-test=%s: %w -- the fault could not be injected, so this run would check an image nothing had corrupted and report a PASS that means nothing", fault, err)
-		}
-		// Read it back the way the check under test will: -t none, so this
-		// confirms the pattern is on the DEVICE and not merely in the page
-		// cache it just wrote through. A cached read-back would happily
-		// confirm a fault the check then could not see.
-		//
-		// The read-back at all, because a qemu-io write that reports success
-		// but lands elsewhere or gets swallowed would otherwise turn into "the
-		// check missed a corruption" -- a false FAIL against vmsync for a
-		// fault that was never applied. Same reasoning as tamper_target's.
-		//
-		// O_DIRECT needs an aligned request. Both call sites pass 4096 bytes
-		// at an offset that is at least 4 KiB aligned; and if O_DIRECT did not
-		// work on this target's filesystem, those read-back exports would
-		// already be broken, so this depends on nothing new.
-		readCmd := fmt.Sprintf("qemu-io -r -t none -f qcow2 -c %s %s",
-			util.ShQuote(fmt.Sprintf("read -P %s %d %d", pattern, off, length)),
-			util.ShQuote(imagePath))
-		if err := runTargetCommand(readCmd, fmt.Sprintf("confirming test corruption reached the device in %s", imagePath)); err != nil {
-			return fmt.Errorf("-test=%s: %w -- the injected pattern did not read back off the device, so the fault did not take and nothing below would be testing what it claims", fault, err)
-		}
-		return nil
-	}
-
-	// testCorruptLen is one 4 KiB sector, the smallest shape a real bad write
-	// takes, and large enough for every check involved: both the pre-commit
-	// digest check and -verify=fast/full digest in 1 MiB blocks, so a 4 KiB
-	// difference changes the block's digest, and the byte comparators see it
-	// directly.
-	const testCorruptLen = 4096
-
-	corruptReplicaForTest := func(d disk.QcowDisk, targetPath string) error {
-		// Offset 0. Not arbitrary: in bounds for any disk vmsync can sync, and
-		// the one region guaranteed to be ALLOCATED on a partitioned disk --
-		// which matters because the compare skips ranges the source reports as
-		// zero (see F11), so a fault written into a hole would be skipped and
-		// read as "verify missed it".
-		//
-		// Unlike the pre-checksum fault, this one does NOT need to land in a
-		// range this run wrote: -verify compares the whole image, not just
-		// this run's delta.
-		return injectTestCorruption(libvirtsync.TestFaultCorruptAfterCommit,
-			"the replica AFTER the copy was committed and the digest check passed -- this replica's contents are now genuinely wrong, and this run's -verify is expected to fail",
-			targetPath, 0, testCorruptLen)
 	}
 
 	// runVerify compares one disk, in whichever mode -verify named.

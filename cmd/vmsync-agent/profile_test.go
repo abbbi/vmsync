@@ -250,7 +250,7 @@ func TestNoChecksumIsEmittedOnlyWhenAsked(t *testing.T) {
 
 	t.Run("explicitly disabled emits the flag", func(t *testing.T) {
 		req := base
-		req.SyncProfile = SyncProfile{NoChecksum: true}
+		req.Profile = SyncProfile{NoChecksum: true}
 		args := req.CommandArgs()
 		if !slices.Contains(args, "-no-checksum") {
 			t.Errorf("args %v are missing -no-checksum for a profile that set it", args)
@@ -297,7 +297,7 @@ func TestVerifyFailureReinitIsEmittedOnlyWhenAsked(t *testing.T) {
 
 	t.Run("asked for, it is emitted as a bare flag", func(t *testing.T) {
 		req := base
-		req.SyncProfile = SyncProfile{Verify: "full", VerifyFailureReinit: true}
+		req.Profile = SyncProfile{Verify: "full", VerifyFailureReinit: true}
 		args := req.CommandArgs()
 		if !slices.Contains(args, "-verify-failure-reinit") {
 			t.Fatalf("args %v are missing -verify-failure-reinit for a profile that set it", args)
