@@ -641,12 +641,20 @@ way through**, so the copies that follow run over the damage.
 Two things about the shape are deliberate.
 
 **Each mode gets its own full chain.** Healing after a tamper has to be a
-full `-reinit` — an incremental sync re-copies only what the *source's*
+full recopy — an incremental sync re-copies only what the *source's*
 dirty bitmap says changed, and the source never wrote to the corrupted
 region — and that destroys the chain. So a single chain followed by several
 tamper/verify attempts would test a deep chain exactly once and a one-deep
 chain every time after, while reporting all of them as though they had
 tested the same thing. Three modes therefore means three chains.
+
+Each chain's baseline is `-force-clean` rather than a plain `-reinit`, and
+that is a consequence of stage 14's feature rather than a preference. The
+previous mode's round ends with a `-verify` that found a difference, which
+records `verify_state=failed` on the target domain — and a domain carrying
+that record refuses an ordinary sync *and* a plain `-reinit` alike,
+deliberately, because a reinit recopies without proving the result. Nothing
+short of `-force-clean` or `-verify-failure-reinit` clears it, by design.
 
 **The corruption lands after a random copy, not after the last one.** Bit
 rot does not wait for a sync window to close. Injecting it mid-chain asks a

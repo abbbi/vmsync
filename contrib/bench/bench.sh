@@ -599,9 +599,20 @@ bench_sync() {
 # bench_sync_hint names the likely cause when one of those syncs fails, since
 # the flags it adds are also the one extra thing that has to be installed on
 # the target.
+# bench_sync_hint -- what to suspect when a stage's baseline sync fails.
+#
+# Two causes, and the order matters because the second one used to be reported
+# as the first. A run that vmsync REFUSED at preflight ends in well under a
+# second having copied nothing, and is not a transport problem at all: a
+# recorded verify_state (stage 14's feature -- a plain -reinit is refused too,
+# by design), a replication_role, or an out-of-band write on the replica will
+# each do it. Blaming BENCH_SYNC_ARGS for those sent two separate
+# investigations after -compress and pkg/nbdsync for a vmsync that was working
+# exactly as designed, so the refusal is named first and by its signature.
 bench_sync_hint() {
+	printf ' -- if that run ended in under a second having transferred nothing, vmsync REFUSED it at preflight rather than failing: check its log for a recorded verify_state (cleared only by -verify-failure-reinit or -force-clean), a replication_role, or an out-of-band-write refusal'
 	if [ ${#BENCH_SYNC_EXTRA[@]} -gt 0 ]; then
-		printf ' -- this stage adds "%s" to every sync (BENCH_SYNC_ARGS in %s); -compress needs vmsync-bridge-helper on %s, so set BENCH_SYNC_ARGS="" if that is not installed there' \
+		printf '. Otherwise, this stage adds "%s" to every sync (BENCH_SYNC_ARGS in %s); -compress needs vmsync-bridge-helper on %s, so set BENCH_SYNC_ARGS="" if that is not installed there' \
 			"${BENCH_SYNC_EXTRA[*]}" "$CONF" "$TARGET_HOST"
 	fi
 }
@@ -993,8 +1004,8 @@ stage_verify_tamper() {
         return 0
 }
 
-# verify_cross_check_subtest PATH VSIZE -- tamper ONCE, ask all three modes
-# about that same state, and require them to agree.
+# verify_cross_check_subtest PATH VSIZE -- ask all three modes about the SAME
+# corruption and require them to agree.
 #
 # The per-mode loop above already proves each mode detects corruption. It
 # cannot prove they agree, because each one gets its own tamper at its own
@@ -1010,11 +1021,18 @@ stage_verify_tamper() {
 # A disagreement here is the signal worth having. fast/full clean while
 # qemu-img reports a mismatch means the skip ate a real difference -- a
 # verify that passes over corruption, which is worse than no verify at all.
+#
+# It costs two extra full resyncs, which it did not before stage 14's feature
+# landed. A -verify that finds a difference now records it on the target
+# domain, and that record refuses the next sync -- so the three modes can no
+# longer share one tamper. Each is given the same corruption on a healed
+# replica instead. See the loop for why re-establishing beats the alternatives:
+# there is no way to clear the record without a full recopy, by design.
 verify_cross_check_subtest() {
         local path="$1" vsize="$2" mode outcome
         local -a agreed=()
 
-        log "--- verify cross-check: one tamper, all three modes, expecting all three to agree ---"
+        log "--- verify cross-check: the same corruption, all three modes, expecting all three to agree ---"
 
         if [ "$DRY_RUN" != yes ]; then
                 stage_needs_target_shutoff "$CSV" verify-cross "verify-cross" || return 0
@@ -1031,9 +1049,38 @@ verify_cross_check_subtest() {
                 fi
         fi
 
-        # The tamper survives each failed verify -- nothing heals it until the
-        # end -- so every mode sees the same corrupted replica.
+        # Every mode must see the SAME bytes, and since stage 14's feature
+        # landed that costs a heal-and-re-tamper between them rather than
+        # nothing at all.
+        #
+        # This loop used to tamper once and run all three modes against it, on
+        # the reasoning that nothing healed the replica in between. The tamper
+        # does still survive -- but the FINDING now survives too: a -verify
+        # that ran and found a difference records verify_state=failed on the
+        # target domain, and a domain carrying that record refuses the next
+        # sync outright. So modes two and three were refused at preflight in
+        # ~0.3s with mode=unknown, never reaching a compare, and the agreement
+        # check below read that as the skip logic dropping real differences --
+        # pointing at pkg/nbdsync for what was vmsync working as designed.
+        #
+        # Re-establishing the state is the honest fix: heal (a -force-clean
+        # full resync, which is also what clears the record) and re-apply the
+        # tamper at the SAME offset, since draw_tamper ran once above and
+        # TAMPER_OFF/TAMPER_LEN have not moved since. Each mode then gets a
+        # byte-identical replica and a clean record, which is what this
+        # cross-check always meant to compare.
+        local tampered_once=no
         for mode in fast full qemu-img; do
+                if [ "$DRY_RUN" != yes ] && [ "$tampered_once" = yes ]; then
+                        heal_target verify-cross "${mode}-heal" "$path"
+                        log "   re-corrupting at offset $TAMPER_OFF length $TAMPER_LEN (the same bytes the previous mode saw)"
+                        if ! tamper_target "$path" yes; then
+                                warn "SKIP verify-cross/$mode: the tamper could not be re-applied after healing, so this mode would compare a CLEAN replica and be scored as having missed a corruption that was never there"
+                                results_row "$CSV" verify-cross "${mode}-result" "" "" "" "" "" "" "SKIP tamper could not be re-applied"
+                                continue
+                        fi
+                fi
+                tampered_once=yes
                 bench_sync verify-cross "$mode" "-verify=$mode"
                 if [ "$DRY_RUN" = yes ]; then
                         results_row "$CSV" verify-cross "${mode}-result" DRYRUN "" "" "" "" "" "SKIP dry run"
@@ -1069,8 +1116,17 @@ verify_cross_check_subtest() {
                 if [ "$disagree" = 0 ] && [ -n "$first" ]; then
                         log "   PASS: all three modes agree (${agreed[*]})"
                         results_row "$CSV" verify-cross agreement 0 "" "" "" "" "" "PASS all modes agree: ${agreed[*]}"
+                elif printf '%s\n' "${agreed[@]}" | grep -q '=NOT_RUN$'; then
+                        # A mode that never compared has no opinion, so this is
+                        # not a disagreement about bytes and must not be
+                        # reported as one. Said separately because the old
+                        # message blamed the skip logic for it, which cost real
+                        # time chasing pkg/nbdsync over a run that was refused
+                        # before it read anything.
+                        warn "FAIL: the cross-check could not be performed -- at least one mode never reached its compare (${agreed[*]}), so the modes were never asked the same question. This says nothing about the skip logic. Check those runs' logs for why they ended early: a refusal at preflight (a recorded verify_state, a role, an out-of-band write) ends a run in well under a second with mode=unknown. Reproduce with TAMPER_SEED=$TAMPER_SEED"
+                        results_row "$CSV" verify-cross agreement 1 "" "" "" "" "" "FAIL cross-check not performed: ${agreed[*]}"
                 else
-                        warn "FAIL: the verify modes DISAGREED about the same corrupted replica (${agreed[*]}). qemu-img reads every byte in a separate implementation; fast and full skip ranges both sides report as zero. If qemu-img saw the corruption and they did not, that skip logic (planCompareChunks in pkg/nbdsync) is dropping real differences. Reproduce with TAMPER_SEED=$TAMPER_SEED"
+                        warn "FAIL: the verify modes DISAGREED about the same corrupted replica (${agreed[*]}). All three ran, so this is a real difference of opinion about identical bytes. qemu-img reads every byte in a separate implementation; fast and full skip ranges both sides report as zero. If qemu-img saw the corruption and they did not, that skip logic (planCompareChunks in pkg/nbdsync) is dropping real differences. Reproduce with TAMPER_SEED=$TAMPER_SEED"
                         results_row "$CSV" verify-cross agreement 1 "" "" "" "" "" "FAIL modes disagree: ${agreed[*]}"
                 fi
         fi
@@ -3149,7 +3205,15 @@ stage_verify_long() {
 	for mode in $VERIFY_LONG_MODES; do
 		log "--- verify-long/$mode: building a fresh ${copies}-deep chain ---"
 
-		bench_sync verify-long "${mode}-baseline" -reinit
+		# -force-clean, not the plain -reinit this used to pass, and for the
+		# same reason heal_target changed: the PREVIOUS mode's round ended
+		# with a -verify that found a difference, which records
+		# verify_state=failed on the target domain -- and a domain carrying
+		# that record refuses an ordinary sync and a plain -reinit alike,
+		# deliberately, because a reinit recopies without proving the result.
+		# So from the second mode on, this baseline was refused at preflight
+		# in ~0.3s with mode=unknown, and the stage aborted blaming -compress.
+		bench_sync verify-long "${mode}-baseline" -force-clean
 		if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
 			warn "baseline full sync for verify-long/$mode failed (see $RUN_LOG) -- aborting stage 8$(bench_sync_hint)"
 			return 1
@@ -3171,8 +3235,10 @@ stage_verify_long() {
 		verify_long_round "$mode" "$copies" "$target_path" "$vsize" || return 1
 	done
 
-	# One heal, at the end. Each round already begins with its own -reinit,
-	# which heals whatever the previous round left behind; only the last one
+	# One heal, at the end. Each round already begins with its own
+	# -force-clean, which heals whatever the previous round left behind --
+	# including the verify_state record its -verify wrote, which is precisely
+	# why that baseline cannot be a plain -reinit any more. Only the last round
 	# needs cleaning up after. (A round that gives up part-way skips this and
 	# leaves the replica corrupted on purpose -- its message says so and says
 	# to inspect it. The stage is marked FAIL and the report still prints.)
