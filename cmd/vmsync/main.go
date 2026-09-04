@@ -25,6 +25,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -3299,7 +3300,8 @@ func run(cfg syncConfig) (runErr error) {
 		trace.Info("resolved nbd port layout",
 			"source_spec", srcSpec.String(), "source_base", cfg.SourceNBDPort, "source_ports", srcNeed,
 			"target_spec", tgtSpec.String(), "target_ports_wanted", tgtNeed,
-			"target_allocation", "per-export bind, no reserved block -- each export logs the port it bound")
+			"target_start_offset", targetPortStart,
+			"target_allocation", "per-export bind from a random start, no reserved block -- each export logs the port it bound")
 	}
 	if err := nbdbridge.CheckRemote(ctx, targetSSHClient, bridgeCfg, targetSSHConfig.Address); err != nil {
 		return err

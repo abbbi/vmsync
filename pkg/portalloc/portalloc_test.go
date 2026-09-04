@@ -335,7 +335,7 @@ func TestAllocatorNeverRepeatsAPort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := NewAllocator(spec, Skew("web01"))
+	a := NewAllocator(spec, 0)
 
 	seen := map[int]bool{}
 	for {
@@ -366,7 +366,7 @@ func TestAllocatorIsSafeUnderConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := NewAllocator(spec, Skew("db01"))
+	a := NewAllocator(spec, 0)
 
 	const goroutines = 20
 	got := make(chan int, 100)
@@ -408,7 +408,7 @@ func TestAllocatorFixedSpecCountsUpwards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := NewAllocator(spec, Skew("web01"))
+	a := NewAllocator(spec, 0)
 	for _, want := range []int{20809, 20810, 20811} {
 		got, ok := a.Next()
 		if !ok {
@@ -430,7 +430,7 @@ func TestAllocatorFixedSpecStopsAt65535(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := NewAllocator(spec, Skew("web01"))
+	a := NewAllocator(spec, 0)
 	var ports []int
 	for {
 		p, ok := a.Next()
@@ -444,33 +444,56 @@ func TestAllocatorFixedSpecStopsAt65535(t *testing.T) {
 	}
 }
 
-// Skew decides where a range STARTS, so two vms tend to begin apart. No
-// longer a correctness property (the bind decides), but it is why a given vm
-// keeps landing on roughly the same ports, which is what makes a firewall log
-// readable.
-func TestAllocatorSkewMovesTheStartingPoint(t *testing.T) {
+// The start offset decides where the range begins, and the caller picks it --
+// vmsync at random per run, so that a vm which starts somewhere unlucky is
+// unlucky once rather than forever.
+//
+// This function stays deterministic, which is the point of the offset being a
+// parameter: the randomness lives at the call site so these assertions can be
+// exact.
+func TestAllocatorStartOffsetPositionsTheRange(t *testing.T) {
 	spec, err := ParseSpec("20000-20099", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := func(id string) int {
-		p, ok := NewAllocator(spec, Skew(id)).Next()
+	first := func(start uint32) int {
+		p, ok := NewAllocator(spec, start).Next()
 		if !ok {
-			t.Fatalf("no candidates for %q", id)
+			t.Fatalf("no candidates for start %d", start)
 		}
 		return p
 	}
-	// Same id, same answer -- the stability that makes it worth having.
-	if a, b := first("web01"), first("web01"); a != b {
-		t.Errorf("the same vm started at %d then %d; the choice must be reproducible", a, b)
+
+	// The offset is taken modulo the span, so any uint32 lands in range --
+	// vmsync passes a raw rand.Uint32(), which is far larger than any span.
+	for _, start := range []uint32{0, 1, 99, 100, 12345, 4294967295} {
+		if got := first(start); got < 20000 || got > 20099 {
+			t.Errorf("start %d produced port %d, outside 20000-20099", start, got)
+		}
 	}
-	// Different ids should generally differ. Not guaranteed for any specific
-	// pair, so this asserts the population rather than a single collision.
-	starts := map[int]bool{}
-	for _, id := range []string{"web01", "db01", "mail01", "app01", "dns01", "ldap01", "ci01", "nfs01"} {
-		starts[first(id)] = true
+	if got, want := first(0), 20000; got != want {
+		t.Errorf("start 0 = %d, want %d", got, want)
 	}
-	if len(starts) < 4 {
-		t.Errorf("8 vms produced only %d distinct starting ports; the skew is not spreading them", len(starts))
+	if got, want := first(7), 20007; got != want {
+		t.Errorf("start 7 = %d, want %d", got, want)
+	}
+	// Wraps rather than clamping: an offset at the top of the span must still
+	// yield the whole range, just beginning near the end.
+	if got, want := first(100), 20000; got != want {
+		t.Errorf("start 100 = %d, want %d (the offset wraps)", got, want)
+	}
+	// And a wrapped order is still a complete permutation, so a run starting
+	// near the top of the range is not short of candidates.
+	a := NewAllocator(spec, 95)
+	seen := map[int]bool{}
+	for {
+		p, ok := a.Next()
+		if !ok {
+			break
+		}
+		seen[p] = true
+	}
+	if len(seen) != 100 {
+		t.Errorf("a run starting at offset 95 saw %d ports, want all 100", len(seen))
 	}
 }
