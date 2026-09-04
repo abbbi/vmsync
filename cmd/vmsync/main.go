@@ -286,15 +286,20 @@ type syncConfig struct {
 	TargetNBDBind  string
 
 	// SourceNBDPortSpec/TargetNBDPortSpec hold the raw -source-nbd-port /
-	// -target-nbd-port flag values, which accept a range or one fixed port and
-	// DEFAULT to a range (see portalloc.ParseSpec). SourceNBDPort/TargetNBDPort are the
-	// resolved base ports, filled in by run() once the disk count and
-	// bridge/verify settings are known -- every other port in the run is
-	// derived from them by offset.
+	// -target-nbd-port flag values, which accept a range or one fixed port
+	// and DEFAULT to a range (see portalloc.ParseSpec).
+	//
+	// SourceNBDPort is the resolved SOURCE base port, filled in by run() once
+	// the disk count and bridge settings are known; the source bridge sits at
+	// +1. There is deliberately no target counterpart: the target side no
+	// longer has a base port, because it no longer reserves a contiguous
+	// block. Each target export draws a candidate from a portalloc.Allocator
+	// and binds it, recording what it actually got -- so there is nothing for
+	// a "resolved base" to mean, and a field holding one would be a number
+	// nothing derives from.
 	SourceNBDPortSpec string
 	TargetNBDPortSpec string
 	SourceNBDPort     int
-	TargetNBDPort     int
 
 	SSHUser       string
 	SSHKey        string
@@ -435,7 +440,7 @@ func main() {
 	flag.StringVar(&cfg.SourceNBDPortSpec, "source-nbd-port", portalloc.DefaultSourceSpec, fmt.Sprintf("Source TCP port range for the libvirt backup NBD export: a free block is chosen inside it, so two concurrent runs do not collide without anyone having to configure anything. Defaults to %s. Pass one port instead (10809) to pin it exactly, which is worth doing only for a firewall that cannot open a range. A run needs 1 port here, or 2 when -compress/-netbuffer is set", portalloc.DefaultSourceSpec))
 	flag.StringVar(&cfg.SourceNBDHost, "source-nbd-host", "", "source host to connect for NBD reads (defaults from --source-uri)")
 	flag.StringVar(&cfg.TargetNBDBind, "target-nbd-bind", "0.0.0.0", "target bind address for qemu-nbd TCP export")
-	flag.StringVar(&cfg.TargetNBDPortSpec, "target-nbd-port", portalloc.DefaultTargetSpec, fmt.Sprintf("Target base TCP port range for the qemu-nbd exports: a free block is chosen inside it, so two concurrent runs do not collide without anyone having to configure anything. Defaults to %s. Pass one port instead (20809) to pin it exactly, which is worth doing only for a firewall that cannot open a range. A run needs N consecutive ports for N disks, 2N with -compress/-netbuffer, 3N with -verify, 4N with both -- so the default range holds 50 concurrent single-disk replicas", portalloc.DefaultTargetSpec))
+	flag.StringVar(&cfg.TargetNBDPortSpec, "target-nbd-port", portalloc.DefaultTargetSpec, fmt.Sprintf("Target base TCP port range for the qemu-nbd exports: a free block is chosen inside it, so two concurrent runs do not collide without anyone having to configure anything. Defaults to %s. Pass one port instead (20809) to pin it exactly, which is worth doing only for a firewall that cannot open a range. Ports are no longer taken as a contiguous block: each export binds its own and logs it, so a run needs N ports anywhere in the range for N disks, 2N with -compress/-netbuffer OR -verify, 4N with both. The default range therefore holds 100 concurrent single-disk replicas, or 25 four-disk ones with everything enabled", portalloc.DefaultTargetSpec))
 	flag.StringVar(&cfg.TargetNBDHost, "target-nbd-host", "", "target host to connect for NBD writes (defaults from --target-uri)")
 	flag.StringVar(&cfg.SSHUser, "ssh-user", "", "ssh user for remote command execution (defaults from URI user, then ~/.ssh/config's User, then root)")
 	flag.StringVar(&cfg.SSHKey, "ssh-key", "", "private key path for ssh authentication (defaults from ~/.ssh/config's IdentityFile)")
@@ -1438,38 +1443,130 @@ func formatRemoteStderr(stderr string) string {
 	return " (remote stderr: " + strings.TrimSpace(stderr) + ")"
 }
 
-// targetPortsNeeded returns how many consecutive ports a run occupies on
-// the TARGET host, given its disk count and which optional stages are on.
+// targetPortsNeeded returns how many ports a run will BIND on the TARGET
+// host, given its disk count and which optional stages are on.
 //
-// The layout is four contiguous blocks of N, each present or not, but
-// always at the same offset -- copyAndCommit puts the qemu-nbd exports at
-// [T, T+N) and their bridges at [T+N, T+2N); runVerify puts the read-only
-// verify exports at [T+2N, T+3N) and their bridges at [T+3N, T+4N). The
-// verify block sits at +2N whether or not bridging is on, so verification
-// alone still reserves through 3N with the second block left idle. That is
-// deliberate in the existing code (it keeps the verify export's port
-// independent of the write export's, which has just been killed and may not
-// have released yet), and this function must mirror it exactly or a run
-// will bind outside the range it reserved.
+// Ports actually bound, not the span of a layout -- and that is a correction,
+// not a rewording. This used to describe four contiguous blocks of N at fixed
+// offsets, with the verify block at +2N whether or not bridging was on. The
+// consequence was that verification WITHOUT bridging reserved through 3N and
+// bound only 2N, leaving the middle block held and idle: a four-disk
+// -verify=qemu-img run with no compression reserved twelve consecutive ports
+// and used eight. Harmless for correctness, since it never under-reserved, but
+// it demanded a 50% larger contiguous span than the run needed -- so it hit
+// "no consecutive free ports" on a fragmented range that could have served it.
+//
+// Nothing reserves a block any more (see portalloc.Allocator: each export
+// binds its own port and records what it got), so the fixed-offset layout this
+// mirrored no longer exists and the honest answer is simply the count. It is
+// used for the up-front "your range is smaller than this run wants"
+// diagnosis and for the log line, neither of which wants a padded figure.
 //
 // The integrity check deliberately does NOT appear here, in either of its
-// two forms. The pre-commit check exports over a UNIX SOCKET, so it needs
-// no port at all; the digest-based -verify reuses the verify export already
-// counted at +2N. Neither adds to a run's reservation, which is what keeps
-// a check that is on by default from silently widening every run's port
-// span -- and from shrinking how many runs an auto-allocated range can
-// hold.
+// two forms. The pre-commit check exports over a UNIX SOCKET, so it needs no
+// port at all; the digest-based -verify reuses the verify export already
+// counted. Neither adds to a run's port usage, which is what keeps a check
+// that is on by default from silently costing every run more ports -- and
+// from shrinking how many runs a range can hold.
 func targetPortsNeeded(disks int, bridging, verifying bool) int {
-	switch {
-	case verifying && bridging:
-		return 4 * disks
-	case verifying:
-		return 3 * disks
-	case bridging:
-		return 2 * disks
-	default:
-		return disks
+	perDisk := 1 // the qemu-nbd write export
+	if bridging {
+		perDisk++ // its bridge helper
 	}
+	if verifying {
+		perDisk++ // the read-only verify export
+		if bridging {
+			perDisk++ // and the verify export's own bridge
+		}
+	}
+	return perDisk * disks
+}
+
+// portBindAttempts is how many different ports one export will try before
+// giving up.
+//
+// The cap exists for one reason only: to bound what a NON-port failure costs.
+// A retry cannot tell "that port is taken" from "this invocation is broken"
+// without matching qemu-nbd's own stderr, which is a third-party message
+// string this code would then depend on -- so instead it retries blindly and
+// the cap keeps a genuine fault (a bad disk path, a missing binary, no
+// permission) from being retried forever. Such a fault costs this many SSH
+// round trips and is then reported verbatim.
+//
+// Sized against the contention it has to survive, which is where a smaller
+// number went wrong. Candidates are handed out CONSECUTIVELY from the skew
+// offset, and a peer run occupies a CONTIGUOUS stretch: four concurrent
+// four-disk syncs with -compress and -verify take sixteen ports each, so a
+// run whose skew lands near another's walks into a solid block of sixteen,
+// thirty-two or forty-eight busy ports before reaching free ones. A cap of
+// five would have given up inside that block and failed a run over a range
+// that was wide open a little further along -- reachable with the agent's
+// default max_concurrent_syncs of 4, not a hypothetical.
+//
+// 64 covers that with room to spare and still bounds a broken invocation at a
+// few seconds. Exhausting the RANGE is reported separately (see
+// bindOnFreePort): "I tried 64 ports" and "the range holds fewer than I
+// needed" are different diagnoses with different fixes.
+const portBindAttempts = 64
+
+// bindOnFreePort starts something that binds a TCP port, trying successive
+// candidate ports until one works, and returns the port that did.
+//
+// This replaces "probe the host, then trust the probe". The probe could not be
+// made correct -- a run's ports are bound at very different times, so the
+// verify exports sit unbound for the whole copy and a second run probing then
+// sees them free -- and the fix is not a better probe but no probe: the bind
+// IS the reservation, which makes the kernel the arbiter. That also covers a
+// port held by something which is not vmsync at all, which no amount of
+// vmsync-side bookkeeping ever could.
+//
+// cleanup runs after every failed attempt and is not optional. A start that
+// bound its port and then failed for some later reason leaves a process
+// holding the replica image open, which blocks the commit and, on a -reinit,
+// the rm of the disk file. Doing it here rather than by pre-registering a stop
+// command is deliberate: pollStopCommands' index is monotonic, so
+// pre-registering would burn the one-shot slot before the pidfile exists, and
+// a signal arriving mid-start would then leave an export nothing reaps.
+func bindOnFreePort(what string, alloc *portalloc.Allocator, start func(port int) error, cleanup func(port int)) (int, error) {
+	var lastErr error
+	for attempt := 1; attempt <= portBindAttempts; attempt++ {
+		port, ok := alloc.Next()
+		if !ok {
+			// Exhausting the range and failing to bind are different
+			// diagnoses with different fixes -- widen the range, versus find
+			// out what is on those ports -- so they get different messages.
+			if lastErr != nil {
+				return 0, fmt.Errorf("%s: ran out of candidate ports after taking all %d in the range; the last attempt failed with: %w", what, alloc.Span(), lastErr)
+			}
+			return 0, fmt.Errorf("%s: the port range holds %d ports and this run has already taken every one of them -- widen it, or reduce how many disks or optional stages this run uses", what, alloc.Span())
+		}
+		if err := start(port); err == nil {
+			// Only worth a line when it took more than one go, and then it is
+			// worth one: it says the range is carrying real contention, which
+			// is the signal that it wants widening before it starts failing
+			// runs.
+			if attempt > 1 {
+				trace.Info("bound "+what+" after skipping busy ports", "port", port, "attempts", attempt)
+			}
+			return port, nil
+		} else {
+			lastErr = err
+			// The FIRST failure is a warning, the rest are debug. A broken
+			// invocation fails identically on every candidate, and 64 copies
+			// of the same message would bury the one that mattered -- while
+			// staying silent from the first would hide ordinary contention
+			// entirely. The summary above reports how many it took.
+			if attempt == 1 {
+				trace.Warning("could not start "+what+" on this port; cleaning up and trying others",
+					"port", port, "attempts_allowed", portBindAttempts, "error", err)
+			} else {
+				trace.Debug("could not start "+what+" on this port either",
+					"port", port, "attempt", attempt, "of", portBindAttempts, "error", err)
+			}
+			cleanup(port)
+		}
+	}
+	return 0, fmt.Errorf("%s: gave up after %d attempts on %d different ports; the last failed with: %w", what, portBindAttempts, portBindAttempts, lastErr)
 }
 
 // sourcePortsNeeded returns how many consecutive ports a run occupies on
@@ -3112,6 +3209,12 @@ func run(cfg syncConfig) (runErr error) {
 	defer cleanupTargetNBD("cleanup")
 	defer cleanupSourceBridge("cleanup")
 
+	// Every target-side port this run binds comes from here, one candidate at
+	// a time, shared across the per-disk goroutines. Assigned in the block
+	// just below; declared out here because copyAndCommit and runVerify both
+	// draw from it.
+	var targetPortAlloc *portalloc.Allocator
+
 	// Resolve the two base ports now: both SSH clients are up, the disk
 	// count is known, and nothing has bound anything yet. Every other port
 	// this run uses is derived from these two by offset, so this is the
@@ -3120,6 +3223,10 @@ func run(cfg syncConfig) (runErr error) {
 	// A fixed spec short-circuits without probing at all -- the operator
 	// named a port, and second-guessing it here would only produce a worse
 	// version of the bind error that follows.
+	//
+	// The TARGET side no longer makes a choice here at all: it builds an
+	// allocator its exports draw from as they bind. Only the source still
+	// resolves a base up front, and only until it moves over too.
 	{
 		bridging := bridgeCfg.Enabled()
 		srcNeed := sourcePortsNeeded(bridging)
@@ -3145,25 +3252,54 @@ func run(cfg syncConfig) (runErr error) {
 			return fmt.Errorf("source-nbd-port: %w", err)
 		}
 
+		// The TARGET side reserves nothing and probes nothing.
+		//
+		// Each of its exports takes a candidate from this allocator, tries to
+		// BIND it, and moves to the next on failure -- so the bind is the
+		// reservation and the kernel is the arbiter. That is the only version
+		// of this that can be correct: the verify exports are bound after the
+		// copy finishes, so under the old scheme they sat unbound for the
+		// entire run and a second run probing in that window saw them free.
+		//
+		// One allocator shared by every disk's goroutine, because its job is
+		// to stop two exports in the SAME run being handed one port. Two
+		// different runs need no coordination at all -- one of the two binds
+		// fails and takes another port.
 		tgtSpec, err := portalloc.ParseSpec(cfg.TargetNBDPortSpec, portalloc.DefaultTargetAutoLow, portalloc.DefaultTargetAutoHigh)
 		if err != nil {
 			return fmt.Errorf("target-nbd-port: %w", err)
 		}
-		tgtUsed := map[int]bool{}
-		if !tgtSpec.IsFixed() {
-			tgtUsed, err = listeningPorts(ctx, true, targetSSHClient)
-			if err != nil {
-				return fmt.Errorf("list listening ports on the target host to choose -target-nbd-port: %w", err)
-			}
-		}
-		cfg.TargetNBDPort, err = portalloc.SelectBase(tgtUsed, tgtSpec, tgtNeed, skew)
-		if err != nil {
-			return fmt.Errorf("target-nbd-port: %w", err)
+		// A RANDOM starting offset, not the per-domain skew the source side
+		// still uses.
+		//
+		// Not for collision probability -- a collision is handled, since the
+		// next candidate is simply tried. It is because a DERIVED offset makes
+		// a vm permanently unlucky: if this domain's hash lands where some
+		// unrelated long-lived service sits, it starts there on every run for
+		// the life of the deployment and pays the same wasted attempts each
+		// time, with no run ever able to escape it. Random makes that a
+		// one-off.
+		//
+		// Logged below, so a run stays reproducible from its own log despite
+		// not being reproducible from its name.
+		targetPortStart := rand.Uint32()
+		targetPortAlloc = portalloc.NewAllocator(tgtSpec, targetPortStart)
+		// Said up front rather than discovered on the last export, which
+		// would be after the copy. Not a refusal: the count is what this run
+		// WANTS, other things on the host may free ports before then, and a
+		// range that turns out to be too small reports so per export with the
+		// span in the message.
+		if !tgtSpec.IsFixed() && targetPortAlloc.Span() < tgtNeed {
+			trace.Warning("the target port range is smaller than this run wants, so an export will run out of candidates",
+				"range", tgtSpec.String(), "range_ports", targetPortAlloc.Span(),
+				"run_wants", tgtNeed, "disks", len(qcowDisks),
+				"remedy", "widen -target-nbd-port")
 		}
 
 		trace.Info("resolved nbd port layout",
 			"source_spec", srcSpec.String(), "source_base", cfg.SourceNBDPort, "source_ports", srcNeed,
-			"target_spec", tgtSpec.String(), "target_base", cfg.TargetNBDPort, "target_ports", tgtNeed)
+			"target_spec", tgtSpec.String(), "target_ports_wanted", tgtNeed,
+			"target_allocation", "per-export bind, no reserved block -- each export logs the port it bound")
 	}
 	if err := nbdbridge.CheckRemote(ctx, targetSSHClient, bridgeCfg, targetSSHConfig.Address); err != nil {
 		return err
@@ -3949,7 +4085,7 @@ func run(cfg syncConfig) (runErr error) {
 	//     it was asked about. A bug or a truncated transfer, not evidence.
 	//   - a non-empty mismatch list: the bytes on the target differ from the
 	//     bytes sent. The only one that condemns the replica.
-	verifyWrittenDigests := func(i int, d disk.QcowDisk, imagePath string, incremental bool, sourceDigests []blockdigest.Block) (checkErr error) {
+	verifyWrittenDigests := func(d disk.QcowDisk, imagePath string, incremental bool, sourceDigests []blockdigest.Block) (checkErr error) {
 		// Fold this disk's conclusion into the run's. Anything that is not
 		// a clean pass or a data mismatch means the check could not be
 		// carried out -- a helper that would not run, version skew, a plan
@@ -4274,7 +4410,7 @@ func run(cfg syncConfig) (runErr error) {
 	// copyAndCommit is exactly today's copy+commit logic (nothing about its
 	// behavior changes), just returning what runVerify/metrics need instead
 	// of leaving them as syncDisk-local variables.
-	copyAndCommit := func(i int, d disk.QcowDisk) (res diskPhase1Result, err error) {
+	copyAndCommit := func(d disk.QcowDisk) (res diskPhase1Result, err error) {
 		res.diskStart = time.Now()
 
 		trace.Info("reading disk via libvirt backup NBD tcp export", "disk", d.TargetDev, "export", d.TargetDev)
@@ -4382,33 +4518,55 @@ func run(cfg syncConfig) (runErr error) {
 			}
 		}
 
-		targetPort := cfg.TargetNBDPort + i
 		pidFile := path.Join("/tmp", fmt.Sprintf("vmsync-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
-		startExportCmd := "qemu-nbd --fork --persistent"
-		if d.DiscardMode != "" {
-			startExportCmd = startExportCmd + " --discard=" + d.DiscardMode
-		}
 		// --export-name so this export is addressable by identity rather
 		// than only by port; see targetExportName.
 		exportName := targetExportName(cfg.TargetDomain, d.TargetDev)
-		startExportCmd = startExportCmd +
-			" --format=qcow2 --bind " +
-			util.ShQuote(cfg.TargetNBDBind) +
-			" --port " +
-			fmt.Sprintf("%d", targetPort) +
-			" --export-name " +
-			util.ShQuote(exportName) +
-			" --pid-file " +
-			util.ShQuote(pidFile) +
-			" "
-
 		if incrementalMode {
 			targetPathInc = targetPath + "_" + bitmapForRead
-			startExportCmd = startExportCmd + util.ShQuote(targetPathInc)
-		} else {
-			startExportCmd = startExportCmd + util.ShQuote(targetPath)
 		}
-		if err := runTargetCommand(startExportCmd, fmt.Sprintf("start target qemu-nbd for %s", targetPath)); err != nil {
+		exportImage := targetPath
+		if incrementalMode {
+			exportImage = targetPathInc
+		}
+		// Built per attempt, because the port is now chosen by trying it. The
+		// pidfile is deliberately NOT port-specific, so one stop command
+		// serves every attempt and the successful one alike.
+		buildStartExport := func(port int) string {
+			cmd := "qemu-nbd --fork --persistent"
+			if d.DiscardMode != "" {
+				cmd = cmd + " --discard=" + d.DiscardMode
+			}
+			return cmd +
+				" --format=qcow2 --bind " +
+				util.ShQuote(cfg.TargetNBDBind) +
+				" --port " +
+				fmt.Sprintf("%d", port) +
+				" --export-name " +
+				util.ShQuote(exportName) +
+				" --pid-file " +
+				util.ShQuote(pidFile) +
+				" " + util.ShQuote(exportImage)
+		}
+		// The same stop string the cleanup paths below register, needed here
+		// too so a failed attempt cannot leave a qemu-nbd holding the image
+		// open -- which would block the commit and, on a -reinit, the rm.
+		killExportCmd := "kill -9 $(cat " + util.ShQuote(pidFile) + ") || true; rm -f " + util.ShQuote(pidFile)
+		targetPort, err := bindOnFreePort(
+			fmt.Sprintf("target qemu-nbd export for %s", targetPath),
+			targetPortAlloc,
+			func(port int) error {
+				return runTargetCommand(buildStartExport(port), fmt.Sprintf("start target qemu-nbd for %s on port %d", targetPath, port))
+			},
+			func(port int) {
+				// context.Background(), never ctx: a retry may be happening
+				// while ctx is already being cancelled by a sibling disk's
+				// failure, and this cleanup must still run.
+				if out, cerr := targetSSHClient.Run(context.Background(), killExportCmd); cerr != nil {
+					trace.Warning("could not clean up after a failed target export start", "disk", d.TargetDev, "port", port, "error", cerr, "output", out)
+				}
+			})
+		if err != nil {
 			return res, err
 		}
 
@@ -4436,7 +4594,10 @@ func run(cfg syncConfig) (runErr error) {
 		// file is a no-op -- the whole replay becomes harmless instead of
 		// dangerous. Matches nbdbridge.BuildStopCommand's own identical
 		// kill-then-remove pattern for the bridge helper's pidfile.
-		stopCmd := "kill -9 $(cat " + util.ShQuote(pidFile) + ") || true; rm -f " + util.ShQuote(pidFile)
+		// killExportCmd, built above the start so the retry loop could use it
+		// too. One string, so the cleanup a failed attempt runs and the one
+		// registered here cannot drift apart.
+		stopCmd := killExportCmd
 		stopMu.Lock()
 		targetStopCommands = append(targetStopCommands, stopCmd)
 		stopMu.Unlock()
@@ -4448,11 +4609,29 @@ func run(cfg syncConfig) (runErr error) {
 		effectiveTargetHost := targetNBDHost
 		effectiveTargetPort := targetPort
 		if bridgeCfg.Enabled() {
-			// All real qemu-nbd ports occupy [TargetNBDPort, TargetNBDPort+N),
-			// so the bridge ports lay out right after them, as one contiguous
-			// block [TargetNBDPort+N, TargetNBDPort+2N).
-			targetBridgePort := targetPort + len(qcowDisks)
-			bridgeStopCmd, err := nbdbridge.StartRemote(ctx, targetSSHClient, cfg.TargetDomain+"-"+d.TargetDev, targetBridgePort, targetPort, bridgeCfg)
+			// From the allocator, like the export it fronts. This used to be
+			// targetPort+N, on the reasoning that the exports occupied a
+			// contiguous [T, T+N) so their bridges could follow at
+			// [T+N, T+2N) -- true while a block was reserved, meaningless
+			// now that each export binds its own port.
+			var bridgeStopCmd string
+			targetBridgePort, err := bindOnFreePort(
+				fmt.Sprintf("target nbd bridge for %s", d.TargetDev),
+				targetPortAlloc,
+				func(port int) error {
+					cmd, serr := nbdbridge.StartRemote(ctx, targetSSHClient, cfg.TargetDomain+"-"+d.TargetDev, port, targetPort, bridgeCfg)
+					if serr != nil {
+						return serr
+					}
+					bridgeStopCmd = cmd
+					return nil
+				},
+				func(port int) {
+					// Nothing to do: StartRemote kills its own orphan on
+					// failure (killOrphanedRemoteBridge), and its pidfile name
+					// includes the bridge port, so one failed attempt cannot
+					// interfere with the next one's.
+				})
 			if err != nil {
 				return res, fmt.Errorf("start target nbd bridge for %s: %w", d.TargetDev, err)
 			}
@@ -4574,7 +4753,7 @@ func run(cfg syncConfig) (runErr error) {
 					return res, err
 				}
 			}
-			if err := verifyWrittenDigests(i, d, checkPath, incrementalMode, sourceDigests); err != nil {
+			if err := verifyWrittenDigests(d, checkPath, incrementalMode, sourceDigests); err != nil {
 				return res, err
 			}
 		}
@@ -4609,7 +4788,7 @@ func run(cfg syncConfig) (runErr error) {
 	// same point in time and must be byte-identical; the mode chooses only
 	// how the comparison is performed and how a difference is reported. See
 	// the verifyMode constants.
-	runVerify := func(i int, d disk.QcowDisk, res diskPhase1Result) (err error) {
+	runVerify := func(d disk.QcowDisk, res diskPhase1Result) (err error) {
 		metricsMu.Lock()
 		verificationAttempted = true
 		metricsMu.Unlock()
@@ -4634,15 +4813,25 @@ func run(cfg syncConfig) (runErr error) {
 
 		targetPath := res.targetPath
 
-		// Dedicated port range, distinct from both the regular
-		// [TargetNBDPort, +N) and bridge [+N, +2N) ranges above, so this
-		// never collides regardless of whether bridging is on, and
-		// doesn't depend on the write export's port (already killed
-		// above, if it ever existed this run) having actually been
-		// released yet.
-		verifyPort := cfg.TargetNBDPort + 2*len(qcowDisks) + i
+		// A port of its own from the allocator, which is what "distinct"
+		// now means. This used to be a dedicated block at +2N, chosen so it
+		// could not collide with the write or bridge ranges whatever was
+		// enabled, and so that it did not reuse the write export's port --
+		// which has just been killed and may not have been released yet.
+		// Both properties still hold, for a better reason: the allocator
+		// never hands out a port twice within a run, and a port another
+		// process still holds simply fails to bind and is skipped.
 		verifyPidFile := path.Join("/tmp", fmt.Sprintf("vmsync-verify-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
 		verifyExportName := targetExportName(cfg.TargetDomain, d.TargetDev)
+		// Same rm -f-after-kill reasoning as stopCmd in copyAndCommit above:
+		// this string is also replayable from the interrupt-cleanup path
+		// after the inline call further down already runs it normally, and
+		// without removing the pidfile that replay could SIGKILL whatever
+		// unrelated process the OS has since reused the old PID for.
+		//
+		// Built before the start rather than after, so the bind retry below
+		// can clean up a failed attempt with the same string.
+		stopVerifyCmd := "kill -9 $(cat " + util.ShQuote(verifyPidFile) + ") || true; rm -f " + util.ShQuote(verifyPidFile)
 		// --cache=none (O_DIRECT) for the same reason the pre-commit checksum
 		// export sets it: without it this read is served from the host page
 		// cache, which still holds the pages the sync just wrote. That would
@@ -4651,25 +4840,38 @@ func run(cfg syncConfig) (runErr error) {
 		// since the write would pass. A fresh qemu-nbd process has a cold
 		// internal cache but the page cache is shared, so bypassing it is
 		// the only way the bytes come off the device.
-		startVerifyCmd := "qemu-nbd --fork --persistent --read-only --cache=none --format=qcow2 --bind " +
-			util.ShQuote(cfg.TargetNBDBind) +
-			" --port " +
-			fmt.Sprintf("%d", verifyPort) +
-			" --export-name " +
-			util.ShQuote(verifyExportName) +
-			" --pid-file " +
-			util.ShQuote(verifyPidFile) +
-			" " +
-			util.ShQuote(targetPath)
-		if err := runTargetCommand(startVerifyCmd, fmt.Sprintf("start read-only verify export for %s", targetPath)); err != nil {
+		buildStartVerify := func(port int) string {
+			return "qemu-nbd --fork --persistent --read-only --cache=none --format=qcow2 --bind " +
+				util.ShQuote(cfg.TargetNBDBind) +
+				" --port " +
+				fmt.Sprintf("%d", port) +
+				" --export-name " +
+				util.ShQuote(verifyExportName) +
+				" --pid-file " +
+				util.ShQuote(verifyPidFile) +
+				" " +
+				util.ShQuote(targetPath)
+		}
+		// This is the export the whole bind-instead-of-reserve change is for.
+		// Every other port is taken during setup, seconds after the layout
+		// would have been decided; this one is taken once the copy has
+		// finished, so under the old scheme its reserved port sat unbound for
+		// the entire run -- long enough for another run to probe, see it free,
+		// and take it.
+		verifyPort, err := bindOnFreePort(
+			fmt.Sprintf("read-only verify export for %s", targetPath),
+			targetPortAlloc,
+			func(port int) error {
+				return runTargetCommand(buildStartVerify(port), fmt.Sprintf("start read-only verify export for %s on port %d", targetPath, port))
+			},
+			func(port int) {
+				if out, cerr := targetSSHClient.Run(context.Background(), stopVerifyCmd); cerr != nil {
+					trace.Warning("could not clean up after a failed verify export start", "disk", d.TargetDev, "port", port, "error", cerr, "output", out)
+				}
+			})
+		if err != nil {
 			return err
 		}
-		// Same rm -f-after-kill reasoning as stopCmd in copyAndCommit above:
-		// this string is also replayable from the interrupt-cleanup path
-		// after the inline call further down already runs it normally, and
-		// without removing the pidfile that replay could SIGKILL whatever
-		// unrelated process the OS has since reused the old PID for.
-		stopVerifyCmd := "kill -9 $(cat " + util.ShQuote(verifyPidFile) + ") || true; rm -f " + util.ShQuote(verifyPidFile)
 		stopMu.Lock()
 		targetStopCommands = append(targetStopCommands, stopVerifyCmd)
 		stopMu.Unlock()
@@ -4702,14 +4904,26 @@ func run(cfg syncConfig) (runErr error) {
 		verifyTargetPort := verifyPort
 		var stopVerifyBridgeCmd string
 		if bridgeCfg.Enabled() {
-			// A fourth contiguous block, right after the real verify
-			// export range above ([TargetNBDPort+2N, +3N)): this is
-			// [TargetNBDPort+3N, +4N) -- never collides with the
-			// regular/bridge/verify ranges regardless of which
-			// combination of -compress/-netbuffer/-verify is active.
-			verifyBridgePort := verifyPort + len(qcowDisks)
-			var err error
-			stopVerifyBridgeCmd, err = nbdbridge.StartRemote(ctx, targetSSHClient, "verify-"+cfg.TargetDomain+"-"+d.TargetDev, verifyBridgePort, verifyPort, bridgeCfg)
+			// From the allocator, like everything else on this side. This was
+			// a fourth contiguous block at [T+3N, +4N), chosen so it could not
+			// collide with the other three whatever combination of
+			// -compress/-netbuffer/-verify was active -- an arithmetic
+			// guarantee that only held while a block was reserved.
+			verifyBridgePort, err := bindOnFreePort(
+				fmt.Sprintf("verify nbd bridge for %s", d.TargetDev),
+				targetPortAlloc,
+				func(port int) error {
+					cmd, serr := nbdbridge.StartRemote(ctx, targetSSHClient, "verify-"+cfg.TargetDomain+"-"+d.TargetDev, port, verifyPort, bridgeCfg)
+					if serr != nil {
+						return serr
+					}
+					stopVerifyBridgeCmd = cmd
+					return nil
+				},
+				func(port int) {
+					// StartRemote cleans up its own orphan; see the copy
+					// bridge's identical note in copyAndCommit.
+				})
 			if err != nil {
 				return fmt.Errorf("start verify nbd bridge for %s: %w", d.TargetDev, err)
 			}
@@ -4982,7 +5196,7 @@ func run(cfg syncConfig) (runErr error) {
 		return err
 	}
 
-	syncDisk := func(i int, d disk.QcowDisk) (err error) {
+	syncDisk := func(d disk.QcowDisk) (err error) {
 		diskStart := time.Now()
 		var res diskPhase1Result
 		if cfg.PrometheusTextfile != "" {
@@ -4994,7 +5208,7 @@ func run(cfg syncConfig) (runErr error) {
 				recordDiskMetric(d, res.diskSize, res.writtenBytes, res.targetBridgeCounters, time.Since(diskStart))
 			}()
 		}
-		res, err = copyAndCommit(i, d)
+		res, err = copyAndCommit(d)
 		if err != nil {
 			return err
 		}
@@ -5011,7 +5225,7 @@ func run(cfg syncConfig) (runErr error) {
 			}
 		}
 		if cfg.Verify != "" {
-			return runVerify(i, d, res)
+			return runVerify(d, res)
 		}
 		trace.Info("disk sync complete", "disk", d.TargetDev, "elapsed", time.Since(diskStart).Round(time.Millisecond).String())
 		return nil
@@ -5028,12 +5242,12 @@ func run(cfg syncConfig) (runErr error) {
 	// from -- needs no barrier, no second job and no cross-disk coordination,
 	// so each disk copies and verifies in its own goroutine exactly as the
 	// suspend-based modes always have.
-	for i, d := range qcowDisks {
-		i, d := i, d
+	for _, d := range qcowDisks {
+		d := d
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := syncDisk(i, d); err != nil {
+			if err := syncDisk(d); err != nil {
 				reportWorkerErr(err)
 			}
 		}()

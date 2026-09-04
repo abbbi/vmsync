@@ -311,25 +311,29 @@ func TestRefuseReinitIfTargetRunning(t *testing.T) {
 	}
 }
 
-// TestTargetPortsNeeded pins the reservation against the offsets the rest
-// of this file actually binds at. The two must agree exactly: reserve too
-// few and a run binds outside the range it was allocated, colliding with
-// whatever else the operator put there; reserve too many and a range that
-// should fit is rejected.
+// TestTargetPortsNeeded pins the count against what a run actually BINDS.
 //
-// The layout is four blocks of N at fixed offsets -- exports [T, +N),
-// their bridges [+N, +2N), verify exports [+2N, +3N), verify bridges
-// [+3N, +4N). The verify block sits at +2N whether or not bridging is on
-// (see runVerify's own comment for why it must not depend on the write
-// export's port), so verification alone still reserves through 3N with the
-// bridge block left idle.
+// The expectations changed when the fixed-offset layout went away, and the
+// verify-without-bridging case is why. It used to assert 3N, mirroring a
+// layout that put the verify block at +2N whether or not bridging was on --
+// so a run reserved through 3N and bound 2N, holding the middle block idle.
+// The test was correct about the code and both were wrong about the need: a
+// four-disk -verify=qemu-img run with no compression demanded twelve
+// consecutive ports to use eight, and was refused on a fragmented range that
+// could have served it. Nothing reserves a block now (see
+// portalloc.Allocator: each export binds its own port), so the padding has no
+// layout left to mirror and the answer is the count.
+//
+// One port per disk for the write export, plus one per disk for its bridge
+// when bridging, plus one per disk for the verify export when verifying, plus
+// one per disk for the verify export's bridge when both.
 //
 // The integrity check, which is ON by default, is deliberately absent from
 // this function and so from this test: the pre-commit check exports over a
-// Unix socket and the digest-based -verify reuses the verify export at +2N,
-// so neither costs a port. TestChecksumCheckCostsNoPorts below states that
-// as its own assertion, so that adding a port to either path fails a test
-// rather than quietly widening every run's reservation.
+// Unix socket and the digest-based -verify reuses the verify export already
+// counted. Neither costs a port. TestChecksumCheckCostsNoPorts below states
+// that as its own assertion, so that adding a port to either path fails a
+// test rather than quietly costing every run more ports.
 func TestTargetPortsNeeded(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -340,9 +344,10 @@ func TestTargetPortsNeeded(t *testing.T) {
 	}{
 		{name: "plain sync, one disk", disks: 1, want: 1},
 		{name: "plain sync, three disks", disks: 3, want: 3},
-		{name: "bridged sync reserves the bridge block too", disks: 3, bridging: true, want: 6},
-		{name: "verify without bridging still reaches +3N", disks: 3, verify: true, want: 9},
-		{name: "verify with bridging reserves all four blocks", disks: 3, bridging: true, verify: true, want: 12},
+		{name: "bridging adds one port per disk", disks: 3, bridging: true, want: 6},
+		// The case the padding was in: two exports per disk, not three.
+		{name: "verify without bridging binds two per disk", disks: 3, verify: true, want: 6},
+		{name: "verify with bridging binds four per disk", disks: 3, bridging: true, verify: true, want: 12},
 		{name: "single disk, everything on", disks: 1, bridging: true, verify: true, want: 4},
 	}
 	for _, tc := range cases {
@@ -354,16 +359,33 @@ func TestTargetPortsNeeded(t *testing.T) {
 		})
 	}
 
-	// The highest offset any code path binds at is base+4N-1, so the
-	// reservation for a fully-enabled run must cover exactly that and no
-	// more -- a direct restatement of the invariant, independent of the
-	// table above.
+	// The same invariant stated independently of the table, and restated for
+	// the new model: the total must be the sum of the per-stage counts, each
+	// of which is one port per disk. It used to check the total against the
+	// highest offset a code path bound at (base+4N-1), which was the right
+	// check for a contiguous layout and is meaningless without one -- and it
+	// passed while the 3N padding was in place, because that case is not
+	// fully-enabled.
 	const disks = 4
-	need := targetPortsNeeded(disks, true, true)
-	highestBound := 4*disks - 1
-	if need != highestBound+1 {
-		t.Errorf("targetPortsNeeded(%d, true, true) = %d, but the highest offset bound is base+%d, so %d ports are required",
-			disks, need, highestBound, highestBound+1)
+	if got, want := targetPortsNeeded(disks, false, false), disks; got != want {
+		t.Errorf("plain: got %d, want %d (write export only)", got, want)
+	}
+	if got, want := targetPortsNeeded(disks, true, false), 2*disks; got != want {
+		t.Errorf("bridging: got %d, want %d (write export + bridge)", got, want)
+	}
+	if got, want := targetPortsNeeded(disks, false, true), 2*disks; got != want {
+		t.Errorf("verifying: got %d, want %d (write export + verify export, with NO bridge block in between)", got, want)
+	}
+	if got, want := targetPortsNeeded(disks, true, true), 4*disks; got != want {
+		t.Errorf("both: got %d, want %d (write export + bridge + verify export + verify bridge)", got, want)
+	}
+	// Each stage costs exactly one port per disk, so the increments must be
+	// equal. A stage that ever costs two would break this without any single
+	// case above having to be updated.
+	plain := targetPortsNeeded(disks, false, false)
+	if bridged, verified := targetPortsNeeded(disks, true, false), targetPortsNeeded(disks, false, true); bridged-plain != verified-plain {
+		t.Errorf("bridging costs %d extra ports and verifying costs %d; each stage should cost one per disk",
+			bridged-plain, verified-plain)
 	}
 }
 
@@ -399,7 +421,10 @@ func TestChecksumCheckCostsNoPorts(t *testing.T) {
 			case tc.verify && tc.bridging:
 				want = 4 * disks
 			case tc.verify:
-				want = 3 * disks
+				// Two per disk, not three: the write export and the verify
+				// export, with nothing held between them. See
+				// TestTargetPortsNeeded for why this used to be 3N.
+				want = 2 * disks
 			case tc.bridging:
 				want = 2 * disks
 			}

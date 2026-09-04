@@ -15,21 +15,30 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Package portalloc picks the base TCP port a sync's NBD exports occupy,
-// either from an explicit number the caller gave or by finding a free
-// contiguous block inside a range.
+// Package portalloc decides which TCP ports a sync's NBD exports occupy.
 //
-// vmsync derives every port in a run from a single base: the target side
-// uses [base, base+N) for N disk exports and [base+N, base+2N) for their
-// bridge helpers, and the source side uses base and base+1. So choosing a
-// port only ever means choosing that base -- all the offset arithmetic in
-// cmd/vmsync is unchanged by this package's existence.
+// There are two mechanisms here, and they exist at once because they are being
+// migrated between.
 //
-// Everything here is pure: the caller is responsible for asking the host
-// which ports are already listening (over SSH, or locally) and handing the
-// result in. That keeps the actual decision -- which block to take --
-// directly testable without a live host, which matters because getting it
-// wrong means two concurrent syncs silently fight over the same ports.
+// Allocator is the one to use. It hands out candidate ports and nothing more:
+// the caller tries to BIND each one and takes the next on failure, so the bind
+// itself is the reservation. That is the only approach that can be correct,
+// because a run's ports are bound at very different times -- the write exports
+// during setup, the verify exports only once the copy has finished -- and any
+// scheme that decides the whole layout up front is deciding it against a
+// picture of the host that is stale long before the last port is taken.
+//
+// SelectBase is the older mechanism: probe the host for listening ports, then
+// reserve a contiguous block. It is still used for the SOURCE side and will go
+// when that moves over. Its problem is structural rather than a bug — see
+// Allocator's own comment — and it also demanded contiguity, so a four-disk
+// run needed a twelve-port consecutive span where eight ports anywhere would
+// have done.
+//
+// Everything here is pure. Binding, probing and talking to hosts belong to the
+// caller, which keeps the decisions directly testable without a live host --
+// and getting them wrong means two concurrent syncs silently fighting over the
+// same ports.
 package portalloc
 
 import (
@@ -37,6 +46,7 @@ import (
 	"hash/fnv"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // The DEFAULT ranges -- what a run uses when nothing is passed at all.
@@ -226,6 +236,114 @@ func countUsedIn(used map[int]bool, spec Spec) int {
 	}
 	return n
 }
+
+// Allocator hands out candidate ports for one side of one run, and is the
+// replacement for reserving a contiguous block up front.
+//
+// The block scheme it replaces asked the host which ports were listening and
+// then trusted that answer for the rest of the run. It could not be made
+// correct: a run's ports are bound at wildly different times -- the write
+// exports during setup, the verify exports only after the copy finishes, so
+// minutes or hours later -- and for that whole window they are not listening.
+// A second run probing then sees them free and picks an overlapping block.
+// Widening the range lowered the odds and changed nothing else.
+//
+// So nothing is reserved and nothing is probed. A caller takes a candidate,
+// tries to BIND it, and on failure takes the next one. The bind is the
+// reservation, which makes the OS the arbiter -- the only authority that
+// cannot be stale, and one that also covers a port held by something that is
+// not vmsync at all, which no amount of vmsync-side bookkeeping could.
+//
+// Two consequences worth knowing. Ports are no longer CONTIGUOUS, so a
+// four-disk run needs eight ports somewhere in the range rather than a
+// twelve-port consecutive span -- strictly more robust under fragmentation.
+// And ports are no longer DERIVABLE from a base: each export records what it
+// actually bound, which is what the "port in use" log lines report.
+//
+// Safe for concurrent use: a run's per-disk goroutines share one Allocator,
+// and it is what stops two exports IN THE SAME RUN being handed the same
+// port. Cross-run collisions need no coordination at all -- one of the two
+// binds fails and moves on.
+type Allocator struct {
+	mu   sync.Mutex
+	next int
+	// candidates is the full ordered list, computed once.
+	candidates []int
+	handedOut  int
+}
+
+// NewAllocator returns an Allocator over spec's ports.
+//
+// For a range, the order starts at start%span and wraps. The caller chooses
+// that offset -- vmsync picks it at RANDOM per run -- and it is a parameter
+// rather than something computed here so this package stays pure and its
+// tests stay deterministic.
+//
+// Random rather than derived from the vm's name, which is what it used to be.
+// The point is not collision probability: a collision is handled, since the
+// caller simply binds the next candidate. The point is that a DERIVED offset
+// makes a vm permanently unlucky. If FNV(domain)%span happens to land where
+// some unrelated long-lived service sits, that vm starts there on every run
+// for the life of the deployment and pays the same wasted attempts each time.
+// A random start makes that a one-off rather than a property of the name.
+//
+// What it costs is run-to-run port stability, which was the original argument
+// for deriving it. That argument was weak: every port a run binds is logged as
+// it is bound, so a firewall log is read against what happened rather than
+// against what a hash predicted -- and vmsync logs the starting offset too, so
+// a run remains reproducible from its own log.
+//
+// For a FIXED spec the order is fixed, fixed+1, ... up to 65535. That matches
+// what a fixed spec has always meant in practice: the old scheme returned it
+// as a BASE and then derived base+1, base+2 ... from it, so "pinned" was
+// already a span rather than a single port. The difference now is that a busy
+// port inside that span is skipped instead of failing the run. Callers bound
+// how far it can wander by capping their attempts.
+func NewAllocator(spec Spec, start uint32) *Allocator {
+	var candidates []int
+	if spec.IsFixed() {
+		for p := spec.Fixed; p <= 65535; p++ {
+			candidates = append(candidates, p)
+		}
+	} else {
+		span := spec.High - spec.Low + 1
+		from := int(start % uint32(span))
+		for i := 0; i < span; i++ {
+			candidates = append(candidates, spec.Low+(from+i)%span)
+		}
+	}
+	return &Allocator{candidates: candidates}
+}
+
+// Next returns the next untried candidate port, and false when the range is
+// exhausted.
+//
+// Every call returns a port no previous call returned, which is the property
+// that keeps one run's own exports off each other's ports without any of them
+// knowing how many others there are.
+func (a *Allocator) Next() (int, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.next >= len(a.candidates) {
+		return 0, false
+	}
+	p := a.candidates[a.next]
+	a.next++
+	a.handedOut++
+	return p, true
+}
+
+// HandedOut is how many candidates have been taken, for the "your range is
+// too small" diagnosis: it is the difference between a run that wanted more
+// ports than the range holds and one whose ports were all genuinely busy.
+func (a *Allocator) HandedOut() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.handedOut
+}
+
+// Span is how many ports this Allocator can ever hand out.
+func (a *Allocator) Span() int { return len(a.candidates) }
 
 // Skew turns a stable identifier (vmsync passes the target domain name)
 // into the search offset SelectBase starts from. Any hash would do; FNV-1a

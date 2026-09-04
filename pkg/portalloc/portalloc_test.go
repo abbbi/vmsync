@@ -19,6 +19,7 @@ package portalloc
 
 import (
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -319,5 +320,157 @@ func TestDefaultSpecsMatchTheirRanges(t *testing.T) {
 				t.Errorf(`"auto" resolved to %v but the default resolves to %v -- they must be identical`, viaAuto, got)
 			}
 		})
+	}
+}
+
+// The Allocator's one job: never hand the same port to two callers.
+//
+// That is what keeps ONE run's own exports off each other's ports. Two
+// exports handed the same candidate would have the second fail to bind
+// against its own sibling and retry for no reason -- and with enough disks
+// they would chase each other up the range. Cross-RUN collisions need no such
+// property, because there the bind failing is the whole mechanism.
+func TestAllocatorNeverRepeatsAPort(t *testing.T) {
+	spec, err := ParseSpec("20000-20009", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := NewAllocator(spec, Skew("web01"))
+
+	seen := map[int]bool{}
+	for {
+		p, ok := a.Next()
+		if !ok {
+			break
+		}
+		if seen[p] {
+			t.Fatalf("port %d handed out twice", p)
+		}
+		if p < 20000 || p > 20009 {
+			t.Fatalf("port %d is outside the range 20000-20009", p)
+		}
+		seen[p] = true
+	}
+	if len(seen) != 10 {
+		t.Errorf("handed out %d distinct ports, want all 10 in the range", len(seen))
+	}
+	if a.Span() != 10 {
+		t.Errorf("Span() = %d, want 10", a.Span())
+	}
+}
+
+// Concurrent callers must see the same guarantee: the per-disk goroutines all
+// take from one Allocator at once.
+func TestAllocatorIsSafeUnderConcurrency(t *testing.T) {
+	spec, err := ParseSpec("30000-30099", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := NewAllocator(spec, Skew("db01"))
+
+	const goroutines = 20
+	got := make(chan int, 100)
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				p, ok := a.Next()
+				if !ok {
+					return
+				}
+				got <- p
+			}
+		}()
+	}
+	wg.Wait()
+	close(got)
+
+	seen := map[int]bool{}
+	for p := range got {
+		if seen[p] {
+			t.Errorf("port %d handed to two goroutines", p)
+		}
+		seen[p] = true
+	}
+	if len(seen) != 100 {
+		t.Errorf("got %d distinct ports across %d goroutines, want 100", len(seen), goroutines)
+	}
+}
+
+// A fixed spec still yields a usable span, because that is what it has always
+// meant: the old scheme returned it as a BASE and derived base+1, base+2 ...
+// from it, so a multi-disk run on a pinned port already used a span. If a
+// fixed spec yielded one candidate, a two-disk run could not start at all.
+func TestAllocatorFixedSpecCountsUpwards(t *testing.T) {
+	spec, err := ParseSpec("20809", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := NewAllocator(spec, Skew("web01"))
+	for _, want := range []int{20809, 20810, 20811} {
+		got, ok := a.Next()
+		if !ok {
+			t.Fatalf("a fixed spec ran out of candidates at %d", want)
+		}
+		if got != want {
+			t.Errorf("got port %d, want %d -- a fixed spec must start AT the pinned port and count up", got, want)
+		}
+	}
+}
+
+// It must stop at 65535 rather than proposing a port that cannot exist.
+//
+// This is F7's overflow, and it stops being a special case to guard: the
+// iterator simply runs out. The old SelectBase computed spec.Fixed+need-1 and
+// could return something above 65535 for a high pinned base.
+func TestAllocatorFixedSpecStopsAt65535(t *testing.T) {
+	spec, err := ParseSpec("65534", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := NewAllocator(spec, Skew("web01"))
+	var ports []int
+	for {
+		p, ok := a.Next()
+		if !ok {
+			break
+		}
+		ports = append(ports, p)
+	}
+	if len(ports) != 2 || ports[0] != 65534 || ports[1] != 65535 {
+		t.Errorf("got %v, want exactly [65534 65535] -- nothing above 65535 may be proposed", ports)
+	}
+}
+
+// Skew decides where a range STARTS, so two vms tend to begin apart. No
+// longer a correctness property (the bind decides), but it is why a given vm
+// keeps landing on roughly the same ports, which is what makes a firewall log
+// readable.
+func TestAllocatorSkewMovesTheStartingPoint(t *testing.T) {
+	spec, err := ParseSpec("20000-20099", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := func(id string) int {
+		p, ok := NewAllocator(spec, Skew(id)).Next()
+		if !ok {
+			t.Fatalf("no candidates for %q", id)
+		}
+		return p
+	}
+	// Same id, same answer -- the stability that makes it worth having.
+	if a, b := first("web01"), first("web01"); a != b {
+		t.Errorf("the same vm started at %d then %d; the choice must be reproducible", a, b)
+	}
+	// Different ids should generally differ. Not guaranteed for any specific
+	// pair, so this asserts the population rather than a single collision.
+	starts := map[int]bool{}
+	for _, id := range []string{"web01", "db01", "mail01", "app01", "dns01", "ldap01", "ci01", "nfs01"} {
+		starts[first(id)] = true
+	}
+	if len(starts) < 4 {
+		t.Errorf("8 vms produced only %d distinct starting ports; the skew is not spreading them", len(starts))
 	}
 }
