@@ -4050,8 +4050,15 @@ func run(cfg syncConfig) (runErr error) {
 			}
 		}()
 
+		// Recorded in the same breath as the ports, because an operator
+		// correlating this run against a host's sockets needs to know this one
+		// occupies NO port: the check is a local read on the target, so it
+		// speaks over a Unix socket and is structurally immune to the port
+		// contention every other export is exposed to. Without the line its
+		// absence from the port log reads as an omission.
 		trace.Info("checksum: asking the target to hash what this run wrote",
-			"disk", d.TargetDev, "image", imagePath, "blocks", len(sourceDigests),
+			"disk", d.TargetDev, "image", imagePath, "socket", sockPath,
+			"blocks", len(sourceDigests),
 			"bytes", blockdigest.TotalBytes(sourceDigests), "algo", blockdigest.DefaultAlgo)
 		targetBlocks, err := askTargetDigests(d.TargetDev, sockPath, exportName, sourceDigests)
 		if err != nil {
@@ -4670,6 +4677,19 @@ func run(cfg syncConfig) (runErr error) {
 		if err := nbdsync.WaitForTCPExport(targetNBDHost, verifyPort, verifyExportName, 10*time.Second); err != nil {
 			return fmt.Errorf("verify: wait for read-only export %s:%d: %w", targetNBDHost, verifyPort, err)
 		}
+		// Logged like every other port this run occupies, and it was the one
+		// omission: the verify BRIDGE had a line, the export it fronts did
+		// not. That made the least traceable port the one most worth tracing.
+		// Every other port is bound during setup, within seconds of the
+		// layout being decided; this one is bound after the copy finishes, so
+		// it sits unclaimed for the whole run and is the likeliest to have
+		// been taken by something else in the meantime.
+		//
+		// After WaitForTCPExport rather than after the start command, so the
+		// line means "this port is serving" rather than "this port was asked
+		// for".
+		trace.Info("target nbd port in use", "side", "target", "kind", "verify_export",
+			"disk", d.TargetDev, "host", targetNBDHost, "port", verifyPort, "export", verifyExportName)
 
 		// Default to the direct, unbridged path against the read-only
 		// export itself; overridden below when --compress/--netbuffer
