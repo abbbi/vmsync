@@ -286,8 +286,8 @@ type syncConfig struct {
 	TargetNBDBind  string
 
 	// SourceNBDPortSpec/TargetNBDPortSpec hold the raw -source-nbd-port /
-	// -target-nbd-port flag values, which accept a fixed port, a range, or
-	// "auto" (see portalloc.ParseSpec). SourceNBDPort/TargetNBDPort are the
+	// -target-nbd-port flag values, which accept a range or one fixed port and
+	// DEFAULT to a range (see portalloc.ParseSpec). SourceNBDPort/TargetNBDPort are the
 	// resolved base ports, filled in by run() once the disk count and
 	// bridge/verify settings are known -- every other port in the run is
 	// derived from them by offset.
@@ -432,10 +432,10 @@ func main() {
 	flag.StringVar(&cfg.TargetDomain, "target-domain", "", "target domain name (defaults to --source-domain)")
 	flag.StringVar(&cfg.TargetDiskPath, "target-disk-path", "", "target disk path for changed location")
 	flag.StringVar(&cfg.SourceNBDBind, "source-nbd-bind", "0.0.0.0", "source bind address for libvirt backup NBD TCP export")
-	flag.StringVar(&cfg.SourceNBDPortSpec, "source-nbd-port", "10809", fmt.Sprintf("Source TCP port for the libvirt backup NBD export. A fixed port (10809), a range to pick a free block from (%d-%d), or \"auto\" for the default range %d-%d. A run needs 1 port here, or 2 when -compress/-netbuffer is set", portalloc.DefaultSourceAutoLow, portalloc.DefaultSourceAutoHigh, portalloc.DefaultSourceAutoLow, portalloc.DefaultSourceAutoHigh))
+	flag.StringVar(&cfg.SourceNBDPortSpec, "source-nbd-port", portalloc.DefaultSourceSpec, fmt.Sprintf("Source TCP port range for the libvirt backup NBD export: a free block is chosen inside it, so two concurrent runs do not collide without anyone having to configure anything. Defaults to %s. Pass one port instead (10809) to pin it exactly, which is worth doing only for a firewall that cannot open a range. A run needs 1 port here, or 2 when -compress/-netbuffer is set", portalloc.DefaultSourceSpec))
 	flag.StringVar(&cfg.SourceNBDHost, "source-nbd-host", "", "source host to connect for NBD reads (defaults from --source-uri)")
 	flag.StringVar(&cfg.TargetNBDBind, "target-nbd-bind", "0.0.0.0", "target bind address for qemu-nbd TCP export")
-	flag.StringVar(&cfg.TargetNBDPortSpec, "target-nbd-port", "20809", fmt.Sprintf("Target base TCP port for the qemu-nbd exports. A fixed port (20809), a range to pick a free block from (%d-%d), or \"auto\" for the default range %d-%d. A run needs N consecutive ports for N disks, 2N with -compress/-netbuffer, 3N with -verify, 4N with both", portalloc.DefaultTargetAutoLow, portalloc.DefaultTargetAutoHigh, portalloc.DefaultTargetAutoLow, portalloc.DefaultTargetAutoHigh))
+	flag.StringVar(&cfg.TargetNBDPortSpec, "target-nbd-port", portalloc.DefaultTargetSpec, fmt.Sprintf("Target base TCP port range for the qemu-nbd exports: a free block is chosen inside it, so two concurrent runs do not collide without anyone having to configure anything. Defaults to %s. Pass one port instead (20809) to pin it exactly, which is worth doing only for a firewall that cannot open a range. A run needs N consecutive ports for N disks, 2N with -compress/-netbuffer, 3N with -verify, 4N with both -- so the default range holds 50 concurrent single-disk replicas", portalloc.DefaultTargetSpec))
 	flag.StringVar(&cfg.TargetNBDHost, "target-nbd-host", "", "target host to connect for NBD writes (defaults from --target-uri)")
 	flag.StringVar(&cfg.SSHUser, "ssh-user", "", "ssh user for remote command execution (defaults from URI user, then ~/.ssh/config's User, then root)")
 	flag.StringVar(&cfg.SSHKey, "ssh-key", "", "private key path for ssh authentication (defaults from ~/.ssh/config's IdentityFile)")

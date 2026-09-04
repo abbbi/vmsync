@@ -39,14 +39,39 @@ import (
 	"strings"
 )
 
-// Default ranges used by the "auto" keyword, anchored at the historical
-// fixed defaults so firewall guidance stays recognizable: a host already
-// allowing 10809/20809 only needs the range widened, not moved.
+// The DEFAULT ranges -- what a run uses when nothing is passed at all.
+//
+// Anchored at the historical fixed defaults so firewall guidance stays
+// recognizable: a host already allowing 10809/20809 only needs the range
+// widened, not moved.
+//
+// These used to be reachable only by typing "auto", with the default being
+// the single fixed port. That was the wrong way round. A range costs nothing
+// when one run is active and is the difference between working and colliding
+// when two are, so it is what an operator who has not thought about ports
+// should get -- and an operator who HAS thought about them can still pin one.
+// Nothing in an agent-managed estate ever set a port range (no preset, no form
+// field, no handler), so every VM took the fixed port and any two concurrent
+// syncs to one target host shared every port.
+//
+// Sized in the unit that actually matters, which is ports per DISK on the
+// target: a run takes 4 per disk with -verify and -compress together (3 with
+// verify alone, 2 with bridging alone, 1 plain). 200 target ports is therefore
+// 50 concurrent single-disk replicas, or 12 four-disk ones. The source side is
+// per RUN rather than per disk -- 1 port, 2 with a bridge -- so 100 is already
+// far more than an estate can use.
 const (
 	DefaultSourceAutoLow  = 10809
 	DefaultSourceAutoHigh = 10908
 	DefaultTargetAutoLow  = 20809
 	DefaultTargetAutoHigh = 21008
+)
+
+// DefaultSourceSpec and DefaultTargetSpec are the flag defaults, as strings,
+// so the CLI default and the range above cannot drift apart.
+var (
+	DefaultSourceSpec = fmt.Sprintf("%d-%d", DefaultSourceAutoLow, DefaultSourceAutoHigh)
+	DefaultTargetSpec = fmt.Sprintf("%d-%d", DefaultTargetAutoLow, DefaultTargetAutoHigh)
 )
 
 // Spec is a parsed -source-nbd-port / -target-nbd-port value: either one
@@ -69,22 +94,36 @@ func (s Spec) String() string {
 	return fmt.Sprintf("%d-%d", s.Low, s.High)
 }
 
-// ParseSpec parses a port flag value. Three accepted forms:
+// ParseSpec parses a port flag value. Two accepted forms:
 //
-//	"20809"        one fixed base port -- the historical behavior
 //	"20000-20100"  choose a free contiguous block inside this range
-//	"auto"         choose inside [defLow, defHigh]
+//	"20809"        pin one exact base port
 //
 // The overloading is deliberate rather than a separate -port-range flag:
 // the source export and the target exports live on different hosts with
 // different firewall policies, so a range belongs per side, and this CLI
 // already overloads -compress, -verify and -netbuffer the same way.
+//
+// There used to be a third form, the keyword "auto", meaning "choose inside
+// [defLow, defHigh]". It is gone because the default became a range: "auto"
+// then meant precisely what passing nothing means, and a keyword whose only
+// effect is to restate the default is a thing to explain rather than a thing
+// to use. An empty value is still an error rather than silently defaulting --
+// the flag has a default, so an empty string reaching here means a caller
+// built one, which is a bug worth surfacing rather than papering over.
+//
+// defLow/defHigh are still parameters because callers pass the side-specific
+// range and the error text quotes it; they are no longer selected by a
+// keyword.
 func ParseSpec(value string, defLow, defHigh int) (Spec, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return Spec{}, fmt.Errorf("port specification is empty: give a port (20809), a range (20000-20100), or \"auto\"")
+		return Spec{}, fmt.Errorf("port specification is empty: give a range (%d-%d) or one fixed port (%d)", defLow, defHigh, defLow)
 	}
 
+	// Accepted for one release, so a config or unit file carrying "auto" does
+	// not fail closed on upgrade. It now resolves to the same range the
+	// default does, which is what it always meant.
 	if strings.EqualFold(value, "auto") {
 		return newRange(defLow, defHigh, value)
 	}

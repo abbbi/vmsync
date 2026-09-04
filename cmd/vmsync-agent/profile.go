@@ -136,7 +136,9 @@ type SyncProfile struct {
 	// pair -- so it is validated below rather than discovered at 3am.
 	Retention string `json:"retention,omitempty"`
 	// SourcePortRange/TargetPortRange are passed to vmsync's own port
-	// selection: a fixed port, a range, or "auto".
+	// selection: a range, or one fixed port to pin it. Both default to a
+	// range, so leaving these empty is the correct choice for almost every
+	// profile -- see pkg/portalloc.
 	SourcePortRange string `json:"source_port_range,omitempty"`
 	TargetPortRange string `json:"target_port_range,omitempty"`
 }

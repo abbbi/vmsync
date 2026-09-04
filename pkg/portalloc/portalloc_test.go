@@ -280,3 +280,44 @@ func TestSpecString(t *testing.T) {
 		t.Errorf("Spec{20000,20100}.String() = %q, want \"20000-20100\"", got)
 	}
 }
+
+// The flag default and the range behind it must be the same thing.
+//
+// They are now two expressions of one fact -- DefaultTargetSpec is a string
+// for flag.StringVar, DefaultTargetAutoLow/High are ints for the search --
+// and a default that drifted from its own range would be invisible: every run
+// would work, and the only symptom would be ports outside the range an
+// operator opened in their firewall.
+func TestDefaultSpecsMatchTheirRanges(t *testing.T) {
+	for _, c := range []struct {
+		what      string
+		spec      string
+		low, high int
+	}{
+		{"source", DefaultSourceSpec, DefaultSourceAutoLow, DefaultSourceAutoHigh},
+		{"target", DefaultTargetSpec, DefaultTargetAutoLow, DefaultTargetAutoHigh},
+	} {
+		t.Run(c.what, func(t *testing.T) {
+			got, err := ParseSpec(c.spec, c.low, c.high)
+			if err != nil {
+				t.Fatalf("the built-in default %q does not parse: %v", c.spec, err)
+			}
+			if got.IsFixed() {
+				t.Fatalf("the default %q parsed as a FIXED port -- two concurrent runs would both take it, which is the whole thing defaulting to a range fixes", c.spec)
+			}
+			if got.Low != c.low || got.High != c.high {
+				t.Errorf("default %q parsed to %d-%d, want %d-%d", c.spec, got.Low, got.High, c.low, c.high)
+			}
+			// The retired keyword must resolve to exactly the same thing, or a
+			// unit file carrying "auto" would quietly get different ports from
+			// one that passes nothing.
+			viaAuto, err := ParseSpec("auto", c.low, c.high)
+			if err != nil {
+				t.Fatalf(`ParseSpec("auto") should still be accepted for compatibility: %v`, err)
+			}
+			if viaAuto != got {
+				t.Errorf(`"auto" resolved to %v but the default resolves to %v -- they must be identical`, viaAuto, got)
+			}
+		})
+	}
+}
