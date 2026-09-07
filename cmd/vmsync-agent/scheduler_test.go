@@ -187,3 +187,95 @@ func TestClassifyRunResult(t *testing.T) {
 		})
 	}
 }
+
+// verifyDue decides which syncs also carry -verify, and the cases below are
+// the ones that make it worth having rather than a plain interval.
+func TestVerifyDue(t *testing.T) {
+	s := &Scheduler{nextVerify: map[string]time.Time{}}
+	now := time.Unix(1_800_000_000, 0)
+
+	t.Run("no verify mode means never, whatever the cadence says", func(t *testing.T) {
+		// A cadence for something the profile does not do. The UI refuses this
+		// combination, but the agent must not depend on that: a standalone
+		// schedule file has no UI in front of it.
+		e := ScheduleEntry{VM: "web01", VerifyIntervalSeconds: 3600}
+		if s.verifyDue(e, now) {
+			t.Error("verifyDue = true with no verify mode; there is nothing to run")
+		}
+	})
+
+	t.Run("no cadence means every sync, which is the old behaviour", func(t *testing.T) {
+		// The default has to stay what it was: a profile that named a verify
+		// mode verified on every run, and an estate upgrading must not
+		// silently start verifying less often than it used to.
+		e := ScheduleEntry{VM: "web01", Profile: SyncProfile{Verify: "fast"}}
+		for i := 0; i < 3; i++ {
+			if !s.verifyDue(e, now.Add(time.Duration(i)*time.Minute)) {
+				t.Errorf("run %d did not verify; interval 0 must mean every sync", i)
+			}
+		}
+	})
+
+	t.Run("the first sighting does not verify, then the cadence holds", func(t *testing.T) {
+		s := &Scheduler{nextVerify: map[string]time.Time{}}
+		e := ScheduleEntry{VM: "db01", Profile: SyncProfile{Verify: "fast"}, VerifyIntervalSeconds: 3600}
+
+		// Not on first sight: an agent restart would otherwise verify every
+		// VM it manages at once, which is the burst the stagger exists to
+		// avoid. Skipping one cycle costs at most one interval.
+		if s.verifyDue(e, now) {
+			t.Error("verified on the first sighting; a restart would verify the whole estate at once")
+		}
+		// Still not due a minute later.
+		if s.verifyDue(e, now.Add(time.Minute)) {
+			t.Error("verified a minute after being scheduled an hour out")
+		}
+		// Due once the interval has passed. The stagger is under an hour by
+		// construction (it is interval-modulo), so two hours is past it.
+		if !s.verifyDue(e, now.Add(2*time.Hour)) {
+			t.Fatal("did not verify two hours into a one-hour cadence")
+		}
+		// And having verified, not again immediately.
+		if s.verifyDue(e, now.Add(2*time.Hour+time.Minute)) {
+			t.Error("verified twice within one interval")
+		}
+	})
+
+	t.Run("a long outage does not owe a backlog of verifies", func(t *testing.T) {
+		// Same rule markRunning follows for syncs: next is now+interval, not
+		// previous+interval. An agent down for a week must come back and
+		// verify once, not seven times.
+		s := &Scheduler{nextVerify: map[string]time.Time{}}
+		e := ScheduleEntry{VM: "db01", Profile: SyncProfile{Verify: "fast"}, VerifyIntervalSeconds: 86400}
+		s.verifyDue(e, now) // first sighting, schedules it
+		if !s.verifyDue(e, now.Add(7*24*time.Hour)) {
+			t.Fatal("did not verify after a week")
+		}
+		if s.verifyDue(e, now.Add(7*24*time.Hour+time.Hour)) {
+			t.Error("verified again an hour later; the missed days were owed as a backlog")
+		}
+	})
+
+	t.Run("different VMs are staggered rather than all due together", func(t *testing.T) {
+		// The point of the stagger. A 24h verify cadence across an estate
+		// would otherwise fall due within the same minute of the same night,
+		// queue against max_concurrent_syncs and the target's slots, and turn
+		// one pass into a multi-hour backlog.
+		s := &Scheduler{nextVerify: map[string]time.Time{}}
+		const interval = 24 * time.Hour
+		for _, vm := range []string{"web01", "db01", "mail01", "app01", "dns01", "ldap01"} {
+			s.verifyDue(ScheduleEntry{VM: vm, Profile: SyncProfile{Verify: "fast"},
+				VerifyIntervalSeconds: int(interval.Seconds())}, now)
+		}
+		seen := map[time.Time]bool{}
+		for _, at := range s.nextVerify {
+			seen[at] = true
+			if at.Before(now) || !at.Before(now.Add(interval)) {
+				t.Errorf("scheduled at %v, outside [now, now+interval)", at)
+			}
+		}
+		if len(seen) < 4 {
+			t.Errorf("6 VMs got %d distinct verify times; they are not being spread", len(seen))
+		}
+	})
+}

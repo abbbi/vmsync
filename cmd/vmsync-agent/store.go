@@ -83,6 +83,25 @@ type ScheduleEntry struct {
 	// 0 to inherit it. How long a guest takes to stop cleanly is a property
 	// of what it runs, not of the estate.
 	ShutdownTimeoutSec int `json:"shutdown_timeout_sec,omitempty"`
+	// VerifyIntervalSeconds is how often a sync of this VM should ALSO
+	// verify, 0 meaning "on every run, if Profile.Verify names a mode".
+	//
+	// Verification was otherwise all-or-nothing per pair: Profile.Verify is a
+	// profile field, so either every sync verified or none did -- and a verify
+	// is a full-image read on both sides. That left no way to express the
+	// thing an estate actually wants, which is a short sync cadence and a slow
+	// verify cadence.
+	//
+	// It selects WHICH SYNCS ALSO VERIFY rather than describing a second
+	// schedule, and that is forced rather than chosen: -verify compares the
+	// target against the backup job's export the copy read from, so it is a
+	// phase of a sync and a verify-only run does not exist. The scheduler
+	// keeps a second due-time per VM (nextVerify) and turns Verify on for the
+	// next sync falling due after it -- no new run type, no extra run lock,
+	// and the verify lands on a sync that was happening anyway.
+	//
+	// Requires Profile.Verify to name a mode: this says how often, not what.
+	VerifyIntervalSeconds int `json:"verify_interval_seconds,omitempty"`
 }
 
 // UIConfig is the configuration the UI hands out.

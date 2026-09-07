@@ -131,23 +131,28 @@ type Scheduler struct {
 	// between two binaries and must not become configurable in production.
 	lockDir string
 
-	mu       sync.Mutex
-	nextRun  map[string]time.Time
-	inFlight map[string]bool // by VM
-	hostLoad map[string]int  // concurrent syncs INTO each target host
-	metrics  *agentMetrics   // nil is safe: every call is nil-guarded
-	results  []SyncResult
+	mu      sync.Mutex
+	nextRun map[string]time.Time
+	// nextVerify is the second due-time: when this VM's next sync should
+	// ALSO carry -verify. Separate from nextRun because the two cadences are
+	// independent -- minutes for the copy, hours or days for the read-back.
+	nextVerify map[string]time.Time
+	inFlight   map[string]bool // by VM
+	hostLoad   map[string]int  // concurrent syncs INTO each target host
+	metrics    *agentMetrics   // nil is safe: every call is nil-guarded
+	results    []SyncResult
 }
 
 func NewScheduler(lv *live, state *sharedState) *Scheduler {
 	return &Scheduler{
-		lv:       lv,
-		state:    state,
-		lockDir:  util.RunLockDir,
-		nextRun:  map[string]time.Time{},
-		inFlight: map[string]bool{},
-		hostLoad: map[string]int{},
-		metrics:  lv.get().metrics,
+		lv:         lv,
+		state:      state,
+		lockDir:    util.RunLockDir,
+		nextRun:    map[string]time.Time{},
+		nextVerify: map[string]time.Time{},
+		inFlight:   map[string]bool{},
+		hostLoad:   map[string]int{},
+		metrics:    lv.get().metrics,
 	}
 }
 
@@ -264,6 +269,28 @@ func (s *Scheduler) launchDue(ctx context.Context, wg *sync.WaitGroup) {
 			continue
 		}
 
+		// Whether THIS run also verifies, decided after admission so a run
+		// that never starts does not consume a verify slot -- the point of a
+		// verify cadence is that the read-back actually happened, and a
+		// claimed-but-skipped slot would push the next one a full interval
+		// away having verified nothing.
+		//
+		// Applied to req, NOT to entry. buildRequest above has already copied
+		// entry.Profile into the plan (see buildSyncRequest), and the plan is
+		// what becomes the command line -- so clearing it on entry here would
+		// be a silent no-op and every run would verify regardless of cadence.
+		// Both are local values, so neither mutation escapes this iteration.
+		if !s.verifyDue(entry, now) {
+			req.Profile.Verify = ""
+			// Kept in step so anything downstream reading the entry sees the
+			// same decision the command line got.
+			entry.Profile.Verify = ""
+		} else if entry.VerifyIntervalSeconds > 0 {
+			trace.Info("scheduled sync will also verify: its verify cadence has come due",
+				"vm", entry.VM, "mode", entry.Profile.Verify,
+				"verify_interval_seconds", entry.VerifyIntervalSeconds)
+		}
+
 		s.markRunning(entry, now)
 		wg.Add(1)
 		go func(entry ScheduleEntry, req syncPlan) {
@@ -296,6 +323,53 @@ func (s *Scheduler) due(entry ScheduleEntry, now time.Time) bool {
 		return false
 	}
 	return !now.Before(next)
+}
+
+// verifyDue reports whether the sync about to be launched should also verify,
+// and claims the slot if so.
+//
+// A second due-time rather than a second schedule, because -verify is a phase
+// of a sync and there is no verify-only run to schedule. So this does not
+// decide whether to run -- due() already did -- only whether THIS run carries
+// -verify.
+//
+// Zero means every run verifies, which is the behaviour before this existed
+// and stays the default: a profile that names a verify mode and no cadence
+// gets what it always got.
+//
+// Staggered on first sight exactly as nextRun is, and for a sharper reason.
+// Sync intervals are minutes, so a burst is survivable; verify intervals are
+// hours or days, so without a stagger every VM in an estate would fall due
+// within the same minute of the same night, queue against
+// max_concurrent_syncs and the target's slots, and turn one verify pass into
+// a multi-hour backlog. The offset is derived from the VM name, so it is
+// stable across restarts and a given VM keeps its slot in the night.
+//
+// The first sighting deliberately does NOT verify. An agent restarting would
+// otherwise verify everything it manages at once, which is the burst this
+// exists to avoid, and skipping one cycle costs at most one verify interval.
+func (s *Scheduler) verifyDue(entry ScheduleEntry, now time.Time) bool {
+	if entry.Profile.Verify == "" {
+		return false
+	}
+	interval := time.Duration(entry.VerifyIntervalSeconds) * time.Second
+	if interval <= 0 {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next, known := s.nextVerify[entry.VM]
+	if !known {
+		s.nextVerify[entry.VM] = now.Add(stagger("verify-"+entry.VM, interval))
+		return false
+	}
+	if now.Before(next) {
+		return false
+	}
+	// now+interval, not next+interval, for the same reason markRunning does
+	// it: an agent down for a week must not owe seven verifies.
+	s.nextVerify[entry.VM] = now.Add(interval)
+	return true
 }
 
 // foreignRunHolds reports whether a vmsync THIS agent did not start is still
