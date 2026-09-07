@@ -4186,6 +4186,7 @@ func run(cfg syncConfig) (runErr error) {
 			" -checksum -nbd " + util.ShQuote(nbdAddr) +
 			" -export " + util.ShQuote(exportName)
 
+		start := time.Now()
 		stdout, stderr, err := targetSSHClient.RunWithInput(ctx, helperCmd, request.Bytes())
 		if err != nil {
 			return nil, fmt.Errorf("checksum: run %s on the target for %s: %w%s -- pass -no-checksum to run without digest checks if the helper is not deployed there yet",
@@ -4199,6 +4200,42 @@ func run(cfg syncConfig) (runErr error) {
 		if err := respHeader.Check(header); err != nil {
 			return nil, fmt.Errorf("checksum: %s: %w", dev, err)
 		}
+
+		// The counterpart of nbdsync's "nbd digest complete", in the same
+		// fields so the two can be read against each other.
+		//
+		// Without this only the SOURCE's hashing pass was timed, which made
+		// the obvious question unanswerable: a digest verify runs both sides
+		// at once (that is what took a real pair from 45s to 27s), so the
+		// slower of the two IS the verify's cost -- and the log said what one
+		// of them took and nothing about the other.
+		//
+		// Logged after the response is parsed and its header checked, so a
+		// failed exchange cannot report a time for work that produced nothing
+		// usable.
+		//
+		// `elapsed` is the ROUND TRIP, not just the hashing: it includes the
+		// SSH command, the helper starting, and its NBD connect. Those are
+		// milliseconds against a hashing pass measured in seconds, so the
+		// comparison holds -- but a suspiciously slow target on a tiny delta
+		// is more likely to be SSH than storage, and the field is named to
+		// admit that rather than invite the wrong conclusion.
+		//
+		// `via` distinguishes the two callers without a parameter: a Unix
+		// socket path is the pre-commit check, 127.0.0.1:<port> is the verify
+		// pass. The pre-commit check had no completion timing at all before
+		// this, since its source-side hashing happens inside the copy and
+		// never had a line of its own.
+		elapsed := time.Since(start)
+		hashedBytes := blockdigest.TotalBytes(blocks)
+		mibPerSec := 0.0
+		if elapsed.Seconds() > 0 {
+			mibPerSec = (float64(hashedBytes) / (1024.0 * 1024.0)) / elapsed.Seconds()
+		}
+		trace.Info("checksum: target digest complete", "disk", dev, "via", nbdAddr,
+			"blocks", len(blocks), "bytes", hashedBytes, "algo", blockdigest.DefaultAlgo,
+			"elapsed", elapsed.Round(time.Millisecond).String(),
+			"mib_per_sec", fmt.Sprintf("%.2f", mibPerSec))
 		return blocks, nil
 	}
 
