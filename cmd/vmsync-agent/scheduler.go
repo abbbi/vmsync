@@ -137,6 +137,10 @@ type Scheduler struct {
 	// ALSO carry -verify. Separate from nextRun because the two cadences are
 	// independent -- minutes for the copy, hours or days for the read-back.
 	nextVerify map[string]time.Time
+	// syncable is the cached list of VMs a default template may cover, with
+	// the time it was taken. See syncableVMs.
+	syncable   []string
+	syncableAt time.Time
 	inFlight   map[string]bool // by VM
 	hostLoad   map[string]int  // concurrent syncs INTO each target host
 	metrics    *agentMetrics   // nil is safe: every call is nil-guarded
@@ -207,7 +211,21 @@ func (s *Scheduler) launchDue(ctx context.Context, wg *sync.WaitGroup) {
 	cached := s.state.get()
 	now := time.Now()
 
-	for _, entry := range cached.Config.Schedule {
+	// Templates resolved HERE, in the agent, because the agent is the only
+	// component present in every deployment -- a standalone agent reads a
+	// schedule file with no control plane at all. See
+	// docs/design/scheduling.md for why a UI-side resolver was the wrong
+	// answer, and why the agent reports its effective schedule back instead.
+	//
+	// syncableVMs is consulted only when a default template exists, so an
+	// estate not using templates pays no extra libvirt round trip.
+	var syncable []string
+	if _, hasDefault := cached.Config.Templates[DefaultTemplateName]; hasDefault {
+		syncable = s.syncableVMs(cfg, now)
+	}
+	schedule := ResolveSchedule(cached.Config.Schedule, cached.Config.Templates, syncable)
+
+	for _, entry := range schedule {
 		if !entry.Enabled || entry.IntervalSeconds <= 0 || entry.VM == "" {
 			continue
 		}

@@ -102,6 +102,13 @@ type ScheduleEntry struct {
 	//
 	// Requires Profile.Verify to name a mode: this says how often, not what.
 	VerifyIntervalSeconds int `json:"verify_interval_seconds,omitempty"`
+	// Template names the ScheduleTemplate this entry inherits unset fields
+	// from. Empty means DefaultTemplateName.
+	//
+	// The fields above are OVERRIDES once a template is in play: 0 or ""
+	// inherits. Enabled is the exception and is never inherited -- see
+	// resolveEntry.
+	Template string `json:"template,omitempty"`
 }
 
 // UIConfig is the configuration the UI hands out.
@@ -123,6 +130,13 @@ type UIConfig struct {
 
 	// Schedule is what this agent should sync, and how often.
 	Schedule []ScheduleEntry `json:"schedule,omitempty"`
+	// Templates are the named cadences entries inherit from, keyed by name.
+	// A template called "default" additionally covers every syncable VM with
+	// no entry of its own -- and its absence is the feature's off switch, so an
+	// estate upgrading does not silently begin syncing VMs nobody scheduled.
+	// Resolved by the agent (ResolveSchedule), never by the UI: see
+	// docs/design/scheduling.md.
+	Templates map[string]ScheduleTemplate `json:"templates,omitempty"`
 	// MaxConcurrentSyncs caps how many run at once on this host. Zero means
 	// the agent's own default; the agent also clamps this, since a UI is a
 	// separately-versioned program whose answers are input to validate.
