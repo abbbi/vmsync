@@ -1004,6 +1004,25 @@ func CompareTCP(ctx context.Context, aHost string, aPort int, aExport string, bH
 // CompareTCPCollect returns its findings as data instead.
 var ErrImagesDiffer = errors.New("images differ")
 
+// ErrExportUnreachable reports that an NBD export did not answer a handshake
+// at the address it was dialled on.
+//
+// Its own sentinel because of what a caller must NOT do about it. vmsync
+// exempts it from the consecutive-failure counter that drives
+// -reinit-after-failures, and the reasoning is that nothing this error can
+// mean is fixed by discarding the checkpoint chain and recopying: a firewall
+// between the hosts, a bind address that does not cover the route, a bridge
+// that is not relaying, an export that bound its port and then died. A forced
+// full resync addresses none of them, so counting it would climb the counter
+// until it triggered an expensive recopy that cannot help -- and a non-zero
+// failure_count blocks promotion in the meantime.
+//
+// Deliberately not narrowed to "firewall". A dial that gets no handshake
+// cannot distinguish unreachable from not-yet-serving from died-after-binding,
+// and inventing that distinction from a timeout would be a guess. What the
+// error says instead is what was actually observed, and lists the causes.
+var ErrExportUnreachable = errors.New("nbd export unreachable")
+
 // MismatchRange is a byte range where source and target bytes differed.
 // Deliberately distinct from Extent (which carries Dirty/allocation
 // semantics that don't apply here), so a caller can't accidentally conflate
@@ -1859,7 +1878,8 @@ func WaitForTCPExport(host string, port int, exportName string, timeout time.Dur
 		}
 		lastErr = err
 		if time.Now().After(deadline) {
-			return fmt.Errorf("nbd export %q not ready on %s:%d after %s: %w", exportName, host, port, timeout, lastErr)
+			return fmt.Errorf("%w: nbd export %q did not answer on %s:%d within %s -- nothing there completed an NBD handshake, so either it is not serving yet or this host cannot reach it (a firewall between the two, a bind address that does not cover this route, or a bridge that is not relaying). Last error: %v",
+				ErrExportUnreachable, exportName, host, port, timeout, lastErr)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

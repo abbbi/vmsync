@@ -986,9 +986,25 @@ func main() {
 		// on top of the "may be wrong" one that is the actual finding, and an
 		// operator reading the promotion assessment would see two problems
 		// where there is one. See ErrVerifyStateRefusesSync.
+		// An unreachable NBD export is exempt for a reason of its own, and it
+		// is the sharpest of the four: nothing this error can mean is fixed by
+		// what the counter would eventually force. A firewall between the
+		// hosts, a bind address that does not cover the route, a bridge that
+		// is not relaying, an export that bound its port and then died -- a
+		// forced full resync addresses none of them. So the count would climb
+		// until it triggered a full recopy that cannot help, and a non-zero
+		// failure_count blocks promotion the whole time it is climbing.
+		//
+		// Note this exempts the died-after-binding case too, which is a real
+		// broken-mechanism failure. That is deliberate rather than overlooked:
+		// a dial that gets no handshake cannot tell that apart from
+		// unreachable, and a reinit does not repair it either, so the
+		// exemption is right whichever cause it was. See
+		// nbdsync.ErrExportUnreachable.
 		if cfg.ReinitAfterFailures > 0 && !isVerifyMismatch(err) &&
 			!errors.Is(err, libvirtsync.ErrRoleRefusesSync) &&
-			!errors.Is(err, libvirtsync.ErrVerifyStateRefusesSync) {
+			!errors.Is(err, libvirtsync.ErrVerifyStateRefusesSync) &&
+			!errors.Is(err, nbdsync.ErrExportUnreachable) {
 			if count, rerr := libvirtsync.RecordTargetSyncFailure(cfg.TargetURI, cfg.TargetDomain); rerr != nil {
 				trace.Warning("failed to record sync failure in target metadata", "error", rerr)
 			} else {
@@ -4478,6 +4494,25 @@ func run(cfg syncConfig) (runErr error) {
 		res.diskStart = time.Now()
 
 		trace.Info("reading disk via libvirt backup NBD tcp export", "disk", d.TargetDev, "export", d.TargetDev)
+
+		// The SOURCE export gets a reachability probe too, which it never had.
+		//
+		// Both target-side probes existed in some form; this side had none at
+		// all, so an unreachable source export surfaced from inside
+		// ChangedExtentsTCP as whatever libnbd happened to say about a failed
+		// connect, at a point that reads as "the extent query broke" rather
+		// than "this host cannot reach the source". Same dial, same sentinel,
+		// same exemption from the failure counter.
+		//
+		// The export NAME is the disk's target device, which is how libvirt
+		// names the exports within one pull-backup job -- so this proves not
+		// merely that something is listening but that THIS disk's export is
+		// being served, which is the same reason WaitForTCPExport asks for a
+		// name rather than just dialling.
+		if err := nbdsync.WaitForTCPExport(effectiveSourceHost, effectiveSourcePort, d.TargetDev, 10*time.Second); err != nil {
+			return res, fmt.Errorf("source nbd export for %s is not reachable: %w", d.TargetDev, err)
+		}
+
 		var extents []nbdsync.Extent
 		var dirty uint64
 		extents, res.diskSize, dirty, err = nbdsync.ChangedExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, bitmapForRead, incrementalMode)
@@ -4716,10 +4751,34 @@ func run(cfg syncConfig) (runErr error) {
 			effectiveTargetPort = localPort
 			res.targetBridgeCounters = counters
 			trace.Info("target nbd port in use", "side", "target", "kind", "bridge_local", "disk", d.TargetDev, "host", "127.0.0.1", "port", localPort)
-		} else {
-			if err := nbdsync.WaitForTCPExport(targetNBDHost, targetPort, exportName, 10*time.Second); err != nil {
-				return res, fmt.Errorf("wait for target nbd export %s:%d: %w", targetNBDHost, targetPort, err)
-			}
+		}
+
+		// Probed in EVERY mode, at the address this run will actually connect
+		// to -- which is the fix for F9 and is not what either call site used
+		// to do.
+		//
+		// This one was guarded behind `else`, so a bridged run got no
+		// readiness check at all; runVerify's was unconditional against the
+		// raw export, which with -use-ssh is an address this host cannot
+		// reach, so it timed out on a perfectly healthy export. Both were
+		// versions of the same mistake: probing a fixed address rather than
+		// the one in use.
+		//
+		// effectiveTargetHost/Port is 127.0.0.1:<local bridge port> when
+		// bridging and the target host otherwise, so the probe always speaks
+		// plain NBD (the bridge's remote end speaks the compressed protocol
+		// and would reject a plain handshake) and always tests the real path.
+		// Through a bridge that means the handshake transits the whole chain,
+		// which proves more than probing the export directly ever did: the
+		// local helper, the link, the remote helper and the export behind it.
+		//
+		// A dial rather than asking the target host whether the port is
+		// listening. The dial is the only one of the two that proves
+		// REACHABILITY -- a firewall between the hosts, or a bind address that
+		// does not cover this route, leaves the port listening and the copy
+		// still unable to start.
+		if err := nbdsync.WaitForTCPExport(effectiveTargetHost, effectiveTargetPort, exportName, 10*time.Second); err != nil {
+			return res, fmt.Errorf("target nbd export for %s is not reachable: %w", d.TargetDev, err)
 		}
 
 		trace.Info("copy extents to remote target", "extents", len(extents), "path", targetPath, "disk_size", res.diskSize)
@@ -4940,9 +4999,6 @@ func run(cfg syncConfig) (runErr error) {
 		targetStopCommands = append(targetStopCommands, stopVerifyCmd)
 		stopMu.Unlock()
 
-		if err := nbdsync.WaitForTCPExport(targetNBDHost, verifyPort, verifyExportName, 10*time.Second); err != nil {
-			return fmt.Errorf("verify: wait for read-only export %s:%d: %w", targetNBDHost, verifyPort, err)
-		}
 		// Logged like every other port this run occupies, and it was the one
 		// omission: the verify BRIDGE had a line, the export it fronts did
 		// not. That made the least traceable port the one most worth tracing.
@@ -5007,6 +5063,22 @@ func run(cfg syncConfig) (runErr error) {
 			verifyTargetHost = "127.0.0.1"
 			verifyTargetPort = localPort
 			trace.Info("target nbd port in use", "side", "target", "kind", "verify_bridge_local", "disk", d.TargetDev, "host", "127.0.0.1", "port", localPort)
+		}
+
+		// Probed HERE, after the bridge is up, rather than before it.
+		//
+		// That ordering is the F9 fix on this side. This check used to run
+		// immediately after the export started, against targetNBDHost:
+		// verifyPort -- an address that with -compress/-netbuffer plus
+		// -use-ssh this host cannot reach at all, since the whole point of
+		// -use-ssh is that only the SSH connection crosses between hosts. It
+		// timed out for ten seconds and failed the verify while the export was
+		// healthy and reachable through the bridge it had not yet built.
+		//
+		// verifyTargetHost/Port is now whatever the compare will really use,
+		// so the probe follows the same path and speaks the same plain NBD.
+		if err := nbdsync.WaitForTCPExport(verifyTargetHost, verifyTargetPort, verifyExportName, 10*time.Second); err != nil {
+			return fmt.Errorf("verify: the read-only export for %s is not reachable: %w", d.TargetDev, err)
 		}
 
 		// The source side is read through its own already-open libvirt
