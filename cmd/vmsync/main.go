@@ -438,7 +438,7 @@ func main() {
 	flag.StringVar(&cfg.TargetDomain, "target-domain", "", "target domain name (defaults to --source-domain)")
 	flag.StringVar(&cfg.TargetDiskPath, "target-disk-path", "", "target disk path for changed location")
 	flag.StringVar(&cfg.SourceNBDBind, "source-nbd-bind", "0.0.0.0", "source bind address for libvirt backup NBD TCP export")
-	flag.StringVar(&cfg.SourceNBDPortSpec, "source-nbd-port", portalloc.DefaultSourceSpec, fmt.Sprintf("Source TCP port range for the libvirt backup NBD export: a free block is chosen inside it, so two concurrent runs do not collide without anyone having to configure anything. Defaults to %s. Pass one port instead (10809) to pin it exactly, which is worth doing only for a firewall that cannot open a range. A run needs 1 port here, or 2 when -compress/-netbuffer is set", portalloc.DefaultSourceSpec))
+	flag.StringVar(&cfg.SourceNBDPortSpec, "source-nbd-port", portalloc.DefaultSourceSpec, fmt.Sprintf("Source TCP port range for the libvirt backup NBD export: a free block is chosen inside it, so two concurrent runs do not collide without anyone having to configure anything. Defaults to %s. Pass one port instead (10809) to pin it exactly, which is worth doing only for a firewall that cannot open a range. A run needs exactly ONE port here, always: the libvirt backup export. Its bridge helper, when -compress/-netbuffer is set, takes a port of its own from the same range rather than sitting at export+1", portalloc.DefaultSourceSpec))
 	flag.StringVar(&cfg.SourceNBDHost, "source-nbd-host", "", "source host to connect for NBD reads (defaults from --source-uri)")
 	flag.StringVar(&cfg.TargetNBDBind, "target-nbd-bind", "0.0.0.0", "target bind address for qemu-nbd TCP export")
 	flag.StringVar(&cfg.TargetNBDPortSpec, "target-nbd-port", portalloc.DefaultTargetSpec, fmt.Sprintf("Target base TCP port range for the qemu-nbd exports: a free block is chosen inside it, so two concurrent runs do not collide without anyone having to configure anything. Defaults to %s. Pass one port instead (20809) to pin it exactly, which is worth doing only for a firewall that cannot open a range. Ports are no longer taken as a contiguous block: each export binds its own and logs it, so a run needs N ports anywhere in the range for N disks, 2N with -compress/-netbuffer OR -verify, 4N with both. The default range therefore holds 100 concurrent single-disk replicas, or 25 four-disk ones with everything enabled", portalloc.DefaultTargetSpec))
@@ -1570,16 +1570,27 @@ func bindOnFreePort(what string, alloc *portalloc.Allocator, start func(port int
 	return 0, fmt.Errorf("%s: gave up after %d attempts on %d different ports; the last failed with: %w", what, portBindAttempts, portBindAttempts, lastErr)
 }
 
-// sourcePortsNeeded returns how many consecutive ports a run occupies on
-// the SOURCE host: the libvirt backup NBD export, plus its bridge helper at
-// +1 when compression or buffering is on. The verify phase reuses the same
-// source export rather than opening another.
-func sourcePortsNeeded(bridging bool) int {
-	if bridging {
-		return 2
-	}
-	return 1
-}
+// sourcePortsNeeded is gone, and its absence is the fix for F8 rather than a
+// tidy-up.
+//
+// It answered "how many consecutive ports does a run occupy on the SOURCE" --
+// one for the libvirt backup export, two when a bridge sat at +1. The audit
+// item was that its predicate had drifted: it took `bridging`, while the only
+// site that actually bound the second port required `bridging && useSSH`, so
+// the flag help, the README and the `source_ports=` trace all told an operator
+// sizing a range a number that was one too high in a common configuration.
+//
+// The predicate is not fixed here because there is nothing left to predict.
+// The bridge draws its own port from an allocator and binds it, so it no
+// longer sits at export+1 and the export no longer has to reserve room for a
+// neighbour that may not arrive. A function whose entire job was guessing
+// whether a second port would be wanted has no job once the second port asks
+// for itself.
+//
+// targetPortsNeeded survives because it still answers a real question -- how
+// many ports the run will want in total, for the up-front "your range is
+// smaller than this" warning and the log line -- and nothing derives an
+// address from it.
 
 // refuseReinitIfTargetRunning decides whether -reinit must abort before
 // touching the target's disk files, given whether the target domain
@@ -3215,6 +3226,10 @@ func run(cfg syncConfig) (runErr error) {
 	// just below; declared out here because copyAndCommit and runVerify both
 	// draw from it.
 	var targetPortAlloc *portalloc.Allocator
+	// The source side's counterpart, used only by the source bridge -- the
+	// backup export itself is still chosen by probe-then-bind; see the block
+	// below for why that is right rather than unfinished.
+	var sourcePortAlloc *portalloc.Allocator
 
 	// Resolve the two base ports now: both SSH clients are up, the disk
 	// count is known, and nothing has bound anything yet. Every other port
@@ -3230,17 +3245,37 @@ func run(cfg syncConfig) (runErr error) {
 	// resolves a base up front, and only until it moves over too.
 	{
 		bridging := bridgeCfg.Enabled()
-		srcNeed := sourcePortsNeeded(bridging)
 		tgtNeed := targetPortsNeeded(len(qcowDisks), bridging, cfg.Verify != "")
-		// Skewed per target domain so two syncs of different vms into the
-		// same target host tend to land on different blocks; see
-		// portalloc.SelectBase.
-		skew := portalloc.Skew(cfg.TargetDomain)
+		// Random, for the same reason the target's start offset is: an offset
+		// derived from the domain name makes a vm permanently unlucky if it
+		// lands where something else already sits.
+		srcStart := rand.Uint32()
 
 		srcSpec, err := portalloc.ParseSpec(cfg.SourceNBDPortSpec, portalloc.DefaultSourceAutoLow, portalloc.DefaultSourceAutoHigh)
 		if err != nil {
 			return fmt.Errorf("source-nbd-port: %w", err)
 		}
+		// The source export is still chosen by probe-then-bind, and that is a
+		// decision rather than unfinished work.
+		//
+		// The probe's validity is a function of how long it is trusted. On the
+		// target it was trusted for the whole run -- the verify exports bind
+		// after the copy finishes -- so it was stale by the time it mattered.
+		// Here StartPullBackupTCP runs seconds later, so the probe is
+		// accurate, and the volumes are different too: the source takes one
+		// port per RUN (the export) rather than four per disk, so four
+		// concurrent syncs use four of a hundred.
+		//
+		// What the target's approach would cost here is what makes it a bad
+		// trade: this port is bound by a libvirt BACKUP JOB on a production
+		// domain, not by a qemu-nbd vmsync starts on a disposable replica, and
+		// libvirt permits one asynchronous job per domain. Retrying it means
+		// repeatedly beginning and aborting jobs against a live guest to
+		// dodge a collision that the probe already prevents.
+		//
+		// Just one port: the bridge no longer sits at +1, so nothing here
+		// needs to predict whether there will be a bridge at all. That
+		// prediction was F8.
 		srcUsed := map[int]bool{}
 		if !srcSpec.IsFixed() {
 			srcUsed, err = listeningPorts(ctx, sourceNeedsSSH, sourceSSHClient)
@@ -3248,10 +3283,21 @@ func run(cfg syncConfig) (runErr error) {
 				return fmt.Errorf("list listening ports on the source host to choose -source-nbd-port: %w", err)
 			}
 		}
-		cfg.SourceNBDPort, err = portalloc.SelectBase(srcUsed, srcSpec, srcNeed, skew)
+		cfg.SourceNBDPort, err = portalloc.SelectBase(srcUsed, srcSpec, 1, srcStart)
 		if err != nil {
 			return fmt.Errorf("source-nbd-port: %w", err)
 		}
+
+		// The source BRIDGE does draw from an allocator and bind, because it
+		// is an ordinary helper process vmsync starts -- the same clean
+		// failure semantics as the target bridges, with none of the backup
+		// job's constraints. It used to sit at export+1, which is why the
+		// export had to reserve two ports whenever bridging was on.
+		//
+		// No coordination with the export port is needed: the bridge starts
+		// after the export is already bound, so a candidate that happens to be
+		// the export's simply fails to bind and the next is tried.
+		sourcePortAlloc = portalloc.NewAllocator(srcSpec, rand.Uint32())
 
 		// The TARGET side reserves nothing and probes nothing.
 		//
@@ -3298,7 +3344,7 @@ func run(cfg syncConfig) (runErr error) {
 		}
 
 		trace.Info("resolved nbd port layout",
-			"source_spec", srcSpec.String(), "source_base", cfg.SourceNBDPort, "source_ports", srcNeed,
+			"source_spec", srcSpec.String(), "source_export_port", cfg.SourceNBDPort,
 			"target_spec", tgtSpec.String(), "target_ports_wanted", tgtNeed,
 			"target_start_offset", targetPortStart,
 			"target_allocation", "per-export bind from a random start, no reserved block -- each export logs the port it bound")
@@ -3939,8 +3985,24 @@ func run(cfg syncConfig) (runErr error) {
 	if bridgeCfg.Enabled() && sourceNeedsSSH {
 		// The source has a single shared NBD export (no per-disk ports), so
 		// its bridge port simply sits right next to it.
-		sourceBridgePort := cfg.SourceNBDPort + 1
-		stopCmd, err := nbdbridge.StartRemote(ctx, sourceSSHClient, "src-"+cfg.SourceDomain, sourceBridgePort, cfg.SourceNBDPort, bridgeCfg)
+		// From the allocator, not export+1. The old offset is what made the
+		// export reserve a second port it might not use.
+		var stopCmd string
+		sourceBridgePort, err := bindOnFreePort(
+			"source nbd bridge",
+			sourcePortAlloc,
+			func(port int) error {
+				cmd, serr := nbdbridge.StartRemote(ctx, sourceSSHClient, "src-"+cfg.SourceDomain, port, cfg.SourceNBDPort, bridgeCfg)
+				if serr != nil {
+					return serr
+				}
+				stopCmd = cmd
+				return nil
+			},
+			func(port int) {
+				// StartRemote kills its own orphan; see the target bridges.
+			},
+		)
 		if err != nil {
 			return fmt.Errorf("start source nbd bridge: %w", err)
 		}

@@ -436,17 +436,21 @@ func TestChecksumCheckCostsNoPorts(t *testing.T) {
 	}
 }
 
-func TestSourcePortsNeeded(t *testing.T) {
-	// The source side is the libvirt backup export, plus its bridge helper
-	// at +1 only when compression or buffering is on. The verify phase
-	// reuses the same export rather than opening a second one.
-	if got := sourcePortsNeeded(false); got != 1 {
-		t.Errorf("sourcePortsNeeded(false) = %d, want 1", got)
-	}
-	if got := sourcePortsNeeded(true); got != 2 {
-		t.Errorf("sourcePortsNeeded(true) = %d, want 2 (export plus its bridge at +1)", got)
-	}
-}
+// TestSourcePortsNeeded is gone with the function it covered, and the reason
+// is worth keeping where somebody looking for it will find it.
+//
+// It asserted that the source occupies one port plain and two when bridging --
+// the export, plus its bridge helper at +1. F8 was that the predicate had
+// drifted from the only site that binds the second port, so the number an
+// operator read while sizing a range was one too high in a common
+// configuration.
+//
+// The bridge now draws its own port from an allocator and binds it, so there
+// is no +1 and nothing to predict: the export needs exactly one port, always,
+// and the second port asks for itself. A test that the prediction is correct
+// has nothing left to assert once nothing is predicted. What replaced it in
+// substance is pkg/portalloc's TestAllocatorNeverRepeatsAPort -- the property
+// the bridge now relies on instead of arithmetic.
 
 // targetFileNewerThanSync is the guard that catches somebody writing to the
 // replica between syncs -- and, before it took a tolerance, the guard that
