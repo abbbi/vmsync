@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,6 +31,7 @@ import (
 	"vmsync/pkg/libvirtsync"
 	"vmsync/pkg/metrics"
 	"vmsync/pkg/nbdsync"
+	"vmsync/pkg/portalloc"
 )
 
 // TestOptionalValueFlag verifies the bare/"=value"/"=false" tri-state
@@ -838,4 +840,161 @@ func TestChecksumMismatchIsIdentifiableThroughWrapping(t *testing.T) {
 	if errors.Is(fmt.Errorf("checksum: run helper: %w", errors.New("ssh died")), errChecksumMismatch) {
 		t.Error("an unrelated checksum failure matched errChecksumMismatch")
 	}
+}
+
+// TestBindOnFreePort pins the port-collision fix, and it is pinned HERE
+// because bench cannot reach it.
+//
+// Every failure this function handles needs two syncs racing for one port on
+// one host, and bench syncs a single VM -- the run lock is keyed by source
+// domain, so it cannot even start a second sync of the same one. A concurrency
+// stage would need a second test VM. Until there is one, this is the only
+// coverage of the logic that replaced reserving a block: try a candidate, and
+// on failure clean up and take another.
+func TestBindOnFreePort(t *testing.T) {
+	// Start offset 0, so candidates come out in ascending order and every
+	// assertion below can name the exact ports expected.
+	newAlloc := func(t *testing.T, spec string) *portalloc.Allocator {
+		t.Helper()
+		s, err := portalloc.ParseSpec(spec, 0, 0)
+		if err != nil {
+			t.Fatalf("ParseSpec(%q): %v", spec, err)
+		}
+		return portalloc.NewAllocator(s, 0)
+	}
+	noCleanup := func(int) {}
+
+	t.Run("a start that works first time returns that port and cleans up nothing", func(t *testing.T) {
+		var tried, cleaned []int
+		got, err := bindOnFreePort("test export", newAlloc(t, "20000-20009"),
+			func(port int) error { tried = append(tried, port); return nil },
+			func(port int) { cleaned = append(cleaned, port) })
+		if err != nil {
+			t.Fatalf("bindOnFreePort() error = %v", err)
+		}
+		if got != 20000 {
+			t.Errorf("got port %d, want 20000 (the first candidate)", got)
+		}
+		if !slices.Equal(tried, []int{20000}) {
+			t.Errorf("start called with %v, want exactly [20000]", tried)
+		}
+		// The cleanup reaps a half-started export. Running it after a SUCCESS
+		// would kill the export that just came up.
+		if len(cleaned) != 0 {
+			t.Errorf("cleanup ran for %v after a successful start", cleaned)
+		}
+	})
+
+	t.Run("it retries on different ports and cleans up each failure", func(t *testing.T) {
+		var tried, cleaned []int
+		busy := map[int]bool{20000: true, 20001: true}
+		got, err := bindOnFreePort("test export", newAlloc(t, "20000-20009"),
+			func(port int) error {
+				tried = append(tried, port)
+				if busy[port] {
+					return errors.New("Failed to bind socket: Address already in use")
+				}
+				return nil
+			},
+			func(port int) { cleaned = append(cleaned, port) })
+		if err != nil {
+			t.Fatalf("bindOnFreePort() error = %v", err)
+		}
+		if got != 20002 {
+			t.Errorf("got port %d, want 20002 -- the first candidate past the two busy ones", got)
+		}
+		// A DIFFERENT port each time. Retrying the same one would be pointless
+		// against a peer run that is holding it for the duration.
+		if want := []int{20000, 20001, 20002}; !slices.Equal(tried, want) {
+			t.Errorf("tried %v, want %v", tried, want)
+		}
+		// Every failed attempt cleaned, and only the failed ones: a start that
+		// bound its port and then failed leaves a qemu-nbd holding the replica
+		// image open, which blocks the commit and, on a -reinit, the rm.
+		if want := []int{20000, 20001}; !slices.Equal(cleaned, want) {
+			t.Errorf("cleaned %v, want %v", cleaned, want)
+		}
+	})
+
+	t.Run("a persistent failure stops at the cap and reports the LAST error", func(t *testing.T) {
+		// The cap is what lets this function retry blindly, without having to
+		// tell "that port is taken" from "this invocation is broken" by
+		// matching qemu-nbd's stderr. A broken invocation therefore costs
+		// exactly this many attempts and must then say why.
+		var attempts int
+		_, err := bindOnFreePort("test export", newAlloc(t, "20000-20099"),
+			func(port int) error {
+				attempts++
+				return fmt.Errorf("failure number %d", attempts)
+			}, noCleanup)
+		if err == nil {
+			t.Fatal("bindOnFreePort() returned no error although every start failed")
+		}
+		if attempts != portBindAttempts {
+			t.Errorf("start called %d times, want exactly %d (the cap)", attempts, portBindAttempts)
+		}
+		// The LAST failure, not the first. On a mixed run -- busy, busy, then
+		// a real fault -- the last one is the one that explains why nothing
+		// worked.
+		if want := fmt.Sprintf("failure number %d", portBindAttempts); !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not carry the last attempt's failure (%q)", err.Error(), want)
+		}
+	})
+
+	t.Run("the wrapped error stays unwrappable", func(t *testing.T) {
+		// main() classifies failures with errors.Is -- nbdsync.ErrExportUnreachable
+		// is exempt from failure_count that way -- so the wrap has to survive
+		// this function or the exemption silently stops applying.
+		sentinel := errors.New("the sentinel")
+		_, err := bindOnFreePort("test export", newAlloc(t, "20000-20099"),
+			func(port int) error { return fmt.Errorf("start failed: %w", sentinel) },
+			noCleanup)
+		if !errors.Is(err, sentinel) {
+			t.Errorf("errors.Is(err, sentinel) = false, so a caller could not classify it; err = %v", err)
+		}
+	})
+
+	t.Run("an exhausted range is a different diagnosis from giving up", func(t *testing.T) {
+		// Two ports, so the range runs out before the cap does. The operator's
+		// fix is "widen the range", not "find out what is on those ports", and
+		// this arrives from a cron job whose only output is a log line -- so
+		// the message must differ and must carry the size.
+		var attempts int
+		_, err := bindOnFreePort("test export", newAlloc(t, "20000-20001"),
+			func(port int) error { attempts++; return errors.New("busy") },
+			noCleanup)
+		if err == nil {
+			t.Fatal("bindOnFreePort() returned no error on an exhausted range")
+		}
+		if attempts != 2 {
+			t.Errorf("start called %d times, want 2 -- the range holds only two ports", attempts)
+		}
+		if !strings.Contains(err.Error(), "ran out of candidate ports") {
+			t.Errorf("error %q should say the range ran out, not that it gave up after N attempts", err.Error())
+		}
+		if !strings.Contains(err.Error(), "2") {
+			t.Errorf("error %q does not name the range's size", err.Error())
+		}
+	})
+
+	t.Run("a range already drained by siblings never calls start", func(t *testing.T) {
+		// One allocator is shared by all of a run's exports, so a later export
+		// can find it empty without ever attempting anything. That is purely a
+		// sizing problem, so it must not quote a "last error" it does not have.
+		a := newAlloc(t, "20000-20001")
+		a.Next()
+		a.Next()
+		var attempts int
+		_, err := bindOnFreePort("test export", a,
+			func(port int) error { attempts++; return nil }, noCleanup)
+		if err == nil {
+			t.Fatal("bindOnFreePort() returned no error with no candidates left")
+		}
+		if attempts != 0 {
+			t.Errorf("start called %d times, want 0 -- there was nothing left to try", attempts)
+		}
+		if !strings.Contains(err.Error(), "already taken every one of them") {
+			t.Errorf("error %q should say this run has taken the whole range", err.Error())
+		}
+	})
 }
