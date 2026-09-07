@@ -20,6 +20,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"slices"
 	"strconv"
@@ -995,6 +996,105 @@ func TestBindOnFreePort(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "already taken every one of them") {
 			t.Errorf("error %q should say this run has taken the whole range", err.Error())
+		}
+	})
+}
+
+// TestFlagHelpIsOneLineAndGrouped enforces what -help was just rescued from.
+//
+// Every flag's help used to carry its own reasoning; several ran past a
+// thousand characters, and the effect was a -help nobody read. Nothing stopped
+// that happening, and nothing would stop the next flag doing it again -- so
+// this is the guard, and registerFlags takes a *flag.FlagSet precisely so a
+// test can register into a throwaway set and inspect what it got.
+func TestFlagHelpIsOneLineAndGrouped(t *testing.T) {
+	var cfg syncConfig
+	fs := flag.NewFlagSet("vmsync", flag.ContinueOnError)
+	registerFlags(fs, &cfg)
+
+	registered := map[string]*flag.Flag{}
+	fs.VisitAll(func(f *flag.Flag) { registered[f.Name] = f })
+	if len(registered) == 0 {
+		t.Fatal("registerFlags registered nothing")
+	}
+
+	t.Run("no help text spans more than one line", func(t *testing.T) {
+		for name, f := range registered {
+			if strings.ContainsAny(f.Usage, "\n\r") {
+				t.Errorf("-%s: help contains a newline; the detail belongs in docs/HOWTO.md", name)
+			}
+			// A soft ceiling rather than a hard one. The point is not the
+			// exact number: it is that a flag needing a paragraph has a
+			// paragraph's worth of context to convey, and -help is the wrong
+			// place for it. 120 leaves room for the flag name and its default
+			// on one terminal line.
+			if len(f.Usage) > 120 {
+				t.Errorf("-%s: help is %d chars; keep it under 120 and put the rest in docs/HOWTO.md:\n  %s",
+					name, len(f.Usage), f.Usage)
+			}
+		}
+	})
+
+	t.Run("every registered flag appears in exactly one group", func(t *testing.T) {
+		seen := map[string]int{}
+		for _, g := range flagGroups {
+			for _, name := range g.flags {
+				seen[name]++
+			}
+		}
+		for name := range registered {
+			switch seen[name] {
+			case 1:
+			case 0:
+				// It would still WORK, and still be settable -- it would just
+				// be absent from -help, which is the worst of the three
+				// outcomes. printUsage prints these under UNGROUPED so they
+				// are at least visible; this makes CI say so first.
+				t.Errorf("-%s is registered but in no flagGroups entry, so -help would list it under UNGROUPED", name)
+			default:
+				t.Errorf("-%s appears in %d flagGroups entries; it must appear in exactly one", name, seen[name])
+			}
+		}
+		for name, n := range seen {
+			if _, ok := registered[name]; !ok {
+				t.Errorf("flagGroups names -%s (%d times) but no such flag is registered -- a typo or a removed flag", name, n)
+			}
+		}
+	})
+
+	t.Run("the ACTIONS group is the set main() refuses to combine", func(t *testing.T) {
+		// These two lists have to agree. An action missing from ACTIONS is one
+		// a reader cannot discover; an entry here that main() does not treat
+		// as exclusive would be advertised as a mode when it is a modifier.
+		// Kept as a literal rather than derived from main(), so that adding an
+		// action in one place and not the other is what fails.
+		want := []string{
+			"promote", "invert", "shutdown-domain", "fence-domain", "read-fence",
+			"update-role", "list-restore-points", "clone-restore-point",
+			"restore-restore-point",
+		}
+		var got []string
+		for _, g := range flagGroups {
+			if g.title == "ACTIONS" {
+				got = g.flags
+			}
+		}
+		if got == nil {
+			t.Fatal("no ACTIONS group in flagGroups")
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("ACTIONS = %v\n   want %v\n(main()'s mutually-exclusive mode list is the other half of this)", got, want)
+		}
+	})
+
+	t.Run("every group has a title and at least one flag", func(t *testing.T) {
+		for i, g := range flagGroups {
+			if g.title == "" {
+				t.Errorf("flagGroups[%d] has no title", i)
+			}
+			if len(g.flags) == 0 {
+				t.Errorf("flagGroups[%d] (%s) is empty; an empty heading is noise", i, g.title)
+			}
 		}
 	})
 }

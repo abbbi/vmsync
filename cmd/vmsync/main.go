@@ -24,6 +24,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/rand/v2"
 	"net/http"
@@ -421,6 +422,134 @@ type syncConfig struct {
 	ShutdownTimeoutSec int
 }
 
+// flagGroups is the order and grouping -help prints, replacing the flat
+// alphabetical list Go's flag package produces by default.
+//
+// Alphabetical is the wrong order for this program. It interleaves the nine
+// mutually-exclusive ACTIONS with the sixty options that modify them, so
+// -promote sorted between -prometheus-textfile and -promoted-by, and nothing
+// told a reader that picking two actions is refused. Grouping by what a flag
+// is FOR makes that structure visible: the actions are a menu, everything
+// else is configuration.
+//
+// The ACTIONS group is the same set main() enforces as mutually exclusive.
+// Those two lists have to agree, and TestFlagGroupsCoverEveryFlag pins it --
+// an action missing here would be one a reader cannot discover.
+var flagGroups = []struct {
+	title string
+	note  string
+	flags []string
+}{
+	{"ACTIONS", "each does one thing and exits; at most one per run", []string{
+		"promote", "invert", "shutdown-domain", "fence-domain", "read-fence",
+		"update-role", "list-restore-points", "clone-restore-point",
+		"restore-restore-point",
+	}},
+	{"CONNECTION", "which domains, and how to reach libvirt", []string{
+		"source-uri", "target-uri", "source-domain", "target-domain",
+		"local-host-name",
+	}},
+	{"SSH", "how remote commands and tunnels authenticate", []string{
+		"ssh-user", "ssh-key", "ssh-password", "ssh-port", "ssh-known-hosts",
+		"ssh-insecure-host-key", "ssh-timeout-sec",
+	}},
+	{"SYNC", "what a sync run does", []string{
+		"start", "reinit", "force-clean", "reinit-after-failures",
+		"ignore-external-snapshot", "timestamp-tolerance-sec",
+	}},
+	{"STORAGE", "where the replica's disks live and who owns them", []string{
+		"target-disk-path", "replaced-disk-action", "target-disk-owner",
+	}},
+	{"TRANSPORT", "how the bytes cross between hosts", []string{
+		"compress", "compress-level", "netbuffer", "use-ssh",
+		"bridge-helper-path", "io-depth",
+	}},
+	{"NBD NETWORK", "the addresses and ports the exports bind", []string{
+		"source-nbd-bind", "source-nbd-port", "source-nbd-host",
+		"target-nbd-bind", "target-nbd-port", "target-nbd-host",
+	}},
+	{"INTEGRITY", "proving the replica matches its source", []string{
+		"verify", "verify-failure-reinit", "no-checksum",
+	}},
+	{"RESTORE POINTS", "keeping and using point-in-time copies", []string{
+		"retention", "clone-to", "force-restore", "restored-by",
+	}},
+	{"FAILOVER OPTIONS", "modifiers for the failover actions above", []string{
+		"promote-mode", "promoted-by", "force-promote", "fence-source",
+		"shutdown-timeout-sec",
+	}},
+	{"REPORTING", "what this run tells the outside world", []string{
+		"prometheus-textfile", "result-json", "run-id", "debug", "v",
+		"version", "test",
+	}},
+}
+
+// printUsage is flag.Usage. One line per flag, grouped, with the detail in
+// docs/HOWTO.md.
+//
+// Any flag not named in flagGroups is printed under UNGROUPED rather than
+// dropped. That direction matters more than it looks: a flag added without
+// being grouped would otherwise vanish from -help entirely, which is a worse
+// outcome than an ugly heading -- the flag would exist, work, and be
+// undiscoverable. The heading is loud enough that whoever added it will see it
+// the first time they run -help.
+func printUsage() {
+	out := flag.CommandLine.Output()
+	fmt.Fprintf(out, "vmsync %s -- checkpoint-based incremental replication of libvirt VMs\n\n", version.Version)
+	fmt.Fprint(out, "Usage:\n")
+	fmt.Fprint(out, "  vmsync -source-uri URI -source-domain NAME -target-uri URI [options]   sync\n")
+	fmt.Fprint(out, "  vmsync <action> [options]                                              everything else\n\n")
+	fmt.Fprint(out, "Each flag below is one line. The reasoning, the worked examples and the\n")
+	fmt.Fprint(out, "caveats are in docs/HOWTO.md -- read that before changing a default.\n")
+
+	grouped := map[string]bool{}
+	for _, g := range flagGroups {
+		fmt.Fprintf(out, "\n%s", g.title)
+		if g.note != "" {
+			fmt.Fprintf(out, " -- %s", g.note)
+		}
+		fmt.Fprintln(out)
+		for _, name := range g.flags {
+			grouped[name] = true
+			printFlagLine(out, flag.Lookup(name))
+		}
+	}
+
+	var ungrouped []*flag.Flag
+	flag.VisitAll(func(f *flag.Flag) {
+		if !grouped[f.Name] {
+			ungrouped = append(ungrouped, f)
+		}
+	})
+	if len(ungrouped) > 0 {
+		fmt.Fprint(out, "\nUNGROUPED -- these are missing from flagGroups in main.go; please file that\n")
+		for _, f := range ungrouped {
+			printFlagLine(out, f)
+		}
+	}
+	fmt.Fprintln(out)
+}
+
+// printFlagLine renders one flag, showing its default only when there is a
+// meaningful one. An empty string, false and 0 are all "unset" here, and
+// printing "=false" against thirty booleans would add a column of noise to
+// the thing this reorganisation exists to make readable.
+func printFlagLine(out io.Writer, f *flag.Flag) {
+	if f == nil {
+		// A name in flagGroups with no such flag. Unreachable while the test
+		// passes; skipped rather than crashed, because -help failing to print
+		// is a worse way to learn about a typo than the flag being absent.
+		return
+	}
+	left := "  -" + f.Name
+	switch f.DefValue {
+	case "", "false", "0":
+	default:
+		left += "=" + f.DefValue
+	}
+	fmt.Fprintf(out, "%-32s %s\n", left, f.Usage)
+}
+
 func main() {
 	if os.Getenv("PROFILE") == "development" {
 		host := "localhost:6060"
@@ -432,77 +561,8 @@ func main() {
 
 	var cfg syncConfig
 
-	flag.StringVar(&cfg.SourceURI, "source-uri", "", "libvirt source URI (example: qemu+ssh://src/system)")
-	flag.StringVar(&cfg.TargetURI, "target-uri", "", "libvirt target URI (example: qemu+ssh://target/system)")
-	flag.StringVar(&cfg.SourceDomain, "source-domain", "", "source domain name")
-	flag.StringVar(&cfg.TargetDomain, "target-domain", "", "target domain name (defaults to --source-domain)")
-	flag.StringVar(&cfg.TargetDiskPath, "target-disk-path", "", "target disk path for changed location")
-	flag.StringVar(&cfg.SourceNBDBind, "source-nbd-bind", "0.0.0.0", "source bind address for libvirt backup NBD TCP export")
-	flag.StringVar(&cfg.SourceNBDPortSpec, "source-nbd-port", portalloc.DefaultSourceSpec, fmt.Sprintf("Source TCP port range for the libvirt backup NBD export: a free block is chosen inside it, so two concurrent runs do not collide without anyone having to configure anything. Defaults to %s. Pass one port instead (10809) to pin it exactly, which is worth doing only for a firewall that cannot open a range. A run needs exactly ONE port here, always: the libvirt backup export. Its bridge helper, when -compress/-netbuffer is set, takes a port of its own from the same range rather than sitting at export+1", portalloc.DefaultSourceSpec))
-	flag.StringVar(&cfg.SourceNBDHost, "source-nbd-host", "", "source host to connect for NBD reads (defaults from --source-uri)")
-	flag.StringVar(&cfg.TargetNBDBind, "target-nbd-bind", "0.0.0.0", "target bind address for qemu-nbd TCP export")
-	flag.StringVar(&cfg.TargetNBDPortSpec, "target-nbd-port", portalloc.DefaultTargetSpec, fmt.Sprintf("Target base TCP port range for the qemu-nbd exports: a free block is chosen inside it, so two concurrent runs do not collide without anyone having to configure anything. Defaults to %s. Pass one port instead (20809) to pin it exactly, which is worth doing only for a firewall that cannot open a range. Ports are no longer taken as a contiguous block: each export binds its own and logs it, so a run needs N ports anywhere in the range for N disks, 2N with -compress/-netbuffer OR -verify, 4N with both. The default range therefore holds 100 concurrent single-disk replicas, or 25 four-disk ones with everything enabled", portalloc.DefaultTargetSpec))
-	flag.StringVar(&cfg.TargetNBDHost, "target-nbd-host", "", "target host to connect for NBD writes (defaults from --target-uri)")
-	flag.StringVar(&cfg.SSHUser, "ssh-user", "", "ssh user for remote command execution (defaults from URI user, then ~/.ssh/config's User, then root)")
-	flag.StringVar(&cfg.SSHKey, "ssh-key", "", "private key path for ssh authentication (defaults from ~/.ssh/config's IdentityFile)")
-	flag.StringVar(&cfg.SSHPassword, "ssh-password", "", "password for ssh authentication")
-	flag.IntVar(&cfg.SSHPort, "ssh-port", 0, "ssh port for remote command execution (0 = use ~/.ssh/config's Port, falling back to 22)")
-	flag.BoolVar(&cfg.SSHInsecure, "ssh-insecure-host-key", false, "disable host key verification (not recommended)")
-	flag.StringVar(&cfg.KnownHosts, "ssh-known-hosts", "", "known_hosts file path (defaults to ~/.ssh/known_hosts)")
-	flag.IntVar(&cfg.SSHTimeoutSec, "ssh-timeout-sec", 10, "ssh connection timeout in seconds")
-	flag.IntVar(&cfg.TimestampToleranceSec, "timestamp-tolerance-sec", 0, "How far a replica disk's mtime may be ahead of the recorded sync time before the sync refuses, in seconds. Mostly no longer needed: vmsync now records replica_written_at per disk, stat'd on the TARGET host, so where that exists both sides of the comparison come from the same clock and drift cannot trigger it. It still matters for a replica written by an older vmsync, where the only record is last_sync_timestamp taken on THIS host's clock -- a target running even a second fast then fails every incremental sync with an error blaming out-of-band modification. Set this above the drift the error reports to recover without a full -reinit, and pass it for ONE run rather than persisting it: that run records replica_written_at for every disk it writes even if it then fails, which is enough to make every later comparison exact. Fixing NTP is still the real repair")
-	flag.BoolVar(&cfg.Start, "start", false, "In case vm is in non-running state, start in paused mode to allow sync")
-	flag.BoolVar(&cfg.Reinit, "reinit", false, "Delete VM on target and restart a full sync process")
-	flag.BoolVar(&cfg.ForceClean, "force-clean", false, "A -reinit for a target that is wedged. Implies -reinit, and additionally: removes the target DOMAIN before syncing rather than redefining it at the end, so a broken definition cannot block the run; overrides the replication_role interlock for a promoted or paused target, DISCARDING its current disks; and clears the source's checkpoint chain even when the source is shut down, removing the qcow2 bitmaps that would otherwise make every later sync fail with \"Bitmap already exists\". It never touches a RUNNING target, and never overrides role=source, which means the pair is configured backwards")
-	flag.StringVar(&cfg.ReplacedDiskAction, "replaced-disk-action", replacedDiskRename, fmt.Sprintf("What to do with a target disk file that is about to be discarded and rebuilt (currently only -reinit does this): %q renames it to <path>%s<unixtime> so its contents survive, %q removes it. Defaults to %q: the target of a reinit may be a former primary whose disks still hold everything written after the last successful sync, and that is unrecoverable once deleted. Renaming needs room for both copies, and the aside files are never reaped automatically", replacedDiskRename, replacedDiskSuffix, replacedDiskDelete, replacedDiskRename))
-	flag.StringVar(&cfg.TargetDiskOwner, "target-disk-owner", util.DiskOwnerAuto, fmt.Sprintf("Who should own the disk files created on the target: %q (default), %q, or an explicit \"user\", \"user:group\" or \":group\". vmsync creates those files by running qemu-img over SSH, so they are owned by that SSH user (root) -- while qemu runs as \"qemu\" on RHEL and \"libvirt-qemu\" on Debian, and cannot open a root-owned disk. libvirt's dynamic_ownership usually hides this, but it is off in plenty of deployments and cannot work at all on NFS with root_squash. %q preserves whatever owned the file before (which is what makes -reinit safe, since it replaces a correctly-owned disk with a fresh root-owned one) and otherwise takes what the target's libvirt qemu.conf sets; it never guesses, and warns instead. %q is the old behaviour", util.DiskOwnerAuto, util.DiskOwnerOff, util.DiskOwnerAuto, util.DiskOwnerOff))
-	flag.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "Reinit automatically after N failures (disabled by default). Count is held on target XML")
-	flag.BoolVar(&cfg.VerifyFailureReinit, "verify-failure-reinit", false, "When -verify finds the replica differing from its source, recopy it in full and verify it AGAIN, once. If the second verify also fails, the replica is recorded as faulty on its own domain XML: later syncs into it are refused, and a promotion reports it as untrustworthy, until a human clears it with another -verify-failure-reinit or discards the replica with -force-clean. Off by default, because the automatic response to \"the replica does not match\" is to destroy its disks and copy them again, which is right when the cause was a bad write and wrong when the cause will corrupt the recopy too. Never retried beyond that one attempt: \"failed, and failed again after a full recopy\" already distinguishes a transient error from a real one, and each pass destroys the previous one's evidence. Requires -verify")
-	flag.StringVar(&cfg.Retention, "retention", "", "Keep point-in-time copies of the replica on the target, as COUNT,INTERVAL -- for example 24,3h for twenty-four copies at least three hours apart, so a sync that faithfully replicated an already-damaged source can be stepped back from. The COUNT is the guarantee; the window it covers is not, because vmsync does not decide when it runs: the interval is a floor (\"take one if at least this long has passed\"), so a pair syncing every 4h gets 4h spacing and a pause leaves a gap. Copies are made with reflink, share storage with the replica, and cost almost nothing until they diverge -- but the target filesystem must support it (XFS with reflink=1, or btrfs), and this is refused at startup where it does not. Disabled by default")
-	flag.BoolVar(&cfg.ListRestorePoints, "list-restore-points", false, "List the restore points kept on the target and stop. Needs -target-uri and -target-disk-path; reads the target filesystem only, and touches neither the replica nor libvirt")
-	flag.StringVar(&cfg.CloneRestorePoint, "clone-restore-point", "", "Copy one restore point's disks to the directory given by -clone-to, and stop. Takes a tag from -list-restore-points. This is how to answer \"is that copy clean?\": boot a throwaway domain from the clone. It changes nothing about the replica, its metadata, or its role -- restoring in place is a different operation and is deliberately not this one")
-	flag.StringVar(&cfg.CloneRestorePointTo, "clone-to", "", "Directory on the target to write -clone-restore-point's copies into. Created if missing")
-	flag.StringVar(&cfg.RestoreRestorePoint, "restore-restore-point", "", "Put one restore point back over the replica IN PLACE, discarding its current contents. Takes a tag from -list-restore-points. -target-disk-path is optional here (unlike the read-only verbs): a restore needs the target domain to exist, so where its disks are is read from the domain itself. Without -force-restore this only prints an assessment and changes nothing. A restore is for promoting: it leaves replication PAUSED, because the next sync from the same source would otherwise overwrite exactly what was rolled back to")
-	flag.BoolVar(&cfg.ForceRestore, "force-restore", false, "Carry out -restore-restore-point instead of only assessing it. Required, because a restore replaces the replica's disks and cannot be undone once the displaced contents are removed")
-	flag.StringVar(&cfg.RestoredBy, "restored-by", "", "Who asked for the rollback, recorded on the domain as restored_by. The counterpart of -promoted-by: a promoted domain's data-loss window says how far back its contents are, but only this says somebody chose to put them there")
-	flag.StringVar(&cfg.TestFault, "test", "", fmt.Sprintf("FOR TESTING ONLY: make vmsync deliberately fail at a chosen point, so error-recovery paths that cannot be reached from outside the process can be exercised. Accepts one of: %s. A run with this set WILL fail and its result means nothing as a replication. The two %q faults CORRUPT REAL DATA on the target and are not merely failure injection: %q writes garbage into the image the copy just wrote, just before the pre-commit integrity check reads it back, which that check is expected to catch -- on an incremental it costs only the discarded overlay, but a full sync has no overlay, so the replica's base is left damaged. %q writes garbage over the committed replica after that check has passed, so -verify finds a genuine mismatch: the replica no longer matches its source, must be rebuilt, and the verification failure is recorded on it like any other (it requires -verify, which is what turns the damage into a test result). Listed here rather than hidden, so an operator who finds one in a log can look it up", strings.Join(libvirtsync.TestFaults, ", "), "corrupt-", libvirtsync.TestFaultCorruptBeforeChecksum, libvirtsync.TestFaultCorruptAfterCommit))
-	compressArg := optionalValueFlag{bareDefault: "s2"}
-	fenceSourceArg := optionalValueFlag{bareDefault: fenceSourceAuto}
-	netBufferArg := optionalValueFlag{bareDefault: "128k,1G"}
-	flag.Var(&compressArg, "compress", "Compress NBD traffic between hosts. Bare -compress (no value) defaults to \"s2\"); ACCEPTS \"zstd\" or \"s2\". Requires vmsync-bridge-helper binary on target")
-	// No flag default, deliberately: one literal cannot be right for both
-	// algorithms. "3" is a valid zstd level and an invalid s2 mode, "better"
-	// is the reverse -- so whichever were declared, --help would print a
-	// value the other algorithm refuses outright. Left empty, Go omits the
-	// "(default ...)" clause altogether and the text below states both,
-	// which is the only accurate thing to say before -compress is known.
-	// streamrelay.ResolveLevel turns empty into the right one.
-	flag.StringVar(&cfg.CompressLevel, "compress-level", "", "Compression level/mode to use when -compress is set. For -compress=zstd: a number 1-19, defaulting to 3. For -compress=s2 (which has no numeric levels, and is what bare -compress selects): one of \"default\" (s2's own fastest mode), \"better\" (the default here) or \"best\". Left unset it resolves per algorithm, so there is no single default to print.")
-	flag.Var(&netBufferArg, "netbuffer", "Buffer NBD bridge traffic through a bounded in-memory buffer to smooth throughput, formatted as <blocksize>,<buffersize> (e.g. 64k,512M). Defaults to \"128k,1G\". Requires vmsync-bridge-helper binary on target")
-	flag.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/local/bin/vmsync-bridge-helper", "Remote path to the vmsync-bridge-helper binary. Defaults to /usr/local/bin")
-	flag.BoolVar(&cfg.UseSSH, "use-ssh", false, "When --compress/--netbuffer is set, route the bridged NBD traffic through the existing SSH connection as an encrypted tunnel")
-	flag.IntVar(&cfg.IODepth, "io-depth", 8, "Number of NBD read/write pairs to keep in flight simultaneously during the disk copy, defaults to 8")
-	flag.BoolVar(&cfg.NoChecksum, "no-checksum", false, "Disable the pre-commit integrity check, which is ON by default. Normally every chunk read from the source is hashed as it passes, vmsync-bridge-helper hashes the same ranges back off the target, and an incremental sync's overlay is removed instead of committed if they disagree -- so a run that succeeds means the bytes are on the target, not merely that the writes were issued. The digests cost no extra I/O on either side and only a few bytes per megabyte on the wire. The only requirement is a matching vmsync-bridge-helper binary on the target (same binary and -bridge-helper-path as -compress/-netbuffer use, but no compression, buffering or bridge port is involved -- it is run as a one-shot command). If it is absent or a different version, the check is skipped with a warning rather than failing the sync; pass this flag to state that intent explicitly and silence the warning")
-	flag.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "Write sync metrics to this path in Prometheus textfile-collector format. Name should be something like /var/lib/node_exporter/textfile_collector/vmsync_[vmname].prom")
-	flag.BoolVar(&cfg.IgnoreExternalSnapshot, "ignore-external-snapshot", false, "If the source domain currently has any external disk snapshot, skip this run entirely")
-	flag.StringVar(&cfg.Verify, "verify", "", "After syncing, compare every disk on the target against the same frozen source snapshot the copy read from. Accepts fast|full|qemu-img. All three answer the same question and none is confused by a running guest; they differ in cost and independence. \"fast\" stops at the first differing range -- the right choice for a scheduled run. \"full\" scans the whole image and reports how many ranges and bytes differ, which is what tells a bad cluster apart from a bad copy path. \"qemu-img\" runs qemu-img compare instead, an INDEPENDENT implementation, and is the one to reach for when another mode reports a mismatch and you need to know whether to believe it; it is also the only mode that suspends the source, which it does to keep the source snapshot's scratch space empty for the duration, not because the comparison needs it")
-	flag.StringVar(&cfg.UpdateRole, "update-role", "", "Set the replication role recorded in a domain's own vmsync metadata, then exit without syncing anything. Accepts "+strings.Join(libvirtsync.ValidRoles, "|")+" (\"none\" clears it). The domain is addressed with -target-uri/-target-domain regardless of which direction it currently replicates in. vmsync refuses to sync INTO a domain whose role is anything other than \"target\" or unset -- this is what stops a scheduled sync from overwriting a domain that was failed over to and then shut down for maintenance")
-	flag.StringVar(&cfg.RunID, "run-id", "", "Opaque identifier for this run, written into the run lock so a supervising agent can join it to its own record of having started this process. Ignored except as a label; vmsync-agent sets it, and nothing needs it when vmsync is run by hand")
-	flag.StringVar(&cfg.ResultJSON, "result-json", "", "Write this run's degradations to this path as JSON, for a supervising agent to read back. A degradation is something the exit code cannot carry -- a guest left frozen by a failed thaw, or a copy that is crash-consistent because the freeze did not take -- since both can happen to a run that otherwise succeeds. vmsync-agent sets this; nothing needs it when vmsync is run by hand")
-	flag.StringVar(&cfg.LocalHostName, "local-host-name", "", "What to call this machine when recording it in replica_source/replica_targets/promoted_from, for a -source-uri or -target-uri that names no host. Defaults to the system hostname. Set it when something else refers to this host by a different name -- vmsync-agent passes its own --hostname here, because the control plane matches these references against the name an agent reports under")
-	flag.BoolVar(&cfg.Promote, "promote", false, "Promote the replica named by -target-uri/-target-domain to serve live: record the promotion and, with -start, boot it. Refuses unless the target actually holds a usable replica. Must be run on the target's own host")
-	flag.BoolVar(&cfg.Invert, "invert", false, "Reverse a pair's direction after a failover: -source-uri/-source-domain name the OLD source, -target-uri/-target-domain the promoted replica. Run on the old source's host")
-	flag.BoolVar(&cfg.ShutdownDomain, "shutdown-domain", false, "Shut the domain named by -target-uri/-target-domain down cleanly and pause its replication. The source half of a planned failover; must be run on that domain's own host")
-	flag.BoolVar(&cfg.FenceDomain, "fence-domain", false, "Shut the domain named by -target-uri/-target-domain down because a PEER WAS PROMOTED over it, and mark its replication role fenced. What -shutdown-domain does, differing only in what it records: paused means a person chose to stop replicating, fenced means nobody here chose anything and a peer took over. Normally run by vmsync-agent's fence loop rather than by hand. Like -shutdown-domain it never destroys a guest that ignores ACPI -- but unlike it, the role is recorded even when the shutdown fails, because at that moment a live domain and a promoted peer are a split brain and the role is all that refuses a sync into it")
-	flag.BoolVar(&cfg.ReadFence, "read-fence", false, "Ask the peer named by -target-uri/-target-domain whether its promotion armed a fence against this host, and print the answer as JSON. Reads only; changes nothing anywhere. Unlike the other failover modes this one accepts a REMOTE uri, because asking the other site is the entire operation. An unreachable peer is reported as unreachable rather than as an absence of fencing")
-	flag.StringVar(&cfg.PromoteMode, "promote-mode", string(failover.ModeForced), fmt.Sprintf("How this promotion came about, recorded on the domain: %q when the source was cleanly shut down first (no data lost), %q when it was never reached", failover.ModePlanned, failover.ModeForced))
-	flag.StringVar(&cfg.PromotedBy, "promoted-by", "", "Who is performing this promotion, recorded on the domain for attribution")
-	flag.BoolVar(&cfg.ForcePromote, "force-promote", false, "Promote even when the target does not look like a usable replica (missing disks, no completed sync, an interrupted copy). The data-loss window is then reported as unknown rather than guessed")
-	flag.Var(&fenceSourceArg, "fence-source", "With -promote: arm a fence so the displaced source shuts itself down, instead of leaving one VM running in two places. Bare -fence-source takes the source from the target's own replica_source; an explicit host:domain names it directly. Off by default, because a DR drill is a promotion too and must not stop production. The promoted domain records the decision; the source acts on it once, ever, and never destroys a guest that ignores the shutdown request")
-	flag.IntVar(&cfg.ShutdownTimeoutSec, "shutdown-timeout-sec", 300, "How long -shutdown-domain waits for a clean guest shutdown. On expiry it fails and leaves the domain running rather than destroying it")
-	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
-	flag.BoolVar(&cfg.ShowVersion, "v", false, "Show version and exit")
-	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
+	compressArg, fenceSourceArg, netBufferArg := registerFlags(flag.CommandLine, &cfg)
+	flag.Usage = printUsage
 	flag.Parse()
 	cfg.FenceSource = fenceSourceArg.value
 	cfg.Compress = compressArg.value
@@ -5612,4 +5672,117 @@ func run(cfg syncConfig) (runErr error) {
 	}
 
 	return nil
+}
+
+// registerFlags declares every command-line flag on fs.
+//
+// A parameter rather than the package-level flag.CommandLine so a test can
+// register into a throwaway FlagSet and then inspect what it got. That is what
+// makes TestFlagHelpIsOneLineAndGrouped possible, and that test is the only
+// thing standing between -help and the state it was just rescued from: sixty
+// flags whose help had grown to a thousand characters each, and no way to
+// notice the next one doing the same.
+//
+// Returns the three optionalValueFlag values, which cannot be read until after
+// Parse and so cannot live in cfg.
+func registerFlags(fs *flag.FlagSet, cfg *syncConfig) (compressArg, fenceSourceArg, netBufferArg *optionalValueFlag) {
+	// Every flag's help below is ONE LINE, deliberately.
+	//
+	// It used to carry the reasoning: why a default is what it is, what breaks
+	// if it is changed, which combinations are refused. Several ran past a
+	// thousand characters, and the result was a -help nobody read -- the place
+	// where a reader has the least context is the worst place to put the most
+	// text, and the flags a hurried operator most needs to find were buried
+	// between essays about the ones they did not.
+	//
+	// All of that prose now lives in docs/HOWTO.md, organised by task rather
+	// than by flag. Nothing was dropped: where a line here needs a caveat
+	// before it can be used safely, the line says "see HOWTO" and the caveat
+	// is there under a matching heading.
+	//
+	// -help groups these by flagGroups, not by the order they are declared in.
+	fs.StringVar(&cfg.SourceURI, "source-uri", "", "libvirt URI of the source (e.g. qemu+ssh://src/system)")
+	fs.StringVar(&cfg.TargetURI, "target-uri", "", "libvirt URI of the target (e.g. qemu+ssh://dr/system)")
+	fs.StringVar(&cfg.SourceDomain, "source-domain", "", "domain to replicate from")
+	fs.StringVar(&cfg.TargetDomain, "target-domain", "", "domain to replicate into (defaults to -source-domain)")
+	fs.StringVar(&cfg.LocalHostName, "local-host-name", "", "name to record for this machine when a URI names no host")
+
+	fs.StringVar(&cfg.SSHUser, "ssh-user", "", "ssh user (defaults to the URI's user, then ~/.ssh/config, then root)")
+	fs.StringVar(&cfg.SSHKey, "ssh-key", "", "private key path (defaults to ~/.ssh/config's IdentityFile)")
+	fs.StringVar(&cfg.SSHPassword, "ssh-password", "", "ssh password; prefer a key")
+	fs.IntVar(&cfg.SSHPort, "ssh-port", 0, "ssh port (0 = ~/.ssh/config's Port, then 22)")
+	fs.StringVar(&cfg.KnownHosts, "ssh-known-hosts", "", "known_hosts path (defaults to ~/.ssh/known_hosts)")
+	fs.BoolVar(&cfg.SSHInsecure, "ssh-insecure-host-key", false, "skip host key verification (not recommended)")
+	fs.IntVar(&cfg.SSHTimeoutSec, "ssh-timeout-sec", 10, "ssh connect timeout, in seconds")
+
+	fs.BoolVar(&cfg.Start, "start", false, "start a shut-off source in paused mode so it can be read")
+	fs.BoolVar(&cfg.Reinit, "reinit", false, "discard the replica and do a full sync")
+	fs.BoolVar(&cfg.ForceClean, "force-clean", false, "-reinit for a wedged target; also drops the domain and role interlock")
+	fs.IntVar(&cfg.ReinitAfterFailures, "reinit-after-failures", 0, "force a full sync after N consecutive failures (0 disables)")
+	fs.BoolVar(&cfg.IgnoreExternalSnapshot, "ignore-external-snapshot", false, "skip the run entirely if the source has an external snapshot")
+	fs.IntVar(&cfg.TimestampToleranceSec, "timestamp-tolerance-sec", 0, "seconds the replica's mtime may lead the recorded sync time (see HOWTO)")
+
+	fs.StringVar(&cfg.TargetDiskPath, "target-disk-path", "", "directory for the replica's disks on the target")
+	fs.StringVar(&cfg.ReplacedDiskAction, "replaced-disk-action", replacedDiskRename, fmt.Sprintf("what -reinit does with the disk it replaces: %s|%s", replacedDiskRename, replacedDiskDelete))
+	fs.StringVar(&cfg.TargetDiskOwner, "target-disk-owner", util.DiskOwnerAuto, fmt.Sprintf("owner for disks created on the target: %s|%s|user[:group]|:group", util.DiskOwnerAuto, util.DiskOwnerOff))
+
+	fs.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/local/bin/vmsync-bridge-helper", "path to vmsync-bridge-helper on the remote host")
+	fs.BoolVar(&cfg.UseSSH, "use-ssh", false, "tunnel bridged traffic through the existing ssh connection")
+	fs.IntVar(&cfg.IODepth, "io-depth", 8, "NBD read/write pairs kept in flight during the copy")
+
+	fs.StringVar(&cfg.SourceNBDBind, "source-nbd-bind", "0.0.0.0", "bind address for the source's backup export")
+	fs.StringVar(&cfg.SourceNBDPortSpec, "source-nbd-port", portalloc.DefaultSourceSpec, "port range for the source export; one port pins where it starts")
+	fs.StringVar(&cfg.SourceNBDHost, "source-nbd-host", "", "host to reach the source export on (defaults from -source-uri)")
+	fs.StringVar(&cfg.TargetNBDBind, "target-nbd-bind", "0.0.0.0", "bind address for the target's qemu-nbd exports")
+	fs.StringVar(&cfg.TargetNBDPortSpec, "target-nbd-port", portalloc.DefaultTargetSpec, "port range for the target exports; one port pins where they start")
+	fs.StringVar(&cfg.TargetNBDHost, "target-nbd-host", "", "host to reach the target exports on (defaults from -target-uri)")
+
+	fs.StringVar(&cfg.Verify, "verify", "", "read the replica back and compare it with the source: fast|full|qemu-img")
+	fs.BoolVar(&cfg.VerifyFailureReinit, "verify-failure-reinit", false, "on a verify mismatch, recopy once and verify again; needs -verify")
+	fs.BoolVar(&cfg.NoChecksum, "no-checksum", false, "disable the pre-commit integrity check, which is ON by default")
+
+	fs.StringVar(&cfg.Retention, "retention", "", "keep COUNT,INTERVAL point-in-time copies of the replica (e.g. 24,3h)")
+	fs.StringVar(&cfg.CloneRestorePointTo, "clone-to", "", "directory on the target for -clone-restore-point's copies")
+	fs.BoolVar(&cfg.ForceRestore, "force-restore", false, "carry out -restore-restore-point instead of only assessing it")
+	fs.StringVar(&cfg.RestoredBy, "restored-by", "", "who asked for the rollback, recorded on the domain")
+
+	fs.BoolVar(&cfg.Promote, "promote", false, "make the replica live; must run on the replica's own host")
+	fs.BoolVar(&cfg.Invert, "invert", false, "reverse a pair's direction after a failover; run on the old source")
+	fs.BoolVar(&cfg.ShutdownDomain, "shutdown-domain", false, "stop a domain and pause its replication (the planned-failover half)")
+	fs.BoolVar(&cfg.FenceDomain, "fence-domain", false, "stop a domain because a peer was promoted over it; records role=fenced")
+	fs.BoolVar(&cfg.ReadFence, "read-fence", false, "ask a peer whether its promotion fenced this host; prints JSON")
+	fs.StringVar(&cfg.UpdateRole, "update-role", "", "set a domain's replication role and exit: "+strings.Join(libvirtsync.ValidRoles, "|"))
+	fs.BoolVar(&cfg.ListRestorePoints, "list-restore-points", false, "list the restore points kept on the target and exit")
+	fs.StringVar(&cfg.CloneRestorePoint, "clone-restore-point", "", "copy one restore point's disks to -clone-to and exit")
+	fs.StringVar(&cfg.RestoreRestorePoint, "restore-restore-point", "", "put a restore point back over the replica; needs -force-restore")
+
+	fs.StringVar(&cfg.PromoteMode, "promote-mode", string(failover.ModeForced), fmt.Sprintf("recorded with a promotion: %s|%s", failover.ModePlanned, failover.ModeForced))
+	fs.StringVar(&cfg.PromotedBy, "promoted-by", "", "who performed the promotion, recorded for attribution")
+	fs.BoolVar(&cfg.ForcePromote, "force-promote", false, "promote even when the target does not look like a usable replica")
+	fs.IntVar(&cfg.ShutdownTimeoutSec, "shutdown-timeout-sec", 300, "seconds -shutdown-domain/-fence-domain waits for a clean guest shutdown")
+
+	fs.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "write metrics to this path in Prometheus textfile-collector format")
+	fs.StringVar(&cfg.ResultJSON, "result-json", "", "write this run's degradations to this path as JSON")
+	fs.StringVar(&cfg.RunID, "run-id", "", "opaque id recorded in the run lock, for a supervising agent")
+	fs.BoolVar(&cfg.Debug, "debug", false, "enable debug logging")
+	fs.BoolVar(&cfg.ShowVersion, "v", false, "print the version and exit")
+	fs.BoolVar(&cfg.ShowVersion, "version", false, "print the version and exit")
+	fs.StringVar(&cfg.TestFault, "test", "", "FOR TESTING ONLY: inject a deliberate fault; two CORRUPT DATA (see HOWTO)")
+
+	compressArg = &optionalValueFlag{bareDefault: "s2"}
+	fenceSourceArg = &optionalValueFlag{bareDefault: fenceSourceAuto}
+	netBufferArg = &optionalValueFlag{bareDefault: "128k,1G"}
+	fs.Var(compressArg, "compress", "compress NBD traffic: zstd|s2 (bare = s2); needs the bridge helper on the target")
+	// No flag default, deliberately: one literal cannot be right for both
+	// algorithms. "3" is a valid zstd level and an invalid s2 mode, "better"
+	// is the reverse -- so whichever were declared, --help would print a
+	// value the other algorithm refuses outright. Left empty, Go omits the
+	// "(default ...)" clause altogether and the one-liner states both, which
+	// is the only accurate thing to say before -compress is known.
+	// streamrelay.ResolveLevel turns empty into the right one.
+	fs.StringVar(&cfg.CompressLevel, "compress-level", "", "zstd 1-19 (default 3), or s2 default|better|best (default better)")
+	fs.Var(netBufferArg, "netbuffer", "buffer bridge traffic, as <blocksize>,<buffersize> (bare = 128k,1G)")
+	fs.Var(fenceSourceArg, "fence-source", "with -promote: arm a fence on the displaced source (bare = from replica_source)")
+
+	return compressArg, fenceSourceArg, netBufferArg
 }
