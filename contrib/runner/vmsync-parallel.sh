@@ -44,7 +44,7 @@ MAX_BANDWIDTH=850M
 # Reinitialize failed sync options (0 means no reinit after n failures)
 # This is a dangerous option since it would overwrite target after 5 failures
 # You'd lose all modifications on target. Only enable if you know exactly what you're doing
-REINIT_AFTER_FAILURES=5
+REINIT_AFTER_FAILURES=0
 
 # Optional prometheus metrics
 PROMETHEUS_TEXTFILE_PATH=/var/lib/node_exporter/textfile_collector
@@ -187,7 +187,7 @@ replicate() {
                 opts="${opts} -reinit"
         fi
         if [ "${VERIFY}" == true ]; then
-                opts="${opts} -verify=full"
+                opts="${opts} -verify=fast"
                 ports_increse=2
         fi
 
