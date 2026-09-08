@@ -63,10 +63,23 @@ type ScheduleDoc struct {
 	PollWaitSeconds       int            `json:"poll_wait_seconds,omitempty"`
 	CadenceSeconds        map[string]int `json:"cadence_seconds,omitempty"`
 
-	Schedule               []ScheduleEntry `json:"schedule,omitempty"`
-	MaxConcurrentSyncs     int             `json:"max_concurrent_syncs,omitempty"`
-	TargetReplicationSlots map[string]int  `json:"target_replication_slots,omitempty"`
-	ShutdownTimeoutSec     int             `json:"shutdown_timeout_sec,omitempty"`
+	Schedule []ScheduleEntry `json:"schedule,omitempty"`
+	// Templates are the named cadences entries inherit from, keyed by name.
+	//
+	// Present here, and not only in the UI's document, because the whole
+	// reason templates resolve in the AGENT is that a standalone agent has no
+	// control plane to resolve on its behalf. Without this field the strict
+	// decoder would reject a hand-written "templates" block as an unknown key,
+	// and the feature would be UI-only -- which would make the resolution
+	// decision in docs/design/scheduling.md pointless.
+	//
+	// A template named "default" additionally covers every syncable VM with no
+	// entry of its own, so a standalone file can legitimately carry templates
+	// and NO entries at all.
+	Templates              map[string]ScheduleTemplate `json:"templates,omitempty"`
+	MaxConcurrentSyncs     int                         `json:"max_concurrent_syncs,omitempty"`
+	TargetReplicationSlots map[string]int              `json:"target_replication_slots,omitempty"`
+	ShutdownTimeoutSec     int                         `json:"shutdown_timeout_sec,omitempty"`
 }
 
 // ScheduleSource is the envelope the state dir keeps beside the document: how
@@ -99,6 +112,7 @@ func (d ScheduleDoc) toUIConfig() UIConfig {
 		PollWaitSeconds:        d.PollWaitSeconds,
 		CadenceSeconds:         d.CadenceSeconds,
 		Schedule:               d.Schedule,
+		Templates:              d.Templates,
 		MaxConcurrentSyncs:     d.MaxConcurrentSyncs,
 		TargetReplicationSlots: d.TargetReplicationSlots,
 		ShutdownTimeoutSec:     d.ShutdownTimeoutSec,
@@ -118,6 +132,7 @@ func scheduleDocFrom(c UIConfig) ScheduleDoc {
 		PollWaitSeconds:        c.PollWaitSeconds,
 		CadenceSeconds:         c.CadenceSeconds,
 		Schedule:               c.Schedule,
+		Templates:              c.Templates,
 		MaxConcurrentSyncs:     c.MaxConcurrentSyncs,
 		TargetReplicationSlots: c.TargetReplicationSlots,
 		ShutdownTimeoutSec:     c.ShutdownTimeoutSec,
@@ -181,11 +196,42 @@ func (c UIConfig) Complaints() []string {
 		add("shutdown_timeout_sec %d is out of range and will be clamped: %v", c.ShutdownTimeoutSec, err)
 	}
 
+	for name, t := range c.Templates {
+		// A bad template is a bad hundred entries, and on this path nothing
+		// refuses it: the control plane's document is input to survive, not a
+		// file to reject. So it has to be loud instead.
+		if err := t.Validate(); err != nil {
+			add("template %q is unusable and every entry inheriting it will be skipped: %v", name, err)
+		} else if t.Name != "" && t.Name != name {
+			add("template %q is named %q inside its own definition; entries refer to it by the key, so the inner name is ignored", name, t.Name)
+		}
+	}
+
 	seen := map[string]bool{}
-	for i, e := range c.Schedule {
+	for i, raw := range c.Schedule {
+		// Judged RESOLVED, exactly as validateStandaloneConfig does.
+		//
+		// Judging the raw entry was right before templates existed and became
+		// wrong the moment they did: an entry inheriting its cadence carries
+		// interval_seconds 0 legitimately, so every templated host logged
+		// "has interval_seconds 0 and will never run" about entries that run
+		// perfectly well -- and an entry overriding compress_level under a
+		// template supplying compress was reported as having an unusable
+		// profile. Warnings that are false about a working system are worse
+		// than none: they send an operator hunting a fault that is not there,
+		// and they teach them to ignore this whole channel.
+		e := resolveEntry(raw, c.Templates)
 		where := fmt.Sprintf("schedule entry %d", i+1)
 		if e.VM != "" {
 			where = fmt.Sprintf("schedule entry %d (%s)", i+1, e.VM)
+		}
+		if raw.Template != "" {
+			if _, ok := c.Templates[raw.Template]; !ok {
+				// resolveEntry returns such an entry unchanged, so it will
+				// fail on its own fields below with a reason that names the
+				// symptom rather than the cause.
+				add("%s names template %q, which this document does not define; it will run on its own settings or not at all", where, raw.Template)
+			}
 		}
 		// These three are what launchDue skips SILENTLY -- the only branch in
 		// that loop with neither a log line nor a metric. A VM that never runs
@@ -204,6 +250,16 @@ func (c UIConfig) Complaints() []string {
 		}
 		if err := e.Profile.Validate(); err != nil {
 			add("%s has an unusable profile and will be skipped every tick: %v", where, err)
+		}
+		// The verify cadence had no check at all on this path. Only the
+		// standalone loader ran validateVerifyCadence, so a control plane
+		// could publish an entry carrying BOTH cadence forms, or a calendar
+		// that does not parse, and the agent adopted it without a word --
+		// then quietly never verified that VM. Complained about rather than
+		// refused, which is this path's whole doctrine: a separately-versioned
+		// program's output is input to survive.
+		if err := validateVerifyCadence(e.VerifyDays, e.VerifyWindow, e.VerifyIntervalSeconds, e.Profile.Verify); err != nil {
+			add("%s %v, so it will never verify", where, err)
 		}
 		if err := validateShutdownTimeoutSec(e.ShutdownTimeoutSec); err != nil && e.ShutdownTimeoutSec != 0 {
 			add("%s: shutdown_timeout_sec %d is out of range and will be clamped: %v", where, e.ShutdownTimeoutSec, err)

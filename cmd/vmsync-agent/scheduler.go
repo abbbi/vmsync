@@ -34,6 +34,7 @@ import (
 	"vmsync/pkg/inventory"
 	"vmsync/pkg/libvirtsync"
 	"vmsync/pkg/runresult"
+	"vmsync/pkg/schedcal"
 	"vmsync/pkg/trace"
 	"vmsync/pkg/util"
 )
@@ -137,6 +138,11 @@ type Scheduler struct {
 	// ALSO carry -verify. Separate from nextRun because the two cadences are
 	// independent -- minutes for the copy, hours or days for the read-back.
 	nextVerify map[string]time.Time
+	// lastVerified is the calendar form's equivalent: the START of the verify
+	// occurrence this VM was last verified in. A start rather than a timestamp
+	// because that is what makes a ten-hour window fire once instead of on
+	// every sync inside it -- see verifyDueByCalendar.
+	lastVerified map[string]time.Time
 	// syncable is the cached list of VMs a default template may cover, with
 	// the time it was taken. See syncableVMs.
 	syncable   []string
@@ -149,14 +155,15 @@ type Scheduler struct {
 
 func NewScheduler(lv *live, state *sharedState) *Scheduler {
 	return &Scheduler{
-		lv:         lv,
-		state:      state,
-		lockDir:    util.RunLockDir,
-		nextRun:    map[string]time.Time{},
-		nextVerify: map[string]time.Time{},
-		inFlight:   map[string]bool{},
-		hostLoad:   map[string]int{},
-		metrics:    lv.get().metrics,
+		lv:           lv,
+		state:        state,
+		lockDir:      util.RunLockDir,
+		nextRun:      map[string]time.Time{},
+		nextVerify:   map[string]time.Time{},
+		lastVerified: map[string]time.Time{},
+		inFlight:     map[string]bool{},
+		hostLoad:     map[string]int{},
+		metrics:      lv.get().metrics,
 	}
 }
 
@@ -300,9 +307,22 @@ func (s *Scheduler) launchDue(ctx context.Context, wg *sync.WaitGroup) {
 		// Both are local values, so neither mutation escapes this iteration.
 		if !s.verifyDue(entry, now) {
 			req.Profile.Verify = ""
+			// VerifyFailureReinit goes with it, and must: CommandArgs emits
+			// -verify-failure-reinit whenever the field is set, and vmsync
+			// REFUSES that flag without -verify (it reacts to a verification
+			// failure, so without a verification there is nothing to react
+			// to) -- exiting 2 before it copies a byte.
+			//
+			// Leaving it set therefore did not merely mis-describe the run, it
+			// broke it: a VM with verify+reinit and any cadence replicated
+			// only during its verify window and failed every interval in
+			// between, logged as an ordinary sync failure with no hint that
+			// the argv was the cause.
+			req.Profile.VerifyFailureReinit = false
 			// Kept in step so anything downstream reading the entry sees the
 			// same decision the command line got.
 			entry.Profile.Verify = ""
+			entry.Profile.VerifyFailureReinit = false
 		} else if entry.VerifyIntervalSeconds > 0 {
 			trace.Info("scheduled sync will also verify: its verify cadence has come due",
 				"vm", entry.VM, "mode", entry.Profile.Verify,
@@ -351,9 +371,10 @@ func (s *Scheduler) due(entry ScheduleEntry, now time.Time) bool {
 // decide whether to run -- due() already did -- only whether THIS run carries
 // -verify.
 //
-// Zero means every run verifies, which is the behaviour before this existed
-// and stays the default: a profile that names a verify mode and no cadence
-// gets what it always got.
+// Zero means every run verifies. A profile that names a verify mode and no
+// cadence is asking to be verified, and the least surprising reading of "how
+// often: unspecified" is "every time" -- the safe direction, since the other
+// one is a check somebody believes is running and is not.
 //
 // Staggered on first sight exactly as nextRun is, and for a sharper reason.
 // Sync intervals are minutes, so a burst is survivable; verify intervals are
@@ -369,6 +390,9 @@ func (s *Scheduler) due(entry ScheduleEntry, now time.Time) bool {
 func (s *Scheduler) verifyDue(entry ScheduleEntry, now time.Time) bool {
 	if entry.Profile.Verify == "" {
 		return false
+	}
+	if entry.VerifyDays != "" || entry.VerifyWindow != "" {
+		return s.verifyDueByCalendar(entry, now)
 	}
 	interval := time.Duration(entry.VerifyIntervalSeconds) * time.Second
 	if interval <= 0 {
@@ -388,6 +412,108 @@ func (s *Scheduler) verifyDue(entry ScheduleEntry, now time.Time) bool {
 	// it: an agent down for a week must not owe seven verifies.
 	s.nextVerify[entry.VM] = now.Add(interval)
 	return true
+}
+
+// verifyDueByCalendar is verifyDue for an entry whose cadence is a window
+// rather than an interval: verify on the first sync that lands inside the
+// window, then not again until the next one opens.
+//
+// now is the agent's own local time, deliberately. A verify window means the
+// quiet hours where the disks are, so an estate spanning zones wants each
+// host's night rather than the console's -- and the host is the only party
+// that knows its own. The control plane displays the zone it is told; it does
+// not pick it.
+//
+// A MISSED window is simply missed, and that is the point. Due only returns
+// true while now is inside an occurrence, so an agent that was down for the
+// whole of Sunday does not wake on Monday owing a verify and drag a
+// full-image read across a working day. A window nobody was up for is a
+// person's problem to notice, which is what the report is for -- it is not
+// the scheduler's to repay at the worst possible moment.
+//
+// Neither staggered nor skipped on first sight, unlike the interval path.
+// Both of those exist to break up a burst, and a window IS the burst control:
+// an operator writing 02:00-12:00 has already said where the load may land,
+// and the syncs inside it arrive spread across ten hours by their own
+// cadences. Skipping the first sighting there would cost a whole month, not a
+// cycle.
+//
+// The cost of keeping lastVerified only in memory is bounded and accepted: an
+// agent restarting INSIDE a window re-verifies each of its VMs once more that
+// window. Each such verify rides a sync that was already due and is still
+// bounded by max_concurrent_syncs, so the worst case is some extra reads
+// during hours chosen for exactly that.
+func (s *Scheduler) verifyDueByCalendar(entry ScheduleEntry, now time.Time) bool {
+	sched, err := schedcal.Parse(entry.VerifyDays, entry.VerifyWindow)
+	if err != nil {
+		// Refused rather than guessed, and loudly. Both remaining readings are
+		// bad -- verifying every sync turns a typo into a full-image read on
+		// both sides forever, and verifying none is the silent no-check this
+		// codebase keeps refusing elsewhere -- so this takes the one that is
+		// recoverable and makes sure it is never quiet, on every run of a VM
+		// whose calendar does not parse.
+		trace.Warning("verify calendar does not parse, so this run will not verify",
+			"vm", entry.VM, "verify_days", entry.VerifyDays,
+			"verify_window", entry.VerifyWindow, "error", err)
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastVerified == nil {
+		// NewScheduler makes this map, so production never needs the guard --
+		// but a write to a nil map panics, this runs on the scheduler
+		// goroutine, and a panic there stops replicating the whole estate.
+		// One line against that is cheap.
+		s.lastVerified = map[string]time.Time{}
+	}
+	start, due := sched.Due(now, s.lastVerified[entry.VM])
+	if !due {
+		return false
+	}
+	// The occurrence's start, not now: that is what makes a ten-hour window
+	// fire once rather than on every sync that lands in it.
+	s.lastVerified[entry.VM] = start
+	zone, _ := now.Zone()
+	trace.Info("scheduled sync will also verify: it landed in the verify window",
+		"vm", entry.VM, "mode", entry.Profile.Verify,
+		"verify_days", entry.VerifyDays, "verify_window", entry.VerifyWindow,
+		"window_opened", start.Format(time.RFC3339), "timezone", zone)
+	return true
+}
+
+// releaseVerifyOccurrence gives back a calendar verify window that was claimed
+// at launch by a run which then did not verify.
+//
+// verifyDueByCalendar has to claim the occurrence at the decision point --
+// otherwise the 10s tick would set -verify on every sync across a ten-hour
+// window. But that claim is a promise the run has not kept yet, and a sync
+// that fails or stands down on lock contention keeps none of it.
+//
+// Without this, one failed sync consumed the whole window, and since a missed
+// window is deliberately never made up, a single transient failure at 02:05
+// cost the VM its entire MONTH's verification. The interval path has the same
+// shape and it barely matters there -- it comes round again in an hour. Here
+// the asymmetry is thirty-fold, which is what makes it worth undoing.
+//
+// Giving it back simply re-arms the window: any later sync inside it verifies,
+// and once the window closes Due goes quiet on its own.
+func (s *Scheduler) releaseVerifyOccurrence(entry ScheduleEntry, plan syncPlan) {
+	// plan.Profile, not entry's: the plan is what became the command line, so
+	// it is the authoritative record of whether this run carried -verify.
+	if plan.Profile.Verify == "" {
+		return
+	}
+	if entry.VerifyDays == "" && entry.VerifyWindow == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, claimed := s.lastVerified[entry.VM]; !claimed {
+		return
+	}
+	delete(s.lastVerified, entry.VM)
+	trace.Info("the verify window is re-armed: this run claimed it but did not verify",
+		"vm", entry.VM, "verify_days", entry.VerifyDays, "verify_window", entry.VerifyWindow)
 }
 
 // foreignRunHolds reports whether a vmsync THIS agent did not start is still
@@ -814,11 +940,13 @@ func (s *Scheduler) runOne(ctx context.Context, cfg *agentConfig, entry Schedule
 		trace.Info("a scheduled sync stood down: another vmsync is already working on this domain, and nothing was changed",
 			"vm", entry.VM, "target", plan.targetHost)
 		s.metrics.runBusy()
+		s.releaseVerifyOccurrence(entry, plan)
 		return
 	}
 
 	if err != nil {
 		res.Error = err.Error()
+		s.releaseVerifyOccurrence(entry, plan)
 		trace.Error("scheduled sync failed", "vm", entry.VM, "target", plan.targetHost,
 			"exit_code", code, "duration_s", res.DurationSecs, "error", err)
 		// vmsync's own output goes to the host's log too, not only into the

@@ -210,3 +210,137 @@ func TestComplaintsIsSilentOnAGoodConfig(t *testing.T) {
 		t.Errorf("a valid configuration produced complaints: %v", got)
 	}
 }
+
+// Complaints judged RAW entries, which was right before templates existed and
+// became wrong the moment they did. Warnings that are false about a working
+// system are worse than none: they send an operator hunting a fault that is
+// not there, and they teach them to ignore the channel.
+func TestComplaintsJudgesResolvedEntries(t *testing.T) {
+	base := func(sched []ScheduleEntry, tpl map[string]ScheduleTemplate) UIConfig {
+		return UIConfig{ReportIntervalSeconds: 60, PollWaitSeconds: 30,
+			MaxConcurrentSyncs: 4, Schedule: sched, Templates: tpl}
+	}
+
+	t.Run("an inherited interval is not reported as never running", func(t *testing.T) {
+		c := base(
+			[]ScheduleEntry{{VM: "db01", Enabled: true, Template: "hourly"}},
+			map[string]ScheduleTemplate{"hourly": {Name: "hourly", IntervalSeconds: 3600, Enabled: true}},
+		)
+		for _, g := range c.Complaints() {
+			if strings.Contains(g, "interval_seconds 0") {
+				t.Errorf("complained %q about an entry that inherits 3600s and runs fine", g)
+			}
+		}
+	})
+
+	t.Run("an inherited profile half is not reported as unusable", func(t *testing.T) {
+		// compress_level without compress is invalid ALONE and valid once the
+		// template's compress is resolved in. Judging the raw entry called
+		// this broken on every adoption.
+		c := base(
+			[]ScheduleEntry{{VM: "web01", Enabled: true, Template: "z",
+				Profile: SyncProfile{CompressLevel: "9"}}},
+			map[string]ScheduleTemplate{"z": {Name: "z", IntervalSeconds: 900, Enabled: true,
+				Profile: SyncProfile{Compress: "zstd", CompressLevel: "5"}}},
+		)
+		for _, g := range c.Complaints() {
+			if strings.Contains(g, "unusable profile") {
+				t.Errorf("complained %q about a profile that resolves cleanly", g)
+			}
+		}
+	})
+
+	t.Run("a genuinely broken entry is still reported", func(t *testing.T) {
+		// The fix must not silence the complaints that were the point: an
+		// entry with no cadence anywhere still never runs.
+		c := base([]ScheduleEntry{{VM: "web01", Enabled: true}}, nil)
+		if !containsSubstring(c.Complaints(), "interval_seconds") {
+			t.Errorf("stopped reporting an entry that genuinely never runs: %v", c.Complaints())
+		}
+	})
+
+	t.Run("the verify cadence is checked on this path at all", func(t *testing.T) {
+		// It never was. Only the standalone loader ran validateVerifyCadence,
+		// so a control plane could publish either of these and the agent
+		// adopted it without a word, then quietly never verified that VM.
+		for _, tc := range []struct {
+			name string
+			e    ScheduleEntry
+			want string
+		}{
+			{
+				"both cadence forms at once",
+				ScheduleEntry{VM: "web01", IntervalSeconds: 900, Enabled: true,
+					Profile:               SyncProfile{Verify: "fast"},
+					VerifyIntervalSeconds: 86400,
+					VerifyDays:            "Sun", VerifyWindow: "02:00-12:00"},
+				"both",
+			},
+			{
+				"a calendar that does not parse",
+				ScheduleEntry{VM: "web01", IntervalSeconds: 900, Enabled: true,
+					Profile:    SyncProfile{Verify: "fast"},
+					VerifyDays: "Frunday"},
+				"calendar",
+			},
+			{
+				"a cadence with no verify mode",
+				ScheduleEntry{VM: "web01", IntervalSeconds: 900, Enabled: true,
+					VerifyDays: "Sun", VerifyWindow: "02:00-12:00"},
+				"verify mode",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				got := base([]ScheduleEntry{tc.e}, nil).Complaints()
+				if !containsSubstring(got, tc.want) {
+					t.Errorf("no complaint mentioning %q; got %v", tc.want, got)
+				}
+			})
+		}
+	})
+
+	t.Run("a bad template is reported once, not once per entry", func(t *testing.T) {
+		// On this path nothing refuses it -- the control plane's document is
+		// input to survive -- so it has to be loud instead.
+		c := base(
+			[]ScheduleEntry{{VM: "a", Enabled: true, Template: "bad"}, {VM: "b", Enabled: true, Template: "bad"}},
+			map[string]ScheduleTemplate{"bad": {Name: "bad", IntervalSeconds: 0}},
+		)
+		n := 0
+		for _, g := range c.Complaints() {
+			if strings.Contains(g, `template "bad"`) {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("the shared template was complained about %d times, want once: %v", n, c.Complaints())
+		}
+	})
+
+	t.Run("a valid templated config is silent", func(t *testing.T) {
+		c := base(
+			[]ScheduleEntry{
+				{VM: "db01", Enabled: true, Template: "nightly"},
+				{VM: "web01", Enabled: true, IntervalSeconds: 300},
+			},
+			map[string]ScheduleTemplate{
+				"nightly": {Name: "nightly", IntervalSeconds: 3600, Enabled: true,
+					VerifyDays: "Sun *-*-01..07", VerifyWindow: "02:00-12:00",
+					Profile: SyncProfile{Verify: "fast"}},
+				DefaultTemplateName: {Name: DefaultTemplateName, IntervalSeconds: 900, Enabled: true},
+			},
+		)
+		if got := c.Complaints(); len(got) != 0 {
+			t.Errorf("a valid templated configuration produced complaints: %v", got)
+		}
+	})
+}
+
+func containsSubstring(all []string, want string) bool {
+	for _, s := range all {
+		if strings.Contains(s, want) {
+			return true
+		}
+	}
+	return false
+}

@@ -205,9 +205,9 @@ func TestVerifyDue(t *testing.T) {
 	})
 
 	t.Run("no cadence means every sync, which is the old behaviour", func(t *testing.T) {
-		// The default has to stay what it was: a profile that named a verify
-		// mode verified on every run, and an estate upgrading must not
-		// silently start verifying less often than it used to.
+		// A profile naming a verify mode and no cadence is asking to be
+		// verified, and "how often: unspecified" reads as "every time". The
+		// other reading is a check somebody believes is running and is not.
 		e := ScheduleEntry{VM: "web01", Profile: SyncProfile{Verify: "fast"}}
 		for i := 0; i < 3; i++ {
 			if !s.verifyDue(e, now.Add(time.Duration(i)*time.Minute)) {
@@ -276,6 +276,313 @@ func TestVerifyDue(t *testing.T) {
 		}
 		if len(seen) < 4 {
 			t.Errorf("6 VMs got %d distinct verify times; they are not being spread", len(seen))
+		}
+	})
+}
+
+// calVM is an entry whose verify cadence is a calendar rather than an
+// interval: the first Sunday of the month, 02:00 to 12:00.
+func calVM(vm string) ScheduleEntry {
+	return ScheduleEntry{
+		VM:           vm,
+		Profile:      SyncProfile{Verify: "fast"},
+		VerifyDays:   "Sun *-*-01..07",
+		VerifyWindow: "02:00-12:00",
+	}
+}
+
+// newSched is a Scheduler with only the maps verifyDue touches, for the
+// calendar cases.
+func newSched() *Scheduler {
+	return &Scheduler{
+		nextVerify:   map[string]time.Time{},
+		lastVerified: map[string]time.Time{},
+	}
+}
+
+func schedTime(t *testing.T, s string) time.Time {
+	t.Helper()
+	// Local, because that is what verifyDueByCalendar is given: the window
+	// means the quiet hours where the disks are, so the agent reads its own
+	// clock and the console displays the zone it is told.
+	ts, err := time.ParseInLocation("2006-01-02 15:04", s, time.Local)
+	if err != nil {
+		t.Fatalf("bad test time %q: %v", s, err)
+	}
+	return ts
+}
+
+// The calendar form of the verify cadence. Separate from the interval cases
+// above because the behaviour deliberately DIFFERS in two ways -- no stagger,
+// no first-sighting skip -- and a missed window is dropped rather than owed.
+func TestVerifyDueByCalendar(t *testing.T) {
+	t.Run("a sync inside the window verifies, and only the first one does", func(t *testing.T) {
+		s := newSched()
+		e := calVM("web01")
+		// 1 March 2026 is a Sunday, and day 1 is inside 01..07.
+		if !s.verifyDue(e, schedTime(t, "2026-03-01 02:30")) {
+			t.Fatal("the first sync inside the window did not verify")
+		}
+		// A ten-hour window and a short sync cadence means dozens of syncs
+		// land in it. Verifying on each would turn a monthly read-back into a
+		// morning of them.
+		for _, at := range []string{"2026-03-01 02:31", "2026-03-01 06:00", "2026-03-01 11:59"} {
+			if s.verifyDue(e, schedTime(t, at)) {
+				t.Errorf("verified again at %s; one occurrence must fire once", at)
+			}
+		}
+	})
+
+	t.Run("the first sighting DOES verify, unlike the interval form", func(t *testing.T) {
+		// The opposite of the interval path on purpose. There, skipping the
+		// first sighting costs one cycle and breaks up a restart burst. Here
+		// the window IS the burst control -- the operator already said where
+		// the load may land -- and skipping a cycle would cost a whole month.
+		s := newSched()
+		if !s.verifyDue(calVM("db01"), schedTime(t, "2026-03-01 02:00")) {
+			t.Error("did not verify on first sight; with a monthly window that defers the verify by a month")
+		}
+	})
+
+	t.Run("syncs outside the window do not verify", func(t *testing.T) {
+		s := newSched()
+		e := calVM("web01")
+		for _, tc := range []struct{ at, why string }{
+			{"2026-03-01 01:59", "before the window opens"},
+			{"2026-03-01 12:00", "the end is excluded"},
+			{"2026-03-01 18:00", "after the window closes"},
+			{"2026-03-08 03:00", "the SECOND Sunday, not the first"},
+			{"2026-03-02 03:00", "a Monday inside 01..07"},
+		} {
+			if s.verifyDue(e, schedTime(t, tc.at)) {
+				t.Errorf("verified at %s (%s)", tc.at, tc.why)
+			}
+		}
+	})
+
+	t.Run("the next month's window fires again", func(t *testing.T) {
+		s := newSched()
+		e := calVM("web01")
+		if !s.verifyDue(e, schedTime(t, "2026-03-01 03:00")) {
+			t.Fatal("March did not verify")
+		}
+		// 5 April 2026 is the first Sunday. A stale lastVerified would make
+		// this the last verify the VM ever got.
+		if !s.verifyDue(e, schedTime(t, "2026-04-05 03:00")) {
+			t.Error("April did not verify; the occurrence start is not advancing")
+		}
+	})
+
+	t.Run("a missed window is dropped, not owed", func(t *testing.T) {
+		// The rule the operator asked for: an agent down for its window has
+		// not created a debt for the scheduler to repay at the worst possible
+		// moment. It is a person's problem to notice, which is what the
+		// report is for.
+		s := newSched()
+		e := calVM("web01")
+		// From a cold start, with no verify ever recorded.
+		if s.verifyDue(e, schedTime(t, "2026-03-02 09:00")) {
+			t.Error("verified the morning after a missed window; a missed occurrence must not back-fire")
+		}
+		// And it does not verify every sync for the rest of the month either.
+		for _, at := range []string{"2026-03-10 09:00", "2026-03-25 22:00"} {
+			if s.verifyDue(e, schedTime(t, at)) {
+				t.Errorf("verified at %s, outside any window", at)
+			}
+		}
+		// April's window still fires normally.
+		if !s.verifyDue(e, schedTime(t, "2026-04-05 04:00")) {
+			t.Error("April did not verify after March was missed")
+		}
+	})
+
+	t.Run("a window missed AFTER a successful one is still not owed", func(t *testing.T) {
+		// The case the cold-start version above cannot reach, and the one an
+		// implementation is most likely to get wrong: an overdue VM is exactly
+		// what tempts a "well, it has been five weeks" fallback. That fallback
+		// is what the operator refused -- it drags a full-image read on both
+		// sides across a working day, at the moment the estate is least able
+		// to absorb it, to repay a window a person is better placed to notice.
+		s := newSched()
+		e := calVM("web01")
+		// 1 February 2026 is a Sunday: February's window, verified.
+		if !s.verifyDue(e, schedTime(t, "2026-02-01 03:00")) {
+			t.Fatal("February did not verify")
+		}
+		// The agent is down for the whole of March's window. It comes back
+		// having gone more than a month without a verify, and must still wait.
+		for _, tc := range []struct{ at, why string }{
+			{"2026-03-02 09:00", "the morning after the missed window"},
+			{"2026-03-20 14:00", "three weeks overdue"},
+			{"2026-04-04 23:00", "an hour before April's Sunday, and five weeks overdue"},
+			{"2026-04-05 01:59", "a minute before April's window opens"},
+		} {
+			if s.verifyDue(e, schedTime(t, tc.at)) {
+				t.Errorf("verified at %s (%s); a missed window must not be owed", tc.at, tc.why)
+			}
+		}
+		// And April's own window still fires, so waiting is not the same as
+		// giving up.
+		if !s.verifyDue(e, schedTime(t, "2026-04-05 02:00")) {
+			t.Error("April did not verify; skipping a window must not disable the schedule")
+		}
+	})
+
+	t.Run("VMs are not staggered: the window already spreads them", func(t *testing.T) {
+		// Deliberately unlike the interval path. Staggering inside a window
+		// the operator chose would push some VMs past its end and skip them
+		// for the month.
+		s := newSched()
+		for _, vm := range []string{"web01", "db01", "mail01", "app01"} {
+			if !s.verifyDue(calVM(vm), schedTime(t, "2026-03-01 02:00")) {
+				t.Errorf("%s did not verify at the window's open", vm)
+			}
+		}
+	})
+
+	t.Run("no verify mode means never, whatever the calendar says", func(t *testing.T) {
+		s := newSched()
+		e := calVM("web01")
+		e.Profile.Verify = ""
+		if s.verifyDue(e, schedTime(t, "2026-03-01 03:00")) {
+			t.Error("verified with no verify mode; there is nothing to run")
+		}
+	})
+
+	t.Run("a window with no days means every day", func(t *testing.T) {
+		s := newSched()
+		e := ScheduleEntry{VM: "web01", Profile: SyncProfile{Verify: "fast"},
+			VerifyWindow: "02:00-04:00"}
+		if !s.verifyDue(e, schedTime(t, "2026-03-04 03:00")) {
+			t.Fatal("a Wednesday did not verify under a days-less window")
+		}
+		if !s.verifyDue(e, schedTime(t, "2026-03-05 03:00")) {
+			t.Error("the next day did not verify; a daily window must fire daily")
+		}
+	})
+
+	t.Run("days with no window means once that day", func(t *testing.T) {
+		s := newSched()
+		e := ScheduleEntry{VM: "web01", Profile: SyncProfile{Verify: "fast"},
+			VerifyDays: "Sun"}
+		if !s.verifyDue(e, schedTime(t, "2026-03-01 09:00")) {
+			t.Fatal("Sunday did not verify")
+		}
+		if s.verifyDue(e, schedTime(t, "2026-03-01 20:00")) {
+			t.Error("verified twice on one Sunday")
+		}
+		if s.verifyDue(e, schedTime(t, "2026-03-04 09:00")) {
+			t.Error("verified on a Wednesday")
+		}
+		if !s.verifyDue(e, schedTime(t, "2026-03-08 09:00")) {
+			t.Error("the next Sunday did not verify")
+		}
+	})
+
+	t.Run("an unparseable calendar does not verify, and does not panic", func(t *testing.T) {
+		// The remaining readings are both bad: verifying every sync turns a
+		// typo into a full-image read on both sides forever. This takes the
+		// recoverable one and logs it on every run.
+		s := newSched()
+		e := calVM("web01")
+		e.VerifyDays = "Frunday"
+		if s.verifyDue(e, schedTime(t, "2026-03-01 03:00")) {
+			t.Error("verified on a calendar that does not parse")
+		}
+	})
+
+	t.Run("a nil lastVerified map does not panic the scheduler goroutine", func(t *testing.T) {
+		// A Scheduler built as a literal, which every test above does.
+		// Panicking here would stop replicating the whole estate.
+		s := &Scheduler{nextVerify: map[string]time.Time{}}
+		if !s.verifyDue(calVM("web01"), schedTime(t, "2026-03-01 03:00")) {
+			t.Error("did not verify with a lazily-created map")
+		}
+	})
+
+	t.Run("the interval form is untouched when no calendar is set", func(t *testing.T) {
+		// The calendar branch must be reached only by entries that asked for
+		// it. An entry with no verify_days anywhere keeps the interval
+		// behaviour exactly, stagger and first-sighting skip included.
+		s := newSched()
+		e := ScheduleEntry{VM: "db01", Profile: SyncProfile{Verify: "fast"}, VerifyIntervalSeconds: 3600}
+		now := time.Unix(1_800_000_000, 0)
+		if s.verifyDue(e, now) {
+			t.Error("verified on first sight; the interval path skips it")
+		}
+		if !s.verifyDue(e, now.Add(2*time.Hour)) {
+			t.Error("the interval path stopped working")
+		}
+	})
+}
+
+// verifyDueByCalendar claims the occurrence at the LAUNCH decision, because
+// otherwise the 10s tick would set -verify on every sync across a ten-hour
+// window. That claim is a promise the run has not kept yet, and a run that
+// fails or stands down keeps none of it.
+//
+// Since a missed window is deliberately never made up, one transient failure
+// at 02:05 used to cost the VM its whole MONTH of verification.
+func TestFailedRunGivesBackTheVerifyWindow(t *testing.T) {
+	verifying := syncPlan{SyncRequest: SyncRequest{Profile: SyncProfile{Verify: "fast"}}}
+
+	t.Run("a failed run re-arms the window for the next sync inside it", func(t *testing.T) {
+		s := newSched()
+		e := calVM("web01")
+		if !s.verifyDue(e, schedTime(t, "2026-03-01 02:00")) {
+			t.Fatal("the first sync in the window did not verify")
+		}
+		// Without the release, this second sync would not verify and the
+		// month's occurrence would be spent on a run that failed.
+		s.releaseVerifyOccurrence(e, verifying)
+		if !s.verifyDue(e, schedTime(t, "2026-03-01 02:15")) {
+			t.Error("the next sync in the window did not verify after the first failed")
+		}
+	})
+
+	t.Run("giving it back does not reopen a window that has closed", func(t *testing.T) {
+		// Re-arming must not become the interval backstop the operator
+		// refused: outside the window nothing fires, however overdue.
+		s := newSched()
+		e := calVM("web01")
+		s.verifyDue(e, schedTime(t, "2026-03-01 11:59"))
+		s.releaseVerifyOccurrence(e, verifying)
+		for _, at := range []string{"2026-03-01 12:00", "2026-03-02 09:00", "2026-03-20 03:00"} {
+			if s.verifyDue(e, schedTime(t, at)) {
+				t.Errorf("verified at %s, outside the window", at)
+			}
+		}
+	})
+
+	t.Run("a run that was not going to verify releases nothing", func(t *testing.T) {
+		// The plan is the authoritative record of what the command line
+		// carried. A non-verifying run must not clear a claim made by the
+		// verifying run that is still in flight beside it.
+		s := newSched()
+		e := calVM("web01")
+		if !s.verifyDue(e, schedTime(t, "2026-03-01 02:00")) {
+			t.Fatal("the first sync did not verify")
+		}
+		s.releaseVerifyOccurrence(e, syncPlan{}) // Profile.Verify == ""
+		if s.verifyDue(e, schedTime(t, "2026-03-01 03:00")) {
+			t.Error("a non-verifying run gave back another run's claim")
+		}
+	})
+
+	t.Run("the interval form is not touched", func(t *testing.T) {
+		// releaseVerifyOccurrence is calendar-only. The interval path comes
+		// round again in an hour, so there is nothing worth undoing, and
+		// clearing nextVerify would hand it a retry it never had.
+		s := newSched()
+		e := ScheduleEntry{VM: "db01", Profile: SyncProfile{Verify: "fast"}, VerifyIntervalSeconds: 3600}
+		now := time.Unix(1_800_000_000, 0)
+		s.verifyDue(e, now)
+		if !s.verifyDue(e, now.Add(2*time.Hour)) {
+			t.Fatal("the interval path did not come due")
+		}
+		s.releaseVerifyOccurrence(e, verifying)
+		if s.verifyDue(e, now.Add(2*time.Hour+time.Minute)) {
+			t.Error("releasing reset an interval cadence it has no business touching")
 		}
 	})
 }

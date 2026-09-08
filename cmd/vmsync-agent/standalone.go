@@ -154,31 +154,95 @@ func loadStandaloneConfig(path string) (UIConfig, error) {
 // hand-written file has nothing in front of it, so this is where the
 // equivalent check has to happen.
 func validateStandaloneConfig(cfg UIConfig) error {
+	// Every template checked before any entry, because a bad template is a
+	// bad HUNDRED entries: the alternative is discovering it one VM at a time
+	// at run time, each skipped by launchDue for a reason that names the VM
+	// rather than the template they all share.
+	for name, t := range cfg.Templates {
+		if t.Name == "" {
+			// A convenience, not a laxity: the map key is the name an entry
+			// refers to, so requiring it twice is a chance for the two to
+			// disagree.
+			t.Name = name
+		}
+		if t.Name != name {
+			return fmt.Errorf("template %q is named %q inside its own definition; an entry can only refer to it by the key, so these must match", name, t.Name)
+		}
+		if err := t.Validate(); err != nil {
+			return fmt.Errorf("template %q: %w", name, err)
+		}
+	}
+	for i, e := range cfg.Schedule {
+		if e.Template == "" {
+			continue
+		}
+		if _, ok := cfg.Templates[e.Template]; !ok {
+			// Caught here rather than left to resolveEntry, which returns
+			// such an entry unchanged so it fails its own validation later.
+			// That is the right behaviour at run time and the wrong error for
+			// a person editing a file: they want the typo named.
+			return fmt.Errorf("entry %d (%s) names template %q, which this file does not define", i+1, e.VM, e.Template)
+		}
+	}
+
+	// Entries are no longer the only way to say what to sync: a "default"
+	// template covers every VM whose domain records replica_targets, so a
+	// file carrying templates and no entries at all is a legitimate and
+	// rather tidy way to run an estate. Without a default, though, this file
+	// really is the only thing telling the agent anything.
 	if len(cfg.Schedule) == 0 {
-		return fmt.Errorf("no schedule entries: this file is the only thing telling the agent what to sync")
+		if _, hasDefault := cfg.Templates[DefaultTemplateName]; !hasDefault {
+			return fmt.Errorf("no schedule entries and no %q template: this file is the only thing telling the agent what to sync", DefaultTemplateName)
+		}
 	}
 	seen := map[string]bool{}
-	for i, e := range cfg.Schedule {
+	for i, raw := range cfg.Schedule {
 		where := fmt.Sprintf("entry %d", i+1)
-		if e.VM != "" {
-			where = fmt.Sprintf("entry %d (%s)", i+1, e.VM)
+		if raw.VM != "" {
+			where = fmt.Sprintf("entry %d (%s)", i+1, raw.VM)
 		}
-		if strings.TrimSpace(e.VM) == "" {
+		if strings.TrimSpace(raw.VM) == "" {
 			return fmt.Errorf("%s has no vm", where)
 		}
-		if seen[e.VM] {
+		if seen[raw.VM] {
 			// Two entries for one VM would both fire, and the second would
 			// find the first still running -- an intermittent, confusing
 			// half-failure rather than a clean error.
 			return fmt.Errorf("%s appears more than once; a VM can have only one entry", where)
 		}
-		seen[e.VM] = true
+		seen[raw.VM] = true
+
+		// Judged RESOLVED, not raw. An entry inheriting its cadence from a
+		// template legitimately carries interval_seconds 0, and checking the
+		// raw entry rejected exactly the entries templates exist to allow --
+		// "has interval_seconds 0" about a file whose template plainly says
+		// 900. The template itself was validated above, so what is checked
+		// here is the combination.
+		//
+		// resolveEntry rather than ResolveSchedule: synthesised entries need
+		// the syncable VM list, which needs libvirt, which this function
+		// deliberately does not touch -- and they are built from a template
+		// already validated above, so there is nothing left to check.
+		e := resolveEntry(raw, cfg.Templates)
 
 		if e.IntervalSeconds <= 0 {
+			if raw.Template != "" || len(cfg.Templates) > 0 {
+				return fmt.Errorf("%s has no interval_seconds and inherits none from template %q; set one on the entry or on the template",
+					where, templateNameOf(raw))
+			}
 			return fmt.Errorf("%s has interval_seconds %d; it must be greater than 0", where, e.IntervalSeconds)
 		}
 		if err := e.Profile.Validate(); err != nil {
 			return fmt.Errorf("%s: %w", where, err)
+		}
+		// The same rule the template enforces, from the same function: a
+		// cadence says how often to verify and not whether to, and its interval
+		// and calendar forms are alternatives. Checked on the RESOLVED entry
+		// because either half can come from either place -- an entry naming a
+		// verify mode under a template supplying the window is the combination
+		// templates exist to allow, and neither object is wrong on its own.
+		if err := validateVerifyCadence(e.VerifyDays, e.VerifyWindow, e.VerifyIntervalSeconds, e.Profile.Verify); err != nil {
+			return fmt.Errorf("%s %w", where, err)
 		}
 		// Refused rather than clamped. shutdownTimeoutFor clamps whatever a
 		// UI sends, because a separately-versioned program's output is input

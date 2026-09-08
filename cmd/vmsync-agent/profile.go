@@ -423,7 +423,17 @@ func (r SyncRequest) CommandArgs() []string {
 	if p.Verify != "" {
 		args = append(args, "-verify="+p.Verify)
 	}
-	if p.VerifyFailureReinit {
+	// Gated on Verify, not on the field alone. vmsync REFUSES
+	// -verify-failure-reinit without -verify and exits 2 before copying a
+	// byte, so emitting it unconditionally means any caller that clears
+	// Verify after Validate has run builds an argv that cannot start.
+	//
+	// The scheduler does exactly that -- a verify cadence suppresses Verify
+	// per run -- and it now clears both fields together. This is the second
+	// line of defence: the guarantee that this function never emits a
+	// combination the engine rejects belongs at the point the argv is built,
+	// not spread across every caller that might mutate a profile.
+	if p.VerifyFailureReinit && p.Verify != "" {
 		args = append(args, "-verify-failure-reinit")
 	}
 	if p.ReinitAfterFailures > 0 {

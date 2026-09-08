@@ -327,3 +327,52 @@ func TestVerifyFailureReinitIsEmittedOnlyWhenAsked(t *testing.T) {
 		}
 	})
 }
+
+// vmsync REFUSES -verify-failure-reinit without -verify and exits 2 before it
+// copies a byte, so this function must never emit that pair. SyncProfile
+// itself cannot guarantee it: Validate rejects the combination, but the
+// scheduler legitimately clears Verify AFTER validation when a verify cadence
+// says this run does not verify.
+//
+// Emitting the flag unconditionally therefore did not merely mis-describe a
+// run, it broke it -- a VM with verify+reinit and any cadence replicated only
+// inside its verify window and failed every interval in between, logged as an
+// ordinary sync failure with nothing pointing at the argv.
+func TestCommandArgsNeverEmitsReinitWithoutVerify(t *testing.T) {
+	argsFor := func(p SyncProfile) []string {
+		return SyncRequest{
+			SourceURI: "qemu:///system", SourceDomain: "web01",
+			TargetURI: "qemu+ssh://root@dr01/system", TargetDomain: "web01",
+			Profile: p,
+		}.CommandArgs()
+	}
+
+	t.Run("both together are still emitted", func(t *testing.T) {
+		args := argsFor(SyncProfile{Verify: "full", VerifyFailureReinit: true})
+		if !hasArg(args, "-verify=full") || !hasArg(args, "-verify-failure-reinit") {
+			t.Errorf("args = %v, want both flags", args)
+		}
+	})
+
+	t.Run("reinit alone is dropped, not emitted", func(t *testing.T) {
+		// Exactly the state the scheduler produces for a non-verifying run.
+		args := argsFor(SyncProfile{Verify: "", VerifyFailureReinit: true})
+		if hasArg(args, "-verify-failure-reinit") {
+			t.Errorf("args = %v: this argv makes vmsync exit 2 before doing anything", args)
+		}
+		for _, a := range args {
+			if strings.HasPrefix(a, "-verify=") {
+				t.Errorf("args = %v, want no -verify at all", args)
+			}
+		}
+	})
+}
+
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}

@@ -102,6 +102,28 @@ type ScheduleEntry struct {
 	//
 	// Requires Profile.Verify to name a mode: this says how often, not what.
 	VerifyIntervalSeconds int `json:"verify_interval_seconds,omitempty"`
+	// VerifyDays and VerifyWindow express the same cadence as a CALENDAR
+	// rather than an interval: "Sun *-*-01..07" and "02:00-12:00" is the first
+	// Sunday of the month, between 2am and noon. See pkg/schedcal for the
+	// grammar, which is a deliberately small subset of systemd's OnCalendar.
+	//
+	// An interval cannot say that. "Every 30 days" drifts off the weekend
+	// within a couple of months, and a verify is the one operation an estate
+	// wants pinned to a quiet window -- it is a full-image read on both sides,
+	// so landing it on a Tuesday afternoon is exactly what an operator is
+	// trying to avoid.
+	//
+	// This and VerifyIntervalSeconds are one setting written two ways, so
+	// setting both is refused rather than resolved to a precedence nobody
+	// would remember. Either form still only selects WHICH SYNCS ALSO VERIFY:
+	// a window does not launch a sync, it marks the syncs that land in it.
+	//
+	// Interpreted in the AGENT'S OWN local time, from the host clock. The
+	// control plane displays the resolved zone rather than choosing it: a
+	// window means the quiet hours where the hardware is, and an estate
+	// spanning zones wants each host's own night, not the console's.
+	VerifyDays   string `json:"verify_days,omitempty"`
+	VerifyWindow string `json:"verify_window,omitempty"`
 	// Template names the ScheduleTemplate this entry inherits unset fields
 	// from. Empty means DefaultTemplateName.
 	//

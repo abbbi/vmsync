@@ -128,9 +128,9 @@ func TestResolveScheduleAppliesTheDefaultOnlyWhereSafe(t *testing.T) {
 	})
 
 	t.Run("no default template means no synthesis at all", func(t *testing.T) {
-		// The feature's off switch, and it matters on upgrade: an estate with
-		// targets recorded and no entries must not begin syncing because it
-		// installed a new agent.
+		// The feature's off switch. Auto-applying a schedule to VMs nobody
+		// wrote an entry for has to be asked for, and the ask is the default
+		// template existing at all.
 		entries := []ScheduleEntry{{VM: "db01", IntervalSeconds: 300, Enabled: true}}
 		got := ResolveSchedule(entries, map[string]ScheduleTemplate{"nightly": tpl("nightly", 900)}, syncable)
 		if len(got) != 1 || got[0].VM != "db01" {
@@ -177,6 +177,119 @@ func TestResolveScheduleAppliesTheDefaultOnlyWhereSafe(t *testing.T) {
 	})
 }
 
+// The verify cadence inherits as ONE unit because its two forms are
+// alternatives. Field-by-field inheritance would manufacture the exact
+// combination Validate refuses -- an entry holding both an interval and a
+// calendar, a contradiction neither author ever wrote.
+func TestVerifyCadenceInheritsAsAUnit(t *testing.T) {
+	byInterval := tpl(DefaultTemplateName, 900)
+	byInterval.VerifyIntervalSeconds = 86400
+	byInterval.Profile.Verify = "fast"
+
+	byCalendar := calTpl(DefaultTemplateName, "Sun *-*-01..07", "02:00-12:00")
+
+	t.Run("an empty entry takes the template's calendar", func(t *testing.T) {
+		got := resolveEntry(ScheduleEntry{VM: "web01"},
+			map[string]ScheduleTemplate{DefaultTemplateName: byCalendar})
+		if got.VerifyDays != "Sun *-*-01..07" || got.VerifyWindow != "02:00-12:00" {
+			t.Errorf("calendar = %q %q, want the template's", got.VerifyDays, got.VerifyWindow)
+		}
+	})
+
+	t.Run("an entry's calendar does not inherit the template's interval", func(t *testing.T) {
+		// The case that matters. The template says "every 86400 seconds"; this
+		// VM says "the first Sunday". It must come out holding only the
+		// calendar, or it would fail its own validation for holding both.
+		got := resolveEntry(
+			ScheduleEntry{VM: "db01", VerifyDays: "Sun", VerifyWindow: "22:00-04:00"},
+			map[string]ScheduleTemplate{DefaultTemplateName: byInterval})
+		if got.VerifyIntervalSeconds != 0 {
+			t.Errorf("VerifyIntervalSeconds = %d, want 0: an entry stating a calendar states its whole cadence",
+				got.VerifyIntervalSeconds)
+		}
+		if got.VerifyDays != "Sun" || got.VerifyWindow != "22:00-04:00" {
+			t.Errorf("calendar = %q %q, want the entry's own", got.VerifyDays, got.VerifyWindow)
+		}
+		if err := validateVerifyCadence(got.VerifyDays, got.VerifyWindow,
+			got.VerifyIntervalSeconds, got.Profile.Verify); err != nil {
+			t.Errorf("the resolved entry does not validate: %v", err)
+		}
+	})
+
+	t.Run("an entry's interval does not inherit the template's calendar", func(t *testing.T) {
+		// The mirror. A VM that wants a plain interval under a calendar
+		// template must not come out with both.
+		got := resolveEntry(
+			ScheduleEntry{VM: "db01", VerifyIntervalSeconds: 3600},
+			map[string]ScheduleTemplate{DefaultTemplateName: byCalendar})
+		if got.VerifyDays != "" || got.VerifyWindow != "" {
+			t.Errorf("calendar = %q %q, want empty: an entry stating an interval states its whole cadence",
+				got.VerifyDays, got.VerifyWindow)
+		}
+		if got.VerifyIntervalSeconds != 3600 {
+			t.Errorf("VerifyIntervalSeconds = %d, want the entry's 3600", got.VerifyIntervalSeconds)
+		}
+		if err := validateVerifyCadence(got.VerifyDays, got.VerifyWindow,
+			got.VerifyIntervalSeconds, got.Profile.Verify); err != nil {
+			t.Errorf("the resolved entry does not validate: %v", err)
+		}
+	})
+
+	t.Run("half a calendar is still a whole statement", func(t *testing.T) {
+		// An entry giving only a window means "every day in these hours". It
+		// must not have the template's days grafted onto it, which would
+		// silently narrow a daily verify to a monthly one.
+		got := resolveEntry(
+			ScheduleEntry{VM: "db01", VerifyWindow: "02:00-04:00"},
+			map[string]ScheduleTemplate{DefaultTemplateName: byCalendar})
+		if got.VerifyDays != "" {
+			t.Errorf("VerifyDays = %q, want empty: the entry said which hours, not which days", got.VerifyDays)
+		}
+		if got.VerifyWindow != "02:00-04:00" {
+			t.Errorf("VerifyWindow = %q, want the entry's own", got.VerifyWindow)
+		}
+	})
+
+	t.Run("the verify MODE still inherits, because it is a different question", func(t *testing.T) {
+		// verify_days says how often; Profile.Verify says what. An entry
+		// supplying the calendar under a template supplying the mode is the
+		// combination templates exist to allow.
+		got := resolveEntry(
+			ScheduleEntry{VM: "db01", VerifyDays: "Sun"},
+			map[string]ScheduleTemplate{DefaultTemplateName: byCalendar})
+		if got.Profile.Verify != "fast" {
+			t.Errorf("Verify = %q, want the template's %q", got.Profile.Verify, "fast")
+		}
+	})
+}
+
+// calTpl is a template whose verify cadence is a calendar rather than an
+// interval.
+func calTpl(name, days, window string) ScheduleTemplate {
+	t := tpl(name, 900)
+	t.Profile.Verify = "fast"
+	t.VerifyDays, t.VerifyWindow = days, window
+	return t
+}
+
+func noModeCalTpl() ScheduleTemplate {
+	t := calTpl("x", "Sun", "02:00-12:00")
+	t.Profile.Verify = ""
+	return t
+}
+
+func defaultNoModeCalTpl() ScheduleTemplate {
+	t := noModeCalTpl()
+	t.Name = DefaultTemplateName
+	return t
+}
+
+func bothFormsTpl() ScheduleTemplate {
+	t := calTpl("x", "Sun", "02:00-12:00")
+	t.VerifyIntervalSeconds = 86400
+	return t
+}
+
 func TestScheduleTemplateValidate(t *testing.T) {
 	withVerify := tpl("x", 900)
 	withVerify.VerifyIntervalSeconds = 86400
@@ -194,13 +307,37 @@ func TestScheduleTemplateValidate(t *testing.T) {
 		{"no name", ScheduleTemplate{IntervalSeconds: 900}, false},
 		{"no cadence", ScheduleTemplate{Name: "x"}, false},
 		{"negative verify cadence", ScheduleTemplate{Name: "x", IntervalSeconds: 900, VerifyIntervalSeconds: -1}, false},
-		// The same rule the per-entry field follows: the cadence says how
-		// often to verify, not whether to.
-		{"verify cadence with no mode", ScheduleTemplate{Name: "x", IntervalSeconds: 900, VerifyIntervalSeconds: 86400}, false},
+		// A NON-default template may carry the cadence alone. That is the
+		// estate-wide-policy shape templates are most worth having for: the
+		// window is the estate's, the mode is the VM's. Requiring the template
+		// to name a mode as well refused exactly that idiom.
+		{"a non-default template may carry the cadence alone", ScheduleTemplate{Name: "x", IntervalSeconds: 900, VerifyIntervalSeconds: 86400}, true},
+		// The default is the exception, because it SYNTHESISES entries for
+		// VMs that have none and those have no other source for a mode.
+		{"the default template may not", ScheduleTemplate{Name: DefaultTemplateName, IntervalSeconds: 900, VerifyIntervalSeconds: 86400}, false},
+		// A negative interval passed every validator and then meant "verify
+		// on every sync", because verifyDue reads interval <= 0 as "no
+		// cadence" -- the most expensive possible reading of a typo.
+		{"a negative verify interval", ScheduleTemplate{Name: "x", IntervalSeconds: 900, VerifyIntervalSeconds: -1}, false},
 		{"verify cadence with a mode", withVerify, true},
 		// A bad profile must be caught here, not discovered when a hundred
 		// inheriting entries all fail at launch.
 		{"an invalid profile", badProfile, false},
+		// The calendar form of the same cadence.
+		{"a verify calendar with a mode", calTpl("x", "Sun *-*-01..07", "02:00-12:00"), true},
+		{"a window with no days", calTpl("x", "", "02:00-12:00"), true},
+		{"days with no window", calTpl("x", "Sun", ""), true},
+		{"a non-default template may carry the window alone", noModeCalTpl(), true},
+		{"the default template carrying a window alone may not", defaultNoModeCalTpl(), false},
+		// Refused rather than resolved by precedence: there is no reading of
+		// "every 86400 seconds, and also the first Sunday" an operator could
+		// predict, and whichever half lost would be the one they meant.
+		{"both an interval and a calendar", bothFormsTpl(), false},
+		// A half-understood expression fires on the wrong days, which is
+		// worse than not starting.
+		{"a malformed calendar", calTpl("x", "Frunday", "02:00-12:00"), false},
+		{"real systemd this does not support", calTpl("x", "Sun *-*-01..07 02:00:00", ""), false},
+		{"a malformed window", calTpl("x", "Sun", "25:00-12:00"), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.in.Validate()
