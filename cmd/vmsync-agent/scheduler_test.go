@@ -479,7 +479,7 @@ func TestVerifyDueByCalendar(t *testing.T) {
 		}
 	})
 
-	t.Run("an unparseable calendar does not verify, and does not panic", func(t *testing.T) {
+	t.Run("an unparsable calendar does not verify, and does not panic", func(t *testing.T) {
 		// The remaining readings are both bad: verifying every sync turns a
 		// typo into a full-image read on both sides forever. This takes the
 		// recoverable one and logs it on every run.
