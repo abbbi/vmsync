@@ -21,16 +21,32 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	// Embeds the IANA timezone database in the test binary so the DST cases
+	// below cannot silently skip on a host without tzdata. See zone().
+	_ "time/tzdata"
 )
 
 // paris is the zone the DST cases use, chosen because Europe's transition IS
 // the last Sunday of March and October -- so any "Sunday" rule lands on one
 // twice a year, by construction rather than by bad luck.
-func paris(t *testing.T) *time.Location {
+func paris(t *testing.T) *time.Location { return zone(t, "Europe/Paris") }
+
+// zone is a Fatal, never a Skip.
+//
+// It used to skip when the host had no tzdata, which turned the entire DST
+// suite into something that could vanish into a green build -- the exact
+// failure this package exists to prevent, applied to its own tests. A slim CI
+// container is enough to trigger it, and nothing would have said so.
+//
+// Importing time/tzdata above embeds the IANA database in the test binary, so
+// a load failure is now a real bug rather than a property of the machine, and
+// the DST coverage is the same wherever it runs.
+func zone(t *testing.T, name string) *time.Location {
 	t.Helper()
-	loc, err := time.LoadLocation("Europe/Paris")
+	loc, err := time.LoadLocation(name)
 	if err != nil {
-		t.Skipf("no tzdata for Europe/Paris: %v", err)
+		t.Fatalf("loading %s failed even with tzdata embedded: %v", name, err)
 	}
 	return loc
 }
@@ -565,4 +581,117 @@ func countMatches(d Days, year int) int {
 		}
 	}
 	return n
+}
+
+// oddZones are the real timezones that break whole-hour assumptions. A
+// scheduler that only ever meets UTC and Europe/Paris has not met either of
+// the first two.
+var oddZones = []string{
+	"UTC",
+	"Europe/Paris",        // 1h DST shift, transition ON a Sunday
+	"Australia/Lord_Howe", // 30-MINUTE DST shift
+	"Pacific/Chatham",     // :45 base offset, 1h shift
+	"America/St_Johns",    // :30 base offset
+	"Asia/Kolkata",        // :30 base offset, no DST at all
+	"America/Santiago",    // southern-hemisphere transitions
+}
+
+// A weekly window must open the same number of times a year whatever the host
+// zone is, and must never claim to have started in the future.
+//
+// The invariants are stated as properties over a whole year rather than as
+// fixed dates, because the point is that no zone is special-cased: the agent
+// reads the host clock, so every one of these is somebody's production host.
+func TestWindowHoldsInEveryZone(t *testing.T) {
+	for _, name := range oddZones {
+		t.Run(name, func(t *testing.T) {
+			loc := zone(t, name)
+			s, err := Parse("Sun", "02:00-04:00")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			starts := map[string]bool{}
+			for ts := time.Date(2026, 1, 1, 0, 0, 0, 0, loc); ts.Year() == 2026; ts = ts.Add(5 * time.Minute) {
+				start, in := s.OccurrenceStart(ts)
+				if !in {
+					continue
+				}
+				// A start may read as slightly FUTURE during a repeated hour
+				// on an autumn-back day: the wall clock occurs twice and
+				// time.Date resolves to one of the pair, so on the first pass
+				// the chosen instant has not happened yet. That is accepted --
+				// see atMinute. What is not accepted is a start unrelated to
+				// the moment inside it, so the bound is one DST shift.
+				if d := start.Sub(ts); d > 2*time.Hour {
+					t.Fatalf("at %s the occurrence start is %s, %v in the future -- more than any DST shift",
+						ts.Format("2006-01-02 15:04 -0700"),
+						start.Format("2006-01-02 15:04 -0700"), d)
+				}
+				starts[start.Format(time.RFC3339)] = true
+			}
+
+			// 2026 has 52 Sundays. Every one must produce exactly one
+			// occurrence: a DST day must not drop one or split it in two.
+			if len(starts) != 52 {
+				t.Errorf("%d distinct occurrences in 2026, want 52 (one per Sunday)", len(starts))
+			}
+		})
+	}
+}
+
+// Due must fire exactly once per occurrence in every zone, which is the
+// property the whole lastVerified dance exists for. A doubled hour is the case
+// most likely to fire twice, and a missing hour the case most likely to fire
+// never.
+func TestDueFiresOncePerOccurrenceInEveryZone(t *testing.T) {
+	for _, name := range oddZones {
+		t.Run(name, func(t *testing.T) {
+			loc := zone(t, name)
+			s, err := Parse("Sun", "02:00-04:00")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var lastActed time.Time
+			fires := 0
+			for ts := time.Date(2026, 1, 1, 0, 0, 0, 0, loc); ts.Year() == 2026; ts = ts.Add(5 * time.Minute) {
+				start, due := s.Due(ts, lastActed)
+				if due {
+					fires++
+					lastActed = start
+				}
+			}
+			if fires != 52 {
+				t.Errorf("fired %d times in 2026, want 52 -- once per Sunday", fires)
+			}
+		})
+	}
+}
+
+// Australia/Lord_Howe shifts by THIRTY minutes, so a fix that assumes DST is
+// always an hour is wrong there and nowhere else. Spelled out separately
+// because the year-long sweep above would only show it as a count.
+func TestLordHoweHalfHourShift(t *testing.T) {
+	loc := zone(t, "Australia/Lord_Howe")
+	s, err := Parse("Sun", "02:00-04:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 4 October 2026: 02:00 springs forward to 02:30.
+	for _, hhmm := range []string{"02:30", "02:45", "03:00", "03:59"} {
+		ts := at(t, loc, "2026-10-04 "+hhmm)
+		start, in := s.OccurrenceStart(ts)
+		if !in {
+			t.Errorf("%s is outside the window on the spring-forward Sunday", hhmm)
+			continue
+		}
+		if start.After(ts) {
+			t.Errorf("at %s the start %s is in the future", hhmm, start)
+		}
+	}
+	// And the autumn-back Sunday, where 01:30-02:00 happens twice.
+	ts := at(t, loc, "2026-04-05 02:00")
+	if start, in := s.OccurrenceStart(ts); !in || start.After(ts) {
+		t.Errorf("autumn-back Sunday: in=%v start=%v now=%v", in, start, ts)
+	}
 }

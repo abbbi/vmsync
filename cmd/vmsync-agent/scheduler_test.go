@@ -23,6 +23,10 @@ import (
 	"testing"
 	"time"
 
+	// Embeds the IANA timezone database so the multi-zone calendar tests below
+	// run on any host, including one without tzdata installed.
+	_ "time/tzdata"
+
 	"vmsync/pkg/runresult"
 )
 
@@ -585,4 +589,96 @@ func TestFailedRunGivesBackTheVerifyWindow(t *testing.T) {
 			t.Error("releasing reset an interval cadence it has no business touching")
 		}
 	})
+}
+
+// agentZones are the zones the verify calendar is exercised against.
+//
+// Driven IN-PROCESS rather than by a CI job per TZ. The scheduler takes `now`
+// as a parameter and never reads the clock itself, so a time already in the
+// target zone exercises exactly the same code -- and doing it in one process
+// costs one test run instead of six, needs no tzdata on the runner, and makes
+// adding a zone a one-line change rather than a workflow edit.
+//
+// The TZ matrix in .github/workflows/ci.yml is not a duplicate of this: it
+// covers the other half, where production gets its time from time.Now() in
+// the host's zone rather than from a caller.
+var agentZones = []string{
+	"UTC",
+	"Europe/Paris",        // 1h DST shift, transition falls ON a Sunday
+	"Australia/Lord_Howe", // 30-MINUTE DST shift
+	"Pacific/Chatham",     // :45 base offset
+	"America/St_Johns",    // :30 base offset
+	"Asia/Kolkata",        // :30 base offset, no DST at all
+}
+
+func zoneAt(t *testing.T, loc *time.Location, s string) time.Time {
+	t.Helper()
+	ts, err := time.ParseInLocation("2006-01-02 15:04", s, loc)
+	if err != nil {
+		t.Fatalf("bad test time %q: %v", s, err)
+	}
+	return ts
+}
+
+// The verify window must behave identically whatever zone the agent's host is
+// in, because the host zone is not a setting -- it is whatever the datacentre
+// happens to be, and every one of these is somebody's production machine.
+//
+// Stated as properties over a whole year rather than fixed instants: the point
+// is that no zone is special-cased.
+func TestVerifyCalendarHoldsInEveryZone(t *testing.T) {
+	for _, name := range agentZones {
+		t.Run(name, func(t *testing.T) {
+			loc, err := time.LoadLocation(name)
+			if err != nil {
+				t.Fatalf("loading %s failed even with tzdata embedded: %v", name, err)
+			}
+			s := newSched()
+			e := calVM("web01")
+
+			// Walk 2026 at five-minute steps and count the syncs that verify.
+			// "First Sunday of the month, 02:00-12:00" is twelve occurrences a
+			// year, and a DST day must neither drop one nor double it.
+			fires := 0
+			for ts := time.Date(2026, 1, 1, 0, 0, 0, 0, loc); ts.Year() == 2026; ts = ts.Add(5 * time.Minute) {
+				if s.verifyDue(e, ts) {
+					fires++
+				}
+			}
+			if fires != 12 {
+				t.Errorf("verified %d times in 2026, want 12 -- one per first Sunday", fires)
+			}
+		})
+	}
+}
+
+// A window that crosses midnight belongs to the day it OPENED on, in every
+// zone. This is the branch that needs calendar arithmetic rather than
+// duration arithmetic, so it is the one a DST bug hides in.
+func TestCrossingWindowHoldsInEveryZone(t *testing.T) {
+	for _, name := range agentZones {
+		t.Run(name, func(t *testing.T) {
+			loc, err := time.LoadLocation(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := newSched()
+			e := ScheduleEntry{
+				VM: "db01", Profile: SyncProfile{Verify: "fast"},
+				VerifyDays: "Sun", VerifyWindow: "22:00-04:00",
+			}
+			fires := 0
+			for ts := time.Date(2026, 1, 1, 0, 0, 0, 0, loc); ts.Year() == 2026; ts = ts.Add(5 * time.Minute) {
+				if s.verifyDue(e, ts) {
+					fires++
+				}
+			}
+			// 52 Sundays in 2026. The window opens on each of them and runs
+			// into Monday; the Monday tail must not count as its own
+			// occurrence, and the spring-forward night must not lose one.
+			if fires != 52 {
+				t.Errorf("verified %d times in 2026, want 52 -- one per Sunday night", fires)
+			}
+		})
+	}
 }

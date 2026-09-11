@@ -50,6 +50,68 @@ jobs:
       - name: Test
         run: go test ./... -v
 
+      # The scheduling and verify-cadence code, under the race detector.
+      #
+      # Scoped to these two packages rather than ./... because the reason is
+      # specific: the calendar decision is a real cross-goroutine handoff.
+      # The scheduler loop claims a verify occurrence in lastVerified under
+      # s.mu, and runOne hands it back from the run's own goroutine when the
+      # sync failed (releaseVerifyOccurrence). A lock mistake there loses or
+      # double-fires a monthly verify, and no assertion would catch it,
+      # because both outcomes look like a plausible schedule.
+      #
+      # TZ is set because the agent resolves a window in the HOST's local
+      # time, from time.Now(). The tests themselves already sweep six zones
+      # in-process (see agentZones in scheduler_test.go and oddZones in
+      # schedcal_test.go), which is the thorough half; this only covers the
+      # process's own clock being something other than UTC. One zone is
+      # enough for that -- a matrix would re-run identical work, since
+      # pkg/schedcal never reads the process clock at all.
+      - name: Test the scheduling code under race
+        env:
+          TZ: Europe/Paris
+        run: go test -race -count=1 ./pkg/schedcal/ ./cmd/vmsync-agent/
+
+      # A SKIP in this code is a silent hole, so here it is a failure. The DST
+      # cases used to skip when the host had no tzdata -- a green build with
+      # no DST coverage at all, and nothing saying so.
+      #
+      # Scoped to the scheduling tests rather than the whole package on
+      # purpose. cmd/vmsync-agent has four legitimate platform-conditional
+      # skips (Unix file modes, /proc) that do not fire on Linux today; a
+      # blanket check would redden CI the moment somebody adds a fifth, and
+      # the fix would then be to weaken the check.
+      - name: Fail if any scheduling test skipped
+        env:
+          SCHED_TESTS: 'Verify|Template|Cadence|Calendar|Complaints|Schedule|Stagger|README|Zone|Window|CommandArgs|Resolve'
+        run: |
+          # pipefail because both commands below are piped into tee, and the
+          # default shell here is `bash -e` WITHOUT it -- so a failing
+          # `go test` would hand its status to tee, which always succeeds,
+          # and the step would go green on a red suite.
+          set -o pipefail
+          go test -count=1 -v ./pkg/schedcal/ 2>&1 | tee sched.log
+          go test -count=1 -v -run "$SCHED_TESTS" ./cmd/vmsync-agent/ 2>&1 | tee -a sched.log
+
+          if grep -q -- "--- SKIP" sched.log; then
+            echo "::error::a scheduling test SKIPPED; that is a coverage hole, not a pass"
+            grep -- "--- SKIP" sched.log
+            exit 1
+          fi
+
+          # And prove the filter actually selected something -- a typo in the
+          # pattern would otherwise run zero tests and pass silently, which is
+          # the same class of bug this step exists to catch.
+          # `|| true` guards grep -c's exit 1 on no matches, so a zero count
+          # reaches the message below rather than depending on how this bash
+          # applies -e to an assignment.
+          n=$(grep -c -- "--- PASS" sched.log || true)
+          echo "scheduling assertions run: $n"
+          if [ "$n" -lt 100 ]; then
+            echo "::error::only $n scheduling tests ran; the -run filter is not matching"
+            exit 1
+          fi
+
   codespell:
     runs-on: ubuntu-latest
     steps:

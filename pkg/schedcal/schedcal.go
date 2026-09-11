@@ -621,5 +621,22 @@ func startOfDay(t time.Time) time.Time {
 }
 
 func atMinute(t time.Time, min int) time.Time {
+	// Deliberately unconditional, ambiguity included.
+	//
+	// On an autumn-back day the start hour happens TWICE, and time.Date
+	// resolves that to one of the pair. Whichever it picks, it picks the SAME
+	// one on both passes -- and that stability is the whole requirement,
+	// because the returned value is the dedupe key: Due compares it against
+	// lastVerified to decide whether this occurrence has already been acted
+	// on. One key, one firing.
+	//
+	// The visible cost is that during the first pass through the repeated hour
+	// the reported start can read as up to one DST shift in the future, which
+	// looks odd in the log line naming it. Correcting that was tried and is a
+	// trap: shifting only when the start looks future makes the two passes
+	// resolve differently, which turns one occurrence into two and verifies
+	// twice that night. A cosmetic timestamp is worth less than firing once,
+	// so this stays as it is -- see TestDueFiresOncePerOccurrenceInEveryZone,
+	// which fails at 53 firings if anyone tries the same correction again.
 	return time.Date(t.Year(), t.Month(), t.Day(), min/60, min%60, 0, 0, t.Location())
 }
