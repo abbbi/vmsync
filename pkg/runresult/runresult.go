@@ -80,11 +80,32 @@ type Result struct {
 	// FSThawFailed says the source guest was left FROZEN. It is still frozen
 	// now, after this process exited, and will block on every write until
 	// somebody thaws it by hand.
+	//
+	// CERTAIN: the thaw call completed and the guest agent refused it.
 	FSThawFailed bool `json:"fsthaw_failed,omitempty"`
+	// FSThawTimedOut says the thaw call did not come back before vmsync gave
+	// up waiting, and had not reported in by the time this file was written.
+	//
+	// UNKNOWN, and deliberately a separate field from FSThawFailed rather
+	// than folded into it. A thaw waits on the guest's own agent, so a busy
+	// guest can answer late without anything being wrong -- and when it does
+	// answer in time to be seen, this is never set. What remains here is the
+	// genuinely unresolved case: nobody knows whether that guest is frozen,
+	// and somebody should look.
+	//
+	// Reporting this as FSThawFailed is what the split exists to stop. That
+	// flag means "go run virsh domfsthaw right now"; spending it on a guest
+	// that turned out fine is how the loudest alarm in this program becomes
+	// one people scroll past.
+	FSThawTimedOut bool `json:"fsthaw_timed_out,omitempty"`
 }
 
 // Degraded reports whether anything here needs a person.
-func (r Result) Degraded() bool { return r.FSFreezeFailed || r.FSThawFailed }
+//
+// An unresolved timeout counts. It is a weaker statement than the others --
+// it may well be nothing -- but "nobody knows whether a production guest is
+// frozen" is not a state to close a run on silently.
+func (r Result) Degraded() bool { return r.FSFreezeFailed || r.FSThawFailed || r.FSThawTimedOut }
 
 // Reason is the degradation in an operator's words, empty when there is
 // none.
@@ -104,6 +125,17 @@ func (r Result) Reason() string {
 		// now and stays blocked until somebody acts.
 		return "the guest filesystems are still FROZEN: the source VM blocks on every write until " +
 			"somebody runs `virsh domfsthaw " + r.VM + "` on its host"
+	case r.FSFreezeFailed && r.FSThawTimedOut:
+		return "the copy is crash-consistent only, and the thaw did not answer in time — " +
+			"check whether the guest is frozen with `virsh domfsinfo " + r.VM + "` on the source host"
+	case r.FSThawTimedOut:
+		// Phrased as a CHECK, not an instruction to act. The difference from
+		// FSThawFailed is the whole point of the field: that one knows the
+		// guest is frozen, this one does not, and telling somebody to thaw a
+		// guest that is running fine is how they learn to ignore the message
+		// that matters.
+		return "the filesystem thaw did not answer before vmsync stopped waiting, so it is unknown whether " +
+			"the guest is frozen — check with `virsh domfsinfo " + r.VM + "` on the source host"
 	case r.FSFreezeFailed:
 		return "the guest filesystems could not be quiesced, so this copy is crash-consistent only — " +
 			"a database restored from it recovers as if the host had lost power"

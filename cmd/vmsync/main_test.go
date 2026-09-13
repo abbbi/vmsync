@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1095,6 +1096,140 @@ func TestFlagHelpIsOneLineAndGrouped(t *testing.T) {
 			if len(g.flags) == 0 {
 				t.Errorf("flagGroups[%d] (%s) is empty; an empty heading is noise", i, g.title)
 			}
+		}
+	})
+}
+
+// A thaw that TIMES OUT is not a thaw that FAILED.
+//
+// The bug this pins: callWithTimeout abandons its goroutine but does not stop
+// it, so a guest agent that answers a second late used to leave the run
+// reporting "the guest filesystems are still FROZEN" about a guest that was
+// never frozen -- confirmed in the field by `virsh domfsthaw` replying
+// "0 filesystems thawed". Spending the loudest alarm in this program on a
+// healthy guest is how operators learn to scroll past it.
+func TestThawTrackerDistinguishesTimeoutFromFailure(t *testing.T) {
+	t.Run("a late success retracts the timeout", func(t *testing.T) {
+		// The observed sequence: run() gives up at the timeout, then the
+		// abandoned goroutine reports the thaw actually completed.
+		var tr thawTracker
+		tr.set(thawTimedOut)
+		if !tr.timedOut() || tr.failed() {
+			t.Fatalf("state = %v; a timeout must read as timed-out and NOT as failed", tr.state())
+		}
+		tr.set(thawOK)
+		if tr.timedOut() || tr.failed() {
+			t.Errorf("state = %v; a completed thaw must clear both", tr.state())
+		}
+	})
+
+	t.Run("a late refusal upgrades the timeout to certain failure", func(t *testing.T) {
+		var tr thawTracker
+		tr.set(thawTimedOut)
+		tr.set(thawRefused)
+		if !tr.failed() {
+			t.Errorf("state = %v; the guest IS frozen and must be reported as such", tr.state())
+		}
+		if tr.timedOut() {
+			t.Error("still reads as timed-out; the answer is known now")
+		}
+	})
+
+	t.Run("a determinate answer is never downgraded by a timeout", func(t *testing.T) {
+		// The ordering that actually races. When the call lands within a
+		// hair of the timeout, the abandoned goroutine can record the real
+		// outcome BEFORE run() records that it stopped waiting. Last writer
+		// wins would then report a timeout over a known answer.
+		for _, known := range []thawState{thawOK, thawRefused} {
+			var tr thawTracker
+			tr.set(known)
+			tr.set(thawTimedOut)
+			if got := tr.state(); got != known {
+				t.Errorf("state = %v, want %v: \"we stopped waiting\" overwrote a known answer", got, known)
+			}
+		}
+	})
+
+	t.Run("an unresolved timeout still reaches a person", func(t *testing.T) {
+		// Retracting must not become swallowing. A thaw that never reports
+		// back is a genuine unknown about a production guest.
+		var tr thawTracker
+		tr.set(thawTimedOut)
+		if !tr.timedOut() {
+			t.Error("an unresolved timeout was silently dropped")
+		}
+	})
+
+	t.Run("no attempt reports nothing", func(t *testing.T) {
+		var tr thawTracker
+		if tr.failed() || tr.timedOut() {
+			t.Errorf("state = %v; a run that never froze anything has nothing to report", tr.state())
+		}
+	})
+
+	t.Run("concurrent writers cannot lose a determinate answer", func(t *testing.T) {
+		// The race as it actually happens, run for real: both writers fire at
+		// once, many times over. The invariant is that thawOK always wins,
+		// whatever the scheduler does.
+		for i := 0; i < 200; i++ {
+			var tr thawTracker
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() { defer wg.Done(); tr.set(thawTimedOut) }()
+			go func() { defer wg.Done(); tr.set(thawOK) }()
+			wg.Wait()
+			if tr.state() != thawOK {
+				t.Fatalf("iteration %d: state = %v, want thawOK", i, tr.state())
+			}
+		}
+	})
+}
+
+// set reports whether it RESOLVED a timeout, which is what decides whether
+// the journal gets a line retracting (or confirming) the scary one above it.
+// Reported by set rather than read separately because a read-then-write is
+// not atomic: the timeout can land in between, and the caller would miss
+// that it had anything to retract.
+func TestThawTrackerReportsWhenItResolvesATimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		first thawState
+		then  thawState
+		want  bool
+	}{
+		{"a late success resolves it", thawTimedOut, thawOK, true},
+		{"a late refusal resolves it too", thawTimedOut, thawRefused, true},
+		// Nothing was given up on, so there is nothing to retract and no line
+		// to print -- ThawFs already logs its own success.
+		{"a prompt success resolves nothing", thawUnknown, thawOK, false},
+		{"a prompt refusal resolves nothing", thawUnknown, thawRefused, false},
+		// The timeout arriving after a known answer is dropped entirely, so
+		// it cannot "resolve" anything either.
+		{"a timeout after a known answer is ignored", thawOK, thawTimedOut, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var tr thawTracker
+			if tc.first != thawUnknown {
+				tr.set(tc.first)
+			}
+			if got := tr.set(tc.then); got != tc.want {
+				t.Errorf("set(%v) after %v = %v, want %v", tc.then, tc.first, got, tc.want)
+			}
+		})
+	}
+
+	t.Run("exactly one writer is told it resolved the timeout", func(t *testing.T) {
+		// Otherwise the retraction could be logged twice, or not at all.
+		var tr thawTracker
+		tr.set(thawTimedOut)
+		n := 0
+		for i := 0; i < 5; i++ {
+			if tr.set(thawOK) {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("%d writers were told they resolved the timeout, want exactly 1", n)
 		}
 	})
 }

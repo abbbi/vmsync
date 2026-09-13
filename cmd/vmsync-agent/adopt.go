@@ -177,7 +177,7 @@ func (s *Scheduler) watchAdopted(ctx context.Context, cfg *agentConfig, vm, targ
 				degraded, degradedReason = true, v.reason
 				trace.Error("an adopted sync left something that needs a person",
 					"vm", vm, "run_id", id.RunID,
-					"fsfreeze_failed", rr.FSFreezeFailed, "fsthaw_failed", rr.FSThawFailed,
+					"fsfreeze_failed", rr.FSFreezeFailed, "fsthaw_failed", rr.FSThawFailed, "fsthaw_timed_out", rr.FSThawTimedOut,
 					"action", v.reason)
 			}
 		}

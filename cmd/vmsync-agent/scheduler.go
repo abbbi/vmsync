@@ -890,7 +890,7 @@ func (s *Scheduler) runOne(ctx context.Context, cfg *agentConfig, entry Schedule
 			// visit.
 			trace.Error("a scheduled sync succeeded but left something that needs a person",
 				"vm", entry.VM, "target", plan.targetHost, "run_id", runID,
-				"fsfreeze_failed", rr.FSFreezeFailed, "fsthaw_failed", rr.FSThawFailed,
+				"fsfreeze_failed", rr.FSFreezeFailed, "fsthaw_failed", rr.FSThawFailed, "fsthaw_timed_out", rr.FSThawTimedOut,
 				"action", v.reason)
 		}
 	}

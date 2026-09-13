@@ -1090,6 +1090,110 @@ func main() {
 // goroutine is already exiting on its own.
 var ErrCallTimedOut = errors.New("underlying goroutine abandoned, may still be running")
 
+// How long each source-domain call is given before its goroutine is
+// abandoned. Separate values because they wait on different things.
+const (
+	// srcDomCallTimeout covers the libvirt-side cleanup calls: resume the
+	// VM, abort the backup job, destroy the domain, delete a checkpoint.
+	// libvirt either answers these promptly or is wedged, so waiting longer
+	// buys nothing and delays the cleanup path after something has already
+	// gone wrong.
+	srcDomCallTimeout = 5 * time.Second
+
+	// thawCallTimeout covers the filesystem thaw, and is longer on purpose.
+	//
+	// The thaw is the only call here that waits on the guest's own agent
+	// rather than on libvirt, so its latency tracks how busy the GUEST is --
+	// a loaded database flushing on FSThaw can take several seconds without
+	// anything being wrong. At five seconds a merely-busy agent was
+	// indistinguishable from a hung one, and abandoning the call recorded a
+	// degradation for a guest that thawed a second later.
+	//
+	// Giving up still has to happen eventually: the point of the timeout is
+	// that run() cannot block forever on a guest that will never answer.
+	// Fifteen seconds is chosen to sit well past the agent latency actually
+	// observed on a healthy-but-loaded guest, while still bounded.
+	thawCallTimeout = 15 * time.Second
+)
+
+// thawState is what is known about this run's single thaw attempt.
+//
+// Three states rather than a bool because "the guest is frozen" and "we
+// stopped waiting to find out" are different facts with different actions.
+// The first is certain and needs somebody at a terminal now; the second is
+// an unknown that usually resolves itself, and reporting it as the first
+// turns the loudest alarm in this program into one operators learn to
+// ignore.
+type thawState int
+
+const (
+	// thawUnknown: no thaw was attempted, or it has not returned yet.
+	thawUnknown thawState = iota
+	// thawOK: the call completed and the guest is not frozen.
+	thawOK
+	// thawTimedOut: the call did not return within thawCallTimeout and its
+	// goroutine was abandoned. INDETERMINATE -- the guest may be frozen, or
+	// the agent may simply have been slow and thawed a moment later. This
+	// state is superseded if that goroutine reports back before the run
+	// writes its result.
+	thawTimedOut
+	// thawRefused: the call completed and the guest agent refused every
+	// attempt. The guest IS frozen and stays frozen until a person acts.
+	thawRefused
+)
+
+// thawTracker records what is known about this run's single thaw attempt.
+//
+// A type rather than a closure over a bool because two goroutines write to
+// it: run()'s own, when it stops waiting, and the one callWithTimeout
+// abandoned, whenever the guest agent finally answers. Those genuinely race
+// when the call lands near the timeout, and the resolution rule below is the
+// whole point of the fix -- so it is worth being able to test it directly.
+type thawTracker struct {
+	mu sync.Mutex
+	st thawState
+}
+
+// set records an outcome, resolving the race in favour of certainty.
+//
+// A DETERMINATE answer (thawOK or thawRefused) always wins over thawTimedOut,
+// whichever goroutine gets here first. "We stopped waiting" is only ever the
+// answer while nothing better is known: it describes this process's patience,
+// not the guest's state, and the abandoned call is the only thing that can
+// actually speak to the latter.
+//
+// thawOK and thawRefused cannot contend with each other: thawOnce admits a
+// single attempt, and that attempt returns once.
+// It returns whether this call RESOLVED a timeout -- that is, whether the
+// abandoned goroutine has just come back with an answer run() had already
+// given up on. Reported here rather than left to the caller to infer from a
+// separate read, because a read-then-write is not atomic: the timeout can be
+// recorded in between, and the caller would then miss that it had anything to
+// retract.
+func (t *thawTracker) set(s thawState) (resolvedTimeout bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if s == thawTimedOut && t.st != thawUnknown {
+		return false
+	}
+	resolvedTimeout = t.st == thawTimedOut && s != thawTimedOut
+	t.st = s
+	return resolvedTimeout
+}
+
+func (t *thawTracker) state() thawState {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.st
+}
+
+// failed is the CERTAIN case: somebody has to run virsh domfsthaw now.
+func (t *thawTracker) failed() bool { return t.state() == thawRefused }
+
+// timedOut is the UNKNOWN case: the thaw never reported back, so whether the
+// guest is frozen is genuinely not known. Worth a look, not worth a page.
+func (t *thawTracker) timedOut() bool { return t.state() == thawTimedOut }
+
 // callWithTimeout runs a blocking libvirt/cgo call in its own goroutine and
 // gives up waiting for it after timeout. libvirt calls have no built-in
 // cancellation, so a genuinely stuck call still runs to completion in the
@@ -1993,9 +2097,14 @@ func run(cfg syncConfig) (runErr error) {
 	var freezeMu sync.Mutex
 	var freezed bool = false
 	var thawOnce sync.Once
-	// fsFreezeFailed and fsThawFailed both need the same mutex, for the same
-	// reason: the metrics closure reads them from the SIGNAL HANDLER's
-	// goroutine while this one is still running the sync.
+	// fsFreezeFailed needs a mutex because the metrics closure reads it from
+	// the SIGNAL HANDLER's goroutine while this one is still running the
+	// sync.
+	//
+	// The thaw outcome needs one for that reason AND a second: the goroutine
+	// callWithTimeout abandons keeps writing to it after run() has stopped
+	// waiting. It carries its own lock inside thawTracker, which is where
+	// the rule for resolving those two writers lives.
 	//
 	// fsFreezeFailed used to be safe unguarded only because nothing off this
 	// goroutine read it -- the handler passed a literal state and
@@ -2006,7 +2115,7 @@ func run(cfg syncConfig) (runErr error) {
 	// still be hung, and reporting one as the other loses whichever it is not.
 	var freezeFailedMu sync.Mutex
 	var fsFreezeFailed bool
-	var fsThawFailed bool
+	var thaw thawTracker
 	setFreezeFailed := func() {
 		freezeFailedMu.Lock()
 		fsFreezeFailed = true
@@ -2017,16 +2126,12 @@ func run(cfg syncConfig) (runErr error) {
 		defer freezeFailedMu.Unlock()
 		return fsFreezeFailed
 	}
-	setThawFailed := func() {
-		freezeFailedMu.Lock()
-		fsThawFailed = true
-		freezeFailedMu.Unlock()
-	}
-	thawDidFail := func() bool {
-		freezeFailedMu.Lock()
-		defer freezeFailedMu.Unlock()
-		return fsThawFailed
-	}
+	// The thaw outcome carries its own lock inside thawTracker rather than
+	// sharing freezeFailedMu: the two are independent facts, and the sharing
+	// was only ever incidental.
+	setThawState := thaw.set
+	thawDidFail := thaw.failed
+	thawDidTimeOut := thaw.timedOut
 	var started bool = false
 	var metricsMu sync.Mutex
 	diskMetrics := make([]metrics.DiskMetric, 0)
@@ -2151,6 +2256,7 @@ func run(cfg syncConfig) (runErr error) {
 			// another.
 			FSFreezeFailed:        freezeDidFail(),
 			FSThawFailed:          thawDidFail(),
+			FSThawTimedOut:        thawDidTimeOut(),
 			ExternalSnapshotCount: snapshotCount,
 			// trace's own counters, not metricsMu-guarded state -- they're
 			// already safe for concurrent reads on their own (atomics), and
@@ -2203,6 +2309,7 @@ func run(cfg syncConfig) (runErr error) {
 			RunID:          cfg.RunID,
 			FSFreezeFailed: freezeDidFail(),
 			FSThawFailed:   thawDidFail(),
+			FSThawTimedOut: thawDidTimeOut(),
 		}
 		if err := runresult.Write(cfg.ResultJSON, res); err != nil {
 			// Warning, not Error: this file is how the agent LEARNS about a
@@ -2442,8 +2549,16 @@ func run(cfg syncConfig) (runErr error) {
 	// still be in use by an abandoned goroutine, recorded via
 	// srcDomMaybeInUse so the deferred Free() above knows to leak rather
 	// than risk a native use-after-free.
-	callOnSrcDom := func(name string, fn func() error) error {
-		err := callWithTimeout(name, 5*time.Second, fn)
+	//
+	// The timeout is per call rather than one constant for all of them,
+	// because these wait on two different things. Most are libvirt-side --
+	// abort a job, destroy a domain, delete a checkpoint -- and libvirt
+	// either answers quickly or is wedged. The thaw is the odd one out: it
+	// waits on the GUEST's agent, whose latency is a property of how busy
+	// the guest is, not of the hypervisor. Holding both to the same few
+	// seconds is what made a merely-busy agent look like a hung one.
+	callOnSrcDom := func(name string, timeout time.Duration, fn func() error) error {
+		err := callWithTimeout(name, timeout, fn)
 		if errors.Is(err, ErrCallTimedOut) {
 			srcDomMu.Lock()
 			srcDomMaybeInUse = true
@@ -2515,7 +2630,7 @@ func run(cfg syncConfig) (runErr error) {
 			if !suspendedForVerify {
 				return
 			}
-			resumeErr := callOnSrcDom("resume source vm", func() error {
+			resumeErr := callOnSrcDom("resume source vm", srcDomCallTimeout, func() error {
 				return srcDom.Resume()
 			})
 			if resumeErr != nil {
@@ -2567,7 +2682,7 @@ func run(cfg syncConfig) (runErr error) {
 			backupMu.Unlock()
 			if wasActive {
 				trace.Info("stopping libvirt backup job", "trigger", trigger)
-				stopErr := callOnSrcDom("abort backup job", func() error {
+				stopErr := callOnSrcDom("abort backup job", srcDomCallTimeout, func() error {
 					return libvirtsync.StopBackup(srcDom)
 				})
 				if stopErr != nil {
@@ -2582,7 +2697,7 @@ func run(cfg syncConfig) (runErr error) {
 			}
 			if started {
 				trace.Info("destroying vm as it was started by sync process")
-				if destroyErr := callOnSrcDom("destroy vm", func() error {
+				if destroyErr := callOnSrcDom("destroy vm", srcDomCallTimeout, func() error {
 					return srcDom.Destroy()
 				}); destroyErr != nil {
 					trace.Error("destroy vm timed out or failed", "trigger", trigger, "error", destroyErr)
@@ -2836,17 +2951,42 @@ func run(cfg syncConfig) (runErr error) {
 				return
 			}
 			trace.Info("thawing source filesystem", "trigger", trigger)
-			if err := callOnSrcDom("thaw source filesystem", func() error {
+			if err := callOnSrcDom("thaw source filesystem", thawCallTimeout, func() error {
+				// Runs on the goroutine callWithTimeout started, which
+				// OUTLIVES the timeout. So this may report back long after
+				// the call was given up on -- and when it does, it is the
+				// authoritative answer and supersedes the timeout.
 				if libvirtsync.ThawFs(srcDom, true) {
-					setThawFailed()
+					if setThawState(thawRefused) {
+						// The timeout above resolved, and badly. Said out
+						// loud so the journal does not leave an operator to
+						// guess which of the two lines is current.
+						trace.Error("the thaw that timed out has now reported back, and it FAILED: this guest's filesystems ARE frozen and it blocks on every write until somebody runs virsh domfsthaw against it",
+							"trigger", trigger)
+					}
+					return nil
+				}
+				if setThawState(thawOK) {
+					// The retraction. Without this the journal carries an
+					// ERROR saying the guest may be frozen and, a few lines
+					// later, an INFO saying it thawed, with nothing to tell
+					// an operator which one won.
+					trace.Warning("the thaw that timed out has now completed: the guest is NOT frozen, and the timeout reported above can be disregarded",
+						"trigger", trigger, "timeout", thawCallTimeout)
 				}
 				return nil
 			}); err != nil {
-				// A timeout leaves the guest frozen just as surely as a
-				// refusal does -- the call never completed, so nothing
-				// unfroze it.
-				setThawFailed()
-				trace.Error("thaw source filesystem timed out; this guest may still have its filesystems FROZEN and block on every write until somebody runs virsh domfsthaw against it", "trigger", trigger, "error", err)
+				// A timeout is NOT a failure. The call did not come back in
+				// time, which is a different fact from the guest agent
+				// refusing: the thaw may well land a moment later, and this
+				// state is superseded if it does.
+				//
+				// It is still reported, because an unresolved timeout has to
+				// reach a person -- but as an unknown to check, not as the
+				// certainty that a refusal is.
+				setThawState(thawTimedOut)
+				trace.Error("thaw source filesystem did not complete in time; the guest MAY still have its filesystems frozen -- if a later line reports the thaw completing, this was a slow guest agent and can be disregarded, otherwise run virsh domfsthaw against it",
+					"trigger", trigger, "timeout", thawCallTimeout, "error", err)
 			}
 		})
 	}
@@ -2910,7 +3050,7 @@ func run(cfg syncConfig) (runErr error) {
 			if name == "" || !advanced || copySucceeded {
 				return
 			}
-			if err := callOnSrcDom("delete checkpoint", func() error {
+			if err := callOnSrcDom("delete checkpoint", srcDomCallTimeout, func() error {
 				return libvirtsync.DeleteCheckpointIfExists(srcDom, name)
 			}); err != nil {
 				trace.Error("failed to delete checkpoint", "trigger", trigger, "checkpoint", name, "error", err)

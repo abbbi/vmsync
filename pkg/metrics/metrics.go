@@ -157,6 +157,16 @@ type RunMetric struct {
 	// the sync's outcome and reporting the guest's, and the guest matters
 	// more.
 	FSThawFailed bool
+	// FSThawTimedOut is true when the thaw call did not return before vmsync
+	// gave up waiting, and had not reported back by the time this was
+	// written.
+	//
+	// Its own series rather than a second reason to raise vmsync_fsthaw_failed,
+	// because the two deserve different alert routing: _failed is a certainty
+	// and should page, this is an unknown and should open a ticket. Merging
+	// them means either paging on a guest that was merely busy, or waiting
+	// out a ticket queue on one that is genuinely hung.
+	FSThawTimedOut bool
 	// ExternalSnapshotCount is how many external disk snapshots were present
 	// on the source domain during this run (see
 	// libvirtsync.ExternalSnapshotCount). Libvirt refuses to create a new
@@ -293,6 +303,11 @@ func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 	fmt.Fprintln(&b, "# TYPE vmsync_fsthaw_failed gauge")
 	fmt.Fprintf(&b, "vmsync_fsthaw_failed{source_host=%q,target_host=%q,vm=%q} %d\n",
 		run.SourceHost, run.TargetHost, run.VM, boolMetric(run.FSThawFailed))
+
+	fmt.Fprintln(&b, "# HELP vmsync_fsthaw_timed_out 1 when the filesystem thaw did not answer before vmsync stopped waiting, and had not reported back when this run ended. UNKNOWN rather than failed: the guest may be frozen, or its agent may simply have been busy. Distinct from vmsync_fsthaw_failed, which is a certainty -- alert on this one more gently.")
+	fmt.Fprintln(&b, "# TYPE vmsync_fsthaw_timed_out gauge")
+	fmt.Fprintf(&b, "vmsync_fsthaw_timed_out{source_host=%q,target_host=%q,vm=%q} %d\n",
+		run.SourceHost, run.TargetHost, run.VM, boolMetric(run.FSThawTimedOut))
 
 	fmt.Fprintln(&b, "# HELP vmsync_warning_count Number of WARNING-level log lines emitted during this run.")
 	fmt.Fprintln(&b, "# TYPE vmsync_warning_count gauge")
