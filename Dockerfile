@@ -20,11 +20,17 @@ RUN dnf -y install dnf-plugins-core && \
     dnf clean all
 
 COPY --from=go-toolchain /usr/local/go /usr/local/go
-COPY --exclude=vmsync_* --exclude=.git --exclude=go.sum --exclude=go.mod . /tmp/go/src
+COPY --exclude=vmsync_* --exclude=.git . /tmp/go/src
 WORKDIR /tmp/go/src/
 
 ENV PATH="/usr/local/go/bin:${PATH}"
-RUN GOOS=linux GOARCH=${TARGETARCH} go mod init vmsync && go mod tidy && \
+# Builds from the COMMITTED go.mod/go.sum, which is what makes this
+# reproducible: `go mod init && go mod tidy` here resolved every dependency to
+# whatever was newest at build time, so two builds of the same commit could
+# differ, and nothing pinned checksums. Go's default -mod=readonly now fails
+# the build if go.mod is out of step with the imports instead of quietly
+# rewriting it.
+RUN GOOS=linux GOARCH=${TARGETARCH} \
     go build -o /out/vmsync ./cmd/vmsync/ && \
     go build -o /out/vmsync-agent ./cmd/vmsync-agent/ && \
     CGO_ENABLED=0 go build -o /out/vmsync-bridge-helper ./cmd/vmsync-bridge-helper/

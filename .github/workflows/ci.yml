@@ -28,11 +28,17 @@ jobs:
           go-version: '1.25.0'
           # dnf install golang
 
-      # This repo doesn't commit go.mod/go.sum (see Dockerfile.debian's own
-      # "go mod init vmsync && go mod tidy" step) -- bootstrap the module the
-      # same way here before anything else can build.
-      - name: Initialize Go module
-        run: go mod init vmsync && go mod tidy
+      # go.mod and go.sum are committed, so nothing bootstraps the module here
+      # any more -- the build uses exactly the versions the repo pins, the same
+      # way the Dockerfiles now do.
+      #
+      # -diff fails when go.mod/go.sum are out of step with what the code
+      # actually imports, rather than silently fixing it. That is the failure
+      # this whole change came from: the module on disk was missing
+      # libguestfs.org/libnbd entirely, and nothing noticed because every build
+      # regenerated it.
+      - name: Check go.mod and go.sum are tidy
+        run: go mod tidy -diff
 
       # Builds every package under the module, including cmd/vmsync itself
       # (cgo, needs libnbd-dev/libvirt-dev above) and the pure-Go

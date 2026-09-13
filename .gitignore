@@ -1,5 +1,6 @@
-# Generated at build time, never committed: the Dockerfiles run
-# "go mod init vmsync && go mod tidy" themselves and explicitly exclude
-# these from the build context. Building locally recreates them.
-/go.sum
-/go.mod
+# go.mod and go.sum are COMMITTED, deliberately.
+#
+# They used to live here, and the Dockerfiles ran "go mod init vmsync && go
+# mod tidy" at build time instead. That made two builds of the same commit
+# able to differ -- every dependency resolved to whatever was newest that day
+# -- and left nothing pinning module checksums at all.
