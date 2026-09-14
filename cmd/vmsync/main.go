@@ -2843,19 +2843,62 @@ func run(cfg syncConfig) (runErr error) {
 			return
 		}
 		exists, err := libvirtsync.DomainExists(tgtMgr.Conn, cfg.TargetDomain)
-		if err != nil || !exists {
+		if err != nil {
+			// NOT the same as "the domain is not there", and conflating the
+			// two is how this failed silently. A connection that has died --
+			// which is what an hour-long verify does to an idle qemu+ssh
+			// link -- landed here, was reported at Debug as the ordinary
+			// shape of a first run, and the stamp was never written. The
+			// replica's disks were newer than its recorded timestamp from
+			// then on, so every later sync was refused as an out-of-band
+			// write, by the guard whose own safety net this is.
+			//
+			// So: say so, reconnect, and try again. The write below is the
+			// only thing standing between a failed run and a replica nobody
+			// can sync into without intervening by hand.
+			trace.Warning("could not reach the target to record the replica write; reconnecting and retrying once",
+				"trigger", trigger, "vm", cfg.TargetDomain, "error", err)
+			if reconnErr := tgtMgr.Reconnect(); reconnErr != nil {
+				trace.Error("could not reconnect to the target to record when this run wrote the replica disks -- if this run fails, the NEXT one's out-of-band-write check will refuse it, because the disks are now newer than the timestamp on record. Clearing that needs -timestamp-tolerance-sec or a resync",
+					"trigger", trigger, "vm", cfg.TargetDomain, "error", reconnErr)
+				return
+			}
+			exists, err = libvirtsync.DomainExists(tgtMgr.Conn, cfg.TargetDomain)
+			if err != nil {
+				trace.Error("could not reach the target to record when this run wrote the replica disks, even after reconnecting -- if this run fails, the NEXT one's out-of-band-write check will refuse it",
+					"trigger", trigger, "vm", cfg.TargetDomain, "error", err)
+				return
+			}
+		}
+		if !exists {
 			// A first full sync, or -reinit/-force-clean having undefined
 			// the target: there is nothing to write to yet, and the run's
 			// own DefineDomain carries the value instead. Not a warning --
-			// this is the ordinary shape of a first run.
+			// this is the ordinary shape of a first run, and the only case
+			// this branch should ever describe.
 			trace.Debug("no target domain to record the replica write against yet", "trigger", trigger, "vm", cfg.TargetDomain)
 			return
 		}
 		if err := libvirtsync.SetDomainMetadataFields(tgtMgr, cfg.TargetDomain, map[string]string{
 			libvirtsync.MetadataFieldReplicaWrittenAt: value,
 		}); err != nil {
-			trace.Warning("could not record when this run wrote the replica disks; if this run fails, the next one's out-of-band-write check may refuse it",
+			// Same reasoning as above: retry once through a fresh connection
+			// before accepting that the replica will refuse its next sync.
+			trace.Warning("could not record when this run wrote the replica disks; reconnecting and retrying once",
 				"trigger", trigger, "vm", cfg.TargetDomain, "error", err)
+			if reconnErr := tgtMgr.Reconnect(); reconnErr != nil {
+				trace.Error("could not record when this run wrote the replica disks, and reconnecting to the target failed too; if this run fails, the next one's out-of-band-write check will refuse it",
+					"trigger", trigger, "vm", cfg.TargetDomain, "error", reconnErr)
+				return
+			}
+			if err := libvirtsync.SetDomainMetadataFields(tgtMgr, cfg.TargetDomain, map[string]string{
+				libvirtsync.MetadataFieldReplicaWrittenAt: value,
+			}); err != nil {
+				trace.Error("could not record when this run wrote the replica disks, even after reconnecting; if this run fails, the next one's out-of-band-write check will refuse it",
+					"trigger", trigger, "vm", cfg.TargetDomain, "error", err)
+				return
+			}
+			trace.Info("recorded the replica write after reconnecting to the target", "trigger", trigger, "vm", cfg.TargetDomain)
 		}
 	}
 
@@ -5978,7 +6021,30 @@ func run(cfg syncConfig) (runErr error) {
 	// and the operator's decision standing, which is the part that matters.
 	currentTargetRole, roleErr := libvirtsync.ReadReplicationRole(tgtMgr, cfg.TargetDomain)
 	if roleErr != nil {
-		return fmt.Errorf("re-read target domain replication role before redefining it: %w", roleErr)
+		// One reconnect, then one retry, before giving up.
+		//
+		// This is the last libvirt call of a run that may have spent an hour
+		// verifying a large disk, and a qemu+ssh connection idle that long
+		// gets closed underneath us. Failing here is expensive out of all
+		// proportion to the cause: every disk has copied, committed and
+		// verified, and the only thing missing is the metadata write that
+		// records it. Worse, the run then leaves the replica's disks newer
+		// than its recorded timestamp, so the out-of-band-write check refuses
+		// every subsequent sync until somebody intervenes.
+		//
+		// Reconnecting the Manager rather than reading the role through a
+		// throwaway connection: DefineDomain below goes through the same
+		// tgtMgr and would fail identically otherwise.
+		trace.Warning("could not read the target's replication role on the primary connection; reconnecting and retrying once",
+			"vm", cfg.TargetDomain, "error", roleErr)
+		if reconnErr := tgtMgr.Reconnect(); reconnErr != nil {
+			return fmt.Errorf("re-read target domain replication role before redefining it: %w (reconnecting to the target also failed: %v)", roleErr, reconnErr)
+		}
+		currentTargetRole, roleErr = libvirtsync.ReadReplicationRole(tgtMgr, cfg.TargetDomain)
+		if roleErr != nil {
+			return fmt.Errorf("re-read target domain replication role before redefining it, including after a reconnect: %w", roleErr)
+		}
+		trace.Info("reconnected to the target and read its replication role", "vm", cfg.TargetDomain, "role", currentTargetRole)
 	}
 	if err := libvirtsync.TargetRoleAllowsSync(currentTargetRole); err != nil {
 		return fmt.Errorf("refusing to redefine %s: its replication role changed to %q while this sync was running: %w",

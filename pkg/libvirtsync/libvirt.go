@@ -702,6 +702,47 @@ func (m *Manager) Close() error {
 	return err
 }
 
+// Reconnect replaces this Manager's connection with a fresh one to the same
+// URI, so every later call through it uses the new connection.
+//
+// For the case a long sync creates and nothing else recovers from: a verify
+// of a large disk can run for an hour, and a qemu+ssh connection idle that
+// long gets closed underneath us. Everything the run does after that fails
+// with "client socket is closed" -- including, on a run where every disk
+// copied, committed and verified correctly, the final role read and redefine
+// that record the work as having happened.
+//
+// Healing the Manager rather than offering a one-shot ViaReconnect helper per
+// call, which is how the SOURCE side does it: those helpers open a connection,
+// do one thing and close it, so the NEXT call is still broken. Here the
+// failing calls come in a sequence that has to complete as a unit -- read the
+// role, then redefine the domain with it -- and reconnecting once has to fix
+// all of them.
+//
+// Safe only where nothing else is using the old connection concurrently. Every
+// caller today is past the disk workers' barrier, on run()'s own goroutine.
+//
+// The old connection is closed best-effort: it is already broken by
+// assumption, and failing to close a broken connection is not a reason to
+// refuse a working replacement.
+func (m *Manager) Reconnect() error {
+	if m == nil {
+		return fmt.Errorf("reconnect: nil manager")
+	}
+	if m.Conn != nil {
+		if _, err := m.Conn.Close(); err != nil {
+			trace.Debug("closing the old libvirt connection before reconnecting failed; it was already broken", "uri", m.URI, "error", err)
+		}
+		m.Conn = nil
+	}
+	conn, err := libvirt.NewConnect(m.URI)
+	if err != nil {
+		return fmt.Errorf("reconnect libvirt %s: %w", m.URI, err)
+	}
+	m.Conn = conn
+	return nil
+}
+
 func (m *Manager) LookupDomain(name string) (*libvirt.Domain, error) {
 	dom, err := m.Conn.LookupDomainByName(name)
 	if err != nil {
