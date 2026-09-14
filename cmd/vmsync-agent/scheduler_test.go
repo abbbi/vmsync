@@ -755,12 +755,16 @@ func TestEffectiveScheduleReportsWhatTheAgentWillActuallyDo(t *testing.T) {
 				Profile: SyncProfile{Verify: "full"}, VerifyIntervalSeconds: 86400},
 		},
 	}
-	s := newSched()
-	stubSyncable = []string{"db01", "lab01", "mail01"}
-	defer func() { stubSyncable = nil }()
-
 	// Mid-March: the first Sunday of March has passed, so April's is next.
 	now := schedTime(t, "2026-03-15 09:00")
+
+	// Primes the syncable cache rather than stubbing the scan. syncableVMs
+	// returns the cached list untouched while it is fresh, so this drives the
+	// real function down its real path with no hypervisor -- and a stub would
+	// have tested a stub.
+	s := newSched()
+	s.syncable = []string{"db01", "lab01", "mail01"}
+	s.syncableAt = now
 	got := map[string]EffectiveScheduleEntry{}
 	for _, row := range s.EffectiveSchedule(&agentConfig{}, cfg, now) {
 		got[row.VM] = row
@@ -824,6 +828,10 @@ func TestEffectiveScheduleReportsWhatTheAgentWillActuallyDo(t *testing.T) {
 
 	t.Run("an open window says so", func(t *testing.T) {
 		inWindow := schedTime(t, "2026-04-05 06:00")
+		// Re-primed: the cache has a one-minute TTL, and this instant is three
+		// weeks past the one above, so a stale entry would send syncableVMs to
+		// libvirt.
+		s.syncableAt = inWindow
 		for _, row := range s.EffectiveSchedule(&agentConfig{}, cfg, inWindow) {
 			if row.VM == "db01" && !row.VerifyWindowOpen {
 				t.Error("db01's window is open at 06:00 on the first Sunday, but the report says otherwise")
