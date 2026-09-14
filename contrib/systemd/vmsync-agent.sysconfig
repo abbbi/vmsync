@@ -1,0 +1,60 @@
+# /etc/sysconfig/vmsync-agent -- the agent's command line, and nothing else.
+#
+# On Debian and Ubuntu this conventionally lives at /etc/default/vmsync-agent;
+# change the EnvironmentFile= line in the unit to match if you put it there.
+#
+# What belongs in this file: the mode, and the handful of flags that say what
+# one invocation is for. What does NOT belong here is any SETTING -- the UI
+# address, its CA bundle, the state directory, SSH details, limits and every
+# feature switch live in /etc/vmsync/agent.json, where a SIGHUP can change
+# them without restarting the agent. Moving one of them here would take a
+# reloadable setting and make it need a restart, which is the opposite of
+# what you want during an incident.
+
+# VMSYNC_AGENT_MODE -- required, exactly one of three. There is no default:
+# the only plausible one would be --controlled, and that is the mode in which
+# the control plane can start, stop and fail over this host's VMs. Arriving
+# there because nobody said otherwise is the accident this refuses to have.
+#
+#   --standalone   The schedule comes from a local file ("schedule_file" in
+#                  agent.json). No control plane is involved at any point and
+#                  nothing off this host can reach it.
+#
+#   --monitor      Reports, and does not act. It enrols with a control plane
+#                  and keeps reporting, but runs no scheduler, executes no
+#                  operations, and fences nothing. For a host whose
+#                  replication is driven by something else -- cron, usually --
+#                  where the point is to make what cron actually did visible
+#                  in the console instead of leaving the site invisible.
+#
+#                  Note what it gives up: a monitored host has no split-brain
+#                  protection from this agent, because fencing is the one
+#                  thing here that stops a running VM and a mode that does not
+#                  act cannot carry it. If you want fencing without
+#                  scheduling, use --controlled with "features.schedule":
+#                  false in agent.json.
+#
+#   --controlled   The full agent. The control plane holds the schedule, this
+#                  agent runs it, executes the operations the UI publishes,
+#                  and fences on its behalf.
+#
+# Changing this needs a restart, not a reload: the mode decides which
+# goroutines exist, and a SIGHUP cannot retract a goroutine.
+VMSYNC_AGENT_MODE=--controlled
+
+# VMSYNC_AGENT_OPTS -- optional, and deliberately short-lived. The only flags
+# that make sense here are the ones that say what this invocation is for:
+#
+#   --enrol-token-file=/etc/vmsync/enrol-token
+#       Needed once, until enrolment succeeds. The agent READS THE FILE AND
+#       DELETES IT, so the token does not outlive its use; remove this line
+#       afterwards, or leave it -- a missing file is the ordinary state of an
+#       enrolled host and is not an error.
+#
+#   --debug
+#       Forces debug logging on until the agent is restarted. It survives
+#       every reload on purpose, so a file that says otherwise cannot switch
+#       it off mid-incident. Prefer "log": {"debug": true} in agent.json,
+#       which a reload can turn back off without dropping the process.
+#
+#VMSYNC_AGENT_OPTS=

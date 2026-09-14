@@ -1,0 +1,50 @@
+# vmsync-bridge-helper -- the piece that goes on TARGET hosts.
+#
+# Its own package, and the one that most needed to be one. vmsync never uploads
+# this binary: it is deployed ahead of time, by hand, to every host that
+# receives a replica, and pkg/nbdbridge's CheckRemote refuses a sync when the
+# two versions disagree. "By hand, to every target host, and it must match"
+# describes a problem package managers exist to solve.
+#
+# It is also the only one of the three that is trivial to install anywhere:
+# built with CGO_ENABLED=0, so it is static and depends on nothing at all. A
+# target host needs neither libvirt nor libnbd to receive a replica.
+name: vmsync-bridge-helper
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+# The version is "0.50~nightly.20260915.0317.gabc12345", which is deliberately
+# not semver -- the '~' is what makes a nightly sort below the release. Left to
+# nfpm's semver parser it would be rejected or mangled; 'none' passes it
+# through to dpkg and rpm, which both understand it natively.
+version_schema: none
+
+maintainer: Orsiris de Jong <ozy@netpower.fr>
+homepage: https://github.com/netinvent/vmsync
+license: GPL-3.0-or-later
+vendor: netinvent
+section: admin
+priority: optional
+
+description: |
+  Target-side helper for vmsync replication.
+
+  Receives the compressed/buffered NBD stream vmsync sends and writes it to the
+  replica's disks. Install this on every host that RECEIVES replicas; it is not
+  needed on the source. Static binary with no runtime dependencies.
+
+  Its version must match the vmsync driving it -- vmsync checks before every
+  sync and refuses on a mismatch.
+
+  Built from ${VMSYNC_FULL_VERSION}.
+
+contents:
+  - src: ${BIN_DIR}/vmsync-bridge-helper
+    dst: /usr/bin/vmsync-bridge-helper
+    file_info:
+      mode: 0755
+
+  - src: ${ROOT}/LICENSE
+    dst: /usr/share/doc/vmsync-bridge-helper/LICENSE
+    file_info:
+      mode: 0644

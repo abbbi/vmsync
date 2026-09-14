@@ -1,0 +1,89 @@
+# vmsync -- the replication engine.
+#
+# One VM, one sync, then exit. Everything else in this repo is something that
+# decides WHEN to run this.
+name: vmsync
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+# See the note in vmsync-bridge-helper.yaml: the version is intentionally not
+# semver, because '~' is what orders a nightly below a release.
+version_schema: none
+
+maintainer: Orsiris de Jong <ozy@netpower.fr>
+homepage: https://github.com/netinvent/vmsync
+license: GPL-3.0-or-later
+vendor: netinvent
+section: admin
+priority: optional
+
+description: |
+  Incremental libvirt VM replication using dirty bitmaps.
+
+  Replicates a running libvirt domain to another hypervisor: a full copy on the
+  first run, then only the blocks that changed since the last checkpoint. Does
+  one VM per invocation and exits, so it is driven by cron, by the bundled
+  parallel launcher, or by vmsync-agent.
+
+  Built from ${VMSYNC_FULL_VERSION}.
+
+# Runtime libraries, not the -devel packages the build containers use. The
+# engine links libvirt and libnbd; the names differ between the two families,
+# which is why they are declared per packager rather than once.
+#
+# These are asserted, not derived -- nfpm does not read a binary's DT_NEEDED
+# the way rpmbuild does. The nightly workflow therefore INSTALLS the package in
+# a clean container of the distro it was built for and runs `vmsync -v`, so a
+# wrong name here fails CI instead of shipping.
+overrides:
+  rpm:
+    depends:
+      - libvirt-libs
+      - libnbd
+  deb:
+    depends:
+      - libvirt0
+      - libnbd0
+
+# Needed on the far end of every sync, but on a DIFFERENT host -- so it is a
+# suggestion, not a dependency. Making it a hard dep would install the helper
+# on every source host, where it does nothing, and still not put it on the
+# target host, where it is required.
+suggests:
+  - vmsync-bridge-helper
+
+contents:
+  - src: ${BIN_DIR}/vmsync
+    dst: /usr/bin/vmsync
+    file_info:
+      mode: 0755
+
+  - src: ${ROOT}/README.md
+    dst: /usr/share/doc/vmsync/README.md
+    file_info:
+      mode: 0644
+  - src: ${ROOT}/docs/MODES.md
+    dst: /usr/share/doc/vmsync/MODES.md
+    file_info:
+      mode: 0644
+  - src: ${ROOT}/docs/HOWTO.md
+    dst: /usr/share/doc/vmsync/HOWTO.md
+    file_info:
+      mode: 0644
+  - src: ${ROOT}/Changelog
+    dst: /usr/share/doc/vmsync/Changelog
+    file_info:
+      mode: 0644
+  - src: ${ROOT}/LICENSE
+    dst: /usr/share/doc/vmsync/LICENSE
+    file_info:
+      mode: 0644
+
+  # The parallel launcher, as an example rather than on PATH. It is configured
+  # by editing the variables at the top of the file, so a copy under /usr/bin
+  # would be a config file in the wrong place -- one that every upgrade would
+  # overwrite. Copy it somewhere of your own and edit that.
+  - src: ${ROOT}/contrib/runner/vmsync-parallel.sh
+    dst: /usr/share/doc/vmsync/examples/vmsync-parallel.sh
+    file_info:
+      mode: 0644

@@ -1,0 +1,120 @@
+[Unit]
+Description=vmsync replication agent
+Documentation=https://github.com/netinvent/vmsync
+After=network-online.target libvirtd.service
+Wants=network-online.target
+
+[Service]
+# Type=simple, not notify: the agent does not call sd_notify(). With
+# Type=notify systemd would wait for a readiness message that never
+# arrives, time out, and kill a perfectly healthy agent.
+Type=simple
+
+# One unit for all three modes.
+#
+# There used to be two, for standalone and control-plane, and they were
+# identical apart from a single word in ExecStart -- around fifty lines of
+# hardening, restart policy and state-directory setup duplicated so that one
+# argument could differ. Adding monitor would have made three copies. The
+# first hardening fix applied to one and forgotten in the others is the whole
+# problem with that shape, and it is the kind of drift nobody notices until
+# the host it mattered on is the one that was missed.
+#
+# The mode comes from the environment file below. Everything else about the
+# agent stays in /etc/vmsync/agent.json: the UI address and its CA bundle
+# moved there deliberately, so that one file describes the agent and it is the
+# file config management already owns. This environment file is not a way back
+# to splitting that across two places -- it carries what the COMMAND LINE
+# carries, which is only ever which agent this is and what this one invocation
+# is for.
+#
+# "-" on the path so a missing file is not a unit failure. That is not
+# leniency: with no VMSYNC_AGENT_MODE the agent starts, finds no mode, and
+# refuses with a message naming all three. That is a far more useful thing to
+# find in the journal than systemd's "Failed to load environment files".
+#
+# Both paths, because the two distro families disagree about which one this is
+# and the packages follow their own convention: the .rpm installs
+# /etc/sysconfig/vmsync-agent, the .deb installs /etc/default/vmsync-agent. On
+# any given host exactly one exists and the other is silently absent, so
+# listing both costs nothing and means one unit file serves everywhere. If you
+# create both by hand, the later line wins.
+EnvironmentFile=-/etc/sysconfig/vmsync-agent
+EnvironmentFile=-/etc/default/vmsync-agent
+
+# $VMSYNC_AGENT_MODE unbraced and unquoted, which is systemd's word-splitting
+# form: an unset or empty variable contributes NO argument rather than an
+# empty one. An empty string argument would be a mode the agent has to reject
+# by name; no argument at all is the "you did not say" path, which is the one
+# with the useful error.
+ExecStart=/usr/local/bin/vmsync-agent $VMSYNC_AGENT_MODE $VMSYNC_AGENT_OPTS --config /etc/vmsync/agent.json
+
+# Everything this agent needs lives in that file, so a reload re-reads it
+# instead of restarting the process -- no sync in flight is interrupted.
+#
+# The mode is the exception and cannot be reloaded: it decides which
+# goroutines exist, and a SIGHUP cannot retract a goroutine. Changing
+# VMSYNC_AGENT_MODE needs `systemctl daemon-reload && systemctl restart`.
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=always
+RestartSec=30
+
+# Disable the start limit outright. systemd's default (5 starts within
+# 10s puts the unit in "failed" and stops restarting it) is designed for
+# services where a crash loop means give up. Here it means the opposite:
+# an agent that cannot reach its UI must keep trying, and permanently
+# stopping the thing that reports replication health is exactly the
+# outcome to avoid. RestartSec above provides the backoff instead.
+#
+# One case this does NOT paper over: a missing or wrong VMSYNC_AGENT_MODE
+# exits 2 immediately, and Restart=always will retry it every 30 seconds
+# forever. That is intentional -- the journal says exactly what is wrong on
+# every attempt, and an agent that gave up would be a host silently absent
+# from the console.
+StartLimitIntervalSec=0
+
+# systemd creates and owns /var/lib/vmsync-agent, which holds the agent's
+# credential (0600) and its cached UI configuration.
+StateDirectory=vmsync-agent
+StateDirectoryMode=0700
+
+# In --standalone and --controlled the agent starts vmsync itself, so
+# KillMode's default (control-group) is what should act: vmsync's SIGTERM
+# path stops the backup job, deletes the verify-window checkpoint, tears down
+# NBD exports and resumes a suspended source, so an aborted sync leaves no
+# orphaned state and retries on its next slot. KillMode=process would instead
+# leave orphaned vmsync processes holding NBD ports and libvirt jobs. In
+# --monitor nothing is spawned and there is nothing for it to act on.
+TimeoutStopSec=30
+
+# Hardening. The agent reads libvirt over its socket and speaks HTTPS out;
+# it needs nothing else. Relax these if a local policy requires it, but
+# note this process holds a credential and reports the estate's topology.
+#
+# Two open questions carried over from the units this replaces, both recorded
+# in docs/design/agent-config.md and neither confirmed on a real host yet.
+# Left as they were rather than changed on a guess:
+#
+#   * ProtectSystem=strict makes /run read-only for the agent AND every child,
+#     and the only writable grant here is StateDirectory. If vmsync's lock
+#     directory (/run/vmsync-locks) cannot be created, a promotion fails
+#     unretryably on a hardened host. RuntimeDirectory= plus
+#     RuntimeDirectoryPreserve=yes is the fix if it reproduces.
+#   * TimeoutStopSec=30 is below the 60s cmd.WaitDelay the agent gives a
+#     vmsync child, so a sync needing 45s to unwind would be SIGKILLed
+#     mid-cleanup -- which defeats the reason KillMode stays at its default,
+#     two blocks up. 90 is the candidate number.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,240 @@
+name: Nightly packages
+
+# Nightlies exist so the current tip is installable, not just buildable. The
+# release workflow ships bare binaries in a tarball from a tag; this ships
+# .deb and .rpm from HEAD, per distro, with the dependencies and the systemd
+# unit that a real install needs.
+on:
+  schedule:
+    # 03:17 UTC. An odd minute on purpose: GitHub queues scheduled jobs and
+    # the top of the hour is the most contended slot there is.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build (blank = the scheduled default below)'
+        required: false
+        default: ''
+
+env:
+  # WHICH BRANCH THE NIGHTLY BUILDS. Edit this line to move it.
+  #
+  # It exists because of a GitHub constraint that cannot be worked around from
+  # here: `on: schedule` only ever fires from the DEFAULT branch, and the
+  # scheduled run checks out that branch unless told otherwise. That is a rule
+  # about where the workflow FILE is read from, not about what it may build --
+  # so this file has to live on the default branch, and then check out whatever
+  # it actually wants.
+  #
+  # Consequence worth knowing: a change to THIS file only takes effect for
+  # scheduled runs once it reaches the default branch. A change to anything
+  # under contrib/packaging/ takes effect as soon as it reaches the branch
+  # named here, because that is what gets checked out.
+  NIGHTLY_BRANCH: agent
+
+# One run at a time per dispatch ref, so building two branches does not have
+# them cancel each other -- without it, a manual dispatch of one branch would
+# kill the scheduled run of another, which looks exactly like a flaky nightly.
+#
+# Keyed on the ref the run was DISPATCHED from, not the one it builds: the env
+# context is not available in `concurrency`, and repeating the branch name here
+# would give two places to edit and one of them would eventually be wrong. The
+# cost is that a manual dispatch of the same branch the schedule builds does
+# not cancel the scheduled run, which wastes a little CI and breaks nothing.
+concurrency:
+  group: nightly-${{ github.event.inputs.branch || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Nothing changed, nothing to build. The packages would be byte-identical --
+  # pkgversion.sh derives the version from the COMMIT's date rather than the
+  # clock, precisely so a rebuild of the same tree is the same version -- so
+  # this saves four container builds rather than changing any outcome.
+  #
+  # Skipped for a manual dispatch: if somebody pressed the button, they want a
+  # build, and telling them "no commits since yesterday" is not an answer.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      branch: ${{ steps.branch.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The branch this nightly is FOR, which on a scheduled run is not the
+          # branch the workflow was triggered on. Everything past this point --
+          # the freshness test, the version string, the packaging scripts
+          # themselves -- comes from here.
+          ref: ${{ github.event.inputs.branch || env.NIGHTLY_BRANCH }}
+          # The freshness test needs history, and the version string needs the
+          # commit date and sha. A shallow clone has neither.
+          fetch-depth: 0
+
+      # Echoed as its own step so the first thing in the log says what is being
+      # built. A nightly that quietly built the wrong branch for a fortnight is
+      # a very annoying thing to discover from a package that lacks a fix you
+      # know you merged.
+      - id: branch
+        run: |
+          name="${{ github.event.inputs.branch || env.NIGHTLY_BRANCH }}"
+          echo "building branch: ${name} ($(git rev-parse --short HEAD))"
+          echo "name=${name}" >>"$GITHUB_OUTPUT"
+
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            echo "manual dispatch: building regardless of activity"
+            echo "build=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # %ct is a unix timestamp, so this is arithmetic rather than date
+          # parsing, which behaves the same everywhere.
+          last=$(git show -s --format=%ct HEAD)
+          now=$(date -u +%s)
+          age=$(( now - last ))
+          echo "HEAD is $(( age / 3600 ))h old"
+          if [ "$age" -lt 86400 ]; then
+            echo "build=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "no commits in the last 24h; skipping"
+            echo "build=false" >>"$GITHUB_OUTPUT"
+          fi
+
+  packages:
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Deliberately the same list as release-build.yml. A nightly that covered
+      # fewer distros than the release would let a packaging break reach a tag
+      # without ever having been built.
+      matrix:
+        target: [rocky_93, rocky_101, debian_trixie, debian_unstable]
+    steps:
+      - name: Check out ${{ needs.changes.outputs.branch }}
+        uses: actions/checkout@v4
+        with:
+          # Taken from the `changes` job rather than re-evaluated, so both jobs
+          # are provably looking at the same branch.
+          ref: ${{ needs.changes.outputs.branch }}
+          fetch-depth: 0
+
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      # Pinned, not "latest". A packaging tool that silently changes how it
+      # lays out a .deb between one night and the next would produce a
+      # difference nobody could attribute to a commit.
+      - name: Install nfpm
+        env:
+          NFPM_VERSION: 2.41.3
+        run: |
+          curl -fsSL -o /tmp/nfpm.tar.gz \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          tar -xzf /tmp/nfpm.tar.gz -C /tmp nfpm
+          sudo install -m 0755 /tmp/nfpm /usr/local/bin/nfpm
+          nfpm --version
+
+      # Same container build the release uses, so the binaries link against
+      # the target distro's own glibc rather than the runner's.
+      - name: Build binaries (make ${{ matrix.target }})
+        run: make ${{ matrix.target }}
+
+      - name: Compute version
+        id: ver
+        run: |
+          v="$(contrib/packaging/pkgversion.sh nightly)"
+          echo "version=$v" >>"$GITHUB_OUTPUT"
+          echo "Package version: $v"
+
+      - name: Build packages
+        env:
+          PKG_VERSION: ${{ steps.ver.outputs.version }}
+        run: contrib/packaging/build.sh
+
+      # The assertion that makes the rest of this worth running.
+      #
+      # nfpm does not derive dependencies from a binary's DT_NEEDED the way
+      # rpmbuild does -- the runtime library names in the nfpm configs are
+      # asserted by hand. Installing into a clean container of the distro the
+      # binaries were built for is what turns a wrong name from something that
+      # ships into something that fails here: the install resolves the declared
+      # deps against the real repositories, and `vmsync -v` then proves the
+      # dynamic linker is actually satisfied, which a successful install alone
+      # does not.
+      - name: Install the packages in a clean ${{ matrix.target }} container
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            rocky_93)        image=rockylinux:9.3 ;;
+            rocky_101)       image=rockylinux:10.1 ;;
+            debian_trixie)   image=debian:trixie ;;
+            debian_unstable) image=debian:unstable ;;
+            *) echo "no test image mapped for ${{ matrix.target }}" >&2; exit 1 ;;
+          esac
+
+          case "${{ matrix.target }}" in
+          rocky_*)
+            podman run --rm -v "$PWD/dist:/dist:ro,Z" "$image" sh -euxc '
+              dnf -y install /dist/*.rpm
+              vmsync -v
+              vmsync-agent -v
+              vmsync-bridge-helper -v
+              test -f /usr/lib/systemd/system/vmsync-agent.service
+              test -f /etc/sysconfig/vmsync-agent
+              test -f /etc/vmsync/agent.json.example
+              # Not shipped, and must not be: a packaged agent.json would be a
+              # placeholder that parses, i.e. a host that starts and
+              # replicates nothing.
+              test ! -e /etc/vmsync/agent.json
+              # Installed, never enabled -- the agent has no default mode.
+              ! systemctl is-enabled vmsync-agent.service 2>/dev/null
+            '
+            ;;
+          debian_*)
+            podman run --rm -v "$PWD/dist:/dist:ro,Z" "$image" sh -euxc '
+              apt-get update -qq
+              apt-get install -y --no-install-recommends /dist/*.deb
+              vmsync -v
+              vmsync-agent -v
+              vmsync-bridge-helper -v
+              test -f /usr/lib/systemd/system/vmsync-agent.service
+              test -f /etc/default/vmsync-agent
+              test -f /etc/vmsync/agent.json.example
+              test ! -e /etc/vmsync/agent.json
+            '
+            ;;
+          esac
+
+      # A nightly must never outrank the release it precedes. Asserted with the
+      # packagers own comparison tools rather than by reading the string,
+      # because "~ sorts first" is a rule of dpkg and rpm, not of sort(1), and
+      # the failure it prevents is silent: every host that ever installed a
+      # nightly would refuse the release as a downgrade.
+      # Runs once per matrix leg rather than in a job of its own. It is cheap,
+      # and a version scheme that is only checked in one place is one that
+      # stops being checked the day somebody edits that place.
+      - name: Assert the nightly sorts below the release
+        run: contrib/packaging/check-ordering.sh "${{ steps.ver.outputs.version }}"
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          # The branch is in the name because artifact names are unique per
+          # run and a reader picking one out of a list has no other way to tell
+          # which branch it came from -- and once more than one branch is being
+          # built nightly, "nightly-rocky_93" is an invitation to install the
+          # wrong one.
+          name: nightly-${{ needs.changes.outputs.branch }}-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          # Nightlies are not archives. Keeping every one forever turns the
+          # artifact store into a landfill nobody prunes; two weeks is long
+          # enough to bisect a regression back to the night it appeared.
+          retention-days: 14
