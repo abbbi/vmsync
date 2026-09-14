@@ -463,6 +463,24 @@ func TestVerifyDueByCalendar(t *testing.T) {
 		if !s.verifyDue(e, schedTime(t, "2026-03-05 03:00")) {
 			t.Error("the next day did not verify; a daily window must fire daily")
 		}
+		// The HOURS have to bind, and nothing above made them.
+		//
+		// Both assertions so far are inside the window, so they are satisfied
+		// just as well by the interval path's "no cadence means verify on
+		// every sync" -- which is exactly what an entry carrying only a
+		// window falls back to if the calendar guard forgets to look at
+		// VerifyWindow. Proven: changing that guard to test VerifyDays alone
+		// left the whole suite green.
+		for _, at := range []string{
+			"2026-03-06 01:59", // before it opens
+			"2026-03-06 04:00", // the end is excluded
+			"2026-03-06 12:00", // the middle of the day
+			"2026-03-06 23:30", // and the night
+		} {
+			if s.verifyDue(e, schedTime(t, at)) {
+				t.Errorf("verified at %s, outside the 02:00-04:00 window -- a window-only entry is being treated as having no cadence at all", at)
+			}
+		}
 	})
 
 	t.Run("days with no window means once that day", func(t *testing.T) {
@@ -678,6 +696,42 @@ func TestCrossingWindowHoldsInEveryZone(t *testing.T) {
 			// occurrence, and the spring-forward night must not lose one.
 			if fires != 52 {
 				t.Errorf("verified %d times in 2026, want 52 -- one per Sunday night", fires)
+			}
+		})
+	}
+}
+
+// releaseVerifyOccurrence has to recognise all THREE calendar shapes, and
+// only the days+window one was ever exercised.
+//
+// Proven gap: changing its guard from `VerifyDays == "" && VerifyWindow == ""`
+// to `||` left the whole suite green, while a days-only or window-only entry
+// silently stopped getting its window back after a failed run -- losing that
+// occurrence entirely, since a missed window is never made up.
+func TestFailedRunReArmsEveryCalendarShape(t *testing.T) {
+	verifying := syncPlan{SyncRequest: SyncRequest{Profile: SyncProfile{Verify: "fast"}}}
+
+	for _, tc := range []struct {
+		name         string
+		days, window string
+		inWindow     [2]string // two instants inside one occurrence
+	}{
+		{"days and window", "Sun *-*-01..07", "02:00-12:00", [2]string{"2026-03-01 02:00", "2026-03-01 02:15"}},
+		{"days only", "Sun *-*-01..07", "", [2]string{"2026-03-01 09:00", "2026-03-01 14:00"}},
+		{"window only", "", "02:00-04:00", [2]string{"2026-03-04 02:00", "2026-03-04 02:30"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSched()
+			e := ScheduleEntry{
+				VM: "web01", Profile: SyncProfile{Verify: "fast"},
+				VerifyDays: tc.days, VerifyWindow: tc.window,
+			}
+			if !s.verifyDue(e, schedTime(t, tc.inWindow[0])) {
+				t.Fatalf("the first sync in the occurrence did not verify")
+			}
+			s.releaseVerifyOccurrence(e, verifying)
+			if !s.verifyDue(e, schedTime(t, tc.inWindow[1])) {
+				t.Error("the next sync did not verify after the first failed; the occurrence was lost")
 			}
 		})
 	}

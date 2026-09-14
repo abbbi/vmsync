@@ -563,9 +563,23 @@ func (s Schedule) IsZero() bool { return s.Days.text == "" && s.Window.IsZero() 
 // ten-second tick would otherwise fire dozens of times.
 //
 // The returned time is in t's own location, and is built with time.Date
-// rather than by subtracting a duration -- so on a spring-forward day a start
-// time that does not exist normalises forward to the next real instant
-// instead of landing an hour out.
+// rather than by subtracting a duration -- a duration lands on the wrong
+// instant whenever the day it crosses is not 24 hours long.
+//
+// What time.Date does with a start time that does NOT exist -- 02:00 on a
+// spring-forward day -- is resolve the gap by the offset change, and that can
+// go either way: Europe/Paris moves it forward to 03:00, while a zone whose
+// gap begins at midnight moves it BACKWARD, onto the previous evening. This
+// comment used to claim it always normalises forward, and that mistake is
+// what made AddDate look safe in the crossing-midnight branch below, where it
+// silently cost half an occurrence in three zones.
+//
+// The firing is correct either way, which is why this is a note rather than a
+// bug: the resolved instant is a pure function of the inputs, so both passes
+// through an occurrence produce the same value, and that stability is all the
+// dedupe in Due needs. What it costs is a reported start that can read an
+// hour early and dated to the previous day -- the same cosmetic price
+// atMinute pays for the ambiguous hour, and paid for the same reason.
 func (s Schedule) OccurrenceStart(t time.Time) (time.Time, bool) {
 	if s.Window.IsZero() {
 		if !s.Days.Matches(t) {
@@ -589,9 +603,28 @@ func (s Schedule) OccurrenceStart(t time.Time) (time.Time, bool) {
 		return atMinute(t, s.Window.startMin), true
 	}
 	if mins < s.Window.endMin {
-		// AddDate, not a 24h subtraction: on a DST boundary the previous
-		// calendar day is not 24 hours ago.
-		y := t.AddDate(0, 0, -1)
+		// Yesterday's DATE, taken at midday, and both halves of that matter.
+		//
+		// Not a 24-hour subtraction: on a DST boundary the previous calendar
+		// day is not 24 hours ago, so subtracting a duration can land on the
+		// wrong date. That was the first bug here.
+		//
+		// But AddDate(0, 0, -1) is wrong too, and more subtly. It carries THIS
+		// instant's wall clock onto the previous date -- and this branch only
+		// runs in the small hours, because it needs mins < endMin. In a zone
+		// whose spring-forward gap begins at MIDNIGHT, that wall clock does
+		// not exist on the previous day, and Go resolves the gap by moving
+		// BACKWARD across midnight: from Monday 00:30 it returns Saturday
+		// 23:30, skipping Sunday entirely. Days.Matches is then asked about
+		// the wrong weekday, and a Sunday-night window reports itself closed
+		// for the whole of Monday's small hours -- half the occurrence, gone
+		// silently, in America/Santiago, America/Havana and Atlantic/Azores.
+		//
+		// Midday is the fix: only the DATE is being asked about here, since
+		// Days.Matches reads nothing finer than the day, and no real zone has
+		// ever moved its clock across noon. So this is the one time of day
+		// that cannot be normalised onto a different date.
+		y := time.Date(t.Year(), t.Month(), t.Day()-1, 12, 0, 0, 0, t.Location())
 		if s.Days.Matches(y) {
 			return atMinute(y, s.Window.startMin), true
 		}

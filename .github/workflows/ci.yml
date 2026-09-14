@@ -58,13 +58,24 @@ jobs:
 
       # The scheduling and verify-cadence code, under the race detector.
       #
-      # Scoped to these two packages rather than ./... because the reason is
-      # specific: the calendar decision is a real cross-goroutine handoff.
-      # The scheduler loop claims a verify occurrence in lastVerified under
-      # s.mu, and runOne hands it back from the run's own goroutine when the
-      # sync failed (releaseVerifyOccurrence). A lock mistake there loses or
-      # double-fires a monthly verify, and no assertion would catch it,
-      # because both outcomes look like a plausible schedule.
+      # Scoped rather than ./... because the reasons are specific, and each
+      # is a handoff no assertion can catch:
+      #
+      #   cmd/vmsync-agent -- the scheduler loop claims a verify occurrence in
+      #     lastVerified under s.mu, and runOne hands it back from the run's
+      #     own goroutine when the sync failed (releaseVerifyOccurrence). A
+      #     lock mistake loses or double-fires a monthly verify, and both
+      #     outcomes look like a plausible schedule.
+      #   cmd/vmsync -- thawTracker is written by run() AND by the goroutine
+      #     callWithTimeout abandoned, which is the entire point of it; and
+      #     the commit barrier has every disk worker appending to `staged` and
+      #     bumping `phase1Done`, where one lost increment means committing
+      #     for a disk that never staged.
+      #
+      # cmd/vmsync was missing from this list at first, which had it exactly
+      # backwards: it holds the most new concurrency of the three, while
+      # pkg/schedcal has none at all. schedcal stays because running it costs
+      # nothing and the day it grows a cache is the day nobody remembers.
       #
       # TZ is set because the agent resolves a window in the HOST's local
       # time, from time.Now(). The tests themselves already sweep six zones
@@ -76,7 +87,7 @@ jobs:
       - name: Test the scheduling code under race
         env:
           TZ: Europe/Paris
-        run: go test -race -count=1 ./pkg/schedcal/ ./cmd/vmsync-agent/
+        run: go test -race -count=1 ./pkg/schedcal/ ./cmd/vmsync-agent/ ./cmd/vmsync/
 
       # A SKIP in this code is a silent hole, so here it is a failure. The DST
       # cases used to skip when the host had no tzdata -- a green build with

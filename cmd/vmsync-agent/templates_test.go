@@ -350,3 +350,39 @@ func TestScheduleTemplateValidate(t *testing.T) {
 		})
 	}
 }
+
+// The inherit-as-a-unit guard has three clauses, and only two were pinned.
+//
+// TestVerifyCadenceInheritsAsAUnit covers a window-only entry and an
+// interval-only one, but never a DAYS-only entry -- so dropping
+// `entry.VerifyDays == ""` from the guard left the whole suite green while a
+// days-only entry silently had the template's window and interval grafted
+// onto it, producing exactly the both-forms combination validation refuses.
+func TestDaysOnlyEntryInheritsNothingFromTheCadence(t *testing.T) {
+	tpl := calTpl(DefaultTemplateName, "Sun *-*-01..07", "02:00-12:00")
+	tpl.VerifyIntervalSeconds = 0 // the calendar form; both would be refused
+	templates := map[string]ScheduleTemplate{DefaultTemplateName: tpl}
+
+	got := resolveEntry(ScheduleEntry{VM: "db01", VerifyDays: "Sat"}, templates)
+
+	if got.VerifyDays != "Sat" {
+		t.Errorf("VerifyDays = %q, want the entry's own %q", got.VerifyDays, "Sat")
+	}
+	if got.VerifyWindow != "" {
+		t.Errorf("VerifyWindow = %q, want empty: an entry stating days states its whole cadence, and grafting the template's hours onto it silently narrows an all-day rule",
+			got.VerifyWindow)
+	}
+	if got.VerifyIntervalSeconds != 0 {
+		t.Errorf("VerifyIntervalSeconds = %d, want 0", got.VerifyIntervalSeconds)
+	}
+	// And the result has to be something validation accepts -- the point of
+	// the unit rule is that inheritance cannot manufacture a refused entry.
+	if err := validateVerifyCadence(got.VerifyDays, got.VerifyWindow,
+		got.VerifyIntervalSeconds, got.Profile.Verify); err != nil {
+		t.Errorf("the resolved entry does not validate: %v", err)
+	}
+	// The mode still inherits: it answers a different question.
+	if got.Profile.Verify != "fast" {
+		t.Errorf("Verify = %q, want the template's %q", got.Profile.Verify, "fast")
+	}
+}

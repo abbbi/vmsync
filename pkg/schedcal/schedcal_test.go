@@ -695,3 +695,185 @@ func TestLordHoweHalfHourShift(t *testing.T) {
 		t.Errorf("autumn-back Sunday: in=%v start=%v now=%v", in, start, ts)
 	}
 }
+
+// midnightGapZones move their clocks forward at MIDNIGHT, so the previous
+// day's small hours are the ones that do not exist.
+//
+// That is what makes them different from Europe/Paris and friends, whose gap
+// starts at 01:00 or later: taking "yesterday at this wall clock" from an
+// early-morning instant lands on a time that never happened, and Go resolves
+// it BACKWARD across midnight -- two calendar days back, the wrong weekday.
+//
+// Each date below is the transition Sunday itself.
+var midnightGapZones = []struct{ zone, springForward string }{
+	{"America/Santiago", "2026-09-06"},
+	{"America/Havana", "2026-03-08"},
+	{"Atlantic/Azores", "2026-03-29"},
+}
+
+// A window that crosses midnight out of one of those Sundays must stay open
+// for the whole of Monday's small hours.
+//
+// This is the case the rest of the suite could not reach. oddZones already
+// lists America/Santiago, but only ever drives it with the NON-crossing
+// "02:00-04:00" -- and every crossing-window test ran in UTC or Europe/Paris,
+// neither of which has a midnight gap. So the branch was exercised and the
+// zones were exercised, just never both at once.
+func TestCrossingWindowOutOfAMidnightGapDay(t *testing.T) {
+	for _, z := range midnightGapZones {
+		t.Run(z.zone, func(t *testing.T) {
+			loc := zone(t, z.zone)
+			sunday := at(t, loc, z.springForward+" 12:00") // midday: always exists
+			if sunday.Weekday() != time.Sunday {
+				t.Fatalf("%s is a %s, not a Sunday -- the fixture is wrong", z.springForward, sunday.Weekday())
+			}
+			s, err := Parse("Sun", "23:00-01:00")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// The tail of the occurrence, on the Monday. Built with time.Date
+			// rather than by parsing a bare date: parsing "<date>" alone asks
+			// for midnight, which in these zones does not exist and silently
+			// resolves to the previous evening -- the same trap the code had.
+			monday := sunday.AddDate(0, 0, 1)
+			for i := 0; i < 60; i++ {
+				ts := time.Date(monday.Year(), monday.Month(), monday.Day(), 0, i, 0, 0, loc)
+				start, in := s.OccurrenceStart(ts)
+				if !in {
+					t.Fatalf("at %s the Sunday-night window reports CLOSED; taking yesterday's date landed on the wrong weekday, so half the occurrence is silently lost",
+						ts.Format("2006-01-02 15:04 -0700"))
+				}
+				if start.Weekday() != time.Sunday {
+					t.Errorf("at %s the occurrence start is %s, a %s -- it must be the Sunday the window opened on",
+						ts.Format("15:04"), start.Format("2006-01-02 15:04 -0700"), start.Weekday())
+				}
+			}
+
+			// And the head of it, on the Sunday, must not have been broken in
+			// the process.
+			for i := 0; i < 60; i++ {
+				ts := time.Date(sunday.Year(), sunday.Month(), sunday.Day(), 23, i, 0, 0, loc)
+				if _, in := s.OccurrenceStart(ts); !in {
+					t.Fatalf("at %s the window reports closed on the Sunday it opens on", ts.Format("2006-01-02 15:04 -0700"))
+				}
+			}
+		})
+	}
+}
+
+// The invariant, for a CROSSING window, across every zone. oddZones only ever
+// checked it for a non-crossing one.
+func TestCrossingWindowFiresOncePerOccurrenceInEveryZone(t *testing.T) {
+	zones := append([]string{}, oddZones...)
+	for _, z := range midnightGapZones {
+		zones = append(zones, z.zone)
+	}
+	for _, name := range zones {
+		t.Run(name, func(t *testing.T) {
+			loc := zone(t, name)
+			s, err := Parse("Sun", "22:00-04:00")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var last time.Time
+			fires := 0
+			for ts := time.Date(2026, 1, 1, 0, 0, 0, 0, loc); ts.Year() == 2026; ts = ts.Add(5 * time.Minute) {
+				if start, due := s.Due(ts, last); due {
+					fires++
+					last = start
+				}
+			}
+			if fires != 52 {
+				t.Errorf("fired %d times in 2026, want 52 -- one per Sunday night", fires)
+			}
+		})
+	}
+}
+
+// The YEAR field, which nothing exercised at all: the whole of it -- parsed,
+// stored, and checked in Matches -- could be deleted and the suite stayed
+// green. A year-pinned expression is unusual but legal, and one that quietly
+// matched every year would run a "2027 only" window forever.
+func TestYearPinnedExpressions(t *testing.T) {
+	utc := time.UTC
+	d, err := ParseDays("2027-*-*")
+	if err != nil {
+		t.Fatalf("ParseDays: %v", err)
+	}
+	for _, tc := range []struct {
+		when string
+		want bool
+	}{
+		{"2027-03-01 12:00", true},
+		{"2026-03-01 12:00", false},
+		{"2028-03-01 12:00", false},
+	} {
+		if got := d.Matches(at(t, utc, tc.when)); got != tc.want {
+			t.Errorf("2027-*-* matched %v at %s, want %v -- the year is being ignored", got, tc.when, tc.want)
+		}
+	}
+
+	t.Run("a year set", func(t *testing.T) {
+		d, err := ParseDays("2026,2028-*-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct {
+			when string
+			want bool
+		}{
+			{"2026-06-01 12:00", true},
+			{"2028-06-01 12:00", true},
+			{"2027-06-01 12:00", false},
+		} {
+			if got := d.Matches(at(t, utc, tc.when)); got != tc.want {
+				t.Errorf("2026,2028-*-* matched %v at %s, want %v", got, tc.when, tc.want)
+			}
+		}
+	})
+
+	t.Run("the leap-year rule is the real one, not just divisible by four", func(t *testing.T) {
+		// feasible() asks whether 29 February can exist in the pinned years.
+		// A naive y%4 check calls 2100 a leap year and accepts a schedule
+		// that can never fire.
+		if _, err := ParseDays("2100-02-29"); err == nil {
+			t.Error("2100-02-29 was accepted; 2100 is divisible by 4 but NOT a leap year")
+		}
+		if _, err := ParseDays("2000-02-29"); err != nil {
+			t.Errorf("2000-02-29 was refused: %v; 2000 is divisible by 400, so it IS a leap year", err)
+		}
+		if _, err := ParseDays("2028-02-29"); err != nil {
+			t.Errorf("2028-02-29 was refused: %v", err)
+		}
+	})
+}
+
+// parseNumSet's UPPER bound was pinned by nothing: "*-13-*" and "*-*-32" are
+// both refused by feasible() instead, so deleting `to > max` kept the suite
+// green while letting a month 14 and a day 32 through.
+//
+// Each case below is out of range but still FEASIBLE-looking, so only the
+// range check can refuse it.
+func TestNumericRangesAreBounded(t *testing.T) {
+	for _, tc := range []struct{ expr, why string }{
+		{"*-*-01,32", "day 32 in a set whose other member is valid"},
+		{"*-01,14-*", "month 14 in a set whose other member is valid"},
+		{"3500-*-*", "a year past the upper bound"},
+		{"1900-*-*", "a year below the lower bound"},
+		{"*-*-01..40", "a day range whose upper end is out of range"},
+	} {
+		t.Run(tc.expr, func(t *testing.T) {
+			if _, err := ParseDays(tc.expr); err == nil {
+				t.Errorf("ParseDays(%q) was accepted -- %s", tc.expr, tc.why)
+			}
+		})
+	}
+
+	// And the boundaries themselves stay legal.
+	for _, expr := range []string{"*-01-*", "*-12-*", "*-*-01", "*-*-31", "1970-*-*", "2999-*-*"} {
+		if _, err := ParseDays(expr); err != nil {
+			t.Errorf("ParseDays(%q) was refused: %v", expr, err)
+		}
+	}
+}
