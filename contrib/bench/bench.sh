@@ -5491,6 +5491,33 @@ stage_commit_barrier() {
 		results_row "$CSV" commit-barrier fault-fires "" "" "" "" "" "" "FAIL the deliberately-failed run reported success"
 		return 1
 	fi
+
+	# A non-zero exit is NOT enough on its own, and relying on it made this
+	# whole stage vacuous.
+	#
+	# vmsync refuses an unknown -test value at flag validation and exits 2
+	# before it copies anything. So against a build where fail-last-disk had
+	# been removed -- or where the barrier never existed -- this run would
+	# exit non-zero, no disk would be touched, the fingerprints below would be
+	# trivially unchanged, and all three assertions would report PASS. The
+	# stage would be green precisely when the feature was absent.
+	#
+	# So: prove the fault fired where it was supposed to, and prove real work
+	# happened first. The fault is injected AFTER the copy and digest check,
+	# so a genuine run of it leaves both markers behind.
+	if ! grep -q "fail-last-disk: failing this disk deliberately" "$RUN_LOG"; then
+		warn "FAIL: the run exited non-zero but never logged the fail-last-disk injection, so it failed for some OTHER reason -- most likely refused at preflight before copying anything. That would make every assertion below pass vacuously. See $RUN_LOG"
+		results_row "$CSV" commit-barrier fault-fires "" "" "" "" "" "" "FAIL run failed before the fault could fire"
+		return 1
+	fi
+	local verified_disks
+	verified_disks="$(grep -c "checksum: target contents match what was sent" "$RUN_LOG" || true)"
+	if [ "${verified_disks:-0}" -lt 2 ]; then
+		warn "FAIL: only $verified_disks disk(s) got as far as a verified delta before the fault fired. The barrier can only be tested when at least one OTHER disk was ready to commit, so this run proves nothing. See $RUN_LOG"
+		results_row "$CSV" commit-barrier fault-fires "" "" "" "" "" "" "FAIL only $verified_disks disk(s) staged; nothing for the barrier to hold back"
+		return 1
+	fi
+	log "the fault fired after $verified_disks disks had verified deltas ready to commit"
 	results_row "$CSV" commit-barrier fault-fires "" "" "" "" "" "" "PASS the run failed as intended"
 
 	after="$(target_base_fingerprints)"
