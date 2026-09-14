@@ -2970,7 +2970,7 @@ agent_start() {
 	# otherwise would not: without it the remote shell's exit takes the
 	# whole process group with it and the fence sweep never happens.
 	run_shell_on "$host" "$is_local" \
-		"setsid nohup '$bin' --config '$dir/agent.json' >'$dir/agent.log' 2>&1 < /dev/null & echo \$!"
+		"setsid nohup '$bin' --standalone --config '$dir/agent.json' >'$dir/agent.log' 2>&1 < /dev/null & echo \$!"
 }
 
 agent_stop() {
