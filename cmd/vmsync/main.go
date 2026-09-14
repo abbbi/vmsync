@@ -5772,6 +5772,23 @@ func run(cfg syncConfig) (runErr error) {
 	// are mixed exactly as before. What changes is the size of that window:
 	// from the whole transfer, which can be hours on a large delta, down to
 	// the commits themselves, which are a cluster-map merge apiece.
+	// discardOverlays removes deltas whose bases are still untouched, which
+	// makes them worth nothing: every byte in them is also still readable
+	// from the source.
+	//
+	// context.Background(), never ctx: the callers run on paths where an
+	// error has already cancelled ctx, which is precisely when this has to
+	// work.
+	discardOverlays := func(list []stagedOverlay) {
+		for _, s := range list {
+			trace.Info("Removing uncommitted temporary image", "image", s.overlay, "disk", s.dev)
+			if out, err := targetSSHClient.Run(context.Background(), "rm -f "+util.ShQuote(s.overlay)); err != nil {
+				trace.Warning("could not remove the uncommitted temporary image; it holds this run's delta and nothing else, so it is safe to delete by hand",
+					"image", s.overlay, "disk", s.dev, "error", err, "output", out)
+			}
+		}
+	}
+
 	commitStaged := func(allDisksReady bool) error {
 		stagedMu.Lock()
 		defer stagedMu.Unlock()
@@ -5786,26 +5803,34 @@ func run(cfg syncConfig) (runErr error) {
 				trace.Warning("not committing: some disks did not produce a verified delta, so this run's copies are being discarded and the replica stays wholly at its previous checkpoint",
 					"staged", len(staged), "disks", len(qcowDisks))
 			}
-			for _, s := range staged {
-				trace.Info("Removing uncommitted temporary image", "image", s.overlay, "disk", s.dev)
-				if out, err := targetSSHClient.Run(context.Background(), "rm -f "+util.ShQuote(s.overlay)); err != nil {
-					trace.Warning("could not remove the uncommitted temporary image; it holds this run's delta and nothing else, so it is safe to delete by hand",
-						"image", s.overlay, "disk", s.dev, "error", err, "output", out)
-				}
-			}
+			discardOverlays(staged)
 			staged = nil
 			return nil
 		}
 
-		for _, s := range staged {
+		for i, s := range staged {
 			trace.Info("Committing changes to base", "image", s.base, "disk", s.dev)
 			commitCmd := "qemu-img commit -b " + util.ShQuote(s.base) + " " + util.ShQuote(s.overlay)
 			if err := runTargetCommand(commitCmd, fmt.Sprintf("committing changes for %s", s.overlay)); err != nil {
-				// From here the base is no longer known-untouched, so this
+				// THIS disk's base is no longer known-untouched, so its
 				// overlay stops being disposable scratch and becomes the only
-				// record of the delta. Left in place deliberately -- and so
-				// are the ones after it in the list, which were never
-				// attempted.
+				// record of the delta. Kept.
+				//
+				// The disks AFTER it in the list were never attempted, so
+				// their bases are untouched and their overlays are worth
+				// exactly nothing -- the same state the discard path above
+				// deals with. Removing them here is not tidiness: the overlay
+				// name carries the parent checkpoint, so the next run against
+				// a different parent writes a different filename and orphans
+				// these permanently. Leaving them is how a target accumulates
+				// a delta-sized qcow2 per failure, which is the accretion the
+				// per-disk cleanup was written to stop and which moving the
+				// commit out of the workers quietly reintroduced.
+				if rest := staged[i+1:]; len(rest) > 0 {
+					trace.Info("discarding the deltas of disks whose commit was never attempted; their bases are untouched",
+						"disks", len(rest))
+					discardOverlays(rest)
+				}
 				return fmt.Errorf("%w -- the temporary image %s has been LEFT IN PLACE deliberately: the base may be partly committed, so that overlay is the only remaining record of this run's delta. Inspect both before removing it", err, s.overlay)
 			}
 			trace.Info("Removing temporary", "image", s.overlay)
