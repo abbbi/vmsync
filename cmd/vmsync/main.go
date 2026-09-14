@@ -4317,11 +4317,35 @@ func run(cfg syncConfig) (runErr error) {
 	}
 	var stagedMu sync.Mutex
 	var staged []stagedOverlay
-	// Which disk -test=fail-last-disk refuses. Empty for a single-disk domain,
-	// where the fault has nothing asymmetric to prove and so does nothing.
-	lastDiskDev := ""
-	if len(qcowDisks) > 1 {
-		lastDiskDev = qcowDisks[len(qcowDisks)-1].TargetDev
+	// arrivals counts the disks that have finished copying AND passed their
+	// digest check -- the disks that are ready to stage. Only
+	// -test=fail-last-disk reads it.
+	var arrivals int
+	// lastToStage reports whether the caller is the FINAL disk to become ready.
+	// Exactly one caller ever sees true, and only once every disk has got
+	// there.
+	//
+	// This is what "last disk" has to mean, and it is not what it used to
+	// mean. The fault used to pick the last disk in the DISK LIST, which is a
+	// static order, while the disks copy CONCURRENTLY -- so on a domain whose
+	// last-listed disk has the smallest delta, that disk finished first and
+	// refused while the others were still copying. The run failed, nothing
+	// committed, and the test recorded a pass for a barrier it had never
+	// reached: there was nothing staged to hold back.
+	//
+	// Counting arrivals instead makes the fault fire exactly where the barrier
+	// lives -- every other disk staged, this one refusing -- which is the
+	// scenario the barrier exists for and the one that used to leave a target
+	// with vda at the new checkpoint and vdb at the old.
+	//
+	// Under the mutex that already guards `staged`, because it is the same
+	// question asked one moment earlier and a second lock would only be a
+	// second thing to get wrong.
+	lastToStage := func() bool {
+		stagedMu.Lock()
+		defer stagedMu.Unlock()
+		arrivals++
+		return arrivals == len(qcowDisks)
 	}
 	stage := func(s stagedOverlay) {
 		stagedMu.Lock()
@@ -5221,12 +5245,19 @@ func run(cfg syncConfig) (runErr error) {
 			}
 		}
 
-		// -test=fail-last-disk: refuse the last disk here, with everything
-		// about it correct. See TestFaultFailLastDisk.
-		if cfg.TestFault == libvirtsync.TestFaultFailLastDisk && d.TargetDev == lastDiskDev {
-			trace.Warning("-test="+libvirtsync.TestFaultFailLastDisk+": failing this disk deliberately, after its copy and digest check both passed. This run is EXPECTED to fail, and no disk should commit",
-				"disk", d.TargetDev)
-			return res, fmt.Errorf("-test=%s: deliberate failure of disk %s", libvirtsync.TestFaultFailLastDisk, d.TargetDev)
+		// -test=fail-last-disk: refuse the last disk to become ready, with
+		// everything about it correct. See TestFaultFailLastDisk and
+		// lastToStage -- "last" is the last ARRIVAL, not the last entry in the
+		// disk list, because the disks copy concurrently and the two are not
+		// the same disk.
+		//
+		// lastToStage() has a side effect, so it is reached only when this
+		// fault is the active one. Nothing else may make the arrival count
+		// move.
+		if cfg.TestFault == libvirtsync.TestFaultFailLastDisk && lastToStage() {
+			trace.Warning("-test="+libvirtsync.TestFaultFailLastDisk+": failing this disk deliberately, after its copy and digest check both passed and after EVERY other disk has staged its delta. This run is EXPECTED to fail, and no disk should commit",
+				"disk", d.TargetDev, "disks_already_staged", len(qcowDisks)-1)
+			return res, fmt.Errorf("-test=%s: deliberate failure of disk %s, the last of %d to become ready", libvirtsync.TestFaultFailLastDisk, d.TargetDev, len(qcowDisks))
 		}
 
 		// Staged, not committed. The commit happens at the barrier below,

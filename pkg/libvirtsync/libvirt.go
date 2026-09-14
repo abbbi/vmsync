@@ -132,6 +132,14 @@ const (
 	// copied every byte correctly and was refused at the final step. A fault
 	// that fired earlier would let the barrier pass for the wrong reason, by
 	// failing before its siblings had anything staged to discard.
+	//
+	// "Last" means the last disk to BECOME READY, not the last entry in the
+	// domain's disk list. The two are rarely the same disk: the disks copy
+	// concurrently, so the one that finishes last is whichever has the largest
+	// delta this run, and picking by list position meant a domain whose
+	// last-listed disk had the smallest delta refused first -- before any
+	// sibling had staged anything, which is exactly the vacuous pass the
+	// paragraph above warns about. See lastToStage in cmd/vmsync/main.go.
 	TestFaultFailLastDisk = "fail-last-disk"
 )
 
