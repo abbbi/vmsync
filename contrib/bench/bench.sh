@@ -69,6 +69,7 @@ Options:
                              5  define       12  wedge
                              6  failover     13  checksum
                              7  fence-agent  14  verify-failure
+                                            15  commit-barrier
                            Runs in whichever order LIST gives them, not a
                            fixed canonical one.
                            (default: matrix,verify,reinit,snapshot,retention;
@@ -76,7 +77,10 @@ Options:
                            target, and it skips cleanly where the target
                            filesystem cannot reflink. define, failover,
                            fence-agent, verify-long, restore, invert, wedge,
-                           checksum and verify-failure are opt-in, see below)
+                           checksum, verify-failure and commit-barrier are
+                           opt-in, see below. commit-barrier additionally
+                           needs a source domain with two or more qcow2
+                           disks, and skips cleanly without one)
   --dry-run               print every vmsync command line; touch nothing
                            (no ssh/qemu-io/vmsync calls actually made)
   -h, --help              this text
@@ -5373,6 +5377,163 @@ vmsync_verb() {
 	log "   $VMSYNC_BIN ${args[*]}"
 	"$VMSYNC_BIN" "${args[@]}" >"$log_file" 2>&1
 }
+# source_qcow_devs -- every qcow2 disk target dev on the source domain, one
+# per line, in the order libvirt reports them (which is the order vmsync
+# itself iterates, so the LAST one here is the one -test=fail-last-disk
+# refuses).
+source_qcow_devs() {
+	virsh_uri "$SOURCE_URI" dumpxml "$SOURCE_DOMAIN" 2>/dev/null \
+		| xmllint --xpath "//disk[driver/@type='qcow2']/target/@dev" - 2>/dev/null \
+		| tr ' ' '\n' \
+		| sed -n 's/.*dev="\([^"]*\)".*/\1/p'
+}
+
+# target_base_fingerprints -- "dev mtime size blocks" for every target base
+# image, one per line.
+#
+# mtime is the assertion that matters: qemu-img commit writes the base, so a
+# disk that committed has a newer one. Size and allocated blocks ride along
+# because they move too, and a fingerprint agreeing on all three is much
+# harder to pass by accident than one resting on a single number.
+#
+# Reads the paths from the TARGET's own domain XML rather than deriving them,
+# so a relocated -target-disk-path is followed rather than guessed at.
+target_base_fingerprints() {
+	local dev path
+	while read -r dev; do
+		[ -n "$dev" ] || continue
+		path="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$dev")" || true
+		if [ -z "$path" ]; then
+			printf '%s MISSING\n' "$dev"
+			continue
+		fi
+		printf '%s %s\n' "$dev" \
+			"$(ssh_host_cmd "$TARGET_HOST" stat -c '%Y %s %b' "$path" 2>/dev/null | tr -d '\r')"
+	done < <(source_qcow_devs)
+}
+
+# Stage 15: the commit barrier.
+#
+# Proves the property the barrier exists for, and the only one that needed a
+# multi-disk domain to state: when ONE disk fails, NO disk commits.
+#
+# Before the barrier, each disk committed inside its own worker. Disks copy
+# concurrently, so a fast disk could merge its delta into the base while a
+# slow one was still transferring -- and if that slow one then failed, the
+# target was left holding one disk at the new checkpoint and one at the old,
+# with nothing recorded as having happened. A promotion of that replica boots
+# a guest whose disks disagree about what time it is.
+stage_commit_barrier() {
+	log "=== Stage 15: commit barrier (one disk fails, none commit) ==="
+
+	if [ "$DRY_RUN" != yes ]; then
+		stage_needs_target_shutoff "$CSV" commit-barrier "stage commit-barrier" || return 0
+		if ! command -v xmllint >/dev/null 2>&1; then
+			warn "SKIP stage 15: xmllint is required to enumerate the source's disks"
+			results_row "$CSV" commit-barrier precondition "" "" "" "" "" "" "SKIP xmllint unavailable"
+			return 0
+		fi
+	fi
+
+	local -a devs=()
+	if [ "$DRY_RUN" != yes ]; then
+		mapfile -t devs < <(source_qcow_devs)
+		if [ "${#devs[@]}" -lt 2 ]; then
+			# Not a failure, and worth saying precisely: the barrier is still
+			# doing its job on this domain, there is simply no second disk for
+			# it to protect, so the assertion below would pass without testing
+			# anything.
+			warn "SKIP stage 15: $SOURCE_DOMAIN has ${#devs[@]} qcow2 disk(s) and this stage needs at least two -- one disk cannot fail while another commits"
+			results_row "$CSV" commit-barrier precondition "" "" "" "" "" "" "SKIP needs a multi-disk source domain"
+			return 0
+		fi
+		log "source disks: ${devs[*]} -- -test=fail-last-disk will refuse ${devs[*]: -1}"
+	fi
+
+	bench_sync commit-barrier baseline -reinit
+	if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
+		warn "baseline full sync failed (see $RUN_LOG) -- aborting stage 15$(bench_sync_hint)"
+		results_row "$CSV" commit-barrier baseline "" "" "" "" "" "" "FAIL baseline sync failed"
+		return 1
+	fi
+
+	# A real delta, or the incremental below copies nothing, the fault never
+	# fires, and the stage passes having tested nothing -- the same vacuous
+	# pass stage 13 documents.
+	local dirtied=no
+	if [ "$DRY_RUN" != yes ] && [ "$GUEST_DIRTY" = yes ] && guest_exec_available; then
+		if guest_dirty; then
+			dirtied=yes
+		fi
+	fi
+	if [ "$DRY_RUN" != yes ] && [ "$dirtied" != yes ]; then
+		warn "SKIP stage 15: could not dirty the guest (${GUEST_EXEC_WHY:-GUEST_DIRTY=no}), so the incremental would copy nothing and the fault would never fire"
+		results_row "$CSV" commit-barrier precondition "" "" "" "" "" "" "SKIP could not produce a delta"
+		return 0
+	fi
+
+	local before after
+	if [ "$DRY_RUN" != yes ]; then
+		before="$(target_base_fingerprints)"
+		log "target bases before the failing run: $(printf '%s' "$before" | tr '\n' '|')"
+	fi
+
+	# The run that must fail, and must leave every base untouched.
+	bench_sync commit-barrier fail "-test=fail-last-disk"
+
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" commit-barrier dry-run "" "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+
+	if [ "$RUN_RC" = 0 ]; then
+		warn "FAIL: the sync succeeded with -test=fail-last-disk, which is supposed to fail one disk deliberately. Either the fault did not fire or its error was swallowed -- see $RUN_LOG"
+		results_row "$CSV" commit-barrier fault-fires "" "" "" "" "" "" "FAIL the deliberately-failed run reported success"
+		return 1
+	fi
+	results_row "$CSV" commit-barrier fault-fires "" "" "" "" "" "" "PASS the run failed as intended"
+
+	after="$(target_base_fingerprints)"
+	log "target bases after the failing run: $(printf '%s' "$after" | tr '\n' '|')"
+
+	if [ "$before" != "$after" ]; then
+		# THE assertion. A changed fingerprint means a disk merged its delta
+		# into its base while a sibling was failing, which is exactly the
+		# mixed-checkpoint replica the barrier exists to prevent.
+		warn "FAIL: a target base image changed during a run that FAILED. One disk committed while another did not, leaving this replica with its disks at different checkpoints. Before: $(printf '%s' "$before" | tr '\n' '|') After: $(printf '%s' "$after" | tr '\n' '|')"
+		results_row "$CSV" commit-barrier no-partial-commit "" "" "" "" "" "" "FAIL a disk committed while another failed"
+		return 1
+	fi
+	log "no target base image changed: one disk failing stopped every other disk from committing"
+	results_row "$CSV" commit-barrier no-partial-commit "" "" "" "" "" "" "PASS no disk committed when one failed"
+
+	# And the barrier must not have broken the ordinary path: a clean
+	# incremental has to commit, and the bases have to move. Without this the
+	# stage would pass just as happily against a vmsync that had stopped
+	# committing altogether.
+	if ! guest_dirty; then
+		warn "could not dirty the guest again -- skipping the recovery sub-test, so this stage proved that nothing commits on failure but NOT that anything commits on success"
+		results_row "$CSV" commit-barrier recovers "" "" "" "" "" "" "SKIP could not produce a second delta"
+		return 0
+	fi
+	bench_sync commit-barrier recover
+	if [ "$RUN_RC" != 0 ]; then
+		warn "FAIL: a clean incremental after the deliberately-failed one did not succeed (see $RUN_LOG)$(bench_sync_hint)"
+		results_row "$CSV" commit-barrier recovers "" "" "" "" "" "" "FAIL clean incremental failed after the fault run"
+		return 1
+	fi
+	local recovered
+	recovered="$(target_base_fingerprints)"
+	if [ "$recovered" = "$after" ]; then
+		warn "FAIL: a clean incremental reported success but no target base changed -- the barrier is discarding deltas it should be committing"
+		results_row "$CSV" commit-barrier recovers "" "" "" "" "" "" "FAIL clean incremental committed nothing"
+		return 1
+	fi
+	log "the clean incremental committed: the barrier blocks a failed run without blocking a good one"
+	results_row "$CSV" commit-barrier recovers "" "" "" "" "" "" "PASS clean incremental still commits"
+	return 0
+}
+
 stage_pattern() {
 	case "$1" in
 	# Anchored to the named sub-tests rather than a bare ^verify- , so a
@@ -5396,6 +5557,7 @@ stage_pattern() {
 	# Anchored to the exact scenario name for stage 2's reason: a bare
 	# ^verify- would fold all of stage 2's rows into this stage's verdict.
 	verify-failure) printf '^verify-failure$' ;;
+	commit-barrier) printf '^commit-barrier$' ;;
 	*) printf '$^' ;; # matches nothing
 	esac
 }
@@ -5738,7 +5900,8 @@ for s in "${stage_list[@]}"; do
         invert) stage_invert || stage_rc=$? ;;
         wedge) stage_wedge || stage_rc=$? ;;
         verify-failure) stage_verify_failure || stage_rc=$? ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure)" ;;
+        commit-barrier) stage_commit_barrier || stage_rc=$? ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure,commit-barrier)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
                 warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."

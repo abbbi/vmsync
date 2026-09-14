@@ -115,11 +115,29 @@ const (
 	// Refused without -verify (see the flag's own validation): without a
 	// comparison to fail, this is not a test, it is just damage.
 	TestFaultCorruptAfterCommit = "corrupt-after-commit"
+
+	// TestFaultFailLastDisk fails exactly ONE disk of a multi-disk domain,
+	// after its copy and its digest check have both passed and immediately
+	// before it would be staged for commit.
+	//
+	// It exists to test the commit barrier, and nothing else can. Every other
+	// fault here fires inside the per-disk worker, so on a multi-disk domain
+	// it fires on EVERY disk -- which proves only that a run where everything
+	// fails commits nothing. The case worth proving is the asymmetric one: one
+	// disk perfect, one disk failed, and the target left wholly at its
+	// previous checkpoint rather than half at this one.
+	//
+	// The LAST disk rather than the first, and after the digest check rather
+	// than before it, so the failing disk is the one that got furthest: it
+	// copied every byte correctly and was refused at the final step. A fault
+	// that fired earlier would let the barrier pass for the wrong reason, by
+	// failing before its siblings had anything staged to discard.
+	TestFaultFailLastDisk = "fail-last-disk"
 )
 
 // TestFaults is every accepted -test value, for validation and for the flag's
 // own help text.
-var TestFaults = []string{TestFaultFailureDefine, TestFaultCorruptBeforeChecksum, TestFaultCorruptAfterCommit}
+var TestFaults = []string{TestFaultFailureDefine, TestFaultCorruptBeforeChecksum, TestFaultCorruptAfterCommit, TestFaultFailLastDisk}
 
 // ValidateTestFault reports whether name is an injectable fault. "" is valid
 // and means no injection.

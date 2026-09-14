@@ -2164,7 +2164,7 @@ func run(cfg syncConfig) (runErr error) {
 	// writeMetricsTextfile can run concurrently from the signal handler.
 	var externalSnapshotCount int
 	// verificationAttempted is set once the -verify compare block is
-	// actually entered for at least one disk (see syncDisk below) --
+	// actually entered for at least one disk (see the disk workers below) --
 	// distinct from cfg.Verify, which is just "was -verify requested" and
 	// stays true even when the run fails before ever reaching that block
 	// (an early SSH/libvirt error, say). Without this, vmsync_verification_
@@ -2191,7 +2191,7 @@ func run(cfg syncConfig) (runErr error) {
 	//
 	// Guarded by metricsMu like verificationAttempted and diskMetrics: disks
 	// verify concurrently, and the signal handler can read these while a
-	// syncDisk goroutine is still writing them.
+	// disk worker is still writing them.
 	verificationOutcome := metrics.CheckStatePassed
 	checksumOutcome := metrics.CheckStatePassed
 	var checksumDecided bool
@@ -2207,7 +2207,7 @@ func run(cfg syncConfig) (runErr error) {
 	// targetNBDHost there needs no lock -- but the signal handler
 	// deliberately does NOT wait for those goroutines (a wedged libnbd call
 	// can't be interrupted), so it can genuinely run concurrently with a
-	// syncDisk goroutine still appending to diskMetrics under metricsMu, or
+	// disk worker still appending to diskMetrics under metricsMu, or
 	// even before nbdHost/targetNBDHost are assigned at all. metricsMu (already
 	// used for the diskMetrics append) guards all three here so both call
 	// sites are race-free regardless of which one gets there first.
@@ -2222,7 +2222,7 @@ func run(cfg syncConfig) (runErr error) {
 		attempted := verificationAttempted
 		// Read under the same lock as everything else here: disks verify and
 		// checksum concurrently, and the signal handler can reach this while
-		// a syncDisk goroutine is still folding its outcome in.
+		// a disk worker is still folding its outcome in.
 		verifyOutcome := verificationOutcome
 		checksumRan := checksumDecided
 		checksumState := checksumOutcome
@@ -3439,7 +3439,7 @@ func run(cfg syncConfig) (runErr error) {
 
 	// Every target-side port this run binds comes from here, one candidate at
 	// a time, shared across the per-disk goroutines. Assigned in the block
-	// just below; declared out here because copyAndCommit and runVerify both
+	// just below; declared out here because copyAndStage and runVerify both
 	// draw from it.
 	var targetPortAlloc *portalloc.Allocator
 	// The source side's counterpart, used only by the source bridge -- the
@@ -4247,7 +4247,44 @@ func run(cfg syncConfig) (runErr error) {
 		trace.Info("source nbd port in use", "side", "source", "kind", "bridge_local", "host", "127.0.0.1", "port", localPort)
 	}
 	var wg sync.WaitGroup
-	errCh := make(chan error, len(qcowDisks))
+	// Two phases now report into this, so a disk could in principle push
+	// twice. It cannot as written -- phase two runs only when every disk
+	// cleared phase one -- but the buffer is what stops reportWorkerErr
+	// blocking forever if that ever stops being true, and widening it costs
+	// a few words of memory.
+	errCh := make(chan error, 2*len(qcowDisks)+1)
+
+	// stagedOverlay is one disk's copied, checksummed delta waiting to be
+	// committed into its base.
+	//
+	// The commits are deliberately held back until every disk has one. Each
+	// disk used to commit inside its own worker, so with disks copying
+	// concurrently one could commit and another then fail -- leaving the
+	// target holding vda at the new checkpoint and vdb at the old, a state no
+	// promotion of that replica is safe from and nothing recorded as having
+	// happened.
+	//
+	// Staging is free to hold: the overlay already IS where the copy landed
+	// (qemu-img create -b <base>), so the base is untouched until the commit
+	// runs. Waiting costs only the delay, not an extra copy.
+	type stagedOverlay struct {
+		dev     string // TargetDev, for messages
+		base    string // the image being committed into
+		overlay string // this run's delta
+	}
+	var stagedMu sync.Mutex
+	var staged []stagedOverlay
+	// Which disk -test=fail-last-disk refuses. Empty for a single-disk domain,
+	// where the fault has nothing asymmetric to prove and so does nothing.
+	lastDiskDev := ""
+	if len(qcowDisks) > 1 {
+		lastDiskDev = qcowDisks[len(qcowDisks)-1].TargetDev
+	}
+	stage := func(s stagedOverlay) {
+		stagedMu.Lock()
+		defer stagedMu.Unlock()
+		staged = append(staged, s)
+	}
 	reportWorkerErr := func(err error) {
 		if err == nil {
 			return
@@ -4257,7 +4294,7 @@ func run(cfg syncConfig) (runErr error) {
 	}
 	// runTargetCommand only ever touches ctx/targetSSHClient, both already
 	// fixed for the rest of run() by this point -- shared as-is by
-	// copyAndCommit and runVerify instead of being redefined in each.
+	// copyAndStage and runVerify instead of being redefined in each.
 	runTargetCommand := func(command, action string) error {
 		trace.Debug(command)
 		out, err := targetSSHClient.Run(ctx, command)
@@ -4295,6 +4332,16 @@ func run(cfg syncConfig) (runErr error) {
 			return fmt.Errorf("-test=%s needs the pre-commit integrity check to be running, and this run has it off (see the checksum line earlier in this log): the fault would corrupt the image with nothing to catch it, and the corruption would be committed. Deploy a matching vmsync-bridge-helper on the target, and do not pass -no-checksum",
 				libvirtsync.TestFaultCorruptBeforeChecksum)
 		}
+	}
+
+	// A single-disk domain has no commit barrier to exercise: there is no
+	// sibling that could have committed while this disk failed. The fault
+	// would run, the disk would fail, and the run would look exactly like any
+	// other failed sync -- a test that passes without testing anything, which
+	// is the outcome this whole fault exists to rule out.
+	if cfg.TestFault == libvirtsync.TestFaultFailLastDisk && len(qcowDisks) < 2 {
+		return fmt.Errorf("-test=%s needs a domain with at least two qcow2 disks and %s has %d: the fault proves that one disk failing stops the OTHERS from committing, and with one disk there is nothing to stop. Point the run at a multi-disk domain",
+			libvirtsync.TestFaultFailLastDisk, cfg.SourceDomain, len(qcowDisks))
 	}
 
 	// askTargetDigests has vmsync-bridge-helper hash the given ranges off an
@@ -4545,7 +4592,7 @@ func run(cfg syncConfig) (runErr error) {
 	}
 
 	// recordDiskMetric appends one metrics.DiskMetric, exactly the
-	// computation syncDisk's own deferred metrics block always did. Its own
+	// computation the per-disk deferred metrics block always did. Its own
 	// closure rather than inline because it once had two callers: the
 	// single-phase path and -verify's since-removed two-phase one. Kept
 	// factored out -- it is the whole per-disk metric in one place, which is
@@ -4567,7 +4614,7 @@ func run(cfg syncConfig) (runErr error) {
 		// meanwhile.
 		//
 		// The target bridge has neither problem: it is created per disk
-		// inside copyAndCommit, so its counter measures exactly this disk.
+		// inside copyAndStage, so its counter measures exactly this disk.
 		// The source leg is a run-level fact and is reported as one, on
 		// RunMetric.
 		compressedBytes := writtenBytes
@@ -4588,10 +4635,10 @@ func run(cfg syncConfig) (runErr error) {
 		metricsMu.Unlock()
 	}
 
-	// diskPhase1Result carries what runVerify needs from copyAndCommit.
+	// diskPhase1Result carries what runVerify needs from copyAndStage.
 	//
-	// A struct rather than closure capture because copyAndCommit and
-	// runVerify are separate closures: syncDisk calls one then the other and
+	// A struct rather than closure capture because copyAndStage and
+	// runVerify are separate closures: the two phases call one then the other and
 	// hands the result across. It dates from when the "online" mode ran them in
 	// two separate goroutine invocations either side of a whole-run barrier;
 	// that barrier is gone, but passing the values explicitly is still
@@ -4625,7 +4672,7 @@ func run(cfg syncConfig) (runErr error) {
 	//     one corruption class nothing upstream can see: storage that went bad
 	//     after a write was confirmed.
 	//
-	// WHEN matters too, and less obviously. This runs inside syncDisk, so it
+	// WHEN matters too, and less obviously. This runs inside a disk worker, so it
 	// completes before wg.Wait() and therefore before
 	// measureReplicaWrittenAt("post-copy") stamps replica_written_at. That
 	// ordering is load-bearing: the write bumps the file's mtime, and if the
@@ -4724,10 +4771,14 @@ func run(cfg syncConfig) (runErr error) {
 			targetPath, 0, testCorruptLen)
 	}
 
-	// copyAndCommit is exactly today's copy+commit logic (nothing about its
-	// behavior changes), just returning what runVerify/metrics need instead
-	// of leaving them as syncDisk-local variables.
-	copyAndCommit := func(d disk.QcowDisk) (res diskPhase1Result, err error) {
+	// copyAndStage copies one disk and proves what it wrote, stopping short of
+	// touching the base: on an incremental it leaves the delta in an overlay
+	// for the barrier to commit, and it returns what runVerify and the
+	// metrics need from that work.
+	//
+	// It used to commit too, hence its old name -- see stagedOverlay and
+	// commitStaged for why that moved out.
+	copyAndStage := func(d disk.QcowDisk) (res diskPhase1Result, err error) {
 		res.diskStart = time.Now()
 
 		trace.Info("reading disk via libvirt backup NBD tcp export", "disk", d.TargetDev, "export", d.TargetDev)
@@ -4795,19 +4846,20 @@ func run(cfg syncConfig) (runErr error) {
 		// here that is NOT a successful commit -- a failed copy, a failed
 		// export stop, a checksum mismatch, or a cancelled context.
 		//
-		// One case is deliberately exempt: a FAILED qemu-img commit. Every
-		// other failure leaves the base untouched, which is what makes the
-		// overlay worthless. A half-finished commit does not -- the base may
-		// already be partly written, and the overlay is then the only record
-		// of the delta and the only way to retry by hand. So commitAttempted
-		// is set before the commit runs, not after it succeeds: the flag
-		// means "the base is no longer known-untouched", and from that
-		// moment the overlay is evidence rather than scratch.
+		// The commit itself no longer happens here, so neither does the case
+		// that used to be exempt from this cleanup. A half-finished commit
+		// leaves the base partly written, which makes the overlay the only
+		// record of the delta rather than disposable scratch -- that rule
+		// still holds, it just lives in commitStaged now, which is where the
+		// commit runs.
 		//
-		// Registered immediately after creation (not before -- there would
-		// be nothing to remove) and skipped once commitAttempted is set, so
-		// the success path keeps using the existing rm below and pays no
-		// extra SSH round trip here.
+		// What reaches this defer is only ever a disk that failed BEFORE the
+		// base was touched, so the overlay really is worth nothing. A disk
+		// that succeeds hands its overlay to the barrier instead, and the
+		// barrier owns the deletion from then on.
+		//
+		// Registered immediately after creation, not before -- there would be
+		// nothing to remove.
 		//
 		// Before this existed, every failing incremental left a delta-sized
 		// qcow2 behind on the target. Whether it was ever reclaimed came
@@ -4820,16 +4872,24 @@ func run(cfg syncConfig) (runErr error) {
 		// context.Background(), never ctx: reportWorkerErr cancels ctx
 		// before pushing an error, so on precisely the failing runs this
 		// exists for, ctx is already dead by the time it runs.
-		commitAttempted := false
+		// Keyed on this function's own error now that the commit has moved
+		// out of it, rather than on a commitAttempted flag.
+		//
+		// The two cases it distinguishes are unchanged in substance. A
+		// failure here leaves the base untouched, so the overlay is worthless
+		// and goes. A SUCCESS hands the overlay to the barrier below, which
+		// owns it from that moment: it either commits it or discards it on
+		// another disk's behalf, and either way this defer must not have
+		// deleted the delta on the way out.
 		if incrementalMode {
 			defer func() {
-				if commitAttempted {
+				if err == nil {
 					return
 				}
 				trace.Info("Removing uncommitted temporary image", "image", targetPathInc, "disk", d.TargetDev)
-				if out, err := targetSSHClient.Run(context.Background(), "rm -f "+util.ShQuote(targetPathInc)); err != nil {
+				if out, rmErr := targetSSHClient.Run(context.Background(), "rm -f "+util.ShQuote(targetPathInc)); rmErr != nil {
 					trace.Warning("could not remove the uncommitted temporary image; it holds this run's delta and nothing else, so it is safe to delete by hand",
-						"image", targetPathInc, "disk", d.TargetDev, "error", err, "output", out)
+						"image", targetPathInc, "disk", d.TargetDev, "error", rmErr, "output", out)
 				}
 			}()
 		}
@@ -4910,7 +4970,7 @@ func run(cfg syncConfig) (runErr error) {
 		// signal-handler cleanup registration below) so the inline stop
 		// call further down is equally tolerant -- kill -9 returning
 		// non-zero for any reason (process already exited, a pidfile
-		// race) must not abort copyAndCommit right after a successful copy:
+		// race) must not abort copyAndStage right after a successful copy:
 		// for incremental mode that would abandon the already-copied
 		// delta sitting in the temp overlay, unmerged and uncleaned,
 		// and report a fully successful transfer as a failure. Mirrors
@@ -5118,23 +5178,24 @@ func run(cfg syncConfig) (runErr error) {
 			}
 		}
 
+		// -test=fail-last-disk: refuse the last disk here, with everything
+		// about it correct. See TestFaultFailLastDisk.
+		if cfg.TestFault == libvirtsync.TestFaultFailLastDisk && d.TargetDev == lastDiskDev {
+			trace.Warning("-test="+libvirtsync.TestFaultFailLastDisk+": failing this disk deliberately, after its copy and digest check both passed. This run is EXPECTED to fail, and no disk should commit",
+				"disk", d.TargetDev)
+			return res, fmt.Errorf("-test=%s: deliberate failure of disk %s", libvirtsync.TestFaultFailLastDisk, d.TargetDev)
+		}
+
+		// Staged, not committed. The commit happens at the barrier below,
+		// once EVERY disk has got this far -- see stagedOverlay.
+		//
+		// Nothing has touched the base at this point: the copy landed in the
+		// overlay and the digest check read it back through that overlay, so
+		// this disk is fully proven and fully reversible at the same time.
+		// That is exactly the state worth holding until its siblings reach
+		// it.
 		if incrementalMode {
-			trace.Info("Committing changes to base", "image", targetPath)
-			commitCmd := "qemu-img commit -b " + util.ShQuote(targetPath) + " " + util.ShQuote(targetPathInc)
-			// Set BEFORE the commit runs, not after it succeeds. From here on
-			// the base is no longer known-untouched, so the overlay stops
-			// being disposable scratch and becomes the only record of this
-			// delta -- see the deferred cleanup where it was created. A
-			// commit that fails halfway must leave it in place for a manual
-			// retry, not have it swept up on the way out.
-			commitAttempted = true
-			if err := runTargetCommand(commitCmd, fmt.Sprintf("committing changes for %s", targetPathInc)); err != nil {
-				return res, fmt.Errorf("%w -- the temporary image %s has been LEFT IN PLACE deliberately: the base may be partly committed, so that overlay is the only remaining record of this run's delta. Inspect both before removing it", err, targetPathInc)
-			}
-			trace.Info("Removing temporary", "image", targetPathInc)
-			if err := runTargetCommand("rm -f "+util.ShQuote(targetPathInc), fmt.Sprintf("removing target image %s", targetPathInc)); err != nil {
-				return res, err
-			}
+			stage(stagedOverlay{dev: d.TargetDev, base: targetPath, overlay: targetPathInc})
 		}
 
 		return res, nil
@@ -5183,7 +5244,7 @@ func run(cfg syncConfig) (runErr error) {
 		// process still holds simply fails to bind and is skipped.
 		verifyPidFile := path.Join("/tmp", fmt.Sprintf("vmsync-verify-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
 		verifyExportName := targetExportName(cfg.TargetDomain, d.TargetDev)
-		// Same rm -f-after-kill reasoning as stopCmd in copyAndCommit above:
+		// Same rm -f-after-kill reasoning as stopCmd in copyAndStage above:
 		// this string is also replayable from the interrupt-cleanup path
 		// after the inline call further down already runs it normally, and
 		// without removing the pidfile that replay could SIGKILL whatever
@@ -5279,7 +5340,7 @@ func run(cfg syncConfig) (runErr error) {
 				},
 				func(port int) {
 					// StartRemote cleans up its own orphan; see the copy
-					// bridge's identical note in copyAndCommit.
+					// bridge's identical note in copyAndStage.
 				})
 			if err != nil {
 				return fmt.Errorf("start verify nbd bridge for %s: %w", d.TargetDev, err)
@@ -5537,20 +5598,24 @@ func run(cfg syncConfig) (runErr error) {
 		return nil
 	}
 
-	// syncDisk is the single-phase path: copy+commit, then (if cfg.Verify != "")
-	// verify against the same already-open backup export, all in one
-	// goroutine per disk with zero cross-disk coordination -- now the only
-	// path, for every mode. The mode now called "full" used to take a
-	// two-phase one with a barrier and a second backup job; comparing
-	// against the export the copy actually read from removed the need for
-	// both.
+	// The disk path is two phases with a commit barrier between them: every
+	// disk copies and checksums into its own overlay, then -- only once all
+	// of them have -- the deltas are committed and the restore points and
+	// -verify run.
+	//
+	// The barrier is NOT the one that used to exist here. That one stopped
+	// the backup job and started a second one to serve a comparison against
+	// the wrong point in time, and removing it was right. This one never
+	// touches the job: the export stays open and frozen at the instant the
+	// copy read from, so -verify still compares against exactly what it
+	// always did. All this barrier orders is when the base gets written.
 	// Decided before any disk is copied, so a target that cannot deliver what
 	// -retention promises fails the run here rather than after paying for a
 	// full copy. Returns an inert value when retention is off or the interval
 	// has not elapsed, so nothing below needs a conditional of its own.
 	//
 	// Declared ahead of the closures rather than beside the loop that uses
-	// it, because syncDisk below captures it.
+	// it, because the disk workers below capture it.
 	// One loop, two consumers: the restore-point paths and the dev-to-path
 	// pairing replica_written_at is keyed by. Deriving the path twice is how
 	// a stamp ends up recorded against a file the preflight never stats.
@@ -5569,22 +5634,67 @@ func run(cfg syncConfig) (runErr error) {
 		return err
 	}
 
-	syncDisk := func(d disk.QcowDisk) (err error) {
-		diskStart := time.Now()
-		var res diskPhase1Result
-		if cfg.PrometheusTextfile != "" {
-			// Runs on every exit path (including early "return err"s
-			// further down), so each disk always gets a metric --
-			// res's fields simply stay at their zero value if the sync
-			// failed before reaching the step that would have set them.
-			defer func() {
-				recordDiskMetric(d, res.diskSize, res.writtenBytes, res.targetBridgeCounters, time.Since(diskStart))
-			}()
-		}
-		res, err = copyAndCommit(d)
+	// Per-disk state that has to survive the barrier: phase two needs what
+	// phase one measured, and the metric spans both.
+	type diskRun struct {
+		start time.Time
+		res   diskPhase1Result
+	}
+	var runsMu sync.Mutex
+	runs := make(map[string]*diskRun, len(qcowDisks))
+	// Disks that completed phase one. Counted rather than inferred from
+	// len(staged): a FULL sync writes the base directly and stages no overlay
+	// at all, and so does an incremental disk with no dirty extents, so an
+	// empty staging list is not the same question as "a disk failed".
+	phase1Done := 0
+
+	// recordDiskMetric already no-ops when -prometheus-textfile is unset, so
+	// this does not repeat that check: one place decides, not two.
+	recordDiskMetricFor := func(d disk.QcowDisk, r *diskRun) {
+		recordDiskMetric(d, r.res.diskSize, r.res.writtenBytes, r.res.targetBridgeCounters, time.Since(r.start))
+	}
+
+	// stageDisk is phase one: copy this disk and prove what was written,
+	// stopping short of touching the base.
+	stageDisk := func(d disk.QcowDisk) (err error) {
+		r := &diskRun{start: time.Now()}
+		runsMu.Lock()
+		runs[d.TargetDev] = r
+		runsMu.Unlock()
+		// On failure this disk never reaches phase two, so its metric has to
+		// be written here or not at all. res's fields stay at their zero
+		// value if the copy failed before setting them.
+		defer func() {
+			if err != nil {
+				recordDiskMetricFor(d, r)
+			}
+		}()
+		r.res, err = copyAndStage(d)
 		if err != nil {
 			return err
 		}
+		runsMu.Lock()
+		phase1Done++
+		runsMu.Unlock()
+		return nil
+	}
+
+	// finishDisk is phase two: everything that needs this disk's delta to be
+	// IN the base. It runs only after every disk's delta has been committed.
+	finishDisk := func(d disk.QcowDisk) (err error) {
+		runsMu.Lock()
+		r := runs[d.TargetDev]
+		runsMu.Unlock()
+		if r == nil {
+			// Unreachable: phase two runs only when every disk cleared phase
+			// one, and phase one records this entry before doing anything
+			// else. Guarded because the alternative is a nil dereference on a
+			// worker goroutine, which panics the whole run rather than
+			// failing one disk.
+			return fmt.Errorf("internal: no phase-one record for disk %s", d.TargetDev)
+		}
+		defer func() { recordDiskMetricFor(d, r) }()
+
 		// Before verify, not after: the reflink costs milliseconds whatever
 		// the image size, while a compare can run for minutes, and a crash in
 		// between would lose the restore point for no benefit. What verify
@@ -5593,40 +5703,133 @@ func run(cfg syncConfig) (runErr error) {
 			return err
 		}
 		if cfg.TestFault == libvirtsync.TestFaultCorruptAfterCommit {
-			if err := corruptReplicaForTest(d, res.targetPath); err != nil {
+			if err := corruptReplicaForTest(d, r.res.targetPath); err != nil {
 				return err
 			}
 		}
 		if cfg.Verify != "" {
-			return runVerify(d, res)
+			return runVerify(d, r.res)
 		}
-		trace.Info("disk sync complete", "disk", d.TargetDev, "elapsed", time.Since(diskStart).Round(time.Millisecond).String())
+		trace.Info("disk sync complete", "disk", d.TargetDev, "elapsed", time.Since(r.start).Round(time.Millisecond).String())
+		return nil
+	}
+
+	// commitStaged puts every staged delta into its base, or throws them all
+	// away if any disk failed to produce one.
+	//
+	// This is the barrier. Committing per disk inside its own worker meant a
+	// disk could commit while a sibling was still copying, and a failure on
+	// that sibling then left the target mixed: one disk at the new
+	// checkpoint, one at the old, and no record that it had happened. Holding
+	// every commit until every disk has a checksummed delta makes the whole
+	// domain's copy phase all-or-nothing.
+	//
+	// It is NOT atomic, and is not sold as such. If the second of three
+	// commits fails -- the target filling up, an I/O error -- the base images
+	// are mixed exactly as before. What changes is the size of that window:
+	// from the whole transfer, which can be hours on a large delta, down to
+	// the commits themselves, which are a cluster-map merge apiece.
+	commitStaged := func(allDisksReady bool) error {
+		stagedMu.Lock()
+		defer stagedMu.Unlock()
+
+		if !allDisksReady {
+			// Some disk did not get here. Nothing is committed, and every
+			// delta that was staged is discarded -- each base is still
+			// untouched, so the overlays are worth nothing and the replica is
+			// left wholly at its previous checkpoint rather than half at this
+			// one.
+			if len(staged) > 0 {
+				trace.Warning("not committing: some disks did not produce a verified delta, so this run's copies are being discarded and the replica stays wholly at its previous checkpoint",
+					"staged", len(staged), "disks", len(qcowDisks))
+			}
+			for _, s := range staged {
+				trace.Info("Removing uncommitted temporary image", "image", s.overlay, "disk", s.dev)
+				if out, err := targetSSHClient.Run(context.Background(), "rm -f "+util.ShQuote(s.overlay)); err != nil {
+					trace.Warning("could not remove the uncommitted temporary image; it holds this run's delta and nothing else, so it is safe to delete by hand",
+						"image", s.overlay, "disk", s.dev, "error", err, "output", out)
+				}
+			}
+			staged = nil
+			return nil
+		}
+
+		for _, s := range staged {
+			trace.Info("Committing changes to base", "image", s.base, "disk", s.dev)
+			commitCmd := "qemu-img commit -b " + util.ShQuote(s.base) + " " + util.ShQuote(s.overlay)
+			if err := runTargetCommand(commitCmd, fmt.Sprintf("committing changes for %s", s.overlay)); err != nil {
+				// From here the base is no longer known-untouched, so this
+				// overlay stops being disposable scratch and becomes the only
+				// record of the delta. Left in place deliberately -- and so
+				// are the ones after it in the list, which were never
+				// attempted.
+				return fmt.Errorf("%w -- the temporary image %s has been LEFT IN PLACE deliberately: the base may be partly committed, so that overlay is the only remaining record of this run's delta. Inspect both before removing it", err, s.overlay)
+			}
+			trace.Info("Removing temporary", "image", s.overlay)
+			if err := runTargetCommand("rm -f "+util.ShQuote(s.overlay), fmt.Sprintf("removing target image %s", s.overlay)); err != nil {
+				return err
+			}
+		}
+		staged = nil
 		return nil
 	}
 
 	// ONE path for every mode.
 	//
-	// There used to be a second, two-phase path for the mode then called
-	// "online": a barrier across all disks, then a domain-wide "compare
-	// window" that stopped the primary backup job and started another. All
-	// of it existed to serve a comparison
-	// against the wrong point in time. Comparing against the primary export
-	// -- which is still open and still frozen at the instant the copy read
-	// from -- needs no barrier, no second job and no cross-disk coordination,
-	// so each disk copies and verifies in its own goroutine exactly as the
-	// suspend-based modes always have.
+	// There used to be a second path for the mode then called "online",
+	// which stopped the primary backup job and started another to serve a
+	// domain-wide "compare window". That existed to support a comparison
+	// against the wrong point in time, and removing it was right: the primary
+	// export is still open and still frozen at the instant the copy read
+	// from, so comparing against it needs no second job at all.
+	//
+	// The barrier below is not a return of that. It leaves the backup job
+	// alone and orders only when the BASE is written, which is a different
+	// question from what -verify compares against.
 	for _, d := range qcowDisks {
 		d := d
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := syncDisk(d); err != nil {
+			if err := stageDisk(d); err != nil {
 				reportWorkerErr(err)
 			}
 		}()
 	}
 	trace.Info("waiting for all processes to finish")
 	wg.Wait()
+
+	// The barrier. Every disk has either staged a checksummed delta or
+	// failed; commit all of them or none.
+	//
+	// Before the stamp below, and that ordering is load-bearing: the commit
+	// is the last thing that writes a replica disk, and measureReplicaWrittenAt
+	// records the mtime the next run's preflight compares against. Stamping
+	// first would record a time older than the commit and make the next run
+	// refuse, blaming an out-of-band writer that was this run.
+	runsMu.Lock()
+	allDisksReady := phase1Done == len(qcowDisks)
+	runsMu.Unlock()
+	commitErr := commitStaged(allDisksReady)
+
+	// Phase two: everything that needs the delta to be in the base --
+	// restore points and -verify. Skipped when a disk failed to copy or a
+	// commit failed, because the base then holds something other than what
+	// this run set out to produce, and verifying that would report on a
+	// generation nobody asked about.
+	if allDisksReady && commitErr == nil {
+		for _, d := range qcowDisks {
+			d := d
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := finishDisk(d); err != nil {
+					reportWorkerErr(err)
+				}
+			}()
+		}
+		wg.Wait()
+	}
 	close(errCh)
 
 	// Record what this run wrote to the replica -- BEFORE the drain below,
@@ -5642,7 +5845,7 @@ func run(cfg syncConfig) (runErr error) {
 	// happens before the copy that would have moved the timestamp on.
 	//
 	// cleanupTargetNBD first, and not for tidiness: on a FULL sync qemu-nbd
-	// exports the base file itself, and on a failed copy copyAndCommit's own
+	// exports the base file itself, and on a failed copy copyAndStage's own
 	// inline stop was never reached, so a live daemon could still be
 	// completing queued writes into the very file about to be stat'd. It is
 	// idempotent (targetCleanupOnce), so the deferred call further up simply
@@ -5691,6 +5894,15 @@ func run(cfg syncConfig) (runErr error) {
 			}
 			return err
 		}
+	}
+	// After the worker drain, not before it: a disk that failed to copy is
+	// the more useful thing to report, and it is also the reason the commit
+	// was skipped rather than attempted. Returned here rather than at the
+	// barrier so the replica stamp above is still recorded -- a failed commit
+	// has touched the base, which is precisely when the next run must not be
+	// told an out-of-band writer did it.
+	if commitErr != nil {
+		return commitErr
 	}
 	if verifyRecordErr != nil {
 		// Unreachable as written: verificationOutcome reaches Mismatch only via
