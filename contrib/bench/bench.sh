@@ -196,6 +196,29 @@ stops rather than trying a third time -- using -test=corrupt-after-commit, which
 corrupts the replica after each copy is committed and so fails both rungs of
 the ladder. Opt-in because four of the five sub-tests deliberately fail a sync,
 and one of them deliberately corrupts the replica.
+
+Stage 15 (commit-barrier) is opt-in and proves the one property that needed a
+multi-disk domain to state at all: when ONE disk fails, NO disk commits. Each
+disk copies into its own overlay beside the base and checksums it there; only
+once EVERY disk has got that far do the commits run. Before that barrier each
+disk committed inside its own worker, so a domain whose third disk failed was
+left with two disks at the new checkpoint and one at the old -- a replica no
+restore point describes, and one that looks perfectly healthy from the
+outside. The stage takes a baseline, dirties the guest, then fails a run on
+purpose with -test=fail-last-disk, which refuses the last disk with everything
+about it correct: its copy and its digest check both passed. The assertion is
+made against the target's own base images rather than the log -- mtime, size
+and allocated blocks for every base, before and after -- because qemu-img
+commit writes the base, so a disk that committed cannot hide it. Not one
+fingerprint may move. Two sub-tests guard the ends: the fault must actually
+have fired (the injection line in the log AND at least two disks staged, so a
+run that died before the barrier could not report a pass for a barrier it
+never reached), and a clean incremental afterwards must still commit and move
+the bases -- without which the stage would pass just as happily against a
+vmsync that had stopped committing altogether. Opt-in because one sub-test
+deliberately fails a sync; it also needs a source domain with two or more
+qcow2 disks and skips cleanly without one, since on a single disk the barrier
+has nothing to hold back.
 EOF
 }
 
@@ -1559,23 +1582,31 @@ EXTSNAP_PREFIX="vmsync-bench-extsnap-"
 # ext_snapshot_precondition -- refuse to start stage 4 against a source disk
 # that is not already flat. 0 to proceed, 1 to abort the stage.
 #
-# This is the only stage that can damage the SOURCE domain, and how much it
-# can damage depends on what it finds already there. Two conditions make it
-# unsafe to begin:
+# This is the only stage that touches the SOURCE domain's disks, and what it
+# is safe to conclude depends on what it finds already there. Three conditions
+# make it wrong to begin:
 #
-#   * A pre-existing backing chain. The cleanup below runs `blockcommit
-#     --active --pivot` with neither --base nor --top, so base defaults to
-#     the BOTTOM of the chain: it commits everything into the base image and
-#     pivots there. Against the single overlay this stage creates itself that
-#     is precisely right. Against a chain somebody else created it flattens
-#     their snapshot structure, and there is no undo.
+#   * A pre-existing backing chain. This is no longer a question of blast
+#     radius -- cleanup is snapshot-delete, which unwinds the snapshot this
+#     stage created and leaves anybody else's structure alone. It is a
+#     question of what the stage would be measuring. The "after the snapshot
+#     is gone" phase asserts the checkpoint chain resumes advancing, and
+#     against a source that still carries somebody else's snapshot afterwards
+#     that assertion is simply false -- it would fail, and blame vmsync for
+#     a snapshot this harness never created.
 #
-#   * The source already running on a bench overlay -- the same condition
-#     seen from the other side, and the specific way it happens: a previous
-#     stage 4 died between snapshot-create-as and blockcommit. Continuing
-#     would stack a second overlay on the first, and the `rm -f` at the end
-#     removes only the one this run created, so the leftover would then be
-#     load-bearing under a file the harness deletes.
+#   * The source already running on a bench overlay: a previous stage 4 died
+#     between snapshot-create-as and the delete. Continuing would stack a
+#     second overlay on the first, and the leftover would then be load-bearing
+#     underneath it.
+#
+#   * A bench overlay on any OTHER disk. Naming one disk in --diskspec does
+#     not stop libvirt snapshotting the rest, and for a long time this stage
+#     both snapshotted the whole domain and cleaned up exactly one disk of it,
+#     so the other disks stacked one overlay per run with nothing looking at
+#     them. The create side now excludes them and the delete side would unwind
+#     them anyway; this check is what makes the failure visible if either ever
+#     stops being true, and what catches the chains left over from before.
 #
 # Leftover overlay FILES are a different matter and only get reported: once
 # the checks above have established the live disk is flat, nothing in the
@@ -1589,22 +1620,46 @@ ext_snapshot_precondition() {
 
         active="$(disk_source_path "$SOURCE_URI" "$SOURCE_DOMAIN" "$TAMPER_DISK_DEV")" || true
         if [ -z "$active" ]; then
-                warn "FAIL: could not resolve the source path of $SOURCE_DOMAIN's $TAMPER_DISK_DEV disk -- aborting stage 4 rather than running blockcommit against a chain this harness cannot see"
+                warn "FAIL: could not resolve the source path of $SOURCE_DOMAIN's $TAMPER_DISK_DEV disk -- aborting stage 4 rather than snapshotting a chain this harness cannot see"
                 results_row "$CSV" ext-snapshot precondition 1 "" "" "" "" "" "FAIL source disk path unresolvable"
                 return 1
         fi
 
         case "$active" in
         *"$EXTSNAP_PREFIX"*)
-                warn "FAIL: $SOURCE_DOMAIN's $TAMPER_DISK_DEV is currently running on a leftover bench overlay ($active) -- an earlier stage 4 died between snapshot-create-as and blockcommit. Aborting: commit it back by hand with 'virsh -c $SOURCE_URI blockcommit $SOURCE_DOMAIN $TAMPER_DISK_DEV --active --pivot --wait' and re-run"
+                warn "FAIL: $SOURCE_DOMAIN's $TAMPER_DISK_DEV is currently running on a leftover bench overlay ($active) -- an earlier stage 4 died between snapshot-create-as and snapshot-delete. Aborting. To repair: if 'virsh -c $SOURCE_URI snapshot-list --domain $SOURCE_DOMAIN' still lists the snapshot, 'virsh -c $SOURCE_URI snapshot-delete --domain $SOURCE_DOMAIN --snapshotname NAME' undoes it completely; if its metadata is already gone, libvirt no longer knows about it and only 'virsh -c $SOURCE_URI blockcommit $SOURCE_DOMAIN $TAMPER_DISK_DEV --active --pivot --wait' can merge it back. Then re-run"
                 results_row "$CSV" ext-snapshot precondition 1 "" "" "" "" "" "FAIL source running on leftover bench overlay"
                 return 1
                 ;;
         esac
 
+        # The same question asked of every OTHER disk, which is where this went
+        # wrong before: a lone --diskspec does not stop libvirt snapshotting the
+        # rest of the domain (see stage_external_snapshot), so the collateral
+        # overlays stacked up on disks nothing here was looking at. The create
+        # side is fixed; this is the check that would have caught it, and the
+        # one that catches the leftovers from before the fix.
+        local otherdev otheractive stacked=""
+        while read -r otherdev; do
+                [ -n "$otherdev" ] || continue
+                [ "$otherdev" = "$TAMPER_DISK_DEV" ] && continue
+                otheractive="$(disk_source_path "$SOURCE_URI" "$SOURCE_DOMAIN" "$otherdev")" || true
+                case "$otheractive" in
+                *"$EXTSNAP_PREFIX"*)
+                        stacked="${stacked}${stacked:+ }${otherdev}=${otheractive}(depth $(disk_backing_depth "$SOURCE_URI" "$SOURCE_DOMAIN" "$otherdev"))"
+                        ;;
+                esac
+        done < <(domain_disk_devs "$SOURCE_URI" "$SOURCE_DOMAIN")
+
+        if [ -n "$stacked" ]; then
+                warn "FAIL: $SOURCE_DOMAIN is running on leftover bench overlays on disks this stage never meant to snapshot: $stacked. Earlier bench runs snapshotted the whole domain but cleaned up only $TAMPER_DISK_DEV, so these stacked up one per run. Aborting stage 4 rather than adding another. snapshot-delete cannot undo these: the old cleanup dropped each snapshot's metadata with --metadata, so libvirt no longer knows they exist and only a manual merge is left. For each disk above: read the chain ('virsh -c $SOURCE_URI dumpxml $SOURCE_DOMAIN') and confirm every entry above the real base carries '${EXTSNAP_PREFIX}' -- a foreign snapshot in there must not be flattened -- then 'virsh -c $SOURCE_URI blockcommit $SOURCE_DOMAIN DEV --active --pivot --wait --base /path/to/the/real/base.qcow2', which merges the whole bench stack into the base in one job, and delete the freed overlay files afterwards"
+                results_row "$CSV" ext-snapshot precondition 1 "" "" "" "" "" "FAIL leftover bench overlays on non-tamper disks"
+                return 1
+        fi
+
         depth="$(disk_backing_depth "$SOURCE_URI" "$SOURCE_DOMAIN" "$TAMPER_DISK_DEV")"
         if [ "$depth" -gt 0 ]; then
-                warn "FAIL: $SOURCE_DOMAIN's $TAMPER_DISK_DEV already sits on a ${depth}-level backing chain below $active -- aborting stage 4. Its cleanup passes neither --base nor --top to blockcommit, so it would commit that entire pre-existing chain into the bottom image and pivot to it, flattening a snapshot structure this harness did not create"
+                warn "FAIL: $SOURCE_DOMAIN's $TAMPER_DISK_DEV already sits on a ${depth}-level backing chain below $active -- aborting stage 4. The cleanup (snapshot-delete) would leave that chain alone, so this is not about damaging it: it is that the stage's closing assertion, 'the checkpoint chain resumes advancing once the snapshot is gone', cannot hold on a source that still carries somebody else's snapshot afterwards. Running anyway would fail the stage and blame vmsync for a snapshot this harness never created"
                 results_row "$CSV" ext-snapshot precondition 1 "" "" "" "" "" "FAIL pre-existing backing chain (depth=$depth)"
                 return 1
         fi
@@ -1659,9 +1714,45 @@ stage_external_snapshot() {
         local snap_name="${EXTSNAP_PREFIX}$$"
         local overlay_path=""
         if [ "$DRY_RUN" != yes ]; then
-                log "creating an external, disk-only snapshot '$snap_name' on source disk $TAMPER_DISK_DEV"
+                # Naming ONE disk in --diskspec does not limit the snapshot to
+                # it. libvirt snapshots every disk it is not told to skip, and
+                # gives the unnamed ones an auto-derived overlay name
+                # (<base>.<snapshot name>) -- so a lone
+                # "--diskspec vda,snapshot=external" on a two-disk domain
+                # silently redirects vdb onto an overlay too.
+                #
+                # snapshot-delete below now unwinds whatever this creates, on
+                # every disk, so the exclusions are no longer what keeps the
+                # source clean. They are here because the stage is scoped to
+                # one disk and should take one disk: TAMPER_DISK_DEV is the
+                # only disk the precondition established is safe to redirect,
+                # and it is the only disk the assertions look at. Snapshotting
+                # the rest would be an unasked-for redirect of a production
+                # source's disks to prove nothing extra.
+                #
+                # snapshot=no is the only way to say it; there is no "these
+                # disks only" form.
+                local -a snapspec=(--diskspec "${TAMPER_DISK_DEV},snapshot=external")
+                local other alldevs
+                alldevs="$(domain_disk_devs "$SOURCE_URI" "$SOURCE_DOMAIN")"
+                # An empty enumeration is not "a single-disk domain", it is
+                # "domblklist did not answer" -- and the two differ by the
+                # whole domain getting snapshotted. Refuse rather than fall
+                # back to the shape that caused the leak in the first place.
+                if [ -z "$alldevs" ]; then
+                        warn "could not enumerate $SOURCE_DOMAIN's disks, so the other disks cannot be excluded from the snapshot -- aborting stage 4 rather than redirecting disks this stage never meant to touch"
+                        results_row "$CSV" ext-snapshot precondition 1 "" "" "" "" "" "FAIL disk enumeration failed, snapshot not attempted"
+                        return 1
+                fi
+                while read -r other; do
+                        [ -n "$other" ] || continue
+                        [ "$other" = "$TAMPER_DISK_DEV" ] && continue
+                        snapspec+=(--diskspec "${other},snapshot=no")
+                done <<<"$alldevs"
+
+                log "creating an external, disk-only snapshot '$snap_name' on source disk $TAMPER_DISK_DEV (${#snapspec[@]} diskspec(s): every other disk excluded with snapshot=no)"
                 virsh_uri "$SOURCE_URI" snapshot-create-as --domain "$SOURCE_DOMAIN" --name "$snap_name" \
-                        --diskspec "${TAMPER_DISK_DEV},snapshot=external" --disk-only --atomic \
+                        "${snapspec[@]}" --disk-only --atomic \
                         || { warn "failed to create external snapshot '$snap_name' on $SOURCE_DOMAIN -- aborting stage 4 (--atomic means either it's fully created or fully rolled back; nothing should be left half-done)"; return 1; }
                 # "|| true": same reasoning as the tamper test's own lookup -- fall
                 # through to a specific, actionable message rather than dying here
@@ -1723,20 +1814,45 @@ stage_external_snapshot() {
                 fi
         fi
 
-        log "--- removing the external snapshot (blockcommit --active --pivot, then metadata cleanup) ---"
+        log "--- removing the external snapshot (snapshot-delete) ---"
         if [ "$DRY_RUN" != yes ]; then
-                # The other die() left inside a stage, and the more serious of
-                # the two: this is the only place the harness can damage the
-                # SOURCE domain. A half-committed chain on a production source
-                # is not something to carry into another eight stages for the
-                # sake of finishing a report.
-                virsh_uri "$SOURCE_URI" blockcommit "$SOURCE_DOMAIN" "$TAMPER_DISK_DEV" --active --pivot --wait \
-                        || die "blockcommit --active --pivot failed for $SOURCE_DOMAIN/$TAMPER_DISK_DEV -- STOP: the source domain's disk chain may now be in an inconsistent state, inspect it by hand (virsh -c $SOURCE_URI blockjob $SOURCE_DOMAIN $TAMPER_DISK_DEV) before continuing"
-                virsh_uri "$SOURCE_URI" snapshot-delete --domain "$SOURCE_DOMAIN" --snapshotname "$snap_name" --metadata \
-                        || warn "removing snapshot metadata for '$snap_name' failed -- the disk merge itself (blockcommit) already succeeded, so this is just stale bookkeeping, but check 'virsh -c $SOURCE_URI snapshot-list --domain $SOURCE_DOMAIN'"
-                if [ -n "$overlay_path" ]; then
-                        maybe_ssh_cmd "$SOURCE_LOCAL" "$SOURCE_HOST" rm -f "$overlay_path" \
-                                || warn "could not remove the now-unused overlay file $overlay_path on $SOURCE_HOST -- harmless (blockcommit --pivot already stopped referencing it) but worth cleaning up by hand"
+                # snapshot-delete, not blockcommit: it is the inverse of the
+                # operation that created this, and it is the one that knows
+                # what "this" is. libvirt merges every disk the snapshot
+                # covers, pivots each of them, removes the overlay files and
+                # drops the metadata -- one call, whatever the snapshot turned
+                # out to span. blockcommit knew about a single disk and a
+                # single chain, which is precisely how the collateral overlays
+                # got left behind: it committed the disk it was told about and
+                # had nothing to say about the others.
+                #
+                # This is still the only place the harness can damage the
+                # SOURCE domain, so a failure here is still a die(): a
+                # half-merged chain on a production source is not something to
+                # carry into another eight stages for the sake of finishing a
+                # report.
+                virsh_uri "$SOURCE_URI" snapshot-delete --domain "$SOURCE_DOMAIN" --snapshotname "$snap_name" \
+                        || die "snapshot-delete failed for $SOURCE_DOMAIN/$snap_name -- STOP: the source domain's disk chain may now be in an inconsistent state, inspect it by hand ('virsh -c $SOURCE_URI dumpxml $SOURCE_DOMAIN' for the chains, 'virsh -c $SOURCE_URI blockjob $SOURCE_DOMAIN $TAMPER_DISK_DEV' for a merge still running) before continuing"
+
+                # What the delete promised, checked rather than assumed. This
+                # is the assertion whose absence let the leak run for as long
+                # as it did: nothing ever looked at the domain again after
+                # cleanup, so nothing noticed the chain had not gone back to
+                # flat.
+                local leftdev leftactive
+                while read -r leftdev; do
+                        [ -n "$leftdev" ] || continue
+                        leftactive="$(disk_source_path "$SOURCE_URI" "$SOURCE_DOMAIN" "$leftdev")" || true
+                        case "$leftactive" in
+                        *"$EXTSNAP_PREFIX"*)
+                                warn "FAIL: snapshot-delete reported success but $SOURCE_DOMAIN's $leftdev is STILL running on a bench overlay ($leftactive) -- the source domain has not been returned to a flat chain and will accumulate another overlay on the next run. Inspect it by hand before re-running"
+                                results_row "$CSV" ext-snapshot cleanup 1 "" "" "" "" "" "FAIL source still on a bench overlay after snapshot-delete"
+                                ;;
+                        esac
+                done < <(domain_disk_devs "$SOURCE_URI" "$SOURCE_DOMAIN")
+
+                if [ -n "$overlay_path" ] && run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "test -e '$overlay_path'" 2>/dev/null; then
+                        warn "snapshot-delete left the overlay file $overlay_path behind on $SOURCE_HOST. The chain no longer references it, so this is disk space rather than a correctness problem -- but it is not what a successful delete should leave, and the precondition will report it on the next run"
                 fi
         fi
 
@@ -4392,23 +4508,56 @@ checksum_real_corruption_subtest() {
 	fi
 
 	# The offset vmsync chose, taken from its own log rather than guessed: it
-	# comes from the digest plan and is different every run. Filtered to the
-	# overlay belonging to THIS base, so a multi-disk VM does not have another
-	# disk's offset checked against this file.
-	line="$(grep 'deliberately corrupting' "$RUN_LOG" 2>/dev/null | grep -F "image=${base_path}_" | head -1 || true)"
+	# comes from the digest plan and is different every run.
+	#
+	# WHICH disk carries it is not predictable on a multi-disk domain, and
+	# that is not a flaw in the fault: every disk injects inside its own
+	# worker, the workers race, and the first one to reach the digest check
+	# fails the whole run before the others get that far. On hap01l the 2MiB
+	# delta on vdb beats the 89-extent delta on vda every time. Filtering the
+	# log by a base chosen in advance therefore found nothing whenever the
+	# race went to another disk, and the sub-test skipped without asserting.
+	#
+	# So the disk is read OUT of the injection line instead of imposed on it:
+	# whichever disk won, that is the one whose base must not contain the
+	# pattern. The overlay is named "<base>_<parent checkpoint>", so stripping
+	# that suffix gives the base to check.
+	line="$(grep 'deliberately corrupting' "$RUN_LOG" 2>/dev/null | head -1 || true)"
 	if [ -z "$line" ]; then
-		warn "SKIP: the run refused the commit, but no injection line for ${base_path}'s overlay was found in the log, so the base cannot be checked at the corrupted offset. See $RUN_LOG"
-		results_row "$CSV" checksum real-corruption-result 0 "" "" "" "" "" "PASS real corruption detected (base offset not locatable in log)"
+		warn "SKIP: the run refused the commit, but no injection line was found in the log at all, so no base can be checked at the corrupted offset. See $RUN_LOG"
+		results_row "$CSV" checksum real-corruption-result 0 "" "" "" "" "" "PASS real corruption detected (no injection line logged)"
 		return 0
 	fi
+	local hit_overlay hit_base
+	hit_overlay="$(printf '%s' "$line" | sed -n 's/.*[[:space:]]image=\([^ ]*\).*/\1/p')"
+	hit_base="$(printf '%s' "$hit_overlay" | sed 's/_vmsync-cpt-[0-9]\{1,\}$//')"
+	if [ -z "$hit_overlay" ] || [ "$hit_base" = "$hit_overlay" ]; then
+		# An incremental run that injected into something not named like an
+		# overlay. Reporting it beats asserting against a path this did not
+		# parse -- a wrong path makes qemu-io fail, which reads as a pass.
+		warn "SKIP: the injection line names '${hit_overlay:-<unparsed>}', which is not an overlay of the form <base>_vmsync-cpt-NNNNNN, so the base to check cannot be derived. See $RUN_LOG"
+		results_row "$CSV" checksum real-corruption-result 0 "" "" "" "" "" "PASS real corruption detected (overlay path not parsable)"
+		return 0
+	fi
+	log "   the injection landed on $hit_overlay; checking its base $hit_base"
 	off="$(printf '%s' "$line" | sed -n 's/.*[[:space:]]offset=\([0-9]*\).*/\1/p')"
 	len="$(printf '%s' "$line" | sed -n 's/.*[[:space:]]length=\([0-9]*\).*/\1/p')"
 
-	local leftovers
-	leftovers="$(ssh_host_cmd "$TARGET_HOST" "ls -1 '${base_path}'_* 2>/dev/null" 2>/dev/null || true)"
+	# Every disk's overlay, not just the corrupted one's. Since the commit
+	# barrier a refusal on ONE disk must discard the overlays of ALL of them,
+	# so a leak on the disks that copied cleanly is exactly the regression
+	# worth catching here, and checking only the failed disk would miss it.
+	local leftovers="" tdev tpath found
+	while read -r tdev; do
+		[ -n "$tdev" ] || continue
+		tpath="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$tdev")" || true
+		[ -n "$tpath" ] || continue
+		found="$(ssh_host_cmd "$TARGET_HOST" "ls -1 '${tpath}'_* 2>/dev/null" 2>/dev/null || true)"
+		[ -n "$found" ] && leftovers="${leftovers}${leftovers:+ }$(printf '%s' "$found" | tr '\n' ' ')"
+	done < <(source_qcow_devs)
 
 	if [ -n "$leftovers" ]; then
-		warn "FAIL: the check refused the commit but LEFT the overlay behind: $(printf '%s' "$leftovers" | tr '\n' ' ') -- every failed run would leak a delta-sized file. See $RUN_LOG"
+		warn "FAIL: the check refused the commit but LEFT overlay(s) behind: $leftovers -- every failed run would leak a delta-sized file, and since the commit barrier a refusal must discard the overlays of every disk, not just the one that failed. See $RUN_LOG"
 		results_row "$CSV" checksum real-corruption-result 1 "" "" "" "" "" "FAIL overlay leaked on refusal"
 		return 0
 	fi
@@ -4417,12 +4566,12 @@ checksum_real_corruption_subtest() {
 	# pattern, so success here means the corruption reached the base and the
 	# refusal did not protect it -- which is why the test is inverted.
 	if [ -n "$off" ] && [ -n "$len" ] && ssh_host_cmd "$TARGET_HOST" qemu-io -r -t none -f qcow2 \
-		-c "'read -P 0xa5 ${off} ${len}'" "'${base_path}'" >/dev/null 2>&1; then
-		warn "FAIL: the check refused the commit, but the corrupted pattern IS PRESENT in the base at offset $off length $len -- the refusal did not stop the bad bytes reaching the replica, which is the one thing it exists to do. See $RUN_LOG"
+		-c "'read -P 0xa5 ${off} ${len}'" "'${hit_base}'" >/dev/null 2>&1; then
+		warn "FAIL: the check refused the commit, but the corrupted pattern IS PRESENT in $hit_base at offset $off length $len -- the refusal did not stop the bad bytes reaching the replica, which is the one thing it exists to do. See $RUN_LOG"
 		results_row "$CSV" checksum real-corruption-result 1 "" "" "" "" "" "FAIL corruption reached the base despite refusal"
 		heal=yes
 	else
-		log "   PASS: real corruption was detected, the overlay is gone, and the base does not contain it at offset $off"
+		log "   PASS: real corruption was detected, no overlay was left behind, and $hit_base does not contain it at offset $off"
 		results_row "$CSV" checksum real-corruption-result 0 "" "" "" "" "" "PASS real corruption refused, overlay removed, base clean at the corrupted offset"
 	fi
 
@@ -4430,7 +4579,7 @@ checksum_real_corruption_subtest() {
 	# base was just proven untouched at the one offset that was written to, so
 	# a full resync would cost a copy to fix nothing.
 	if [ "$heal" = yes ]; then
-		heal_target checksum real-corruption-heal "$base_path"
+		heal_target checksum real-corruption-heal "$hit_base"
 	fi
 }
 
@@ -5341,6 +5490,20 @@ domain_disk_dir() {
 		| awk 'NR==1 { d=$0 } NR>1 { exit 1 } END { if (NR==1) print d }'
 }
 
+# domain_disk_devs URI DOMAIN -> every disk target dev, one per line.
+#
+# Every DISK, not just the qcow2 ones source_qcow_devs reports: this exists to
+# enumerate what an external snapshot would touch if not told otherwise, and
+# libvirt will happily put a qcow2 overlay over a raw disk as well. Narrowing
+# it to qcow2 would leave exactly the disks that need excluding un-excluded.
+#
+# domblklist over xmllint for the reason domain_disk_dir gives beside it, and
+# $2 == "disk" to drop cdroms and floppies, which have no chain worth touching.
+domain_disk_devs() {
+	virsh_uri "$1" domblklist "$2" --details 2>/dev/null \
+		| awk '$2 == "disk" && $3 != "" { print $3 }'
+}
+
 # vmsync_checkpoint_count URI DOMAIN -> how many vmsync-managed checkpoints
 # the domain carries.
 #
@@ -5791,6 +5954,21 @@ generate_report() {
                         awk -F, 'NR>1 && $1=="verify-failure" { printf "| %s | %s | %s | %s |\n", $2, $3, $4, $9 }' "$CSV"
                 else
                         echo "_not run (opt in with \`--stages verify-failure\`; it corrupts the replica and three of its four sub-tests deliberately fail a sync)_"
+                fi
+                echo
+                echo "## Stage 15: the commit barrier"
+                echo
+                # Same exact match as stage 14's, for the same reason. The
+                # SKIP rows matter more here than in most stages: this one
+                # stands down on a single-disk source, and a stage that
+                # silently vanished from the report would read as a stage
+                # that passed.
+                if awk -F, 'NR>1 && $1=="commit-barrier" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| check | exit | wall (s) | result |"
+                        echo "|---|---|---|---|"
+                        awk -F, 'NR>1 && $1=="commit-barrier" { printf "| %s | %s | %s | %s |\n", $2, $3, $4, $9 }' "$CSV"
+                else
+                        echo "_not run (opt in with \`--stages commit-barrier\`; one sub-test deliberately fails a sync, and it needs a source domain with two or more qcow2 disks)_"
                 fi
                 echo
                 echo "## Stage 8: verify after a long incremental chain"
