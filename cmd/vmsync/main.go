@@ -5994,13 +5994,25 @@ func run(cfg syncConfig) (runErr error) {
 	checkpointMu.Unlock()
 	close(copyCommitted)
 
-	if incrementalMode && checkpointAdvanced {
-		trace.Info("sync successful cleaning up parent checkpoint", "parent", parent)
-		err := libvirtsync.DeleteCheckpointIfExists(srcDom, parent)
-		if err != nil {
-			return err
-		}
-	} else if incrementalMode {
+	// The parent checkpoint is NOT deleted here. It used to be, and that
+	// ordering is what turned a failed redefine into a lost baseline.
+	//
+	// Deleting the parent before the target has accepted its successor leaves
+	// a window where the source holds only the new checkpoint while the
+	// target still records the old one. Anything failing in that window --
+	// the redefine, the role re-read, the target host going away -- strands
+	// the pair: the target asks for an incremental from a checkpoint the
+	// source no longer has, and the only ways out are hand-editing the
+	// target's metadata or a full resync.
+	//
+	// It also defeated pending_checkpoint, which exists precisely to undo a
+	// source advance the target never accepted. That recovery needs the
+	// parent to still be there to fall back to, and this deleted it first.
+	//
+	// So the cleanup moved to after the redefine succeeds -- see the prune
+	// below DefineDomain. The failure it trades into is a leaked checkpoint,
+	// which the prune collects on any later run.
+	if incrementalMode && !checkpointAdvanced {
 		trace.Info("checkpoint chain did not advance this run (external snapshot was blocking checkpoint creation); keeping existing checkpoint for next run", "checkpoint", parent)
 	}
 
@@ -6133,6 +6145,33 @@ func run(cfg syncConfig) (runErr error) {
 	defineDomainMu.Unlock()
 	if defineErr != nil {
 		return defineErr
+	}
+
+	// The target has now accepted effectiveCheckpoint, so and only so is the
+	// source free to drop everything older -- the parent this run diffed
+	// against, plus any leftovers from earlier runs that died before getting
+	// this far.
+	//
+	// This is the deferred half of the ordering change above: the parent
+	// survives until the replica is provably on the new checkpoint, and the
+	// cost of that safety is a checkpoint left behind whenever a run fails
+	// after copying. Collecting those here rather than in a separate tool
+	// means a single later success cleans up every earlier failure, so they
+	// cannot accumulate across runs.
+	//
+	// Non-fatal, deliberately. The replication itself has fully succeeded by
+	// this point -- disks committed, target redefined, metadata written --
+	// and refusing the run over tidy-up would report a failure that did not
+	// happen, then leave the next run to redo an hour of copying. A leftover
+	// checkpoint costs a bitmap and gets collected next time.
+	if incrementalMode {
+		if pruned, err := libvirtsync.PruneCheckpointsOlderThan(srcDom, effectiveCheckpoint); err != nil {
+			trace.Warning("could not clean up checkpoints older than this run's baseline; they cost a dirty bitmap each and a later successful run will collect them",
+				"baseline", effectiveCheckpoint, "removed", pruned, "error", err)
+		} else if len(pruned) > 0 {
+			trace.Info("sync successful, cleaning up checkpoints older than the new baseline",
+				"baseline", effectiveCheckpoint, "removed", pruned)
+		}
 	}
 
 	// Records this source<->target relationship on the SOURCE's own

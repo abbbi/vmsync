@@ -2521,6 +2521,78 @@ func DeleteAllManagedCheckpointsMetadataOnly(dom *libvirt.Domain) error {
 // "Bitmap already exists" failure in
 // https://github.com/abbbi/vmsync/issues/9) by discarding it entirely and
 // letting the next sync start over as a fresh full sync.
+// PruneCheckpointsOlderThan deletes every vmsync-managed checkpoint created
+// before baseline, and returns the names it removed.
+//
+// vmsync keeps exactly one checkpoint on a source: the baseline the next
+// incremental will diff against. Anything older is a leftover from a run that
+// created its successor and then failed before tidying up -- which is now the
+// ordinary failure shape, because the parent is deleted only AFTER the target
+// has accepted the new checkpoint. Trading "lose the baseline" for "leak a
+// checkpoint" is the right way round, but only if something eventually
+// collects the leaks. This is that something.
+//
+// Deletes oldest-first, which is the only safe direction. libvirt merges a
+// deleted checkpoint's bitmap into its child, so removing the bottom of the
+// chain is exactly the per-run parent cleanup vmsync has always done, just
+// repeated. Removing from the middle is a different operation that later
+// checkpoints depend on, and this never does it.
+//
+// Refuses to delete anything when baseline is not among the domain's own
+// checkpoints. That means the caller's idea of the chain and the source's
+// disagree, and the one thing worse than a leaked checkpoint is deleting the
+// baseline a replica is diffing against.
+// checkpointsOlderThan picks the entries preceding baseline in an
+// oldest-first list.
+//
+// Separate from the deleting, and pure, because this is the decision that
+// chooses which checkpoints get destroyed -- it should be readable and
+// exhaustively testable without a hypervisor. Every guard here is the
+// difference between collecting a leak and deleting the baseline a replica is
+// diffing against.
+func checkpointsOlderThan(existing []Checkpoint, baseline string) ([]Checkpoint, error) {
+	idx := -1
+	for i, c := range existing {
+		if c.Name == baseline {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		// The caller's idea of the chain and the source's disagree. Deleting
+		// on that basis is how a baseline gets destroyed, so nothing is.
+		return nil, fmt.Errorf("prune checkpoints: the baseline %s is not among this domain's %d vmsync checkpoints, so the chain is not what this run believes it is -- refusing to delete anything",
+			baseline, len(existing))
+	}
+	return existing[:idx], nil
+}
+
+func PruneCheckpointsOlderThan(dom *libvirt.Domain, baseline string) ([]string, error) {
+	if baseline == "" {
+		return nil, fmt.Errorf("prune checkpoints: no baseline checkpoint given")
+	}
+	existing, err := ListManagedCheckpoints(dom)
+	if err != nil {
+		return nil, fmt.Errorf("prune checkpoints: %w", err)
+	}
+	stale, err := checkpointsOlderThan(existing, baseline)
+	if err != nil {
+		return nil, err
+	}
+
+	var deleted []string
+	for _, c := range stale {
+		if err := DeleteCheckpointIfExists(dom, c.Name); err != nil {
+			// Stop at the first failure rather than pressing on: the ones
+			// after it are its children, and deleting a child while its
+			// parent survives is the mid-chain removal this avoids.
+			return deleted, fmt.Errorf("prune checkpoints: deleting %s: %w", c.Name, err)
+		}
+		deleted = append(deleted, c.Name)
+	}
+	return deleted, nil
+}
+
 func DeleteAllManagedCheckpoints(dom *libvirt.Domain) error {
 	existing, err := ListManagedCheckpoints(dom)
 	if err != nil {

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -2543,4 +2544,103 @@ func TestUpdateSyncMetadataDoesNotInheritTheSourcesReplicaWriteRecord(t *testing
 	if got != "" {
 		t.Errorf("the target inherited the source's replica_written_at (%q); it must be removed, not merely left unset", got)
 	}
+}
+
+// checkpointsOlderThan chooses which checkpoints get DESTROYED, so every case
+// here is the difference between collecting a leak and deleting the baseline
+// a replica is diffing against.
+//
+// The leaks exist because the parent checkpoint is no longer deleted before
+// the target accepts its successor: that ordering turned a failed redefine
+// into a lost baseline, and the price of fixing it is a checkpoint left
+// behind whenever a run dies after copying. This is what collects them.
+func TestCheckpointsOlderThan(t *testing.T) {
+	// Oldest first, as ListManagedCheckpoints sorts them.
+	chain := []Checkpoint{
+		{Name: "vmsync-cpt-000001"},
+		{Name: "vmsync-cpt-000002"},
+		{Name: "vmsync-cpt-000003"},
+	}
+
+	names := func(cs []Checkpoint) []string {
+		out := []string{}
+		for _, c := range cs {
+			out = append(out, c.Name)
+		}
+		return out
+	}
+
+	t.Run("the baseline and everything newer is kept", func(t *testing.T) {
+		got, err := checkpointsOlderThan(chain, "vmsync-cpt-000002")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"vmsync-cpt-000001"}; !slices.Equal(names(got), want) {
+			t.Errorf("got %v, want %v -- the baseline itself must never be selected", names(got), want)
+		}
+	})
+
+	t.Run("the usual case: one parent to collect", func(t *testing.T) {
+		got, err := checkpointsOlderThan(chain, "vmsync-cpt-000003")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"vmsync-cpt-000001", "vmsync-cpt-000002"}; !slices.Equal(names(got), want) {
+			t.Errorf("got %v, want %v", names(got), want)
+		}
+	})
+
+	t.Run("a baseline already at the bottom selects nothing", func(t *testing.T) {
+		got, err := checkpointsOlderThan(chain, "vmsync-cpt-000001")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want nothing", names(got))
+		}
+	})
+
+	t.Run("an unknown baseline deletes NOTHING and says why", func(t *testing.T) {
+		// The dangerous case. If the caller's idea of the chain and the
+		// source's disagree, acting on that belief is how a live baseline
+		// gets destroyed and every future incremental turns into a full
+		// resync.
+		got, err := checkpointsOlderThan(chain, "vmsync-cpt-000009")
+		if err == nil {
+			t.Fatalf("accepted a baseline that is not in the chain, selecting %v", names(got))
+		}
+		if len(got) != 0 {
+			t.Errorf("selected %v alongside the error; it must select nothing", names(got))
+		}
+		if !strings.Contains(err.Error(), "vmsync-cpt-000009") {
+			t.Errorf("error %q does not name the baseline it could not find", err)
+		}
+	})
+
+	t.Run("an empty chain deletes nothing", func(t *testing.T) {
+		got, err := checkpointsOlderThan(nil, "vmsync-cpt-000001")
+		if err == nil {
+			t.Error("accepted a baseline against an empty chain")
+		}
+		if len(got) != 0 {
+			t.Errorf("selected %v from an empty chain", names(got))
+		}
+	})
+
+	t.Run("selection order is oldest first", func(t *testing.T) {
+		// libvirt merges a deleted checkpoint's bitmap into its child, so
+		// removing the bottom of the chain is the per-run parent cleanup
+		// repeated. Deleting newest-first would remove a parent's child
+		// while the parent survives, which is the mid-chain removal this
+		// whole function avoids.
+		got, err := checkpointsOlderThan(chain, "vmsync-cpt-000003")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 1; i < len(got); i++ {
+			if got[i-1].Name > got[i].Name {
+				t.Errorf("selection is not oldest-first: %v", names(got))
+			}
+		}
+	})
 }
