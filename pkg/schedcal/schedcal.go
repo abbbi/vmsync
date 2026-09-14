@@ -673,3 +673,56 @@ func atMinute(t time.Time, min int) time.Time {
 	// which fails at 53 firings if anyone tries the same correction again.
 	return time.Date(t.Year(), t.Month(), t.Day(), min/60, min%60, 0, 0, t.Location())
 }
+
+// nextOccurrenceHorizon bounds the forward search in NextOccurrence.
+//
+// Four years and a bit, because an expression may pin a YEAR: "2030-*-*" asked
+// in 2026 is legal and its answer is four years out. Beyond that the honest
+// answer is "not soon", which is what a false return means.
+//
+// The cost is a few thousand iterations of a date comparison in the worst
+// case, on a path that runs once per VM per report. Almost every real
+// expression resolves within days.
+const nextOccurrenceHorizon = 1500
+
+// NextOccurrence returns when this schedule next OPENS, at or after t, and
+// whether it opens at all within the horizon.
+//
+// Deliberately absent from the matcher for a long time, and added only for
+// REPORTING. The scheduler itself never needs it: it is handed a time and asks
+// "am I in a window", which is a comparison rather than a search, and that is
+// what keeps the matching side free of next-fire arithmetic. This exists so
+// the agent can tell the console when a VM is next due to verify, which the
+// console must not compute for itself -- it does not know the host's timezone
+// and is not the authority on the resolved schedule.
+//
+// Walks by CALENDAR DAY at midday, never by adding 24 hours, for the reason
+// the crossing-midnight branch documents at length: a day is not always 24
+// hours, and a wall clock carried onto another date can land on the wrong one.
+// Midday is the one time no zone has ever moved its clock across.
+//
+// If t is already inside an occurrence, that occurrence's start is returned --
+// "next" means the next one an operator would see, and one already open is it.
+func (s Schedule) NextOccurrence(t time.Time) (time.Time, bool) {
+	if start, in := s.OccurrenceStart(t); in {
+		return start, true
+	}
+	for i := 0; i <= nextOccurrenceHorizon; i++ {
+		day := time.Date(t.Year(), t.Month(), t.Day()+i, 12, 0, 0, 0, t.Location())
+		if !s.Days.Matches(day) {
+			continue
+		}
+		var start time.Time
+		if s.Window.IsZero() {
+			start = startOfDay(day)
+		} else {
+			start = atMinute(day, s.Window.startMin)
+		}
+		// A matching day whose window has already closed today is not the
+		// answer; the search moves on to the next matching day.
+		if !start.Before(t) {
+			return start, true
+		}
+	}
+	return time.Time{}, false
+}

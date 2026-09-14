@@ -155,6 +155,27 @@ type Report struct {
 	// Syncs are recent scheduled-run outcomes, so an operator can see what
 	// happened without reading a journal on the host. Bounded by the agent.
 	Syncs []SyncResult `json:"syncs,omitempty"`
+	// EffectiveSchedule is what this agent will actually act on, AFTER
+	// resolving templates and synthesising entries from the default.
+	//
+	// Reported rather than left for the console to derive, because the
+	// console cannot derive it: templates resolve in the agent (a standalone
+	// one has no control plane at all), so what the UI published and what the
+	// agent runs are different documents. Showing the published one as though
+	// it were the running one is the failure this closes -- an operator
+	// reading a schedule that was never the schedule.
+	EffectiveSchedule []EffectiveScheduleEntry `json:"effective_schedule,omitempty"`
+	// Timezone is the agent host's own zone, and the one every verify window
+	// in EffectiveSchedule is expressed in.
+	//
+	// A window means the quiet hours where the disks are, so an estate
+	// spanning zones has each host on its own clock. The console displays
+	// what it is told here; it has no business picking one.
+	Timezone string `json:"timezone,omitempty"`
+	// TimezoneOffsetSeconds is that zone's offset from UTC at the moment of
+	// the report, so the console can render a window without carrying tzdata
+	// and without guessing at DST.
+	TimezoneOffsetSeconds int `json:"timezone_offset_seconds,omitempty"`
 	// OperationResults carries the outcome of every operation this agent
 	// still holds a ledger record for, re-sent on EVERY report until the UI
 	// stops publishing the operation.

@@ -595,8 +595,17 @@ func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler, ledger 
 		// moment ago", which 0 would otherwise mean.
 		report.ConfigAgeSeconds = -1
 	}
+	// The host's own zone, named at the moment of the report so the console
+	// renders windows in the zone they were resolved in rather than its own.
+	zoneName, zoneOffset := now.Zone()
+	report.Timezone = zoneName
+	report.TimezoneOffsetSeconds = zoneOffset
+
 	if sched != nil {
 		report.Syncs = sched.Results()
+		// Resolved through the same function the scheduler acts on, so the
+		// report cannot claim a schedule the agent would not run.
+		report.EffectiveSchedule = sched.EffectiveSchedule(&cfg, cached.Config, now)
 	}
 	if ledger != nil {
 		// Every stored result, on every report -- not just newly finished

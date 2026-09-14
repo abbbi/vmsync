@@ -736,3 +736,118 @@ func TestFailedRunReArmsEveryCalendarShape(t *testing.T) {
 		})
 	}
 }
+
+// The report the console displays instead of predicting. Every field here
+// exists because the console cannot work it out: templates resolve in the
+// agent, so what the UI published and what the agent runs are different
+// documents.
+func TestEffectiveScheduleReportsWhatTheAgentWillActuallyDo(t *testing.T) {
+	cfg := UIConfig{
+		Schedule: []ScheduleEntry{
+			{VM: "db01", Enabled: true, Template: "nightly"},
+			{VM: "lab01", Enabled: false},
+		},
+		Templates: map[string]ScheduleTemplate{
+			"nightly": {Name: "nightly", IntervalSeconds: 3600, Enabled: true,
+				VerifyDays: "Sun *-*-01..07", VerifyWindow: "02:00-12:00",
+				Profile: SyncProfile{Verify: "fast"}},
+			DefaultTemplateName: {Name: DefaultTemplateName, IntervalSeconds: 900, Enabled: true,
+				Profile: SyncProfile{Verify: "full"}, VerifyIntervalSeconds: 86400},
+		},
+	}
+	s := newSched()
+	stubSyncable = []string{"db01", "lab01", "mail01"}
+	defer func() { stubSyncable = nil }()
+
+	// Mid-March: the first Sunday of March has passed, so April's is next.
+	now := schedTime(t, "2026-03-15 09:00")
+	got := map[string]EffectiveScheduleEntry{}
+	for _, row := range s.EffectiveSchedule(&agentConfig{}, cfg, now) {
+		got[row.VM] = row
+	}
+
+	t.Run("an explicit entry reports its RESOLVED cadence, not its written one", func(t *testing.T) {
+		// db01's own entry carries no interval and no verify mode at all. A
+		// console showing the published document would show blanks.
+		e := got["db01"]
+		if e.IntervalSeconds != 3600 || e.VerifyMode != "fast" {
+			t.Errorf("db01 = interval %d verify %q, want 3600 and \"fast\" from its template",
+				e.IntervalSeconds, e.VerifyMode)
+		}
+		if e.Template != "nightly" {
+			t.Errorf("Template = %q, want %q", e.Template, "nightly")
+		}
+		if e.Synthesised {
+			t.Error("db01 is marked synthesised; it has an explicit entry")
+		}
+	})
+
+	t.Run("a synthesised entry is visibly distinguishable", func(t *testing.T) {
+		// "somebody configured this" and "the default swept it up" are
+		// different facts, and an operator asking why a VM is being synced
+		// needs to tell them apart.
+		e, ok := got["mail01"]
+		if !ok {
+			t.Fatal("mail01 is syncable with no entry, so the default should have covered it")
+		}
+		if !e.Synthesised {
+			t.Error("mail01 is not marked synthesised, so the console cannot say where it came from")
+		}
+		if e.Template != DefaultTemplateName || e.IntervalSeconds != 900 {
+			t.Errorf("mail01 = template %q interval %d, want the default's", e.Template, e.IntervalSeconds)
+		}
+	})
+
+	t.Run("a disabled entry is reported, not omitted", func(t *testing.T) {
+		e, ok := got["lab01"]
+		if !ok {
+			t.Fatal("lab01 is missing; a disabled VM still needs to show as disabled")
+		}
+		if e.Enabled {
+			t.Error("lab01 reports enabled")
+		}
+	})
+
+	t.Run("the next verify window is resolved, not left to the console", func(t *testing.T) {
+		e := got["db01"]
+		if e.NextVerifyUnix == 0 {
+			t.Fatal("no next verify window reported for a calendar entry")
+		}
+		next := time.Unix(e.NextVerifyUnix, 0).In(now.Location())
+		if next.Month() != time.April || next.Day() != 5 {
+			t.Errorf("next verify = %v, want 5 April 2026 (the next first-Sunday)", next)
+		}
+		if e.VerifyWindowOpen {
+			t.Error("reported the window open on 15 March, which is not a first Sunday")
+		}
+	})
+
+	t.Run("an open window says so", func(t *testing.T) {
+		inWindow := schedTime(t, "2026-04-05 06:00")
+		for _, row := range s.EffectiveSchedule(&agentConfig{}, cfg, inWindow) {
+			if row.VM == "db01" && !row.VerifyWindowOpen {
+				t.Error("db01's window is open at 06:00 on the first Sunday, but the report says otherwise")
+			}
+		}
+	})
+
+	t.Run("a calendar that does not parse is reported rather than hidden", func(t *testing.T) {
+		// Such an entry never verifies. That has to be visible somewhere an
+		// operator looks, not only in the agent's own journal.
+		broken := UIConfig{Schedule: []ScheduleEntry{{
+			VM: "web01", Enabled: true, IntervalSeconds: 900,
+			Profile:    SyncProfile{Verify: "fast"},
+			VerifyDays: "Frunday",
+		}}}
+		rows := s.EffectiveSchedule(&agentConfig{}, broken, now)
+		if len(rows) != 1 {
+			t.Fatalf("got %d rows, want 1", len(rows))
+		}
+		if rows[0].CalendarError == "" {
+			t.Error("a calendar that does not parse was reported as if it were fine")
+		}
+		if rows[0].NextVerifyUnix != 0 {
+			t.Error("reported a next window for a calendar that does not parse")
+		}
+	})
+}

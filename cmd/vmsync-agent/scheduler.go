@@ -1037,3 +1037,94 @@ func runResultPath(stateDir, runID string) string {
 // runResultDir holds them. Its own subdirectory so a sweep of leftovers
 // cannot touch anything else in the state dir.
 const runResultDir = "results"
+
+// EffectiveScheduleEntry is one VM's schedule AS THE AGENT RESOLVED IT, for
+// the console to display.
+//
+// The console must not work this out for itself, and that is the whole point.
+// Templates resolve in the agent -- a standalone agent has no control plane at
+// all, so a UI-side resolver would make them unavailable in exactly the
+// deployment that benefits most (see resolveEntry). The consequence is that
+// the console cannot predict what an agent will do; it has to be told. This is
+// the telling.
+//
+// It is a report of OBSERVED state, not a second copy of the configuration:
+// what is in here is what the scheduler will actually act on, including
+// entries no operator ever wrote.
+type EffectiveScheduleEntry struct {
+	VM string `json:"vm"`
+	// Template is the template this entry inherited from, resolved -- so an
+	// entry naming none reads "default" here rather than empty.
+	Template string `json:"template,omitempty"`
+	// Synthesised is an entry the agent invented from the default template
+	// because the VM had none of its own. Distinguished because "somebody
+	// configured this" and "the default swept it up" are different facts, and
+	// an operator looking for why a VM is being synced needs to tell them
+	// apart.
+	Synthesised     bool `json:"synthesised,omitempty"`
+	Enabled         bool `json:"enabled"`
+	IntervalSeconds int  `json:"interval_seconds,omitempty"`
+
+	VerifyMode            string `json:"verify_mode,omitempty"`
+	VerifyIntervalSeconds int    `json:"verify_interval_seconds,omitempty"`
+	VerifyDays            string `json:"verify_days,omitempty"`
+	VerifyWindow          string `json:"verify_window,omitempty"`
+	// NextVerifyUnix is when the verify window next opens, in the AGENT's own
+	// clock, or 0 when there is no calendar or none falls within the horizon.
+	//
+	// Computed here rather than in the console for the same reason the rest of
+	// this struct exists: the answer depends on the host's timezone, which the
+	// console does not know.
+	NextVerifyUnix int64 `json:"next_verify_unix,omitempty"`
+	// VerifyWindowOpen says the window is open right now. Not derivable from
+	// NextVerifyUnix alone, which reports an already-open occurrence's start.
+	VerifyWindowOpen bool `json:"verify_window_open,omitempty"`
+	// CalendarError is why a calendar could not be parsed, when it could not.
+	// Reported rather than silently omitted: an entry whose calendar does not
+	// parse never verifies, and that has to be visible somewhere an operator
+	// looks.
+	CalendarError string `json:"calendar_error,omitempty"`
+}
+
+// EffectiveSchedule resolves what this agent will actually act on.
+//
+// Built from the same inputs and the same function the scheduler uses, so the
+// report cannot drift from behaviour: if this said something the scheduler
+// disagreed with, the report would be worse than none.
+func (s *Scheduler) EffectiveSchedule(cfg *agentConfig, cached UIConfig, now time.Time) []EffectiveScheduleEntry {
+	explicit := make(map[string]bool, len(cached.Schedule))
+	for _, e := range cached.Schedule {
+		explicit[e.VM] = true
+	}
+
+	resolved := ResolveSchedule(cached.Schedule, cached.Templates, s.syncableVMs(cfg, now))
+	out := make([]EffectiveScheduleEntry, 0, len(resolved))
+	for _, e := range resolved {
+		row := EffectiveScheduleEntry{
+			VM:                    e.VM,
+			Template:              templateNameOf(e),
+			Synthesised:           !explicit[e.VM],
+			Enabled:               e.Enabled,
+			IntervalSeconds:       e.IntervalSeconds,
+			VerifyMode:            e.Profile.Verify,
+			VerifyIntervalSeconds: e.VerifyIntervalSeconds,
+			VerifyDays:            e.VerifyDays,
+			VerifyWindow:          e.VerifyWindow,
+		}
+		if e.VerifyDays != "" || e.VerifyWindow != "" {
+			sched, err := schedcal.Parse(e.VerifyDays, e.VerifyWindow)
+			if err != nil {
+				row.CalendarError = err.Error()
+			} else {
+				if _, open := sched.OccurrenceStart(now); open {
+					row.VerifyWindowOpen = true
+				}
+				if next, ok := sched.NextOccurrence(now); ok {
+					row.NextVerifyUnix = next.Unix()
+				}
+			}
+		}
+		out = append(out, row)
+	}
+	return out
+}

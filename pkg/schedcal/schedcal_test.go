@@ -877,3 +877,111 @@ func TestNumericRangesAreBounded(t *testing.T) {
 		}
 	}
 }
+
+// NextOccurrence exists so the AGENT can tell the console when a VM next
+// verifies. The console must not work that out for itself: it does not know
+// the host's timezone and is not the authority on the resolved schedule.
+func TestNextOccurrence(t *testing.T) {
+	utc := time.UTC
+
+	t.Run("the first Sunday of next month", func(t *testing.T) {
+		s, err := Parse("Sun *-*-01..07", "02:00-12:00")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Mid-March: the first Sunday of March is past, so April's is next.
+		got, ok := s.NextOccurrence(at(t, utc, "2026-03-15 09:00"))
+		if !ok {
+			t.Fatal("no next occurrence found")
+		}
+		if want := at(t, utc, "2026-04-05 02:00"); !got.Equal(want) {
+			t.Errorf("next = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("an occurrence already open returns its own start", func(t *testing.T) {
+		// "Next" means the next one an operator would see, and one that is
+		// open right now is it -- otherwise the console would say a VM
+		// verifies next month while it is verifying.
+		s, _ := Parse("Sun *-*-01..07", "02:00-12:00")
+		got, ok := s.NextOccurrence(at(t, utc, "2026-03-01 06:00"))
+		if !ok {
+			t.Fatal("no occurrence found while inside one")
+		}
+		if want := at(t, utc, "2026-03-01 02:00"); !got.Equal(want) {
+			t.Errorf("next = %v, want the open occurrence's start %v", got, want)
+		}
+	})
+
+	t.Run("a window that has already closed today moves to the next day", func(t *testing.T) {
+		s, _ := Parse("", "02:00-04:00")
+		got, ok := s.NextOccurrence(at(t, utc, "2026-03-04 09:00"))
+		if !ok {
+			t.Fatal("no next occurrence")
+		}
+		if want := at(t, utc, "2026-03-05 02:00"); !got.Equal(want) {
+			t.Errorf("next = %v, want tomorrow's %v", got, want)
+		}
+	})
+
+	t.Run("a days-only schedule opens at the start of the day", func(t *testing.T) {
+		s, _ := Parse("Sun", "")
+		got, ok := s.NextOccurrence(at(t, utc, "2026-03-03 09:00"))
+		if !ok {
+			t.Fatal("no next occurrence")
+		}
+		if want := at(t, utc, "2026-03-08 00:00"); !got.Equal(want) {
+			t.Errorf("next = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a year pinned beyond the horizon reports none rather than guessing", func(t *testing.T) {
+		s, err := Parse("2999-*-*", "02:00-04:00")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := s.NextOccurrence(at(t, utc, "2026-03-01 09:00")); ok {
+			t.Errorf("found %v; a schedule further out than the horizon must report none", got)
+		}
+	})
+
+	t.Run("a year pinned within the horizon IS found", func(t *testing.T) {
+		s, _ := Parse("2028-*-01", "02:00-04:00")
+		got, ok := s.NextOccurrence(at(t, utc, "2026-03-01 09:00"))
+		if !ok {
+			t.Fatal("a schedule two years out was not found; the horizon is too short")
+		}
+		if got.Year() != 2028 {
+			t.Errorf("next = %v, want a 2028 date", got)
+		}
+	})
+
+	// The search walks calendar days, so it is exposed to exactly the trap the
+	// crossing-midnight branch was: in a midnight-gap zone, a day stepped by
+	// duration lands on the wrong date.
+	t.Run("the walk is DST-safe in every zone", func(t *testing.T) {
+		for _, name := range append(append([]string{}, oddZones...),
+			"America/Santiago", "America/Havana", "Atlantic/Azores") {
+			t.Run(name, func(t *testing.T) {
+				loc := zone(t, name)
+				s, _ := Parse("Sun", "22:00-04:00")
+				// Step through a whole year asking for the next occurrence;
+				// every answer must be a Sunday, and never in the past.
+				for d := 0; d < 365; d++ {
+					now := time.Date(2026, 1, 1, 12, 0, 0, 0, loc).AddDate(0, 0, d)
+					got, ok := s.NextOccurrence(now)
+					if !ok {
+						t.Fatalf("day %d: no next occurrence", d)
+					}
+					if got.Weekday() != time.Sunday {
+						t.Fatalf("day %d: next = %v, a %s -- the walk landed on the wrong date",
+							d, got.Format("2006-01-02 15:04 -0700"), got.Weekday())
+					}
+					if got.Before(now.Add(-24 * time.Hour)) {
+						t.Fatalf("day %d: next = %v is in the past relative to %v", d, got, now)
+					}
+				}
+			})
+		}
+	})
+}
