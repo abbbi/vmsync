@@ -147,6 +147,21 @@ type Report struct {
 	Hostname       string         `json:"hostname"`
 	LibvirtURI     string         `json:"libvirt_uri"`
 	Domains        []ReportDomain `json:"domains"`
+	// Mode is which agent this is: "standalone", "monitor" or "controlled".
+	//
+	// Reported because the console cannot work it out and the difference is
+	// not cosmetic. A monitor agent runs no scheduler and executes no
+	// operations, so every control the console offers for it -- change the
+	// interval, sync now, fail over -- would be accepted, published, and
+	// never acted on. An operator watching for the result of an instruction
+	// that no process will ever read is the worst failure this control plane
+	// has, because everything about it looks like it worked.
+	//
+	// Only ever "monitor" or "controlled" in practice, since a standalone
+	// agent has no control plane to report to. Sent anyway rather than
+	// special-cased: a field whose value set depends on whether it could be
+	// sent is one nobody can reason about later.
+	Mode string `json:"mode,omitempty"`
 	// ConfigAgeSeconds is how long since this agent last confirmed its
 	// configuration with the UI. It lets the UI show that an agent is
 	// running on stale instructions -- the expected state during a

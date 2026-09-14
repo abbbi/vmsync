@@ -87,10 +87,10 @@ var skipReasons = []string{
 // that is configured, never runs, and therefore never writes a per-VM file
 // to go stale in the first place.
 type agentMetrics struct {
-	version    string
-	hostname   string
-	standalone bool
-	startedAt  time.Time
+	version   string
+	hostname  string
+	mode      agentMode
+	startedAt time.Time
 
 	runsOK   atomic.Uint64
 	runsFail atomic.Uint64
@@ -180,11 +180,11 @@ func (m *agentMetrics) fenceUnrecorded() {
 	m.fencesUnrecorded.Add(1)
 }
 
-func newAgentMetrics(version, hostname string, standalone bool) *agentMetrics {
+func newAgentMetrics(version, hostname string, mode agentMode) *agentMetrics {
 	m := &agentMetrics{
 		version:      version,
 		hostname:     hostname,
-		standalone:   standalone,
+		mode:         mode,
 		startedAt:    time.Now(),
 		skips:        make(map[string]*atomic.Uint64, len(skipReasons)),
 		domainStatus: map[string]int{},
@@ -320,7 +320,21 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	fmt.Fprintf(&b, "vmsync_agent_build_info{host=%q,version=%q} 1\n", host, m.version)
 
 	g("vmsync_agent_start_timestamp_seconds", "When this agent process started.", m.startedAt.Unix(), "")
-	g("vmsync_agent_standalone", "1 when scheduling from a local file with no control plane.", boolGauge(m.standalone), "")
+
+	// One series per mode, exactly one of them 1 -- the state-set pattern,
+	// written out here rather than through g() because g() emits its own
+	// HELP and TYPE and a metric family may only declare those once.
+	//
+	// It replaces a boolean that could only ask "is there a control plane?",
+	// a question with three answers now. The one worth alerting on is
+	// vmsync_agent_mode{mode="monitor"} == 1: a host that reports beautifully
+	// and replicates nothing on its own is invisible in every other series
+	// here, which is exactly how a site everybody assumed was covered turns
+	// out not to be.
+	fmt.Fprintf(&b, "# HELP vmsync_agent_mode Which mode this agent runs in; exactly one of these series is 1.\n# TYPE vmsync_agent_mode gauge\n")
+	for _, mode := range []agentMode{modeStandalone, modeMonitor, modeControlled} {
+		fmt.Fprintf(&b, "vmsync_agent_mode{host=%q,mode=%q} %d\n", host, string(mode), boolGauge(m.mode == mode))
+	}
 
 	// --- schedule ---------------------------------------------------------
 	var enabled, disabled int

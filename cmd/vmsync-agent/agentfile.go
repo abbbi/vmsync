@@ -118,7 +118,14 @@ type ControlPlaneFile struct {
 	HTTPTimeoutSec int    `json:"http_timeout_sec,omitempty"`
 }
 
-// Standalone reports whether this agent runs with no control plane.
+// Standalone reports whether this FILE can only describe a standalone agent.
+//
+// Not the authority on the mode -- agentMode is, and it comes from the command
+// line. This answers the narrower question the file can actually settle: with
+// no control plane there is nothing to enrol with, so standalone is the only
+// mode this file supports. The converse does not hold, which is why the mode
+// had to move out: a file WITH a control plane describes --monitor and
+// --controlled equally well, and nothing in it says which.
 func (a AgentFile) Standalone() bool { return a.ControlPlane == nil }
 
 // resolveAgentConfig turns the file into the runtime configuration the rest
@@ -130,7 +137,7 @@ func (a AgentFile) Standalone() bool { return a.ControlPlane == nil }
 // consumer, and the loops keep the flat field names their call sites already
 // use. It is also the one place the two vocabularies are reconciled, so the
 // inversions (features.schedule -> NoSchedule) exist exactly once.
-func resolveAgentConfig(a AgentFile, configPath string, once, forceDebug bool, enrolTokenFile string) (agentConfig, error) {
+func resolveAgentConfig(a AgentFile, mode agentMode, configPath string, once, forceDebug bool, enrolTokenFile string) (agentConfig, error) {
 	host, err := a.ResolveHostname()
 	if err != nil {
 		return agentConfig{}, err
@@ -138,6 +145,7 @@ func resolveAgentConfig(a AgentFile, configPath string, once, forceDebug bool, e
 
 	cfg := agentConfig{
 		ConfigPath: configPath,
+		Mode:       mode,
 		StateDir:   a.StateDir,
 		LibvirtURI: a.LibvirtURI,
 		Hostname:   host,
@@ -167,10 +175,11 @@ func resolveAgentConfig(a AgentFile, configPath string, once, forceDebug bool, e
 		NoSchedule:  !boolValue(a.Features.Schedule, true),
 		NoAutoFence: !boolValue(a.Features.AutoFence, true),
 
-		// Doubles as the standalone marker, exactly as it did when it was a
-		// flag: validation guarantees schedule_file is set if and only if
-		// there is no control plane, so "this string is non-empty" and "this
-		// agent has no control plane" remain the same question.
+		// Just the path now. It used to double as the standalone marker --
+		// "this string is non-empty" and "this agent has no control plane"
+		// were the same question -- which stopped being true the moment there
+		// were three modes rather than two. Mode says which agent this is;
+		// this says where a standalone one reads its schedule.
 		StandaloneFile: a.ScheduleFile,
 	}
 

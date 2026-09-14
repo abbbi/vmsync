@@ -77,6 +77,13 @@ type reloader struct {
 	// them on the first reload.
 	once       bool
 	forceDebug bool
+	// mode is startup-only in the strongest sense: it came from the command
+	// line, so no edit to the file can change it. Carried here so a reload
+	// can hold the new file to the running mode -- an operator who deletes
+	// "control_plane" from a --controlled agent's file has written a document
+	// that describes a different agent, and the reload has to say so rather
+	// than publish a generation with nothing to be controlled by.
+	mode agentMode
 
 	mu sync.Mutex
 	// lastApplied is the digest of the file contents that produced the
@@ -91,10 +98,10 @@ type reloader struct {
 	gen     uint64
 }
 
-func newReloader(lv *live, configPath string, initialDigest string, once, forceDebug bool) *reloader {
+func newReloader(lv *live, configPath string, initialDigest string, once, forceDebug bool, mode agentMode) *reloader {
 	return &reloader{
 		lv: lv, configPath: configPath,
-		once: once, forceDebug: forceDebug,
+		once: once, forceDebug: forceDebug, mode: mode,
 		lastApplied: initialDigest,
 	}
 }
@@ -145,7 +152,15 @@ func (r *reloader) reload(cause string) {
 		r.failed(cause, err)
 		return
 	}
-	next, err := resolveAgentConfig(af, r.configPath, r.once, r.forceDebug, "")
+	// Held to the mode this process is actually running in, before the file
+	// is resolved into anything. The checks differ from the startup ones only
+	// in when they run, which is the point: a file is not valid in the
+	// abstract, it is valid for an agent.
+	if err := r.mode.checkFile(af, r.configPath); err != nil {
+		r.failed(cause, err)
+		return
+	}
+	next, err := resolveAgentConfig(af, r.mode, r.configPath, r.once, r.forceDebug, "")
 	if err != nil {
 		r.failed(cause, err)
 		return
@@ -235,9 +250,23 @@ func refuseColdChanges(old, next agentConfig) error {
 		return fmt.Errorf(`"state_dir" cannot be changed while the agent is running (%s -> %s): it holds the credential, both ledgers and the run log, which other goroutines are writing to right now. Restart the agent to move it`,
 			old.StateDir, next.StateDir)
 	}
-	// Mode is not a setting either. Flipping between control-plane and
-	// standalone changes who is in charge of this host, and costing the
-	// operator a deliberate restart for that is the feature.
+	// Mode is not a setting either. It changes who is in charge of this host
+	// and which goroutines exist, and costing the operator a deliberate
+	// restart for that is the feature.
+	//
+	// Since it moved to the command line this cannot be reached by editing
+	// the file -- the reloader passes the running mode back in, so the two
+	// are equal by construction. It stays because "equal by construction" is
+	// a property of today's call path rather than of the type, and the cost
+	// of being wrong about that is an agent that quietly starts or stops
+	// fencing on a SIGHUP.
+	if old.Mode != next.Mode {
+		return fmt.Errorf("this agent cannot change mode while running (%s -> %s); restart it", old.Mode, next.Mode)
+	}
+	// The same question asked of the file, which an edit CAN reach: a
+	// standalone agent whose "schedule_file" disappeared has nothing left to
+	// run, and one that grew a "control_plane" is describing an agent this
+	// process is not.
 	if (old.StandaloneFile == "") != (next.StandaloneFile == "") {
 		return fmt.Errorf("this agent cannot change between control-plane and standalone mode while running; restart it")
 	}

@@ -42,13 +42,13 @@ func newReloadFixture(t *testing.T, body string) *reloadFixture {
 	if err != nil {
 		t.Fatalf("the fixture config does not load: %v", err)
 	}
-	cfg, err := resolveAgentConfig(af, path, false, false, "")
+	cfg, err := resolveAgentConfig(af, modeStandalone, path, false, false, "")
 	if err != nil {
 		t.Fatalf("the fixture config does not resolve: %v", err)
 	}
 	lv := newLive(cfg)
 	data, _ := os.ReadFile(path)
-	return &reloadFixture{path: path, lv: lv, r: newReloader(lv, path, configDigest(data), false, false)}
+	return &reloadFixture{path: path, lv: lv, r: newReloader(lv, path, configDigest(data), false, false, modeStandalone)}
 }
 
 func writeConfig(t *testing.T, path, body string) {
@@ -67,6 +67,76 @@ func standaloneConfig(stateDir, vmsyncPath string) string {
   "vmsync_path": "` + vmsyncPath + `",
   "schedule_file": "/etc/vmsync/schedule.json"
 }`
+}
+
+// controlPlaneConfig is the same file the other way round: a control plane and
+// no schedule_file, which is what --monitor and --controlled both require and
+// what --standalone must refuse.
+func controlPlaneConfig(stateDir, vmsyncPath string) string {
+	return `{
+  "config_version": 1,
+  "state_dir": "` + stateDir + `",
+  "vmsync_path": "` + vmsyncPath + `",
+  "control_plane": {"url": "https://ui.example:8443"}
+}`
+}
+
+// The mode is a command-line flag, so an edit cannot change it -- but an edit
+// CAN produce a file that no longer describes the mode this process is running
+// in, and that has to be refused rather than applied. Applying it would leave a
+// --standalone agent whose configuration names no schedule file: a host that
+// looks healthy in the journal and replicates nothing.
+func TestReloadRefusesAFileThatNoLongerMatchesTheMode(t *testing.T) {
+	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/local/bin/vmsync"))
+
+	// The fixture's reloader runs in modeStandalone. This file is valid on its
+	// own terms -- it would start a --controlled agent perfectly -- and is
+	// still wrong for THIS agent.
+	writeConfig(t, f.path, controlPlaneConfig("/var/lib/vmsync-agent", "/opt/vmsync/bin/vmsync"))
+	f.r.reload("test")
+
+	cur := f.lv.get()
+	if cur.Gen != 0 {
+		t.Errorf("generation = %d, want 0: a file that does not match the running mode was applied", cur.Gen)
+	}
+	if cur.StandaloneFile != "/etc/vmsync/schedule.json" {
+		t.Errorf("schedule_file = %q; the agent lost the only thing telling it what to sync", cur.StandaloneFile)
+	}
+	if cur.VmsyncPath != "/usr/local/bin/vmsync" {
+		t.Errorf("vmsync_path = %q; the allowed half of a refused reload was applied anyway", cur.VmsyncPath)
+	}
+}
+
+// refuseColdChanges compares Mode directly as well. It cannot differ today --
+// the reloader passes the running mode back in, so the two are equal by
+// construction -- and the check stays because that is a property of the current
+// call path rather than of the type. Getting it wrong later means an agent that
+// quietly starts or stops fencing on a SIGHUP.
+func TestRefuseColdChangesOnMode(t *testing.T) {
+	base := agentConfig{StateDir: "/var/lib/vmsync-agent", Mode: modeControlled}
+	for _, tc := range []struct {
+		name string
+		next agentMode
+		want string
+	}{
+		{"controlled to monitor", modeMonitor, "mode"},
+		{"controlled to standalone", modeStandalone, "mode"},
+		{"unchanged", modeControlled, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			next := base
+			next.Mode = tc.next
+			err := refuseColdChanges(base, next)
+			switch {
+			case tc.want == "" && err != nil:
+				t.Errorf("refused a reload that changed no mode: %v", err)
+			case tc.want != "" && err == nil:
+				t.Error("permitted a mode change under a running agent")
+			case tc.want != "" && !strings.Contains(err.Error(), tc.want):
+				t.Errorf("error %q does not mention %q", err, tc.want)
+			}
+		})
+	}
 }
 
 func TestReloadAppliesAChange(t *testing.T) {
@@ -201,7 +271,7 @@ func TestRefuseColdChanges(t *testing.T) {
 // log's open file handle.
 func TestReloadCarriesTheLiveObjectsForward(t *testing.T) {
 	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/local/bin/vmsync"))
-	m := newAgentMetrics("test", "host01", true)
+	m := newAgentMetrics("test", "host01", modeStandalone)
 	rl := newRunLog(t.TempDir(), "session-1", m)
 
 	cur := *f.lv.get()
@@ -272,7 +342,7 @@ func TestForcedDebugSurvivesAReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	// forceDebug true, as --debug does.
-	cfg, err := resolveAgentConfig(af, path, false, true, "")
+	cfg, err := resolveAgentConfig(af, modeStandalone, path, false, true, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +351,7 @@ func TestForcedDebugSurvivesAReload(t *testing.T) {
 	}
 	lv := newLive(cfg)
 	data, _ := os.ReadFile(path)
-	r := newReloader(lv, path, configDigest(data), false, true)
+	r := newReloader(lv, path, configDigest(data), false, true, modeStandalone)
 
 	// The file still says nothing about debug, i.e. false.
 	writeConfig(t, path, standaloneConfig("/var/lib/vmsync-agent", "/opt/vmsync/bin/vmsync"))

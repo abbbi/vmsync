@@ -33,7 +33,7 @@ import (
 func adoptFixture(t *testing.T, entries ...ScheduleEntry) (*Scheduler, *agentConfig, string) {
 	t.Helper()
 	dir := t.TempDir()
-	m := newAgentMetrics("test", "host01", true)
+	m := newAgentMetrics("test", "host01", modeStandalone)
 	cfg := agentConfig{
 		VmsyncPath: "/usr/local/bin/vmsync",
 		StateDir:   dir,

@@ -96,11 +96,17 @@ type agentConfig struct {
 	// never raise it, because how much concurrent I/O this machine can
 	// absorb is something only this machine knows.
 	MaxConcurrentSyncs int
-	// StandaloneFile, when set, makes this a scheduler and nothing else:
-	// the schedule is read from that path and no control plane is involved
-	// at any point. Mutually exclusive with -ui and everything that only
-	// means something alongside one.
+	// StandaloneFile is where a standalone agent reads its schedule from.
+	// Empty in every other mode, where the schedule is agent-written state
+	// under StateDir.
+	//
+	// It no longer doubles as the mode marker. Mode does that, and says so.
 	StandaloneFile string
+
+	// Mode is what this invocation is for, taken from the command line. See
+	// agentMode: it decides which loops start, and it is the one thing here a
+	// reload cannot change.
+	Mode agentMode
 
 	// metrics is this agent's own metric state, carried here so the
 	// scheduler and both run paths reach the same instance without a
@@ -120,9 +126,16 @@ type agentConfig struct {
 	runLog *runLog
 }
 
-// Everything else this agent needs now lives in the config file. These four
-// remain because none of them is a SETTING: they select a file, or they say
-// what this one invocation is for.
+// Everything else this agent needs now lives in the config file. These remain
+// because none of them is a SETTING: they select a file, or they say what this
+// one invocation is for.
+//
+// The three mode flags are the clearest case of the second kind. A mode is not
+// a value the agent reads and applies, it is which agent this is: it decides
+// which goroutines exist, so it could not be reloaded even if it lived in the
+// file. Putting it on the command line also puts it in the unit, where
+// "can a network service stop VMs on this host?" is answered by looking rather
+// than by reading a JSON document and knowing a rule about it.
 //
 // The nineteen that went are not merely relocated. A flag can only be changed
 // by restarting the process, and a daemon whose settings can only be changed
@@ -136,6 +149,10 @@ func main() {
 		enrolTokenFile = flag.String("enrol-token-file", "", "Path to a file holding a single-use enrolment token. Read once and then DELETED, so the token does not outlive its use. Only needed until enrolment succeeds")
 		showVersion    = flag.Bool("v", false, "Show version and exit")
 		showVersionL   = flag.Bool("version", false, "Show version and exit")
+
+		standalone = flag.Bool("standalone", false, "Run the schedule from a local file, with no control plane. Requires \"schedule_file\"")
+		monitor    = flag.Bool("monitor", false, "Report to a control plane and run nothing: no scheduler, no operations, no fencing. For a host whose replication is driven by something else, usually cron. Requires \"control_plane\"")
+		controlled = flag.Bool("controlled", false, "Take the schedule from the control plane and run it, execute the operations it publishes, and fence on its behalf. Requires \"control_plane\"")
 	)
 	flag.Parse()
 
@@ -154,6 +171,15 @@ func main() {
 	// to load can be diagnosed with the flag that exists for diagnosing it.
 	trace.SetDebug(*debug)
 
+	// Before the file, because it needs nothing from it and because "you did
+	// not say what this agent is" is a clearer first thing to hear than a
+	// complaint about a document the operator may not have got to yet.
+	mode, err := resolveMode(*standalone, *monitor, *controlled)
+	if err != nil {
+		trace.Error("invalid command line", "error", err)
+		os.Exit(2)
+	}
+
 	af, warnings, err := LoadAgentFile(*configPath)
 	if err != nil {
 		trace.Error("invalid configuration", "error", err)
@@ -162,8 +188,12 @@ func main() {
 	for _, w := range warnings {
 		trace.Warning("configuration hygiene", "detail", w)
 	}
+	if err := mode.checkFile(af, *configPath); err != nil {
+		trace.Error("configuration does not match the mode this agent was started in", "error", err)
+		os.Exit(2)
+	}
 
-	cfg, err := resolveAgentConfig(af, *configPath, *once, *debug, *enrolTokenFile)
+	cfg, err := resolveAgentConfig(af, mode, *configPath, *once, *debug, *enrolTokenFile)
 	if err != nil {
 		trace.Error("invalid configuration", "error", err)
 		os.Exit(2)
@@ -189,7 +219,7 @@ func main() {
 			"reports_as", cfg.Hostname, "replica_identity", h, "libvirt_uri", cfg.LibvirtURI)
 	}
 	if cfg.PrometheusDir != "" {
-		cfg.metrics = newAgentMetrics(version.Version, cfg.Hostname, cfg.StandaloneFile != "")
+		cfg.metrics = newAgentMetrics(version.Version, cfg.Hostname, cfg.Mode)
 	}
 
 	// Opened before anything can launch, and fatal if it cannot be.
@@ -221,10 +251,15 @@ func main() {
 	// The digest of the bytes that produced generation 0, so the first poll
 	// does not mistake "unchanged" for "changed".
 	initial, _ := os.ReadFile(*configPath)
-	reloads := newReloader(lv, *configPath, configDigest(initial), *once, *debug)
+	reloads := newReloader(lv, *configPath, configDigest(initial), *once, *debug, cfg.Mode)
 
+	// Monitor shares run() with controlled rather than getting an entry point
+	// of its own: it is a strict subset -- the same enrolment, the same
+	// reporting, the same poll -- and the difference is entirely in which
+	// loops start. Two near-identical entry points would drift, and the half
+	// that drifted would be the one nobody runs on their busiest host.
 	runner := run
-	if cfg.StandaloneFile != "" {
+	if cfg.Mode == modeStandalone {
 		runner = runStandalone
 	}
 	if err := runner(lv, reloads); err != nil {
@@ -272,7 +307,7 @@ func run(lv *live, reloads *reloader) error {
 	// Free: every HTTP response already carries a Date header, so the
 	// control plane doubles as a clock reference without an extra request.
 	client.OnClockSkew = cfg.metrics.recordUIClockSkew
-	trace.Info("agent ready", "agent_id", creds.AgentID, "ui", client.Base, "hostname", cfg.Hostname, "libvirt_uri", cfg.LibvirtURI)
+	trace.Info("agent ready", "mode", string(cfg.Mode), "agent_id", creds.AgentID, "ui", client.Base, "hostname", cfg.Hostname, "libvirt_uri", cfg.LibvirtURI)
 
 	cached, everFetched, err := store.LoadCache()
 	if err != nil {
@@ -299,13 +334,29 @@ func run(lv *live, reloads *reloader) error {
 	// would look like an agent that has never done anything, which would
 	// re-run every operation the UI is still publishing -- so this is
 	// fatal rather than best-effort.
-	ledger := newOperationLedger(cfg.StateDir)
-	if err := ledger.Load(); err != nil {
-		return fmt.Errorf("load the operation ledger: %w", err)
+	//
+	// Nil in monitor mode, which neither executes operations nor reports
+	// their results. The nil is doing real work, not saving a file read: a
+	// host moved from --controlled to --monitor still has that host's results
+	// on disk, and reporting them from an agent that no longer runs the
+	// operations loop would republish them every cycle with nothing left to
+	// acknowledge them. Same reasoning as reportOnce's nil, arrived at from
+	// the other direction.
+	var ledger *operationLedger
+	if cfg.Mode.actsOnItsOwn() {
+		ledger = newOperationLedger(cfg.StateDir)
+		if err := ledger.Load(); err != nil {
+			return fmt.Errorf("load the operation ledger: %w", err)
+		}
 	}
 
 	var sched *Scheduler
-	if !cfg.NoSchedule {
+	switch {
+	case !cfg.Mode.actsOnItsOwn():
+		trace.Info("monitor mode: no scheduler. Replication on this host belongs to whatever drives it, and this agent reports what that leaves behind in libvirt")
+	case cfg.NoSchedule:
+		trace.Info(`scheduling disabled by "features.schedule": false; this agent will report and nothing else`)
+	default:
 		sched = NewScheduler(lv, state)
 		wg.Add(1)
 		// Synchronously, and BEFORE Run: the first launchDue must already know
@@ -314,8 +365,6 @@ func run(lv *live, reloads *reloader) error {
 		sched.Reconcile(ctx)
 		go func() { defer wg.Done(); sched.Run(ctx) }()
 		trace.Info("scheduler running", "vmsync", cfg.VmsyncPath, "target_uri_pattern", cfg.TargetURIPattern)
-	} else {
-		trace.Info("scheduling disabled by -no-schedule; this agent will report and nothing else")
 	}
 
 	if cfg.metrics != nil {
@@ -326,20 +375,27 @@ func run(lv *live, reloads *reloader) error {
 		go func() { defer wg.Done(); metricsLoop(ctx, lv, state, sched, cfg.metrics, false) }()
 	}
 
-	// Started regardless of -no-schedule. That flag means "do not run the
-	// schedule", and a DR-site target host is exactly the machine most
-	// likely to carry it -- it has no schedule of its own, so nobody ever
-	// removes it -- while also being the machine a failover must run on.
+	// Started regardless of "features.schedule". That setting means "do not
+	// run the schedule", and a DR-site target host is exactly the machine
+	// most likely to carry it -- it has no schedule of its own, so nobody
+	// ever removes it -- while also being the machine a failover must run on.
 	// Tying the two together would deliver a promotion to a visibly healthy
 	// agent that silently ignores it.
-	wg.Add(1)
-	go func() { defer wg.Done(); operationsLoop(ctx, lv, state, ledger) }()
+	//
+	// The MODE is a different question, and the one case where it does not
+	// start: an operation is the control plane telling this host to do
+	// something, and a monitor agent is the one that does not.
+	if cfg.Mode.actsOnItsOwn() {
+		wg.Add(1)
+		go func() { defer wg.Done(); operationsLoop(ctx, lv, state, ledger) }()
+	}
 
-	// Also started regardless of -no-schedule, and for a sharper reason
-	// than the operations loop: a source whose replication was disabled --
-	// by the operator, or by the failover that displaced it -- is MORE
-	// likely to be a split-brain risk, not less. Gating this on the
-	// schedule would switch off the protection exactly where it is needed.
+	// The fence ledger is loaded in every mode, including the one that never
+	// writes to it. A report carries the whole picture of a host and replaces
+	// what the UI holds, so an agent that skipped loading it would erase the
+	// console's record of which VMs this host has fenced -- the same trap
+	// reportOnce documents, and the reason it passes the fence ledger while
+	// withholding the operation ledger.
 	fences := newFenceLedger(cfg.StateDir)
 	if err := fences.Load(); err != nil {
 		// Fatal for the same reason the operation ledger is: an agent that
@@ -348,8 +404,27 @@ func run(lv *live, reloads *reloader) error {
 		// single-use.
 		return fmt.Errorf("load the fence ledger: %w", err)
 	}
-	wg.Add(1)
-	go func() { defer wg.Done(); fenceLoop(ctx, lv, state, fences) }()
+	// Also started regardless of "features.schedule", and for a sharper
+	// reason than the operations loop: a source whose replication was
+	// disabled -- by the operator, or by the failover that displaced it -- is
+	// MORE likely to be a split-brain risk, not less. Gating this on the
+	// schedule would switch off the protection exactly where it is needed.
+	//
+	// Monitor mode is the exception, and it is a deliberate trade rather than
+	// an oversight. Fencing is the only thing this agent does that stops a
+	// running VM, and a mode whose entire contract is "this host does not
+	// act" cannot carry it: an operator who adds --monitor to watch a
+	// cron-driven site would otherwise get unattended VM shutdowns they did
+	// not ask for, since autofence is on by default. The cost is real -- a
+	// monitored site has no split-brain protection from this agent -- and the
+	// answer to wanting both is --controlled with "features.schedule": false,
+	// which fences without scheduling.
+	if cfg.Mode.actsOnItsOwn() {
+		wg.Add(1)
+		go func() { defer wg.Done(); fenceLoop(ctx, lv, state, fences) }()
+	} else {
+		trace.Info(`monitor mode: not fencing. Nothing on this host will be stopped by this agent; run it --controlled with "features.schedule": false if you want fencing without scheduling`)
+	}
 
 	wg.Add(2)
 	go func() { defer wg.Done(); reportLoop(ctx, client, lv, state, sched, ledger, fences) }()
@@ -586,6 +661,7 @@ func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler, ledger 
 		AgentVersion:   version.Version,
 		Hostname:       cfg.Hostname,
 		LibvirtURI:     cfg.LibvirtURI,
+		Mode:           string(cfg.Mode),
 		Domains:        make([]ReportDomain, 0, len(domains)),
 	}
 	if cached.FetchedAtUnix > 0 {
