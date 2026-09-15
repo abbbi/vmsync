@@ -218,6 +218,50 @@ func runPromote(ctx context.Context, cfg syncConfig) error {
 		}
 	}
 
+	// Autostart follows the role, and a promotion is the one transition where
+	// it comes back ON. This domain is production now, so it gets what its
+	// source had -- read from the record the last sync left here, because by
+	// the time anybody promotes, the source is usually gone and this is the
+	// only surviving evidence of what the operator wanted.
+	//
+	// After the metadata write above, never before: the safe failure on this
+	// direction is "recorded as promoted but will not boot by itself", which
+	// is visible and one command to fix. The other order risks a domain that
+	// autostarts with nothing recording that it was ever promoted.
+	//
+	// Run unconditionally rather than inside the WriteMetadata branch, so a
+	// re-run against an already-promoted domain converges instead of leaving
+	// the flag at whatever a half-finished earlier attempt left.
+	//
+	// Not stripped afterwards, deliberately: -update-role=target is the
+	// documented remedy for an unwanted promotion, and it turns autostart back
+	// off. Keeping the record means a later re-promotion still knows what the
+	// source wanted, instead of falling back to "unknown" and silently
+	// refusing to start production a second time.
+	promotedIntent, intentErr := libvirtsync.ReadDomainMetadataField(mgr, cfg.TargetDomain, libvirtsync.MetadataFieldAutostartIntent)
+	if intentErr != nil {
+		promotedIntent = libvirtsync.AutostartIntentUnknown
+	}
+	if changed, err := libvirtsync.ApplyAutostartForRole(mgr, cfg.TargetDomain, libvirtsync.RolePromoted, promotedIntent); err != nil {
+		trace.Warning("the promotion is recorded but this domain's autostart flag could not be set; check it by hand, or it may not come back after a reboot of this host",
+			"vm", cfg.TargetDomain, "autostart_intent", promotedIntent, "error", err)
+	} else if changed {
+		trace.Info("enabled autostart on the promoted domain, matching what its source was set to",
+			"vm", cfg.TargetDomain)
+	} else if promotedIntent != libvirtsync.AutostartIntentYes {
+		// Said out loud rather than left silent. Not starting is the correct
+		// answer here -- either the source genuinely was not set to autostart,
+		// or nobody could tell -- but an operator who reboots this host during
+		// a failover and finds production down deserves to have been told
+		// which of those it was, at promotion time.
+		reason := "its source was not set to autostart either"
+		if promotedIntent != libvirtsync.AutostartIntentNo {
+			reason = "the source's setting was never successfully read, so vmsync will not start it on a guess"
+		}
+		trace.Warning("this domain will NOT start automatically if the host reboots: "+reason+". Set it with 'virsh autostart' if that is wrong",
+			"vm", cfg.TargetDomain, "autostart_intent", promotedIntent)
+	}
+
 	if plan.StartDomain {
 		if err := libvirtsync.StartDomain(mgr, cfg.TargetDomain); err != nil {
 			return fmt.Errorf("promotion of %s was recorded but the domain did not start: %w", cfg.TargetDomain, err)
@@ -605,8 +649,52 @@ func runInvert(ctx context.Context, cfg syncConfig) error {
 	// end is the LOCAL one, so the write that is most likely to fail (the
 	// remote one) happens second, leaving the promoted domain still reading
 	// `promoted`, which is exactly the precondition a retry needs.
+	// The old source is about to become a replica, and it is the one domain in
+	// the estate most likely to be set to autostart -- it was production until
+	// the failover. Capture that BEFORE anything turns it off, or the
+	// operator's intention is destroyed by the very command that demotes it,
+	// and a later promotion back would leave production not booting with
+	// nothing left to say it should.
+	//
+	// Recording its OWN current flag as the intent is right, not a fudge. The
+	// intent field means "what the source of this replica is set to", and
+	// until the first sync in the new direction overwrites it from the new
+	// source, this domain's own value is both the best evidence available and
+	// exactly what an immediate invert-back should restore.
+	//
+	// Folded into the same ApplyMetadata as the rest of the demotion rather
+	// than written separately: one call makes the whole role change true or
+	// none of it, and a second write could leave a domain marked target while
+	// still claiming its old intent.
+	oldSourceAutostart, oldSourceAutostartKnown := libvirtsync.ReadDomainAutostart(srcMgr, cfg.SourceDomain)
+	if plan.NewTargetUpdates == nil {
+		plan.NewTargetUpdates = map[string]string{}
+	}
+	plan.NewTargetUpdates[libvirtsync.MetadataFieldAutostartIntent] =
+		libvirtsync.AutostartIntentFor(oldSourceAutostart, oldSourceAutostartKnown)
+
 	if err := libvirtsync.ApplyMetadata(srcMgr, cfg.SourceDomain, plan.NewTargetUpdates, plan.NewTargetRemovals...); err != nil {
 		return fmt.Errorf("make %s a replication target: %w", cfg.SourceDomain, err)
+	}
+
+	// Now it is recorded, turn the flag itself off. A replica must not boot,
+	// and this is the exact path that used to leave one that would: the host
+	// reboots, libvirt starts the demoted domain, and a second copy of the VM
+	// is live with the same MAC and identity as the one that replaced it.
+	//
+	// After the metadata, so a failure here leaves a domain that is recorded
+	// as a target and still autostarts -- visible in its own metadata, and
+	// fixed by one virsh command or by the next successful sync, which
+	// re-asserts this unconditionally. Non-fatal for that reason: the
+	// inversion itself has succeeded, and refusing it now would leave the pair
+	// half-flipped, which is worse than a boot flag that is re-asserted every
+	// interval from here on.
+	if changed, err := libvirtsync.ApplyAutostartForRole(srcMgr, cfg.SourceDomain, libvirtsync.RoleTarget, ""); err != nil {
+		trace.Warning("the inversion is recorded but autostart could NOT be turned off on the new replica; if this host reboots libvirt may start it, putting a second copy of this VM on the network. Clear it by hand with 'virsh autostart --disable'",
+			"vm", cfg.SourceDomain, "error", err)
+	} else if changed {
+		trace.Info("turned off autostart on the new replica; its previous setting is recorded so a later promotion restores it",
+			"vm", cfg.SourceDomain, "autostart_intent", plan.NewTargetUpdates[libvirtsync.MetadataFieldAutostartIntent])
 	}
 	if err := libvirtsync.ApplyMetadata(tgtMgr, cfg.TargetDomain, plan.NewSourceUpdates, plan.NewSourceRemovals...); err != nil {
 		return fmt.Errorf("%s is now a replication target, but %s could not be made the new source -- re-run this to finish: %w",

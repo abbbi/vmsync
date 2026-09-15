@@ -512,7 +512,116 @@ const (
 	MetadataFieldFenceSource  = "fence_source"
 	MetadataFieldFenceArmedAt = "fence_armed_at"
 	MetadataFieldFenceArmedBy = "fence_armed_by"
+
+	// MetadataFieldAutostartIntent records whether the SOURCE of this replica
+	// is marked to autostart, so that a promotion can restore the operator's
+	// actual intention rather than guess at one.
+	//
+	// libvirt keeps autostart as a symlink beside the domain definition, not
+	// as part of the XML, so it does not travel with a replica the way the
+	// rest of a domain's shape does -- and DomainDefineXML does not touch it.
+	// That asymmetry cuts both ways, and both ways are wrong:
+	//
+	//   - A domain that already autostarts and then BECOMES a replica keeps
+	//     autostarting. An inversion does exactly that to a production source.
+	//     The host reboots, libvirt starts the replica, and now a second copy
+	//     of the VM is live with the source's MAC and identity. vmsync itself
+	//     refuses to write into it (a running target is refused before any
+	//     copy), so the replica's disks survive -- but the booted guest can
+	//     corrupt everything OUTSIDE them: an AD computer account, an NFS
+	//     mount, a clustered database.
+	//   - A replica that is PROMOTED does not start autostarting, because
+	//     nothing ever set it. Fail over, reboot the DR host, and production
+	//     does not come back -- silently, in the window where the estate is
+	//     already degraded.
+	//
+	// Recording the source's setting on the target closes both, and it has to
+	// be recorded rather than read live for the case that matters: at
+	// promotion time the source is usually GONE. This field is the only
+	// surviving evidence of what the operator wanted.
+	//
+	// Three values, never absent: AutostartIntentYes, AutostartIntentNo and
+	// AutostartIntentUnknown. "Unknown" is written deliberately when the
+	// source's flag could not be read, and is distinct from the field being
+	// missing -- one says "asked and could not tell", the other says "nothing
+	// ever asked". Both refuse to autostart a promotion, but only one of them
+	// is a record.
+	//
+	// NOT stripped on promotion, unlike the promotion record itself. A
+	// promoted domain keeps it because -update-role=target is the documented
+	// remedy for an unwanted promotion and turns autostart back off; keeping
+	// the record means a later re-promotion still knows what the source
+	// wanted, rather than falling back to "unknown" and refusing to start
+	// production a second time.
+	//
+	// It cannot go stale in the way MetadataFieldReplicaWrittenAt warns about,
+	// and by construction rather than by care: UpdateSyncMetadata merges into
+	// the SOURCE's XML, so a source that was once a replica carries its own
+	// old value -- but this field is always SET from a live read of the
+	// source's real flag on every sync, so the merged-through value is
+	// overwritten before it can ever be written to a target.
+	MetadataFieldAutostartIntent = "autostart_intent"
 )
+
+// The values MetadataFieldAutostartIntent can hold. Strings rather than a
+// bool-plus-presence, so "we asked and could not tell" is a thing the record
+// can say -- see the field's own comment.
+const (
+	AutostartIntentYes     = "yes"
+	AutostartIntentNo      = "no"
+	AutostartIntentUnknown = "unknown"
+)
+
+// AutostartIntentFor turns a live reading of a domain's autostart flag into
+// the value to record. ok is whether the flag could be read at all.
+func AutostartIntentFor(autostart, ok bool) string {
+	switch {
+	case !ok:
+		return AutostartIntentUnknown
+	case autostart:
+		return AutostartIntentYes
+	default:
+		return AutostartIntentNo
+	}
+}
+
+// autostartForRole is the whole policy, kept pure so it can be tested without
+// a hypervisor: given a domain's replication role and its recorded intent, say
+// what its real autostart flag should be, and whether vmsync owns that
+// decision at all.
+//
+// managed=false means "not vmsync's business, leave the flag exactly as it
+// is". That is the right answer for a SOURCE: its autostart belongs to the
+// operator who runs it, vmsync only ever READS it to record the intent. Taking
+// ownership of a production domain's boot behaviour because it happens to be
+// replicating would be a much worse surprise than the bug this fixes.
+//
+// The roles that DO get managed are the ones where vmsync's opinion is the
+// safety property:
+//
+//   - target, paused: a replica must never boot. Unconditional, regardless of
+//     intent -- the intent describes the source, and this domain is not it.
+//   - fenced: unconditional and the sharpest of the three. A fence exists to
+//     stop a displaced source running beside the copy that replaced it, and a
+//     fence a power cycle undoes is not a fence. The host that was just
+//     fenced is also the host most likely to be rebooted next.
+//   - promoted: this domain IS production now, so it gets what the source had.
+//     Only an explicit "yes" turns it on; both "no" and "unknown" leave it off,
+//     which is the conservative direction and the one an operator can fix in
+//     one command if it was wrong.
+func autostartForRole(role, intent string) (want, managed bool) {
+	switch role {
+	case RoleTarget, RolePaused, RoleFenced:
+		return false, true
+	case RolePromoted:
+		return intent == AutostartIntentYes, true
+	default:
+		// RoleSource, RoleNone, and anything unrecognised. Deliberately
+		// permissive: an unknown role is not a licence to start changing a
+		// domain's boot behaviour.
+		return false, false
+	}
+}
 
 // Replication roles, as stored in MetadataFieldReplicationRole. An empty or
 // absent value is deliberately NOT one of these: it means "no role
@@ -606,6 +715,7 @@ var metadataFieldOrder = []string{
 	MetadataFieldFenceSource,
 	MetadataFieldFenceArmedAt,
 	MetadataFieldFenceArmedBy,
+	MetadataFieldAutostartIntent,
 }
 
 // vmsyncBlockRe is gone: finding and replacing the metadata element by
@@ -1378,13 +1488,21 @@ func SetMetadataFields(domainXML string, updates map[string]string, removeFields
 // the key would stamp that onto this target, so the next run would compare
 // this host's disks against mtimes taken on a different host at a different
 // time.
-func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetRole string, checkpointAtUnix int64, sourceStopped bool, replicaWrittenAt string) (string, error) {
+func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetRole string, checkpointAtUnix int64, sourceStopped bool, replicaWrittenAt, autostartIntent string) (string, error) {
 	updates := map[string]string{
 		MetadataFieldLastCheckpoint: checkpoint,
 		MetadataFieldLastSync:       strconv.FormatInt(time.Now().Unix(), 10),
 		MetadataFieldFailureCount:   "0",
 		MetadataFieldReplicaSource:  ReplicaEntry(sourceHost, sourceDomain),
 		MetadataFieldCheckpointAt:   strconv.FormatInt(checkpointAtUnix, 10),
+		// Always SET, never merged through, and refreshed on every single
+		// sync. Two reasons it cannot be allowed to arrive by merge: this
+		// function merges into the SOURCE's XML, so a source that was once
+		// somebody's replica still carries its own old intent -- which
+		// describes a different domain entirely -- and an operator who
+		// changes the source's autostart expects the record to follow within
+		// one sync rather than at the next full copy.
+		MetadataFieldAutostartIntent: autostartIntent,
 	}
 	remove := []string{
 		// A successful define means the target has accepted last_checkpoint,
@@ -1755,6 +1873,75 @@ func ReadReplicationRole(mgr *Manager, domainName string) (string, error) {
 	return role, nil
 }
 
+// ReadDomainAutostart reports a domain's real autostart flag, and whether it
+// could be read at all.
+//
+// ok=false with a nil error is the "asked and could not tell" case that
+// AutostartIntentUnknown exists to record: a domain that does not exist yet
+// (the first sync of a new pair reads the SOURCE, so this is rare, but a
+// racing undefine is not impossible), or a libvirt that answered with an
+// error. Neither is worth failing a sync over -- the replica is still correct,
+// only the intent is unknown -- so the caller records "unknown" and carries on
+// rather than aborting a good copy over a boot flag.
+func ReadDomainAutostart(mgr *Manager, domainName string) (autostart, ok bool) {
+	dom, err := mgr.Conn.LookupDomainByName(domainName)
+	if err != nil {
+		return false, false
+	}
+	defer dom.Free()
+
+	on, err := dom.GetAutostart()
+	if err != nil {
+		return false, false
+	}
+	return on, true
+}
+
+// setDomainAutostart writes a domain's real autostart flag, and is a no-op
+// when it already holds the wanted value.
+//
+// The read-before-write is not an optimisation. libvirt implements autostart
+// as a symlink under /etc/libvirt/qemu/autostart/, so setting it is a
+// filesystem operation that can fail on a read-only or full /etc while the
+// domain itself is perfectly healthy -- and on the overwhelmingly common path
+// (every sync, re-asserting "off" on a replica that is already off) there is
+// nothing to write at all. Skipping the write when it would change nothing
+// means that failure mode cannot be reached by a run that had no work to do.
+func setDomainAutostart(mgr *Manager, domainName string, want bool) (changed bool, err error) {
+	dom, err := mgr.Conn.LookupDomainByName(domainName)
+	if err != nil {
+		return false, fmt.Errorf("look up domain %s to set its autostart flag: %w", domainName, err)
+	}
+	defer dom.Free()
+
+	current, err := dom.GetAutostart()
+	if err != nil {
+		return false, fmt.Errorf("read domain %s autostart flag: %w", domainName, err)
+	}
+	if current == want {
+		return false, nil
+	}
+	if err := dom.SetAutostart(want); err != nil {
+		return false, fmt.Errorf("set domain %s autostart to %v: %w", domainName, want, err)
+	}
+	return true, nil
+}
+
+// ApplyAutostartForRole makes a domain's real autostart flag agree with what
+// its replication role says it should be, using the recorded intent for the
+// one role that restores it.
+//
+// Returns changed=false both when the flag already agreed and when the role is
+// one vmsync does not manage -- see autostartForRole for which, and why a
+// source's boot behaviour is left to its operator.
+func ApplyAutostartForRole(mgr *Manager, domainName, role, intent string) (changed bool, err error) {
+	want, managed := autostartForRole(role, intent)
+	if !managed {
+		return false, nil
+	}
+	return setDomainAutostart(mgr, domainName, want)
+}
+
 // ReadVerifyState returns the verify_state and verify_failed_at recorded on a
 // domain, both "" when there is no recorded verification failure -- which is
 // the case for every healthy replica. A domain that does not exist is likewise
@@ -1862,6 +2049,35 @@ func SetReplicationRole(mgr *Manager, domainName, role string) (previous string,
 	}
 	if err != nil {
 		return "", err
+	}
+
+	// Autostart follows the role, and this is the single place every role
+	// transition passes through -- an inversion, a fence, -update-role, a
+	// promotion by hand. Enforcing it here rather than at each of those call
+	// sites is what makes the invariant hold for a caller nobody has written
+	// yet.
+	//
+	// ORDER: the metadata is written first and the flag second, which is the
+	// safe way round for the direction that matters. Every role this manages
+	// except `promoted` turns autostart OFF, and by the time we get here the
+	// domain is already recorded as a replica -- so a failure below leaves a
+	// domain marked target/paused/fenced that might still autostart, which is
+	// visible in its own metadata and fixable with one command. The reverse
+	// order would risk the opposite on promotion: a domain that autostarts
+	// with nothing recording that it was promoted.
+	//
+	// The error is returned, but `previous` is returned WITH it: the role
+	// change did happen, and a caller that reported only the failure would
+	// have an operator believe the transition did not occur.
+	intent, intentErr := ReadDomainMetadataField(mgr, domainName, MetadataFieldAutostartIntent)
+	if intentErr != nil {
+		// Not fatal on its own: an unreadable intent is exactly the
+		// AutostartIntentUnknown case, and every role except `promoted`
+		// ignores the intent entirely.
+		intent = AutostartIntentUnknown
+	}
+	if _, err := ApplyAutostartForRole(mgr, domainName, role, intent); err != nil {
+		return previous, fmt.Errorf("domain %s was recorded as %s but its autostart flag could not be set to match: %w", domainName, role, err)
 	}
 	return previous, nil
 }

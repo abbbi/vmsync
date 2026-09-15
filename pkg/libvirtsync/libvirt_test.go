@@ -755,7 +755,7 @@ func TestAllMetadataFieldsNoBlock(t *testing.T) {
 func TestUpdateSyncMetadata(t *testing.T) {
 	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
 	before := time.Now().Unix()
-	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "source-host.example.org", "sourcevm", "", 1700000000, false, "")
+	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "source-host.example.org", "sourcevm", "", 1700000000, false, "", AutostartIntentUnknown)
 	after := time.Now().Unix()
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
@@ -825,7 +825,7 @@ func TestUpdateSyncMetadataDoesNotInheritSourceSideFields(t *testing.T) {
 		t.Fatalf("building source xml: %v", err)
 	}
 
-	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", "", 1700000000, false, "")
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", "", 1700000000, false, "", AutostartIntentUnknown)
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
@@ -866,7 +866,7 @@ func TestUpdateSyncMetadataPreservesTheTargetsOwnRole(t *testing.T) {
 		t.Fatalf("building source xml: %v", err)
 	}
 
-	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", RoleTarget, 1700000000, false, "")
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", RoleTarget, 1700000000, false, "", AutostartIntentNo)
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
@@ -881,7 +881,7 @@ func TestUpdateSyncMetadataPreservesTheTargetsOwnRole(t *testing.T) {
 func TestUpdateSyncMetadataRecordsWhetherTheSourceWasStopped(t *testing.T) {
 	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
 
-	stopped, err := UpdateSyncMetadata(base, "vmsync-cpt-000001", "src", "testvm", "", 1700000000, true, "")
+	stopped, err := UpdateSyncMetadata(base, "vmsync-cpt-000001", "src", "testvm", "", 1700000000, true, "", AutostartIntentUnknown)
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata: %v", err)
 	}
@@ -891,7 +891,7 @@ func TestUpdateSyncMetadataRecordsWhetherTheSourceWasStopped(t *testing.T) {
 
 	// A later incremental from a RUNNING source must clear it, or the
 	// replica keeps claiming a completeness it no longer has.
-	running, err := UpdateSyncMetadata(stopped, "vmsync-cpt-000002", "src", "testvm", "", 1700000100, false, "")
+	running, err := UpdateSyncMetadata(stopped, "vmsync-cpt-000002", "src", "testvm", "", 1700000100, false, "", AutostartIntentUnknown)
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata: %v", err)
 	}
@@ -2498,7 +2498,7 @@ func TestElementDropWarningStillCatchesRealLosses(t *testing.T) {
 func TestUpdateSyncMetadataCarriesTheReplicaWriteRecord(t *testing.T) {
 	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
 
-	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "src-host", "testvm", "", 1700000000, false, "vda=1756000000,vdb=1756000005")
+	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "src-host", "testvm", "", 1700000000, false, "vda=1756000000,vdb=1756000005", AutostartIntentUnknown)
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
@@ -2533,7 +2533,7 @@ func TestUpdateSyncMetadataDoesNotInheritTheSourcesReplicaWriteRecord(t *testing
 		t.Fatalf("seed the source: %v", err)
 	}
 
-	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", "", 1700000000, false, "")
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", "", 1700000000, false, "", AutostartIntentUnknown)
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
@@ -2643,4 +2643,108 @@ func TestCheckpointsOlderThan(t *testing.T) {
 			}
 		}
 	})
+}
+
+// A replica must never boot, whatever the source's intent said. The intent
+// describes the SOURCE; this domain is not it.
+func TestReplicaRolesNeverAutostart(t *testing.T) {
+	for _, role := range []string{RoleTarget, RolePaused, RoleFenced} {
+		for _, intent := range []string{AutostartIntentYes, AutostartIntentNo, AutostartIntentUnknown, "", "garbage"} {
+			want, managed := autostartForRole(role, intent)
+			if !managed {
+				t.Errorf("role %q intent %q: not managed; a replica's boot flag must be vmsync's business", role, intent)
+			}
+			if want {
+				t.Errorf("role %q intent %q: wants autostart ON; a replica must never boot", role, intent)
+			}
+		}
+	}
+}
+
+// The sharpest case: a fence a power cycle undoes is not a fence, and the host
+// that was just fenced is the one most likely to be rebooted next.
+func TestFencedIsForcedOffEvenWhenTheSourceWantedAutostart(t *testing.T) {
+	want, managed := autostartForRole(RoleFenced, AutostartIntentYes)
+	if !managed || want {
+		t.Fatalf("fenced+intent=yes gave want=%v managed=%v; a fenced domain must not survive a reboot as a running VM", want, managed)
+	}
+}
+
+// Promotion restores the operator's actual will -- and only on an explicit
+// yes. Both "no" and "unknown" stay off, which is the conservative direction.
+func TestPromotionRestoresOnlyAnExplicitYes(t *testing.T) {
+	cases := []struct {
+		intent string
+		want   bool
+	}{
+		{AutostartIntentYes, true},
+		{AutostartIntentNo, false},
+		{AutostartIntentUnknown, false},
+		{"", false},
+		{"YES", false},  // not normalised anywhere; must not be read as yes
+		{"true", false}, // nor must any other truthy-looking spelling
+		{"1", false},
+	}
+	for _, c := range cases {
+		want, managed := autostartForRole(RolePromoted, c.intent)
+		if !managed {
+			t.Errorf("promoted intent %q: not managed; promotion is exactly where the flag must be set", c.intent)
+		}
+		if want != c.want {
+			t.Errorf("promoted intent %q: want autostart %v, got %v", c.intent, c.want, want)
+		}
+	}
+}
+
+// A source's boot behaviour belongs to the operator who runs it. vmsync reads
+// it to record the intent and must never write it -- taking ownership of a
+// production domain's boot flag because it happens to be replicating would be
+// a worse surprise than the bug this feature fixes.
+func TestSourceAndUnknownRolesAreLeftAlone(t *testing.T) {
+	for _, role := range []string{RoleSource, RoleNone, "", "some-future-role"} {
+		for _, intent := range []string{AutostartIntentYes, AutostartIntentNo, AutostartIntentUnknown} {
+			_, managed := autostartForRole(role, intent)
+			if managed {
+				t.Errorf("role %q intent %q: managed=true; vmsync must not touch this domain's autostart", role, intent)
+			}
+		}
+	}
+}
+
+// The recording side: three values, and "could not tell" is its own answer
+// rather than being folded into "no".
+func TestAutostartIntentFor(t *testing.T) {
+	cases := []struct {
+		on, ok bool
+		want   string
+	}{
+		{true, true, AutostartIntentYes},
+		{false, true, AutostartIntentNo},
+		{false, false, AutostartIntentUnknown},
+		{true, false, AutostartIntentUnknown}, // unreadable wins over the value
+	}
+	for _, c := range cases {
+		if got := AutostartIntentFor(c.on, c.ok); got != c.want {
+			t.Errorf("AutostartIntentFor(on=%v, ok=%v) = %q, want %q", c.on, c.ok, got, c.want)
+		}
+	}
+}
+
+// The end-to-end property the owner asked for: whatever the source was set to,
+// a full replicate -> promote cycle lands the promoted VM on the same setting.
+func TestOperatorWillSurvivesAReplicateThenPromoteCycle(t *testing.T) {
+	for _, sourceAutostart := range []bool{true, false} {
+		intent := AutostartIntentFor(sourceAutostart, true)
+
+		if want, managed := autostartForRole(RoleTarget, intent); !managed || want {
+			t.Fatalf("source autostart=%v: replica would boot", sourceAutostart)
+		}
+		got, managed := autostartForRole(RolePromoted, intent)
+		if !managed {
+			t.Fatalf("source autostart=%v: promotion did not manage the flag", sourceAutostart)
+		}
+		if got != sourceAutostart {
+			t.Errorf("source autostart=%v -> promoted autostart=%v; the operator's will was not preserved", sourceAutostart, got)
+		}
+	}
 }

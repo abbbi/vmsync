@@ -6135,9 +6135,46 @@ func run(cfg syncConfig) (runErr error) {
 		}
 	}
 
+	// The SOURCE's own autostart flag, recorded on the replica so a later
+	// promotion can restore what the operator actually wanted rather than
+	// guess. See MetadataFieldAutostartIntent: at promotion time the source is
+	// usually gone, so this record is the only surviving evidence of it.
+	//
+	// Refreshed on EVERY sync, not just the first, so flipping the source's
+	// autostart is reflected within one interval.
+	//
+	// A failure here never fails the run. The replica is correct either way --
+	// this is a boot flag, not data -- and refusing a copy that has already
+	// landed would trade a real replica for a cosmetic field. What it costs is
+	// recorded honestly as "unknown", which a promotion treats as "do not
+	// start", so the conservative direction is also the default.
+	autostartIntent := libvirtsync.AutostartIntentUnknown
+	var srcAutostart, srcAutostartKnown bool
+	if timeoutErr := callWithTimeout("read source autostart flag", srcDomCallTimeout, func() error {
+		srcAutostart, srcAutostartKnown = libvirtsync.ReadDomainAutostart(srcMgr, cfg.SourceDomain)
+		return nil
+	}); timeoutErr != nil {
+		// Deliberately NOT reading srcAutostart/srcAutostartKnown on this
+		// branch. callWithTimeout abandons its goroutine rather than killing
+		// it (there is no way to kill one), so on a timeout that closure may
+		// still be running and may still assign to those two variables --
+		// reading them here would be a genuine data race. On the nil-error
+		// branch below there is no race: callWithTimeout only returns nil once
+		// fn() has delivered on its channel, and that receive establishes
+		// happens-before for everything fn wrote.
+		trace.Warning("could not read the source's autostart flag before recording the replica's metadata; its autostart intent is recorded as unknown, which means a promotion will NOT start this VM automatically",
+			"vm", cfg.SourceDomain, "error", timeoutErr)
+	} else {
+		autostartIntent = libvirtsync.AutostartIntentFor(srcAutostart, srcAutostartKnown)
+		if !srcAutostartKnown {
+			trace.Warning("the source's autostart flag could not be read; the replica's autostart intent is recorded as unknown, so a promotion will NOT start this VM automatically",
+				"vm", cfg.SourceDomain)
+		}
+	}
+
 	trace.Info("Adding metadata information")
 	var newXML string
-	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint, util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName), cfg.SourceDomain, currentTargetRole, checkpointAt.Unix(), sourceStoppedAtCheckpoint, replicaWrittenAt)
+	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint, util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName), cfg.SourceDomain, currentTargetRole, checkpointAt.Unix(), sourceStoppedAtCheckpoint, replicaWrittenAt, autostartIntent)
 	if err != nil {
 		// UpdateSyncMetadata is a pure in-memory XML transformation -- no
 		// network or libvirt call involved -- so a failure here is almost
@@ -6176,6 +6213,39 @@ func run(cfg syncConfig) (runErr error) {
 	defineDomainMu.Unlock()
 	if defineErr != nil {
 		return defineErr
+	}
+
+	// A replica must not boot. Asserted here, on every successful sync,
+	// unconditionally.
+	//
+	// Not routed through ApplyAutostartForRole, and that is the point: roles
+	// are opt-in, so a perfectly ordinary replica often carries no
+	// replication_role at all, and a role-driven rule would decline to manage
+	// exactly the domains that most need managing. At THIS line the question
+	// does not need asking -- a domain we have just committed a replica's
+	// disks into and written a replica's metadata onto is a replica, whatever
+	// its role field says.
+	//
+	// The case this exists for is an inversion, where a production source with
+	// autostart set becomes a target and keeps it: the host reboots, libvirt
+	// starts the replica, and a second copy of the VM is live with the
+	// source's MAC and identity. vmsync's own refusal to write into a running
+	// target protects the replica's disks; nothing protects what the booted
+	// guest touches outside them.
+	//
+	// Non-fatal, like the checkpoint tidy-up below and for the same reason:
+	// the replication itself has fully succeeded by this point, and failing a
+	// run that produced a correct replica -- sending the next one to recopy an
+	// hour of data -- would be a worse outcome than a boot flag that is still
+	// wrong and is re-asserted every interval. It is a Warning rather than a
+	// silent skip because a replica that autostarts is a real hazard and
+	// nobody would go looking for it.
+	if changed, err := libvirtsync.ApplyAutostartForRole(tgtMgr, cfg.TargetDomain, libvirtsync.RoleTarget, autostartIntent); err != nil {
+		trace.Warning("could not turn OFF autostart on the replica; if this host reboots libvirt may start it, putting a second copy of this VM on the network with the source's identity -- clear it by hand with 'virsh autostart --disable'",
+			"vm", cfg.TargetDomain, "error", err)
+	} else if changed {
+		trace.Info("turned off autostart on the replica; the source's own setting is recorded so a promotion can restore it",
+			"vm", cfg.TargetDomain, "autostart_intent", autostartIntent)
 	}
 
 	// The target has now accepted effectiveCheckpoint, so and only so is the
