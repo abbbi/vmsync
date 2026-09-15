@@ -6467,7 +6467,7 @@ func registerFlags(fs *flag.FlagSet, cfg *syncConfig) (compressArg, fenceSourceA
 	fs.IntVar(&cfg.TimestampToleranceSec, "timestamp-tolerance-sec", 0, "seconds the replica's mtime may lead the recorded sync time (see HOWTO)")
 
 	fs.StringVar(&cfg.TargetDiskPath, "target-disk-path", "", "directory for the replica's disks on the target")
-	fs.StringVar(&cfg.TargetRuntimeDir, "target-runtime-dir", util.TargetRuntimeDir, "directory on the TARGET for the qemu-nbd exports' sockets and pidfiles. Must not be a path the target polyinstantiates per SSH session (SELinux pam_namespace does that to /tmp and /var/tmp), or an export started by one command is invisible to the next")
+	fs.StringVar(&cfg.TargetRuntimeDir, "target-runtime-dir", util.TargetRuntimeDir, "directory on the TARGET for the exports' sockets and pidfiles; never one it polyinstantiates -- see HOWTO")
 	fs.StringVar(&cfg.ReplacedDiskAction, "replaced-disk-action", replacedDiskRename, fmt.Sprintf("what -reinit does with the disk it replaces: %s|%s", replacedDiskRename, replacedDiskDelete))
 	fs.StringVar(&cfg.TargetDiskOwner, "target-disk-owner", util.DiskOwnerAuto, fmt.Sprintf("owner for disks created on the target: %s|%s|user[:group]|:group", util.DiskOwnerAuto, util.DiskOwnerOff))
 
