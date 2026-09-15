@@ -78,6 +78,56 @@ func replaceDomainName(domainXML, name string) (string, error) {
 	return doc.WriteToString()
 }
 
+// domainNameFromXML reads <name> from a domain document.
+//
+// Needed because DefineDomain has to know what the SOURCE was called after it
+// has already renamed the document to the target: asking the rewritten XML
+// would answer with the target's name, and every rewrite keyed on the source's
+// name would then do nothing.
+func domainNameFromXML(domainXML string) (string, error) {
+	doc, err := parseDomainDoc(domainXML)
+	if err != nil {
+		return "", err
+	}
+	el := doc.Root().FindElement("./name")
+	if el == nil {
+		return "", fmt.Errorf("domain xml has no <name>")
+	}
+	return strings.TrimSpace(el.Text()), nil
+}
+
+// replaceDomainNvramPath repoints <os><nvram> at the target domain's own
+// varstore, leaving every other element alone.
+//
+// In here with the other rewrites, and patched in the parsed tree rather than
+// round-tripped through libvirtxml, for the reason this whole file exists: a
+// typed re-marshal drops what the model does not describe, and on a target that
+// is a dropped element in the definition that boots when the replica is
+// promoted. TargetNvramPath decides what the new path should be; this only
+// applies it.
+//
+// A domain with no <nvram> is returned untouched, which is most domains.
+func replaceDomainNvramPath(domainXML, sourceDomain, targetDomain string) (string, error) {
+	if sourceDomain == "" || sourceDomain == targetDomain {
+		return domainXML, nil
+	}
+	doc, err := parseDomainDoc(domainXML)
+	if err != nil {
+		return "", err
+	}
+	el := doc.Root().FindElement("./os/nvram")
+	if el == nil {
+		return domainXML, nil
+	}
+	current := strings.TrimSpace(el.Text())
+	want := TargetNvramPath(current, sourceDomain, targetDomain)
+	if want == current {
+		return domainXML, nil
+	}
+	el.SetText(want)
+	return doc.WriteToString()
+}
+
 // stripDomainUUID removes <uuid> so libvirt assigns a fresh one.
 //
 // Removing the element is not the same as blanking it: an empty <uuid/>

@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1032,6 +1033,24 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 
 	if shouldRewriteDiskPaths(targetDiskPath, rootSourceByLiveSource) {
 		updatedXML, err = replaceDomainDiskPath(updatedXML, targetDiskPath, rootSourceByLiveSource)
+		if err != nil {
+			return rollback(fmt.Errorf("rewrite target domain xml: %w", err))
+		}
+	}
+
+	// The UEFI varstore, repathed for the same reason and in the same breath as
+	// the disks. libvirt names it after the DOMAIN, so a replica inheriting the
+	// source's path verbatim carries a file named for a different domain --
+	// harmless while the two names match, and a shared-varstore collision the
+	// moment the target host also runs a domain genuinely called that. See
+	// TargetNvramPath for exactly which paths are rewritten and which are left
+	// to the operator.
+	//
+	// Reads the SOURCE's name from the source XML rather than being handed it:
+	// replaceDomainName above has already renamed the document, so asking
+	// updatedXML would answer with the target's name and rewrite nothing.
+	if srcName, nameErr := domainNameFromXML(sourceDomainXML); nameErr == nil {
+		updatedXML, err = replaceDomainNvramPath(updatedXML, srcName, targetDomainName)
 		if err != nil {
 			return rollback(fmt.Errorf("rewrite target domain xml: %w", err))
 		}
@@ -2166,6 +2185,50 @@ func DetectNvram(domainXML string) (string, error) {
 
 	}
 	return "", nil
+}
+
+// TargetNvramPath is where a replica's UEFI varstore belongs, given the
+// source's.
+//
+// libvirt derives this path from the domain NAME --
+// /var/lib/libvirt/qemu/nvram/<name>_VARS.fd -- so a replica that inherits the
+// source's path verbatim ends up with a varstore named after a different
+// domain. When the two names match that is invisible and correct, because the
+// inherited path is exactly what libvirt would have chosen anyway. When they
+// differ it is a collision waiting to happen: if the target host ever also runs
+// a domain genuinely called that, the two share one file and each boot
+// overwrites the other's boot entries and Secure Boot keys.
+//
+// So the name is rewritten, for the same reason and in the same place as the
+// disk paths. DefineDomain already repaths every disk for the target; leaving
+// the varstore pointing at the source's filename was the inconsistency, not the
+// rewrite.
+//
+// The BASENAME only, and only when it actually contains the source's name:
+//
+//   - /var/lib/libvirt/qemu/nvram/web01_VARS.fd -> .../web01-dr_VARS.fd.
+//     libvirt's own layout, rewritten to what libvirt would have picked.
+//   - /srv/uefi/web01.fd -> /srv/uefi/web01-dr.fd. A custom DIRECTORY is the
+//     operator's choice and is preserved; the filename is still domain-derived
+//     and still collides, so it is still rewritten.
+//   - /srv/uefi/shared-vars.fd -> unchanged. Nothing here is domain-derived,
+//     so there is no name to correct and guessing would override a deliberate
+//     choice.
+//
+// Returns sourceNvram unchanged whenever there is nothing to do, so callers can
+// use it unconditionally.
+func TargetNvramPath(sourceNvram, sourceDomain, targetDomain string) string {
+	if sourceNvram == "" || sourceDomain == "" || targetDomain == "" || sourceDomain == targetDomain {
+		return sourceNvram
+	}
+	dir, base := path.Split(sourceNvram)
+	if !strings.Contains(base, sourceDomain) {
+		return sourceNvram
+	}
+	// Once, not every occurrence: a name appearing twice in one filename is
+	// not a thing to be clever about, and replacing only the first keeps the
+	// result predictable.
+	return dir + strings.Replace(base, sourceDomain, targetDomain, 1)
 }
 
 func DetectLoader(domainXML string) (string, error) {

@@ -6372,6 +6372,43 @@ func run(cfg syncConfig) (runErr error) {
 			"vm", cfg.TargetDomain, "autostart_intent", autostartIntent)
 	}
 
+	// The UEFI varstore, for a domain that has one. See nvram.go: the disks
+	// were the only thing being replicated, so a UEFI replica had none of the
+	// source's boot entries and none of its enrolled Secure Boot keys.
+	//
+	// Here, after DefineDomain, for the same reason the autostart call above
+	// is here: this runs only on a sync that actually succeeded, so a failed
+	// run never leaves the replica with new firmware state beside old disks.
+	//
+	// Non-fatal, and the third thing in a row on this path to be so -- the
+	// replica's disks are committed and correct by now, and failing a run that
+	// produced a good replica because a 128 KiB boot-variable file could not
+	// be copied would send the next run to recopy an hour of data to fix
+	// nothing. It is a Warning rather than a silent skip because "your DR copy
+	// will not boot" is not something to discover at failover.
+	{
+		var srcRunner commandRunner = localRunner{}
+		if sourceNeedsSSH {
+			srcRunner = sourceSSHClient
+		}
+		owner := targetDirOwner(ctx, targetSSHClient, cfg)
+		writer := &remoteFileWriter{
+			runner: targetSSHClient,
+			input: func(ctx context.Context, command string, data []byte) error {
+				_, stderr, err := targetSSHClient.RunWithInput(ctx, command, data)
+				if err != nil {
+					return fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr))
+				}
+				return nil
+			},
+			owner: owner.Spec(),
+		}
+		if err := syncNvram(ctx, srcRunner, writer, srcXML, cfg.SourceDomain, cfg.TargetDomain); err != nil {
+			trace.Warning("could not replicate the source's UEFI varstore; the replica keeps whatever varstore it already had, so its boot entries and any enrolled Secure Boot keys may not match the source. A promotion may boot to firmware rather than to the guest",
+				"vm", cfg.TargetDomain, "error", err)
+		}
+	}
+
 	// The target has now accepted effectiveCheckpoint, so and only so is the
 	// source free to drop everything older -- the parent this run diffed
 	// against, plus any leftovers from earlier runs that died before getting
