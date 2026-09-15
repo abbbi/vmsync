@@ -1,0 +1,50 @@
+{
+  "config_version": 1,
+
+  "templates": {
+    "default": {
+      "name": "default",
+      "interval_seconds": 900,
+      "enabled": true,
+      "verify_days": "Sun *-*-01..07",
+      "verify_window": "02:00-06:00",
+      "profile": {
+        "compress": "zstd",
+        "compress_level": "5",
+        "netbuffer": "128k,1G",
+        "io_depth": 16,
+        "verify": "full",
+        "target_disk_path": "/data/replicas",
+        "retention": "24,3h"
+      }
+    }
+  },
+
+  "schedule": [
+    {
+      "vm": "web01",
+      "enabled": true,
+      "interval_seconds": 900
+    },
+    {
+      "vm": "db01",
+      "enabled": true,
+      "interval_seconds": 300,
+      "target_host": "dr01",
+      "shutdown_timeout_sec": 900,
+      "profile": {
+        "compress": "zstd",
+        "compress_level": "9",
+        "netbuffer": "128k,1G",
+        "io_depth": 16,
+        "verify": "full",
+        "target_disk_path": "/data/replicas",
+        "retention": "48,3h"
+      }
+    }
+  ],
+
+  "max_concurrent_syncs": 4,
+  "shutdown_timeout_sec": 300,
+  "target_replication_slots": { "dr01": 2 }
+}

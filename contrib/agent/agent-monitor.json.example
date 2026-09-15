@@ -1,0 +1,8 @@
+{
+  "config_version": 1,
+
+  "control_plane": {
+    "url": "https://vmsync-ui.dr.example.org",
+    "ca_file": "/etc/vmsync/ui-ca.pem"
+  }
+}

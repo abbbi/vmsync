@@ -1,0 +1,14 @@
+{
+  "config_version": 1,
+
+  "schedule_file": "/etc/vmsync/schedule.json",
+
+  "ssh": {
+    "user": "root",
+    "key": "/etc/vmsync/id_ed25519"
+  },
+
+  "limits": {
+    "max_concurrent_syncs": 4
+  }
+}

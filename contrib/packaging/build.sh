@@ -103,26 +103,39 @@ package_one() {
 		return 1
 	}
 
-	# The example config, with the same paths. Written here rather than kept as
-	# a checked-in file for exactly one reason: if it were checked in, it would
-	# name /usr/local/bin like everything else aimed at hand-installers, and
-	# the one config a packaged agent copies would be the one pointing at
-	# binaries the package did not install.
-	cat >"${stage}/agent.json.example" <<'JSON'
-{
-  "config_version": 1,
+	# The example config: the checked-in one, with the package's own binary
+	# paths spliced in.
+	#
+	# Derived rather than written out here, so contrib/agent/ stays the single
+	# source of truth and the two cannot drift -- a second copy in this script
+	# is one that gets a new key months late, or never. What the package has to
+	# change is exactly two lines: contrib/agent/ targets the hand-install the
+	# READMEs describe, whose defaults are /usr/local/bin, while this package
+	# owns /usr/bin. Left alone, a packaged agent would try to exec binaries
+	# its own package did not install.
+	#
+	# Inserted after config_version rather than appended, because trailing
+	# commas are not JSON and the last key is not a fixed thing to anchor on.
+	sed '/"config_version"/a\
+\
+  "vmsync_path": "/usr/bin/vmsync",\
+  "bridge_helper_path": "/usr/bin/vmsync-bridge-helper",' \
+		"${ROOT}/contrib/agent/agent-controlled.json.example" >"${stage}/agent.json.example"
 
-  "vmsync_path": "/usr/bin/vmsync",
-  "bridge_helper_path": "/usr/bin/vmsync-bridge-helper",
-
-  "ssh": { "user": "root", "key": "/etc/vmsync/id_ed25519" },
-
-  "control_plane": {
-    "url": "https://vmsync-ui.dr.example.org",
-    "ca_file": "/etc/vmsync/ui-ca.pem"
-  }
-}
-JSON
+	# Proving it is still JSON, and still names the packaged paths. A sed that
+	# silently matched nothing would ship an example pointing at binaries this
+	# package does not install, which is precisely the failure the splice
+	# exists to prevent -- and it would look fine.
+	grep -q '"vmsync_path": "/usr/bin/vmsync"' "${stage}/agent.json.example" || {
+		echo "build.sh: the agent.json.example path splice matched nothing -- has contrib/agent/agent-controlled.json.example changed shape?" >&2
+		return 1
+	}
+	if command -v python3 >/dev/null 2>&1; then
+		python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "${stage}/agent.json.example" || {
+			echo "build.sh: the spliced agent.json.example is not valid JSON" >&2
+			return 1
+		}
+	fi
 
 	local sysconfig_dst
 	if [ "$family" = rpm ]; then

@@ -1,0 +1,17 @@
+{
+  "config_version": 1,
+
+  "ssh": {
+    "user": "root",
+    "key": "/etc/vmsync/id_ed25519"
+  },
+
+  "control_plane": {
+    "url": "https://vmsync-ui.dr.example.org",
+    "ca_file": "/etc/vmsync/ui-ca.pem"
+  },
+
+  "limits": {
+    "max_concurrent_syncs": 4
+  }
+}
