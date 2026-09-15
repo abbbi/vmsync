@@ -318,6 +318,59 @@ Two things follow that are worth stating plainly:
   file that never mentioned either is indistinguishable from one that asked for
   both.
 
+### Changing a host's mode
+
+Always the same two mechanical steps — **edit `VMSYNC_AGENT_MODE`, then
+`systemctl restart`**. Never `reload`: the mode decides which goroutines exist
+and a SIGHUP cannot retract a goroutine, so a reload will not change it. If the
+new mode needs a different `agent.json` shape, edit that too, or the agent
+refuses to start and names the mismatch.
+
+Nothing clears `state_dir`, and nothing should. It holds the enrolment
+credential, the operation ledger and the **fence ledger** — and that last one is
+what makes a fence single-use, so wiping it would let the agent perform a second
+unattended shutdown of a VM it had already fenced.
+
+| from → to | `agent.json` | other steps |
+| --- | --- | --- |
+| standalone → controlled | drop `schedule_file`, add `control_plane` | enrol (`--enrol-token-file`) |
+| standalone → monitor | drop `schedule_file`, add `control_plane` | enrol |
+| monitor → controlled | *unchanged* | — |
+| controlled → monitor | *unchanged* | cancel pending operations first |
+| controlled → standalone | drop `control_plane`, add `schedule_file` | write the schedule file; revoke in the UI |
+| monitor → standalone | drop `control_plane`, add `schedule_file` | write the schedule file; revoke in the UI |
+
+Four of them have a sharp edge, and in each case it is the same shape: the
+host keeps running and quietly does something other than what you assumed.
+
+**standalone → controlled: the host can stop replicating the moment you
+restart.** The local schedule is no longer read, and the control plane's
+schedule for a newly enrolled agent is empty. Unless a `default` template covers
+the VMs, nothing runs. Create the entries in the console **before** the restart,
+and keep the old `schedule_file` — nothing deletes it, and it is the record of
+what the cadences used to be.
+
+**monitor → controlled: the host starts running whatever the console holds, at
+once.** If that host was `--controlled` months ago, its old entries are still
+there and it resumes them on the first tick. Look at the schedule page for that
+host before you flip it, not after.
+
+**controlled → monitor: operations already published will never execute.** The
+agent runs no operations loop, so anything pending sits in the console forever
+looking merely slow. Cancel them first. The agent also stops fencing, so that
+host loses split-brain protection — which is the deliberate contract of the
+mode, but it is a real capability to give up knowingly. Its results ledger is
+not loaded either, so any result it had not yet had acknowledged is dropped
+rather than republished.
+
+**controlled → standalone: you write the schedule file by hand.**
+`config-cache.json` holds what the console last published, but it is not a
+schedule file — it wraps the document as `{etag, fetched_at_unix, config}`, and
+`LoadScheduleFile` decodes strictly and rejects it. Read the cadences off the
+console (or out of the cache) and write the file yourself. Afterwards **revoke
+the agent in the UI**, or the console shows a host that is never coming back as
+permanently stale.
+
 `--debug` is applied *before* the config file is read, so a file that fails to
 load can be diagnosed with the flag that exists for diagnosing it. It can only
 turn debug **on**: it survives every reload, a reload cannot switch it off, and
@@ -339,6 +392,7 @@ key is an error naming the key.
 | `schedule_file` | — | **Standalone only**, and required there. Path to file 2. Cannot be set together with `control_plane`. |
 | `vmsync_path` | `/usr/local/bin/vmsync` | The binary every sync, operation and fence executes. Warned about if group- or world-writable. |
 | `bridge_helper_path` | — | Passed to vmsync as `-bridge-helper-path`. |
+| `target_runtime_dir` | — (vmsync's own default, `/run/vmsync`) | Passed to vmsync as `-target-runtime-dir`: where the **target-side** qemu-nbd exports put their sockets and pidfiles. Leave it unset unless that path is unsuitable on the far host. Never point it at a directory the target polyinstantiates per SSH session — SELinux with `pam_namespace` does that to `/tmp` and `/var/tmp`, and an export started by one command is then invisible to the next, so the helper cannot find the socket and an abandoned export can never be reclaimed. |
 | `target_uri_pattern` | `qemu+ssh://%s/system` | How a target host's name becomes a libvirt URI. Must take exactly one `%s`; it is trial-rendered at load, which catches zero verbs, two verbs and a stray `%d` alike while still accepting a legitimate `%%s`. |
 | `prometheus_dir` | — | When set, the agent writes `vmsync-agent.prom` here and hands each sync `-prometheus-textfile <dir>/vmsync_<vm>.prom`. The directory must already exist and be writable; the agent does not create it. |
 | `ssh.user` | — | |

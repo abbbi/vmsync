@@ -337,6 +337,10 @@ type SyncRequest struct {
 	// agent-scheduled runs exactly as it does for cron-driven ones.
 	PrometheusTextfile string
 	BridgeHelperPath   string
+	// TargetRuntimeDir, when set, is passed through as -target-runtime-dir.
+	// Empty leaves vmsync on its own default rather than the agent asserting
+	// one, so the two binaries cannot disagree about it by default.
+	TargetRuntimeDir string
 	// RunID joins the run lock vmsync writes to this agent's own run-log
 	// entry for having launched it, so an operator holding one can find the
 	// other. Set per launch, not per schedule entry.
@@ -394,6 +398,9 @@ func (r SyncRequest) CommandArgs() []string {
 	}
 	if r.BridgeHelperPath != "" {
 		args = append(args, "-bridge-helper-path", r.BridgeHelperPath)
+	}
+	if r.TargetRuntimeDir != "" {
+		args = append(args, "-target-runtime-dir", r.TargetRuntimeDir)
 	}
 
 	// "-compress=zstd" rather than "-compress zstd": vmsync's -compress and

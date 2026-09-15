@@ -60,6 +60,9 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=30
 
+# Defaults sockets and pid files to /run/vmsync
+RuntimeDirectory=vmsync
+
 # Disable the start limit outright. systemd's default (5 starts within
 # 10s puts the unit in "failed" and stops restarting it) is designed for
 # services where a crash loop means give up. Here it means the opposite:

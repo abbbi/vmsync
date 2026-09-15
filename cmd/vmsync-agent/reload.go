@@ -301,6 +301,7 @@ func describeChanges(old, next agentConfig) []string {
 	add("libvirt_uri", old.LibvirtURI, next.LibvirtURI)
 	add("vmsync_path", old.VmsyncPath, next.VmsyncPath)
 	add("bridge_helper_path", old.BridgeHelperPath, next.BridgeHelperPath)
+	add("target_runtime_dir", old.TargetRuntimeDir, next.TargetRuntimeDir)
 	add("target_uri_pattern", old.TargetURIPattern, next.TargetURIPattern)
 	add("prometheus_dir", old.PrometheusDir, next.PrometheusDir)
 	add("ssh.user", old.SSHUser, next.SSHUser)

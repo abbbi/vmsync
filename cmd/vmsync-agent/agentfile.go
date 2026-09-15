@@ -61,6 +61,16 @@ type AgentFile struct {
 
 	VmsyncPath       string `json:"vmsync_path,omitempty"`
 	BridgeHelperPath string `json:"bridge_helper_path,omitempty"`
+	// TargetRuntimeDir overrides where the TARGET-side qemu-nbd exports put
+	// their sockets and pidfiles. Empty leaves vmsync on its own default
+	// (/run/vmsync), which is the right answer almost everywhere.
+	//
+	// Set it only when that path is unsuitable on the far host, and never to
+	// a directory the target polyinstantiates per SSH session -- SELinux with
+	// pam_namespace does exactly that to /tmp and /var/tmp, and an export
+	// started by one command is then invisible to the next. See
+	// util.TargetRuntimeDir.
+	TargetRuntimeDir string `json:"target_runtime_dir,omitempty"`
 	TargetURIPattern string `json:"target_uri_pattern,omitempty"`
 	PrometheusDir    string `json:"prometheus_dir,omitempty"`
 
@@ -158,6 +168,7 @@ func resolveAgentConfig(a AgentFile, mode agentMode, configPath string, once, fo
 
 		VmsyncPath:       a.VmsyncPath,
 		BridgeHelperPath: a.BridgeHelperPath,
+		TargetRuntimeDir: a.TargetRuntimeDir,
 		TargetURIPattern: a.TargetURIPattern,
 		PrometheusDir:    a.PrometheusDir,
 
@@ -394,6 +405,7 @@ func (a AgentFile) Validate() error {
 		{"schedule_file", a.ScheduleFile},
 		{"vmsync_path", a.VmsyncPath},
 		{"bridge_helper_path", a.BridgeHelperPath},
+		{"target_runtime_dir", a.TargetRuntimeDir},
 		{"prometheus_dir", a.PrometheusDir},
 		{"ssh.key", a.SSH.Key},
 		{"ssh.known_hosts", a.SSH.KnownHosts},

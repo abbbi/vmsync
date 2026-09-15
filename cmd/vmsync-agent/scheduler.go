@@ -746,6 +746,7 @@ func buildSyncRequest(cfg agentConfig, entry ScheduleEntry) (syncPlan, error) {
 	plan.SSHPort = cfg.SSHPort
 	plan.SSHKnownHosts = cfg.SSHKnownHosts
 	plan.BridgeHelperPath = cfg.BridgeHelperPath
+	plan.TargetRuntimeDir = cfg.TargetRuntimeDir
 	if cfg.PrometheusDir != "" {
 		plan.PrometheusTextfile = filepath.Join(cfg.PrometheusDir, "vmsync_"+entry.VM+".prom")
 	}

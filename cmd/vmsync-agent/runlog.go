@@ -436,6 +436,7 @@ var agentFlagVocabulary = map[string]argClass{
 
 	// tuning
 	"-bridge-helper-path":      argValue,
+	"-target-runtime-dir":      argValue,
 	"-compress-level":          argValue,
 	"-io-depth":                argValue,
 	"-prometheus-textfile":     argValue,

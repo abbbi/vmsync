@@ -83,6 +83,10 @@ type agentConfig struct {
 	// UI compromise must not be able to redirect either.
 	VmsyncPath       string
 	BridgeHelperPath string
+	// TargetRuntimeDir is passed to vmsync as -target-runtime-dir when set.
+	// Empty means "leave vmsync on its own default", which is what almost
+	// every host wants.
+	TargetRuntimeDir string
 	TargetURIPattern string
 	PrometheusDir    string
 	SSHUser          string
