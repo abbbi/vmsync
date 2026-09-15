@@ -39,6 +39,36 @@ import (
 // neither should any evidence that one was running.
 const RunLockDir = "/run/vmsync-locks"
 
+// TargetRuntimeDir is where a sync puts the short-lived files its TARGET-side
+// qemu-nbd exports need: their Unix sockets and their pidfiles. Overridable
+// with -target-runtime-dir.
+//
+// It used to be /tmp, and /tmp is the one directory that cannot be relied on
+// for this. Hosts running SELinux with pam_namespace POLYINSTANTIATE it: every
+// SSH session gets a private mount namespace in which /tmp is bound to its own
+// instance under /tmp-inst. vmsync drives the target over SSH, so a socket
+// created by one command is simply not there for the next, and a pidfile
+// written by the run that started an export is invisible to the run that has
+// to stop it. Nothing errors -- the paths just resolve somewhere else -- so it
+// fails as "the helper cannot find the socket" and as exports that can never
+// be reclaimed because their pidfile was never visible to begin with.
+//
+// /run for the same two reasons RunLockDir gives, plus a third:
+//
+//   - it is tmpfs, so nothing here outlives a reboot, which is exactly right
+//     for a socket and a pidfile;
+//   - default pam_namespace configurations polyinstantiate /tmp, /var/tmp and
+//     sometimes $HOME -- never /run;
+//   - RunLockDir is ALREADY under /run and is already created over SSH on the
+//     target by AcquireRemoteRunLock. So any host where the target-side run
+//     lock works is a host where this works, which makes it the one choice
+//     that needs no new assumption about the far end.
+//
+// Separate from RunLockDir rather than reusing it: a lock file's presence is
+// meaningful and is read by vmsync-agent, while these are scratch. Mixing them
+// would put files the agent scans for locks next to files that look like them.
+const TargetRuntimeDir = "/run/vmsync"
+
 // RunLockIdentity is what the lock's holder writes into the (otherwise always
 // empty) lock file, immediately after the lock is held.
 //

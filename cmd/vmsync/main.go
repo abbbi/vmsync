@@ -282,10 +282,14 @@ type syncConfig struct {
 	SourceDomain   string
 	TargetDomain   string
 	TargetDiskPath string
-	SourceNBDHost  string
-	SourceNBDBind  string
-	TargetNBDHost  string
-	TargetNBDBind  string
+	// TargetRuntimeDir is where the target-side qemu-nbd exports put their
+	// sockets and pidfiles. See util.TargetRuntimeDir for why it must not be
+	// /tmp on a host that polyinstantiates it.
+	TargetRuntimeDir string
+	SourceNBDHost    string
+	SourceNBDBind    string
+	TargetNBDHost    string
+	TargetNBDBind    string
 
 	// SourceNBDPortSpec/TargetNBDPortSpec hold the raw -source-nbd-port /
 	// -target-nbd-port flag values, which accept a range or one fixed port
@@ -464,9 +468,10 @@ var flagGroups = []struct {
 		"compress", "compress-level", "netbuffer", "use-ssh",
 		"bridge-helper-path", "io-depth",
 	}},
-	{"NBD NETWORK", "the addresses and ports the exports bind", []string{
+	{"NBD NETWORK", "the addresses, ports and runtime files the exports bind", []string{
 		"source-nbd-bind", "source-nbd-port", "source-nbd-host",
 		"target-nbd-bind", "target-nbd-port", "target-nbd-host",
+		"target-runtime-dir",
 	}},
 	{"INTEGRITY", "proving the replica matches its source", []string{
 		"verify", "verify-failure-reinit", "no-checksum",
@@ -833,6 +838,17 @@ func main() {
 	if cfg.TestFault == libvirtsync.TestFaultCorruptAfterCommit && cfg.Verify == "" {
 		trace.Error("invalid test configuration", "error", fmt.Errorf("-test=%s needs -verify: the fault exists to make a verification fail, and without one it would corrupt the replica and then report success",
 			libvirtsync.TestFaultCorruptAfterCommit))
+		os.Exit(2)
+	}
+	// Absolute, or it is not the directory anybody meant. A relative value
+	// resolves against whatever the SSH session's working directory happens to
+	// be -- root's home, normally -- so the exports would work, the sockets
+	// would be somewhere nobody looks, and the reclaim would never find an
+	// abandoned one because it searches for a path that no longer matches.
+	// Silently-wrong-but-functional is the worst outcome available here, so it
+	// is refused at startup instead.
+	if !path.IsAbs(cfg.TargetRuntimeDir) {
+		trace.Error("invalid target runtime directory", "error", fmt.Errorf("-target-runtime-dir %q must be an absolute path: it names a directory on the TARGET host, and a relative one would resolve against whatever directory the ssh session lands in", cfg.TargetRuntimeDir))
 		os.Exit(2)
 	}
 
@@ -4371,6 +4387,23 @@ func run(cfg syncConfig) (runErr error) {
 		return nil
 	}
 
+	// Created once, here, because every export below puts its socket or its
+	// pidfile in it and none of them should each be doing this.
+	//
+	// 0700 and root-owned: the only things in here are a Unix socket that
+	// exports this replica's blocks read-only and the pidfiles naming the
+	// processes serving it. /tmp was world-writable, which meant anybody on
+	// the target could have pre-created a pidfile path and had vmsync's own
+	// cleanup kill a PID of their choosing.
+	//
+	// mkdir -p, so a second concurrent run against another domain on the same
+	// target host does not race this one -- and so the directory surviving
+	// from an earlier run costs nothing.
+	if err := runTargetCommand("mkdir -p -m 0700 "+util.ShQuote(cfg.TargetRuntimeDir),
+		fmt.Sprintf("create the target runtime directory %s", cfg.TargetRuntimeDir)); err != nil {
+		return err
+	}
+
 	// Both corruption faults need qemu-io on the target, and need it BEFORE
 	// the copy rather than after.
 	//
@@ -4565,8 +4598,8 @@ func run(cfg syncConfig) (runErr error) {
 		//
 		// Keyed by domain and device, like the pidfile, so two runs against
 		// different VMs on one target host cannot collide.
-		sockPath := path.Join("/tmp", fmt.Sprintf("vmsync-checksum-%s-%s.sock", cfg.TargetDomain, d.TargetDev))
-		pidFile := path.Join("/tmp", fmt.Sprintf("vmsync-checksum-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
+		sockPath := path.Join(cfg.TargetRuntimeDir, fmt.Sprintf("vmsync-checksum-%s-%s.sock", cfg.TargetDomain, d.TargetDev))
+		pidFile := path.Join(cfg.TargetRuntimeDir, fmt.Sprintf("vmsync-checksum-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
 		exportName := targetExportName(cfg.TargetDomain, d.TargetDev)
 
 		// --cache=none is the point of re-exporting at all rather than
@@ -5072,7 +5105,7 @@ func run(cfg syncConfig) (runErr error) {
 			}
 		}
 
-		pidFile := path.Join("/tmp", fmt.Sprintf("vmsync-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
+		pidFile := path.Join(cfg.TargetRuntimeDir, fmt.Sprintf("vmsync-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
 		// --export-name so this export is addressable by identity rather
 		// than only by port; see targetExportName.
 		exportName := targetExportName(cfg.TargetDomain, d.TargetDev)
@@ -5407,7 +5440,7 @@ func run(cfg syncConfig) (runErr error) {
 		// Both properties still hold, for a better reason: the allocator
 		// never hands out a port twice within a run, and a port another
 		// process still holds simply fails to bind and is skipped.
-		verifyPidFile := path.Join("/tmp", fmt.Sprintf("vmsync-verify-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
+		verifyPidFile := path.Join(cfg.TargetRuntimeDir, fmt.Sprintf("vmsync-verify-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
 		verifyExportName := targetExportName(cfg.TargetDomain, d.TargetDev)
 		// Same rm -f-after-kill reasoning as stopCmd in copyAndStage above:
 		// this string is also replayable from the interrupt-cleanup path
@@ -6434,6 +6467,7 @@ func registerFlags(fs *flag.FlagSet, cfg *syncConfig) (compressArg, fenceSourceA
 	fs.IntVar(&cfg.TimestampToleranceSec, "timestamp-tolerance-sec", 0, "seconds the replica's mtime may lead the recorded sync time (see HOWTO)")
 
 	fs.StringVar(&cfg.TargetDiskPath, "target-disk-path", "", "directory for the replica's disks on the target")
+	fs.StringVar(&cfg.TargetRuntimeDir, "target-runtime-dir", util.TargetRuntimeDir, "directory on the TARGET for the qemu-nbd exports' sockets and pidfiles. Must not be a path the target polyinstantiates per SSH session (SELinux pam_namespace does that to /tmp and /var/tmp), or an export started by one command is invisible to the next")
 	fs.StringVar(&cfg.ReplacedDiskAction, "replaced-disk-action", replacedDiskRename, fmt.Sprintf("what -reinit does with the disk it replaces: %s|%s", replacedDiskRename, replacedDiskDelete))
 	fs.StringVar(&cfg.TargetDiskOwner, "target-disk-owner", util.DiskOwnerAuto, fmt.Sprintf("owner for disks created on the target: %s|%s|user[:group]|:group", util.DiskOwnerAuto, util.DiskOwnerOff))
 
