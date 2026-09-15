@@ -116,6 +116,62 @@ dom_state() {
 	return 1
 }
 
+# graceful_shutdown URI DOMAIN LIMIT_SECONDS LABEL -> 0 once shut off, 1 on
+# timeout. Sets SHUTDOWN_WAITED and SHUTDOWN_ATTEMPTS for the caller's message.
+#
+# RE-SENDS the request, and that is the whole reason this exists rather than
+# being two lines at each call site.
+#
+# `virsh shutdown` is fire-and-forget: it injects an ACPI power-button event
+# and returns. A guest that is not yet listening for one -- which every Linux
+# guest is, for the first half-minute of its boot, before acpid or systemd's
+# handler is up -- drops the event on the floor, and nothing retries. Stage 7
+# hit this every single run: it promotes the target (which BOOTS it), then
+# asks it to shut down about seven seconds later. The request landed in a
+# guest that could not honour it, the poll then watched a perfectly healthy VM
+# for the full timeout, and the harness destroyed it. Raising the timeout
+# cannot fix that; the guest is never asked again.
+#
+# So the request is repeated while we wait. Re-sending is safe: an ACPI event
+# delivered to a guest already shutting down is ignored, and one delivered to a
+# guest that has just finished booting is exactly what was wanted.
+graceful_shutdown() {
+	local uri="$1" domain="$2" limit="$3" what="$4"
+	local waited=0 since_send=0 sent=1 state=""
+	# Re-send this often. Short enough that a guest finishing its boot is
+	# asked again promptly, long enough not to fill the log.
+	local resend_every=15
+
+	virsh_uri "$uri" shutdown "$domain" >/dev/null 2>&1 || true
+
+	while [ "$waited" -lt "$limit" ]; do
+		state="$(dom_state "$uri" "$domain" 2>/dev/null || true)"
+		if [ "$state" = shutoff ]; then
+			SHUTDOWN_WAITED="$waited"
+			SHUTDOWN_ATTEMPTS="$sent"
+			log "   $what stopped after ${waited}s (${sent} shutdown request(s) sent)"
+			return 0
+		fi
+		sleep 3
+		waited=$((waited + 3))
+		since_send=$((since_send + 3))
+		if [ "$since_send" -ge "$resend_every" ]; then
+			# Said once, the first time, because it is the explanation an
+			# operator reading this log actually needs: a guest ignoring the
+			# first request is almost always one that was still booting when
+			# it arrived, not one that is refusing to stop.
+			[ "$sent" = 1 ] && log "   $what has not reacted to the shutdown request; re-sending every ${resend_every}s (a guest still booting cannot honour an ACPI shutdown, and the first request is not retried by libvirt)"
+			virsh_uri "$uri" shutdown "$domain" >/dev/null 2>&1 || true
+			sent=$((sent + 1))
+			since_send=0
+		fi
+	done
+
+	SHUTDOWN_WAITED="$waited"
+	SHUTDOWN_ATTEMPTS="$sent"
+	return 1
+}
+
 # domain_uuid URI DOMAIN -> the domain's UUID (whitespace collapsed), or
 # empty + non-zero exit on failure (see dom_state's own VIRSH_ERR comment).
 domain_uuid() {

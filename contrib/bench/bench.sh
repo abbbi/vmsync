@@ -3064,18 +3064,16 @@ stage_fence_agent() {
 		local tgt_now waited=0
 		tgt_now="$(dom_state "$TARGET_URI" "$TARGET_DOMAIN" 2>/dev/null || true)"
 		if [ "$tgt_now" = running ]; then
+			# This domain was BOOTED by the promotion moments ago, which is
+			# exactly the case a single fire-and-forget ACPI request cannot
+			# handle -- see graceful_shutdown, which re-sends.
 			log "   shutting the promoted target down again (this stage started it by promoting it)"
-			virsh_uri "$TARGET_URI" shutdown "$TARGET_DOMAIN" >/dev/null 2>&1 || true
-			while [ "$waited" -lt "${TARGET_SHUTDOWN_WAIT_SECONDS:-90}" ]; do
-				tgt_now="$(dom_state "$TARGET_URI" "$TARGET_DOMAIN" 2>/dev/null || true)"
-				[ "$tgt_now" = shutoff ] && break
-				sleep 3
-				waited=$((waited + 3))
-			done
-			if [ "$tgt_now" != shutoff ]; then
-				warn "the promoted target did not shut down gracefully within ${waited}s -- destroying it. It is a disposable replica and the next stage reinitialises it anyway, but leaving it running would make every later stage refuse to sync. Raise TARGET_SHUTDOWN_WAIT_SECONDS if this guest is legitimately slow to stop."
+			if ! graceful_shutdown "$TARGET_URI" "$TARGET_DOMAIN" \
+				"${TARGET_SHUTDOWN_WAIT_SECONDS:-120}" "the promoted target"; then
+				warn "the promoted target did not shut down gracefully within ${SHUTDOWN_WAITED}s despite ${SHUTDOWN_ATTEMPTS} shutdown request(s) -- destroying it. It is a disposable replica and the next stage reinitialises it anyway, but leaving it running would make every later stage refuse to sync. Raise TARGET_SHUTDOWN_WAIT_SECONDS if this guest is legitimately slow to stop."
 				virsh_uri "$TARGET_URI" destroy "$TARGET_DOMAIN" >/dev/null 2>&1 || true
 			fi
+			tgt_now="$(dom_state "$TARGET_URI" "$TARGET_DOMAIN" 2>/dev/null || true)"
 		fi
 
 		maybe_ssh_cmd "$SOURCE_LOCAL" "$SOURCE_HOST" "$src_vmsync" \
@@ -5285,14 +5283,12 @@ stage_invert() {
 	if [ "$src_state" = running ]; then
 		log "   shutting the source down: -invert requires it, because the inversion makes it a replication target"
 		INVERT_STOPPED_SOURCE=yes
-		virsh_uri "$SOURCE_URI" shutdown "$SOURCE_DOMAIN" >/dev/null 2>&1 || true
-		local waited=0 now_state="$src_state"
-		while [ "$waited" -lt "${SOURCE_SHUTDOWN_WAIT_SECONDS:-90}" ]; do
-			now_state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN" 2>/dev/null || true)"
-			[ "$now_state" = shutoff ] && break
-			sleep 3
-			waited=$((waited + 3))
-		done
+		local now_state="$src_state"
+		if graceful_shutdown "$SOURCE_URI" "$SOURCE_DOMAIN" \
+			"${SOURCE_SHUTDOWN_WAIT_SECONDS:-120}" "the source"; then
+			now_state=shutoff
+		fi
+		local waited="$SHUTDOWN_WAITED"
 		if [ "$now_state" != shutoff ]; then
 			# Deliberately NOT destroyed. Stage 6 will hard-stop a disposable
 			# replica, but this is the SOURCE -- the one domain in this pair

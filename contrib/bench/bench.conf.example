@@ -228,6 +228,28 @@ GUEST_DIRTY=yes
 GUEST_DIRTY_PATH=/var/tmp/vmsync-bench-dirty
 GUEST_DIRTY_MIB=64
 
+# How long a guest gets to stop cleanly before the harness gives up on it.
+#
+# Two stages have to stop a domain and wait. Stage 7 shuts the promoted TARGET
+# down and destroys it on timeout (a disposable replica the next stage
+# reinitialises anyway); stage 11 shuts the SOURCE down and SKIPS rather than
+# destroy it, because pulling a stand-in-for-production VM's power to run a
+# test is a worse trade than not running the test.
+#
+# Undocumented until now, which is its own bug: the warning on timeout named
+# TARGET_SHUTDOWN_WAIT_SECONDS but nothing here told you it existed, so the
+# obvious response -- raising it -- meant guessing the name.
+#
+# Raising these is rarely the answer. The usual cause of a timeout was never a
+# slow guest: stage 7 PROMOTES the target, which boots it, then asks it to stop
+# about seven seconds later, and a guest that far into its boot has no acpid
+# yet to hear the request. `virsh shutdown` does not retry, so the guest
+# finished booting and was never asked again. graceful_shutdown now re-sends
+# every 15s, which fixes that without a longer wait. Raise these only for a
+# guest that is genuinely slow to shut down once it has been asked.
+TARGET_SHUTDOWN_WAIT_SECONDS=120
+SOURCE_SHUTDOWN_WAIT_SECONDS=120
+
 # How long to wait for each in-guest write to finish. guest-exec is
 # asynchronous -- it returns a pid immediately -- so the harness polls
 # guest-exec-status rather than letting the next checkpoint be taken while dd
