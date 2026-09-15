@@ -4660,17 +4660,43 @@ func run(cfg syncConfig) (runErr error) {
 		// Left running, these hold an unlinked image open: the overlay above
 		// had been discarded, so its blocks were still charged to the
 		// filesystem with no file to show for them.
+		// It PRINTS what it kills, and that is not decoration.
+		//
+		// A reclaim that silently cleans up is a reclaim that hides the leak
+		// it is compensating for: the bench would go green and an export
+		// would keep being abandoned every run with nobody the wiser. The
+		// image path is the useful part -- an orphan still holding
+		// "<base>_<checkpoint>" is one whose overlay was already discarded,
+		// so its blocks are charged to the filesystem with no file to show
+		// for them, and that is a different and worse story than one holding
+		// the base.
 		reclaimCmd := "for d in /proc/[0-9]*; do " +
 			"[ -r \"$d/comm\" ] || continue; " +
 			"read -r c < \"$d/comm\" || continue; " +
 			"[ \"$c\" = qemu-nbd ] || continue; " +
 			"tr '\\0' '\\n' < \"$d/cmdline\" 2>/dev/null | grep -qxF " + util.ShQuote(sockPath) + " || continue; " +
+			"img=$(tr '\\0' '\\n' < \"$d/cmdline\" 2>/dev/null | tail -1); " +
+			"echo \"pid=${d#/proc/} image=$img\"; " +
 			"kill -9 \"${d#/proc/}\" 2>/dev/null || true; " +
 			"done; " +
 			"rm -f " + util.ShQuote(pidFile) + " " + util.ShQuote(sockPath)
 
-		startCmd := reclaimCmd + "; " +
-			"qemu-nbd --fork --persistent --read-only --cache=none --format=qcow2 --socket " +
+		// Run on its own rather than folded into the start, so its output can
+		// be read. runTargetCommand discards stdout on success, and on
+		// success is exactly when this has something to say.
+		if reclaimed, err := targetSSHClient.Run(ctx, reclaimCmd); err != nil {
+			// Not fatal: the start below will fail loudly and specifically
+			// ("Cannot lock pid file") if a leftover really is in the way,
+			// which is a better error than anything that could be reported
+			// from here.
+			trace.Warning("checksum: could not check the target for abandoned checksum exports before starting a new one",
+				"disk", d.TargetDev, "error", err)
+		} else if found := strings.TrimSpace(reclaimed); found != "" {
+			trace.Warning("checksum: killed an ABANDONED checksum export left behind by an earlier run and took its place. The replication is unaffected, but an export leaking means an earlier run did not clean up after itself -- and one still holding a '_vmsync-cpt-' overlay is pinning a discarded file's blocks, so the space it occupies is not visible as a file",
+				"disk", d.TargetDev, "reclaimed", strings.ReplaceAll(found, "\n", "; "))
+		}
+
+		startCmd := "qemu-nbd --fork --persistent --read-only --cache=none --format=qcow2 --socket " +
 			util.ShQuote(sockPath) +
 			" --export-name " +
 			util.ShQuote(exportName) +
