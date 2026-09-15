@@ -4580,29 +4580,42 @@ func run(cfg syncConfig) (runErr error) {
 		// on every byte copied, to benefit a check that reads back only the
 		// delta, is the wrong trade.
 		//
-		// rm -f before starting: qemu-nbd refuses to bind a socket path that
-		// already exists, and a previous run killed with -9 leaves one
-		// behind. Removing a stale socket is safe in a way removing a stale
-		// pidfile is not -- there is no PID to be reused by anything else.
-		startCmd := "rm -f " + util.ShQuote(sockPath) + "; " +
-			"qemu-nbd --fork --persistent --read-only --cache=none --format=qcow2 --socket " +
-			util.ShQuote(sockPath) +
-			" --export-name " +
-			util.ShQuote(exportName) +
-			" --pid-file " +
-			util.ShQuote(pidFile) +
-			" " +
-			util.ShQuote(imagePath)
-		if err := runTargetCommand(startCmd, fmt.Sprintf("start read-only checksum export for %s", imagePath)); err != nil {
-			return err
-		}
-		// Same rm -f-after-kill reasoning as the other stop strings: this is
-		// replayable from the interrupt-cleanup path after the inline stop
-		// below has already run it, and without removing the pidfile that
-		// replay could SIGKILL whatever unrelated process the OS has since
-		// reused the PID for. The socket goes too -- qemu-nbd unlinks it on
-		// a clean exit but not on the kill -9 above.
-		stopCmd := "kill -9 $(cat " + util.ShQuote(pidFile) + ") || true; rm -f " + util.ShQuote(pidFile) + " " + util.ShQuote(sockPath)
+		// Stopping this export means killing the PID in its pidfile -- but
+		// only after proving that PID is still OUR qemu-nbd. The socket path
+		// carries the domain and the device, so an argv containing it
+		// verbatim cannot belong to anything else; a PID the OS has since
+		// recycled onto an unrelated process will not match and is left
+		// alone. That check is what makes the command safe to replay, which
+		// it has to be: the interrupt-cleanup path runs it after the inline
+		// teardown already has, and it is now also run BEFORE the start.
+		//
+		// The files go afterwards either way. qemu-nbd unlinks its socket on
+		// a clean exit but not on a kill -9, and a pidfile naming a process
+		// that no longer exists is exactly what makes the next run's
+		// reclaim a no-op.
+		stopCmd := "p=$(cat " + util.ShQuote(pidFile) + " 2>/dev/null); " +
+			"if [ -n \"$p\" ] && tr '\\0' '\\n' < \"/proc/$p/cmdline\" 2>/dev/null | grep -qxF " + util.ShQuote(sockPath) + "; then " +
+			"kill -9 \"$p\" 2>/dev/null || true; " +
+			"n=0; while kill -0 \"$p\" 2>/dev/null && [ \"$n\" -lt 50 ]; do n=$((n+1)); sleep 0.1; done; " +
+			"fi; " +
+			"rm -f " + util.ShQuote(pidFile) + " " + util.ShQuote(sockPath)
+
+		// REGISTERED AND DEFERRED BEFORE THE START, not after.
+		//
+		// qemu-nbd --fork daemonizes, so the export can be running by the
+		// time anything goes wrong with the ssh call that launched it -- a
+		// dropped connection or a timeout returns an error while the daemon
+		// is very much alive. Registering afterwards meant that export was
+		// leaked with nothing, anywhere, knowing to stop it. It then held
+		// this pidfile forever, and because the failure returns before
+		// reaching the registration, EVERY later run leaked in the same
+		// place and failed the same way: "Cannot lock pid file: Resource
+		// temporarily unavailable", permanently, until somebody killed it by
+		// hand on the target.
+		//
+		// Stopping an export that never started is harmless -- the pidfile
+		// is absent, the guarded kill does nothing, and rm -f removes
+		// nothing -- so there is no cost to arming it first.
 		stopMu.Lock()
 		targetStopCommands = append(targetStopCommands, stopCmd)
 		stopMu.Unlock()
@@ -4616,6 +4629,58 @@ func run(cfg syncConfig) (runErr error) {
 				trace.Warning("checksum: could not stop the read-only checksum export", "disk", d.TargetDev, "error", err)
 			}
 		}()
+
+		// Reclaim before starting -- and NOT via the pidfile, because the
+		// pidfile is exactly what goes missing.
+		//
+		// Observed in the field: two qemu-nbd checksum exports for the same
+		// disk, 27 minutes apart, both naming this same pidfile path, one
+		// holding the base and one still holding an incremental run's
+		// overlay. Two processes can only share one pidfile path if the file
+		// was REMOVED while the first was still alive -- which is what the old
+		// stop did whenever its `kill -9 $(cat pidfile)` found the file
+		// missing or empty: the kill silently became a no-op, `|| true`
+		// swallowed it, and `rm -f` then destroyed the only pointer to a
+		// running process. A later run created a fresh pidfile and started
+		// cleanly alongside it.
+		//
+		// So the reclaim sweeps by what cannot go missing: the socket path in
+		// the process's own argv. It is keyed by domain and device, nothing
+		// else on the host writes that name, and a leftover carrying it is
+		// unambiguously vmsync's own abandoned export.
+		//
+		// /proc/<pid>/comm == qemu-nbd is checked FIRST, and it is what makes
+		// the sweep safe rather than merely narrow: it excludes this very
+		// pipeline. `grep -qxF <sockpath>` has that path in its own argv, so a
+		// cmdline-only scan would match the grep and kill it mid-sweep.
+		// Matching whole argv entries (-x) additionally means the enclosing
+		// `sh -c '<the whole command>'` does not match, since its single
+		// argument is the entire script rather than the bare path.
+		//
+		// Left running, these hold an unlinked image open: the overlay above
+		// had been discarded, so its blocks were still charged to the
+		// filesystem with no file to show for them.
+		reclaimCmd := "for d in /proc/[0-9]*; do " +
+			"[ -r \"$d/comm\" ] || continue; " +
+			"read -r c < \"$d/comm\" || continue; " +
+			"[ \"$c\" = qemu-nbd ] || continue; " +
+			"tr '\\0' '\\n' < \"$d/cmdline\" 2>/dev/null | grep -qxF " + util.ShQuote(sockPath) + " || continue; " +
+			"kill -9 \"${d#/proc/}\" 2>/dev/null || true; " +
+			"done; " +
+			"rm -f " + util.ShQuote(pidFile) + " " + util.ShQuote(sockPath)
+
+		startCmd := reclaimCmd + "; " +
+			"qemu-nbd --fork --persistent --read-only --cache=none --format=qcow2 --socket " +
+			util.ShQuote(sockPath) +
+			" --export-name " +
+			util.ShQuote(exportName) +
+			" --pid-file " +
+			util.ShQuote(pidFile) +
+			" " +
+			util.ShQuote(imagePath)
+		if err := runTargetCommand(startCmd, fmt.Sprintf("start read-only checksum export for %s", imagePath)); err != nil {
+			return err
+		}
 
 		// Recorded in the same breath as the ports, because an operator
 		// correlating this run against a host's sockets needs to know this one
