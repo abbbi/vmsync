@@ -39,12 +39,18 @@ description: |
   Built from ${VMSYNC_FULL_VERSION}.
 
 contents:
+  # NOTE: nfpm only expands ${VAR} in src/dst when `expand: true` is set on
+  # the entry (see nfpm.go expandEnvVarsContents). Without it the literal
+  # string "${BIN_DIR}/..." is globbed and packaging fails with
+  # `Glob failed: ${BIN_DIR}/...: no matching files`.
   - src: ${BIN_DIR}/vmsync-bridge-helper
     dst: /usr/bin/vmsync-bridge-helper
+    expand: true
     file_info:
       mode: 0755
 
   - src: ${ROOT}/LICENSE
     dst: /usr/share/doc/vmsync-bridge-helper/LICENSE
+    expand: true
     file_info:
       mode: 0644

@@ -53,29 +53,39 @@ suggests:
   - vmsync-bridge-helper
 
 contents:
+  # NOTE: nfpm only expands ${VAR} in src/dst when `expand: true` is set on
+  # the entry (see nfpm.go expandEnvVarsContents). Without it the literal
+  # string "${BIN_DIR}/..." is globbed and packaging fails with
+  # `Glob failed: ${BIN_DIR}/...: no matching files`.
   - src: ${BIN_DIR}/vmsync
     dst: /usr/bin/vmsync
+    expand: true
     file_info:
       mode: 0755
 
   - src: ${ROOT}/README.md
     dst: /usr/share/doc/vmsync/README.md
+    expand: true
     file_info:
       mode: 0644
   - src: ${ROOT}/docs/MODES.md
     dst: /usr/share/doc/vmsync/MODES.md
+    expand: true
     file_info:
       mode: 0644
   - src: ${ROOT}/docs/HOWTO.md
     dst: /usr/share/doc/vmsync/HOWTO.md
+    expand: true
     file_info:
       mode: 0644
   - src: ${ROOT}/Changelog
     dst: /usr/share/doc/vmsync/Changelog
+    expand: true
     file_info:
       mode: 0644
   - src: ${ROOT}/LICENSE
     dst: /usr/share/doc/vmsync/LICENSE
+    expand: true
     file_info:
       mode: 0644
 
@@ -85,5 +95,6 @@ contents:
   # overwrite. Copy it somewhere of your own and edit that.
   - src: ${ROOT}/contrib/runner/vmsync-parallel.sh
     dst: /usr/share/doc/vmsync/examples/vmsync-parallel.sh
+    expand: true
     file_info:
       mode: 0644

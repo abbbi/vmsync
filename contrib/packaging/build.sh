@@ -21,9 +21,23 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+INVOCATION_DIR="$PWD"
 NFPM="${NFPM:-nfpm}"
 OUT_DIR="${OUT_DIR:-${ROOT}/dist}"
 PKG_CHANNEL="${PKG_CHANNEL:-nightly}"
+
+# nfpm resolves `scripts:` relative to CWD, not to the config file, while
+# vmsync-agent.yaml deliberately uses repo-relative script paths -- nfpm never
+# expands ${VAR} in the scripts fields (see nfpm.go expandEnvVars: Scripts is
+# simply absent there), so an absolute path cannot be expressed with a
+# variable. Run from the repo root so those resolve no matter where build.sh
+# was invoked from. OUT_DIR is made absolute first so a relative OUT_DIR still
+# lands where the caller meant.
+case "$OUT_DIR" in
+/*) ;;
+*) OUT_DIR="${INVOCATION_DIR}/${OUT_DIR}" ;;
+esac
+cd "$ROOT"
 
 command -v "$NFPM" >/dev/null 2>&1 || {
 	echo "build.sh: nfpm not found. Install it (https://github.com/goreleaser/nfpm) or set NFPM=" >&2
@@ -166,7 +180,16 @@ package_one() {
 main() {
 	local -a dirs=()
 	if [ "$#" -gt 0 ]; then
-		dirs=("$@")
+		# Resolved against the caller's directory, not $ROOT: the script
+		# cd's to $ROOT above, so a relative argument must be anchored
+		# before that.
+		local a
+		for a in "$@"; do
+			case "$a" in
+			/*) dirs+=("${a%/}") ;;
+			*) dirs+=("${INVOCATION_DIR}/${a%/}") ;;
+			esac
+		done
 	else
 		# A nullglob-free way to notice there is nothing to do, so the script
 		# says so instead of running nfpm against a literal "vmsync_*".

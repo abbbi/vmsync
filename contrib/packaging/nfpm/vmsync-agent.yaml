@@ -38,8 +38,13 @@ depends:
   - vmsync
 
 contents:
+  # NOTE: nfpm only expands ${VAR} in src/dst when `expand: true` is set on
+  # the entry (see nfpm.go expandEnvVarsContents). Without it the literal
+  # string "${BIN_DIR}/..." is globbed and packaging fails with
+  # `Glob failed: ${BIN_DIR}/...: no matching files`.
   - src: ${BIN_DIR}/vmsync-agent
     dst: /usr/bin/vmsync-agent
+    expand: true
     file_info:
       mode: 0755
 
@@ -48,6 +53,7 @@ contents:
   # the docs describe and the wrong one for a package that owns /usr/bin.
   - src: ${STAGE_DIR}/vmsync-agent.service
     dst: /usr/lib/systemd/system/vmsync-agent.service
+    expand: true
     file_info:
       mode: 0644
 
@@ -62,6 +68,7 @@ contents:
   - src: ${ROOT}/contrib/systemd/vmsync-agent.sysconfig
     dst: ${SYSCONFIG_DST}
     type: config|noreplace
+    expand: true
     file_info:
       mode: 0644
 
@@ -75,19 +82,23 @@ contents:
   # binaries rather than where the hand-install docs put them.
   - src: ${STAGE_DIR}/agent.json.example
     dst: /etc/vmsync/agent.json.example
+    expand: true
     file_info:
       mode: 0644
 
   - src: ${ROOT}/cmd/vmsync-agent/README.md
     dst: /usr/share/doc/vmsync-agent/README.md
+    expand: true
     file_info:
       mode: 0644
   - src: ${ROOT}/docs/MODES.md
     dst: /usr/share/doc/vmsync-agent/MODES.md
+    expand: true
     file_info:
       mode: 0644
   - src: ${ROOT}/LICENSE
     dst: /usr/share/doc/vmsync-agent/LICENSE
+    expand: true
     file_info:
       mode: 0644
 
@@ -100,8 +111,14 @@ contents:
       mode: 0750
 
 scripts:
-  postinstall: ${ROOT}/contrib/packaging/scripts/agent-postinstall.sh
-  postremove: ${ROOT}/contrib/packaging/scripts/agent-postremove.sh
+  # Relative to the repo root, NOT ${ROOT}/...: nfpm expands ${VAR} in most
+  # top-level fields and in contents entries with `expand: true`, but it never
+  # expands the scripts paths (see nfpm.go expandEnvVars -- Scripts is simply
+  # absent). A ${ROOT} here would be read literally and fail with
+  # `open ${ROOT}/...: no such file`. build.sh runs nfpm from $ROOT so these
+  # resolve regardless of where build.sh was invoked from.
+  postinstall: contrib/packaging/scripts/agent-postinstall.sh
+  postremove: contrib/packaging/scripts/agent-postremove.sh
 
 # One overrides block, holding everything that genuinely differs by packager.
 #
@@ -117,11 +134,11 @@ overrides:
       - libvirt-libs
       - libnbd
     scripts:
-      preremove: ${ROOT}/contrib/packaging/scripts/agent-preremove-rpm.sh
+      preremove: contrib/packaging/scripts/agent-preremove-rpm.sh
   deb:
     depends:
       - vmsync
       - libvirt0
       - libnbd0
     scripts:
-      preremove: ${ROOT}/contrib/packaging/scripts/agent-preremove-deb.sh
+      preremove: contrib/packaging/scripts/agent-preremove-deb.sh
