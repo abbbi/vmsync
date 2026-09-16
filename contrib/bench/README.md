@@ -9,6 +9,11 @@ confirm mismatch detection actually works, and the external-snapshot
 lifecycle (syncing while a source-side external snapshot exists, then
 again after it's removed) -- not just that the flags are accepted.
 
+## Requirements
+
+Bench should be given a running test VM, ideally with multiple disks
+to exercice all paths.
+
 ## Before you run this anywhere
 
 **This is a genuinely destructive tool.** Read this whole section first.
