@@ -12,7 +12,7 @@ again after it's removed) -- not just that the flags are accepted.
 ## Requirements
 
 Bench should be given a running test VM, ideally with multiple disks
-to exercice all paths.
+to exercise all paths.
 
 ## Before you run this anywhere
 
