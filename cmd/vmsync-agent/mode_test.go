@@ -75,6 +75,59 @@ func TestResolveModeRefusesMoreThanOne(t *testing.T) {
 	}
 }
 
+// Enrolment needs no mode: the token exchange is the same for --monitor and
+// --controlled, so a setup invocation carrying --enrol-token-file may omit
+// the flag and simply enrols (reporting once with --once) instead of running.
+func TestResolveModeOrEnrolAllowsModelessEnrolment(t *testing.T) {
+	for _, tokenFile := range []string{"/run/vmsync-enrol-token", "-"} {
+		mode, enrolOnly, err := resolveModeOrEnrol(false, false, false, tokenFile)
+		if err != nil {
+			t.Fatalf("modeless enrolment with %q was refused: %v", tokenFile, err)
+		}
+		if !enrolOnly || mode != "" {
+			t.Errorf("resolveModeOrEnrol = (%q, %v), want no mode and enrol-only", mode, enrolOnly)
+		}
+	}
+}
+
+func TestResolveModeOrEnrolKeepsTheModeWhenOneIsNamed(t *testing.T) {
+	// A mode plus a token is the ordinary daemon enrolment: first start with
+	// the token present, later starts reusing the stored credential.
+	mode, enrolOnly, err := resolveModeOrEnrol(false, true, false, "/run/vmsync-enrol-token")
+	if err != nil {
+		t.Fatalf("resolveModeOrEnrol: %v", err)
+	}
+	if enrolOnly || mode != modeMonitor {
+		t.Errorf("resolveModeOrEnrol = (%q, %v), want (%q, false)", mode, enrolOnly, modeMonitor)
+	}
+}
+
+func TestResolveModeOrEnrolStillRefusesNoModeWithoutAToken(t *testing.T) {
+	_, _, err := resolveModeOrEnrol(false, false, false, "")
+	if err == nil {
+		t.Fatal("no mode and no token was accepted; a daemon with no mode is the accident the flags exist to prevent")
+	}
+	for _, want := range []string{"--standalone", "--monitor", "--controlled"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not name %s: %v", want, err)
+		}
+	}
+}
+
+func TestResolveModeOrEnrolStillRefusesContradictoryModes(t *testing.T) {
+	// Two modes at once is a mistyped unit file, even when a token is present:
+	// the enrolment cannot know which agent it is setting up.
+	_, _, err := resolveModeOrEnrol(false, true, true, "/run/vmsync-enrol-token")
+	if err == nil {
+		t.Fatal("two modes at once were accepted")
+	}
+	for _, want := range []string{"--monitor", "--controlled"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not name %s: %v", want, err)
+		}
+	}
+}
+
 func TestCheckFileMatchesModeToFile(t *testing.T) {
 	cp := &ControlPlaneFile{URL: "https://ui.example:8443"}
 

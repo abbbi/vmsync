@@ -192,11 +192,12 @@ to detect and work around.
 
 ## Enrol
 
-Generate a single-use enrolment token in the UI for this host, put it in a
-file, and run the agent once by hand:
+Generate a single-use enrolment token in the UI for this host, and run the
+agent once by hand. No mode flag: the token exchange is identical for
+`--monitor` and `--controlled`, so setup enrols first and you choose the mode
+when you start the service:
 
 ```bash
-umask 077 && printf '%s' 'PASTE_TOKEN_HERE' > /run/vmsync-enrol-token
 vmsync-agent --config /etc/vmsync/agent.json \
              --enrol-token-file /run/vmsync-enrol-token \
              --once
@@ -244,6 +245,10 @@ without touching the service. It needs a control plane; on a standalone agent
 there is nowhere to report to, and it is **ignored rather than refused** — the
 process runs as a daemon.
 
+A modeless `--once` sends its one report without a mode, which is the honest
+answer: the mode is chosen when the service starts, not when the host enrols.
+The daemon's first report carries the real one.
+
 A reload never re-reads or re-deletes the token (file or stdin), and never re-enrols.
 
 ## Flags
@@ -263,7 +268,7 @@ invocation is for, or they say **which agent this is**. Go's `flag` accepts
 | `--enrol-token-file` | Path to a file holding a single-use enrolment token, or `-` to read it from stdin. A file is read once and then **deleted**. Only needed until enrolment succeeds. |
 | `-v`, `--version` | Print the version and exit. |
 
-**Exactly one mode flag is required, and there is no default.** The mode used to
+**Exactly one mode flag is required to run the agent, and there is no default.** The one exception is setup: `--enrol-token-file` with no mode flag enrols (and with `--once` reports once) and exits, because the exchange is the same for `--monitor` and `--controlled`. The mode used to
 be inferred from the file — a `schedule_file` meant standalone, a
 `control_plane` meant control-plane — which worked while there were two modes
 and they needed different files, but it made the most consequential property of

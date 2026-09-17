@@ -52,6 +52,29 @@ const (
 	modeControlled agentMode = "controlled"
 )
 
+// resolveModeOrEnrol decides whether this invocation names an agent mode or
+// performs a modeless enrolment.
+//
+// Enrolment needs no mode: the token exchange is identical for --monitor and
+// --controlled (Enrol sends hostname, token and version, never a mode), and
+// --standalone never enrols at all. Requiring one anyway forces the operator
+// to answer, during setup, a question the setup does not ask -- and whatever
+// word they type there changes nothing about the credential they get, only
+// which flag they must remember to repeat on the next command. The daemon
+// still requires exactly one mode; only an invocation carrying
+// --enrol-token-file may omit it, and such an invocation enrols (and, with
+// --once, reports once) and then exits instead of running.
+func resolveModeOrEnrol(standalone, monitor, controlled bool, enrolTokenFile string) (agentMode, bool, error) {
+	if !standalone && !monitor && !controlled && enrolTokenFile != "" {
+		return "", true, nil
+	}
+	mode, err := resolveMode(standalone, monitor, controlled)
+	if err != nil {
+		return "", false, err
+	}
+	return mode, false, nil
+}
+
 // resolveMode turns the three flags into one mode, or says what is wrong.
 //
 // Exactly one is required, and there is deliberately no default. The only

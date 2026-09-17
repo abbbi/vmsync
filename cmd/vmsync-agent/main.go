@@ -178,7 +178,9 @@ func main() {
 	// Before the file, because it needs nothing from it and because "you did
 	// not say what this agent is" is a clearer first thing to hear than a
 	// complaint about a document the operator may not have got to yet.
-	mode, err := resolveMode(*standalone, *monitor, *controlled)
+	// An invocation carrying --enrol-token-file may omit the mode entirely
+	// and simply enrols instead of running (see resolveModeOrEnrol).
+	mode, enrolOnly, err := resolveModeOrEnrol(*standalone, *monitor, *controlled, *enrolTokenFile)
 	if err != nil {
 		trace.Error("invalid command line", "error", err)
 		os.Exit(2)
@@ -192,6 +194,34 @@ func main() {
 	for _, w := range warnings {
 		trace.Warning("configuration hygiene", "detail", w)
 	}
+
+	// Modeless enrolment: exchange the token for a credential (and, with
+	// --once, send one report) and exit. No mode is needed because the
+	// exchange is the same for --monitor and --controlled, and no loops ever
+	// start here -- the daemon still requires exactly one mode, set in the
+	// unit, before it will run anything.
+	if enrolOnly {
+		cfg, err := resolveAgentConfig(af, "", *configPath, *once, *debug, *enrolTokenFile)
+		if err != nil {
+			trace.Error("invalid configuration", "error", err)
+			os.Exit(2)
+		}
+		trace.SetDebug(cfg.Debug)
+		if *debug && !af.Log.Debug {
+			trace.Warning(`--debug on the command line overrides "log.debug"; it stays on until this agent is restarted, and a reload cannot turn it off`)
+		}
+		client, err := NewClient(cfg.UIBase, cfg.CAFile, cfg.HTTPTimeout)
+		if err != nil {
+			trace.Error("agent stopped", "error", err)
+			os.Exit(1)
+		}
+		if err := runEnrolOnly(context.Background(), client, Store{Dir: cfg.StateDir}, cfg); err != nil {
+			trace.Error("agent stopped", "error", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	if err := mode.checkFile(af, *configPath); err != nil {
 		trace.Error("configuration does not match the mode this agent was started in", "error", err)
 		os.Exit(2)
@@ -456,6 +486,41 @@ func (s *sharedState) set(c CachedConfig) {
 	s.cached = c
 }
 
+// runEnrolOnly performs a modeless enrolment and exits: it exchanges the
+// enrolment token for a long-lived credential and, with --once, sends one
+// report, without starting any loop.
+//
+// The client and store are parameters rather than built here so tests can
+// point them at a stub UI and a temp dir; main builds the real ones. Reporting
+// without --once is deliberately not a thing: a bare run enrols and leaves,
+// and only --once inventories libvirtd, so enrolling a host never requires
+// libvirtd to be up.
+func runEnrolOnly(ctx context.Context, client *Client, store Store, cfg agentConfig) error {
+	creds, err := ensureEnrolled(ctx, client, store, cfg)
+	if err != nil {
+		return err
+	}
+	client.Creds = creds
+	if cfg.EnrolToken == "" {
+		// No token was spent: the credential was already stored, which is the
+		// ordinary state of re-running setup on an enrolled host. Say so,
+		// since ensureEnrolled only logs when it actually enrols and silence
+		// here would look like nothing happened.
+		trace.Info("already enrolled", "agent_id", creds.AgentID)
+	}
+	if !cfg.Once {
+		return nil
+	}
+	cached, everFetched, err := store.LoadCache()
+	if err != nil {
+		return fmt.Errorf("load cached configuration: %w", err)
+	}
+	if !everFetched {
+		trace.Info("no cached configuration yet; running on defaults until the UI answers")
+	}
+	return reportOnce(ctx, client, cfg, cached)
+}
+
 // ensureEnrolled returns a usable credential, enrolling first if needed.
 //
 // A stored credential issued by a DIFFERENT UI is refused rather than
@@ -476,7 +541,7 @@ func ensureEnrolled(ctx context.Context, client *Client, store Store, cfg agentC
 	}
 
 	if cfg.EnrolToken == "" {
-		return Credentials{}, fmt.Errorf("this agent has not enrolled yet and no -enrol-token was given: generate one for %q in the UI and pass it once", cfg.Hostname)
+		return Credentials{}, fmt.Errorf("this agent has not enrolled yet and no --enrol-token-file was given: generate one for %q in the UI and pass it once", cfg.Hostname)
 	}
 	trace.Info("enrolling with the control-plane UI", "ui", client.Base, "hostname", cfg.Hostname)
 	creds, err = client.Enrol(ctx, cfg.Hostname, cfg.EnrolToken, version.Version)
