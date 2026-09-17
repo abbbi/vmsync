@@ -688,11 +688,37 @@ itself uses — so under systemd it lands in the journal with no file to rotate:
 journalctl -u vmsync-agent -f
 ```
 
-Debug adds the per-tick scheduling decisions and the full argv of every vmsync
+Debug adds the per-tick scheduling decisions, the per-device skip lines and
+the full argv of every vmsync
 it runs. When a scheduled sync fails, the agent logs the exit code **and
 vmsync's own output tail**, so the journal on this host explains the failure
 without needing the UI — and in standalone mode instead of it, since there is no
 report for the tail to travel in.
+
+### Inventory: once at startup, then on SIGUSR1
+
+At startup the agent logs one INFO `inventory` block: every domain libvirt
+knows about, whether it is running, its replication role and assessed status,
+its cadence, which disk files replicate, and why. The block includes the
+per-device skip lines (cdroms included). Per-scan chatter stays out of the
+journal otherwise on purpose — a cdrom skip is debug-level outside these
+dumps (one sits on nearly every VM and scans run constantly: report loop,
+fence sweep, scheduler tick),
+and only a disk with an unexpected driver, which may be a VM someone believes
+is replicated and is not, still logs at INFO on every scan.
+
+To see the block again without restarting:
+
+```bash
+systemctl kill --kill-whom=main -s SIGUSR1 vmsync-agent
+# systemd older than 249 has no --kill-whom: kill -USR1 $MAINPID
+journalctl -u vmsync-agent -f
+```
+
+Signal **only the main process**. The unit's default `KillMode` addresses the
+whole control group, and in-flight `vmsync` children do not handle `SIGUSR1`
+— a group-wide delivery terminates every running sync. (`ExecReload` targets
+`$MAINPID` for the same reason.)
 
 **Prometheus.** Set `prometheus_dir`; the agent then hands each run
 `-prometheus-textfile <dir>/vmsync_<vm>.prom`, one file per VM, which is what

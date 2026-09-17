@@ -319,7 +319,21 @@ func Assess(d Domain, now time.Time, cadence time.Duration) Assessment {
 // Inactive domains are included: a replication target is SUPPOSED to be
 // shut off, so listing only running domains would hide every target in the
 // estate.
+//
+// Expected cdrom skips log at debug level; see ScanVerbose for the loud
+// variant. Every periodic scan in the agent uses this one.
 func Scan(mgr *libvirtsync.Manager) ([]Domain, error) {
+	return scan(mgr, false)
+}
+
+// ScanVerbose is Scan with the per-device skip lines (cdroms included) at
+// INFO. For operator-requested records -- the agent's startup inventory and
+// its on-demand (SIGUSR1) dump -- not for anything that runs on a timer.
+func ScanVerbose(mgr *libvirtsync.Manager) ([]Domain, error) {
+	return scan(mgr, true)
+}
+
+func scan(mgr *libvirtsync.Manager, verboseSkips bool) ([]Domain, error) {
 	doms, err := mgr.Conn.ListAllDomains(0)
 	if err != nil {
 		return nil, fmt.Errorf("list domains: %w", err)
@@ -332,7 +346,7 @@ func Scan(mgr *libvirtsync.Manager) ([]Domain, error) {
 
 	out := make([]Domain, 0, len(doms))
 	for i := range doms {
-		d, err := describe(&doms[i])
+		d, err := describe(&doms[i], verboseSkips)
 		if err != nil {
 			return nil, err
 		}
@@ -342,7 +356,7 @@ func Scan(mgr *libvirtsync.Manager) ([]Domain, error) {
 	return out, nil
 }
 
-func describe(dom *libvirt.Domain) (Domain, error) {
+func describe(dom *libvirt.Domain, verboseSkips bool) (Domain, error) {
 	name, err := dom.GetName()
 	if err != nil {
 		return Domain{}, fmt.Errorf("read domain name: %w", err)
@@ -375,7 +389,11 @@ func describe(dom *libvirt.Domain) (Domain, error) {
 	// holds the data -- and that a replica is named after -- is the base of
 	// the chain. Sizing the overlay would report a few megabytes for a
 	// hundred-gigabyte VM.
-	if disks, derr := disk.ParseQcowDisks(xml); derr == nil {
+	parse := disk.ParseQcowDisksQuiet
+	if verboseSkips {
+		parse = disk.ParseQcowDisks
+	}
+	if disks, derr := parse(xml); derr == nil {
 		paths := make([]string, 0, len(disks))
 		for _, qd := range disks {
 			// Was this same fallback written out inline. It is QcowDisk.Path()

@@ -94,6 +94,11 @@ func runStandalone(lv *live, reloads *reloader) error {
 	// stamping a time here would report a config age that means nothing.
 	state := &sharedState{cached: CachedConfig{Config: uiCfg}}
 
+	// Once at startup, and again on every SIGUSR1 -- see the same call in
+	// run(): the journal otherwise never says at INFO which VMs exist here.
+	dumpInventory(cfg, state.get(), "startup")
+	watchStatusSignals(ctx, lv, state.get)
+
 	var wg sync.WaitGroup
 	sched := NewScheduler(lv, state)
 	if cfg.metrics != nil {

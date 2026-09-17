@@ -18,8 +18,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package disk
 
 import (
+	"bytes"
+	"log"
+	"os"
 	"path"
+	"strings"
 	"testing"
+
+	"vmsync/pkg/trace"
 )
 
 // TestResolveRootSource pins down QcowDisk.RootSource's actual resolution
@@ -180,6 +186,104 @@ func TestBitmapNamesToleratesMalformedEntries(t *testing.T) {
 	if got := BitmapNames(QemuImgInfo{FormatSpec: bad2}); got != nil {
 		t.Errorf("BitmapNames = %v, want nil", got)
 	}
+}
+
+// A cdrom is expected on nearly every domain, so the quiet variant -- the
+// one repeated automated scans use -- logs those skips at debug level only.
+// The verbose variant keeps the historical behaviour (everything at INFO)
+// for one-shot runs. A disk with an unexpected driver may be a VM somebody
+// believes is being replicated and is not, so it stays loud in both.
+func TestParseQcowDisksLogsSkipsAtTheRightLevel(t *testing.T) {
+	const cdromXML = `<domain type='kvm'>
+  <name>vm01</name>
+  <devices>
+    <disk type='file' device='cdrom'>
+      <target dev='sda'/>
+    </disk>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/data/vm01.qcow2'/>
+      <target dev='vda'/>
+    </disk>
+  </devices>
+</domain>`
+	const rawXML = `<domain type='kvm'>
+  <name>vm02</name>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source file='/data/vm02.raw'/>
+      <target dev='vda'/>
+    </disk>
+  </devices>
+</domain>`
+
+	t.Run("a cdrom skip is debug-quiet in quiet scans by default", func(t *testing.T) {
+		out := captureTrace(t, false)
+		disks, err := ParseQcowDisksQuiet(cdromXML)
+		if err != nil {
+			t.Fatalf("ParseQcowDisksQuiet: %v", err)
+		}
+		if len(disks) != 1 {
+			t.Fatalf("ParseQcowDisksQuiet returned %d disks, want just vda", len(disks))
+		}
+		if strings.Contains(out.String(), "skipping") {
+			t.Errorf("a cdrom skip was logged at INFO; it should be debug-only, got:\n%s", out.String())
+		}
+	})
+
+	t.Run("a cdrom skip is still visible with debug on", func(t *testing.T) {
+		out := captureTrace(t, true)
+		if _, err := ParseQcowDisksQuiet(cdromXML); err != nil {
+			t.Fatalf("ParseQcowDisksQuiet: %v", err)
+		}
+		for _, want := range []string{"skipping", "vm01", "cdrom"} {
+			if !strings.Contains(out.String(), want) {
+				t.Errorf("debug output does not mention %q, got:\n%s", want, out.String())
+			}
+		}
+	})
+
+	t.Run("a cdrom skip is INFO in verbose scans", func(t *testing.T) {
+		out := captureTrace(t, false)
+		if _, err := ParseQcowDisks(cdromXML); err != nil {
+			t.Fatalf("ParseQcowDisks: %v", err)
+		}
+		for _, want := range []string{"skipping", "vm01", "cdrom"} {
+			if !strings.Contains(out.String(), want) {
+				t.Errorf("verbose output does not mention %q, got:\n%s", want, out.String())
+			}
+		}
+	})
+
+	t.Run("a non-qcow2 disk skip stays INFO even when quiet", func(t *testing.T) {
+		out := captureTrace(t, false)
+		disks, err := ParseQcowDisksQuiet(rawXML)
+		if err != nil {
+			t.Fatalf("ParseQcowDisksQuiet: %v", err)
+		}
+		if len(disks) != 0 {
+			t.Fatalf("ParseQcowDisksQuiet returned %d disks, want none -- raw is not replicated", len(disks))
+		}
+		for _, want := range []string{"skipping", "vm02", "raw"} {
+			if !strings.Contains(out.String(), want) {
+				t.Errorf("INFO output does not mention %q; a silently unreplicated disk looks healthy, got:\n%s", want, out.String())
+			}
+		}
+	})
+}
+
+// captureTrace diverts the trace package's log output into a buffer for one
+// test. Colour is forced off so assertions read plain level names.
+func captureTrace(t *testing.T, debug bool) *bytes.Buffer {
+	t.Helper()
+	t.Setenv("NO_COLOR", "1")
+	trace.SetDebug(debug)
+	t.Cleanup(func() { trace.SetDebug(false) })
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	return &buf
 }
 
 // QcowFormatSpecFixture builds the format-specific block qemu-img emits for a

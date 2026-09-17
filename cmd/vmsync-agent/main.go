@@ -362,6 +362,14 @@ func run(lv *live, reloads *reloader) error {
 	// whatever the cached configuration says, including while the UI is
 	// unreachable; and the operations loop executes one-shot instructions.
 	state := &sharedState{cached: cached}
+
+	// Once at startup, and again on every SIGUSR1: which VMs are on this host
+	// and what the agent makes of them. Per-device skip lines are
+	// debug-level and per-tick decisions are debug too, so without this the
+	// journal says nothing about the inventory at INFO at all.
+	dumpInventory(cfg, cached, "startup")
+	watchStatusSignals(ctx, lv, state.get)
+
 	var wg sync.WaitGroup
 
 	// Loaded before anything can execute. A ledger that failed to load
@@ -573,7 +581,7 @@ func reportOnce(ctx context.Context, client *Client, cfg agentConfig, cached Cac
 	if err := fences.Load(); err != nil {
 		return fmt.Errorf("load the fence ledger: %w", err)
 	}
-	report, err := buildReport(cfg, cached, nil, nil, fences)
+	report, err := buildReport(cfg, cached, nil, nil, fences, false)
 	if err != nil {
 		return err
 	}
@@ -590,7 +598,7 @@ func reportLoop(ctx context.Context, client *Client, lv *live, state *sharedStat
 	for {
 		cfg := *lv.get()
 		cached := state.get()
-		report, err := buildReport(cfg, cached, sched, ledger, fences)
+		report, err := buildReport(cfg, cached, sched, ledger, fences, false)
 		if err != nil {
 			// A libvirt failure is worth logging loudly but is not fatal:
 			// libvirtd restarts, and an agent that exited would then need
@@ -712,14 +720,23 @@ func pollLoop(ctx context.Context, client *Client, lv *live, store Store, state 
 }
 
 // buildReport inventories the local host and assesses every domain.
-func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler, ledger *operationLedger, fences *fenceLedger) (Report, error) {
+//
+// verboseScan selects the loud scan (per-device skip lines at INFO, cdroms
+// included) for operator-requested records; timer-driven reports pass false
+// so one cdrom per domain does not repeat into the journal on every cycle.
+func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler, ledger *operationLedger, fences *fenceLedger, verboseScan bool) (Report, error) {
 	mgr, err := libvirtsync.Connect(cfg.LibvirtURI)
 	if err != nil {
 		return Report{}, fmt.Errorf("connect to %s: %w", cfg.LibvirtURI, err)
 	}
 	defer mgr.Close()
 
-	domains, err := inventory.Scan(mgr)
+	var domains []inventory.Domain
+	if verboseScan {
+		domains, err = inventory.ScanVerbose(mgr)
+	} else {
+		domains, err = inventory.Scan(mgr)
+	}
 	if err != nil {
 		return Report{}, err
 	}

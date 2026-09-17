@@ -93,6 +93,19 @@ type CommandRunner interface {
 }
 
 func ParseQcowDisks(domainXML string) ([]QcowDisk, error) {
+	return parseQcowDisks(domainXML, false)
+}
+
+// ParseQcowDisksQuiet is ParseQcowDisks for repeated automated scans: the
+// expected cdrom skips log at debug level instead of info, so a scan of every
+// domain on every cycle is not a perpetual stream of noise. A disk with an
+// unexpected driver still logs at INFO either way -- that one may be a real
+// misconfiguration hiding as a healthy VM.
+func ParseQcowDisksQuiet(domainXML string) ([]QcowDisk, error) {
+	return parseQcowDisks(domainXML, true)
+}
+
+func parseQcowDisks(domainXML string, cdromToDebug bool) ([]QcowDisk, error) {
 	domcfg := &libvirtxml.Domain{}
 	err := domcfg.Unmarshal(domainXML)
 	if err != nil {
@@ -119,12 +132,22 @@ func ParseQcowDisks(domainXML string) ([]QcowDisk, error) {
 			// disk whose driver is not qcow2, which is a VM somebody may
 			// believe is being replicated and is not. Reading the same line
 			// for both is what makes the second one easy to miss.
+			//
+			// The two cases no longer share a level in quiet scans. A cdrom is
+			// on nearly every domain, so INFO here on every automated scan is
+			// a perpetual stream of noise -- debug only. A disk with an
+			// unexpected driver stays INFO: that one may be a real
+			// misconfiguration hiding as a healthy VM.
 			format := "none"
 			if d.Driver != nil && d.Driver.Type != "" {
 				format = d.Driver.Type
 			}
-			trace.Info("skipping incompatible device, it will not be replicated",
-				"vm", domcfg.Name, "device", targetDev, "device_type", d.Device, "format", format)
+			args := []any{"vm", domcfg.Name, "device", targetDev, "device_type", d.Device, "format", format}
+			if d.Device == "cdrom" && cdromToDebug {
+				trace.Debug("skipping incompatible device, it will not be replicated", args...)
+			} else {
+				trace.Info("skipping incompatible device, it will not be replicated", args...)
+			}
 			continue
 		}
 
