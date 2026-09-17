@@ -202,12 +202,21 @@ vmsync-agent --config /etc/vmsync/agent.json \
              --once
 ```
 
-A file, not a flag value: `/proc/<pid>/cmdline` is world-readable and shell
-history keeps a pasted token indefinitely.
+You can also use stdin to directly pass an enrol token.
+
+```bash
+echo 'TOKEN' | vmsync-agent --config /etc/vmsync/agent.json \
+             --enrol-token-file - \
+             --once
+```
+
+A file or a pipe, never a flag value: `/proc/<pid>/cmdline` is
+world-readable and shell history keeps a pasted token indefinitely.
 
 That exchanges the token for a long-lived credential in
 `/var/lib/vmsync-agent/credentials.json` (mode 0600), sends one report, and
-exits. **The token file is deleted the moment it is read**, before enrolment is
+exits. **The token file is deleted the moment it is read** (stdin is read and
+not deleted, there being nothing to delete), before enrolment is
 even attempted — the token is spent by that call and a copy left on disk is a
 credential-shaped thing that is no longer a credential, and at worst something
 config management re-deploys forever because it looks like configuration. If
@@ -235,7 +244,7 @@ without touching the service. It needs a control plane; on a standalone agent
 there is nowhere to report to, and it is **ignored rather than refused** — the
 process runs as a daemon.
 
-A reload never re-reads or re-deletes the token file, and never re-enrols.
+A reload never re-reads or re-deletes the token (file or stdin), and never re-enrols.
 
 ## Flags
 
@@ -251,7 +260,7 @@ invocation is for, or they say **which agent this is**. Go's `flag` accepts
 | `--config` | Path to file 1. Default `/etc/vmsync/agent.json`. |
 | `--once` | Report once and exit, instead of running as a daemon. For verifying a new install. |
 | `--debug` | Force debug logging on, whatever `log.debug` says, until this agent is restarted. |
-| `--enrol-token-file` | Path to a file holding a single-use enrolment token. Read once and then **deleted**. Only needed until enrolment succeeds. |
+| `--enrol-token-file` | Path to a file holding a single-use enrolment token, or `-` to read it from stdin. A file is read once and then **deleted**. Only needed until enrolment succeeds. |
 | `-v`, `--version` | Print the version and exit. |
 
 **Exactly one mode flag is required, and there is no default.** The mode used to

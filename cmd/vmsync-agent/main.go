@@ -150,7 +150,7 @@ func main() {
 		configPath     = flag.String("config", "/etc/vmsync/agent.json", "Path to this agent's configuration. Everything except the flags listed here lives in that file; see the agent README")
 		once           = flag.Bool("once", false, "Report once and exit, instead of running as a daemon. For verifying a new install")
 		debug          = flag.Bool("debug", false, `Force debug logging on, whatever "log.debug" says, until this agent is restarted`)
-		enrolTokenFile = flag.String("enrol-token-file", "", "Path to a file holding a single-use enrolment token. Read once and then DELETED, so the token does not outlive its use. Only needed until enrolment succeeds")
+		enrolTokenFile = flag.String("enrol-token-file", "", "Path to a file holding a single-use enrolment token, or - to read it from stdin. A file is read once and then DELETED")
 		showVersion    = flag.Bool("v", false, "Show version and exit")
 		showVersionL   = flag.Bool("version", false, "Show version and exit")
 

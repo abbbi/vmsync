@@ -22,6 +22,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"strings"
@@ -221,9 +222,28 @@ func resolveAgentConfig(a AgentFile, mode agentMode, configPath string, once, fo
 // re-deploys forever because it looks like configuration. This also keeps it
 // off the command line, where /proc/<pid>/cmdline is world-readable and shell
 // history keeps it indefinitely.
+//
+// A path of "-" reads the token from stdin instead, for a one-shot enrolment
+// without touching the filesystem at all:
+//
+//	printf '%s' "$TOKEN" | vmsync-agent --enrol-token-file - --once
+//
+// Stdin is never "removed", for obvious reasons, and a reload never re-reads
+// anything: reload.go resolves with "" so a running daemon can never block on
+// a pipe it was not started with.
 func readEnrolToken(path string) (string, error) {
 	if path == "" {
 		return "", nil
+	}
+	if path == "-" {
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return "", fmt.Errorf("read enrolment token from stdin: %w", err)
+		}
+		if tok := strings.TrimSpace(string(b)); tok != "" {
+			return tok, nil
+		}
+		return "", fmt.Errorf("enrolment token read from stdin is empty")
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {

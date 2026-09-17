@@ -350,3 +350,92 @@ func runtimeSupportsUnixModes() bool {
 	fi, err := os.Stat(f.Name())
 	return err == nil && fi.Mode().Perm()&0o022 != 0
 }
+
+// A token file is read once and then deleted, so a spent token cannot linger
+// on disk looking like configuration that config management re-deploys
+// forever.
+func TestReadEnrolTokenFileIsReadOnceThenDeleted(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(p, []byte("  secret-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readEnrolToken(p)
+	if err != nil || got != "secret-token" {
+		t.Fatalf("readEnrolToken = %q, %v; want %q", got, err, "secret-token")
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Error("the token file still exists after reading; a spent token must not outlive its use")
+	}
+	// Already spent on a previous start is the ordinary state of an enrolled
+	// host whose unit still names the file -- not an error.
+	got, err = readEnrolToken(p)
+	if err != nil || got != "" {
+		t.Errorf("second read = %q, %v; want %q and no error", got, err, "")
+	}
+}
+
+func TestReadEnrolTokenEmptyPathMeansNoToken(t *testing.T) {
+	got, err := readEnrolToken("")
+	if err != nil || got != "" {
+		t.Errorf("readEnrolToken(%q) = %q, %v; want %q and no error", "", got, err, "")
+	}
+}
+
+func TestReadEnrolTokenRefusesAnEmptyFile(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(p, []byte("  \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readEnrolToken(p); err == nil {
+		t.Error("an empty token file was accepted")
+	} else if !strings.Contains(err.Error(), "empty") {
+		t.Errorf("error %q does not say the token is empty", err)
+	}
+}
+
+// "-" reads the token from stdin, so enrolment needs no file at all:
+// printf '%s' "$TOKEN" | vmsync-agent --enrol-token-file - --once
+func TestReadEnrolTokenDashReadsStdin(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("  piped-token\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdin
+	os.Stdin = f
+	defer func() { os.Stdin = old }()
+	got, err := readEnrolToken("-")
+	f.Close()
+	if err != nil || got != "piped-token" {
+		t.Fatalf("readEnrolToken(%q) = %q, %v; want %q", "-", got, err, "piped-token")
+	}
+}
+
+func TestReadEnrolTokenDashRefusesEmptyStdin(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("  \n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdin
+	os.Stdin = f
+	defer func() { os.Stdin = old }()
+	_, err = readEnrolToken("-")
+	f.Close()
+	if err == nil {
+		t.Fatal("empty stdin was accepted as a token")
+	}
+	if !strings.Contains(err.Error(), "empty") {
+		t.Errorf("error %q does not say the token is empty", err)
+	}
+}
