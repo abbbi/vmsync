@@ -167,6 +167,19 @@ not only at startup: a sync runs for minutes or hours, and a role set part
 way through would otherwise be silently reverted by the run that was
 already in flight when it was set.
 
+**`-promote` is gated separately, on evidence.** The role says what a domain
+*is*; promoting it also asks whether there is a usable replica there to make
+live. `-promote` refuses on missing disks, no completed sync, no recorded
+source, an uncommitted overlay left by an interrupted copy, a non-zero
+`failure_count` — and on a recorded verification failure, which is the one
+reason that means the copy is *wrong* rather than merely *stale*: a `-verify`
+compared it against its source, found the contents differing, and stamped
+`verify_state` on the domain. `-force-promote` proceeds past any of them and
+then reports the data-loss window as unknown rather than guessing; it does not
+clear the verification record, so a replica forced live stays marked as one
+known not to match. [docs/RUNBOOK.md](docs/RUNBOOK.md) has what to do about
+each refusal instead.
+
 ## Two runs, one target
 
 vmsync takes two run locks. The first is on the **source** host, keyed by
