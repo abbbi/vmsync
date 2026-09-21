@@ -222,6 +222,20 @@ type ReportDomain struct {
 	FailureCount   int      `json:"failure_count"`
 	ReplicaSource  string   `json:"replica_source,omitempty"`
 	ReplicaTargets []string `json:"replica_targets,omitempty"`
+	// The record a -verify run left when it found this replica's contents
+	// differing from its source. Absent on every replica that has never
+	// failed one, which is almost all of them; presence is the state.
+	//
+	// Reported because it is the only signal here about what the replica
+	// CONTAINS rather than about whether replication ran. FailureCount and
+	// LastSyncUnix can only ever say the copy may be missing recent writes;
+	// this says the copy that arrived was compared against its source and
+	// did not match. The console needs the difference to warn before a
+	// failover rather than explain after one -- the hypervisor already
+	// refuses to sync into such a domain, so without this the estate view
+	// shows a replica quietly frozen with no visible cause.
+	VerifyState        string `json:"verify_state,omitempty"`
+	VerifyFailedAtUnix int64  `json:"verify_failed_at_unix,omitempty"`
 	// The promotion record, present only on a domain failed over TO.
 	// PromotedFrom identifies which source a promotion displaced, which is
 	// what lets the control plane work out who must not keep running

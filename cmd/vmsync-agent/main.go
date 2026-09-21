@@ -804,6 +804,8 @@ func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler, ledger 
 			FailureCount:         d.FailureCount,
 			ReplicaSource:        d.ReplicaSource,
 			ReplicaTargets:       d.ReplicaTargets,
+			VerifyState:          d.VerifyState,
+			VerifyFailedAtUnix:   d.VerifyFailedAtUnix,
 			PromotedFrom:         d.PromotedFrom,
 			PromotedAtUnix:       d.PromotedAtUnix,
 			PromotedBy:           d.PromotedBy,

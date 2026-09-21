@@ -238,6 +238,71 @@ func TestSendReportCarriesFenceStateUnderTheAgreedNames(t *testing.T) {
 	}
 }
 
+// The agent's half of the wire contract for a recorded verification failure.
+//
+// Pinned for the same reason the fence names above are: the UI decodes
+// reports with DisallowUnknownFields, so a name that drifts here does not
+// degrade one badge, it rejects the whole report and looks like every
+// upgraded host going offline at once. This one carries a second cost --
+// it is the field that says a replica's contents are known wrong, so a
+// rejected report takes the warning down with it.
+func TestSendReportCarriesVerifyStateUnderTheAgreedNames(t *testing.T) {
+	var raw map[string]any
+	c, _ := stubUI(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&raw)
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	report := Report{
+		ReportedAtUnix: 1_800_000_000,
+		Hostname:       "hyper02p",
+		Domains: []ReportDomain{
+			{
+				Name: "web01", Active: false, Role: "target", Status: "critical",
+				ReplicaSource:      "hyper01p:web01",
+				VerifyState:        "failed",
+				VerifyFailedAtUnix: 1_799_990_000,
+			},
+			{
+				Name: "db01", Active: false, Role: "target", Status: "ok",
+				ReplicaSource: "hyper01p:db01",
+			},
+		},
+	}
+	if err := c.SendReport(context.Background(), report); err != nil {
+		t.Fatalf("SendReport() error = %v", err)
+	}
+
+	domains, _ := raw["domains"].([]any)
+	if len(domains) != 2 {
+		t.Fatalf("the UI received %d domains, want 2", len(domains))
+	}
+
+	first, _ := domains[0].(map[string]any)
+	if got := first["verify_state"]; got != "failed" {
+		t.Errorf("verify_state = %v, want \"failed\" -- vmsync_ui's store.ReportDomain pins the same key", got)
+	}
+	// Compared as a number: JSON has no integers, so this is what the UI
+	// actually decodes into an int64 field, and a value sent as a string
+	// would fail there rather than here.
+	if got, ok := first["verify_failed_at_unix"].(float64); !ok || int64(got) != 1_799_990_000 {
+		t.Errorf("verify_failed_at_unix = %v (%T), want the unix number 1799990000", first["verify_failed_at_unix"], first["verify_failed_at_unix"])
+	}
+
+	// A replica that never failed a verification must send neither key.
+	// `omitempty` is what keeps the absent case absent, and absence is the
+	// state the UI reads as "no recorded failure" -- an empty string
+	// arriving for every healthy domain in the estate would be indexed and
+	// rendered as though it meant something.
+	second, _ := domains[1].(map[string]any)
+	if _, present := second["verify_state"]; present {
+		t.Error("a replica with no recorded verification failure must omit verify_state entirely")
+	}
+	if _, present := second["verify_failed_at_unix"]; present {
+		t.Error("a replica with no recorded verification failure must omit verify_failed_at_unix entirely")
+	}
+}
+
 func TestRevokedCredentialIsDistinguishedFromEveryOtherFailure(t *testing.T) {
 	// Worth its own error: every other failure is worth retrying, this one
 	// never succeeds until an operator issues a fresh enrolment token. An

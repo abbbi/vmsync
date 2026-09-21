@@ -65,6 +65,28 @@ type Domain struct {
 	LastSyncUnix int64 `json:"last_sync_unix,omitempty"`
 	FailureCount int   `json:"failure_count"`
 
+	// The record a -verify run leaves behind when it found this replica's
+	// contents differing from its source. Presence IS the state, exactly as
+	// libvirtsync.MetadataFieldVerifyState defines it: empty is every
+	// replica that has never failed a verification, and the only value ever
+	// written is libvirtsync.VerifyStateFailed.
+	//
+	// This is the one field here that says the replica is WRONG, as opposed
+	// to merely old. Everything else on this struct describes whether
+	// replication RAN -- an age, a failure count, a missing checkpoint, all
+	// of which mean recent writes may be missing. This one means a
+	// comparison against the source read back what was already copied and
+	// found it different, so the copy that IS there cannot be trusted
+	// either. Failing to report it is how a replica known not to match its
+	// source gets chosen as a failover target by an operator looking at a
+	// screen that showed nothing wrong.
+	//
+	// VerifyFailedAtUnix is 0 when the finding carries no timestamp, which
+	// is reported as such rather than guessed at: a verification failure of
+	// unknown date is still a verification failure.
+	VerifyState        string `json:"verify_state,omitempty"`
+	VerifyFailedAtUnix int64  `json:"verify_failed_at_unix,omitempty"`
+
 	// ReplicaSource is set on a TARGET: "host:domain" of where it is
 	// replicated from. ReplicaTargets is set on a SOURCE: every target it
 	// has ever been replicated to.
@@ -222,7 +244,53 @@ type Assessment struct {
 // where it replicates TO, not when -- the timestamp lives on the target,
 // written by the run that updated it -- so assessing a source on its own
 // last_sync would report every source as permanently stale.
+//
+// A recorded verification failure is applied on top of that verdict rather
+// than inside it, which is why this function is a wrapper. The replication
+// verdict below is built from a chain of early returns -- unreplicated,
+// paused, fenced, promoted, never-synced -- and every one of them is a path
+// on which a "your replica is wrong" finding would never be reached. Laying
+// it over the result instead makes the finding independent of that chain by
+// construction, including for early returns added later.
 func Assess(d Domain, now time.Time, cadence time.Duration) Assessment {
+	a := assessReplication(d, now, cadence)
+
+	// Presence is the state -- see libvirtsync.MetadataFieldVerifyState --
+	// so any value at all is a failure, including one this build does not
+	// recognise. An unknown value is treated as bad news on purpose: the
+	// alternative is a future value silently reading as healthy.
+	if d.VerifyState != "" {
+		// Outranks everything assessReplication can have concluded, and the
+		// ordering of Status does that on its own: critical is the maximum,
+		// so "known wrong" wins over "stale" (warning), over the
+		// administrative paused/promoted states, and over unreplicated.
+		//
+		// That precedence is the whole point. A paused, fenced or promoted
+		// replica is exactly where this finding is easiest to lose -- those
+		// are the states an operator reads as "nothing to do here" -- and a
+		// promoted domain that failed its last verification is a live
+		// service running on data known not to match what it replaced.
+		// Administrative calm must not outrank evidence of corruption.
+		a.Status = Worse(a.Status, StatusCritical)
+
+		when := "at an unrecorded time"
+		if d.VerifyFailedAtUnix > 0 {
+			when = "on " + time.Unix(d.VerifyFailedAtUnix, 0).UTC().Format(time.RFC3339)
+		}
+		// Prepended, not appended: this is the reason that changes what an
+		// operator does, and a UI showing only the first one must not show
+		// "promoted to live after a failover" while the copy is known wrong.
+		a.Reasons = append([]string{fmt.Sprintf(
+			"the replica's contents were found to differ from its source %s and the finding has not been cleared (verify_state=%s), so this copy is known WRONG rather than merely stale -- see that run's log for which blocks differed",
+			when, d.VerifyState)}, a.Reasons...)
+	}
+	return a
+}
+
+// assessReplication is the replication-health half of Assess: everything
+// judged from whether syncing ran and how recently. Kept separate so the
+// verification finding cannot be swallowed by its early returns.
+func assessReplication(d Domain, now time.Time, cadence time.Duration) Assessment {
 	a := Assessment{Status: StatusOK, AgeSeconds: -1}
 
 	if !d.Participates() {
@@ -409,6 +477,28 @@ func describe(dom *libvirt.Domain, verboseSkips bool) (Domain, error) {
 		d.RestorePoints = RestorePointsFor(d)
 	}
 
+	applyDomainMetadata(xml, &d)
+	return d, nil
+}
+
+// applyDomainMetadata fills in everything a Domain takes from its vmsync
+// metadata element, and touches nothing that needs a libvirt connection.
+//
+// Split out of describe so this mapping can be tested at all. Inline, the
+// only way to reach these lines was a live libvirt holding a real domain, so
+// a field that was never parsed here looked exactly like a field no domain
+// had -- and a test that built a Domain by hand went on passing while the
+// scan reported an empty value for it. That is not hypothetical: the verify
+// verdict reached the promotion gate's own rules and was never populated by
+// the reader in front of them, which is the defect this seam exists to keep
+// from recurring. A field added to Domain that comes from metadata belongs
+// here, where a test can see whether it arrives.
+//
+// Every parse failure is swallowed into the zero value, matching how the
+// rest of this package reads metadata: an absent field is the ordinary case,
+// so it must not turn an otherwise good scan into an error. The value fails
+// closed, never the whole read.
+func applyDomainMetadata(xml string, d *Domain) {
 	d.Role, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldReplicationRole)
 	d.LastCheckpoint, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldLastCheckpoint)
 	d.ReplicaSource, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldReplicaSource)
@@ -453,6 +543,19 @@ func describe(dom *libvirt.Domain, verboseSkips bool) (Domain, error) {
 			d.FailureCount = n
 		}
 	}
+	// Read unconditionally rather than only for targets: the field is written
+	// on whatever domain a -verify compared, and a domain carrying one that
+	// its current role does not explain is itself something an operator needs
+	// to see rather than something this scan should quietly drop.
+	d.VerifyState, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldVerifyState)
+	if raw, err := libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldVerifyFailedAt); err == nil && raw != "" {
+		if n, convErr := strconv.ParseInt(raw, 10, 64); convErr == nil {
+			d.VerifyFailedAtUnix = n
+		}
+		// A value that will not parse leaves the timestamp at 0, which Assess
+		// reports as an unrecorded time. Dropping the whole finding because
+		// its date is unreadable would discard the part that matters.
+	}
 	if raw, err := libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldReplicaTargets); err == nil && raw != "" {
 		for _, entry := range strings.Split(raw, ",") {
 			if entry = strings.TrimSpace(entry); entry != "" {
@@ -460,5 +563,4 @@ func describe(dom *libvirt.Domain, verboseSkips bool) (Domain, error) {
 			}
 		}
 	}
-	return d, nil
 }
