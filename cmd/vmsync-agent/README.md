@@ -1221,7 +1221,7 @@ that a value the agent accepts is one vmsync will accept:
 | `io_depth` | 0 for vmsync's default, otherwise 1–64 |
 | `no_checksum` | boolean, default `false` — the check is **on**. Disables the pre-commit integrity check: the copy hashes every chunk it reads, `vmsync-bridge-helper` hashes the same ranges back off the target, and an incremental sync's overlay is removed instead of committed if they disagree. Rarely needed: where the helper is missing or version-skewed vmsync already skips the check with a warning rather than failing the sync, so this is for stating that intent deliberately and silencing that warning. |
 | `verify` | `""`, `"fast"`, `"full"`, `"qemu-img"`. All three compare against the same frozen source snapshot the copy read from; only `qemu-img` suspends the source, and only to keep the snapshot's scratch space empty. |
-| `verify_failure_reinit` | boolean, default `false`. Answers a verification failure with one full recopy and a second verification. If that also fails, the replica is recorded as faulty on its own domain XML: later syncs into it are refused, and a promotion reports it as untrustworthy, until a human clears it. Refused without `verify`. Worth setting here even though vmsync defaults it off — a one-off run has an operator to decide what to do about a mismatch, a scheduled one does not, and without it the next run syncs straight over the finding. |
+| `verify_failure_reinit` | boolean, default `false`. Answers a verification failure with one full recopy and a second verification. If that also fails, the replica is recorded as faulty on its own domain XML: later syncs into it are refused, and a promotion is refused too unless `-force-promote` is passed, until a human clears it. Refused without `verify`. Worth setting here even though vmsync defaults it off — a one-off run has an operator to decide what to do about a mismatch, a scheduled one does not, and without it the next run syncs straight over the finding. |
 | `reinit_after_failures` | 0 to disable, otherwise up to 100 |
 | `target_disk_path` | absolute and clean |
 | `timestamp_tolerance_sec` | 0 to compare exactly, otherwise up to 3600 |
@@ -1468,14 +1468,18 @@ Each domain gets a status and the reasons behind it:
 | `unreplicated` | vmsync has no relationship with this domain. |
 | `paused` / `promoted` | Administrative states, not faults. |
 | `warning` | Degraded but still replicating — failures recorded, past its cadence, or no checkpoint to sync incrementally against. |
-| `critical` | Never synced, or far past its cadence. |
+| `critical` | Never synced, far past its cadence, or carrying a recorded verification failure — a comparison against the source found the replica's contents differing, so this copy is known *wrong* rather than merely behind. |
 
 Two rules worth knowing when reading the output:
 
 - **`promoted` and `paused` suppress the staleness checks.** Those domains are
   supposed to stop receiving syncs, so a growing age is expected rather than a
   fault — reporting it would bury the real signal for exactly the VMs you are
-  watching most closely.
+  watching most closely. They do **not** suppress a recorded verification
+  failure, which overrides either of them and reports `critical`: those are the
+  states an operator reads as "nothing to do here", and a promoted domain that
+  failed its last verification is a live service running on data known not to
+  match what it replaced.
 - **A domain with no configured cadence is not judged on freshness at all.**
   Guessing a threshold would report a pair that legitimately syncs weekly as
   critical forever. Cadences come from the UI, so in standalone mode nothing is
@@ -1483,7 +1487,11 @@ Two rules worth knowing when reading the output:
 
 A report also carries the host's filesystem usage for the paths its domains'
 disks live on, each domain's disks and restore points, the recent sync outcomes,
-stored operation results, and the fence state described above.
+stored operation results, the fence state described above, and each domain's
+verification record (`verify_state` with `verify_failed_at_unix`) — read from
+the domain's own metadata, where vmsync wrote it, and reported for every domain
+rather than only for targets, because a domain carrying a finding its current
+role does not explain is itself something to look at.
 
 A libvirt failure while building a report is logged loudly but is not fatal:
 libvirtd restarts, and an agent that exited would then need systemd to bring it
