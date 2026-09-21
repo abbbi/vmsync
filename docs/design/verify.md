@@ -373,9 +373,14 @@ yet run on hardware" and at the end of "Settled on hardware":
 - Two `pending_checkpoint` recovery branches bench cannot construct — a
   mid-chain pending record, and the source-shut-down case. Both are covered by
   `TestPlanCheckpointRecovery`; neither has run against libvirt.
-- Whether a digest verify's cost is now dominated by the source-side read
-  through the fleecing export. The `nbd digest complete` line reports its own
-  elapsed time; comparing that against the run's total verify time answers it.
+- Which SIDE a digest verify is waiting on. Both sides hash at once, so the slower of the two IS the
+  verify. Two log lines now answer it directly, in the same fields: `nbd
+  digest complete` for the source read through the fleecing export, and
+  `checksum: target digest complete` for the target. The second one was
+  missing, which made the question unanswerable from a log -- only the source
+  was timed. Note the target line is a ROUND TRIP: it includes the SSH
+  command and the helper starting, milliseconds against a hashing pass in
+  seconds, but enough to explain an odd-looking number on a tiny delta.
 
 ### Historical: how the checksum design was arrived at
 
@@ -607,7 +612,9 @@ now run against a real pair, with all bench stages passing:
   the dirty bitmap and must refuse with the remedy rather than fall back to
   a metadata-only delete. Both are unit-tested
   (`TestPlanCheckpointRecovery`); neither has run against libvirt.
-- Whether a digest verify's cost is now dominated by the source-side read
-  through the fleecing export. The `nbd digest complete` line reports its own
-  elapsed time; comparing that against the run's total verify time answers
-  it, and decides whether anything further is worth optimising.
+- Which side a digest verify is waiting on. Both sides hash at once, so the
+  slower one is the verify's cost. `nbd digest complete` times the source and
+  `checksum: target digest complete` times the target, in the same fields —
+  the second was added later, because until then only the source was timed and
+  the question could not be answered from a log at all. See the fuller note
+  under "Open".
