@@ -922,7 +922,7 @@ incremental at 03:00, and the promotion at 09:00 saw a replica with a clean
 record. Nothing was untrue — the finding was in a log — but nothing that
 *decides* anything could see it.
 
-Four assertions, in the order the state moves:
+Six assertions, in the order the state moves:
 
 - **`mismatch`** — the finding must be written to the target domain as
   `verify_state=failed` plus a `verify_failed_at` unix timestamp. The
@@ -961,12 +961,44 @@ Four assertions, in the order the state moves:
   mechanism rather than the data), that the log says a third attempt is not
   coming, and that the record is there afterwards.
 
-Not in the default stage list: four of the five sub-tests deliberately fail a
-sync, and one deliberately corrupts the replica. Its baseline is `-force-clean`
-rather than `-reinit`, because a re-run after a previous attempt left a record
-behind would otherwise be refused by the very interlock under test. Every
-sub-test's damage is undone by a `heal_target` on the way out, whichever way
-the stage ends.
+- **`refuse-promote`** — while the record stands, `vmsync -promote` must be
+  **refused**, and `-force-promote` must still get past it *loudly*. The
+  assertion the five above exist to make possible: they prove the **sync**
+  gate acts on the finding, this is the only one that proves the **promotion**
+  gate does — a separate check, in a separate package, on a code path no other
+  sub-test crosses, which is why it could pass its own unit tests while
+  production promoted the bad replica anyway. A promotion is where a replica stops being a copy and
+  becomes what users are talking to, so a replica a comparison has already
+  found different from its source is precisely the one that must not get there
+  without somebody saying so in a flag. It is checked three ways on purpose.
+  The refusal must **name the recorded verification failure in its log**, not
+  merely exit non-zero — a promote that never ran at all (wrong binary path,
+  unreadable domain) exits non-zero too, and accepting that would record this
+  interlock as working on a run where it was never consulted. The domain must
+  **not be left promoted**, since a run that calls itself refused and writes
+  the role anyway is worse than either outcome alone. And `-force-promote`
+  must succeed *and* say what it overrode, because an override that says
+  nothing leaves no way to tell a considered decision from a mistake when
+  somebody reads this domain's metadata a week later.
+
+  It runs **last**, and that placement is load-bearing: `repair` clears the
+  record the moment a verify passes, so a promotion attempted after it would
+  meet a clean replica and "pass" by refusing nothing, while `gives-up`
+  deliberately leaves a fresh `verify_state=failed` behind — the state a real
+  estate finds its replica in the morning after. It reads that record first
+  and **skips** if it is absent, rather than reporting a pass it did not earn.
+  It puts the role back with `-update-role target` whatever it found, because
+  the stage's heal on the way out is a sync and a promoted domain refuses
+  those. Needs `TARGET_VMSYNC_BIN` (vmsync on the *target* host): `-promote`
+  refuses a remote libvirt URI by design, so it must run where the domain is,
+  and without that setting this sub-test skips rather than failing.
+
+Not in the default stage list: four of the six sub-tests deliberately fail a
+sync, one deliberately corrupts the replica, and one promotes it (putting the
+role straight back). Its baseline is `-force-clean` rather than `-reinit`,
+because a re-run after a previous attempt left a record behind would otherwise
+be refused by the very interlock under test. Every sub-test's damage is undone
+by a `heal_target` on the way out, whichever way the stage ends.
 
 One consequence worth knowing: `heal_target`, which undoes every tamper in this
 harness, now uses `-force-clean` rather than `-reinit`, because every tamper
