@@ -280,8 +280,10 @@ DEFINE_ROLLBACK_WAIT_SECONDS=300
 # else. This harness therefore has to invoke vmsync over SSH on the target
 # rather than driving it from here as every other stage does.
 #
-# Leave it unset to skip Stage 6 entirely (it skips with a message rather
-# than failing).
+# Leave it unset and everything here that has to run vmsync on the target
+# skips with a message rather than failing: Stages 6, 7 and 11 entirely, and
+# Stage 14's promotion sub-test (14f) on its own, while the rest of that
+# stage still runs -- it needs no target-side binary.
 #TARGET_VMSYNC_BIN=/usr/local/bin/vmsync
 
 

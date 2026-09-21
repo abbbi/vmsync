@@ -181,7 +181,7 @@ belongs.
 
 Stage 14 (verify-failure) is opt-in and tests what happens AFTER -verify finds
 a difference -- stage 2 proves the difference is noticed, this proves the
-notice outlives the process. It corrupts the replica, then asserts four things
+notice outlives the process. It corrupts the replica, then asserts six things
 in the order the state moves: the finding is written to the target domain
 (verify_state/verify_failed_at); an ordinary sync is refused while it stands,
 without being counted toward -reinit-after-failures; a plain -reinit is
@@ -194,8 +194,17 @@ fails and the recopy-and-re-verify fires for real. A fifth then covers the
 branch a tamper cannot reach -- the repair's own verify failing, so vmsync
 stops rather than trying a third time -- using -test=corrupt-after-commit, which
 corrupts the replica after each copy is committed and so fails both rungs of
-the ladder. Opt-in because four of the five sub-tests deliberately fail a sync,
-and one of them deliberately corrupts the replica.
+the ladder. A sixth runs last, on the record that fifth one deliberately leaves
+standing, and asserts what keeping a record is ultimately FOR: a -promote
+against a replica recorded as having failed verification is refused, by name in
+the log rather than merely by a non-zero exit, and without leaving the domain
+promoted -- while -force-promote still gets past it and records exactly what it
+overrode. That last one needs TARGET_VMSYNC_BIN set (vmsync on the TARGET
+host), since -promote refuses a remote libvirt URI by design, and skips rather
+than failing without it. Opt-in because four of the six sub-tests deliberately
+fail a sync, one deliberately corrupts the replica, and one promotes it --
+putting the role straight back afterwards, since the stage's own heal is a sync
+and a promoted domain refuses those.
 
 Stage 15 (commit-barrier) is opt-in and proves the one property that needed a
 multi-disk domain to state at all: when ONE disk fails, NO disk commits. Each
@@ -4714,7 +4723,7 @@ checksum_disabled_subtest() {
 # was lied to exactly once -- the finding was in a log -- but nothing that
 # decides anything could see it.
 #
-# So five assertions, in the order the state moves:
+# So six assertions, in the order the state moves:
 #   14a the finding is written to the target domain
 #   14b an ordinary sync is REFUSED while it stands, and does not count as a
 #       sync failure
@@ -4725,12 +4734,18 @@ checksum_disabled_subtest() {
 #   14d -verify-failure-reinit repairs it, and only a PASSING verify clears it
 #   14e when the repair's OWN verify fails, vmsync stops rather than trying a
 #       third time, and leaves the replica faulty for a human
+#   14f a PROMOTION is refused while the finding stands -- the end every one of
+#       the assertions above exists to serve, since promoting is the moment a
+#       replica stops being a copy and starts being what users are talking to
+#       -- and the override that gets past it says in its log what it overrode
 #
 # 14a-14d run off the tamper this stage applies; 14e cannot, because the repair
 # recopies the whole replica and so heals any corruption staged from outside --
 # that is what makes 14d pass. It brings its own fault instead
 # (-test=corrupt-after-commit), which fires after each copy is committed, so both
-# rungs of the ladder fail.
+# rungs of the ladder fail. 14f needs no fault of its own at all: it runs on the
+# record 14e leaves standing, which is exactly the state a real estate finds its
+# replica in the morning after a verification failed twice overnight.
 stage_verify_failure() {
 	log "=== Stage 14: a verification failure must outlive the run that found it ==="
 
@@ -4765,6 +4780,27 @@ stage_verify_failure() {
 	# of the two things that gets past the record.
 	trap 'heal_target verify-failure final-heal "$target_path"' RETURN
 
+	# And an EXIT trap beside it, for the one sub-test that promotes: 14f.
+	# RETURN does not fire on die or on a signal, which are exactly the cases
+	# that would leave the target promoted -- and a promoted target does not
+	# merely fail this stage, it makes the heal above a die() of its own,
+	# because that heal is a sync and the role gate refuses syncs into a
+	# promoted domain. Same shape as stages 6 and 7, guarded so it acts only
+	# when 14f actually promoted and has not already put the role back.
+	VF_PROMOTED=no
+	VF_CLEANED=no
+	verify_failure_promotion_cleanup() {
+		[ "$VF_CLEANED" = yes ] && return 0
+		VF_CLEANED=yes
+		[ "$VF_PROMOTED" = yes ] || return 0
+		if clear_target_promotion; then
+			log "stage 14: the target is back to role=target"
+		else
+			warn_target_still_promoted
+		fi
+	}
+	trap 'verify_failure_promotion_cleanup' EXIT
+
 	if ! draw_tamper "$vsize"; then
 		warn "SKIP stage 14: the configured tamper band does not fit inside a ${vsize}-byte disk"
 		results_row "$CSV" verify-failure precondition "" "" "" "" "" "" "SKIP tamper band does not fit the disk"
@@ -4780,10 +4816,22 @@ stage_verify_failure() {
 	verify_failure_refuses_sync_subtest
 	verify_failure_refuses_reinit_subtest
 	verify_failure_repair_subtest
-	# Last, because it is the only sub-test that does not depend on the tamper
+	# Late, because it is the only sub-test that does not depend on the tamper
 	# applied above -- it brings its own fault -- and because it deliberately
 	# ends with the replica faulty for the RETURN trap to clean up.
 	verify_failure_gives_up_subtest
+	# Last, and running on what 14e leaves behind rather than on anything of
+	# its own. 14d CLEARS the record the moment a verify passes, so this is
+	# the only point after it where a fresh verify_state=failed is standing
+	# to be promoted against. Running last also means the one thing it
+	# changes -- the domain's role, briefly -- is put back with nothing but
+	# the RETURN trap's heal behind it, so a restore that fails cannot turn
+	# into another sub-test failing for a reason that is not its own.
+	verify_failure_refuses_promote_subtest
+	# Stood down here, not left armed: the sub-test puts the role back itself,
+	# and an EXIT trap still armed at this point would fire at the end of the
+	# whole run, long after the heal below has rebuilt this replica.
+	trap - EXIT
 	return 0
 }
 
@@ -4993,6 +5041,181 @@ verify_failure_gives_up_subtest() {
 	else
 		warn "FAIL: $details. See $RUN_LOG"
 		results_row "$CSV" verify-failure gives-up-result 1 "" "" "" "" "" "FAIL $failures check(s) failed"
+	fi
+}
+
+# 14f: while the record stands, a PROMOTION must be refused as well.
+#
+# The assertion the other five exist to make possible. 14b and 14c prove the
+# SYNC gate acts on the record; this is the only one that proves the PROMOTION
+# gate does -- a separate check, in a separate package, reached by a code path
+# no other sub-test crosses. That separation is exactly why the promotion gate
+# could sit there passing its own unit tests, against inputs built by hand,
+# while production promoted the bad replica anyway. A promotion is where a replica stops being a
+# copy and becomes what users are talking to, so a replica a comparison has
+# already found different from its source is precisely the one that must not
+# become production without somebody saying, in a flag and in the log, that
+# they are booting a copy known to be wrong.
+#
+# Worth asserting rather than assuming, because the check it exercises is split
+# across two packages: pkg/failover decides from a struct, and the promote
+# command has to fill that struct in from the domain. A promote that never
+# reads verify_state off the target leaves the refusal as dead code that every
+# unit test still passes -- those tests set the field by hand -- while
+# production promotes the bad replica without a word. Nothing else in this
+# harness would catch that: stage 6 promotes a replica it synced moments
+# earlier, which carries no finding for a promotion to ignore.
+#
+# Placement is load-bearing and is why this runs last. 14d CLEARS the record as
+# soon as a verify passes, which is the whole point of that sub-test, so a
+# promotion attempted after it would meet a clean replica and "pass" by
+# refusing nothing -- the same vacuous pass the stage header warns about for
+# 14b and 14c. 14e then leaves a FRESH verify_state=failed behind on purpose,
+# because it is the sub-test that ends with the replica faulty for a human to
+# find, and that human's next move is the one being tested here.
+#
+# The precondition is therefore READ rather than assumed. 14e can fail or be
+# skipped -- it needs a vmsync built with -test=corrupt-after-commit -- and a
+# promotion refused against a replica carrying no finding at all would prove
+# nothing while reporting a pass, which is worse than reporting nothing.
+verify_failure_refuses_promote_subtest() {
+	log "--- 14f verify-failure/refuses-promote: a promotion must be refused while the record stands ---"
+
+	# -promote acts on the host it runs on and refuses a remote libvirt URI by
+	# design -- that is what keeps a failover working when the other site is
+	# unreachable -- so it needs vmsync ON the target host, exactly as stages
+	# 6, 7 and 11 do. Saying so beats letting the attempt fail: a promote that
+	# could not be run at all exits non-zero just like a promote that was
+	# refused, and that is the confusion this whole sub-test is written to
+	# avoid.
+	if [ -z "${TARGET_VMSYNC_BIN:-}" ]; then
+		warn "SKIP 14f: TARGET_VMSYNC_BIN is not set in $CONF, and -promote must run ON $TARGET_HOST because it refuses a remote libvirt URI by design -- so there is no way from here to attempt the promotion this sub-test is about."
+		results_row "$CSV" verify-failure refuse-promote-result "" "" "" "" "" "" "SKIP TARGET_VMSYNC_BIN unset"
+		return 0
+	fi
+
+	local state
+	state="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" verify_state)"
+	if [ "$state" != failed ]; then
+		warn "SKIP 14f: $TARGET_DOMAIN carries verify_state='$state' rather than 'failed', so there is no recorded verification failure for a promotion to be refused over. 14e is what leaves one standing -- read its row above before treating this as a vmsync problem."
+		results_row "$CSV" verify-failure refuse-promote-result "" "" "" "" "" "" "SKIP no verify_state record to promote against"
+		return 0
+	fi
+
+	# The target host addressed by its own LOCAL uri, never TARGET_URI, for
+	# the reason above.
+	local local_uri="qemu:///system"
+	local failures=0 details="" role role_before refuse_log refuse_rc force_log force_rc
+
+	# Captured BEFORE the attempt so the refusal can be checked positively --
+	# "the role did not change" rather than "the role is not promoted".
+	# vmsync_meta_field swallows every error it meets, so a virsh that will
+	# not answer, a missing xmllint or an SSH hiccup all read as an empty
+	# string; an assertion phrased as [ "$role" != promoted ] is satisfied by
+	# every one of those without the domain having been looked at, which is
+	# the wrong-reason pass this sub-test exists to rule out. The verify_state
+	# read above already proved the same path works on this pair a moment ago.
+	role_before="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
+
+	# Both outcomes of this run are read more than once below, so they are
+	# copied out of RUN_LOG/RUN_RC immediately: those two are globals that the
+	# next vmsync_on_host overwrites, and an assertion reading a later run's
+	# exit code while quoting this one's is exactly the kind of wrong-reason
+	# pass this sub-test exists to rule out.
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" verify-failure refuse-promote \
+		-promote -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN" \
+		-promote-mode forced -promoted-by bench-harness
+	refuse_log="$RUN_LOG"
+	refuse_rc="$RUN_RC"
+	if [ "$refuse_rc" = 0 ]; then
+		failures=$((failures + 1))
+		details="-promote SUCCEEDED against a replica recorded as having failed verification, so a copy already proven not to match its source becomes production with nothing said and nobody asked to override anything"
+	elif ! grep -q "verification found this replica's contents differing from its source" "$refuse_log" 2>/dev/null; then
+		# Not satisfied by the exit code alone, and deliberately so. A promote
+		# that never ran -- wrong path, unreadable domain, a libvirt that would
+		# not answer -- exits non-zero too, and so does one refused over some
+		# unrelated piece of missing evidence. Accepting any of those as proof
+		# would record this interlock as working on a run where it was never
+		# consulted, which is the exact failure mode that let the gap this
+		# sub-test covers survive a green harness.
+		failures=$((failures + 1))
+		details="-promote failed (exit=$refuse_rc) but its log never names the recorded verification failure, so something else stopped it -- a binary that is not there, a domain that could not be read, or an unrelated evidence problem all end this way, and none of them proves the finding was so much as read"
+	fi
+
+	# Refused has to mean nothing was written, not merely that something was
+	# reported. A domain left promoted by a run that called itself refused is
+	# worse than either outcome alone: the replica is serving and the only
+	# record of how it got there says it was not allowed to.
+	role="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
+	if [ "$role" != "$role_before" ]; then
+		failures=$((failures + 1))
+		details="${details}${details:+; }the promotion reported itself refused but $TARGET_DOMAIN's replication_role moved from '$role_before' to '$role', so the refusal is cosmetic -- and at 'promoted' every sync into this domain is now refused as well"
+	fi
+
+	# And the way past, which must exist and must be loud. An interlock with
+	# no supported override is one an operator routes around by hand during
+	# an outage, and an override that says nothing leaves no durable trace
+	# that a copy known to be wrong was chosen deliberately -- which is the
+	# only thing that distinguishes a considered decision from a mistake when
+	# somebody reads this domain's metadata a week later.
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" verify-failure force-promote \
+		-promote -force-promote -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN" \
+		-promote-mode forced -promoted-by bench-harness
+	force_log="$RUN_LOG"
+	force_rc="$RUN_RC"
+	# Armed the moment the promotion may have taken, so the stage's EXIT trap
+	# can put the role back if anything between here and the restore below
+	# ends the run instead -- a die, a Ctrl+C, a failed assertion that exits.
+	[ "$force_rc" = 0 ] && VF_PROMOTED=yes
+	if [ "$force_rc" != 0 ]; then
+		failures=$((failures + 1))
+		details="${details}${details:+; }-force-promote failed too (exit=$force_rc), so the documented way past this refusal does not work and an operator facing a real outage has no supported way to boot the only copy they have left"
+	elif ! grep -q 'promoted despite' "$force_log" 2>/dev/null; then
+		failures=$((failures + 1))
+		details="${details}${details:+; }-force-promote succeeded without recording WHAT it was overriding, so the override is indistinguishable in the log from an ordinary promotion of a healthy replica"
+	elif ! grep -q "verification found this replica's contents differing from its source" "$force_log" 2>/dev/null; then
+		failures=$((failures + 1))
+		details="${details}${details:+; }-force-promote said it promoted despite something, but never that the something was the recorded verification failure -- so the finding was still not read, and the override is loud about the wrong thing"
+	fi
+
+	role="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
+	if [ "$force_rc" = 0 ] && [ "$role" != promoted ]; then
+		failures=$((failures + 1))
+		details="${details}${details:+; }-force-promote exited 0 but left replication_role='$role', so it reported a promotion it did not actually perform"
+	fi
+
+	# Whatever any of the above found, put the role back -- unconditionally,
+	# and not behind any of the branches, because the assertions are the part
+	# most likely to be wrong and the restore is the part that must not be.
+	# The stage's RETURN trap heals this replica with a -force-clean sync, and
+	# a sync into a promoted domain is refused by the role gate -- so a target
+	# left promoted here does not merely fail this sub-test, it turns the heal
+	# into a die() that ends the whole run with a knowingly corrupted replica
+	# still in place. -update-role=target is the same documented way back
+	# stage 6 uses, and it takes the promotion record with it.
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" verify-failure restore-role \
+		-update-role target -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+	role="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
+	if [ "$role" = target ]; then
+		# Verified back, so the stage's EXIT trap has nothing left to undo.
+		VF_PROMOTED=no
+	else
+		failures=$((failures + 1))
+		details="${details}${details:+; }the way back did not take and $TARGET_DOMAIN is left with replication_role='$role' rather than 'target'"
+		# Only a role that still REFUSES syncs is an emergency, and only that
+		# one deserves the full remedy printed: the heal on the way out of this
+		# stage is the very next thing that would run into it.
+		case "$role" in
+		promoted | source | paused) warn_target_still_promoted "$role" ;;
+		esac
+	fi
+
+	if [ "$failures" = 0 ]; then
+		log "   PASS: the promotion was refused by name, the domain stayed a target, and the override promoted it while saying what it overrode"
+		results_row "$CSV" verify-failure refuse-promote-result 0 "" "" "" "" "" "PASS promotion refused while the finding stands"
+	else
+		warn "FAIL: $details. See $refuse_log and $force_log"
+		results_row "$CSV" verify-failure refuse-promote-result 1 "" "" "" "" "" "FAIL $failures check(s) failed"
 	fi
 }
 
@@ -5949,7 +6172,7 @@ generate_report() {
                         echo "|---|---|---|---|"
                         awk -F, 'NR>1 && $1=="verify-failure" { printf "| %s | %s | %s | %s |\n", $2, $3, $4, $9 }' "$CSV"
                 else
-                        echo "_not run (opt in with \`--stages verify-failure\`; it corrupts the replica and three of its four sub-tests deliberately fail a sync)_"
+                        echo "_not run (opt in with \`--stages verify-failure\`; it corrupts the replica, four of its six sub-tests deliberately fail a sync, and one promotes the replica and puts the role straight back)_"
                 fi
                 echo
                 echo "## Stage 15: the commit barrier"
