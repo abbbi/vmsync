@@ -178,7 +178,7 @@ func failoverStateFromXML(domXML string) FailoverState {
 	// to know -- "failed" -- would silently drop a verdict written by a
 	// newer vmsync, which is the one direction this must not fail in.
 	st.VerifyState, _ = ParseMetadata(domXML, MetadataFieldVerifyState)
-	// Independently of the verdict, deliberately. A missing or unparseable
+	// Independently of the verdict, deliberately. A missing or unparsable
 	// date leaves this zero and the verdict standing, so the promotion is
 	// still refused and merely says the time was not recorded.
 	st.VerifyFailedAt = parseUnix(domXML, MetadataFieldVerifyFailedAt)
