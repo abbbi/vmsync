@@ -60,6 +60,65 @@ func requireLocalURI(uri, flagName string) error {
 	return nil
 }
 
+// promoteTargetState maps what was observed of a replica onto the input the
+// decision in pkg/failover is made from.
+//
+// A function of its own, and pure, because this mapping is a safety boundary
+// that nothing could otherwise test: reaching it inside runPromote needs a
+// libvirt connection, a run lock and a real domain, so on any machine
+// without those it simply is not exercised. A field quietly missing from the
+// literal below therefore costs nothing at build time and disables a refusal
+// at run time -- which is exactly what happened to the verify verdict, whose
+// gate sat in pkg/failover being tested against hand-built inputs while no
+// production promotion ever carried the field to it. Adding a field to
+// failover.TargetState means adding it here, and the test beside this file
+// is what says so out loud.
+//
+// disksPresent and overlayPresent are passed in rather than read here for
+// the same reason: they come from the filesystem, and a pure function is
+// worth more than the small saving of fetching them itself.
+//
+// CALLERS MUST ALREADY HOLD THIS TARGET'S RUN LOCK. SyncInFlight is reported
+// false on the strength of that alone, so calling this without the lock
+// manufactures the one piece of evidence AssessPromote refuses to let
+// -force-promote override, and a replica being written right now would be
+// assessed as quietly promotable. Inside runPromote the lock is taken a few
+// lines above; anywhere else it has to be checked deliberately.
+func promoteTargetState(st libvirtsync.FailoverState, disksPresent, overlayPresent bool) failover.TargetState {
+	return failover.TargetState{
+		Role:             st.Role,
+		LastCheckpoint:   st.LastCheckpoint,
+		LastSyncUnix:     st.LastSyncUnix,
+		CheckpointAtUnix: st.CheckpointAtUnix,
+		ReplicaSource:    st.ReplicaSource,
+		FailureCount:     st.FailureCount,
+		DisksPresent:     disksPresent,
+		OverlayPresent:   overlayPresent,
+		// The run lock the caller took on this target already proved no sync
+		// is writing this domain: it could not have been acquired otherwise.
+		SyncInFlight: false,
+		Active:       st.Active,
+		// Written by the sync that produced this replica: the source was
+		// already stopped when its checkpoint was taken, so nothing was
+		// written afterwards. This is what turns "planned failover" from a
+		// claim into a measurement.
+		SourceStoppedAtSync: st.SourceStoppedAtSync,
+		// A -verify run compared this replica against its own source and
+		// found them differing, and nothing has cleared the finding since.
+		// Every other field here describes whether replication RAN; this one
+		// describes what it produced, so leaving it out does not make the
+		// promotion slightly less informed -- it removes the only check that
+		// distinguishes a replica that may be stale from one already known
+		// to be wrong.
+		VerifyState:    st.VerifyState,
+		VerifyFailedAt: st.VerifyFailedAt,
+		// Changes nothing about whether this promotion is allowed; it changes
+		// what the plan SAYS about the window, which on a rolled-back replica
+		// is the age of a copy somebody chose rather than replication lag.
+		RestoredFrom: st.RestoredFrom,
+	}
+}
+
 // runPromote makes a replica authoritative.
 func runPromote(ctx context.Context, cfg syncConfig) error {
 	if cfg.TargetURI == "" || cfg.TargetDomain == "" {
@@ -107,29 +166,7 @@ func runPromote(ctx context.Context, cfg syncConfig) error {
 		return fmt.Errorf("could not inspect %s's disk files, so its replica cannot be corroborated: %w", cfg.TargetDomain, err)
 	}
 
-	plan, err := failover.AssessPromote(failover.TargetState{
-		Role:             st.Role,
-		LastCheckpoint:   st.LastCheckpoint,
-		LastSyncUnix:     st.LastSyncUnix,
-		CheckpointAtUnix: st.CheckpointAtUnix,
-		ReplicaSource:    st.ReplicaSource,
-		FailureCount:     st.FailureCount,
-		DisksPresent:     disksPresent,
-		OverlayPresent:   overlayPresent,
-		// The lock above already proved no sync is writing this domain: it
-		// could not have been acquired otherwise.
-		SyncInFlight: false,
-		Active:       st.Active,
-		// Written by the sync that produced this replica: the source was
-		// already stopped when its checkpoint was taken, so nothing was
-		// written afterwards. This is what turns "planned failover" from a
-		// claim into a measurement.
-		SourceStoppedAtSync: st.SourceStoppedAtSync,
-		// Changes nothing about whether this promotion is allowed; it changes
-		// what the plan SAYS about the window, which on a rolled-back replica
-		// is the age of a copy somebody chose rather than replication lag.
-		RestoredFrom: st.RestoredFrom,
-	}, failover.PromoteOptions{
+	plan, err := failover.AssessPromote(promoteTargetState(st, disksPresent, overlayPresent), failover.PromoteOptions{
 		Mode:    mode,
 		Start:   cfg.Start,
 		Force:   cfg.ForcePromote,

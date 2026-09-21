@@ -50,6 +50,28 @@ type FailoverState struct {
 	// RestoredFrom is the restore point this replica's disks were rolled
 	// back to, empty for a replica that was never restored.
 	RestoredFrom string
+	// VerifyState is the verdict a -verify run left behind when it found
+	// this replica's contents differing from its source, and is empty for
+	// every replica carrying no such finding -- which is nearly all of
+	// them. See MetadataFieldVerifyState: presence IS the state, and
+	// VerifyStateFailed is the only value ever written.
+	//
+	// It is read here because a promotion has to see it, and for a long
+	// while it was not. pkg/failover's evidence check refuses a replica
+	// carrying one, on the grounds that everything else it looks at means
+	// the replica may be STALE while this one means it may be WRONG -- so a
+	// field this package never fills in turns that refusal into dead code,
+	// and a replica already proven not to match its source is promoted with
+	// no warning and without anyone being asked to override anything.
+	VerifyState string
+	// VerifyFailedAt is when that finding was recorded, and is zero when the
+	// timestamp is absent or unreadable.
+	//
+	// A zero here must never be read as "no failure": VerifyState alone
+	// says that. A record written without a usable date still has to block
+	// a promotion, rather than being waved through for want of a timestamp
+	// -- the date only changes how the refusal is worded.
+	VerifyFailedAt int64
 	// Fence is the shutdown a promotion armed against its displaced source.
 	// Zero on every domain that was never promoted, and on every promotion
 	// that did not ask for one -- a drill, for instance.
@@ -89,6 +111,56 @@ func ReadFailoverState(mgr *Manager, domainName string) (FailoverState, error) {
 		return st, fmt.Errorf("read domain %s xml: %w", domainName, err)
 	}
 
+	// Everything this state takes from the metadata, decided by a function
+	// that needs no libvirt at all, then the two observations above put back
+	// on top of it: Exists is true by construction this far past the lookup,
+	// and Active is already in hand. See failoverStateFromXML for why the
+	// mapping lives on the other side of that seam.
+	st = failoverStateFromXML(domXML)
+	st.Exists = true
+	st.Active = active
+
+	// The real checkpoint objects, as opposed to the last_checkpoint string.
+	// These are what a later sync would try to chain onto, and what blocks
+	// an undefine, so an inversion has to know about them.
+	cpts, err := ListManagedCheckpoints(dom)
+	if err != nil {
+		return st, fmt.Errorf("list checkpoints on domain %s: %w", domainName, err)
+	}
+	st.HasCheckpoints = len(cpts) > 0
+
+	return st, nil
+}
+
+// failoverStateFromXML works out every part of a FailoverState that comes
+// from a domain's vmsync metadata, and nothing that needs a connection.
+//
+// It is a separate function so that this mapping can be tested at all, and
+// that is not tidiness: it is the direct remedy for how verify_state came to
+// be consumed by the promotion gate and never populated here. Inline in
+// ReadFailoverState, the only way to reach these lines was a live libvirt
+// holding a real domain, so no test could cross the seam between the XML and
+// the struct; the consuming package's tests set the fields by hand and
+// passed, while in production a replica known not to match its source was
+// promoted without a word. Any metadata-derived field added later belongs
+// here for the same reason -- a field mapped anywhere else is a field
+// nothing can check.
+//
+// Exists, Active and HasCheckpoints are deliberately NOT set. They are
+// observations about the domain rather than about its metadata, and only a
+// caller holding the libvirt handle can make them; returning a guess for
+// them here would be a lie that looks exactly like a reading.
+//
+// Every parse error is swallowed into the zero value, matching the idiom the
+// rest of this package reads metadata with: an absent field is the ordinary
+// case -- most of these are written only by particular operations -- so it
+// must not turn an otherwise good read into a failure. The value fails
+// closed, not the whole read. What must NOT be swallowed is the presence of
+// a field, which is why the verify verdict below is taken as written rather
+// than being made conditional on its timestamp parsing.
+func failoverStateFromXML(domXML string) FailoverState {
+	var st FailoverState
+
 	st.Role, _ = ParseMetadata(domXML, MetadataFieldReplicationRole)
 	st.LastCheckpoint, _ = ParseMetadata(domXML, MetadataFieldLastCheckpoint)
 	st.ReplicaSource, _ = ParseMetadata(domXML, MetadataFieldReplicaSource)
@@ -98,6 +170,18 @@ func ReadFailoverState(mgr *Manager, domainName string) (FailoverState, error) {
 		st.SourceStoppedAtSync = true
 	}
 	st.RestoredFrom, _ = ParseMetadata(domXML, MetadataFieldRestoredFrom)
+
+	// Read exactly as written, with no value interpreted here. Presence is
+	// the state (see MetadataFieldVerifyState), and deciding what a present
+	// verdict means belongs to pkg/failover, where that decision can be
+	// tested without libvirt. A build that mapped only the value it happens
+	// to know -- "failed" -- would silently drop a verdict written by a
+	// newer vmsync, which is the one direction this must not fail in.
+	st.VerifyState, _ = ParseMetadata(domXML, MetadataFieldVerifyState)
+	// Independently of the verdict, deliberately. A missing or unparseable
+	// date leaves this zero and the verdict standing, so the promotion is
+	// still refused and merely says the time was not recorded.
+	st.VerifyFailedAt = parseUnix(domXML, MetadataFieldVerifyFailedAt)
 
 	st.Fence.ID, _ = ParseMetadata(domXML, MetadataFieldFenceID)
 	st.Fence.Source, _ = ParseMetadata(domXML, MetadataFieldFenceSource)
@@ -117,16 +201,7 @@ func ReadFailoverState(mgr *Manager, domainName string) (FailoverState, error) {
 		}
 	}
 
-	// The real checkpoint objects, as opposed to the last_checkpoint string.
-	// These are what a later sync would try to chain onto, and what blocks
-	// an undefine, so an inversion has to know about them.
-	cpts, err := ListManagedCheckpoints(dom)
-	if err != nil {
-		return st, fmt.Errorf("list checkpoints on domain %s: %w", domainName, err)
-	}
-	st.HasCheckpoints = len(cpts) > 0
-
-	return st, nil
+	return st
 }
 
 func parseUnix(domXML, field string) int64 {
