@@ -3732,6 +3732,18 @@ stage_retention() {
 	if [ "$n" = 1 ]; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "a sync with -retention takes a restore point" "$fo_ok" \
 		"expected exactly 1 in $rp_dir but found $n"
+	if [ "$fo_ok" != 0 ]; then
+		# Everything below reads that restore point. Without one they do not
+		# fail informatively -- they fail SEVEN times for one cause, and two of
+		# them PASS while proving nothing: the reflink check measures a
+		# free-space delta, which is indistinguishable from zero when no copy
+		# was made, and the "inspection leaves replication state untouched"
+		# check is trivially true of an inspection that had nothing to inspect.
+		# A vacuous pass is worse than a failure, so stop here with the one
+		# thing an operator needs to look at, the way stage 16 does.
+		warn "no restore point exists, so the remaining retention checks are skipped rather than reported as a wall of separate failures -- two of them would otherwise PASS on an empty store and prove nothing. Fix this first: check $RUN_LOG for what the sync said about -retention, and confirm the vmsync binary under test is built from this tree ($rp_dir is the per-domain layout; a binary predating it writes into $(rp_root) directly)"
+		return 1
+	fi
 
 	# --- is it actually sharing storage? -------------------------------------
 	# Measured across one more sync rather than inferred: if these were full
