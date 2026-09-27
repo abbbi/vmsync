@@ -11,7 +11,7 @@
 # --- What to test ------------------------------------------------------
 
 # Path to the vmsync binary under test.
-VMSYNC_BIN=/usr/local/bin/vmsync
+VMSYNC_BIN=/usr/bin/vmsync
 
 # Set to "yes" if bench.sh itself runs directly on the source hypervisor
 # (e.g. SOURCE_URI is a local "qemu:///system" URI, not qemu+ssh://).
@@ -68,7 +68,7 @@ SSH_KNOWN_HOSTS=""
 # only actually used as the fixed -io-depth for Stage 2 (verify+tamper)
 # and Stage 3 (reinit-after-failures), which don't vary it.
 IO_DEPTH=8
-BRIDGE_HELPER_PATH=""   # empty = vmsync's own default (/usr/local/bin/vmsync-bridge-helper)
+BRIDGE_HELPER_PATH=""   # empty = vmsync's own default (/usr/bin/vmsync-bridge-helper)
 
 # What -reinit does with the target disk it is about to replace: "delete" or
 # "rename". This harness defaults to delete; vmsync itself defaults to rename.
@@ -292,7 +292,7 @@ DEFINE_ROLLBACK_WAIT_SECONDS=300
 # skips with a message rather than failing: Stages 6, 7 and 11 entirely, and
 # Stage 14's promotion sub-test (14f) on its own, while the rest of that
 # stage still runs -- it needs no target-side binary.
-#TARGET_VMSYNC_BIN=/usr/local/bin/vmsync
+#TARGET_VMSYNC_BIN=/usr/bin/vmsync
 
 
 # --- Fencing end to end with real agents (Stage 7, --stages ...,fence-agent) --
@@ -305,16 +305,16 @@ DEFINE_ROLLBACK_WAIT_SECONDS=300
 
 # vmsync-agent on the SOURCE host. This is the agent that gets fenced.
 # Required for Stage 7; unset skips it.
-#SOURCE_AGENT_BIN=/usr/local/bin/vmsync-agent
+#SOURCE_AGENT_BIN=/usr/bin/vmsync-agent
 
 # vmsync-agent on the TARGET host. Optional: when set, Stage 7 also starts an
 # agent there and asserts it does NOT fence the promoted copy (a fence sweep
 # must skip anything whose role is not source).
-#TARGET_AGENT_BIN=/usr/local/bin/vmsync-agent
+#TARGET_AGENT_BIN=/usr/bin/vmsync-agent
 
 # Path to vmsync on the SOURCE host, for the agent to shell out to. Defaults
 # to VMSYNC_BIN, which is right whenever SOURCE_LOCAL=yes.
-#SOURCE_VMSYNC_BIN=/usr/local/bin/vmsync
+#SOURCE_VMSYNC_BIN=/usr/bin/vmsync
 
 # Scratch directory on each host for the throwaway standalone agent's config,
 # state dir and log. Removed by nothing -- inspect agent.log there when a

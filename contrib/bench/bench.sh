@@ -530,7 +530,7 @@ preflight() {
 # would notice.
 preflight_bridge_helper() {
 	local helper vmsync_version helper_version
-	helper="${BRIDGE_HELPER_PATH:-/usr/local/bin/vmsync-bridge-helper}"
+	helper="${BRIDGE_HELPER_PATH:-/usr/bin/vmsync-bridge-helper}"
 
 	if ! ssh_host_cmd "$TARGET_HOST" "test -x '$helper'" >/dev/null 2>&1; then
 		warn "vmsync-bridge-helper is not present (or not executable) at $helper on $TARGET_HOST. -compress/-netbuffer cannot run, and the pre-commit integrity check will be SKIPPED on every sync -- it is on by default but needs that binary. Deploy it, set BRIDGE_HELPER_PATH in $CONF, or set BENCH_SYNC_ARGS=\"\" to stop asking for compression."
@@ -4420,7 +4420,7 @@ CHECKSUM_SHIM_DIR="/tmp/vmsync-bench-checksum-shim"
 # checksum_real_helper -> the helper path vmsync would use by default, which
 # is what the shims wrap.
 checksum_real_helper() {
-	printf '%s\n' "${BRIDGE_HELPER_PATH:-/usr/local/bin/vmsync-bridge-helper}"
+	printf '%s\n' "${BRIDGE_HELPER_PATH:-/usr/bin/vmsync-bridge-helper}"
 }
 
 # checksum_install_shim NAME AWK_PROGRAM -- writes a wrapper at
