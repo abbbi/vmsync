@@ -215,6 +215,53 @@ unrecoverable; keeping it costs disk space and a file to clean up later.
 Nothing reaps the aside files: that is deliberately a decision, not a
 background job.
 
+Every disk of one run gets the **same** stamp, so one name identifies the
+whole displaced machine rather than a per-disk accident of which second the
+rename landed in.
+
+### If the rebuild does not finish
+
+A full copy writes new base images **directly**. There is no overlay to throw
+away, and the target domain keeps its old metadata until the very last write.
+So a rebuild killed part way through — a dropped link, an agent restart, a
+lost power feed — leaves disks holding a half-written image underneath a
+`last_checkpoint`, `last_sync_timestamp`, `replica_source` and
+`failure_count` that all still describe the replica that was renamed aside.
+Every one of those reads healthy, because every one of them is true about a
+replica that is no longer there.
+
+vmsync therefore writes `replica_incomplete` on the target's own metadata
+**before** the copy displaces anything, and clears it in the same write that
+records the copy as finished:
+
+```
+verb=reinit,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=1758441600
+```
+
+While it stands, **`-promote` refuses** — naming the verb, when it started,
+which host started it, and the exact `.vmsync-replaced-<stamp>` suffix, which
+is where the complete replica still is and is recorded nowhere else on the DR
+host. `-force-promote` still gets through, because the half-written copy may
+genuinely be all that is left, and reports the data-loss window as **unknown**
+rather than computing one from a checkpoint that describes different bytes.
+**Syncs are not refused**: a sync is the only thing that repairs a
+half-written replica, so the refusal lifts itself the moment one completes.
+An unreadable value still refuses — presence is the finding, and a record this
+build cannot parse is not a record that can be ignored.
+
+It is on the domain's own metadata rather than in a file or a control-plane
+record for one reason: `-promote` runs locally on the replica's host, and
+during the disaster it exists for, the other site is gone.
+[docs/RUNBOOK.md](docs/RUNBOOK.md) has the recovery, which is one `mv` per
+disk.
+
+**There is no `failure_count` carrier, deliberately**, and the cost is worth
+stating plainly: an **older** vmsync doing the `-promote` on the DR host does
+not know this field and will accept a half-written replica exactly as it
+always did. Every host that drives or receives syncs has to be upgraded before
+the refusal can be relied on — check `vmsync -version` on the DR host, not
+only on the one that runs the syncs.
+
 ## When a reinit itself will not go through
 
 `-force-clean` is a `-reinit` for a target that is wedged. It implies
@@ -263,6 +310,7 @@ records which of the two actually ran.
 | 1 | the run failed |
 | 2 | the flags were wrong; nothing was attempted |
 | 75 | **an operator verb** stood down without doing anything, because another vmsync held the lock — retry when it finishes |
+| 137 | only ever from `-test=die-writing-base`, never from a real run — see below |
 
 A **sync** that finds the lock held exits 0 and writes no metrics record. It is
 not a failure: another vmsync is doing the work right now, and a scheduler
@@ -277,6 +325,47 @@ would report one that never started as failed. 75 is `EX_TEMPFAIL` from
 reads it and defers the operation rather than recording a terminal result,
 which is what lets the same operation succeed on a later attempt instead of
 having to be reissued by hand.
+
+**137 is not an error code at all.** `-test=die-writing-base` makes vmsync
+kill itself part way through writing a replica — no unwinding, no cleanup, no
+metadata write — so the interrupted-rebuild state can be reproduced on real
+hardware and the promotion refusal above can be tested against it rather than
+against a hand-built struct. 128+9 is the shell's encoding of `SIGKILL`, and
+that is the point: a harness reading the status sees a process that was
+killed, not a sync that failed. `-test` is a flag, never an environment
+variable, and it is not in the agent's argv allowlist, so nothing scheduled
+can ever pass it.
+
+## Correlating a run with what it left behind
+
+Two flags, both defaulted, both about answering "what happened here" after the
+fact.
+
+| flag | |
+| --- | --- |
+| `-action-id <hex>` | a correlation id for this action. Minted by vmsync when absent (8 random bytes), so every run has one. `vmsync-agent` passes the scheduled run's id, or the control plane's operation id, so the journal below joins back to `runs.jsonl` and `operations.json` without a lookup. Refused if it is over 64 bytes or outside `[0-9A-Za-z._-]` |
+| `-journal <actions\|off>` | default `actions`: one **intent** record before each acting verb, one **outcome** when it stops, appended to `<disk dir>/.vmsync-journal/<domain>.jsonl` **on the host that owns those disks**. `off` writes nothing |
+
+The journal is **evidence, never an input to a decision** — nothing in vmsync
+branches on it, and a write that fails is counted and warned about but never
+fails the action it describes. Its value is the record of a run that *died*: a
+killed process writes its intent and then nothing, and an intent with no
+outcome is exactly what an interrupted rebuild looks like. It rotates at 4 MiB
+to `<name>.1.jsonl`, one generation, so a domain costs at most 8 MiB.
+
+```bash
+# on the host that owns the disks — the marker, the aside suffix, and the
+# recent actions, in one place. Reads only; never journals itself.
+vmsync -explain-domain web01 -target-uri qemu:///system -target-disk-path /vm_data
+```
+
+`-explain-domain` needs a **local** `-target-uri`, like the other verbs that
+act where the domain lives. It deliberately still works when the domain is
+**gone**: `-force-clean` undefines the target before replacing its disks, so a
+run killed in that window leaves disks, an aside set, and a journal with no
+metadata above them — and therefore no marker. Given `-target-disk-path` it
+prints the journal anyway and says so, rather than reporting a clean bill of
+health that would be false.
 
 ## Clock drift between the two hosts
 

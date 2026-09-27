@@ -502,7 +502,11 @@ func runListRestorePoints(ctx context.Context, cfg syncConfig) error {
 // booting a scratch domain from a clone reconciles no metadata, changes no
 // role, and leaves last_checkpoint valid. Restoring in place is a different
 // operation with a different risk, and is deliberately not this one.
-func runCloneRestorePoint(ctx context.Context, cfg syncConfig, tagName, dest string) error {
+// The return is named so the action journal's outcome is written on every path
+// out. A clone changes nothing about the replica, but it does put a full copy
+// of it somewhere an operator chose, and "a second copy of this machine exists
+// at /scratch" is a fact worth being able to find later.
+func runCloneRestorePoint(ctx context.Context, cfg syncConfig, tagName, dest string) (runErr error) {
 	if dest == "" {
 		return fmt.Errorf("-clone-restore-point needs -clone-to DIR, the directory to write the copies into")
 	}
@@ -519,6 +523,18 @@ func runCloneRestorePoint(ctx context.Context, cfg syncConfig, tagName, dest str
 		return err
 	}
 	defer closeRunner()
+
+	// Beside the replica's disks rather than beside the clone: the journal
+	// belongs with the machine this copy was taken FROM, which is what anybody
+	// later asking "where did that second copy come from" is standing in front
+	// of. cfg.TargetDiskPath is required by this verb (restorePointRoot refuses
+	// without it), so the directory is known.
+	journal := newRecorderInDir(cfg, client, cfg.TargetDiskPath, journalDomainName(cfg))
+	journal.Intent(ctx, journalVerbCloneRestorePoint, map[string]string{
+		"tag":  tag.String(),
+		"dest": dest,
+	})
+	defer func() { finishAction(ctx, journal, runErr, nil) }()
 
 	// Confirm it is actually there before writing anything, so a mistyped tag
 	// fails clean instead of leaving an empty destination behind.

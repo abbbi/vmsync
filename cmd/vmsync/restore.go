@@ -95,7 +95,12 @@ type restorePlan struct {
 }
 
 // runRestoreRestorePoint is the -restore-restore-point verb.
-func runRestoreRestorePoint(ctx context.Context, cfg syncConfig, tagName string) error {
+//
+// The return is named so the action journal's outcome is written on every path
+// out, assessment and refusal included: a restore that was assessed and not
+// carried out is a decision somebody made, and it belongs in the history
+// beside the one that was.
+func runRestoreRestorePoint(ctx context.Context, cfg syncConfig, tagName string) (runErr error) {
 	tag, err := restorepoint.ParseTag(tagName)
 	if err != nil {
 		return fmt.Errorf("%w -- run -list-restore-points to see the available tags", err)
@@ -138,7 +143,25 @@ func runRestoreRestorePoint(ctx context.Context, cfg syncConfig, tagName string)
 	}
 	defer lock.Close()
 
-	if err := loadRestorePlan(ctx, client, &plan); err != nil {
+	// Beside the replica's own disks, reached the same way every other command
+	// in this verb reaches them -- over SSH when the target is remote, with os
+	// when vmsync is running on the target itself.
+	//
+	// Before the plan is even loaded, so that a restore which then refuses is
+	// recorded too. A restore is the most destructive thing vmsync does to a
+	// replica on purpose, and "who asked for this, when, against which point,
+	// and was it carried out" is exactly what nobody can reconstruct afterwards
+	// from the disks.
+	journal := newRecorderInDir(cfg, client, plan.replicaDir, cfg.TargetDomain)
+	journal.Intent(ctx, journalVerbRestoreRestore, map[string]string{
+		"tag":           plan.tag.String(),
+		"forced":        strconv.FormatBool(cfg.ForceRestore),
+		"was_role":      plan.role,
+		"replaced_disk": cfg.ReplacedDiskAction,
+	})
+	defer func() { finishAction(ctx, journal, runErr, nil) }()
+
+	if err := loadRestorePlan(ctx, client, cfg, &plan); err != nil {
 		return err
 	}
 	// Before the assessment, not after: the assessment describes a restore in
@@ -347,7 +370,11 @@ func checkRestoreIdentity(cfg syncConfig, plan restorePlan) error {
 }
 
 // loadRestorePlan fills in everything the restore would touch, writing nothing.
-func loadRestorePlan(ctx context.Context, client remoteRunner, plan *restorePlan) error {
+//
+// cfg is read for identity only -- which host to record as having started the
+// rollback, and this invocation's action id -- both of which go into the
+// replica_incomplete value the plan would write. Nothing here acts on it.
+func loadRestorePlan(ctx context.Context, client remoteRunner, cfg syncConfig, plan *restorePlan) error {
 	replicaDir := plan.replicaDir
 	// Confirm the tag is really there before reading anything out of it, so a
 	// mistyped tag fails naming the tag rather than naming a missing file.
@@ -407,11 +434,35 @@ func loadRestorePlan(ctx context.Context, client remoteRunner, plan *restorePlan
 	// The rollback's own instant, not the copy's. Fixed here rather than at
 	// the moment of the write so the assessment names exactly what the
 	// restore would record.
+	at := time.Now().Unix()
 	plan.provenance = restorepoint.Provenance{
 		Tag:    plan.tag.String(),
-		AtUnix: time.Now().Unix(),
+		AtUnix: at,
 		By:     plan.restoredBy,
 	}
+	// A restore replaces the replica's contents wholesale, which is the same
+	// hazard a full copy carries and it is armed the same way: between the
+	// metadata write and the end of the swap the disks are a mixture of two
+	// moments, while the metadata that same write just laid down says
+	// failure_count=0 and names one coherent checkpoint. Without this,
+	// pkg/failover's evidence check finds nothing wrong and a half-swapped
+	// machine promotes.
+	//
+	// stamp is the one suffix every displaced disk of this restore is renamed
+	// with, so the refusal can name the exact files to put back -- and it is
+	// the same stamp plan.asides were built from a few lines up, not a fresh
+	// reading of the clock.
+	//
+	// Failing here refuses the restore before a single file is staged, which
+	// is the right direction: the alternative is swapping disks with nothing
+	// recording that the swap began.
+	incomplete, err := libvirtsync.ReplicaIncompleteValue(
+		libvirtsync.ReplicaIncompleteVerbRestore, at, cfg.ActionID,
+		util.ReplicaHost(cfg.TargetURI, cfg.LocalHostName), strconv.FormatInt(stamp, 10))
+	if err != nil {
+		return fmt.Errorf("restore: %w -- nothing has been staged or changed", err)
+	}
+	plan.provenance.ReplicaIncomplete = incomplete
 	plan.updates, plan.removals = restorepoint.MetadataPlan(status, plan.provenance)
 	return nil
 }
@@ -476,6 +527,13 @@ var restoreFieldOrder = []string{
 	restorepoint.FieldSourceStoppedAtSync,
 	restorepoint.FieldFailureCount,
 	restorepoint.FieldReplicationRole,
+	// Listed because the assessment is what an operator reads before saying
+	// yes, and this is the one field here that is written NOW and withdrawn
+	// later: between the metadata write and the end of the swap it refuses a
+	// promotion, and if the restore dies in that window it keeps refusing.
+	// Leaving it off the list would make that refusal arrive unannounced,
+	// during an incident, on a domain they were told would be promotable.
+	restorepoint.FieldReplicaIncomplete,
 	restorepoint.FieldRestoredFrom,
 	restorepoint.FieldRestoredAt,
 	restorepoint.FieldRestoredBy,
@@ -487,6 +545,10 @@ func annotateRestoreField(field, value string) string {
 		if n, err := strconv.ParseInt(value, 10, 64); err == nil && n > 0 {
 			return fmt.Sprintf("%s  (%s)", value, time.Unix(n, 0).UTC().Format("2006-01-02 15:04:05 UTC"))
 		}
+	case restorepoint.FieldReplicaIncomplete:
+		// The raw value is a machine-readable line; what an operator needs
+		// from this row is what it DOES, and that it goes away by itself.
+		return value + "  (set while the disks are being swapped, so a restore that dies half-way cannot be promoted; withdrawn once every disk is in place)"
 	}
 	return value
 }
@@ -598,11 +660,67 @@ func applyRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.
 	}
 
 	// --- ownership -----------------------------------------------------------
+	ownershipOK := true
 	for i, d := range plan.disks {
 		if err := applyTargetDiskOwner(ctx, client, cfg, d, owners[i]); err != nil {
+			ownershipOK = false
 			trace.Warning("restore: could not set ownership on the restored disk; if the promoted domain cannot open it, chown it by hand",
 				"disk", d, "error", err)
 		}
+	}
+
+	// --- stand the replica back up -------------------------------------------
+	// The counterpart of the replica_incomplete armed in step 2, withdrawn
+	// only now: every disk has been swapped and every one of them has an
+	// owner qemu can open, so the replica on these files is the restore point
+	// entire and a promotion of it is a promotion of a known, coherent copy.
+	//
+	// A second, narrow write rather than part of any of the above, because
+	// there is nothing here to make it atomic with -- the swap is N renames
+	// on a remote host, not a libvirt transaction -- and the only honest
+	// place to clear a "this is mid-flight" marker is after the flight.
+	//
+	// WHAT A FAILURE OF THIS WRITE COSTS, plainly: a healthy restored replica
+	// that -promote refuses, and refuses with a message about an interrupted
+	// copy that in fact completed. It stays force-only until the next
+	// successful sync into it clears the field (UpdateSyncMetadata does so
+	// unconditionally) -- and a restored replica is paused, so that sync
+	// needs -update-role=target first. Force-only is the cost, and it is the
+	// right way round: the opposite order would clear the marker before the
+	// disks were actually in place.
+	//
+	// Cleared once the swap loop has succeeded, and NOT made conditional on
+	// the ownership pass above.
+	//
+	// It was, briefly, and that was wrong in the way this codebase keeps
+	// warning about: one field would then carry two unrelated findings, and
+	// the refusal it produces states something false. This marker says "a
+	// full copy was STARTED and never recorded as finished, so these files
+	// are a partial image". After the swap loop that is simply not true --
+	// the disks are the restore point entire. A disk qemu cannot open is a
+	// real problem and a different one; reporting it through this field
+	// would send an operator hunting for a half-written copy that does not
+	// exist, and would teach them that this refusal sometimes means
+	// something else. Ownership failure stays what it is: a loud per-disk
+	// warning, and a domain that fails to boot visibly if it was never
+	// fixed.
+	//
+	// WHAT A FAILURE OF THIS WRITE COSTS, plainly: a healthy restored replica
+	// that -promote refuses, and refuses with a message about an interrupted
+	// copy that in fact completed. It stays force-only until the next
+	// successful sync into it clears the field (UpdateSyncMetadata does so
+	// unconditionally) -- and a restored replica is paused, so that sync
+	// needs -update-role=target first. Force-only is the cost, and it is the
+	// right way round: the opposite order would clear the marker before the
+	// disks were actually in place.
+	if err := libvirtsync.SetDomainMetadataFields(tgtMgr, cfg.TargetDomain, nil,
+		libvirtsync.MetadataFieldReplicaIncomplete); err != nil {
+		trace.Warning("restore: the disks are fully restored, but the record saying a restore was in flight could not be withdrawn. This replica is healthy and -promote will nonetheless refuse it until a successful sync clears the field; force the promotion if you need it now, or clear it by hand",
+			"vm", cfg.TargetDomain, "field", libvirtsync.MetadataFieldReplicaIncomplete, "error", err)
+	}
+	if !ownershipOK {
+		trace.Warning("restore: the disks are restored and the in-flight record has been withdrawn, but at least one disk could not be given an owner qemu can open. A promoted domain may fail to start on it -- chown it by hand before failing over to this replica",
+			"vm", cfg.TargetDomain)
 	}
 
 	// --- the displaced contents ---------------------------------------------
@@ -673,6 +791,6 @@ func undoRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.M
 			"disks", len(plan.disks), "not_put_back", failed, "asides", plan.asides)
 		return
 	}
-	trace.Warning("restore: a disk could not be replaced, so every disk already replaced was put back. The replica is as it was before this ran, but its replication metadata was already invalidated -- it is paused and its metadata describes the restore point rather than its contents. Re-run the restore, or run -update-role=target followed by a -reinit full sync",
+	trace.Warning("restore: a disk could not be replaced, so every disk already replaced was put back. The replica is as it was before this ran, but its replication metadata was already invalidated -- it is paused, its metadata describes the restore point rather than its contents, and the record saying a restore was in flight is deliberately left armed so -promote refuses it. Re-run the restore, or run -update-role=target followed by a -reinit full sync",
 		"disks", len(plan.disks))
 }

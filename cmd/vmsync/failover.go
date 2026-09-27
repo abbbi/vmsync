@@ -112,6 +112,17 @@ func promoteTargetState(st libvirtsync.FailoverState, disksPresent, overlayPrese
 		// to be wrong.
 		VerifyState:    st.VerifyState,
 		VerifyFailedAt: st.VerifyFailedAt,
+		// The record a full copy left when it started rewriting these disks
+		// and never came back. Carried raw: pkg/failover decides what it
+		// means, including what an unreadable one means.
+		//
+		// This is the field that closes the -reinit hole. Everything else in
+		// this literal describes the replica the interrupted copy REPLACED
+		// and reads perfectly healthy, so dropping this line does not make
+		// the promotion slightly less informed -- it restores the exact
+		// defect CI-02 named, in which -promote accepts a half-written disk
+		// and reports a normal data-loss window.
+		ReplicaIncomplete: st.ReplicaIncomplete,
 		// Changes nothing about whether this promotion is allowed; it changes
 		// what the plan SAYS about the window, which on a rolled-back replica
 		// is the age of a copy somebody chose rather than replication lag.
@@ -120,7 +131,13 @@ func promoteTargetState(st libvirtsync.FailoverState, disksPresent, overlayPrese
 }
 
 // runPromote makes a replica authoritative.
-func runPromote(ctx context.Context, cfg syncConfig) error {
+//
+// The return is named so the action journal's outcome record can be written
+// from a defer and therefore on EVERY path out, including the refusals. A verb
+// that journalled its intent and only sometimes its outcome would manufacture
+// the one finding the journal exists to report -- an intent with nothing after
+// it, which is supposed to mean the process died mid-action.
+func runPromote(ctx context.Context, cfg syncConfig) (runErr error) {
 	if cfg.TargetURI == "" || cfg.TargetDomain == "" {
 		return fmt.Errorf("-promote needs -target-uri and -target-domain naming the replica to promote")
 	}
@@ -158,6 +175,23 @@ func runPromote(ctx context.Context, cfg syncConfig) error {
 	if !st.Exists {
 		return fmt.Errorf("no domain named %s on this host -- there is nothing here to promote", cfg.TargetDomain)
 	}
+
+	// Journalled from here, which is the earliest point the journal's location
+	// is knowable: it lives beside this domain's disks, and the domain has
+	// just been confirmed to exist. Deliberately BEFORE the assessment rather
+	// than after it, so a promotion that is REFUSED is recorded too --
+	// "somebody tried to promote this replica three times and was stopped each
+	// time" is exactly the history an incident review needs, and it is
+	// invisible everywhere else once the terminal is closed.
+	journal := newLocalDomainRecorder(cfg, mgr, cfg.TargetURI, cfg.TargetDomain)
+	journal.Intent(ctx, journalVerbPromote, map[string]string{
+		"promote_mode": string(mode),
+		"force":        strconv.FormatBool(cfg.ForcePromote),
+		"start":        strconv.FormatBool(cfg.Start),
+		"fence_source": cfg.FenceSource,
+		"was_role":     st.Role,
+	})
+	defer func() { finishAction(ctx, journal, runErr, nil) }()
 
 	disksPresent, overlayPresent, err := inspectReplicaDisks(mgr, cfg.TargetDomain)
 	if err != nil {
@@ -528,7 +562,11 @@ func runFenceDomain(ctx context.Context, cfg syncConfig) error {
 // role is the whole difference between the two callers, and it is a parameter
 // rather than a branch so that neither mode can drift from the other in
 // anything else.
-func shutdownAndMark(ctx context.Context, cfg syncConfig, mode, role string) error {
+//
+// The return is named so the journal's outcome record is written on every path
+// out -- including the one where the shutdown failed and the role was recorded
+// anyway, which is the outcome most worth having a record of.
+func shutdownAndMark(ctx context.Context, cfg syncConfig, mode, role string) (runErr error) {
 	if cfg.TargetURI == "" || cfg.TargetDomain == "" {
 		return fmt.Errorf("%s needs -target-uri and -target-domain naming the domain to stop", mode)
 	}
@@ -541,6 +579,23 @@ func shutdownAndMark(ctx context.Context, cfg syncConfig, mode, role string) err
 		return fmt.Errorf("connect to libvirt at %s: %w", cfg.TargetURI, err)
 	}
 	defer mgr.Close()
+
+	// Before the ACPI request goes out, because that is the point of no
+	// return for a guest: from here on the domain may stop at any moment, and
+	// a run interrupted between the shutdown and the role write leaves a
+	// stopped domain with nothing recording why. The intent is the only thing
+	// that then says a fence was in progress.
+	verb := journalVerbShutdownDomain
+	if role == libvirtsync.RoleFenced {
+		verb = journalVerbFenceDomain
+	}
+	journal := newLocalDomainRecorder(cfg, mgr, cfg.TargetURI, cfg.TargetDomain)
+	journal.Intent(ctx, verb, map[string]string{
+		"flag":             mode,
+		"role":             role,
+		"shutdown_timeout": strconv.Itoa(cfg.ShutdownTimeoutSec),
+	})
+	defer func() { finishAction(ctx, journal, runErr, nil) }()
 
 	// The role is recorded even when the shutdown FAILS, and unconditionally
 	// -- for a fence and for a planned failover alike.
@@ -604,7 +659,12 @@ func shutdownAndMark(ctx context.Context, cfg syncConfig, mode, role string) err
 //
 // Runs on the OLD SOURCE's host: that is the end which already has an SSH
 // path to the other one, because that is the direction syncs run.
-func runInvert(ctx context.Context, cfg syncConfig) error {
+//
+// The return is named so the journal's outcome is written on every path out,
+// including the half-applied one -- an inversion that made the old source a
+// target and then failed to make the promoted end a source is the state a
+// re-run has to finish, and the record of it is beside the disks either way.
+func runInvert(ctx context.Context, cfg syncConfig) (runErr error) {
 	if cfg.SourceURI == "" || cfg.SourceDomain == "" || cfg.TargetURI == "" {
 		return fmt.Errorf("-invert needs -source-uri/-source-domain naming the OLD source and -target-uri/-target-domain naming the promoted replica")
 	}
@@ -640,6 +700,24 @@ func runInvert(ctx context.Context, cfg syncConfig) error {
 
 	srcHost := util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName)
 	tgtHost := util.ReplicaHost(cfg.TargetURI, cfg.LocalHostName)
+
+	// Beside the OLD SOURCE's disks, which are the local ones: this verb runs
+	// on that host, and its disks are the set this inversion turns into a
+	// replica. The promoted end is on the other side of the network and may be
+	// unreachable for anything but libvirt, so it is not where a record can be
+	// relied on to land.
+	//
+	// Before the assessment, so a refused inversion is recorded too: the
+	// refusals here are about the pair's state, and a history of them is how
+	// somebody works out what that state has been doing.
+	journal := newLocalDomainRecorder(cfg, srcMgr, cfg.SourceURI, cfg.SourceDomain)
+	journal.Intent(ctx, journalVerbInvert, map[string]string{
+		"old_source":    srcHost + ":" + cfg.SourceDomain,
+		"promoted":      tgtHost + ":" + cfg.TargetDomain,
+		"old_role":      oldSrc.Role,
+		"promoted_role": promoted.Role,
+	})
+	defer func() { finishAction(ctx, journal, runErr, nil) }()
 
 	plan, err := failover.AssessInvert(failover.PairState{
 		OldSource: failover.DomainEnd{

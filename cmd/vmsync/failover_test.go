@@ -172,6 +172,7 @@ func TestPromoteTargetStateMapsEveryField(t *testing.T) {
 		RestoredFrom:        "1756041600-vmsync-cpt-000042",
 		VerifyState:         libvirtsync.VerifyStateFailed,
 		VerifyFailedAt:      promoteTestNowUnix - 3600,
+		ReplicaIncomplete:   "verb=reinit,at=1700000100,action=9f3c1a2b4d5e6f70,host=prod01,aside=1700000100",
 	}
 
 	got := promoteTargetState(st, true, true)
@@ -189,6 +190,7 @@ func TestPromoteTargetStateMapsEveryField(t *testing.T) {
 		RestoredFrom:        "1756041600-vmsync-cpt-000042",
 		VerifyState:         libvirtsync.VerifyStateFailed,
 		VerifyFailedAt:      promoteTestNowUnix - 3600,
+		ReplicaIncomplete:   "verb=reinit,at=1700000100,action=9f3c1a2b4d5e6f70,host=prod01,aside=1700000100",
 		// SyncInFlight stays false whatever was observed: the promotion
 		// path holds this target's run lock, which a sync could not have
 		// let it take.
@@ -222,5 +224,91 @@ func TestPromoteTargetStateMapsEveryField(t *testing.T) {
 		if v.Field(i).IsZero() {
 			t.Errorf("failover.TargetState.%s came back zero: promoteTargetState does not map it, so the promotion gate never sees it", name)
 		}
+	}
+}
+
+// The wiring for the record an interrupted full copy leaves behind, tested
+// the same way the verify verdict is and for the same reason: the rule lives
+// in pkg/failover and passes its own tests against a TargetState built by
+// hand, so a mapping that drops the field leaves the gate intact and dead.
+//
+// That is CI-02 exactly. -reinit renames the good replica disks aside and
+// writes new bases directly while the target domain keeps its OLD metadata,
+// so a run that dies in between leaves last_checkpoint, last_sync_timestamp,
+// replica_source and failure_count all describing the replica that copy
+// replaced. Every evidence check reads clean, and -promote accepts a
+// half-written disk while reporting a normal data-loss window.
+func TestPromoteCarriesAnInterruptedFullCopyIntoTheDecision(t *testing.T) {
+	const armed = "verb=reinit,at=1700000100,action=9f3c1a2b4d5e6f70,host=prod01,aside=1700000100"
+
+	opts := func(force bool) failover.PromoteOptions {
+		return failover.PromoteOptions{
+			Mode:    failover.ModePlanned,
+			Start:   true,
+			Force:   force,
+			NowUnix: promoteTestNowUnix,
+		}
+	}
+
+	t.Run("the field reaches the decision input", func(t *testing.T) {
+		st := promotableState()
+		st.ReplicaIncomplete = armed
+		if got := promoteTargetState(st, true, false).ReplicaIncomplete; got != armed {
+			t.Errorf("replica_incomplete = %q, want %q -- the promotion path is not passing the record to the gate that refuses it", got, armed)
+		}
+	})
+
+	t.Run("it is refused without the override", func(t *testing.T) {
+		st := promotableState()
+		st.ReplicaIncomplete = armed
+
+		_, err := failover.AssessPromote(promoteTargetState(st, true, false), opts(false))
+		if err == nil {
+			t.Fatal("a replica a full copy was part-way through rewriting was promoted with no override: this is CI-02")
+		}
+		// The suffix is the whole recovery: the complete replica is in those
+		// files and nothing else on this host records their names.
+		if !strings.Contains(err.Error(), replacedDiskSuffix+"1700000100") {
+			t.Errorf("refusal = %q, want it to name the aside files the complete copy is in", err)
+		}
+	})
+
+	t.Run("the override still gets through, with no window", func(t *testing.T) {
+		st := promotableState()
+		st.ReplicaIncomplete = armed
+
+		plan, err := failover.AssessPromote(promoteTargetState(st, true, false), opts(true))
+		if err != nil {
+			t.Fatalf("the override was refused: %v -- during a real outage an operator may knowingly boot a half-written copy rather than nothing", err)
+		}
+		if !plan.WriteMetadata {
+			t.Error("a forced promotion produced no promotion record")
+		}
+		if plan.DataLoss.Known {
+			t.Errorf("a forced promotion reported a data-loss window of %s; the metadata that figure is measured from describes the replica the interrupted copy replaced", plan.DataLoss)
+		}
+	})
+}
+
+// The aside suffix is spelled in two packages that cannot import each other
+// -- a library cannot import a main package at all -- and the refusal is only
+// useful if the name it prints is the name the files really have.
+func TestAsideSuffixMatchesTheOneTheRefusalNames(t *testing.T) {
+	if replacedDiskSuffix != failover.ReplicaReplacedSuffix {
+		t.Errorf("cmd/vmsync renames disks aside with %q but the promotion refusal tells operators to look for %q -- one of them sends people to files that do not exist",
+			replacedDiskSuffix, failover.ReplicaReplacedSuffix)
+	}
+}
+
+// Which reinit flavour ran is recorded rather than flattened to "reinit",
+// because the two leave different wreckage: a plain -reinit leaves the target
+// DOMAIN standing over half-written disks, while -force-clean removes the
+// domain outright.
+func TestReinitVerbNamesTheFlavourThatRan(t *testing.T) {
+	if got := reinitVerb(syncConfig{Reinit: true}); got != libvirtsync.ReplicaIncompleteVerbReinit {
+		t.Errorf("reinitVerb(plain reinit) = %q, want %q", got, libvirtsync.ReplicaIncompleteVerbReinit)
+	}
+	if got := reinitVerb(syncConfig{Reinit: true, ForceClean: true}); got != libvirtsync.ReplicaIncompleteVerbForceClean {
+		t.Errorf("reinitVerb(-force-clean) = %q, want %q", got, libvirtsync.ReplicaIncompleteVerbForceClean)
 	}
 }

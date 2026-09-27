@@ -1072,7 +1072,7 @@ func TestFlagHelpIsOneLineAndGrouped(t *testing.T) {
 		want := []string{
 			"promote", "invert", "shutdown-domain", "fence-domain", "read-fence",
 			"update-role", "list-restore-points", "clone-restore-point",
-			"restore-restore-point",
+			"restore-restore-point", "explain-domain",
 		}
 		var got []string
 		for _, g := range flagGroups {

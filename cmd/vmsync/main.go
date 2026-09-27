@@ -229,6 +229,30 @@ type syncConfig struct {
 	// nor the log tail can carry them. Empty for a run started by hand, which
 	// has nobody to report to.
 	ResultJSON string
+	// ActionID is the correlation id this invocation records in everything it
+	// writes about itself -- the replica_incomplete value above all, so that
+	// a refusal on the DR host can be traced back to the exact run that armed
+	// it, and every record in the action journal, which is where that run's
+	// story is. An opaque hex string; never interpreted here.
+	//
+	// Set from -action-id, and MINTED in main() when the flag is absent, so
+	// every run has one: the id is what joins the marker on the domain to the
+	// journal beside its disks, and a refusal naming a run that no journal
+	// mentions is half a diagnosis. vmsync-agent passes its operation's id.
+	//
+	// Every writer nonetheless treats an empty id as "no correlation
+	// available" rather than as a reason not to write -- an unarmed replica
+	// would be far worse than an unattributed one.
+	ActionID string
+	// Journal is the -journal level: journalLevelActions (the default) or
+	// journalLevelOff. It governs the action journal ONLY, never the
+	// replica_incomplete safety field -- that is metadata on the domain, it is
+	// what refuses a promotion, and no journal setting may touch it.
+	Journal string
+	// ExplainDomain names the domain -explain-domain reports on. Handled in
+	// main() like the failover modes: it reads this host's own view of one
+	// replica, prints it, and changes nothing anywhere.
+	ExplainDomain string
 
 	// ReplacedDiskAction selects what happens to a target disk file that is
 	// about to be discarded and rebuilt: replacedDiskRename (the default) or
@@ -447,7 +471,7 @@ var flagGroups = []struct {
 	{"ACTIONS", "each does one thing and exits; at most one per run", []string{
 		"promote", "invert", "shutdown-domain", "fence-domain", "read-fence",
 		"update-role", "list-restore-points", "clone-restore-point",
-		"restore-restore-point",
+		"restore-restore-point", "explain-domain",
 	}},
 	{"CONNECTION", "which domains, and how to reach libvirt", []string{
 		"source-uri", "target-uri", "source-domain", "target-domain",
@@ -484,8 +508,8 @@ var flagGroups = []struct {
 		"shutdown-timeout-sec",
 	}},
 	{"REPORTING", "what this run tells the outside world", []string{
-		"prometheus-textfile", "result-json", "run-id", "debug", "v",
-		"version", "test",
+		"prometheus-textfile", "result-json", "run-id", "action-id", "journal",
+		"debug", "v", "version", "test",
 	}},
 }
 
@@ -592,6 +616,48 @@ func main() {
 		trace.Info(fmt.Sprintf("vmsync Version: %s", version.Version))
 		os.Exit(0)
 	}
+
+	// The two journal flags are validated HERE, above the mode dispatch below
+	// and above every sync-specific check, because unlike all of those they
+	// apply to every mode: a promotion, an inversion and a sync all record
+	// themselves, and all three of them exit from the block below without ever
+	// reaching the validation further down.
+	//
+	// Refused rather than defaulted. A typo read as "off" would leave an
+	// operator believing every action is being journalled while nothing is,
+	// and they would find that out at the one moment the journal was the only
+	// evidence left.
+	if err := validateJournalLevel(cfg.Journal); err != nil {
+		trace.Error("invalid -journal", "error", err)
+		os.Exit(2)
+	}
+	if cfg.Journal == journalLevelOff {
+		// Said out loud, once, on every run that asks for it. A diagnostic
+		// that is off is indistinguishable from one that is failing, and the
+		// difference matters to whoever later comes looking for a record that
+		// is not there.
+		trace.Warning("the action journal is disabled by -journal=off: this run will leave no record beside the replica's disks of what it set out to do. The replica_incomplete safety field is unaffected -- it is metadata on the domain, and it is what refuses a promotion of an interrupted copy")
+	}
+	if err := validateActionID(cfg.ActionID); err != nil {
+		trace.Error("invalid -action-id", "error", err)
+		os.Exit(2)
+	}
+	if cfg.ActionID == "" {
+		// Minted for EVERY run, including one typed by hand. The id is what
+		// joins a refusal on the DR host to the journal record of the run that
+		// armed it, and a run with no id leaves a marker nobody can trace.
+		//
+		// A failure to mint is not fatal: an unattributed record is a far
+		// smaller loss than a run that refuses to start because the system's
+		// entropy pool could not be read.
+		id, err := mintActionID()
+		if err != nil {
+			trace.Warning("could not mint a correlation id for this run; it will still act and still record itself, but its journal records and any replica_incomplete marker it leaves will carry no action id to join them by", "error", err)
+		} else {
+			cfg.ActionID = id
+		}
+	}
+	trace.Debug("action id for this run", "action_id", cfg.ActionID, "journal", cfg.Journal)
 	// -update-role is a mode, not a modifier: it changes one metadata field
 	// on one domain and exits, syncing nothing. Handled before the
 	// source-side argument check below, and before every sync-specific
@@ -633,6 +699,7 @@ func main() {
 			{cfg.ListRestorePoints, "-list-restore-points"},
 			{cfg.CloneRestorePoint != "", "-clone-restore-point"},
 			{cfg.RestoreRestorePoint != "", "-restore-restore-point"},
+			{cfg.ExplainDomain != "", "-explain-domain"},
 		} {
 			if m.on {
 				chosen = append(chosen, m.name)
@@ -666,6 +733,8 @@ func main() {
 				err = runCloneRestorePoint(ctx, cfg, cfg.CloneRestorePoint, cfg.CloneRestorePointTo)
 			case cfg.RestoreRestorePoint != "":
 				err = runRestoreRestorePoint(ctx, cfg, cfg.RestoreRestorePoint)
+			case cfg.ExplainDomain != "":
+				err = runExplainDomain(cfg, cfg.ExplainDomain)
 			}
 			if err != nil {
 				// Nothing was done, so this must not read as a failure. The
@@ -705,11 +774,31 @@ func main() {
 			os.Exit(1)
 		}
 		defer mgr.Close()
+
+		// Journalled explicitly rather than from a defer, because this mode
+		// exits the process on both paths and a deferred record would never be
+		// written on either. The ctx is a fresh Background: -update-role is one
+		// metadata call and registers no signal handling of its own, so there
+		// is none to inherit.
+		//
+		// It is a one-field metadata write, and it is journalled for the same
+		// reason the destructive verbs are: -update-role=target is what makes a
+		// paused or restored replica syncable again, so it is the step that
+		// precedes somebody's replica being overwritten, and it is invisible
+		// everywhere else once the terminal is closed.
+		roleCtx := context.Background()
+		journal := newLocalDomainRecorder(cfg, mgr, cfg.TargetURI, roleDomain)
+		journal.Intent(roleCtx, journalVerbUpdateRole, map[string]string{
+			"role": cfg.UpdateRole,
+			"uri":  cfg.TargetURI,
+		})
 		previous, err := libvirtsync.SetReplicationRole(mgr, roleDomain, cfg.UpdateRole)
 		if err != nil {
+			finishAction(roleCtx, journal, err, nil)
 			trace.Error("update-role: set replication role", "vm", roleDomain, "role", cfg.UpdateRole, "error", err)
 			os.Exit(1)
 		}
+		finishAction(roleCtx, journal, nil, map[string]string{"previous_role": previous})
 		displayRole := func(r string) string {
 			if r == "" || r == libvirtsync.RoleNone {
 				return "(none)"
@@ -1808,6 +1897,104 @@ func refuseReinitIfTargetRunning(targetDomain string, exists, running bool) erro
 	if exists && running {
 		return fmt.Errorf("reinit: target domain %s is running, shut it down before reinitializing", targetDomain)
 	}
+	return nil
+}
+
+// reinitVerb names, for the replica_incomplete record, which of the two
+// reinit flavours is about to run.
+//
+// They are told apart rather than collapsed into "reinit" because they leave
+// different wreckage: a plain -reinit leaves the target DOMAIN standing with
+// its old metadata over half-written disks, while -force-clean removes the
+// domain outright. An operator reading a refusal needs to know which one to
+// go looking for, and the pair of verbs is the only place that survives.
+//
+// Pure and standalone, mirroring cleanVerb, so the mapping is testable
+// without libvirt.
+func reinitVerb(cfg syncConfig) string {
+	if cfg.ForceClean {
+		return libvirtsync.ReplicaIncompleteVerbForceClean
+	}
+	return libvirtsync.ReplicaIncompleteVerbReinit
+}
+
+// armReplicaIncomplete records on the TARGET domain that a full copy is about
+// to start replacing this replica, BEFORE anything is displaced.
+//
+// The order is the entire mechanism, exactly as it is for
+// pending_checkpoint. A full copy renames the good disks aside and writes new
+// bases directly, with no overlay, while the domain keeps its old metadata --
+// so from the moment the first disk moves until UpdateSyncMetadata records
+// success, the domain describes a replica that is no longer under it. A run
+// that dies in that window leaves a half-written image behind a clean bill of
+// health, and -promote accepts it. Writing this first is what makes that
+// window visible; writing it LAST would protect nothing at all.
+//
+// Only when the target domain exists, and that existence test is the same one
+// the pending_checkpoint write makes, for the same reason: on a first-ever
+// run there is no domain to write to, and refusing to sync into a target that
+// does not exist yet would break the ordinary case in order to guard a
+// window that does not exist there either -- nothing is being replaced.
+//
+// asideStamp is the ONE suffix the whole displaced set was renamed with, or
+// "" on the paths that rename nothing. It is passed in rather than taken from
+// the clock here because the refusal names it back to an operator as the
+// files to recover from, so it has to be the stamp the renames actually used.
+//
+// A failure here is fatal to the caller by contract: the caller must return
+// having destroyed nothing. That is why this only ever returns an error and
+// never logs and continues -- proceeding unarmed would mean carrying out
+// exactly the destructive sequence that this field exists to make survivable.
+func armReplicaIncomplete(tgtMgr *libvirtsync.Manager, cfg syncConfig, verb, asideStamp string) error {
+	exists, err := libvirtsync.DomainExists(tgtMgr.Conn, cfg.TargetDomain)
+	if err != nil {
+		return fmt.Errorf("check whether target domain %s exists before starting a full copy of its disks: %w", cfg.TargetDomain, err)
+	}
+	if !exists {
+		// Nothing to arm and nothing to protect: with no target domain there
+		// is no metadata for a later -promote to be misled by, and no replica
+		// being replaced.
+		return nil
+	}
+	// An existing record that names an aside stamp is never replaced by one
+	// that does not, and that is a data-recovery rule rather than tidiness:
+	// the stamp is the only thing on this host that says where the last
+	// COMPLETE copy went. failover.KeepExistingReplicaIncomplete holds the
+	// rule and the whole argument for it, kept there because it is a decision
+	// about evidence and this file cannot be compiled without libvirt.
+	//
+	// Read first, every time, and let the helper decide -- rather than
+	// skipping the read when this run has a stamp of its own.
+	//
+	// Skipping would be one libvirt round trip cheaper per rebuild and would
+	// reach the same answer, but it would leave half of
+	// KeepExistingReplicaIncomplete's contract unreachable from production:
+	// the branch that says "the incoming record names files of its own, so
+	// replacing loses nothing" would be exercised only by its unit test. A
+	// rule that is tested where it is not used is a rule that can drift from
+	// its caller without anything failing, which is the shape of defect this
+	// whole field exists to answer.
+	existing, readErr := libvirtsync.ReadDomainMetadataField(tgtMgr, cfg.TargetDomain, libvirtsync.MetadataFieldReplicaIncomplete)
+	if readErr != nil {
+		return fmt.Errorf("read the existing interrupted-copy record on %s before replacing it: %w", cfg.TargetDomain, readErr)
+	}
+	if failover.KeepExistingReplicaIncomplete(existing, asideStamp) {
+		trace.Warning("this replica already carries an interrupted-copy record naming the disks a previous rebuild set aside; keeping that record rather than replacing it, because it is the only thing that says where the last complete copy went",
+			"vm", cfg.TargetDomain, libvirtsync.MetadataFieldReplicaIncomplete, existing)
+		return nil
+	}
+	value, err := libvirtsync.ReplicaIncompleteValue(verb, time.Now().Unix(), cfg.ActionID,
+		util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName), asideStamp)
+	if err != nil {
+		return err
+	}
+	if err := libvirtsync.SetDomainMetadataFields(tgtMgr, cfg.TargetDomain, map[string]string{
+		libvirtsync.MetadataFieldReplicaIncomplete: value,
+	}); err != nil {
+		return err
+	}
+	trace.Info("recorded on the target that a full copy is starting, so an interrupted one cannot be promoted as a healthy replica",
+		"vm", cfg.TargetDomain, libvirtsync.MetadataFieldReplicaIncomplete, value)
 	return nil
 }
 
@@ -3366,6 +3553,58 @@ func run(cfg syncConfig) (runErr error) {
 	sshClientMu.Unlock()
 	defer targetSSHClient.Close()
 
+	// The action journal, opened at the FIRST moment both of the things it
+	// needs exist: a path to the replica's disks on the target (resolved just
+	// above, with each disk's chain walked to its base) and a way to reach the
+	// host holding them. It is written beside those disks, on that host,
+	// because the disks are what it is about and because the machine running
+	// this sync is the one most likely to be the thing that died.
+	//
+	// The intent lands BEFORE the reinit block below, which is the first step
+	// in a sync that can displace anything, and before the first qemu-img
+	// create of a base on the non-reinit full-sync path. That ordering is the
+	// whole mechanism: a record flushed at exit would be removed by exactly
+	// the events worth recording.
+	//
+	// EARLIER THAN THIS IS NOT POSSIBLE, and it is worth being honest about
+	// what that costs. Everything before this point is source-side reading and
+	// preflight -- connecting, listing disks, resolving backing chains -- with
+	// one exception, the unconditional cleanup of a leftover verify-window
+	// checkpoint from an older build, which touches the SOURCE's checkpoint
+	// metadata and not the replica. Nothing that can leave the replica
+	// half-written happens above this line.
+	journal := newRecorder(cfg, targetSSHClient, util.SetTargetPath(cfg.TargetDiskPath, qcowDisks[0].RootSource), cfg.TargetDomain)
+	journal.Intent(ctx, journalVerbSync, map[string]string{
+		"mode":          syncJournalMode(cfg),
+		"source":        util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName) + ":" + cfg.SourceDomain,
+		"disks":         strconv.Itoa(len(qcowDisks)),
+		"replaced_disk": cfg.ReplacedDiskAction,
+	})
+	// Registered AFTER the SSH client's own Close defer, so it runs BEFORE it:
+	// the outcome has to cross the connection the record is written over.
+	//
+	// A run killed by a signal never reaches this, because the handler calls
+	// os.Exit and nothing deferred runs. That is deliberate rather than a gap
+	// -- the intent with no outcome IS the evidence that the run stopped
+	// mid-flight, which is the CI-02 signature, and adding an SSH round trip
+	// to a signal path that is already racing several timeouts would risk the
+	// cleanup that actually matters.
+	defer func() {
+		checkpointMu.Lock()
+		effective, effectiveParent := checkpointName, parent
+		checkpointMu.Unlock()
+		detail := map[string]string{
+			"mode":       syncOutcomeMode(cfg, effectiveParent),
+			"checkpoint": effective,
+			"parent":     effectiveParent,
+		}
+		finishAction(ctx, journal, runErr, detail)
+		if n := journal.Failures(); n > 0 {
+			trace.Warning("this run could not write part of its action journal, so the record beside the replica is incomplete. The sync itself is unaffected: the journal is evidence, never an input to a decision",
+				"vm", cfg.TargetDomain, "lost_records", n)
+		}
+	}()
+
 	// checksumEnabled is THE decision about the pre-commit integrity check
 	// for this run, resolved once, here.
 	//
@@ -3673,6 +3912,58 @@ func run(cfg syncConfig) (runErr error) {
 	if cfg.Reinit {
 		trace.Warning("reinit requested: discarding checkpoint chain and existing target state", "domain", cfg.SourceDomain)
 
+		// ONE stamp for the whole displaced set, fixed here rather than per
+		// disk inside the loop below.
+		//
+		// It used to be taken next to each `mv -n`, so a multi-disk reinit
+		// that crossed a second boundary produced vda.vmsync-replaced-1758441600
+		// and vdb.vmsync-replaced-1758441601 -- two suffixes, and no single
+		// stamp naming the set. That made the displaced copy unrecoverable by
+		// any one instruction: an operator restoring it has to put back the
+		// whole machine, not one disk from one moment and another from the
+		// next, and the refusal below can only name one suffix. cmd/vmsync's
+		// restore path already fixes one stamp for its own set, for the same
+		// reason.
+		//
+		// Recorded even when the action is delete, since only the rename
+		// branch uses it -- reinitAsideStamp below is what decides whether
+		// anything is told about it.
+		reinitStamp := strconv.FormatInt(time.Now().Unix(), 10)
+		// Named to a later reader only when files really carry it. Telling an
+		// operator to recover from .vmsync-replaced-<stamp> files that a
+		// delete run never created would send them hunting for data that is
+		// genuinely gone.
+		reinitAsideStamp := ""
+		if cfg.ReplacedDiskAction == replacedDiskRename {
+			reinitAsideStamp = reinitStamp
+		}
+
+		// FIRST, before anything below has displaced or deleted a single
+		// thing: before -force-clean removes the target definition, before
+		// the block jobs are aborted, before the checkpoint chain is dropped,
+		// before the restore-point sweep, and before any `mv`.
+		//
+		// From the first of those onwards the target no longer holds what its
+		// own metadata claims, and until UpdateSyncMetadata records success
+		// nothing else on that domain says so -- last_checkpoint,
+		// last_sync_timestamp, replica_source and failure_count all still
+		// describe the replica this run is replacing. A run killed in that
+		// window (SIGTERM, whose handler calls os.Exit so nothing here gets
+		// to run; a dropped link; a lost power feed) therefore leaves a
+		// half-written image that -promote accepts, reporting a normal
+		// data-loss window, while the complete copy sits unused in the
+		// renamed-aside files.
+		//
+		// RETURNING here destroys nothing, which is exactly the point: the
+		// order makes an unarmed run impossible rather than merely unlikely.
+		// With -force-clean the value is written onto a domain that is about
+		// to be undefined, so it does not survive -- and that is fine, since
+		// a target with no domain at all is already refused by -promote with
+		// "there is nothing here to promote".
+		if err := armReplicaIncomplete(tgtMgr, cfg, reinitVerb(cfg), reinitAsideStamp); err != nil {
+			return fmt.Errorf("reinit: %w -- refusing to start, so NOTHING has been deleted, renamed or undefined on the target and this replica is exactly as it was. Without this record an interrupted reinit leaves a half-written replica that -promote accepts as healthy", err)
+		}
+
 		// -force-clean removes the target DEFINITION as well, before anything
 		// else touches it.
 		//
@@ -3858,7 +4149,12 @@ func run(cfg syncConfig) (runErr error) {
 				// Suffix, not a different directory: a sibling path is on the
 				// same filesystem, so the rename is atomic and cannot fail
 				// part-way or silently copy gigabytes.
-				aside := reinitTargetPath + replacedDiskSuffix + strconv.FormatInt(time.Now().Unix(), 10)
+				//
+				// reinitStamp, fixed once above this loop: every disk of this
+				// run lands under the SAME suffix, so one name identifies the
+				// whole displaced machine and the promotion refusal can tell
+				// an operator what to put back.
+				aside := reinitTargetPath + replacedDiskSuffix + reinitStamp
 				trace.Warning("reinit: renaming target disk aside instead of deleting it",
 					"path", reinitTargetPath, "renamed_to", aside)
 				// -n so an existing file at the destination is never
@@ -3886,6 +4182,20 @@ func run(cfg syncConfig) (runErr error) {
 	if err != nil {
 		return err
 	}
+
+	// The SAME exposure the reinit block above arms against, reached without
+	// -reinit: an empty parent means this run writes base images directly,
+	// with no overlay to commit at the end, while the target domain keeps the
+	// metadata of whatever it held before. Interrupted, it leaves a
+	// half-written base under a description of the replica that preceded it,
+	// and -promote reads that description and accepts.
+	//
+	// Not for a -reinit run, which armed the field at the top of its own
+	// block with verb=reinit AND the aside stamp. Overwriting it here would
+	// replace the one record that names the .vmsync-replaced-<stamp> files
+	// with one that names nothing -- turning a recoverable interruption into
+	// an unrecoverable one, which is the opposite of the point.
+	//
 	var targetPath string
 	if parent == "" {
 		// Preflight for full sync: fail before sync operations if target disk path exists.
@@ -3915,6 +4225,35 @@ func run(cfg syncConfig) (runErr error) {
 			if exists {
 				return fmt.Errorf("full sync requested but target disk already exists on target host: %s", targetPath)
 			}
+		}
+	}
+
+	// The SAME exposure the reinit block above arms against, reached without
+	// -reinit: an empty parent means this run writes base images directly,
+	// with no overlay to commit at the end, while the target domain keeps the
+	// metadata of whatever it held before. Interrupted, it leaves a
+	// half-written base under a description of the replica that preceded it,
+	// and -promote reads that description and accepts.
+	//
+	// Not for a -reinit run, which armed the field at the top of its own
+	// block with verb=reinit AND the aside stamp. Overwriting it here would
+	// replace the one record that names the .vmsync-replaced-<stamp> files
+	// with one that names nothing -- turning a recoverable interruption into
+	// an unrecoverable one, which is the opposite of the point.
+	//
+	// AFTER the preflight above, and that ordering is load-bearing in a way
+	// the obvious one is not. Nothing in that preflight writes to the replica
+	// -- it creates the target directory and refuses on a disk that already
+	// exists -- while the first byte of this run reaches the replica at the
+	// qemu-img create far below. Arming before it looked safer and was not:
+	// the refusal it walks into leaves nothing to clear the field, and the
+	// only thing that clears it is a SUCCESSFUL sync, so every later run
+	// arms again and refuses again at the same line. A replica nothing ever
+	// touched would have been left permanently unpromotable by a sync that
+	// declined to run.
+	if parent == "" && !cfg.Reinit {
+		if err := armReplicaIncomplete(tgtMgr, cfg, libvirtsync.ReplicaIncompleteVerbFullSync, ""); err != nil {
+			return fmt.Errorf("full sync: %w -- refusing to start, so nothing on the target has been written yet", err)
 		}
 	}
 
@@ -4482,6 +4821,24 @@ func run(cfg syncConfig) (runErr error) {
 	if cfg.TestFault == libvirtsync.TestFaultFailLastDisk && len(qcowDisks) < 2 {
 		return fmt.Errorf("-test=%s needs a domain with at least two qcow2 disks and %s has %d: the fault proves that one disk failing stops the OTHERS from committing, and with one disk there is nothing to stop. Point the run at a multi-disk domain",
 			libvirtsync.TestFaultFailLastDisk, cfg.SourceDomain, len(qcowDisks))
+	}
+
+	// -test=die-writing-base only means anything on a run that writes BASES.
+	// An incremental copies into an overlay that is removed on every path out
+	// that is not a commit, so killing it leaves the replica's base untouched
+	// and its metadata describing it correctly -- a healthy replica, nothing
+	// armed, nothing for the refusal to fire on. The harness asserting that
+	// refusal would then fail for a reason that has nothing to do with
+	// vmsync, which is the most expensive kind of test result to read.
+	//
+	// Here rather than at flag-parse time because whether this run is a full
+	// copy is only known once the source's checkpoint chain has been read,
+	// which is the same reason the checksum fault's own precondition cannot
+	// be a flag check either. It is still a long way before anything is
+	// copied, and nothing on the target has been touched yet.
+	if cfg.TestFault == libvirtsync.TestFaultDieWritingBase && parent != "" {
+		return fmt.Errorf("-test=%s needs a run that writes base images directly, and this one is an incremental against parent %s: its copy lands in an overlay that a failed run discards anyway, so killing it would leave the replica healthy and prove nothing. Pass -reinit (or -force-clean), or point the run at a target that has no replica yet",
+			libvirtsync.TestFaultDieWritingBase, parent)
 	}
 
 	// askTargetDigests has vmsync-bridge-helper hash the given ranges off an
@@ -5314,6 +5671,41 @@ func run(cfg syncConfig) (runErr error) {
 		res.writtenBytes, sourceDigests, err = nbdsync.CopyExtentsTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, effectiveTargetHost, effectiveTargetPort, exportName, extents, cfg.IODepth, checksumEnabled)
 		if err != nil {
 			return res, err
+		}
+
+		// -test=die-writing-base, injected in exactly the window CI-02
+		// happens in: this run's `mv` has displaced the good replica, a new
+		// base has been created and has taken real bytes, the write export is
+		// still open, and NOTHING has been digest-checked, committed or
+		// recorded. The target domain's own metadata still describes the
+		// replica that was renamed aside, so every evidence check -promote
+		// makes reads healthy -- which is why an interrupted rebuild used to
+		// be promotable. See libvirtsync.TestFaultDieWritingBase for why
+		// exiting earlier, right after the rename, would be a test that
+		// passes without testing anything.
+		//
+		// os.Exit, so no defer runs: not the export stop, not the overlay
+		// cleanup, not the outcome record, not the metadata write. That is
+		// the point rather than a shortcut -- a SIGKILL, a power cut and
+		// vmsync's own SIGTERM handler all leave exactly this behind, and a
+		// fault that unwound tidily would be testing the recovery path
+		// instead of the one there is no recovery from.
+		//
+		// Guarded on !incrementalMode as well as by the preflight refusal
+		// above, because an incremental's copy goes into a disposable overlay
+		// and killing the run there would leave a replica nothing is wrong
+		// with. Guarded on written bytes too: a disk whose extents are
+		// entirely unallocated has created a base and copied nothing into it,
+		// and dying on THAT disk would reach the state where the other disks
+		// are still missing -- which -promote already refuses on for an
+		// entirely different reason. Passing over it lets a disk with a real
+		// delta fire instead; if no disk on the domain has one the run simply
+		// completes, and the harness's own "this run must have died" check is
+		// what catches it.
+		if cfg.TestFault == libvirtsync.TestFaultDieWritingBase && !incrementalMode && res.writtenBytes > 0 {
+			trace.Warning("-test="+libvirtsync.TestFaultDieWritingBase+": killing this process NOW, with a new base written and nothing recorded. The replica on the target is half-written while its metadata still describes the copy this run replaced -- the interrupted-rebuild state replica_incomplete exists to refuse. This run is EXPECTED to die and means nothing as a replication",
+				"disk", d.TargetDev, "path", targetPath, "written_bytes", res.writtenBytes)
+			os.Exit(137)
 		}
 
 		if res.targetBridgeCounters != nil {
@@ -6577,6 +6969,7 @@ func registerFlags(fs *flag.FlagSet, cfg *syncConfig) (compressArg, fenceSourceA
 	fs.BoolVar(&cfg.ListRestorePoints, "list-restore-points", false, "list the restore points kept on the target and exit")
 	fs.StringVar(&cfg.CloneRestorePoint, "clone-restore-point", "", "copy one restore point's disks to -clone-to and exit")
 	fs.StringVar(&cfg.RestoreRestorePoint, "restore-restore-point", "", "put a restore point back over the replica; needs -force-restore")
+	fs.StringVar(&cfg.ExplainDomain, "explain-domain", "", "print this host's record of one domain: its replica_incomplete marker and its recent actions")
 
 	fs.StringVar(&cfg.PromoteMode, "promote-mode", string(failover.ModeForced), fmt.Sprintf("recorded with a promotion: %s|%s", failover.ModePlanned, failover.ModeForced))
 	fs.StringVar(&cfg.PromotedBy, "promoted-by", "", "who performed the promotion, recorded for attribution")
@@ -6586,6 +6979,8 @@ func registerFlags(fs *flag.FlagSet, cfg *syncConfig) (compressArg, fenceSourceA
 	fs.StringVar(&cfg.PrometheusTextfile, "prometheus-textfile", "", "write metrics to this path in Prometheus textfile-collector format")
 	fs.StringVar(&cfg.ResultJSON, "result-json", "", "write this run's degradations to this path as JSON")
 	fs.StringVar(&cfg.RunID, "run-id", "", "opaque id recorded in the run lock, for a supervising agent")
+	fs.StringVar(&cfg.ActionID, "action-id", "", "correlation id for this action, joining its journal records to the domain's own markers (minted when absent)")
+	fs.StringVar(&cfg.Journal, "journal", journalLevelActions, fmt.Sprintf("action journal beside the replica's disks: %s|%s", journalLevelActions, journalLevelOff))
 	fs.BoolVar(&cfg.Debug, "debug", false, "enable debug logging")
 	fs.BoolVar(&cfg.ShowVersion, "v", false, "print the version and exit")
 	fs.BoolVar(&cfg.ShowVersion, "version", false, "print the version and exit")
