@@ -51,6 +51,15 @@ to exercise all paths.
   than `-reinit` already is — but they are failure injection rather than
   measurement, so they only belong on the same disposable test host
   everything else here already requires.
+- Stage 16 (opt-in, not run by default — see below) deliberately **kills a
+  rebuild part-way through**, with `-test=die-writing-base`, and leaves the
+  target holding a half-written replica on purpose. It then promotes that
+  replica with `-force-promote`, puts the complete copy back from the
+  `.vmsync-replaced-<unixtime>` files, promotes again, and rebuilds. The role
+  goes back after each promotion and an `EXIT` trap does the same on a die or a
+  Ctrl+C — but a `kill -9` leaves the target `promoted`, and a promoted target
+  refuses **every** sync in the estate until somebody runs
+  `-update-role target` on it.
 
 **Point this at a disposable, dedicated test VM.** Never at a real,
 in-use replication pair. `bench.sh` refuses to run for real (as opposed to
@@ -81,7 +90,7 @@ vmsync itself to work at all).
 
 ```bash
 ./bench.sh --dry-run          # print every vmsync command line, touch nothing
-./bench.sh                    # the defaults: Stage 1, then 2, 3, 4, then 9
+./bench.sh                    # the defaults: Stage 1, then 2, 3, 4, then 17, then 9
 ./bench.sh --only 'compress-zstd-*'   # Stage 1 only, matching scenarios
 ./bench.sh --stages verify       # 2  just the verify+tamper tests
 ./bench.sh --stages snapshot     # 4  just the external-snapshot lifecycle test
@@ -92,6 +101,8 @@ vmsync itself to work at all).
 ./bench.sh --stages retention    # 9  just the restore-point tests
 ./bench.sh --stages restore      # 10 opt-in: putting a restore point back
 ./bench.sh --stages invert       # 11 opt-in: reversing a pair; STOPS THE SOURCE VM
+./bench.sh --stages interrupted-reinit   # 16 opt-in: kill a rebuild mid-copy, then try to promote it
+./bench.sh --stages journal      # 17 the action journal beside the replica's disks
 ```
 
 Stages 2, 3, 4, 9, 10 and 11 each run their own baseline `-reinit` full
@@ -1005,6 +1016,159 @@ harness, now uses `-force-clean` rather than `-reinit`, because every tamper
 sub-test leaves a `verify_state` record behind and a plain `-reinit` is refused.
 That means the heal path no longer exercises the refusal — which is exactly why
 Stage 14 asserts it rather than assuming it.
+
+### Stage 16 (`interrupted-reinit`), opt-in
+
+The stage for the one failure a promotion used to accept without a word.
+
+A full copy — `-reinit`, `-force-clean`, or any sync whose computed parent is
+empty — renames the good replica disks aside and writes **new base images
+directly**, with no overlay to commit at the end, while the target domain keeps
+its **old** metadata until the very last write. Kill a run in that window — a
+dropped link, an agent restart (the signal handler calls `os.Exit`, so `main()`
+never runs), a lost power feed — and the target still says
+`last_checkpoint=<old>`, `last_sync_timestamp=<old>`, `replica_source=<set>`,
+`failure_count=0`. Every one of those is true about the replica the copy
+**replaced** and false about the half-written image now on the disks. So every
+evidence check passed, `-promote` booted a half-written machine and reported an
+ordinary data-loss window — while the complete copy sat unread in the
+`.vmsync-replaced-<unixtime>` files beside it.
+
+`replica_incomplete` on the target's own metadata closes it: written before the
+copy destroys anything, cleared by the same `DomainDefineXML` that records
+success, and read by the promotion gate as an evidence problem.
+
+This stage is the only place that closure is proven against a **real**
+interruption rather than a struct literal, and the distinction is not academic:
+the gate is split across two packages — `pkg/failover` decides from a struct,
+and the promote command has to fill that struct in from the domain — so a field
+missing from the mapping costs nothing at build time and disables the refusal
+at run time. That is exactly what happened to the verify record once already.
+
+It needs `-test=die-writing-base` and cannot be done any other way. The window
+is inside one process, between a `qemu-img create` and a metadata write, with
+no I/O an external harness could interrupt at the right moment. The fault kills
+the process (**exit 137**, nothing unwound, no defer, no cleanup, no outcome
+record) once a base has been created and taken real bytes. A fault that exited
+right after the rename would land in a state `-promote` **already** refuses on
+("one or more disk files are missing"), so the stage would be green precisely
+when the feature was absent.
+
+What it asserts, in the order the state moves:
+
+- **the interruption happened where it says** — non-zero is not enough, and
+  resting on it would make the whole stage vacuous: vmsync refuses an unknown
+  `-test` value at flag validation and exits 2 having touched nothing, so
+  against a build with the fault removed the run exits non-zero, the target is
+  untouched, and several checks below pass trivially. The injection's own log
+  line is what proves it fired, and exit **137** specifically proves nothing
+  unwound.
+- **the record, and the fact that nothing else moved** — `replica_incomplete`
+  is present in `virsh dumpxml --inactive` (the persistent definition, which is
+  the only copy that outlives the process and the one `-promote` reads), names
+  `verb=reinit`, and carries **exactly one** `aside=` stamp; while
+  `last_checkpoint` and `last_sync_timestamp` are **unchanged**. That those
+  still look healthy is the whole reason this replica used to be promotable — a
+  stage where the rebuild had cleared them would be proving the refusal against
+  a target any older check would have caught on its own.
+- **exactly one `.vmsync-replaced-<stamp>` per disk, all sharing that one
+  stamp**. One stamp names one displaced machine; two stamps across a
+  multi-disk domain name no coherent set, and the refusal could then tell an
+  operator nothing useful about what to put back.
+- **`-promote` is refused, by name** — the log must carry the interrupted-copy
+  finding *and* the exact `.vmsync-replaced-<stamp>` suffix, and the domain's
+  `replication_role` must not have moved. A promote that never ran at all exits
+  non-zero too; accepting that would record the interlock as working on a run
+  where it was never consulted.
+- **`-force-promote` still gets through, loudly** — it must succeed, say
+  `promoted despite` *and* name the finding, and report the data-loss window as
+  **unknown**. A figure there would be computed from a checkpoint describing
+  the copy that was replaced and printed beside disks holding something else: a
+  measurement of a replica that no longer exists, which reads as reassurance.
+- **the recovery the refusal names works** — putting the aside files back
+  restores the complete replica *exactly* (same inode, so mtime, size and
+  allocated blocks all return to their previous values, which a base created
+  seconds later cannot match by accident), and it can then be force-promoted.
+  A plain `-promote` is **still refused** afterwards, and that is asserted
+  rather than glossed over: a rename on the target host tells vmsync nothing,
+  and a record a rename could clear would be a record *any* rename could clear.
+- **the refusal lifts itself** — re-running the rebuild to completion clears
+  `replica_incomplete`, and a plain `-promote` is accepted again with a
+  **measured** window. Without this the stage would pass just as happily
+  against a build that refused every promotion in the estate, which would teach
+  operators to type `-force-promote` without reading what it said.
+
+It forces `-replaced-disk-action=rename` for its own syncs whatever
+`REPLACED_DISK_ACTION` says, because with `delete` there are no aside files and
+three of those assertions have nothing to look at; the setting is restored on
+the way out, and the stage deletes its own aside set when it finishes. Needs
+`TARGET_VMSYNC_BIN` (vmsync on the *target* host) because `-promote` refuses a
+remote libvirt URI by design, and skips rather than failing without it.
+
+One piece of housekeeping is the stage's own, and worth knowing if you adapt
+it. Because the fault unwinds nothing, the **target-side `qemu-nbd` is left
+running**, holding the half-written base open — the deferred cleanup and the
+signal handler's replay of the stop commands are exactly what `os.Exit` skips.
+It blocks none of the assertions (nothing here opens the replica's disks), but
+it would hold that file's blocks after any later `rm`, so the stage kills it
+by its pidfile in `/run/vmsync` immediately after the run and again from its
+cleanup trap. Set `TARGET_RUNTIME_DIR` in `bench.conf` if you ever point
+vmsync's `-target-runtime-dir` somewhere else.
+
+Opt-in, and after Stages 7 and 11 the most destructive thing here: it
+deliberately leaves the target half-written, promotes it three times and
+rebuilds it. It puts the role back each time and an `EXIT` trap does the same on
+a die or a Ctrl+C — but a `kill -9` leaves the target `promoted`, and a promoted
+target refuses **every** later sync in the estate, not just this harness's.
+
+The same false-positive guards are spread across the stages that would notice
+them first: an ordinary promotion of a healthy replica must not be refused over
+this (Stage 6), a successful `-reinit` must not leave the record behind
+(Stage 3), a restore must arm it before the swap and withdraw it after
+(Stage 10), and a run the commit barrier discarded entirely must arm nothing at
+all (Stage 15) — that last one is the opposite case, where every base is
+provably untouched and the replica is whole.
+
+### Stage 17 (`journal`), default
+
+Cheap — one ordinary sync, no `-reinit` — and in the default list because of
+what it guards rather than what it proves.
+
+vmsync writes an **action journal** beside the disks it describes, on the host
+that owns them: `<disk dir>/.vmsync-journal/<domain>.jsonl` on the **target**,
+append-only, one intent record before a verb acts and one outcome when it
+stops, joined by `(aid, seq)`. Nothing ever branches on it — it is evidence,
+never an input to a decision — and that is precisely why nothing else here
+would notice it quietly ceasing to be written. Its whole value is the record of
+an action that **died**: a run killed by `SIGTERM`, a dropped link or a power
+cut writes its intent and then nothing at all, and that unmatched intent *is*
+the evidence. An estate whose journals had stopped would look identical to one
+where nothing ever crashed, and every other stage here would keep reporting
+`PASS`.
+
+So this asserts the ordinary case, which is the one that can be asserted from
+outside:
+
+- a sync writes an **intent** record (`k=intent`, `verb=sync`) beside the
+  replica;
+- it carries the `(aid, seq)` join — the **pair**, never `aid` alone, because
+  one process can perform two actions under one id and joining on the id would
+  pair one run's intent with the other's outcome;
+- a **matching outcome** with `res=ok` follows it;
+- the intent is written **before** the outcome. Order is the mechanism, not a
+  formatting detail: a record flushed at exit would be removed by exactly the
+  events worth recording;
+- and the finished sync leaves **no `replica_incomplete`** behind.
+
+It reads past the existing file (`tail -n +N`) rather than truncating it: the
+journal is shared with every other stage in the run, and a harness that deleted
+one to make its own test easier to write would be deleting the one thing the
+feature exists to keep. It works out the path the same way vmsync does —
+`TARGET_DISK_PATH` when set, otherwise the directory the target domain's own
+disks are in — and skips, saying so, when it cannot.
+
+The interrupted half of the journal's story is Stage 16's, where
+`-test=die-writing-base` provides the death this stage cannot stage.
 
 ## Files
 

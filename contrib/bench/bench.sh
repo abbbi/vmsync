@@ -37,7 +37,7 @@ CONF="$SCRIPT_DIR/bench.conf"
 SCENARIOS="$SCRIPT_DIR/scenarios.conf"
 DRY_RUN=no
 ONLY_PATTERN=""
-STAGES="matrix,verify,reinit,snapshot,retention"
+STAGES="matrix,verify,reinit,snapshot,journal,retention"
 
 # INTERRUPTED: vmsync catches SIGINT/SIGTERM itself (cleanup, then a plain
 # os.Exit(1) -- see cmd/vmsync/main.go's own signal handling), so a Ctrl+C
@@ -70,24 +70,29 @@ Options:
                              6  failover     13  checksum
                              7  fence-agent  14  verify-failure
                                             15  commit-barrier
+                                            16  interrupted-reinit
+                                            17  journal
                            Runs in whichever order LIST gives them, not a
                            fixed canonical one.
-                           (default: matrix,verify,reinit,snapshot,retention;
-                           retention is last because it reinitialises the
-                           target, and it skips cleanly where the target
-                           filesystem cannot reflink. define, failover,
-                           fence-agent, verify-long, restore, invert, wedge,
-                           checksum, verify-failure and commit-barrier are
-                           opt-in, see below. commit-barrier additionally
-                           needs a source domain with two or more qcow2
-                           disks, and skips cleanly without one)
+                           (default: matrix,verify,reinit,snapshot,journal,
+                           retention; retention is last because it
+                           reinitialises the target, and it skips cleanly
+                           where the target filesystem cannot reflink. define,
+                           failover, fence-agent, verify-long, restore,
+                           invert, wedge, checksum, verify-failure,
+                           commit-barrier and interrupted-reinit are opt-in,
+                           see below. commit-barrier additionally needs a
+                           source domain with two or more qcow2 disks, and
+                           skips cleanly without one)
   --dry-run               print every vmsync command line; touch nothing
                            (no ssh/qemu-io/vmsync calls actually made)
   -h, --help              this text
 
-Stages 2, 3, 4, 9, 10, 11, 13 and 14 each start with their own baseline full
-sync, so none of them actually require Stage 1 (or any prior sync) to have run
-first -- each is safe to run standalone via --stages. Stage 4 additionally
+Stages 2, 3, 4, 9, 10, 11, 13, 14 and 16 each start with their own baseline
+full sync, so none of them actually require Stage 1 (or any prior sync) to have
+run first -- each is safe to run standalone via --stages. Stage 17 needs no
+baseline at all: its one sync is whatever the pair's state makes it, full or
+incremental, and either answers what it asks. Stage 4 additionally
 requires the SOURCE domain to be running. (Stage 14's baseline is -force-clean
 rather than -reinit, because a re-run after a previous attempt left a
 verification failure recorded would otherwise be refused by the very interlock
@@ -228,6 +233,49 @@ vmsync that had stopped committing altogether. Opt-in because one sub-test
 deliberately fails a sync; it also needs a source domain with two or more
 qcow2 disks and skips cleanly without one, since on a single disk the barrier
 has nothing to hold back.
+
+Stage 16 (interrupted-reinit) is opt-in and covers the one failure a promotion
+used to accept. A full copy -- `-reinit`, `-force-clean`, or any sync that
+writes bases directly -- renames the good replica disks aside and writes new
+ones with no overlay, while the target domain keeps its OLD metadata. A run
+killed in that window leaves last_checkpoint, last_sync_timestamp,
+replica_source and failure_count all still describing the replica that was
+replaced, so every evidence check reads healthy and `-promote` boots a
+half-written machine reporting an ordinary data-loss window -- with the
+complete copy sitting unused in the `.vmsync-replaced-<unixtime>` files beside
+it. The stage reaches that state with vmsync's own `-test=die-writing-base`,
+which kills the process (exit 137, nothing unwound) once a base has been
+created and written, and then asserts the whole ladder: the run died where the
+fault says it did; the target carries `replica_incomplete` with ONE aside
+stamp while last_checkpoint is untouched; there is exactly one
+`.vmsync-replaced-<stamp>` per disk and they all share that one stamp;
+`-promote` is REFUSED naming the interrupted rebuild and that exact suffix;
+`-force-promote` gets past it and reports the window as unknown; putting the
+aside files back restores the complete replica byte for byte and it can then
+be force-promoted, while a plain promote is still refused because a rename on
+the target tells vmsync nothing; and finally a rebuild run to completion
+clears the record and a plain `-promote` is accepted again with a measured
+window. It forces `-replaced-disk-action=rename` for its own runs whatever
+REPLACED_DISK_ACTION says, because with `delete` there are no aside files and
+three of those assertions would have nothing to look at; the setting is put
+back on the way out. Needs TARGET_VMSYNC_BIN (`-promote` refuses a remote
+libvirt URI by design) and skips rather than failing without it. Opt-in
+because it deliberately leaves the target half-written, promotes it three
+times and rebuilds it -- it puts the role back each time and an EXIT trap does
+the same on a die or a Ctrl+C, but a kill -9 leaves the target promoted, and a
+promoted target refuses EVERY later sync in the estate.
+
+Stage 17 (journal) IS a default, and is cheap: one ordinary sync, no reinit.
+It proves the action journal beside the replica's disks
+(`<disk dir>/.vmsync-journal/<domain>.jsonl` on the TARGET host) is actually
+being written -- one intent record before the verb acts, one outcome when it
+stops, joined by (aid, seq) and in that order -- and that a sync which
+finishes leaves no `replica_incomplete` behind. It is in the default list
+because of what it guards: the journal's whole value is the record of an
+action that DIED, where the intent is written and the outcome never is, and a
+journal that had quietly stopped being written would look exactly like an
+estate where nothing ever crashed. Every other stage here would keep reporting
+PASS either way. It reads past the existing file rather than truncating it.
 EOF
 }
 
@@ -1501,6 +1549,14 @@ VMSYNC_METADATA_URI="http://vmsync.org/xmlns/libvirt/domain/1.0"
 # that quietly stops testing anything.
 VMSYNC_TEST_FAILURE_DEFINE="failure-define"
 
+# Must match libvirtsync.TestFaultDieWritingBase, and the same reasoning
+# applies: a rename there becomes an immediate "unknown -test fault" here
+# rather than a stage that silently stops reaching the state it is about.
+# Stage 16 additionally refuses to draw any conclusion from a non-zero exit it
+# cannot tie to the injection line, precisely because that is what a removed
+# fault looks like.
+VMSYNC_TEST_DIE_WRITING_BASE="die-writing-base"
+
 stage_reinit_after_failures() {
         log "=== Stage 3: -reinit-after-failures ==="
         local n="${REINIT_AFTER_FAILURES_N:-3}"
@@ -1559,6 +1615,29 @@ stage_reinit_after_failures() {
         else
                 warn "FAIL: expected a forced full resync after $n induced failures, see $RUN_LOG"
                 results_row "$CSV" reinit-after-failures result 1 "" "" "" "" "" "FAIL no forced resync observed"
+        fi
+
+        # The false-positive guard for the interrupted-rebuild refusal, made
+        # here because this stage ends with the exact run that arms it: a
+        # forced full resync renames the replica aside and writes new bases,
+        # so it writes replica_incomplete before it starts and must clear it in
+        # the write that records success.
+        #
+        # Stage 16 proves the field is written and refused on. This proves it
+        # does not SURVIVE a run that worked -- and the cost of getting that
+        # wrong is worse than the refusal never existing: every replica in the
+        # estate would be force-only after its first full sync, and operators
+        # would learn to type -force-promote without reading what it said.
+        if [ "$DRY_RUN" != yes ] && [ "$RUN_RC" = 0 ]; then
+                local marker
+                marker="$(replica_incomplete "$TARGET_URI" "$TARGET_DOMAIN")"
+                if [ -z "$marker" ]; then
+                        log "   PASS: the forced full resync left no replica_incomplete behind"
+                        results_row "$CSV" reinit-after-failures no-incomplete-marker 0 "" "" "" "" "" "PASS successful reinit cleared the marker"
+                else
+                        warn "FAIL: the target still carries replica_incomplete='$marker' after a forced full resync that reported success -- every -promote of this replica is now refused until another sync clears it"
+                        results_row "$CSV" reinit-after-failures no-incomplete-marker 1 "" "" "" "" "" "FAIL successful reinit left the marker armed"
+                fi
         fi
         return 0
 }
@@ -2365,6 +2444,55 @@ vmsync_meta_field() {
 		| xmllint --xpath "string(//*[local-name()='${field}']/@id)" - 2>/dev/null || true
 }
 
+# replica_incomplete URI DOMAIN -> the raw replica_incomplete value, or empty.
+#
+# vmsync writes this on the TARGET before a full copy starts destroying the
+# replica that is there, and clears it in the same write that records the copy
+# as finished. Its PRESENCE is the finding, which is why every caller here
+# tests for emptiness rather than for a shape -- an unreadable value still
+# refuses a promotion, and a harness that only recognised well-formed ones
+# would report a pass for a build that had stopped refusing.
+#
+# --config, like everything vmsync_meta_field reads: that is the persistent
+# definition, which is what -promote reads (DOMAIN_XML_INACTIVE) and the only
+# copy that outlives the process that wrote it.
+replica_incomplete() {
+	vmsync_meta_field "$1" "$2" replica_incomplete
+}
+
+# replica_incomplete_key VALUE KEY -> one key's value out of that line.
+#
+# The value is a single line of comma-separated k=v pairs
+# (verb, at, action, host, aside) and this matches the key EXACTLY rather than
+# by substring: an assertion about `at` that silently read `verb` instead, or
+# one about `aside` that matched some later key ending in those letters, would
+# be a passing check on the wrong field.
+replica_incomplete_key() {
+	printf '%s' "$1" | awk -v k="$2" -F, '{
+		for (i = 1; i <= NF; i++) {
+			n = index($i, "=")
+			if (n > 0 && substr($i, 1, n - 1) == k) { print substr($i, n + 1); exit }
+		}
+	}'
+}
+
+# replica_incomplete_key_count VALUE KEY -> how many times KEY appears.
+#
+# Exists for one assertion: the field is single-valued and NEVER appended to,
+# so a second `aside=` would name a second displaced set that does not exist
+# and leave the refusal unable to say what to put back. Counting is the only
+# way to notice, since replica_incomplete_key stops at the first match.
+replica_incomplete_key_count() {
+	printf '%s' "$1" | awk -v k="$2" -F, '{
+		c = 0
+		for (i = 1; i <= NF; i++) {
+			n = index($i, "=")
+			if (n > 0 && substr($i, 1, n - 1) == k) c++
+		}
+		print c
+	}'
+}
+
 # fo_check SCENARIO LABEL OK DETAIL -- records one assertion, where OK is 0
 # for pass and anything else for fail.
 #
@@ -2688,6 +2816,18 @@ stage_failover() {
 			fo_check "$sc" "replica_source names a real host rather than loopback" 0
 			;;
 		esac
+
+		# The first half of the interrupted-rebuild false-positive guard. The
+		# baseline above was a -reinit: it renamed the replica aside, wrote new
+		# bases and armed replica_incomplete before it started, so a field
+		# still standing here means the clear did not happen -- and everything
+		# below would then be testing a promotion of a replica vmsync believes
+		# is half-written, which is stage 16's subject and not this one's.
+		local incomplete
+		incomplete="$(replica_incomplete "$TARGET_URI" "$TARGET_DOMAIN")"
+		if [ -z "$incomplete" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "a healthy replica carries no replica_incomplete" "$fo_ok" \
+			"the freshly synced target still says replica_incomplete='$incomplete'"
 	fi
 
 	# --- disk ownership -----------------------------------------------------
@@ -2711,6 +2851,22 @@ stage_failover() {
 	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "promote succeeds against a freshly synced replica" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
 	if [ "$fo_ok" = 0 ]; then FAILOVER_PROMOTED=yes; fi
+
+	# The other half of the interrupted-rebuild guard, and the one that names
+	# the cause. A refusal firing on a healthy replica shows up in the check
+	# above only as "promote failed", with the reason buried in a log nobody
+	# opens until the failover is already going badly. This refusal is the one
+	# most able to fire wrongly, because it rests on a field being ABSENT
+	# rather than on a value being right: anything that armed it and did not
+	# clear it -- a strip list a new field was never added to, a clear that
+	# moved after the write that was supposed to contain it -- turns every
+	# promotion in the estate into a -force-promote.
+	#
+	# Its own variable, not fo_ok, which the early return below still needs.
+	local fo_incomplete=0
+	if grep -q 'a full copy of this replica was STARTED and never recorded as finished' "$RUN_LOG" 2>/dev/null; then fo_incomplete=1; fi
+	fo_check "$sc" "the ordinary promotion is not refused over an interrupted rebuild" "$fo_incomplete" \
+		"-promote named an interrupted rebuild on a replica the baseline sync finished moments ago -- see $RUN_LOG"
 
 	# Everything below this point only means anything against a target that
 	# is actually promoted. Running those checks anyway turns ONE root cause
@@ -3266,7 +3422,14 @@ stage_fence_agent() {
 # --stages matrix,checksum reported Stage 1 as FAILED on the strength of a
 # deliberate refusal in another stage. Stage 14's rows are already covered by
 # the ^verify- prefix.
-NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$)'
+#
+# commit-barrier, interrupted-reinit and journal are here for exactly that
+# reason. The first two fail a sync on purpose as well -- one with
+# -test=fail-last-disk, one with -test=die-writing-base -- so without them a
+# run passing --stages matrix,commit-barrier or matrix,interrupted-reinit
+# would report Stage 1 as FAILED on the strength of a deliberate kill in
+# another stage. commit-barrier was missing when this line was last touched.
+NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$)'
 
 # stage_pattern STAGE -> the regex matching that stage's scenario column.
 # --- Stage 8: verify after a long incremental chain --------------------------
@@ -3884,6 +4047,25 @@ stage_restore() {
 	if grep -q "$rp_old" "$RUN_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "the assessment names the restore point it would apply" "$fo_ok" "see $RUN_LOG"
 
+	# A restore replaces the replica's contents wholesale, which is the same
+	# hazard a full copy carries, and it is armed the same way: the single
+	# metadata write that happens between staging and swapping sets
+	# replica_incomplete, and only the swap finishing withdraws it. Between
+	# those two the disks are a mixture of two moments while the metadata
+	# beside them names one coherent checkpoint -- so without the field a
+	# half-swapped machine promotes with nothing to say it should not.
+	#
+	# The window is inside one process and cannot be sampled from outside, so
+	# what is asserted here is the thing that CAN be: the plan the restore
+	# applies before it touches a disk contains the field, and the assessment
+	# says so. That matters on its own terms too -- the assessment is what an
+	# operator reads before saying yes, and a promotion refusal arriving
+	# unannounced mid-incident, on a domain they were told would be
+	# promotable, is the one surprise this whole feature must not create.
+	if grep -q 'replica_incomplete' "$RUN_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the assessment warns that the restore will arm a promotion refusal" "$fo_ok" \
+		"replica_incomplete is not in the assessment's field list, so the restore either does not arm it -- leaving a half-swapped replica promotable -- or arms it without telling the operator it is about to. See $RUN_LOG"
+
 	# Same assessment, without -target-disk-path. A restore refuses outright
 	# without the target domain, so it can read the directory off the domain
 	# instead -- and doing so uses the same rule the sync used to place the
@@ -3985,6 +4167,18 @@ stage_restore() {
 	if [ -z "$got" ]; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "source_stopped_at_sync is cleared" "$fo_ok" \
 		"source_stopped_at_sync is still '$got' -- a promotion would report a VERIFIED zero data loss for rolled-back data"
+
+	# The other end of the window the assessment announced. Every disk is
+	# swapped and every one has an owner qemu can open, so the replica on
+	# these files is the restore point entire -- and the refusal has to be
+	# withdrawn, because a restore is very often done precisely in order to
+	# promote. A field left standing here turns the deliberate rollback an
+	# operator performed into a replica they then have to force past, with a
+	# message about an interrupted copy that in fact completed.
+	got="$(replica_incomplete "$TARGET_URI" "$TARGET_DOMAIN")"
+	if [ -z "$got" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the restore withdraws its own promotion refusal once the swap is done" "$fo_ok" \
+		"replica_incomplete is still '$got' after a restore that reported success -- this replica is healthy and -promote will refuse it until a sync clears the field, which a paused target first has to be taken out of pause to run"
 
 	# The three fields pkg/failover reads as evidence that a sync landed. A
 	# restore that cleared them would leave a replica that cannot be promoted
@@ -5794,6 +5988,136 @@ target_base_fingerprints() {
 	done < <(source_qcow_devs)
 }
 
+# target_disk_paths -> the target's own path for every qcow2 disk of the source
+# domain, one per line.
+#
+# Read off the TARGET domain's own XML, never composed from TARGET_DISK_PATH,
+# for the reason target_base_fingerprints reads it too: that XML is what the
+# replica actually is. After an interrupted rebuild it is also the thing under
+# test, because it still describes the copy the rebuild replaced -- which is
+# exactly why every other promotion check passes.
+#
+# The devs are collected with mapfile before anything is run over SSH. A
+# `while read` fed by a process substitution shares its stdin with every
+# command in the loop body, and ssh reads stdin by default, so an ssh call
+# inside such a loop can swallow the remaining disks and silently shorten the
+# list this harness then asserts against.
+target_disk_paths() {
+	local -a devs=()
+	local dev path
+	mapfile -t devs < <(source_qcow_devs)
+	# Guarded because "${devs[@]}" on an empty array is an unbound variable
+	# under `set -u` on bash before 4.4, which would end the whole harness
+	# rather than this function.
+	[ "${#devs[@]}" -gt 0 ] || return 0
+	for dev in "${devs[@]}"; do
+		[ -n "$dev" ] || continue
+		path="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$dev")" || true
+		[ -n "$path" ] && printf '%s\n' "$path"
+	done
+	return 0
+}
+
+# sweep_replaced_disks -- remove every .vmsync-replaced-* file beside the
+# target's disks.
+#
+# Two call sites need it for two different reasons. Before an interruption is
+# staged, because "exactly ONE aside file per disk" is the assertion and a set
+# left by the baseline -reinit ten seconds earlier would fail it for a reason
+# that has nothing to do with vmsync. After a stage that forced rename mode,
+# because a full-size copy per disk left on the target's filesystem is how a
+# long run fills it and then fails three stages later for a cause nobody
+# connects back here.
+sweep_replaced_disks() {
+	local -a paths=()
+	local path
+	mapfile -t paths < <(target_disk_paths)
+	[ "${#paths[@]}" -gt 0 ] || return 0
+	for path in "${paths[@]}"; do
+		[ -n "$path" ] || continue
+		ssh_host_cmd "$TARGET_HOST" "rm -f '${path}'.vmsync-replaced-*" >/dev/null 2>&1 || true
+	done
+	return 0
+}
+
+# kill_orphaned_target_exports -- stop any qemu-nbd the TARGET host is still
+# running for this domain, and remove its pidfile.
+#
+# Only stage 16 needs this, and only because of what its fault does. Every
+# other failure path in vmsync stops its own exports: the deferred cleanup
+# runs, or the signal handler replays the registered stop commands.
+# -test=die-writing-base calls os.Exit with the write export still open, and
+# that is the point of it -- nothing unwinds, exactly as nothing unwinds after
+# a power cut. What it leaves behind on the target is a qemu-nbd holding a disk
+# file open.
+#
+# It breaks none of this stage's assertions, since nothing here opens the
+# replica's disks. What it does is hold that file's blocks after a later `rm`,
+# so an unswept run would leak a process and a disk's worth of space per
+# invocation -- and this harness is run repeatedly against the same target.
+#
+# The pidfile name is vmsync's own (vmsync-qemu-nbd-<target domain>-<dev>.pid
+# in -target-runtime-dir, which this harness never overrides, so /run/vmsync).
+# The `[ -f ]` guard is there because an unmatched glob arrives at the remote
+# shell as its own literal text.
+kill_orphaned_target_exports() {
+	local dir="${TARGET_RUNTIME_DIR:-/run/vmsync}"
+	ssh_host_cmd "$TARGET_HOST" \
+		"for p in ${dir}/vmsync-qemu-nbd-${TARGET_DOMAIN}-*.pid; do [ -f \"\$p\" ] || continue; kill -9 \"\$(cat \"\$p\")\" 2>/dev/null || true; rm -f \"\$p\"; done" \
+		>/dev/null 2>&1 || true
+	return 0
+}
+
+# abort_orphaned_source_backup -- end the libvirt pull-backup job a killed run
+# left running on the SOURCE domain.
+#
+# The other half of the same wreckage, and the more damaging half. A fault that
+# exits without unwinding skips vmsync's own `abortBackup` cleanup, so the
+# source keeps an active block job; libvirt allows one per domain, and vmsync
+# refuses at preflight while one exists. Left behind, it does not merely fail
+# the next assertion in this stage -- it blocks EVERY later sync of this domain
+# on this host, including the ones other stages depend on, until a person runs
+# domjobabort by hand. The harness broke it, so the harness clears it.
+#
+# Tolerant of everything: a run that died before BackupBegin has no job to
+# abort, and "no job is active" is the state this wants either way.
+abort_orphaned_source_backup() {
+	virsh_uri "$SOURCE_URI" domjobabort "$SOURCE_DOMAIN" >/dev/null 2>&1 || true
+	return 0
+}
+
+# journal_safe_key DOMAIN -- the filename component actionlog.SafeKey produces.
+#
+# Reimplemented here rather than asked of vmsync, and in the same order
+# pkg/actionlog's own replacer lists: "%" first, so a "%" the domain really
+# contains cannot be confused with one this encoding introduced, then "/" and
+# then " ". A harness that guessed the filename instead would look at a path
+# that does not exist and report a missing journal for every domain whose name
+# has a space in it -- a failure indistinguishable from the one this stage is
+# actually for.
+journal_safe_key() {
+	local s="$1"
+	s="${s//%/%%}"
+	s="${s//\//%2f}"
+	s="${s// /%20}"
+	printf '%s' "$s"
+}
+
+# journal_file -> the target-side path of TARGET_DOMAIN's action journal, or
+# empty when the disk directory cannot be worked out.
+#
+# <dir of the replica's disks>/.vmsync-journal/<SafeKey(domain)>.jsonl, which
+# is actionlog.Root(diskPath) joined with actionlog.File(). TARGET_DISK_PATH
+# when it is set, because that is where the sync places the disks and
+# therefore the journal; otherwise the directory the target domain's own disks
+# are already in, which domain_disk_dir reports only when they all share one.
+journal_file() {
+	local dir="${TARGET_DISK_PATH:-}"
+	[ -n "$dir" ] || dir="$(domain_disk_dir "$TARGET_URI" "$TARGET_DOMAIN")"
+	[ -n "$dir" ] || return 0
+	printf '%s/.vmsync-journal/%s.jsonl' "${dir%/}" "$(journal_safe_key "$TARGET_DOMAIN")"
+}
+
 # Stage 15: the commit barrier.
 #
 # Proves the property the barrier exists for, and the only one that needed a
@@ -5916,6 +6240,27 @@ stage_commit_barrier() {
 	log "no target base image changed: one disk failing stopped every other disk from committing"
 	results_row "$CSV" commit-barrier no-partial-commit "" "" "" "" "" "" "PASS no disk committed when one failed"
 
+	# And the barrier's failure must not look like an interrupted rebuild.
+	#
+	# The two are opposites and the difference is exactly what
+	# replica_incomplete is for. A run that discards every overlay leaves the
+	# replica's bases untouched -- the assertion above just proved it -- so
+	# the replica is whole, correctly described by its own metadata, and
+	# promotable. An interrupted FULL copy leaves half-written bases under
+	# metadata describing the copy they replaced, and must refuse. An
+	# incremental that armed the field anyway would refuse a promotion of a
+	# perfectly good replica on the day of a failover, which is the worst
+	# possible time to be wrong in that direction.
+	local barrier_marker
+	barrier_marker="$(replica_incomplete "$TARGET_URI" "$TARGET_DOMAIN")"
+	if [ -z "$barrier_marker" ]; then
+		log "the discarded run left no replica_incomplete: a barrier that throws every overlay away has not touched the replica"
+		results_row "$CSV" commit-barrier no-incomplete-marker 0 "" "" "" "" "" "PASS a discarded run arms nothing"
+	else
+		warn "FAIL: the target carries replica_incomplete='$barrier_marker' after a run the barrier discarded entirely. That run left every base exactly as it found it, so this replica is whole -- and -promote will now refuse it, naming a rebuild that never touched these disks"
+		results_row "$CSV" commit-barrier no-incomplete-marker 1 "" "" "" "" "" "FAIL a discarded run left the marker armed"
+	fi
+
 	# And the barrier must not have broken the ordinary path: a clean
 	# incremental has to commit, and the bases have to move. Without this the
 	# stage would pass just as happily against a vmsync that had stopped
@@ -5943,6 +6288,626 @@ stage_commit_barrier() {
 	return 0
 }
 
+# --- Stage 16: an interrupted rebuild ----------------------------------------
+#
+# The stage for the one failure a promotion used to accept without a word.
+#
+# A full copy -- `-reinit`, `-force-clean`, or any sync whose computed parent
+# is empty -- renames the good replica disks aside and writes NEW base images
+# directly, with no overlay to commit at the end, while the target domain keeps
+# its OLD metadata until the very last write. A run killed in that window
+# leaves the target saying last_checkpoint=<old>, last_sync_timestamp=<old>,
+# replica_source=<set>, failure_count=0. Every one of those is true about the
+# replica the copy REPLACED and false about the half-written image now sitting
+# on the disks, so pkg/failover's evidence check found nothing wrong and
+# -promote booted a half-written machine reporting an ordinary data-loss
+# window -- while the complete copy sat unread in the .vmsync-replaced-<unix>
+# files beside it.
+#
+# replica_incomplete closes that, and this is the only place the closure is
+# proven against a real interruption rather than against a struct literal in a
+# unit test. That distinction is not academic here: the promotion gate is split
+# across two packages -- pkg/failover decides from a struct, and the promote
+# command has to fill that struct in from the domain -- and a field missing
+# from that mapping costs nothing at build time while disabling the refusal at
+# run time. It is exactly what happened to the verify record once already.
+#
+# It needs vmsync's own -test=die-writing-base and cannot be done any other
+# way: the window is inside one process, between a qemu-img create and a
+# metadata write, with no I/O an external harness could interrupt at the right
+# moment. A fault that exited right after the `mv` would land in a state
+# -promote ALREADY refuses on (disks missing), so the stage would be green
+# precisely when the feature was absent.
+stage_interrupted_reinit() {
+	log "=== Stage 16: an interrupted rebuild must not be promotable ==="
+	local sc=interrupted-reinit
+	local fo_ok=0
+	# -promote and -update-role act on the host they run on, so the target
+	# host is addressed with its own LOCAL uri, never TARGET_URI.
+	local local_uri="qemu:///system"
+
+	if [ "$DRY_RUN" = yes ]; then
+		# rename here too, purely so the command lines --dry-run prints are
+		# the ones a real run would use. This stage overrides
+		# REPLACED_DISK_ACTION for its own syncs (see below for why it has
+		# to), and a dry run that printed the harness's usual `delete` would
+		# be advertising a command that cannot test what this stage tests.
+		IR_SAVED_REPLACED_DISK_ACTION="$REPLACED_DISK_ACTION"
+		REPLACED_DISK_ACTION=rename
+		bench_sync "$sc" baseline -reinit
+		bench_sync "$sc" fault -reinit "-test=$VMSYNC_TEST_DIE_WRITING_BASE"
+		REPLACED_DISK_ACTION="$IR_SAVED_REPLACED_DISK_ACTION"
+		fo_check "$sc" "the rebuild dies instead of completing" 0
+		fo_check "$sc" "the interrupted rebuild left a replica_incomplete record" 0
+		fo_check "$sc" "promoting an interrupted rebuild is refused" 0
+		fo_check "$sc" "-force-promote still gets through" 0
+		fo_check "$sc" "putting the aside files back restores the complete replica exactly" 0
+		fo_check "$sc" "a completed rebuild clears the record" 0
+		return 0
+	fi
+
+	# -promote refuses a remote libvirt URI by design -- that is what keeps a
+	# failover working when the other site is unreachable -- so it has to run
+	# ON the target host. Saying so beats letting the attempt fail: a promote
+	# that could not be run at all exits non-zero exactly like one that was
+	# refused, and telling those two apart is most of what this stage does.
+	if [ -z "${TARGET_VMSYNC_BIN:-}" ]; then
+		warn "SKIP stage 16: TARGET_VMSYNC_BIN is not set in $CONF, and -promote must run ON $TARGET_HOST. What -promote does with an interrupted rebuild is the entire stage, so there is nothing here to test without it."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP TARGET_VMSYNC_BIN unset"
+		return 0
+	fi
+
+	stage_needs_target_shutoff "$CSV" "$sc" "stage interrupted-reinit" || return 0
+	reset_pair_state "$sc"
+	require_target_syncable "$sc" || return 0
+
+	# rename, whatever bench.conf says, and this is not a preference.
+	#
+	# The refusal's one-line recovery is "put the .vmsync-replaced-<stamp>
+	# files back", and with -replaced-disk-action=delete there are none: the
+	# value carries no aside= at all and the wording deliberately branches to
+	# say so rather than sending an operator hunting for files that were never
+	# created. This harness defaults to delete so a long run does not fill the
+	# target's filesystem (see REPLACED_DISK_ACTION near the top), which would
+	# turn the three assertions this stage is built around into skips.
+	#
+	# A global rather than a local, because the cleanup that restores it also
+	# runs from an EXIT trap, which may fire when this function is no longer
+	# on the stack and its locals no longer exist.
+	IR_SAVED_REPLACED_DISK_ACTION="$REPLACED_DISK_ACTION"
+	REPLACED_DISK_ACTION=rename
+
+	# The backstop for everything below. This stage promotes the target three
+	# times and is responsible for putting it back each time; a die, a Ctrl+C
+	# or a failed way back would otherwise leave it promoted, and a promoted
+	# target refuses every sync in the estate -- not just this harness's later
+	# stages. An EXIT trap rather than RETURN for the reason stages 6 and 7
+	# give: RETURN does not fire on a die or on a signal, and those are
+	# precisely the cases that would leave it behind.
+	IR_PROMOTED=no
+	IR_CLEANED=no
+	interrupted_reinit_cleanup() {
+		[ "$IR_CLEANED" = yes ] && return 0
+		IR_CLEANED=yes
+		REPLACED_DISK_ACTION="$IR_SAVED_REPLACED_DISK_ACTION"
+		# Again here as the backstop: the inline call after the fault run
+		# covers the ordinary path, and this covers a die or a Ctrl+C landing
+		# between the fault and it. Running it twice costs one ssh and finds
+		# nothing the second time.
+		kill_orphaned_target_exports
+		abort_orphaned_source_backup
+		[ "$IR_PROMOTED" = yes ] || return 0
+		if clear_target_promotion; then
+			log "stage 16: the target is back to role=target"
+		else
+			warn_target_still_promoted
+		fi
+	}
+	trap 'interrupted_reinit_cleanup' EXIT
+
+	# --- baseline: a complete replica worth losing --------------------------
+	bench_sync "$sc" baseline -reinit
+	if [ "$RUN_RC" != 0 ]; then
+		warn "baseline full sync failed (see $RUN_LOG) -- aborting stage 16 before anything is interrupted$(bench_sync_hint)"
+		results_row "$CSV" "$sc" baseline "" "" "" "" "" "" "FAIL baseline sync failed"
+		interrupted_reinit_cleanup
+		trap - EXIT
+		return 1
+	fi
+
+	# Guest writes between the baseline and the interrupted rebuild, so the
+	# copy in the aside files is demonstrably not the same bytes the
+	# half-written one holds.
+	#
+	# NOT a precondition, unlike stage 15's: a full copy writes every allocated
+	# byte whether the guest moved or not, so the fault fires either way. This
+	# only makes the recovery assertion further down a comparison of two
+	# genuinely different copies rather than of two copies of the same data.
+	[ "$GUEST_DIRTY" = yes ] && { wait_for_guest_agent || true; }
+	if [ "$GUEST_DIRTY" = yes ] && guest_exec_available; then
+		guest_dirty || warn "could not dirty the guest; the assertions below still hold, they just compare copies that may be identical"
+	else
+		log "   (guest-exec unavailable: ${GUEST_EXEC_WHY:-GUEST_DIRTY=no} -- the rebuild will copy the same bytes the baseline did)"
+	fi
+
+	# The baseline above renamed its own predecessor aside, and this stage is
+	# about to assert "exactly ONE aside file per disk". Leaving that set
+	# behind would fail that assertion for a reason that has nothing to do
+	# with vmsync.
+	sweep_replaced_disks
+
+	local -a disks=()
+	mapfile -t disks < <(target_disk_paths)
+	if [ "${#disks[@]}" -eq 0 ]; then
+		warn "SKIP stage 16: no target disk path could be resolved from $TARGET_DOMAIN's own XML via $TARGET_URI, so the aside files cannot be found or counted"
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP target disk paths unresolved"
+		interrupted_reinit_cleanup
+		trap - EXIT
+		return 0
+	fi
+
+	local cp_before sync_before fingerprints_before
+	cp_before="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_checkpoint)"
+	sync_before="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_sync_timestamp)"
+	fingerprints_before="$(target_base_fingerprints)"
+	log "before the interrupted rebuild: last_checkpoint='$cp_before' disks=${disks[*]}"
+
+	# --- the interruption ---------------------------------------------------
+	bench_sync "$sc" fault -reinit "-test=$VMSYNC_TEST_DIE_WRITING_BASE"
+	local fault_log fault_rc
+	fault_log="$RUN_LOG"
+	fault_rc="$RUN_RC"
+
+	# Immediately, before anything else looks at the target. The fault exits
+	# without unwinding, so the target-side qemu-nbd it started is still there
+	# holding a disk file open -- see kill_orphaned_target_exports for why
+	# leaving it costs a process and a disk's worth of space per run.
+	kill_orphaned_target_exports
+	# And the source's backup job, for a sharper reason: every later sync of
+	# this domain refuses while it is active, so leaving it would fail the
+	# stages after this one for a cause that has nothing to do with them.
+	abort_orphaned_source_backup
+
+	if [ "$fault_rc" != 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the rebuild dies instead of completing" "$fo_ok" \
+		"vmsync exited 0 under -test=$VMSYNC_TEST_DIE_WRITING_BASE, which is supposed to kill it -- see $fault_log"
+
+	# A non-zero exit proves nothing on its own, and resting on it would make
+	# this entire stage vacuous. vmsync refuses an unknown -test value at flag
+	# validation and exits 2 having touched nothing at all, so against a build
+	# where this fault had been renamed or removed the run would exit
+	# non-zero, the target would be untouched, and several assertions below
+	# would pass trivially -- green precisely when the feature was gone. The
+	# line the injection itself writes is what proves it fired, and where.
+	local fired=no
+	if grep -q "$VMSYNC_TEST_DIE_WRITING_BASE: killing this process NOW" "$fault_log" 2>/dev/null; then
+		fired=yes
+		fo_ok=0
+	else
+		fo_ok=1
+	fi
+	fo_check "$sc" "the fault fired after a base had been written" "$fo_ok" \
+		"the run ended (exit $fault_rc) without logging the injection, so it stopped for some OTHER reason -- refused at flag validation, refused at preflight, or failed before writing anything. Any of those would leave the target in a state -promote already refuses on, and every check below would report a pass for a refusal that was never exercised. See $fault_log"
+
+	if [ "$fired" != yes ]; then
+		warn "the interrupted-rebuild state was never reached, so the remaining checks are skipped rather than reported as a wall of separate failures -- fix that first, nothing here can say anything until the fault fires"
+		results_row "$CSV" "$sc" interruption_dependent_checks "" "" "" "" "" "" "SKIP the fault did not fire"
+		interrupted_reinit_cleanup
+		trap - EXIT
+		return 0
+	fi
+
+	# 137 specifically, not merely non-zero. An orderly failure would have
+	# stopped the exports, discarded what it wrote and recorded an outcome --
+	# none of which a power cut, an OOM kill or vmsync's own SIGTERM handler
+	# does, and none of which leaves the state this stage is about.
+	if [ "$fault_rc" = 137 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the rebuild was killed rather than failed, so nothing unwound" "$fo_ok" \
+		"exit $fault_rc, want 137 -- a run that unwound tidily would be testing the recovery path instead of the one there is no recovery from"
+
+	# --- what the target says about itself now ------------------------------
+	local marker stamp verb aside_keys
+	marker="$(replica_incomplete "$TARGET_URI" "$TARGET_DOMAIN")"
+	if [ -n "$marker" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the interrupted rebuild left a replica_incomplete record" "$fo_ok" \
+		"there is none on $TARGET_DOMAIN, so -promote has nothing to refuse on and would accept these half-written disks reporting an ordinary data-loss window -- the exact defect this field exists to close"
+
+	if [ -z "$marker" ]; then
+		warn "nothing was recorded on the target, so every check that reads that record is skipped rather than reported separately"
+		results_row "$CSV" "$sc" record_dependent_checks "" "" "" "" "" "" "SKIP no replica_incomplete was written"
+		interrupted_reinit_cleanup
+		trap - EXIT
+		return 0
+	fi
+	log "replica_incomplete: $marker"
+
+	# In the PERSISTENT definition, which is the only copy that outlives the
+	# process that wrote it and the only one -promote reads. Asserted against
+	# `dumpxml --inactive` rather than through the metadata API because that
+	# is also the command the runbook sends an operator to during an incident:
+	# a record only the API can see is one nobody finds.
+	if virsh_uri "$TARGET_URI" dumpxml "$TARGET_DOMAIN" --inactive 2>/dev/null | grep -q 'replica_incomplete'; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the record is in the domain's persistent definition" "$fo_ok" \
+		"virsh dumpxml --inactive $TARGET_DOMAIN does not mention replica_incomplete, so whatever the metadata API just returned would not survive a libvirtd restart -- and -promote reads the inactive definition"
+
+	verb="$(replica_incomplete_key "$marker" verb)"
+	if [ "$verb" = reinit ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the record names the verb that was interrupted" "$fo_ok" \
+		"verb='$verb' in '$marker', want 'reinit' -- the refusal quotes this back, and an operator who cannot tell an interrupted reinit from an interrupted restore cannot tell which recovery applies"
+
+	stamp="$(replica_incomplete_key "$marker" aside)"
+	aside_keys="$(replica_incomplete_key_count "$marker" aside)"
+	if [ -n "$stamp" ] && [ "$aside_keys" = 1 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the record carries exactly ONE aside stamp" "$fo_ok" \
+		"aside appears ${aside_keys:-0} time(s) in '$marker'. This field is single-valued and never appended to, and a second stamp would name a second displaced set that does not exist -- leaving the refusal unable to say which files to put back"
+
+	# The rest of the metadata must be untouched, and that is the point rather
+	# than a detail. That last_checkpoint, last_sync_timestamp and the others
+	# still look perfectly healthy is the whole reason this replica used to be
+	# promotable; a stage where the rebuild had cleared them would be proving
+	# the refusal against a target that any of the older checks would have
+	# caught on its own.
+	local cp_after sync_after
+	cp_after="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_checkpoint)"
+	sync_after="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_sync_timestamp)"
+	if [ -n "$cp_after" ] && [ "$cp_after" = "$cp_before" ] && [ "$sync_after" = "$sync_before" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the rest of the metadata still describes the REPLACED replica" "$fo_ok" \
+		"last_checkpoint '$cp_before' -> '$cp_after' and last_sync_timestamp '$sync_before' -> '$sync_after'; both must be unchanged, because the refusal is the only thing standing between those healthy-looking fields and a promoted half-written disk"
+
+	# --- the aside files ----------------------------------------------------
+	# One stamp names one displaced machine. Two stamps across a multi-disk
+	# domain name no coherent set at all, and the refusal could then tell an
+	# operator nothing useful about what to put back.
+	local path listing n aside_bad=0 aside_detail=""
+	for path in "${disks[@]}"; do
+		listing="$(ssh_host_cmd "$TARGET_HOST" "ls -1 '${path}'.vmsync-replaced-* 2>/dev/null || true")"
+		n="$(printf '%s' "$listing" | grep -c . || true)"
+		if [ "${n:-0}" != 1 ]; then
+			aside_bad=$((aside_bad + 1))
+			aside_detail="${aside_detail}${aside_detail:+; }$path has ${n:-0} aside file(s)"
+			continue
+		fi
+		if [ "$listing" != "${path}.vmsync-replaced-${stamp}" ]; then
+			aside_bad=$((aside_bad + 1))
+			aside_detail="${aside_detail}${aside_detail:+; }$listing does not carry the stamp $stamp the record names"
+		fi
+	done
+	if [ "$aside_bad" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "every disk has exactly one aside file and they all share that one stamp" "$fo_ok" \
+		"$aside_detail"
+
+	# --- the refusal --------------------------------------------------------
+	local role_before role_after refuse_log refuse_rc
+	role_before="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
+
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" refuse-promote \
+		-promote -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN" \
+		-promote-mode forced -promoted-by bench-harness
+	refuse_log="$RUN_LOG"
+	refuse_rc="$RUN_RC"
+
+	if [ "$refuse_rc" != 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "promoting an interrupted rebuild is refused" "$fo_ok" \
+		"-promote exited 0 against a replica a rebuild was part-way through replacing, so a half-written image becomes production with nobody asked to override anything -- see $refuse_log"
+
+	# Not satisfied by the exit code, deliberately. A promote that never ran
+	# -- wrong path, unreadable domain, a libvirt that would not answer --
+	# exits non-zero too, and so does one refused over some unrelated piece of
+	# missing evidence. Accepting any of those would record this interlock as
+	# working on a run where it was never consulted.
+	if grep -q 'a full copy of this replica was STARTED and never recorded as finished' "$refuse_log" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the refusal names the interrupted rebuild, not something else" "$fo_ok" \
+		"-promote failed (exit $refuse_rc) but never said so in those terms, so something else stopped it and the record was very possibly never read. See $refuse_log"
+
+	if grep -qF ".vmsync-replaced-$stamp" "$refuse_log" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the refusal names the aside files by their exact stamp" "$fo_ok" \
+		"'.vmsync-replaced-$stamp' does not appear in $refuse_log. That suffix is the entire recovery and it exists nowhere else on this host: without it an operator is told their replica is unusable and not that the complete one is lying beside it"
+
+	# Refused has to mean nothing was written. A domain left promoted by a run
+	# that called itself refused is worse than either outcome alone: the
+	# replica is serving and the only record of how it got there says it was
+	# not allowed to. Compared against the role read BEFORE the attempt, not
+	# against the literal "promoted", because vmsync_meta_field swallows every
+	# error it meets and an unreadable domain would satisfy the negative form
+	# without anything having been looked at.
+	role_after="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
+	if [ "$role_after" = "$role_before" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the refused promotion wrote nothing" "$fo_ok" \
+		"replication_role moved from '$role_before' to '$role_after', so the refusal is cosmetic -- and at 'promoted' every sync into this domain is refused as well"
+
+	# --- and the way past ---------------------------------------------------
+	# An interlock with no supported override is one an operator routes around
+	# by hand during an outage. This one must let them through -- the
+	# half-written copy may genuinely be all that is left -- and it must say
+	# what it is overriding and stop claiming to know how much data is being
+	# given up.
+	local force_log force_rc
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" force-promote \
+		-promote -force-promote -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN" \
+		-promote-mode forced -promoted-by bench-harness
+	force_log="$RUN_LOG"
+	force_rc="$RUN_RC"
+	# Armed the moment the promotion may have taken, so the EXIT trap can put
+	# the role back if anything between here and the restore below ends the
+	# run instead.
+	[ "$force_rc" = 0 ] && IR_PROMOTED=yes
+
+	if [ "$force_rc" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "-force-promote still gets through" "$fo_ok" \
+		"-force-promote failed too (exit $force_rc), so the documented way past this refusal does not work and an operator facing a real outage has no supported way to boot the only copy they have -- see $force_log"
+
+	if grep -q 'promoted despite' "$force_log" 2>/dev/null \
+		&& grep -q 'a full copy of this replica was STARTED and never recorded as finished' "$force_log" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the override records exactly what it overrode" "$fo_ok" \
+		"$force_log does not carry both 'promoted despite' and the interrupted-rebuild finding, so this override is indistinguishable in the log from an ordinary promotion of a healthy replica -- which is the only thing separating a considered decision from a mistake when somebody reads this domain a week later"
+
+	if [ "$force_rc" = 0 ]; then
+		# The window must go UNKNOWN, not merely wide. A number here would be
+		# computed from a checkpoint describing the copy this rebuild
+		# replaced and printed beside disks holding something else: a
+		# measurement of a replica that does not exist, which reads as
+		# reassurance.
+		if grep -q 'data_loss=unknown' "$force_log" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the forced promotion reports the data-loss window as UNKNOWN" "$fo_ok" \
+			"no 'data_loss=unknown' in $force_log -- a figure derived from the replaced replica's own checkpoint would be a measurement of something that is no longer on these disks"
+	else
+		results_row "$CSV" "$sc" forced_window "" "" "" "" "" "" "SKIP the forced promotion did not happen"
+	fi
+
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" role-back-after-force \
+		-update-role target -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+	if [ "$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)" = target ]; then
+		IR_PROMOTED=no
+	else
+		warn_target_still_promoted
+	fi
+
+	# Undoing the promotion must not take the finding with it. -update-role
+	# clears the promotion record, which is its job; if it cleared this too,
+	# one command that repairs nothing would make the next -promote accept the
+	# same half-written disks.
+	marker="$(replica_incomplete "$TARGET_URI" "$TARGET_DOMAIN")"
+	if [ -n "$marker" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "undoing the promotion does not clear the finding" "$fo_ok" \
+		"replica_incomplete is gone after -update-role=target, so the one record saying these disks are half-written can be erased by a command that does not touch them"
+
+	# --- the recovery the refusal names -------------------------------------
+	local fingerprints_broken fingerprints_restored
+	fingerprints_broken="$(target_base_fingerprints)"
+	if [ "$fingerprints_broken" != "$fingerprints_before" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the interrupted rebuild really did displace the replica" "$fo_ok" \
+		"every target base is exactly where it was before the rebuild started, so nothing was replaced and the recovery below would be putting back a replica that never left. Before: $(printf '%s' "$fingerprints_before" | tr '\n' '|') now: $(printf '%s' "$fingerprints_broken" | tr '\n' '|')"
+
+	local restore_failed=0
+	for path in "${disks[@]}"; do
+		ssh_host_cmd "$TARGET_HOST" "mv -f '${path}.vmsync-replaced-${stamp}' '${path}'" >/dev/null 2>&1 \
+			|| restore_failed=$((restore_failed + 1))
+	done
+	if [ "$restore_failed" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the aside files can be put back over the disks" "$fo_ok" \
+		"$restore_failed of ${#disks[@]} rename(s) failed on $TARGET_HOST -- this single line is what the refusal exists to be able to print"
+
+	# Same inode moved back, so mtime, size and allocated blocks all return to
+	# their exact previous values -- which the base created seconds later
+	# cannot match by accident. It is the same evidence stage 15 rests on, and
+	# it is why no digest of a multi-gigabyte disk is needed here.
+	fingerprints_restored="$(target_base_fingerprints)"
+	if [ "$fingerprints_restored" = "$fingerprints_before" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "putting the aside files back restores the complete replica exactly" "$fo_ok" \
+		"after: $(printf '%s' "$fingerprints_restored" | tr '\n' '|') before: $(printf '%s' "$fingerprints_before" | tr '\n' '|')"
+
+	# And it is STILL refused, which is the honest half of this recovery and
+	# worth asserting rather than glossing over. A rename on the target host
+	# tells vmsync nothing: the field is cleared by the write that records a
+	# successful copy and by nothing else. So an operator who needs the
+	# replica live during the outage forces the promotion -- and now boots the
+	# COMPLETE copy rather than a half-written one -- while an operator with
+	# time re-runs the rebuild.
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" refuse-after-restore \
+		-promote -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN" \
+		-promote-mode forced -promoted-by bench-harness
+	if [ "$RUN_RC" != 0 ] \
+		&& grep -q 'a full copy of this replica was STARTED and never recorded as finished' "$RUN_LOG" 2>/dev/null; then
+		fo_ok=0
+	else
+		fo_ok=1
+	fi
+	fo_check "$sc" "restoring the files by hand does not clear the record" "$fo_ok" \
+		"a plain -promote came back with exit $RUN_RC after the aside files were renamed back. Nothing on this host can tell that a rename happened, so a record a rename could clear would be a record any rename could clear -- see $RUN_LOG"
+
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" force-promote-restored \
+		-promote -force-promote -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN" \
+		-promote-mode forced -promoted-by bench-harness
+	[ "$RUN_RC" = 0 ] && IR_PROMOTED=yes
+	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the restored replica can still be promoted during the outage" "$fo_ok" \
+		"-force-promote failed (exit $RUN_RC) against the complete replica the aside files just put back, so the documented recovery ends with a copy nobody can boot -- see $RUN_LOG"
+
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" role-back-after-recovery \
+		-update-role target -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+	if [ "$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)" = target ]; then
+		IR_PROMOTED=no
+	else
+		warn_target_still_promoted
+	fi
+
+	# --- and the rebuild, run to completion ---------------------------------
+	# The refusal has to lift itself. There is deliberately no flag that
+	# clears this field, so a rebuild that finishes is the whole cure -- and a
+	# field that outlived one would leave every replica in the estate
+	# force-only from its first interrupted run onwards, which turns a safety
+	# refusal into noise operators learn to pass -force-promote past.
+	sweep_replaced_disks
+	bench_sync "$sc" heal -reinit
+	local heal_sync_rc
+	heal_sync_rc="$RUN_RC"
+	if [ "$heal_sync_rc" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "an interrupted rebuild can simply be re-run" "$fo_ok" \
+		"the repeat -reinit failed (exit $heal_sync_rc)$(bench_sync_hint) -- see $RUN_LOG"
+
+	marker="$(replica_incomplete "$TARGET_URI" "$TARGET_DOMAIN")"
+	if [ -z "$marker" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "a completed rebuild clears the record" "$fo_ok" \
+		"replica_incomplete is still '$marker' after a sync that reported success, so this replica stays force-only for ever"
+
+	local heal_log heal_rc
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" promote-after-heal \
+		-promote -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN" \
+		-promote-mode forced -promoted-by bench-harness
+	heal_log="$RUN_LOG"
+	heal_rc="$RUN_RC"
+	[ "$heal_rc" = 0 ] && IR_PROMOTED=yes
+
+	# The false-positive guard, and the reason this sub-test is not optional:
+	# a refusal that fired on every replica would pass every assertion above
+	# and cost a real failover the one thing it needs.
+	if [ "$heal_rc" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "a plain promote is accepted again once the rebuild finished" "$fo_ok" \
+		"-promote was refused (exit $heal_rc) against a replica a full sync had just completed -- see $heal_log"
+
+	if [ "$heal_rc" = 0 ]; then
+		if grep -q 'data_loss=unknown' "$heal_log" 2>/dev/null; then fo_ok=1; else fo_ok=0; fi
+		fo_check "$sc" "and its data-loss window is measured rather than unknown" "$fo_ok" \
+			"the promotion reported an unknown window, so something is still being treated as an evidence problem on a replica that was rebuilt successfully moments ago -- see $heal_log"
+	else
+		results_row "$CSV" "$sc" healed_window "" "" "" "" "" "" "SKIP the promotion after the heal did not happen"
+	fi
+
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" role-back \
+		-update-role target -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+	if [ "$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)" = target ]; then
+		IR_PROMOTED=no
+	else
+		warn "the way back did not take, so this stage is leaving the pair unusable rather than as it found it"
+		warn_target_still_promoted
+	fi
+
+	# The aside set this stage's own heal left behind: full-size copies that
+	# nothing reaps, on a filesystem the following stages still need.
+	sweep_replaced_disks
+
+	if [ "$FAILOVER_FAILURES" -eq 0 ]; then
+		log "=== Stage 16: every interrupted-rebuild assertion passed ==="
+	fi
+
+	interrupted_reinit_cleanup
+	trap - EXIT
+	return 0
+}
+
+# --- Stage 17: the action journal --------------------------------------------
+#
+# Cheap, and in the DEFAULT list because of what it guards rather than because
+# of what it proves.
+#
+# The journal's whole value is the record of an action that DIED: a run killed
+# by SIGTERM (whose handler calls os.Exit, so nothing deferred runs), a dropped
+# link or a power cut writes its intent and then nothing at all, and that
+# unmatched intent IS the evidence. Nothing branches on it -- it is evidence,
+# never an input to a decision -- which is exactly why nothing else in this
+# harness would notice it quietly ceasing to be written. An estate whose
+# journals had stopped would look identical to one where nothing ever crashed,
+# and every other stage here would keep reporting PASS.
+#
+# So this asserts the ordinary case, which is the one that CAN be asserted
+# from outside: a sync that finishes leaves an intent and a matching outcome,
+# in that order, joined by (aid, seq) -- and leaves no replica_incomplete
+# behind. The interrupted case is stage 16's, where the fault provides the
+# death this one cannot stage.
+stage_journal() {
+	log "=== Stage 17: the action journal ==="
+	local sc=journal
+	local fo_ok=0
+
+	if [ "$DRY_RUN" = yes ]; then
+		bench_sync "$sc" sync
+		fo_check "$sc" "the sync writes an intent record beside the replica" 0
+		fo_check "$sc" "the intent has a matching outcome recording success" 0
+		fo_check "$sc" "the intent is written BEFORE the outcome" 0
+		fo_check "$sc" "a finished sync leaves no replica_incomplete behind" 0
+		return 0
+	fi
+
+	stage_needs_target_shutoff "$CSV" "$sc" "stage journal" || return 0
+
+	local jfile
+	jfile="$(journal_file)"
+	if [ -z "$jfile" ]; then
+		warn "SKIP stage 17: could not work out which directory $TARGET_DOMAIN's disks live in on $TARGET_HOST, so there is no journal path to look at. Set TARGET_DISK_PATH in $CONF."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP journal path unresolved"
+		return 0
+	fi
+	log "journal: $jfile on $TARGET_HOST"
+
+	# Read past the file, never truncate it. It is append-only and shared with
+	# every other stage in this run, so the assertions below are made against
+	# the lines THIS sync added -- and a harness that deleted a journal to
+	# make its own test easier to write would be deleting the one thing the
+	# feature exists to keep.
+	local before
+	before="$(ssh_host_cmd "$TARGET_HOST" "wc -l < '$jfile' 2>/dev/null || echo 0" | tr -d '[:space:]')"
+	case "$before" in '' | *[!0-9]*) before=0 ;; esac
+
+	bench_sync "$sc" sync
+	if [ "$RUN_RC" != 0 ]; then
+		warn "FAIL: the ordinary sync this stage is built on did not succeed (see $RUN_LOG)$(bench_sync_hint)"
+		results_row "$CSV" "$sc" sync-result 1 "" "" "" "" "" "FAIL the sync failed"
+		return 1
+	fi
+
+	local added intent outcome aid seq res intent_line outcome_line
+	added="$(ssh_host_cmd "$TARGET_HOST" "tail -n +$((before + 1)) '$jfile' 2>/dev/null || true")"
+
+	# awk over the added lines rather than grep per record, so both line
+	# numbers come out of one reading of one text and cannot disagree about
+	# which record came first -- which is the whole point of the third
+	# assertion below.
+	intent_line="$(printf '%s\n' "$added" | awk '/"k":"intent"/ && /"verb":"sync"/ { n = NR } END { print n + 0 }')"
+	intent=""
+	[ "${intent_line:-0}" -gt 0 ] && intent="$(printf '%s\n' "$added" | sed -n "${intent_line}p")"
+
+	if [ -n "$intent" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the sync writes an intent record beside the replica" "$fo_ok" \
+		"that run appended nothing with k=intent and verb=sync to $jfile on $TARGET_HOST. A sync that records no intent leaves an interrupted run indistinguishable from one that never started -- see $RUN_LOG"
+
+	if [ -z "$intent" ]; then
+		results_row "$CSV" "$sc" journal_dependent_checks "" "" "" "" "" "" "SKIP no intent record to join against"
+		return 0
+	fi
+
+	aid="$(json_str "$intent" aid)"
+	seq="$(printf '%s' "$intent" | grep -o '"seq":[0-9]*' | head -1 | sed 's/.*://')"
+	if [ -n "$aid" ] && [ -n "$seq" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the intent carries the (aid,seq) join" "$fo_ok" \
+		"aid='$aid' seq='$seq' in: $intent -- the join is the PAIR, never aid alone, because one process can perform two actions under one id and joining on the id would pair one run's intent with the other's outcome"
+
+	# The trailing comma in the seq match is not decoration: "seq":1 is a
+	# prefix of "seq":10, and the next key is always "at", so anchoring on the
+	# separator is what stops a tenth action's outcome being read as the
+	# first's.
+	outcome_line="$(printf '%s\n' "$added" \
+		| awk -v a="\"aid\":\"$aid\"" -v s="\"seq\":$seq," '/"k":"outcome"/ && index($0, a) && index($0, s) { n = NR } END { print n + 0 }')"
+	outcome=""
+	[ "${outcome_line:-0}" -gt 0 ] && outcome="$(printf '%s\n' "$added" | sed -n "${outcome_line}p")"
+	res="$(json_str "$outcome" res)"
+
+	if [ -n "$outcome" ] && [ "$res" = ok ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the intent has a matching outcome recording success" "$fo_ok" \
+		"no outcome with aid=$aid seq=$seq and res=ok among the lines that run added (got res='$res'). An unmatched intent is what the reader reports as a run that died mid-action, so a sync that finished and left one would manufacture the exact finding this journal exists to report"
+
+	if [ "${outcome_line:-0}" -gt "${intent_line:-0}" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the intent is written BEFORE the outcome" "$fo_ok" \
+		"intent on line ${intent_line:-0} and outcome on line ${outcome_line:-0} of what that run appended. Order is the mechanism, not a formatting detail: an intent flushed at exit would be removed by precisely the events worth recording"
+
+	local marker
+	marker="$(replica_incomplete "$TARGET_URI" "$TARGET_DOMAIN")"
+	if [ -z "$marker" ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "a finished sync leaves no replica_incomplete behind" "$fo_ok" \
+		"the target still carries replica_incomplete='$marker' after a sync that reported success. It is cleared by the same write that records the success, so one standing here means every -promote of this replica is refused until another sync clears it"
+
+	return 0
+}
+
 stage_pattern() {
 	case "$1" in
 	# Anchored to the named sub-tests rather than a bare ^verify- , so a
@@ -5967,6 +6932,10 @@ stage_pattern() {
 	# ^verify- would fold all of stage 2's rows into this stage's verdict.
 	verify-failure) printf '^verify-failure$' ;;
 	commit-barrier) printf '^commit-barrier$' ;;
+	# Anchored whole, so stage 3's ^reinit-after-failures$ and this one cannot
+	# fold into each other on a run doing both.
+	interrupted-reinit) printf '^interrupted-reinit$' ;;
+	journal) printf '^journal$' ;;
 	*) printf '$^' ;; # matches nothing
 	esac
 }
@@ -6190,6 +7159,31 @@ generate_report() {
                         echo "_not run (opt in with \`--stages commit-barrier\`; one sub-test deliberately fails a sync, and it needs a source domain with two or more qcow2 disks)_"
                 fi
                 echo
+                echo "## Stage 16: an interrupted rebuild"
+                echo
+                # Same exact match, same reason. The SKIP rows are worth as
+                # much as the PASS rows here: this stage stands down without
+                # TARGET_VMSYNC_BIN and again when the fault does not fire,
+                # and either one vanishing from the report would read as a
+                # promotion refusal that had been proven when it had not.
+                if awk -F, 'NR>1 && $1=="interrupted-reinit" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| check | exit | wall (s) | result |"
+                        echo "|---|---|---|---|"
+                        awk -F, 'NR>1 && $1=="interrupted-reinit" { printf "| %s | %s | %s | %s |\n", $2, $3, $4, $9 }' "$CSV"
+                else
+                        echo "_not run (opt in with \`--stages interrupted-reinit\`; it kills a rebuild on purpose, leaves the target half-written, promotes it three times and rebuilds it, and needs TARGET_VMSYNC_BIN)_"
+                fi
+                echo
+                echo "## Stage 17: the action journal"
+                echo
+                if awk -F, 'NR>1 && $1=="journal" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| check | exit | wall (s) | result |"
+                        echo "|---|---|---|---|"
+                        awk -F, 'NR>1 && $1=="journal" { printf "| %s | %s | %s | %s |\n", $2, $3, $4, $9 }' "$CSV"
+                else
+                        echo "_not run (it is a default stage, so this means --stages named something else)_"
+                fi
+                echo
                 echo "## Stage 8: verify after a long incremental chain"
                 echo
                 if awk -F, 'NR>1 && $1=="verify-long" { found=1 } END { exit !found }' "$CSV"; then
@@ -6325,7 +7319,9 @@ for s in "${stage_list[@]}"; do
         wedge) stage_wedge || stage_rc=$? ;;
         verify-failure) stage_verify_failure || stage_rc=$? ;;
         commit-barrier) stage_commit_barrier || stage_rc=$? ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure,commit-barrier)" ;;
+        interrupted-reinit) stage_interrupted_reinit || stage_rc=$? ;;
+        journal) stage_journal || stage_rc=$? ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure,commit-barrier,interrupted-reinit,journal)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
                 warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."

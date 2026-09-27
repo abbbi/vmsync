@@ -87,6 +87,14 @@ BRIDGE_HELPER_PATH=""   # empty = vmsync's own default (/usr/local/bin/vmsync-br
 #
 # Set it to "rename" if you would rather keep every replaced copy and have the
 # space for them.
+#
+# ONE STAGE IGNORES THIS. Stage 16 (interrupted-reinit) forces "rename" for its
+# own syncs whatever is set here, and puts the setting back on the way out. It
+# kills a rebuild part-way through on purpose and then asserts that the
+# promotion refusal names the .vmsync-replaced-<unixtime> files the rebuild
+# displaced -- which is the one-line recovery from an interrupted rebuild, and
+# with "delete" those files do not exist. It deletes its own aside set when it
+# finishes, so this stage does not cost the disk space the setting is about.
 REPLACED_DISK_ACTION=delete
 
 # Transport flags added to every sync in every stage EXCEPT Stage 1.
