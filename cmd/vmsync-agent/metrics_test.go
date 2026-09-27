@@ -23,8 +23,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"vmsync/pkg/restorepoint"
 )
 
 // checkPrometheusText is a strict reader of the text exposition format,

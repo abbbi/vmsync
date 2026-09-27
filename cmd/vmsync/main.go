@@ -2525,8 +2525,6 @@ func run(cfg syncConfig) (runErr error) {
 			RestorePointsStaging:               rps.Staging,
 			RestorePointNewestUnix:             rps.Newest,
 			RestorePointOldestUnix:             rps.Oldest,
-			RestorePointsLegacyFlat:            rps.LegacyFlat,
-			RestorePointStoreDomains:           rps.Stores,
 		}
 		// A run with -retention that never reached the decision reports
 		// undetermined rather than an empty label value, which would render a
