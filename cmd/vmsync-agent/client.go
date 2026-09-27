@@ -236,6 +236,20 @@ type ReportDomain struct {
 	// shows a replica quietly frozen with no visible cause.
 	VerifyState        string `json:"verify_state,omitempty"`
 	VerifyFailedAtUnix int64  `json:"verify_failed_at_unix,omitempty"`
+	// ReplicaIncomplete is the marker a full rebuild armed on this domain
+	// before it renamed the good disks aside, and that only a completed sync
+	// clears. Absent on every replica whose rebuilds all finished, which is
+	// almost all of them; presence is the state, and the raw value is sent
+	// unparsed because the console renders it and pkg/failover reads it.
+	//
+	// The reason it has to travel is that nothing else in this report shows
+	// it. A domain in this state reports a recent last_sync_unix, a
+	// last_checkpoint and failure_count=0 -- all describing the sync BEFORE
+	// the interrupted rebuild -- so the estate view shows a healthy replica
+	// while the disks are a half-written image. The console is where somebody
+	// decides to fail over, and this is the one field that says the copy they
+	// would be failing over to was never finished.
+	ReplicaIncomplete string `json:"replica_incomplete,omitempty"`
 	// The promotion record, present only on a domain failed over TO.
 	// PromotedFrom identifies which source a promotion displaced, which is
 	// what lets the control plane work out who must not keep running

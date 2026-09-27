@@ -654,6 +654,8 @@ look it up.
 | `failure-define` | makes the target's redefine fail, exercising the rollback to the previous definition |
 | `corrupt-before-checksum` | writes garbage into the image the copy just wrote, just before the pre-commit check reads it back |
 | `corrupt-after-commit` | writes garbage over the committed replica after that check passed, so `-verify` finds a genuine mismatch |
+| `fail-last-disk` | fails exactly one disk of a multi-disk domain, after its copy and digest check have both passed, so the commit barrier is asked the only question that matters: one disk failed, did *any* disk commit? |
+| `die-writing-base` | kills the process outright (exit 137, nothing unwound) once a full copy has written real bytes into a base image, which is the one fault that reproduces an interrupted rebuild exactly: disks present, no overlay, and the previous replica's metadata still describing them |
 
 **The two `corrupt-` faults damage real data**, and are not merely failure
 injection:
@@ -670,3 +672,14 @@ injection:
 
 Both need `qemu-io` on the target host, checked before the copy rather than
 after it.
+
+`die-writing-base` damages nothing on purpose, but it is the least tidy of
+them: the process is killed outright, so nothing unwinds. It leaves a
+half-written base, a `qemu-nbd` still running on the target, and — the part
+that bites the next run rather than this one — an active pull-backup job on
+the **source**, which vmsync refuses to start another run against until it is
+cleared (`virsh domjobabort <domain>`). The replica itself is recoverable: the
+complete copy is in the `.vmsync-replaced-<unixtime>` files the rebuild set
+aside, and the interrupted run records where, which is what a promotion
+refuses on afterwards. `contrib/bench/bench.sh`'s `interrupted-reinit` stage
+does all of that cleanup itself.

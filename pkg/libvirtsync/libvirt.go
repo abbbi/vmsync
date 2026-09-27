@@ -142,11 +142,64 @@ const (
 	// sibling had staged anything, which is exactly the vacuous pass the
 	// paragraph above warns about. See lastToStage in cmd/vmsync/main.go.
 	TestFaultFailLastDisk = "fail-last-disk"
+
+	// TestFaultDieWritingBase kills the process outright -- os.Exit(137), no
+	// unwinding, no deferred cleanup, no signal handler -- once the first
+	// base image of a FULL copy has been created and has had real extents
+	// copied into it, and before anything has checked, committed or recorded
+	// that the copy happened.
+	//
+	// It is the only fault that reproduces the geometry replica_incomplete
+	// exists for, and the geometry IS the point. A full copy -- a -reinit, a
+	// -force-clean, or any sync that writes bases directly -- renames the
+	// good replica disks aside and writes new ones with no overlay, while the
+	// target domain keeps its OLD metadata. A run killed in that window
+	// leaves a half-written image on disk underneath a last_checkpoint,
+	// last_sync_timestamp, replica_source and failure_count that all still
+	// describe the replica it replaced. Every evidence check -promote makes
+	// therefore reads healthy, and without the field it accepts the
+	// half-written image and reports an ordinary data-loss window, while the
+	// complete copy sits unused in the .vmsync-replaced-<unix> files.
+	//
+	// A fault that exited right after the rename would prove NOTHING. It
+	// leaves the target with no disk files at all, which -promote already
+	// refuses on ("one or more disk files are missing from the target host"),
+	// so the refusal would fire identically against a build that never had
+	// the field and the test would be green precisely when the feature was
+	// absent. The state worth reaching is the one where every other check
+	// passes.
+	//
+	// os.Exit rather than a returned error, and 137 rather than 1, because an
+	// orderly failure is not what this models: an orderly failure unwinds,
+	// stops the exports and writes an outcome, none of which the real cause
+	// does. vmsync's own SIGTERM handler calls os.Exit too, so an agent
+	// restart runs no defers either; a power cut and an OOM kill run fewer
+	// still. 137 is the shell's encoding of SIGKILL, so a harness reading the
+	// status sees a killed process rather than a failed sync.
+	//
+	// Refused on an incremental run (see run()): with a parent checkpoint the
+	// copy lands in an overlay that is removed on every path out that is not
+	// a commit, so dying there leaves the replica's base untouched, healthy
+	// and correctly described by its own metadata -- nothing for the refusal
+	// to catch, and a stage asserting that refusal would fail for a reason
+	// that says nothing about vmsync.
+	//
+	// WHAT IT LEAVES ON THE TARGET, because nothing unwinds: the write export
+	// is still running there, a qemu-nbd holding the half-written base open,
+	// with its pidfile in -target-runtime-dir. Nothing reaps it -- the
+	// deferred cleanup and the signal handler's replay of the registered stop
+	// commands are both precisely what this fault skips. It blocks nothing
+	// (-promote never opens the disks, and a later run creates a new file
+	// rather than reopening this one), but it does hold that file's blocks
+	// after any later rm, so a harness running this repeatedly against one
+	// target must kill it. contrib/bench/bench.sh does, immediately after the
+	// run and again from its cleanup trap.
+	TestFaultDieWritingBase = "die-writing-base"
 )
 
 // TestFaults is every accepted -test value, for validation and for the flag's
 // own help text.
-var TestFaults = []string{TestFaultFailureDefine, TestFaultCorruptBeforeChecksum, TestFaultCorruptAfterCommit, TestFaultFailLastDisk}
+var TestFaults = []string{TestFaultFailureDefine, TestFaultCorruptBeforeChecksum, TestFaultCorruptAfterCommit, TestFaultFailLastDisk, TestFaultDieWritingBase}
 
 // ValidateTestFault reports whether name is an injectable fault. "" is valid
 // and means no injection.
@@ -415,6 +468,57 @@ const (
 	// that was once somebody's replica must not carry a stale value onto a
 	// target. See the strip lists named in that field's comment.
 	MetadataFieldPendingCheckpoint = "pending_checkpoint"
+
+	// MetadataFieldReplicaIncomplete is written on the TARGET before a full
+	// copy starts destroying the replica that is there, and cleared by the
+	// write that records the copy as finished.
+	//
+	// It exists because a full copy -- -reinit, -force-clean, or any sync
+	// whose computed parent is empty -- renames the good replica disks aside
+	// and writes NEW base images directly, with no overlay, while the target
+	// domain keeps its OLD metadata. A run that dies in that window (a
+	// network drop, an agent restart whose signal handler calls os.Exit so
+	// main() never runs, power loss) leaves the target saying
+	// last_checkpoint=<old>, last_sync_timestamp=<old>, replica_source=<set>
+	// and failure_count=0. Every one of those is true about the replica the
+	// copy REPLACED and false about the half-written image now on the disks,
+	// so pkg/failover's evidenceProblems finds nothing wrong and -promote
+	// accepts it, reporting a normal data-loss window. The complete copy sits
+	// unread in the .vmsync-replaced-<unix> files beside it.
+	//
+	// ON THE ACTED-ON DOMAIN'S OWN METADATA, deliberately, and that is the
+	// whole reason it is a metadata field rather than a file or a control
+	// plane record: -promote and -restore run LOCALLY on the target host, and
+	// during the disaster they exist for THE SOURCE HOST IS GONE. Anything a
+	// refusal depends on has to be readable on the replica's own host with
+	// the other site unreachable.
+	//
+	// SINGLE-VALUED, never appended to, and cleared atomically by the same
+	// DomainDefineXML that records success -- exactly the pattern
+	// MetadataFieldPendingCheckpoint uses, and for the same reason: never
+	// both set and accepted, never neither.
+	//
+	// The value is a single line of comma-separated k=v pairs built by
+	// ReplicaIncompleteValue and read by failover.ParseReplicaIncomplete. A
+	// value that cannot be read still refuses, because the presence of the
+	// field is the finding and the parse only decides the wording.
+	//
+	// WHAT IT DELIBERATELY DOES NOT DO: it does not carry a failure_count.
+	// Arming could have written failure_count=1, which every existing engine
+	// already refuses a promotion on, and that was rejected -- a counter that
+	// means "the last attempt failed" would then also mean "a copy is in
+	// flight", and the two want different cures. The honest cost of that
+	// choice: a PRE-UPGRADE engine doing a -promote on the DR host does not
+	// know this field and would still accept a half-written replica, so every
+	// host that drives syncs must be upgraded before the refusal can be
+	// relied on.
+	//
+	// Same care as MetadataFieldReplicaWrittenAt about where it must be
+	// stripped: UpdateSyncMetadata merges into the SOURCE's XML, so a source
+	// that was once somebody's replica must not carry a stale value onto a
+	// target. See the strip lists named in that field's comment, and the test
+	// that pins all of them at once.
+	MetadataFieldReplicaIncomplete = "replica_incomplete"
 
 	// MetadataFieldVerifyState and MetadataFieldVerifyFailedAt record that
 	// -verify found this replica's contents differing from its source, so
@@ -694,6 +798,7 @@ var metadataFieldOrder = []string{
 	MetadataFieldReplicationRole,
 	MetadataFieldLastCheckpoint,
 	MetadataFieldPendingCheckpoint,
+	MetadataFieldReplicaIncomplete,
 	MetadataFieldVerifyState,
 	MetadataFieldVerifyFailedAt,
 	MetadataFieldLastSync,
@@ -1535,6 +1640,19 @@ func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetR
 		MetadataFieldVerifyState,
 		MetadataFieldVerifyFailedAt,
 		MetadataFieldPendingCheckpoint,
+		// Cleared HERE and nowhere else on the success path, for exactly the
+		// reason pending_checkpoint is: reaching this function means the copy
+		// finished and is about to be recorded, so accepting the new replica
+		// and withdrawing the warning about the old one are ONE atomic
+		// DomainDefineXML. A separate write afterwards could leave a healthy
+		// replica permanently refusing promotion, and a separate write before
+		// could leave a half-written one accepted.
+		//
+		// Unconditional, like verify_state: this function merges into the
+		// SOURCE's XML, so a source that was once somebody's replica can
+		// carry a stale value of its own, and omitting the key would stamp
+		// that onto a target the copy has just proved complete.
+		MetadataFieldReplicaIncomplete,
 		MetadataFieldReplicaTargets,
 		MetadataFieldPromotedAt,
 		MetadataFieldPromotedBy,
@@ -1574,6 +1692,184 @@ func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetR
 // human or external tooling inspecting either domain's XML by hand.
 func ReplicaEntry(host, domain string) string {
 	return host + ":" + domain
+}
+
+// The verbs MetadataFieldReplicaIncomplete records, and the only ones
+// ReplicaIncompleteValue will build a value for.
+//
+// A closed set rather than a free string, because the verb is what the
+// refusal names back to an operator standing in front of a broken replica:
+// "a reinit was started" tells them where to look, and an unrecognised word
+// invented at a call site tells them nothing. Refusing an unknown one also
+// means a typo at a call site fails the ARMING write, which returns before
+// anything is destroyed, rather than writing a value the refusal cannot
+// explain.
+const (
+	// ReplicaIncompleteVerbReinit is a plain -reinit: the replica's disks are
+	// renamed aside and rebuilt from scratch.
+	ReplicaIncompleteVerbReinit = "reinit"
+	// ReplicaIncompleteVerbForceClean is -reinit -force-clean, which
+	// additionally removes the target DOMAIN. Distinct because the two leave
+	// different wreckage behind: after a force-clean the domain carrying this
+	// value may itself be gone.
+	ReplicaIncompleteVerbForceClean = "force-clean"
+	// ReplicaIncompleteVerbFullSync is an ordinary sync that computed no
+	// parent checkpoint, so it writes base images directly with no overlay.
+	// No disks are renamed aside on this path, so it records no aside stamp.
+	ReplicaIncompleteVerbFullSync = "full-sync"
+	// ReplicaIncompleteVerbRestore is a restore point being put back over the
+	// replica in place.
+	ReplicaIncompleteVerbRestore = "restore"
+)
+
+// replicaIncompleteMaxBytes caps the whole value. Metadata is spliced into a
+// production domain's persistent definition, and an unbounded field there is
+// an unbounded write on every arming; 512 bytes is far more than the grammar
+// can legitimately need and small enough that no domain document notices it.
+const replicaIncompleteMaxBytes = 512
+
+// replicaIncompleteHostUnsafe matches every character a hostname cannot
+// legitimately contain, which is exactly the set that would corrupt the
+// grammar or the XML around it.
+//
+// Stripped rather than refused. The host is the least load-bearing part of
+// the value -- the refusal fires on the field's PRESENCE, and the verb, the
+// time and the aside stamp are what make it actionable -- so a strange
+// hostname must never be the reason a replica goes unarmed and a half-written
+// promotion is accepted.
+var replicaIncompleteHostUnsafe = regexp.MustCompile(`[^A-Za-z0-9._:-]`)
+
+// replicaIncompleteActionIDRe matches an action id this value will carry.
+//
+// WIDER THAN HEX ON PURPOSE, although the engine's own minted ids are hex.
+// The ids that actually arrive here come from vmsync-agent, which stamps an
+// operation's id from the control plane and deliberately permits hyphens,
+// dots and underscores -- its own degraded run-id form uses them. Refusing
+// those would refuse the ARMING WRITE, which fails the whole reinit before it
+// starts: a correlation id must never be the reason a replica goes
+// unprotected, so this only has to be wide enough to admit every id the
+// estate really produces and narrow enough that none of them can break the
+// grammar or the XML.
+var replicaIncompleteActionIDRe = regexp.MustCompile(`^[0-9A-Za-z._-]+$`)
+
+// replicaIncompleteActionIDMax bounds an id before it is carried, matching
+// vmsync-agent's own bound on what it will pass. An id near it is already
+// wrong, and a longer one would eat into the host name, which is the part a
+// person reads during a disaster.
+const replicaIncompleteActionIDMax = 64
+
+// replicaIncompleteDigits matches an aside stamp: a unix second, or nothing.
+var replicaIncompleteDigits = regexp.MustCompile(`^[0-9]*$`)
+
+// ReplicaIncompleteValue builds the single-line value
+// MetadataFieldReplicaIncomplete carries:
+//
+//	verb=<reinit|force-clean|full-sync|restore>,at=<unix>,action=<hex>,host=<replica-host>,aside=<unix>
+//
+// for example
+//
+//	verb=reinit,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=1758441600
+//
+// Pure, so the one string standing between an interrupted copy and a
+// promotion that accepts it can be tested exhaustively without libvirt.
+//
+// atUnix is when the copy STARTED, which is what the refusal quotes back.
+// actionID correlates this value with the run's journal and its log, and is
+// omitted entirely when the caller has none OR when the id could not be
+// carried safely -- an unarmed field would be far worse than an unattributed
+// one, so no correlation id ever stops the write. asideStamp is the suffix
+// the displaced disks were renamed with
+// (".vmsync-replaced-<stamp>"), omitted on the paths that rename nothing:
+// naming a suffix that does not exist would send an operator looking for
+// files that were deleted.
+//
+// host is the machine that STARTED the copy and was expected to finish it --
+// the one to go and look at when nothing did. On a restore, which runs
+// locally on the replica's own host, that is the replica host itself.
+//
+// REFUSES an unknown verb, a non-positive time and a non-numeric aside
+// stamp. Those three are call-site errors rather than anything an operator or
+// a control plane supplies, so refusing costs nothing real -- and it is safe
+// here precisely because the value is written BEFORE anything is destroyed,
+// so the caller returns having touched nothing. An unusable ACTION ID is the
+// deliberate exception: it arrives over the network, so it is dropped rather
+// than made into a reason to leave a replica unprotected.
+//
+// The grammar deliberately contains no XML-special character, so the value
+// needs no escaping to survive the metadata element it is spliced into.
+func ReplicaIncompleteValue(verb string, atUnix int64, actionID, host string, asideStamp string) (string, error) {
+	switch verb {
+	case ReplicaIncompleteVerbReinit, ReplicaIncompleteVerbForceClean,
+		ReplicaIncompleteVerbFullSync, ReplicaIncompleteVerbRestore:
+	default:
+		return "", fmt.Errorf("replica_incomplete: unknown verb %q -- it must be one of %s, %s, %s or %s, because the verb is what the promotion refusal names back to whoever has to recover from the interrupted copy",
+			verb, ReplicaIncompleteVerbReinit, ReplicaIncompleteVerbForceClean,
+			ReplicaIncompleteVerbFullSync, ReplicaIncompleteVerbRestore)
+	}
+	if atUnix <= 0 {
+		return "", fmt.Errorf("replica_incomplete: refusing to record a copy as starting at %d -- the refusal quotes this time back to an operator, and a zero would tell them the copy started in 1970", atUnix)
+	}
+	// DROPPED, never refused, and never escaped. An id that cannot survive
+	// the grammar -- a comma, an equals sign, a newline, or one long enough
+	// to crowd out the host -- would make the whole value unreadable, and an
+	// unreadable value refuses with no verb, no host and no aside stamp. But
+	// refusing to BUILD the value would be worse still: this is written
+	// before anything is destroyed, so a bad id would abort the reinit
+	// outright. A marker with no correlation id is a smaller loss than no
+	// marker, and a far smaller one than a marker nobody can read. Escaping
+	// was rejected because it puts the burden on every reader of the value,
+	// for ever. vmsync-agent applies the same rule on its side and for the
+	// same reason.
+	// The drop is visible without being logged here, which keeps this
+	// function pure: the caller logs the whole value it wrote, so an id that
+	// did not survive is missing from a line that shows everything else.
+	if actionID != "" && (len(actionID) > replicaIncompleteActionIDMax || !replicaIncompleteActionIDRe.MatchString(actionID)) {
+		actionID = ""
+	}
+	if !replicaIncompleteDigits.MatchString(asideStamp) {
+		return "", fmt.Errorf("replica_incomplete: aside stamp %q is not a unix second -- it names the .vmsync-replaced-<stamp> files an operator is told to recover from, so a wrong one sends them looking for files that do not exist", asideStamp)
+	}
+
+	host = replicaIncompleteHostUnsafe.ReplaceAllString(host, "")
+
+	build := func(h string) string {
+		v := "verb=" + verb + ",at=" + strconv.FormatInt(atUnix, 10)
+		if actionID != "" {
+			v += ",action=" + actionID
+		}
+		if h != "" {
+			v += ",host=" + h
+		}
+		if asideStamp != "" {
+			v += ",aside=" + asideStamp
+		}
+		return v
+	}
+
+	value := build(host)
+	if len(value) <= replicaIncompleteMaxBytes {
+		return value, nil
+	}
+	// Host first, because it is the only part an operator can recover
+	// without: the verb, the time and the aside suffix are what turn this
+	// refusal into a one-line recovery, and truncating any of them would cost
+	// more than a shortened hostname does. Cut to fit rather than dropped
+	// outright, so a long name still identifies its host by its prefix.
+	over := len(value) - replicaIncompleteMaxBytes
+	if over < len(host) {
+		return build(host[:len(host)-over]), nil
+	}
+	if value = build(""); len(value) <= replicaIncompleteMaxBytes {
+		return value, nil
+	}
+	// A tripwire rather than a reachable path: with the verb from a closed
+	// set, the time and the aside stamp bounded by their own formats and the
+	// action id bounded above, nothing left can make the value this long.
+	// Kept because if it ever does fire, something has widened one of those
+	// bounds without widening the cap, and that is worth hearing about at the
+	// arming write -- which destroys nothing -- rather than at the promotion.
+	return "", fmt.Errorf("replica_incomplete: the value is %d bytes with no host at all, over the %d-byte cap -- the action id (%d bytes) is the only thing left that can be that long, so it is wrong",
+		len(value), replicaIncompleteMaxBytes, len(actionID))
 }
 
 // replicaListContains reports whether entry is already present in a
@@ -1649,9 +1945,30 @@ func RecordReplicaTarget(mgr *Manager, sourceDomainName, targetHost, targetDomai
 		// TARGET, and this domain is acting as a SOURCE. Left behind it is
 		// meaningless to anyone reading the XML, and worse, it is what
 		// UpdateSyncMetadata would inherit onto a real replica.
-	}, MetadataFieldLastCheckpoint, MetadataFieldLastSync, MetadataFieldFailureCount,
-		MetadataFieldReplicaWrittenAt, MetadataFieldPendingCheckpoint,
-		MetadataFieldVerifyState, MetadataFieldVerifyFailedAt)
+	}, recordReplicaTargetStrips...)
+}
+
+// recordReplicaTargetStrips is the set of TARGET-only fields
+// RecordReplicaTarget removes from a domain it is establishing as a SOURCE.
+//
+// Named rather than written inline at the call site so that one test can read
+// it. "Forgot one of the strip lists" is this codebase's documented failure
+// mode for target-only fields -- see MetadataFieldReplicaWrittenAt, which
+// names all four places -- and a list nothing can enumerate is a list nothing
+// can check.
+var recordReplicaTargetStrips = []string{
+	MetadataFieldLastCheckpoint,
+	MetadataFieldLastSync,
+	MetadataFieldFailureCount,
+	MetadataFieldReplicaWrittenAt,
+	MetadataFieldPendingCheckpoint,
+	MetadataFieldVerifyState,
+	MetadataFieldVerifyFailedAt,
+	// A copy interrupted while this domain was somebody's replica says
+	// nothing about it as a source, and left behind it is what
+	// UpdateSyncMetadata would inherit onto a real replica -- which would
+	// refuse a promotion of a replica nothing was ever copying.
+	MetadataFieldReplicaIncomplete,
 }
 
 // ReadTargetFailureCount reconnects to the target and returns the
@@ -1812,6 +2129,20 @@ func TargetVerifyStateAllowsSync(verifyState, failedAt string) error {
 	return fmt.Errorf("%w: -verify found this replica's contents differing from its source %s, and the finding has not been cleared -- the replica is NOT trustworthy for a promotion. See that run's log for which blocks differed (this metadata deliberately records only the verdict). Recover with -verify-failure-reinit, which recopies and then re-verifies before clearing this, or override with -force-clean if you have decided the replica is disposable",
 		ErrVerifyStateRefusesSync, when)
 }
+
+// THERE IS DELIBERATELY NO TargetReplicaIncompleteAllowsSync, and this is
+// where a reader will come looking for one.
+//
+// MetadataFieldReplicaIncomplete refuses a PROMOTION, never a sync. The two
+// gates above exist because syncing into those domains would destroy
+// something (a paused operator's work, a finding about the replica's
+// contents); this field means the opposite -- a full copy was started and
+// never finished, so the replica on those disks is half-written and a sync is
+// the only thing that repairs it. Gating a sync on it would wedge the one
+// path that heals the replica, and wedge it precisely on the runs that most
+// need to be re-run: the interrupted ones. The next successful sync clears
+// the field as part of recording its own success (see UpdateSyncMetadata), so
+// the refusal lifts itself without anybody having to override anything.
 
 // TargetRoleAllowsRestore is TargetRoleAllowsSync's counterpart for putting a
 // restore point back over a replica in place.

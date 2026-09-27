@@ -141,6 +141,22 @@ type SyncProfile struct {
 	// profile -- see pkg/portalloc.
 	SourcePortRange string `json:"source_port_range,omitempty"`
 	TargetPortRange string `json:"target_port_range,omitempty"`
+	// Journal is "actions" or "off", and empty means "say nothing", which
+	// leaves vmsync on its own default -- actions, the journal ON.
+	//
+	// Empty rather than a value this agent asserts, deliberately. The
+	// journal is the append-only record of what each run intended and what
+	// came of it, written beside the disks it describes, and it is how an
+	// interrupted rebuild is diagnosed afterwards. An agent that spelled out
+	// a default would pin the estate to whatever this build thought the
+	// default was on the day it shipped, including on hosts whose engine has
+	// since changed it.
+	//
+	// Nothing in vmsync or in this agent BRANCHES on the journal -- it is
+	// evidence, never an input to a decision -- so switching it off degrades
+	// nothing except the ability to answer "what happened here?", which is
+	// the entire reason anyone would be reading it.
+	Journal string `json:"journal,omitempty"`
 }
 
 // Preset names a built-in profile. The UI offers these so nobody has to
@@ -240,6 +256,16 @@ func (p SyncProfile) Validate() error {
 	case "", "fast", "full", "qemu-img":
 	default:
 		return fmt.Errorf("verify %q is not one of \"\", \"fast\", \"full\", \"qemu-img\"", p.Verify)
+	}
+
+	// Refused rather than passed through, like every other enumerated value
+	// here: vmsync exits 2 on a level it does not recognise, so a typo in a
+	// browser would stop this pair replicating entirely -- and the run log
+	// would show a sync that never started rather than a bad setting.
+	switch p.Journal {
+	case "", "actions", "off":
+	default:
+		return fmt.Errorf("journal %q is not one of \"\" (leave vmsync's default), \"actions\", \"off\"", p.Journal)
 	}
 
 	// Rejected rather than ignored, matching vmsync's own startup check. A
@@ -349,6 +375,18 @@ type SyncRequest struct {
 	// agent to read back once the process has exited. Set per launch, like
 	// RunID, and for the same reason: it names one run, not one schedule.
 	ResultJSON string
+	// ActionID is the correlation id stamped into the journal records this
+	// run writes -- and, when the run arms replica_incomplete, into that
+	// marker's own action= field, which is what leads from a refused
+	// promotion back to the record of the action that caused it.
+	//
+	// Left empty for a scheduled sync, which falls back to RunID below: the
+	// agent already mints one id per launch and joins its own runs.jsonl on
+	// it, so reusing it means one id spans the run log on this host and the
+	// journal on whichever host the disks are on. Set explicitly only where
+	// there is a better id to use -- an operation, which carries an id the
+	// control plane's operations.json is keyed by.
+	ActionID string
 
 	// LocalHostName is the name this agent reports under, passed so the
 	// references vmsync writes into metadata match what the control plane
@@ -467,6 +505,31 @@ func (r SyncRequest) CommandArgs() []string {
 	}
 	if r.ResultJSON != "" {
 		args = append(args, "-result-json", r.ResultJSON)
+	}
+	// The correlation id for the journal, defaulting to this launch's run id
+	// so a scheduled sync needs nothing set at all: the run log on this host
+	// and the journal beside the disks on the other then carry the same
+	// string, and an operator holding either can find the other.
+	//
+	// Sanitised, not trusted. An operation's id arrives over the network and
+	// ends up inside a metadata value whose grammar is a single line of
+	// comma-separated k=v pairs, so a comma or a newline in it would corrupt
+	// the one field a promotion refuses on -- and a corrupted value is read
+	// as unparseable, which fails closed but loses the detail. An id that
+	// will not survive that is dropped instead, leaving vmsync to mint its
+	// own: a journal record that cannot be joined back to this run beats a
+	// marker nobody can read.
+	if id := sanitizedActionID(r.ActionID, r.RunID); id != "" {
+		args = append(args, "-action-id", id)
+	}
+	// The "=" form, like -compress and -verify. A value-taking flag written
+	// with a space is only safe when it is NOT an IsBoolFlag, and whether
+	// -journal is one is the engine's business, not an assumption worth
+	// encoding here: get it wrong and the level is left as a positional
+	// argument, which vmsync rejects outright -- so the pair would stop
+	// replicating over a diagnostic setting.
+	if p.Journal != "" {
+		args = append(args, "-journal="+p.Journal)
 	}
 	return args
 }

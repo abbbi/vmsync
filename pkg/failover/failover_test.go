@@ -498,3 +498,389 @@ func TestVerifyFailureBlocksPromotion(t *testing.T) {
 		}
 	})
 }
+
+// --- replica_incomplete --------------------------------------------------
+
+// The parser is the one piece of this that reads something written by
+// another process, possibly by another VERSION, so every shape it can be
+// handed is enumerated rather than sampled.
+//
+// The rule it has to obey is stated once here and asserted everywhere below:
+// the PRESENCE of the field is the finding, and parsing only decides the
+// wording. Nothing may make a promotion possible that the raw field alone
+// would have refused.
+func TestParseReplicaIncomplete(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want ReplicaIncomplete
+	}{
+		{
+			name: "well formed, every key",
+			raw:  "verb=reinit,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=1758441600",
+			want: ReplicaIncomplete{
+				Parsed: true, Verb: "reinit", AtUnix: 1758441600,
+				ActionID: "9f3c1a2b4d5e6f70", Host: "hv-a", AsideStamp: "1758441600",
+			},
+		},
+		{
+			// A full sync renames nothing aside, so its value carries no
+			// aside key at all. It must still parse: this is the ordinary
+			// shape of that path, not a damaged value.
+			name: "no aside stamp, which is a full sync",
+			raw:  "verb=full-sync,at=1758441600,action=abc123,host=hv-a",
+			want: ReplicaIncomplete{
+				Parsed: true, Verb: "full-sync", AtUnix: 1758441600,
+				ActionID: "abc123", Host: "hv-a",
+			},
+		},
+		{
+			// A key a newer vmsync added. Ignoring it is what lets that
+			// engine write one without every older engine on the estate
+			// losing the ability to read the field at all -- which would lose
+			// the refusal, not merely the extra key.
+			name: "an unknown key is ignored, the rest still reads",
+			raw:  "verb=restore,at=1758441600,host=hv-b,tier=gold,aside=1758441700",
+			want: ReplicaIncomplete{
+				Parsed: true, Verb: "restore", AtUnix: 1758441600,
+				Host: "hv-b", AsideStamp: "1758441700",
+			},
+		},
+		{
+			// A verb this build has never heard of, taken as found. A newer
+			// engine's interrupted copy leaves exactly the same wreckage as
+			// this one's, so refusing to read the verb would discard a real
+			// finding over a vocabulary difference.
+			name: "a verb from a newer build is read, not rejected",
+			raw:  "verb=rebase-from-cold,at=1758441600,host=hv-a",
+			want: ReplicaIncomplete{
+				Parsed: true, Verb: "rebase-from-cold", AtUnix: 1758441600, Host: "hv-a",
+			},
+		},
+		{
+			// No verb: not enough to word the refusal around, so Parsed is
+			// false. What was readable is still filled in, and Raw is kept.
+			name: "missing verb",
+			raw:  "at=1758441600,host=hv-a",
+			want: ReplicaIncomplete{AtUnix: 1758441600, Host: "hv-a"},
+		},
+		{
+			name: "missing time",
+			raw:  "verb=reinit,host=hv-a,aside=1758441600",
+			want: ReplicaIncomplete{Verb: "reinit", Host: "hv-a", AsideStamp: "1758441600"},
+		},
+		{
+			// A time that will not parse must not become a time. Zero, and
+			// Parsed false -- the refusal then simply does not claim to know
+			// when the copy started.
+			name: "an unreadable time is not a time",
+			raw:  "verb=reinit,at=yesterday,host=hv-a",
+			want: ReplicaIncomplete{Verb: "reinit", Host: "hv-a"},
+		},
+		{
+			name: "garbage",
+			raw:  "not a value at all",
+			want: ReplicaIncomplete{},
+		},
+		{
+			// The only case that means "nothing happened". Everything else
+			// above still refuses a promotion.
+			name: "empty",
+			raw:  "",
+			want: ReplicaIncomplete{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.want.Raw = tc.raw
+			got := ParseReplicaIncomplete(tc.raw)
+			if got != tc.want {
+				t.Errorf("ParseReplicaIncomplete(%q) =\n%+v\nwant\n%+v", tc.raw, got, tc.want)
+			}
+			// Raw is kept on every path, readable or not, because an
+			// unreadable value is the one somebody has to be shown verbatim
+			// to work out what wrote it.
+			if got.Raw != tc.raw {
+				t.Errorf("Raw = %q, want the value exactly as the domain held it (%q)", got.Raw, tc.raw)
+			}
+		})
+	}
+}
+
+// The keep-the-aside rule, enumerated. Every shape the engine can be holding
+// when it is about to arm, because the one that goes wrong costs the operator
+// the location of the last complete copy of a production machine -- and it
+// goes wrong silently, since the promotion stays refused on either record and
+// nothing else would ever say the stamp had been dropped.
+func TestKeepExistingReplicaIncomplete(t *testing.T) {
+	const asideStamp = "1758441600"
+	for _, tc := range []struct {
+		name     string
+		existing string
+		newStamp string
+		want     bool
+		why      string
+	}{
+		{
+			// THE case this exists for: an interrupted reinit's record, and
+			// the full sync that follows it, which renames nothing and so
+			// names nothing.
+			name:     "existing names files aside, incoming names none",
+			existing: "verb=reinit,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=" + asideStamp,
+			newStamp: "",
+			want:     true,
+			why:      "the incoming full-sync record carries no stamp, so overwriting loses the only pointer to the .vmsync-replaced files",
+		},
+		{
+			// A second reinit set a complete copy aside of its own, under a
+			// stamp of its own. Its record describes the disks that are on
+			// the host NOW; the older one describes files the second reinit
+			// has just replaced. Keeping the stale one would name the wrong
+			// set.
+			name:     "existing names files aside, incoming names its own",
+			existing: "verb=reinit,at=1758441600,host=hv-a,aside=" + asideStamp,
+			newStamp: "1758445200",
+			want:     false,
+			why:      "the incoming record names a displaced set of its own, so nothing is lost by replacing",
+		},
+		{
+			// An interrupted full sync, then another. Neither record points
+			// anywhere, so the fresher one is strictly better: same refusal,
+			// but the action id and host of the run that is actually running.
+			name:     "existing names nothing aside",
+			existing: "verb=full-sync,at=1758441600,action=abc123,host=hv-a",
+			newStamp: "",
+			want:     false,
+			why:      "there is no stamp to protect, so the newer record wins on freshness",
+		},
+		{
+			name:     "no existing record at all",
+			existing: "",
+			newStamp: "",
+			want:     false,
+			why:      "an unarmed replica has nothing to keep",
+		},
+		{
+			// DECIDED DELIBERATELY: keep. The value is unreadable as a whole
+			// -- no verb, no time, so ParseReplicaIncomplete leaves Parsed
+			// false -- yet the aside= field itself is intact. A stamp this
+			// build can still read is a stamp an operator can still use, and
+			// the rule is built on the stamp's presence rather than on the
+			// record parsing, exactly as the refusal is built on the field's
+			// presence rather than on its contents.
+			name:     "unparsable existing value that still carries an aside",
+			existing: "written by something newer,aside=" + asideStamp + ",,,",
+			newStamp: "",
+			want:     true,
+			why:      "the stamp is readable even though the record is not, and it is still the only pointer to the displaced disks",
+		},
+		{
+			// The other half of that: unreadable AND carrying nothing worth
+			// keeping. "aside" appears in the text but never as its own
+			// field, so there is no stamp here, only the word.
+			name:     "unparsable existing value with no aside field",
+			existing: "aside from that it is not the grammar at all",
+			newStamp: "",
+			want:     false,
+			why:      "nothing here is a usable stamp, so there is nothing to protect",
+		},
+		{
+			// An empty stamp written out longhand by a newer engine is not a
+			// stamp. It names no files, so there is nothing to recover from
+			// and nothing to keep the record for.
+			name:     "existing carries an empty aside",
+			existing: "verb=reinit,at=1758441600,host=hv-a,aside=",
+			newStamp: "",
+			want:     false,
+			why:      "an empty stamp names no files",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := KeepExistingReplicaIncomplete(tc.existing, tc.newStamp); got != tc.want {
+				t.Errorf("KeepExistingReplicaIncomplete(%q, %q) = %v, want %v: %s",
+					tc.existing, tc.newStamp, got, tc.want, tc.why)
+			}
+		})
+	}
+}
+
+// The decision never depends on WHICH verb is already there, and that is
+// worth pinning separately: a future reader looking at the call site sees it
+// invoked on the full-sync path and could reasonably decide to narrow the
+// rule to "keep only a reinit record". That would drop a restore's stamp,
+// which names exactly the same kind of displaced-aside files.
+func TestKeepExistingReplicaIncompleteIgnoresTheVerb(t *testing.T) {
+	for _, verb := range []string{"reinit", "force-clean", "restore", "rebase-from-cold"} {
+		if !KeepExistingReplicaIncomplete("verb="+verb+",at=1758441600,host=hv-a,aside=1758441600", "") {
+			t.Errorf("a record with verb=%q and an aside stamp was not kept; the stamp is what matters, whatever wrote it", verb)
+		}
+	}
+}
+
+// The gate itself: CI-02 in one test.
+//
+// An interrupted -reinit leaves a target whose every other field describes
+// the replica it REPLACED, so this fixture is deliberately the healthy one
+// with nothing else spoiled. Remove the branch and the promotion below
+// succeeds silently, reporting a confident data-loss window measured off
+// metadata that describes a different set of disks.
+func TestAnInterruptedFullCopyRefusesPromotion(t *testing.T) {
+	armed := func() TargetState {
+		st := healthyTarget()
+		st.ReplicaIncomplete = "verb=reinit,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=1758441600"
+		return st
+	}
+
+	t.Run("it is the only thing wrong, and it is enough", func(t *testing.T) {
+		problems := evidenceProblems(armed())
+		if len(problems) != 1 {
+			t.Fatalf("got %d problems, want exactly 1 (everything else about this replica reads healthy): %v", len(problems), problems)
+		}
+		p := problems[0]
+		// Each of these is in the message because leaving it out costs an
+		// operator time in the middle of an outage.
+		for _, want := range []string{
+			"never recorded as finished",  // what happened
+			"reinit",                      // which verb, so they know what to go and look at
+			"2025-09-21",                  // when it started
+			"hv-a",                        // and from where
+			"replaced",                    // that the metadata above describes a DIFFERENT replica
+			".vmsync-replaced-1758441600", // the one-line recovery
+		} {
+			if !strings.Contains(p, want) {
+				t.Errorf("problem = %q\nwant it to contain %q", p, want)
+			}
+		}
+	})
+
+	t.Run("it reads FIRST, ahead of the checks it contradicts", func(t *testing.T) {
+		// Ordering is load-bearing rather than cosmetic: the other problems
+		// are answers about a different set of disks, so an operator has to
+		// meet this one before them or they reason from the wrong premise.
+		st := armed()
+		st.DisksPresent = false
+		st.FailureCount = 2
+		problems := evidenceProblems(st)
+		if len(problems) < 2 {
+			t.Fatalf("expected several problems, got %v", problems)
+		}
+		if !strings.Contains(problems[0], "never recorded as finished") {
+			t.Errorf("problems[0] = %q, want the interrupted copy reported first", problems[0])
+		}
+	})
+
+	t.Run("promotion is refused without the override", func(t *testing.T) {
+		_, err := AssessPromote(armed(), PromoteOptions{Mode: ModeForced, NowUnix: nowUnix})
+		if err == nil {
+			t.Fatal("a replica a full copy was part-way through rewriting was promoted with no override: this is CI-02")
+		}
+		if !strings.Contains(err.Error(), ReplicaReplacedSuffix) {
+			t.Errorf("refusal = %q, want it to name the aside suffix, which is the only record of where the complete copy went", err)
+		}
+	})
+
+	t.Run("an unreadable value still refuses", func(t *testing.T) {
+		// Fail closed. A value written by a newer build, or torn mid-splice,
+		// must not read as "no record" -- that is precisely the direction
+		// that promotes a half-written image.
+		st := armed()
+		st.ReplicaIncomplete = "who wrote this"
+		problems := evidenceProblems(st)
+		if len(problems) != 1 {
+			t.Fatalf("an unreadable record produced %d problems, want 1: %v", len(problems), problems)
+		}
+		if !strings.Contains(problems[0], "could not be read") {
+			t.Errorf("problem = %q, want it to admit the record is unreadable rather than inventing details", problems[0])
+		}
+		if !strings.Contains(problems[0], "never recorded as finished") {
+			t.Errorf("problem = %q, want the finding itself to survive the failed parse", problems[0])
+		}
+		if _, err := AssessPromote(st, PromoteOptions{Mode: ModeForced, NowUnix: nowUnix}); err == nil {
+			t.Fatal("an unreadable replica_incomplete was waved through")
+		}
+	})
+
+	t.Run("a full sync does not send anyone looking for aside files", func(t *testing.T) {
+		// That path writes bases where no disk file existed, so it renames
+		// nothing aside. Naming a suffix here would cost an operator an hour
+		// hunting for files that were never created.
+		st := armed()
+		st.ReplicaIncomplete = "verb=full-sync,at=1758441600,host=hv-a"
+		p := evidenceProblems(st)[0]
+		if strings.Contains(p, ReplicaReplacedSuffix) {
+			t.Errorf("problem = %q, want it NOT to name aside files a full sync never creates", p)
+		}
+		if !strings.Contains(p, "re-run the sync") {
+			t.Errorf("problem = %q, want it to name the recovery that does exist", p)
+		}
+	})
+}
+
+// It is an EVIDENCE problem, not a role one, and the difference is the whole
+// of what an operator is allowed to do during a real outage.
+//
+// -force-promote must still get through -- a questionable copy beats nothing
+// when the other site is gone -- and the window it reports must become
+// unknown rather than the confident figure the contradicted metadata would
+// have produced. That second half is what makes forcing safe to offer: the
+// operator is told the number cannot be trusted instead of being handed one.
+func TestForcingPastAnInterruptedCopyReportsNoWindow(t *testing.T) {
+	st := healthyTarget()
+	st.ReplicaIncomplete = "verb=reinit,at=1758441600,action=9f3c,host=hv-a,aside=1758441600"
+
+	// The control: the same fixture without the field reports a normal
+	// window, so the change below can only have come from the field.
+	clean, err := AssessPromote(healthyTarget(), PromoteOptions{Mode: ModeForced, Force: true, NowUnix: nowUnix})
+	if err != nil {
+		t.Fatalf("the healthy control was refused: %v", err)
+	}
+	if !clean.DataLoss.Known {
+		t.Fatalf("the control reported no window (%s); this test cannot tell the two cases apart", clean.DataLoss)
+	}
+
+	plan, err := AssessPromote(st, PromoteOptions{Mode: ModeForced, Force: true, NowUnix: nowUnix})
+	if err != nil {
+		t.Fatalf("force was refused: %v -- during a real outage an operator may knowingly boot a half-written copy rather than nothing", err)
+	}
+	if plan.DataLoss.Known {
+		t.Errorf("a forced promotion past an interrupted copy reported a normal data-loss window of %s -- the metadata that figure comes from describes the replica the copy replaced, not these disks", plan.DataLoss)
+	}
+	if !plan.WriteMetadata {
+		t.Error("a forced promotion produced no promotion record")
+	}
+	if !strings.Contains(strings.Join(plan.Notes, "; "), "never recorded as finished") {
+		t.Errorf("notes = %v, want the interrupted copy named among what was overridden", plan.Notes)
+	}
+}
+
+// The strip lists: an inversion must not carry this field onto either end.
+//
+// Both directions matter and they fail differently. Left on the new TARGET it
+// refuses the promotion of a replica about to be rebuilt from scratch; left
+// on the new SOURCE it is inherited onto every future target by
+// UpdateSyncMetadata, refusing promotions of replicas nothing ever
+// interrupted.
+func TestInversionStripsAnInterruptedCopyFromBothEnds(t *testing.T) {
+	plan, err := AssessInvert(PairState{
+		OldSource: DomainEnd{Host: "prod01", Domain: "web01", Role: RoleSource,
+			ReplicaTargets: []string{"dr01:web01"}},
+		Promoted: DomainEnd{Host: "dr01", Domain: "web01", Role: RolePromoted,
+			ReplicaSource: "prod01:web01"},
+	})
+	if err != nil {
+		t.Fatalf("AssessInvert: %v", err)
+	}
+	for name, list := range map[string][]string{
+		"NewTargetRemovals": plan.NewTargetRemovals,
+		"NewSourceRemovals": plan.NewSourceRemovals,
+	} {
+		found := false
+		for _, f := range list {
+			if f == FieldReplicaIncomplete {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s does not strip %s", name, FieldReplicaIncomplete)
+		}
+	}
+}

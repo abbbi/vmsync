@@ -1,0 +1,28 @@
+
+vmsync journal for web01
+  libvirt uri     qemu:///system
+  journal         /data/replicas/.vmsync-journal/web01.jsonl
+  records read    1 in 1 action(s)
+
+replica_incomplete
+  There is NO DOMAIN by this name on this host, so there is no metadata to
+  carry a marker -- which is not a clean bill of health. A -force-clean
+  undefines the target before it replaces the disks, so a run killed in that
+  window leaves the disks and this journal with nothing above them.
+
+recent actions, oldest first (1 of 1)
+  STARTED              VERB                   OUTCOME     EXIT  ACTION
+  2025-09-21 08:00:00  sync                   UNFINISHED     -  9f3c1a2b4d5e6f70
+
+1 action(s) recorded an intent and NEVER an outcome.
+  Each is a run that started against this replica and stopped without saying so:
+  a signal (vmsync's handler exits the process, so nothing deferred runs), a dropped
+  link, or a lost power feed. If one of them was a full copy, the disks beside this
+  journal may be the half-written set it left behind. Nothing above them records
+  that, because there is no domain above them: -promote reports only that there is
+  nothing here to promote, which is true and is not the whole story.
+    2025-09-21 08:00:00  sync  action=9f3c1a2b4d5e6f70 seq=1 host=hv-a pid=4242 {mode=force-clean}
+
+This journal is evidence, never an input to a decision: no refusal anywhere in
+vmsync reads it. Nothing was changed by printing it.
+

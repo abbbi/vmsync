@@ -87,6 +87,31 @@ type Domain struct {
 	VerifyState        string `json:"verify_state,omitempty"`
 	VerifyFailedAtUnix int64  `json:"verify_failed_at_unix,omitempty"`
 
+	// ReplicaIncomplete is the armed-and-never-cleared marker a full rebuild
+	// writes on this domain BEFORE it renames the good disks aside and
+	// starts writing new base images over them. Presence IS the state, like
+	// VerifyState: the run that finishes clears it in the same
+	// DomainDefineXML that records the sync, so a value surviving here means
+	// no run ever recorded success.
+	//
+	// Kept RAW and unparsed on purpose. What the value says -- which verb,
+	// when, which action id, which host, and the .vmsync-replaced-<unix>
+	// stamp naming the complete copy that was set aside -- is pkg/failover's
+	// to read (see ParseReplicaIncomplete), because the refusal decision
+	// belongs there. This package's job is to make sure the field reaches a
+	// screen at all.
+	//
+	// It is the one field here that says the disks are not a COPY OF
+	// ANYTHING. VerifyState says the copy is wrong; every other field says
+	// the copy is merely old. This says a rebuild was interrupted between
+	// "the good replica has been renamed aside" and "the new one is
+	// finished", so what the target's metadata still calls a replica is a
+	// half-written image whose last_checkpoint, last_sync_timestamp and
+	// failure_count all describe the run BEFORE the rebuild and therefore
+	// look perfectly healthy. Failing to report it is how an operator
+	// promotes a partial image believing the reported data-loss window.
+	ReplicaIncomplete string `json:"replica_incomplete,omitempty"`
+
 	// ReplicaSource is set on a TARGET: "host:domain" of where it is
 	// replicated from. ReplicaTargets is set on a SOURCE: every target it
 	// has ever been replicated to.
@@ -252,6 +277,12 @@ type Assessment struct {
 // on which a "your replica is wrong" finding would never be reached. Laying
 // it over the result instead makes the finding independent of that chain by
 // construction, including for early returns added later.
+//
+// An interrupted rebuild (replica_incomplete) is laid over the same way and
+// for the same reason, and it needs that treatment even more than the
+// verification verdict does: the whole danger of an interrupted rebuild is
+// that every OTHER field on the domain still describes the run before it, so
+// the replication verdict underneath is a confident "ok".
 func Assess(d Domain, now time.Time, cadence time.Duration) Assessment {
 	a := assessReplication(d, now, cadence)
 
@@ -283,6 +314,25 @@ func Assess(d Domain, now time.Time, cadence time.Duration) Assessment {
 		a.Reasons = append([]string{fmt.Sprintf(
 			"the replica's contents were found to differ from its source %s and the finding has not been cleared (verify_state=%s), so this copy is known WRONG rather than merely stale -- see that run's log for which blocks differed",
 			when, d.VerifyState)}, a.Reasons...)
+	}
+
+	// Presence is the state again, and again any value counts, including one
+	// this build cannot read: the marker is armed before the disks are
+	// touched and cleared only by the define that records success, so
+	// whatever is still here means no run ever got that far.
+	//
+	// Laid over the replication verdict rather than checked inside it, for
+	// the reason given above -- and applied AFTER the verification overlay
+	// so that when both are present this one is prepended in front of it.
+	// That order is a judgement about which sentence an operator must read
+	// first: "wrong" still describes a whole copy of something, while this
+	// describes disks that were being overwritten when the writer died and
+	// are not a consistent image of any point in time.
+	if d.ReplicaIncomplete != "" {
+		a.Status = Worse(a.Status, StatusCritical)
+		a.Reasons = append([]string{fmt.Sprintf(
+			"a full rebuild of this replica was STARTED and never recorded as finished (replica_incomplete=%s), so these disks are a partial copy: the previous complete replica was renamed aside as .vmsync-replaced-<unix> and new base images were being written over it when the run stopped. Everything else recorded here -- last_checkpoint, last_sync_timestamp, failure_count -- describes the sync BEFORE that rebuild and must not be read as describing what is on disk now. Re-run the sync to completion, or recover the set-aside copy; do NOT promote this domain",
+			d.ReplicaIncomplete)}, a.Reasons...)
 	}
 	return a
 }
@@ -556,6 +606,14 @@ func applyDomainMetadata(xml string, d *Domain) {
 		// reports as an unrecorded time. Dropping the whole finding because
 		// its date is unreadable would discard the part that matters.
 	}
+	// Read unconditionally and kept verbatim, for two reasons. The marker is
+	// armed on whatever domain a full rebuild is about to overwrite, so a
+	// role gate here would drop it on exactly the domain whose role was left
+	// describing the state before the rebuild. And the value is pkg/failover's
+	// to interpret: this reader must not turn an unparsable one into an empty
+	// one, because empty is the only value that means "no interrupted
+	// rebuild" -- the one reading that lets a promotion go ahead.
+	d.ReplicaIncomplete, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldReplicaIncomplete)
 	if raw, err := libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldReplicaTargets); err == nil && raw != "" {
 		for _, entry := range strings.Split(raw, ",") {
 			if entry = strings.TrimSpace(entry); entry != "" {

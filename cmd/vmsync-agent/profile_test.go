@@ -62,6 +62,8 @@ func TestValidateAcceptsReasonableProfiles(t *testing.T) {
 		{TargetDiskPath: "/data/replicas"},
 		{SourcePortRange: "auto", TargetPortRange: "20000-20100"},
 		{TargetPortRange: "20809"},
+		{Journal: "actions"},
+		{Journal: "off"},
 	}
 	for _, p := range good {
 		if err := p.Validate(); err != nil {
@@ -92,6 +94,11 @@ func TestValidateRejects(t *testing.T) {
 		{"a target disk path climbing out with ..", SyncProfile{TargetDiskPath: "/data/../../etc"}, "clean"},
 		{"an inverted port range", SyncProfile{TargetPortRange: "20100-20000"}, "target_port_range"},
 		{"a privileged port range", SyncProfile{SourcePortRange: "80-100"}, "source_port_range"},
+		// A typo here would otherwise stop the pair replicating entirely:
+		// vmsync exits 2 on a journal level it does not know, and the run
+		// log would show a sync that never started rather than a bad value.
+		{"an unknown journal level", SyncProfile{Journal: "verbose"}, "verbose"},
+		{"a journal level that looks like a boolean", SyncProfile{Journal: "true"}, "journal"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -375,4 +382,133 @@ func hasArg(args []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// valueOf returns the element after flag, or "" when the flag is absent.
+func valueOf(args []string, flag string) string {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// TestCommandArgsCarriesTheActionID pins the correlation id that joins this
+// agent's run log to the journal the engine writes beside the disks -- and
+// to the action= field of a replica_incomplete marker, which is what leads
+// from a refused promotion back to the run that armed it.
+//
+// The fallback to RunID is the case that covers every scheduled sync: the
+// agent already mints one id per launch and records it in runs.jsonl, so
+// nothing else has to be set for the two logs to share a key.
+func TestCommandArgsCarriesTheActionID(t *testing.T) {
+	base := SyncRequest{
+		SourceURI: "qemu:///system", SourceDomain: "web01",
+		TargetURI: "qemu+ssh://root@dr01/system", TargetDomain: "web01",
+	}
+
+	t.Run("a scheduled sync reuses its run id", func(t *testing.T) {
+		req := base
+		req.RunID = "9f3c1a2b4d5e6f708192a3b4c5d6e7f8"
+		args := req.CommandArgs()
+		if got := valueOf(args, "-action-id"); got != req.RunID {
+			t.Errorf("-action-id = %q, want the run id %q -- otherwise runs.jsonl and the journal share no key at all", got, req.RunID)
+		}
+		// And the run id itself is still passed: they are two different
+		// flags with two different jobs, one stamped into the run lock and
+		// one into the journal.
+		if got := valueOf(args, "-run-id"); got != req.RunID {
+			t.Errorf("-run-id = %q, want %q", got, req.RunID)
+		}
+	})
+
+	t.Run("an explicit action id wins over the run id", func(t *testing.T) {
+		req := base
+		req.RunID = "9f3c1a2b4d5e6f708192a3b4c5d6e7f8"
+		req.ActionID = "0123456789abcdef0123456789abcdef"
+		if got := valueOf(req.CommandArgs(), "-action-id"); got != req.ActionID {
+			t.Errorf("-action-id = %q, want the operation's id %q", got, req.ActionID)
+		}
+	})
+
+	t.Run("emitted exactly once", func(t *testing.T) {
+		req := base
+		req.RunID, req.ActionID = "aaaa", "bbbb"
+		n := 0
+		for _, a := range req.CommandArgs() {
+			if a == "-action-id" {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("-action-id appears %d times; a second one silently wins over the first", n)
+		}
+	})
+
+	t.Run("no id at all emits nothing", func(t *testing.T) {
+		if args := base.CommandArgs(); hasArg(args, "-action-id") {
+			t.Errorf("args = %v carry an empty -action-id, which vmsync would read as an explicit empty id", args)
+		}
+	})
+
+	t.Run("an id that would corrupt the metadata value is refused", func(t *testing.T) {
+		// This string ends up inside replica_incomplete, whose grammar is
+		// one line of comma-separated k=v pairs. A comma in it makes the
+		// whole marker unreadable -- which still refuses a promotion, by
+		// design, but refuses with no verb, no host and no aside stamp, so
+		// nobody can find the complete copy that was set aside.
+		for _, bad := range []string{
+			"has,a,comma", "has=equals", "has space", "has\nnewline",
+			"<xml>", strings.Repeat("a", maxActionIDLen+1),
+		} {
+			req := base
+			req.ActionID = bad
+			if args := req.CommandArgs(); hasArg(args, "-action-id") {
+				t.Errorf("ActionID %q was passed through: %v", bad, args)
+			}
+		}
+	})
+
+	t.Run("an unusable action id falls back to the run id", func(t *testing.T) {
+		req := base
+		req.ActionID, req.RunID = "no,good", "9f3c1a2b4d5e6f70"
+		if got := valueOf(req.CommandArgs(), "-action-id"); got != req.RunID {
+			t.Errorf("-action-id = %q, want the run id %q -- a bad operation id must not cost the run its traceability too", got, req.RunID)
+		}
+	})
+}
+
+// TestCommandArgsCarriesTheJournalLevel covers the second of the journal's
+// two flags. Written in the "=" form deliberately: a value-taking flag
+// written with a space breaks if the engine declares it IsBoolFlag, and the
+// consequence is not a missing diagnostic but a pair that stops replicating,
+// because vmsync rejects the leftover positional argument.
+func TestCommandArgsCarriesTheJournalLevel(t *testing.T) {
+	base := SyncRequest{
+		SourceURI: "qemu:///system", SourceDomain: "web01",
+		TargetURI: "qemu+ssh://root@dr01/system", TargetDomain: "web01",
+	}
+
+	for _, level := range []string{"actions", "off"} {
+		req := base
+		req.Profile.Journal = level
+		args := req.CommandArgs()
+		if !hasArg(args, "-journal="+level) {
+			t.Errorf("args = %v do not contain -journal=%s", args, level)
+		}
+		if hasArg(args, "-journal") {
+			t.Errorf("args = %v contain the bare -journal, whose value vmsync may leave as a positional argument it then rejects", args)
+		}
+	}
+
+	// Silence, not a default this build asserts. A default spelled out here
+	// would pin every host to whatever this agent thought it was on the day
+	// it shipped, including hosts whose engine has since changed it.
+	args := base.CommandArgs()
+	for _, a := range args {
+		if strings.HasPrefix(a, "-journal") {
+			t.Errorf("args = %v name the journal although no level was configured", args)
+		}
+	}
 }

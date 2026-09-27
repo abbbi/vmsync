@@ -96,6 +96,31 @@ from a separately-versioned program: refusing it outright would let a newer UI
 take an estate offline over one out-of-range field, so its values are
 normalised, clamped and complained about, never rejected.
 
+### Upgrade order: UI, then engines, then agents
+
+The fifth document is the one going the *other* way — the report this agent
+sends — and it is decoded **strictly** by the UI. That makes the order
+load-bearing rather than advisory, and it is not softened by `omitempty`.
+
+1. **The UI first.** An unknown field rejects the **whole** report, not just
+   that field. `replica_incomplete` is the current example of why that bites
+   late: a healthy estate decodes perfectly, and the first report to be thrown
+   away is the one from the host where a rebuild has just been interrupted —
+   the exact moment the estate view is worth having.
+2. **Then the `vmsync` engines**, on every host this agent launches them on.
+   This agent passes `-action-id` on **every** scheduled sync, so an agent
+   upgraded ahead of its `vmsync` binary makes every run fail immediately with
+   an unknown-flag error. Agent and engine ship together on a host.
+3. **Then the agents.**
+
+And one thing the order cannot fix, worth knowing before relying on it: the
+interrupted-rebuild refusal lives entirely in the `replica_incomplete` field
+on the replica's own domain, with **no `failure_count` carrier** behind it. A
+pre-upgrade `vmsync` performing a `-promote` on the DR host does not know that
+field and will accept a half-written replica exactly as it always did. Until
+every host that drives *or receives* syncs is upgraded, the refusal is
+advisory.
+
 ## Install
 
 ```bash
@@ -804,6 +829,8 @@ The seven skip reasons:
 | --- | --- | --- | --- |
 | `vmsync_agent_domains_total` | gauge | — | Domains on this host. |
 | `vmsync_agent_domains` | gauge | `status` | Domains by assessed replication status. |
+| `vmsync_agent_replica_incomplete_vms` | gauge | — | VMs here whose disks a full copy started replacing and never finished. **The one to alert on.** Always emitted, including as a zero: a missing series and a clean host look identical to a query, and one of those is a design choice while the other is a scrape that is not happening. |
+| `vmsync_agent_replica_incomplete` | gauge | `vm` | 1 while that VM carries the marker. The count above says *whether*; this says *which* — and which is what an operator needs before a failover, because `-promote` will refuse exactly these. |
 
 **Control plane**
 
@@ -935,6 +962,37 @@ replaced, and a URI that will not parse is redacted whole. Note what this is
 *not* doing: the unredacted argv is already in `/proc/<pid>/cmdline`,
 world-readable on a default Linux. This declines to make a transient exposure
 durable and archivable.
+
+### The correlation id
+
+`runs.jsonl` answers "what did this host run". It cannot answer "and what did
+that run leave on the replica", because the replica is on another host and
+`run_id` means nothing there. So every `vmsync` this agent starts is given
+**`-action-id`**, and the engine stamps it into both the action journal beside
+the replica's disks and the `replica_incomplete` marker on the replica's
+domain. One id, readable from either end, with no lookup.
+
+| launched by | `-action-id` |
+| --- | --- |
+| the scheduler | this run's `run_id` (32 hex) — so a scheduled sync joins `runs.jsonl` with nothing extra to configure |
+| an operation | the control plane's operation id (32 hex) — so it joins `operations.json` and the UI's audit trail |
+
+**Ids arriving over the network are sanitised, never trusted.** An operation id
+comes from the control plane and ends up inside a single-line, comma-separated
+metadata value on a production domain. `sanitizedActionID` refuses anything
+outside `[A-Za-z0-9._-]` or longer than 64 bytes and falls back to the run id,
+then to omitting the flag entirely — the engine mints its own when absent. It
+never refuses the **operation**: declining to act during a disaster over an odd
+correlation id would be the worse failure by a wide margin.
+
+`-action-id` and `-journal` are both in the run log's argv allowlist as
+value-carrying flags, so they appear in `runs.jsonl` unredacted. They have to:
+an id redacted out of the one file that would let you join on it is an id that
+does not exist.
+
+`-journal=<level>` is emitted from the profile's `journal` field (`actions`,
+the default, or `off`). Like every other `SyncProfile` field it must also be
+listed in `resolveProfile`, or it is silently not inherited from a template.
 
 ### What fails closed, and what does not
 
@@ -1227,6 +1285,7 @@ that a value the agent accepts is one vmsync will accept:
 | `timestamp_tolerance_sec` | 0 to compare exactly, otherwise up to 3600 |
 | `retention` | `"<count>,<interval>"`, e.g. `"24,3h"`. Empty keeps no restore points, so an estate run entirely through the schedule takes none. |
 | `source_port_range`, `target_port_range` | a range (`20000-20100`), or one fixed port to pin it. Both **default to a range**, so leaving these empty is right for almost every profile — and is what makes two concurrent syncs on one host not collide. They used to default to a single fixed port, and since nothing here or in the UI ever set them, every VM in an estate shared it. |
+| `journal` | `""` (vmsync's default, `actions`) or `"off"`. `actions` appends one intent record before each run acts and one outcome when it stops, to `.vmsync-journal/<domain>.jsonl` beside the replica's disks on the target host. Nothing branches on it and a failed write never fails a sync — it is there so an interrupted run leaves an intent with no outcome, which is the only evidence such a run leaves at all. 8 MiB per domain at most. `off` only if that filesystem genuinely cannot take it. |
 
 `report_interval_seconds`, `poll_wait_seconds` and `cadence_seconds` are part of
 the same document type and are accepted here, but do nothing: there is nothing
@@ -1468,7 +1527,7 @@ Each domain gets a status and the reasons behind it:
 | `unreplicated` | vmsync has no relationship with this domain. |
 | `paused` / `promoted` | Administrative states, not faults. |
 | `warning` | Degraded but still replicating — failures recorded, past its cadence, or no checkpoint to sync incrementally against. |
-| `critical` | Never synced, far past its cadence, or carrying a recorded verification failure — a comparison against the source found the replica's contents differing, so this copy is known *wrong* rather than merely behind. |
+| `critical` | Never synced, far past its cadence, carrying a recorded verification failure — a comparison against the source found the replica's contents differing, so this copy is known *wrong* rather than merely behind — or carrying an **unfinished rebuild**: a full copy started replacing these disks and never recorded itself as finished, so what is on them is partial. |
 
 Two rules worth knowing when reading the output:
 
@@ -1485,13 +1544,33 @@ Two rules worth knowing when reading the output:
   critical forever. Cadences come from the UI, so in standalone mode nothing is
   judged on freshness — there is no estate-wide view to draw one from.
 
+- **An unfinished rebuild overrides everything, including a verification
+  failure.** When both are present the interrupted rebuild is reported
+  **first**, because it is the only finding that says the *others* describe a
+  replica these disks no longer hold: a full copy renames the good disks aside
+  and writes new ones while the domain keeps its old metadata, so
+  `last_checkpoint`, `last_sync_timestamp` and `failure_count` all read
+  healthy about a copy that has been replaced. The reason names the rebuild
+  that started and never finished, says the copy on the disks is partial,
+  points at the `.vmsync-replaced-<unixtime>` set-aside files, and says not to
+  promote. **Presence is the state** — any value counts, unreadable ones
+  included, because a record this build cannot parse is not a record that can
+  be ignored.
+
 A report also carries the host's filesystem usage for the paths its domains'
 disks live on, each domain's disks and restore points, the recent sync outcomes,
-stored operation results, the fence state described above, and each domain's
-verification record (`verify_state` with `verify_failed_at_unix`) — read from
-the domain's own metadata, where vmsync wrote it, and reported for every domain
-rather than only for targets, because a domain carrying a finding its current
-role does not explain is itself something to look at.
+stored operation results, the fence state described above, each domain's
+verification record (`verify_state` with `verify_failed_at_unix`), and each
+domain's `replica_incomplete` marker — all read from the domain's own metadata,
+where vmsync wrote it, and reported for every domain rather than only for
+targets, because a domain carrying a finding its current role does not explain
+is itself something to look at.
+
+`replica_incomplete` is carried **raw and verbatim**: the agent does not parse,
+trim or normalise it anywhere. Reading that value is the job of the code that
+*decides* on it (`pkg/failover`, on the replica's own host) and of the UI's own
+display code. An agent that tidied it up would be a third implementation of a
+grammar two others already have to agree on.
 
 A libvirt failure while building a report is logged loudly but is not fatal:
 libvirtd restarts, and an agent that exited would then need systemd to bring it

@@ -2748,3 +2748,210 @@ func TestOperatorWillSurvivesAReplicateThenPromoteCycle(t *testing.T) {
 		}
 	}
 }
+
+// ReplicaIncompleteValue is the one string standing between an interrupted
+// full copy and a promotion that accepts it, so every branch of it is pinned
+// here: the exact spelling per verb, the refusals, and the cap.
+func TestReplicaIncompleteValue(t *testing.T) {
+	const at = int64(1758441600)
+
+	t.Run("every verb, spelled exactly", func(t *testing.T) {
+		// The spelling is a wire format: pkg/failover parses it, the agent
+		// carries it, and the control plane displays it. A verb renamed here
+		// and nowhere else produces a refusal nothing can explain.
+		for verb, want := range map[string]string{
+			ReplicaIncompleteVerbReinit:     "verb=reinit,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=1758441600",
+			ReplicaIncompleteVerbForceClean: "verb=force-clean,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=1758441600",
+			ReplicaIncompleteVerbFullSync:   "verb=full-sync,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=1758441600",
+			ReplicaIncompleteVerbRestore:    "verb=restore,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=1758441600",
+		} {
+			got, err := ReplicaIncompleteValue(verb, at, "9f3c1a2b4d5e6f70", "hv-a", "1758441600")
+			if err != nil {
+				t.Fatalf("verb %q refused: %v", verb, err)
+			}
+			if got != want {
+				t.Errorf("verb %q:\n got %q\nwant %q", verb, got, want)
+			}
+		}
+	})
+
+	t.Run("the omittable keys are omitted, not left empty", func(t *testing.T) {
+		// An empty "action=" or "aside=" would parse into an empty string
+		// that reads, downstream, as a stamp of "" -- and the refusal would
+		// then name ".vmsync-replaced-" as the files to recover from.
+		got, err := ReplicaIncompleteValue(ReplicaIncompleteVerbFullSync, at, "", "hv-a", "")
+		if err != nil {
+			t.Fatalf("ReplicaIncompleteValue: %v", err)
+		}
+		if got != "verb=full-sync,at=1758441600,host=hv-a" {
+			t.Errorf("got %q, want the action and aside keys absent entirely", got)
+		}
+	})
+
+	t.Run("a missing action id never stops the write", func(t *testing.T) {
+		// An unarmed replica is far worse than an unattributed one, so no
+		// correlation id must ever be a reason to refuse.
+		if _, err := ReplicaIncompleteValue(ReplicaIncompleteVerbReinit, at, "", "hv-a", "1758441600"); err != nil {
+			t.Errorf("an empty action id was refused: %v -- the arming write would then fail and the reinit would proceed unprotected", err)
+		}
+	})
+
+	t.Run("an unknown verb is refused", func(t *testing.T) {
+		// The verb is what the refusal names back to whoever has to recover,
+		// so a typo at a call site must fail the ARMING write -- which
+		// happens before anything is destroyed -- rather than write a value
+		// the refusal cannot explain.
+		if _, err := ReplicaIncompleteValue("rebuild", at, "", "hv-a", ""); err == nil {
+			t.Fatal("an unknown verb produced a value")
+		}
+	})
+
+	t.Run("refusals that are call-site errors", func(t *testing.T) {
+		// None of these can come from an operator or a control plane, so
+		// refusing costs nothing real -- and the arming write it fails
+		// happens before anything has been destroyed.
+		for name, call := range map[string]func() (string, error){
+			"a zero time":     func() (string, error) { return ReplicaIncompleteValue(ReplicaIncompleteVerbReinit, 0, "", "hv-a", "") },
+			"a negative time": func() (string, error) { return ReplicaIncompleteValue(ReplicaIncompleteVerbReinit, -1, "", "hv-a", "") },
+			"a non-numeric aside": func() (string, error) {
+				return ReplicaIncompleteValue(ReplicaIncompleteVerbReinit, at, "", "hv-a", "yesterday")
+			},
+		} {
+			if got, err := call(); err == nil {
+				t.Errorf("%s was accepted, producing %q", name, got)
+			}
+		}
+	})
+
+	t.Run("the ids vmsync-agent really passes are carried unchanged", func(t *testing.T) {
+		// Not hex, deliberately. vmsync-agent stamps an operation's id from
+		// the control plane and permits hyphens, dots and underscores; an
+		// engine that accepted only hex would drop the correlation on every
+		// agent-driven run, which is the kind of run that most needs one.
+		got, err := ReplicaIncompleteValue(ReplicaIncompleteVerbReinit, at, "op-2025.09.21_web01", "hv-a", "")
+		if err != nil {
+			t.Fatalf("an id vmsync-agent would pass was refused: %v", err)
+		}
+		if !strings.Contains(got, "action=op-2025.09.21_web01") {
+			t.Errorf("got %q, want the agent's own id carried through verbatim", got)
+		}
+	})
+
+	t.Run("an id that cannot be carried is dropped, never refused", func(t *testing.T) {
+		// An action id arrives over the network. Refusing one would fail the
+		// ARMING write, and that aborts the whole reinit -- so an unusable id
+		// must cost the correlation and nothing else. Escaping was rejected
+		// for the reason vmsync-agent gives on its own side: it puts the
+		// burden on every reader of the value, for ever.
+		for name, id := range map[string]string{
+			"one that would break the grammar":      "9f3c,host=elsewhere",
+			"one carrying an XML metacharacter":     `9f3c<&>"`,
+			"one long enough to crowd out the host": strings.Repeat("a", replicaIncompleteActionIDMax+1),
+		} {
+			got, err := ReplicaIncompleteValue(ReplicaIncompleteVerbReinit, at, id, "hv-a", "1758441600")
+			if err != nil {
+				t.Errorf("%s was refused (%v), which leaves the replica unarmed; it must be dropped instead", name, err)
+				continue
+			}
+			// Everything that makes the refusal actionable is still there.
+			if got != "verb=reinit,at=1758441600,host=hv-a,aside=1758441600" {
+				t.Errorf("%s: got %q, want the id gone and the rest of the value intact", name, got)
+			}
+		}
+	})
+
+	t.Run("a hostile host cannot break the grammar or the XML", func(t *testing.T) {
+		// Stripped rather than refused: the host is the least load-bearing
+		// part of the value, and a strange name must never be the reason a
+		// replica goes unarmed. What it must not do is inject a comma, an
+		// equals sign or an XML metacharacter.
+		got, err := ReplicaIncompleteValue(ReplicaIncompleteVerbReinit, at, "", `hv-a",aside=9999<&>`, "1758441600")
+		if err != nil {
+			t.Fatalf("ReplicaIncompleteValue: %v", err)
+		}
+		if got != "verb=reinit,at=1758441600,host=hv-aaside9999,aside=1758441600" {
+			t.Errorf("got %q, want every grammar- and XML-breaking character stripped from the host", got)
+		}
+		if strings.ContainsAny(got[strings.Index(got, "host="):], `<>&"'`) {
+			t.Errorf("got %q, which carries an XML metacharacter into the metadata element", got)
+		}
+	})
+
+	t.Run("the cap truncates the host first", func(t *testing.T) {
+		// Host first because it is the only part an operator can recover
+		// without: the verb, the time and the aside suffix are what turn the
+		// refusal into a one-line recovery.
+		long := strings.Repeat("h", 600)
+		got, err := ReplicaIncompleteValue(ReplicaIncompleteVerbReinit, at, "9f3c1a2b4d5e6f70", long, "1758441600")
+		if err != nil {
+			t.Fatalf("ReplicaIncompleteValue: %v", err)
+		}
+		if len(got) != replicaIncompleteMaxBytes {
+			t.Errorf("value is %d bytes, want it capped at exactly %d", len(got), replicaIncompleteMaxBytes)
+		}
+		for _, want := range []string{"verb=reinit", "at=1758441600", "action=9f3c1a2b4d5e6f70", "aside=1758441600"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("value %q lost %q to the cap; only the host may be cut", got, want)
+			}
+		}
+		if !strings.Contains(got, "host=hhh") {
+			t.Errorf("value %q dropped the host entirely; it must be cut to fit, so its prefix still identifies the machine", got)
+		}
+	})
+
+	t.Run("nothing a caller can pass makes the value exceed the cap", func(t *testing.T) {
+		// The final refusal in the builder is a tripwire, not a reachable
+		// path: the verb comes from a closed set, the time and the aside
+		// stamp are bounded by their own formats, and an over-long action id
+		// is dropped. This asserts that, so that widening one of those bounds
+		// without widening the cap shows up here rather than at a promotion.
+		got, err := ReplicaIncompleteValue(ReplicaIncompleteVerbForceClean, at,
+			strings.Repeat("f", replicaIncompleteActionIDMax), strings.Repeat("h", 4096), "1758441600")
+		if err != nil {
+			t.Fatalf("the largest value any caller can ask for was refused: %v -- that refusal leaves a replica unarmed", err)
+		}
+		if len(got) > replicaIncompleteMaxBytes {
+			t.Errorf("value is %d bytes, over the %d-byte cap", len(got), replicaIncompleteMaxBytes)
+		}
+	})
+}
+
+// The writer and the reader live in two packages that cannot import each
+// other, and nothing else makes them agree.
+//
+// A grammar change on one side alone does not fail to compile and does not
+// fail any test on that side: it produces a value the other side reads as
+// unparseable, and an unparseable value still refuses -- but it refuses with
+// no verb, no host and, above all, no aside stamp naming the complete copy
+// that was set aside. The refusal survives and the RECOVERY is lost, silently.
+// This is the only place that catches that.
+func TestReplicaIncompleteRoundTripsThroughTheParserThatRefuses(t *testing.T) {
+	for _, verb := range []string{
+		ReplicaIncompleteVerbReinit, ReplicaIncompleteVerbForceClean,
+		ReplicaIncompleteVerbFullSync, ReplicaIncompleteVerbRestore,
+	} {
+		value, err := ReplicaIncompleteValue(verb, 1758441600, "9f3c1a2b4d5e6f70", "hv-a", "1758441600")
+		if err != nil {
+			t.Fatalf("verb %q: %v", verb, err)
+		}
+		got := failover.ParseReplicaIncomplete(value)
+		want := failover.ReplicaIncomplete{
+			Parsed: true, Raw: value, Verb: verb, AtUnix: 1758441600,
+			ActionID: "9f3c1a2b4d5e6f70", Host: "hv-a", AsideStamp: "1758441600",
+		}
+		if got != want {
+			t.Errorf("verb %q round trip:\n got %+v\nwant %+v", verb, got, want)
+		}
+	}
+
+	// The shape the full-sync path writes: no action id and no aside stamp.
+	// It must still be Parsed, or the refusal for that path loses its verb
+	// and its time as well as the aside stamp it legitimately has not got.
+	value, err := ReplicaIncompleteValue(ReplicaIncompleteVerbFullSync, 1758441600, "", "hv-a", "")
+	if err != nil {
+		t.Fatalf("ReplicaIncompleteValue: %v", err)
+	}
+	if got := failover.ParseReplicaIncomplete(value); !got.Parsed || got.Verb != ReplicaIncompleteVerbFullSync || got.AsideStamp != "" {
+		t.Errorf("a full sync's own value read back as %+v", got)
+	}
+}

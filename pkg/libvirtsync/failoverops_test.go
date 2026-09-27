@@ -92,6 +92,7 @@ func TestFailoverStateFromXML(t *testing.T) {
 				MetadataFieldRestoredFrom:        "1756041600-vmsync-cpt-000042",
 				MetadataFieldVerifyState:         VerifyStateFailed,
 				MetadataFieldVerifyFailedAt:      "1700000500",
+				MetadataFieldReplicaIncomplete:   "verb=reinit,at=1700000100,action=9f3c1a2b4d5e6f70,host=prod01,aside=1700000100",
 				MetadataFieldFenceID:             "0123456789abcdef0123456789abcdef",
 				MetadataFieldFenceSource:         "prod01:web01",
 				MetadataFieldFenceArmedBy:        "ops@example.org",
@@ -109,6 +110,11 @@ func TestFailoverStateFromXML(t *testing.T) {
 				RestoredFrom:        "1756041600-vmsync-cpt-000042",
 				VerifyState:         VerifyStateFailed,
 				VerifyFailedAt:      1700000500,
+				// Carried RAW, unparsed: reading it is a promotion decision
+				// and belongs to pkg/failover. A build that parsed it here
+				// would also have to decide what an unreadable value means,
+				// and the answer -- refuse anyway -- is not a metadata rule.
+				ReplicaIncomplete: "verb=reinit,at=1700000100,action=9f3c1a2b4d5e6f70,host=prod01,aside=1700000100",
 				Fence: failover.FenceToken{
 					ID:      "0123456789abcdef0123456789abcdef",
 					Source:  "prod01:web01",
@@ -201,6 +207,26 @@ func TestFailoverStateFromXML(t *testing.T) {
 			want: FailoverState{
 				Role:           RoleTarget,
 				VerifyFailedAt: 1700000500,
+			},
+		},
+		{
+			// A replica_incomplete this build cannot make sense of -- written
+			// by a newer vmsync, or a write torn mid-splice. It must arrive
+			// here EXACTLY as written, because pkg/failover refuses on the
+			// field's presence and only words the refusal from the parse.
+			// Dropping it here would turn the one record that an interrupted
+			// full copy ever happened into silence, and silence is what
+			// promotes a half-written image.
+			name: "an unreadable in-flight record still arrives, raw",
+			fields: map[string]string{
+				MetadataFieldReplicationRole:   RoleTarget,
+				MetadataFieldReplicaSource:     "prod01:web01",
+				MetadataFieldReplicaIncomplete: "written by something newer",
+			},
+			want: FailoverState{
+				Role:              RoleTarget,
+				ReplicaSource:     "prod01:web01",
+				ReplicaIncomplete: "written by something newer",
 			},
 		},
 	} {

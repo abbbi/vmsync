@@ -296,6 +296,14 @@ func resolveProfile(entry, tpl SyncProfile) SyncProfile {
 	if entry.TargetPortRange == "" {
 		entry.TargetPortRange = tpl.TargetPortRange
 	}
+	// Inherited like every other value here, and it has to be: a field left
+	// out of this function is a setting an operator writes on a template and
+	// watches do nothing, discovered only by reading an argv. Empty still
+	// means "say nothing and leave vmsync's default", so a template that
+	// names no journal level imposes none.
+	if entry.Journal == "" {
+		entry.Journal = tpl.Journal
+	}
 	return entry
 }
 

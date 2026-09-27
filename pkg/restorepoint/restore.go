@@ -178,6 +178,10 @@ const (
 	FieldReplicaWrittenAt = "replica_written_at"
 	// Mirrors libvirtsync.MetadataFieldPendingCheckpoint; same pinning.
 	FieldPendingCheckpoint = "pending_checkpoint"
+	// Mirrors libvirtsync.MetadataFieldReplicaIncomplete; same pinning. A
+	// restore is one of the operations that arms it: between staging and
+	// swapping, this replica's disks are being replaced wholesale.
+	FieldReplicaIncomplete = "replica_incomplete"
 	// Mirrors libvirtsync.MetadataFieldVerifyState/VerifyFailedAt; same pinning.
 	FieldVerifyState         = "verify_state"
 	FieldVerifyFailedAt      = "verify_failed_at"
@@ -212,6 +216,21 @@ type Provenance struct {
 	// same reason promoted_by is: a control plane's audit log does not
 	// survive losing the control plane, and this does.
 	By string
+	// ReplicaIncomplete is the ready-built value for FieldReplicaIncomplete,
+	// arming the replica against a promotion while its disks are being
+	// swapped. Empty means "clear it", which is what every OTHER caller of
+	// this plan wants and what the restore's own second write does once the
+	// swap and the ownership pass have both succeeded.
+	//
+	// Passed in already formatted rather than built here, because the value's
+	// grammar belongs to libvirtsync.ReplicaIncompleteValue and this package
+	// must not import libvirtsync: that would drag in cgo libvirt and make
+	// MetadataPlan -- the single most consequential decision in a restore --
+	// buildable only where libvirt's headers are.
+	//
+	// It lives on Provenance rather than on Status because it describes the
+	// ACT, not the copy: this restore, on this host, right now.
+	ReplicaIncomplete string
 }
 
 // MetadataPlan is what a restore writes onto the replica's domain metadata,
@@ -268,6 +287,15 @@ type Provenance struct {
 //     the cure, so replication stops deliberately rather than silently, and
 //     -update-role=target is the operator's explicit decision to resume.
 //
+//   - replica_incomplete <- the caller's value, or REMOVED when it has none.
+//     The one field here that describes the act in flight rather than either
+//     the disks or the policy. Paused stops a SYNC; this stops a PROMOTION,
+//     which is what the restore exists to enable and therefore the thing
+//     somebody will attempt the moment the swap dies half-way. Written in
+//     this call rather than a separate one so no disk is ever swapped with
+//     the refusal not yet in place, and cleared by a second narrow write once
+//     the swap and the ownership pass have both succeeded.
+//
 // Never touched: replica_source (identifies whose replica this is, and an empty
 // one blocks promotion), replica_targets, last_replicated_at/to (they describe
 // a life as a SOURCE), and the promotion and fence records (an audit trail of a
@@ -294,6 +322,27 @@ func MetadataPlan(s Status, r Provenance) (updates map[string]string, removals [
 		// inherit whoever performed the LAST one, which is what a stale
 		// value on a domain restored twice would mean.
 		removals = append(removals, FieldRestoredBy)
+	}
+	// Armed when the caller supplied a value, cleared when it did not, and
+	// never merely omitted -- the same set-or-remove shape the fields below
+	// use, for a sharper reason.
+	//
+	// A restore is a full replacement of the replica's contents. Between the
+	// metadata write and the end of the swap, the disks are a mixture of the
+	// restore point and the replica that was there, while the metadata this
+	// same call writes says failure_count=0 and names one coherent
+	// checkpoint -- so pkg/failover's evidence check would find nothing wrong
+	// and -promote would accept a half-swapped machine. This is what refuses
+	// it, and it is written in the SAME call as everything else so that a
+	// restore cannot begin swapping disks with the refusal not yet in place.
+	//
+	// Cleared on the empty value because a domain restored a second time, or
+	// restored after an interrupted sync armed the field, must not inherit
+	// the previous act's record and stay force-only forever.
+	if r.ReplicaIncomplete != "" {
+		updates[FieldReplicaIncomplete] = r.ReplicaIncomplete
+	} else {
+		removals = append(removals, FieldReplicaIncomplete)
 	}
 	// Always: the sidecar cannot attest it, and a stale one is a verified
 	// zero-data-loss promotion of rolled-back data.

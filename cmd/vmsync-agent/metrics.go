@@ -131,6 +131,22 @@ type agentMetrics struct {
 	fencesActed      atomic.Uint64
 	fencesFailed     atomic.Uint64
 	fencesUnrecorded atomic.Uint64
+
+	// incompleteVMs is the set of VMs on this host whose domain carries
+	// replica_incomplete: a full rebuild was started on them and never
+	// recorded as finished, so their disks are a partial copy.
+	//
+	// A gauge for the same reason the split-brain set is one -- the question
+	// is "is this true RIGHT NOW", and it clears by itself when a sync
+	// completes and the define that records it removes the marker. Nothing
+	// here counts occurrences: a rebuild interrupted twice is still one
+	// broken replica, and a counter would keep alerting after the repair.
+	//
+	// This is the only place the condition is visible without a control
+	// plane. A standalone host has no console to show a report on, and every
+	// other number it publishes about such a domain -- its status, its last
+	// sync -- describes the sync BEFORE the interrupted rebuild.
+	incompleteVMs map[string]bool
 }
 
 // setSplitBrain replaces the whole set from one complete sweep.
@@ -149,6 +165,26 @@ func (m *agentMetrics) setSplitBrain(vms map[string]bool) {
 	m.splitBrainVMs = make(map[string]bool, len(vms))
 	for vm := range vms {
 		m.splitBrainVMs[vm] = true
+	}
+}
+
+// setReplicaIncomplete replaces the whole set from one complete sweep, for
+// the same reason setSplitBrain does: replacing is what lets the condition
+// clear on its own when a rebuild finally completes and clears the marker,
+// where a merge would latch the alert forever after one bad run.
+//
+// Fed from whoever last inventoried this host -- reportLoop with a control
+// plane, the metrics loop in standalone -- so libvirt is never walked twice
+// for the same answer.
+func (m *agentMetrics) setReplicaIncomplete(vms map[string]bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.incompleteVMs = make(map[string]bool, len(vms))
+	for vm := range vms {
+		m.incompleteVMs[vm] = true
 	}
 }
 
@@ -431,12 +467,28 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	m.mu.Lock()
 	split := len(m.splitBrainVMs)
 	splitVMs := sortedKeys(m.splitBrainVMs)
+	incompleteVMs := sortedKeys(m.incompleteVMs)
 	m.mu.Unlock()
 
 	g("vmsync_agent_split_brain_vms", "VMs running on this host that a peer reports having been failed over from. Non-zero means one VM is live in two places; alert on it.", split, "")
-	for _, vm := range splitVMs {
-		g("vmsync_agent_split_brain", "1 while this host still runs a VM another host has been promoted for.", 1, fmt.Sprintf(",vm=%q", vm))
+	// HELP and TYPE once, then one sample line per VM -- NOT g() per VM.
+	//
+	// g() emits its own HELP and TYPE on every call, and the Prometheus text
+	// format allows each only once per metric family: a second HELP line for
+	// the same name makes node_exporter reject THE WHOLE TEXTFILE, not the
+	// one series. Two split-brain VMs on one host would therefore have taken
+	// down every metric this agent publishes, including the one being alerted
+	// on, and the file would have looked fine to anyone reading it by eye.
+	//
+	// The same rule governs vmsync_agent_mode and the per-VM timestamps
+	// above, which is why they are written out longhand too.
+	if len(splitVMs) > 0 {
+		fmt.Fprintf(&b, "# HELP vmsync_agent_split_brain 1 while this host still runs a VM another host has been promoted for.\n# TYPE vmsync_agent_split_brain gauge\n")
+		for _, vm := range splitVMs {
+			fmt.Fprintf(&b, "vmsync_agent_split_brain{host=%q,vm=%q} 1\n", host, vm)
+		}
 	}
+
 	c("vmsync_agent_fences_total", "Fences this agent has acted on, by result. A failure here needs a person: fences are never retried automatically.", m.fencesActed.Load(), `,result="success"`)
 	fmt.Fprintf(&b, "vmsync_agent_fences_total{host=%q,result=\"failure\"} %d\n", host, m.fencesFailed.Load())
 	// Independent of the two above: a fence can be unrecorded and still
@@ -447,6 +499,29 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	c("vmsync_agent_config_rejected_total", "Reloads refused because the new file asked for something a running agent cannot do, such as moving state_dir. Needs a restart, not another edit.", m.configRejects.Load(), "")
 	g("vmsync_agent_run_log_writable", "1 when the run log can be written. At 0 this host launches no syncs at all, because an unrecorded vmsync is refused.", boolGauge(m.runLogWritable.Load()), "")
 	c("vmsync_agent_fences_unrecorded_total", "Fences that proceeded without a durable ledger record, because writing it failed and a split brain is the worse outcome.", m.fencesUnrecorded.Load(), "")
+
+	// --- interrupted rebuilds ---------------------------------------------
+	//
+	// A full rebuild renamed a replica's good disks aside, began writing new
+	// base images over them, and died. The domain's own metadata still says
+	// last_checkpoint=<old>, last_sync_timestamp=<old>, failure_count=0, so
+	// vmsync_agent_domains counts it healthy and nothing else in this file
+	// moves at all. This is the only series that says otherwise, which is
+	// what makes it worth alerting on as directly as split brain is.
+	//
+	// The count is emitted unconditionally, at zero when nothing is wrong,
+	// because an alert cannot fire on the absence of a series that exists
+	// only while the estate is broken.
+	g("vmsync_agent_replica_incomplete_vms", "Replicas on this host whose full rebuild was started and never recorded as finished, so their disks are a partial copy. Non-zero means promoting one of them would bring up a half-written image; alert on it.", len(incompleteVMs), "")
+	// HELP and TYPE once, then one sample line per VM, for the reason spelled
+	// out at the split-brain gauge above: g() per VM would emit a second HELP
+	// line for one family and node_exporter would reject the entire file.
+	if len(incompleteVMs) > 0 {
+		fmt.Fprintf(&b, "# HELP vmsync_agent_replica_incomplete 1 while a replica on this host carries an interrupted full rebuild (replica_incomplete). It clears by itself when a sync completes, because the define that records the sync clears the marker.\n# TYPE vmsync_agent_replica_incomplete gauge\n")
+		for _, vm := range incompleteVMs {
+			fmt.Fprintf(&b, "vmsync_agent_replica_incomplete{host=%q,vm=%q} 1\n", host, vm)
+		}
+	}
 
 	return b.String()
 }
@@ -517,8 +592,13 @@ func metricsLoop(ctx context.Context, lv *live, state *sharedState, sched *Sched
 		// ceiling in a single file always come from the same generation.
 		cfg := *lv.get()
 		if scanInventory {
-			if total, byStatus, err := scanDomainStatus(cfg); err == nil {
+			if total, byStatus, incomplete, err := scanDomainStatus(cfg); err == nil {
 				m.setDomains(total, byStatus)
+				// From the same sweep, so the two can never describe
+				// different moments -- and so a standalone host, which has
+				// no console to show a report on, still publishes the one
+				// signal that a replica's disks are a partial copy.
+				m.setReplicaIncomplete(incomplete)
 			}
 		}
 		if err := m.writeMetrics(cfg.PrometheusDir, state.get(), sched, cfg.MaxConcurrentSyncs, time.Now()); err != nil {
@@ -542,25 +622,38 @@ func metricsLoop(ctx context.Context, lv *live, state *sharedState, sched *Sched
 }
 
 // scanDomainStatus inventories the host and counts domains by assessed
-// status.
+// status, and names the ones carrying an interrupted full rebuild.
 //
 // Only used in standalone mode. With a control plane, reportLoop already
 // scans on its own interval and feeds the result in, so doing it here as
 // well would double the libvirt work for the same numbers.
-func scanDomainStatus(cfg agentConfig) (int, map[string]int, error) {
+//
+// The incomplete set is returned by NAME rather than folded into the status
+// counts, because the alert an operator writes is about a specific VM: "one
+// of your replicas is a partial copy" without saying which is an alert that
+// cannot be acted on at 3am.
+func scanDomainStatus(cfg agentConfig) (int, map[string]int, map[string]bool, error) {
 	mgr, err := libvirtsync.Connect(cfg.LibvirtURI)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	defer mgr.Close()
 
 	domains, err := inventory.Scan(mgr)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	byStatus := map[string]int{}
+	incomplete := map[string]bool{}
 	now := time.Now()
 	for _, d := range domains {
+		// Presence is the state, exactly as pkg/inventory documents it: any
+		// value at all means a rebuild was armed and no run ever recorded
+		// finishing it. Matching on a known value here would let a newer
+		// engine's marker publish a zero.
+		if d.ReplicaIncomplete != "" {
+			incomplete[d.Name] = true
+		}
 		// .String(), not a string() conversion: inventory.Status is an int
 		// enum, so converting it would compile and silently yield a one-rune
 		// control character as the label value.
@@ -572,7 +665,7 @@ func scanDomainStatus(cfg agentConfig) (int, map[string]int, error) {
 		// judged against a number invented locally.
 		byStatus[inventory.Assess(d, now, 0).Status.String()]++
 	}
-	return len(domains), byStatus, nil
+	return len(domains), byStatus, incomplete, nil
 }
 
 // statusCounts tallies a report's domains by status, for the gauge.
@@ -580,6 +673,27 @@ func statusCounts(domains []ReportDomain) map[string]int {
 	out := map[string]int{}
 	for _, d := range domains {
 		out[d.Status]++
+	}
+	return out
+}
+
+// incompleteReplicaVMs names the domains in a report whose full rebuild was
+// started and never recorded as finished.
+//
+// Taken from the REPORT rather than from a second libvirt walk, so the
+// metric and the report a control-plane agent just sent describe the same
+// sweep. A host publishing a gauge that disagrees with the console for the
+// same minute is worse than one publishing neither.
+//
+// Presence is the state: any value counts, including one this build cannot
+// parse. Reading an unfamiliar marker as "nothing wrong" is the failure mode
+// this whole field exists to close.
+func incompleteReplicaVMs(domains []ReportDomain) map[string]bool {
+	out := map[string]bool{}
+	for _, d := range domains {
+		if d.ReplicaIncomplete != "" {
+			out[d.Name] = true
+		}
 	}
 	return out
 }

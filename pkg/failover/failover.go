@@ -30,6 +30,7 @@ package failover
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -111,6 +112,24 @@ type TargetState struct {
 	// the replica may be stale, the second means it may be wrong.
 	VerifyState    string
 	VerifyFailedAt int64
+	// ReplicaIncomplete is the raw libvirtsync.MetadataFieldReplicaIncomplete
+	// value: a full copy was started against these disks and never recorded
+	// as finished. Empty on every replica that is not in that state.
+	//
+	// It is unlike every other field here, and the difference is why CI-02
+	// existed. The others are read to work out whether the metadata
+	// CORROBORATES a replica; this one says the metadata describes a
+	// DIFFERENT replica -- the one the interrupted copy renamed aside and was
+	// part-way through replacing. So last_checkpoint, last_sync_timestamp,
+	// replica_source and failure_count all read perfectly healthy while the
+	// disks underneath them hold a half-written image, and without this field
+	// evidenceProblems finds nothing to say.
+	//
+	// Kept raw and parsed by ParseReplicaIncomplete rather than arriving
+	// structured, so that an unreadable value still reaches the gate: the
+	// presence of the field is the finding, and the parse decides only how
+	// the refusal is worded.
+	ReplicaIncomplete string
 	// SourceStoppedAtSync records that the SOURCE domain was already shut
 	// off when the checkpoint behind this replica was taken.
 	//
@@ -303,10 +322,156 @@ func AssessPromote(st TargetState, opt PromoteOptions) (PromotePlan, error) {
 	return plan, nil
 }
 
+// ReplicaReplacedSuffix is the prefix of the name an interrupted full copy
+// renamed the good replica disks to: "<disk>.vmsync-replaced-<unix>".
+//
+// Duplicated from cmd/vmsync's own replacedDiskSuffix rather than imported --
+// a package cannot import a main package at all -- and pinned against it by a
+// test over there. It is here because the refusal below has to NAME the
+// suffix: it is the single piece of information that turns an interrupted
+// -reinit from "this replica is unusable" into a one-line recovery, and it
+// exists nowhere else on the replica's own host.
+const ReplicaReplacedSuffix = ".vmsync-replaced-"
+
+// ReplicaIncomplete is a parsed libvirtsync.MetadataFieldReplicaIncomplete
+// value.
+//
+// Parsed is the honest half of it. The refusal never depends on this struct
+// being readable -- the field's PRESENCE is the finding -- so a value this
+// build cannot make sense of comes back with Parsed false, Raw intact, and is
+// still refused. That is failing closed: the alternative, treating an
+// unreadable record as no record, promotes exactly the half-written replica
+// the field was written to stop.
+type ReplicaIncomplete struct {
+	// Parsed is true when the value carried at least a verb and a usable
+	// start time -- enough for the refusal to say what was started and when.
+	Parsed bool
+	// Raw is what the domain actually held, always, so an unreadable value
+	// can be quoted back to whoever has to work out what wrote it.
+	Raw string
+	// Verb is reinit, force-clean, full-sync or restore -- or whatever a
+	// newer vmsync wrote, taken as found. Deliberately NOT validated against
+	// a known set: refusing to parse a verb this build has not heard of would
+	// discard a record written by a newer engine, and a newer engine's
+	// interrupted copy leaves exactly the same wreckage as this one's.
+	Verb string
+	// AtUnix is when the copy started, on the clock of the host that started
+	// it.
+	AtUnix int64
+	// ActionID correlates this with the run's journal and log. Empty when the
+	// engine that wrote it had none.
+	ActionID string
+	// Host is the machine that started the copy and was expected to finish
+	// it.
+	Host string
+	// AsideStamp is the <unix> in ".vmsync-replaced-<unix>", empty on the
+	// paths that rename nothing aside (a full sync into an empty target, or a
+	// reinit run with -replaced-disk-action=delete).
+	AsideStamp string
+}
+
+// ParseReplicaIncomplete reads the single-line comma-separated k=v value
+// libvirtsync.ReplicaIncompleteValue writes.
+//
+// Pure and stdlib-only, like everything else in this package, so the reading
+// that decides whether a promotion is refused can be exercised exhaustively
+// on any machine.
+//
+// UNKNOWN KEYS ARE IGNORED, which is what lets a newer vmsync add one without
+// every older engine on the estate suddenly failing to read the field at all.
+// Missing keys are not an error either; they only leave Parsed false when
+// what is missing is the verb or the time, because those two are what the
+// refusal is written around.
+func ParseReplicaIncomplete(raw string) ReplicaIncomplete {
+	ri := ReplicaIncomplete{Raw: raw}
+	if raw == "" {
+		return ri
+	}
+	for _, pair := range strings.Split(raw, ",") {
+		key, value, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "verb":
+			ri.Verb = value
+		case "at":
+			// A time that will not parse leaves AtUnix zero and Parsed
+			// false, and the value is still refused -- the missing date only
+			// costs the refusal its "started at" clause.
+			if n, err := strconv.ParseInt(value, 10, 64); err == nil && n > 0 {
+				ri.AtUnix = n
+			}
+		case "action":
+			ri.ActionID = value
+		case "host":
+			ri.Host = value
+		case "aside":
+			ri.AsideStamp = value
+		}
+	}
+	ri.Parsed = ri.Verb != "" && ri.AtUnix > 0
+	return ri
+}
+
+// KeepExistingReplicaIncomplete answers whether a record already on the
+// target must be left where it is rather than overwritten by the one an
+// engine is about to arm.
+//
+// The rule is one line and it is about RECOVERY, not tidiness: a record
+// naming an aside stamp is never replaced by one that names none.
+//
+// What the stamp is. A -reinit renames the good disks to
+// .vmsync-replaced-<stamp> and arms verb=reinit carrying that number. The
+// number exists nowhere else on the replica's host -- not in the domain XML,
+// not in the disks' own names -- so it is the single thing that turns an
+// interrupted rebuild from "this replica is unusable" into a one-line
+// recovery.
+//
+// What would eat it. If that reinit dies, the next ordinary sync finds no
+// checkpoint chain, concludes it must do a full copy, and arms verb=full-sync
+// -- which carries no stamp, because a full sync renames nothing aside.
+// Overwriting would change nothing about the promotion, which is refused on
+// either record, and would cost the operator the only line that says where
+// the last COMPLETE copy went. Keeping the older one is free: the field is
+// single-valued, a successful sync clears it either way, and refusing on a
+// stale verb name is no weaker than refusing on a fresh one.
+//
+// The decision rests on the stamp ALONE and deliberately not on Parsed. A
+// value this build cannot make sense of -- written by a newer engine, or
+// truncated -- that still carries a readable aside= is still the only pointer
+// to those files, and discarding it because the rest of the line is unreadable
+// would throw away recovery information over a vocabulary difference. Same
+// failing-closed instinct as the refusal itself, applied to the evidence.
+//
+// newAsideStamp non-empty means the incoming record names files of its own, so
+// nothing is lost by replacing: the caller is arming a rebuild that is itself
+// setting a complete copy aside.
+//
+// Pure and stdlib-only like the rest of this package, so the engine's call
+// site is a lookup and a branch, and the rule itself is exercised here on a
+// machine with no libvirt at all.
+func KeepExistingReplicaIncomplete(existingRaw, newAsideStamp string) bool {
+	if newAsideStamp != "" {
+		return false
+	}
+	return ParseReplicaIncomplete(existingRaw).AsideStamp != ""
+}
+
 // evidenceProblems lists the reasons this target does not look like a
 // replica a sync has actually landed on. Empty means it does.
 func evidenceProblems(st TargetState) []string {
 	var problems []string
+	// FIRST, before every other check, because it is the only one that says
+	// the rest of them are answering questions about a DIFFERENT replica.
+	// last_checkpoint, last_sync_timestamp, replica_source and failure_count
+	// below all still describe the copy this interrupted run renamed aside
+	// and was part-way through replacing, so every one of them reads clean
+	// and an operator scanning the list would otherwise reach this last, if
+	// at all.
+	if st.ReplicaIncomplete != "" {
+		problems = append(problems, replicaIncompleteProblem(st.ReplicaIncomplete))
+	}
 	if !st.DisksPresent {
 		problems = append(problems, "one or more disk files are missing from the target host")
 	}
@@ -342,6 +507,62 @@ func evidenceProblems(st TargetState) []string {
 		problems = append(problems, fmt.Sprintf("verification found this replica's contents differing from its source %s and the finding has not been cleared, so the replica is known not to match (see that run's log for which blocks)", when))
 	}
 	return problems
+}
+
+// replicaIncompleteProblem words the refusal for a replica a full copy
+// started rewriting and never finished.
+//
+// Three things it must say, and each one exists because leaving it out costs
+// an operator an hour in the middle of an outage:
+//
+//   - WHAT was started, WHEN and FROM WHERE, so they can go and find out why
+//     it stopped instead of guessing;
+//   - that the metadata above these disks describes the replica the copy
+//     REPLACED, because otherwise the obvious reading of a domain whose every
+//     other field is healthy is that this refusal is spurious and should be
+//     forced past;
+//   - the ASIDE SUFFIX, spelled out, because the complete replica is sitting
+//     in those files and nothing else on this host records their names. That
+//     is what turns "this replica is unusable" into one rename.
+//
+// An unreadable value is worded differently rather than dropped: the finding
+// survives, the raw text is quoted so somebody can work out what wrote it,
+// and the recovery is described by its shape ("the sibling files carrying
+// the suffix") since no stamp can be read out of it.
+func replicaIncompleteProblem(raw string) string {
+	ri := ParseReplicaIncomplete(raw)
+
+	var b strings.Builder
+	b.WriteString("a full copy of this replica was STARTED and never recorded as finished")
+	if ri.Parsed {
+		fmt.Fprintf(&b, " (%s, begun %s", ri.Verb, time.Unix(ri.AtUnix, 0).UTC().Format(time.RFC3339))
+		if ri.Host != "" {
+			fmt.Fprintf(&b, " from %s", ri.Host)
+		}
+		if ri.ActionID != "" {
+			fmt.Fprintf(&b, ", action %s", ri.ActionID)
+		}
+		b.WriteString(")")
+	} else {
+		fmt.Fprintf(&b, ", and the record it left could not be read (%s=%q)", FieldReplicaIncomplete, raw)
+	}
+	b.WriteString(" -- so these disk files are a HALF-WRITTEN image, while last_checkpoint, last_sync_timestamp and replica_source on this domain still describe the replica that copy replaced, which is why every other check here looks healthy")
+
+	switch {
+	case ri.AsideStamp != "":
+		fmt.Fprintf(&b, ". That complete replica was not destroyed: it is in the files beside each disk named with the suffix %s%s, and putting them back over the disks is the recovery",
+			ReplicaReplacedSuffix, ri.AsideStamp)
+	case ri.Parsed && ri.Verb == "full-sync":
+		// Nothing was renamed aside because there was nothing there to
+		// rename: a full sync only runs against a target whose disk files do
+		// not exist. Saying "look for the aside files" here would send an
+		// operator hunting for something that was never created.
+		b.WriteString(". No previous contents were renamed aside on this path -- a full sync writes bases where no disk file existed -- so there is nothing to put back: re-run the sync, which is what repairs it")
+	default:
+		fmt.Fprintf(&b, ". If that copy renamed the previous contents aside, they are in the files beside each disk carrying a %s<unix> suffix, and putting them back over the disks is the recovery; if it was run with -replaced-disk-action=delete there are none, and re-running the sync is",
+			ReplicaReplacedSuffix)
+	}
+	return b.String()
 }
 
 // computeDataLoss measures the window from the point the replica's contents
@@ -447,6 +668,11 @@ const (
 	FieldReplicaWrittenAt = "replica_written_at"
 	// Mirrors libvirtsync.MetadataFieldPendingCheckpoint; same pinning.
 	FieldPendingCheckpoint = "pending_checkpoint"
+	// Mirrors libvirtsync.MetadataFieldReplicaIncomplete; same pinning. This
+	// is the field a full copy arms before it starts destroying the replica
+	// that is there, and the only one that contradicts the rest of the
+	// metadata after such a copy is interrupted.
+	FieldReplicaIncomplete = "replica_incomplete"
 	// Mirrors libvirtsync.MetadataFieldVerifyState/VerifyFailedAt; same pinning.
 	FieldVerifyState    = "verify_state"
 	FieldVerifyFailedAt = "verify_failed_at"
@@ -535,6 +761,11 @@ func AssessInvert(st PairState) (InvertPlan, error) {
 			FieldLastSync,
 			FieldReplicaWrittenAt,
 			FieldPendingCheckpoint,
+			// A copy interrupted while this domain was the SOURCE has
+			// nothing to say about it as a target, and left standing it
+			// would refuse the promotion of a replica that is about to be
+			// built here from scratch.
+			FieldReplicaIncomplete,
 			FieldVerifyState, FieldVerifyFailedAt,
 			FieldFailureCount,
 			FieldPromotedAt, FieldPromotedBy, FieldPromotedFrom, FieldPromotionMode,
@@ -554,6 +785,11 @@ func AssessInvert(st PairState) (InvertPlan, error) {
 			FieldLastSync,
 			FieldReplicaWrittenAt,
 			FieldPendingCheckpoint,
+			// This domain is the primary now. A record of a copy that was
+			// being written INTO it, back when it was somebody's replica,
+			// would be inherited onto its own future targets by
+			// UpdateSyncMetadata and refuse their promotions.
+			FieldReplicaIncomplete,
 			FieldVerifyState, FieldVerifyFailedAt,
 			FieldFailureCount,
 			FieldPromotedAt, FieldPromotedBy, FieldPromotedFrom, FieldPromotionMode,

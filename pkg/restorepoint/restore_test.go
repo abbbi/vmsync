@@ -391,3 +391,56 @@ func TestMetadataPlanNeverSetsAndRemovesProvenance(t *testing.T) {
 		}
 	}
 }
+
+// A restore swaps every disk of the machine, which is the same hazard a
+// -reinit carries: between the metadata write and the end of the swap the
+// disks are a mixture of two moments, while the metadata this very call
+// writes says failure_count=0 and names one coherent checkpoint. Without
+// this field pkg/failover's evidence check finds nothing wrong and a
+// half-swapped machine promotes.
+//
+// Set-or-remove, never omitted, for the reason the fields below it are:
+// omitting the key leaves whatever the domain already carried, and a domain
+// restored twice would keep the first restore's record for ever -- a healthy
+// replica that is force-only with no way back.
+func TestMetadataPlanArmsAndDisarmsTheInFlightRecord(t *testing.T) {
+	t.Run("armed when the caller supplies a value", func(t *testing.T) {
+		p := testProvenance()
+		p.ReplicaIncomplete = "verb=restore,at=1756900000,host=dr01,aside=1756900000"
+		updates, removals := MetadataPlan(fullStatus(), p)
+
+		if updates[FieldReplicaIncomplete] != p.ReplicaIncomplete {
+			t.Errorf("updates[%s] = %q, want %q", FieldReplicaIncomplete, updates[FieldReplicaIncomplete], p.ReplicaIncomplete)
+		}
+		if contains(removals, FieldReplicaIncomplete) {
+			t.Errorf("%s is both set and removed, so the restore begins swapping disks with nothing recording that it started", FieldReplicaIncomplete)
+		}
+	})
+
+	t.Run("cleared when the caller supplies none", func(t *testing.T) {
+		// The clearing write after a successful swap, and the guard against
+		// inheriting a previous act's record.
+		updates, removals := MetadataPlan(fullStatus(), testProvenance())
+		if _, ok := updates[FieldReplicaIncomplete]; ok {
+			t.Errorf("an unarmed plan invented a %s value: %q", FieldReplicaIncomplete, updates[FieldReplicaIncomplete])
+		}
+		if !contains(removals, FieldReplicaIncomplete) {
+			t.Errorf("%s must be REMOVED when there is none to record, or a domain restored twice stays force-only for ever", FieldReplicaIncomplete)
+		}
+	})
+
+	t.Run("it is written in the same call as everything else", func(t *testing.T) {
+		// SetDomainMetadataFields refuses rather than retries on a concurrent
+		// change, so a plan that needed two calls would give a concurrent
+		// writer a chance to land half of it -- and the half that matters is
+		// this one.
+		p := testProvenance()
+		p.ReplicaIncomplete = "verb=restore,at=1756900000,host=dr01"
+		updates, _ := MetadataPlan(fullStatus(), p)
+		for _, f := range []string{FieldReplicaIncomplete, FieldReplicationRole, FieldFailureCount} {
+			if updates[f] == "" {
+				t.Errorf("%s is not in the same update map as the rest of the plan", f)
+			}
+		}
+	})
+}

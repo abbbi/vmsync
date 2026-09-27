@@ -72,6 +72,23 @@ type FailoverState struct {
 	// a promotion, rather than being waved through for want of a timestamp
 	// -- the date only changes how the refusal is worded.
 	VerifyFailedAt int64
+	// ReplicaIncomplete is the record a full copy wrote before it started
+	// destroying the replica that was here, RAW and unparsed. Empty on every
+	// replica no interrupted copy left behind, which is nearly all of them.
+	//
+	// Deliberately carried as the string the domain holds rather than as a
+	// parsed struct: reading it is a decision about what a promotion means,
+	// and that decision lives in pkg/failover, where it can be tested without
+	// libvirt. Parsing here would also force this package to decide what an
+	// unreadable value means, and the answer -- "refuse anyway" -- is a
+	// promotion rule, not a metadata one.
+	//
+	// It is the only field on the domain that contradicts the others. See
+	// MetadataFieldReplicaIncomplete: after an interrupted full copy
+	// last_checkpoint, last_sync_timestamp, replica_source and failure_count
+	// are all still true about the replica that copy REPLACED, which is why
+	// every other check reads clean.
+	ReplicaIncomplete string
 	// Fence is the shutdown a promotion armed against its displaced source.
 	// Zero on every domain that was never promoted, and on every promotion
 	// that did not ask for one -- a drill, for instance.
@@ -182,6 +199,15 @@ func failoverStateFromXML(domXML string) FailoverState {
 	// date leaves this zero and the verdict standing, so the promotion is
 	// still refused and merely says the time was not recorded.
 	st.VerifyFailedAt = parseUnix(domXML, MetadataFieldVerifyFailedAt)
+
+	// Raw, exactly as written, and never conditioned on being readable. A
+	// value this build cannot parse -- written by a newer vmsync, or a write
+	// torn mid-splice -- still has to reach the promotion gate, because the
+	// PRESENCE of the field is the finding and the parse only decides the
+	// wording of the refusal. Dropping an unreadable one here would turn the
+	// one signal that an interrupted full copy ever happened into silence,
+	// which is the direction that promotes a half-written image.
+	st.ReplicaIncomplete, _ = ParseMetadata(domXML, MetadataFieldReplicaIncomplete)
 
 	st.Fence.ID, _ = ParseMetadata(domXML, MetadataFieldFenceID)
 	st.Fence.Source, _ = ParseMetadata(domXML, MetadataFieldFenceSource)

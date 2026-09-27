@@ -1,0 +1,39 @@
+
+vmsync journal for web01
+  libvirt uri     qemu:///system
+  journal         /data/replicas/.vmsync-journal/web01.jsonl
+  records read    5 in 3 action(s)
+
+replica_incomplete
+  verb=reinit,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=1758441600
+  a reinit started on hv-a at 2026-09-21 08:00:00 UTC and never recorded
+  finishing; the metadata above these disks describes the replica that copy
+  REPLACED, and the complete copy is in the .vmsync-replaced-1758441600 files
+  beside them
+
+recent actions, oldest first (3 of 3)
+  STARTED              VERB                   OUTCOME     EXIT  ACTION
+  2025-09-20 20:26:40  sync                   ok             0  7a1c9e40b2d35f61
+  2025-09-21 08:00:00  sync                   UNFINISHED     -  9f3c1a2b4d5e6f70
+  2025-09-21 09:00:00  promote                failed         1  c0ffee1234567890
+
+1 action(s) recorded an intent and NEVER an outcome.
+  Each is a run that started against this replica and stopped without saying so:
+  a signal (vmsync's handler exits the process, so nothing deferred runs), a dropped
+  link, or a lost power feed. If one of them was a full copy, the disks beside this
+  journal may be the half-written set it left behind -- replica_incomplete above is
+  what refuses to promote them, and it names the aside files holding the good copy.
+    2025-09-21 08:00:00  sync  action=9f3c1a2b4d5e6f70 seq=1 host=hv-a pid=4242 {mode=reinit}
+
+1 action(s) ended other than "ok":
+    2025-09-21 09:00:05  promote  failed exit=1  refusing to promote web01: a full copy was interrupted
+
+1 line(s) of this journal could not be read back as a record.
+  The final line of a file whose append was interrupted looks exactly like this and
+  costs exactly that one record; several of them mean something else is wrong here.
+    generation 1 line 4: not a journal record: unexpected end of JSON input
+      {"v":1,"k":"outcome","aid":"c0ffee1234567890","seq":1,"at":17584
+
+This journal is evidence, never an input to a decision: no refusal anywhere in
+vmsync reads it. Nothing was changed by printing it.
+

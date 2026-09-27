@@ -1,0 +1,16 @@
+
+vmsync journal for db02
+  libvirt uri     qemu:///system
+  journal         /data/replicas/.vmsync-journal/db02.jsonl
+                  no journal has been written for this domain yet
+  records read    0 in 0 action(s)
+
+replica_incomplete
+  (none) -- this domain carries no record of an interrupted full copy
+
+recent actions, oldest first (0 of 0)
+  (nothing recorded)
+
+This journal is evidence, never an input to a decision: no refusal anywhere in
+vmsync reads it. Nothing was changed by printing it.
+

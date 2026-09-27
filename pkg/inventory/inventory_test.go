@@ -295,6 +295,139 @@ func TestAssessVerificationFailureWithNoUsableTimestamp(t *testing.T) {
 	}
 }
 
+// incompleteValue is the shape the engine writes when it arms the marker:
+// the verb that started the rebuild, when, the action id joining it to the
+// journal, the host holding the disks, and the stamp naming the
+// .vmsync-replaced-<unix> files that hold the COMPLETE copy.
+const incompleteValue = "verb=reinit,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=1758441600"
+
+// TestAssessInterruptedRebuildIsCritical is CI-02 seen from the screen an
+// operator actually looks at.
+//
+// The domain below is what a half-finished '-reinit' leaves behind: the
+// rebuild renamed the good disks aside and started writing new base images,
+// then died -- so last_checkpoint, last_sync_timestamp and failure_count all
+// still describe the sync BEFORE it and are individually perfect. Everything
+// except this one field says "healthy replica", which is precisely why the
+// field has to be able to outrank all of it.
+func TestAssessInterruptedRebuildIsCritical(t *testing.T) {
+	d := target(60) // fresh, checkpointed, no failures -- and a partial copy
+	d.ReplicaIncomplete = incompleteValue
+
+	got := Assess(d, now, 15*time.Minute)
+	if got.Status != StatusCritical {
+		t.Errorf("Assess(target carrying an interrupted rebuild) = %v, want critical -- reasons: %v", got.Status, got.Reasons)
+	}
+	joined := strings.Join(got.Reasons, " ")
+	for _, want := range []string{"rebuild", "never recorded as finished", "partial copy"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("reasons %v do not say %q -- an operator must be told a rebuild started and never finished, and that the disks are therefore a partial copy", got.Reasons, want)
+		}
+	}
+	// The raw value carries the action id and the aside stamp, which are how
+	// somebody finds the journal record and the set-aside complete copy.
+	// Summarising it away here would cost them both.
+	if !strings.Contains(joined, incompleteValue) {
+		t.Errorf("reasons %v drop the recorded value, which names the action id and the .vmsync-replaced stamp", got.Reasons)
+	}
+	// Leading, because a UI with room for one line must show this one.
+	if !strings.Contains(got.Reasons[0], "partial copy") {
+		t.Errorf("the interrupted-rebuild finding is not the first reason: %v", got.Reasons)
+	}
+}
+
+// TestAssessInterruptedRebuildSurvivesEveryEarlyReturn walks every path
+// assessReplication can leave by, because each one is a return that a check
+// written inside it would never reach.
+//
+// The promoted case is the one CI-02 ends at: a domain promoted off a
+// half-written rebuild is a live service on disks that are not a copy of any
+// point in time, and "promoted to live after a failover" alone reads as
+// nothing to do.
+func TestAssessInterruptedRebuildSurvivesEveryEarlyReturn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		d    Domain
+	}{
+		{"paused", func() Domain { d := target(90 * 86400); d.Role = libvirtsync.RolePaused; return d }()},
+		{"fenced", func() Domain { d := target(90 * 86400); d.Role = libvirtsync.RoleFenced; return d }()},
+		{"promoted", func() Domain { d := target(90 * 86400); d.Role = libvirtsync.RolePromoted; return d }()},
+		// Never synced: the rebuild wiped the only copy there ever was.
+		{"never synced", func() Domain { d := target(0); d.LastSyncUnix, d.LastCheckpoint = 0, ""; return d }()},
+		// A source, which is judged on nothing at all -- and is exactly what
+		// an '-invert' leaves the interrupted side looking like.
+		{"source", Domain{Name: "web01", ReplicaTargets: []string{"dr01:web01"}}},
+		// Fail-closed: a domain whose only remaining vmsync metadata is this
+		// marker. Filing it under "nobody configured replication here" would
+		// put a half-written image in the one bucket nobody looks in.
+		{"unreplicated", Domain{Name: "web01"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := tc.d
+			d.ReplicaIncomplete = incompleteValue
+
+			got := Assess(d, now, 15*time.Minute)
+			if got.Status != StatusCritical {
+				t.Errorf("Assess(%s + interrupted rebuild) = %v, want critical -- an interrupted rebuild outranks every administrative state", tc.name, got.Status)
+			}
+			if !strings.Contains(strings.Join(got.Reasons, " "), "partial copy") {
+				t.Errorf("the %s path swallowed the interrupted-rebuild finding: %v", tc.name, got.Reasons)
+			}
+		})
+	}
+}
+
+// Both findings at once: the operator needs both sentences, and the one
+// saying the disks are not a whole copy of anything comes first.
+func TestAssessInterruptedRebuildLeadsAVerificationFailure(t *testing.T) {
+	d := target(60)
+	d.VerifyState = libvirtsync.VerifyStateFailed
+	d.VerifyFailedAtUnix = now.Unix() - 3600
+	d.ReplicaIncomplete = incompleteValue
+
+	got := Assess(d, now, 15*time.Minute)
+	if got.Status != StatusCritical {
+		t.Errorf("Assess(both findings) = %v, want critical", got.Status)
+	}
+	if len(got.Reasons) < 2 {
+		t.Fatalf("reasons = %v, want the interrupted rebuild AND the verification failure", got.Reasons)
+	}
+	if !strings.Contains(got.Reasons[0], "partial copy") {
+		t.Errorf("reasons = %v, want the interrupted rebuild first: \"wrong\" still describes a whole copy, this does not", got.Reasons)
+	}
+	if !strings.Contains(strings.Join(got.Reasons, " "), "differ from its source") {
+		t.Errorf("reasons = %v lost the verification failure", got.Reasons)
+	}
+}
+
+// Presence is the state, so a value this build cannot read is still a
+// finding. Fail closed: the marker is cleared only by the define that
+// records a completed sync, so anything at all standing here means no run
+// ever got that far -- and reading an unfamiliar value as healthy is how a
+// newer engine's marker would be promoted straight over.
+func TestAssessInterruptedRebuildIsPresenceNotValue(t *testing.T) {
+	d := target(60)
+	d.ReplicaIncomplete = "something a later version writes"
+	if got := Assess(d, now, 15*time.Minute); got.Status != StatusCritical {
+		t.Errorf("Assess(unreadable replica_incomplete) = %v, want critical -- any value means a rebuild never finished", got.Status)
+	}
+}
+
+// The no-false-positive half. Almost every replica in an estate has never
+// had a rebuild interrupted, and they must assess exactly as they did before
+// this check existed -- a verdict that cried wolf would be switched off.
+func TestAssessWithoutAnInterruptedRebuildIsUnchanged(t *testing.T) {
+	got := Assess(target(60), now, 15*time.Minute)
+	if got.Status != StatusOK {
+		t.Errorf("Assess(healthy target, no marker) = %v, want ok -- reasons: %v", got.Status, got.Reasons)
+	}
+	for _, r := range got.Reasons {
+		if strings.Contains(r, "partial copy") {
+			t.Errorf("a target with no interrupted rebuild was told it had one: %v", got.Reasons)
+		}
+	}
+}
+
 func TestAssessClockSkew(t *testing.T) {
 	d := target(-3600) // last sync an hour in the future
 	got := Assess(d, now, 15*time.Minute)
@@ -417,27 +550,28 @@ func domainXMLWithMetadata(t *testing.T, fields map[string]string) string {
 // hand -- from no domain ever carrying one.
 func TestApplyDomainMetadataMapsEveryField(t *testing.T) {
 	fields := map[string]string{
-		libvirtsync.MetadataFieldReplicationRole:  libvirtsync.RoleTarget,
-		libvirtsync.MetadataFieldLastCheckpoint:   "vmsync-cpt-000042",
-		libvirtsync.MetadataFieldReplicaSource:    "hyper01p:web01",
-		libvirtsync.MetadataFieldReplicaTargets:   "dr01:web01, dr02:web01",
-		libvirtsync.MetadataFieldLastSync:         "1799999700",
-		libvirtsync.MetadataFieldFailureCount:     "2",
-		libvirtsync.MetadataFieldPromotedFrom:     "hyper01p:web01",
-		libvirtsync.MetadataFieldPromotedBy:       "ops@example.org",
-		libvirtsync.MetadataFieldPromotedAt:       "1799999500",
-		libvirtsync.MetadataFieldPromotionMode:    "forced",
-		libvirtsync.MetadataFieldFenceID:          "0123456789abcdef0123456789abcdef",
-		libvirtsync.MetadataFieldFenceSource:      "hyper01p:web01",
-		libvirtsync.MetadataFieldFenceArmedBy:     "ops@example.org",
-		libvirtsync.MetadataFieldFenceArmedAt:     "1799999400",
-		libvirtsync.MetadataFieldLastReplicatedAt: "1799999300",
-		libvirtsync.MetadataFieldLastReplicatedTo: "dr01:web01",
-		libvirtsync.MetadataFieldRestoredFrom:     "1756041600-vmsync-cpt-000040",
-		libvirtsync.MetadataFieldRestoredAt:       "1799999200",
-		libvirtsync.MetadataFieldRestoredBy:       "ops@example.org",
-		libvirtsync.MetadataFieldVerifyState:      libvirtsync.VerifyStateFailed,
-		libvirtsync.MetadataFieldVerifyFailedAt:   "1799999100",
+		libvirtsync.MetadataFieldReplicationRole:   libvirtsync.RoleTarget,
+		libvirtsync.MetadataFieldLastCheckpoint:    "vmsync-cpt-000042",
+		libvirtsync.MetadataFieldReplicaSource:     "hyper01p:web01",
+		libvirtsync.MetadataFieldReplicaTargets:    "dr01:web01, dr02:web01",
+		libvirtsync.MetadataFieldLastSync:          "1799999700",
+		libvirtsync.MetadataFieldFailureCount:      "2",
+		libvirtsync.MetadataFieldPromotedFrom:      "hyper01p:web01",
+		libvirtsync.MetadataFieldPromotedBy:        "ops@example.org",
+		libvirtsync.MetadataFieldPromotedAt:        "1799999500",
+		libvirtsync.MetadataFieldPromotionMode:     "forced",
+		libvirtsync.MetadataFieldFenceID:           "0123456789abcdef0123456789abcdef",
+		libvirtsync.MetadataFieldFenceSource:       "hyper01p:web01",
+		libvirtsync.MetadataFieldFenceArmedBy:      "ops@example.org",
+		libvirtsync.MetadataFieldFenceArmedAt:      "1799999400",
+		libvirtsync.MetadataFieldLastReplicatedAt:  "1799999300",
+		libvirtsync.MetadataFieldLastReplicatedTo:  "dr01:web01",
+		libvirtsync.MetadataFieldRestoredFrom:      "1756041600-vmsync-cpt-000040",
+		libvirtsync.MetadataFieldRestoredAt:        "1799999200",
+		libvirtsync.MetadataFieldRestoredBy:        "ops@example.org",
+		libvirtsync.MetadataFieldVerifyState:       libvirtsync.VerifyStateFailed,
+		libvirtsync.MetadataFieldVerifyFailedAt:    "1799999100",
+		libvirtsync.MetadataFieldReplicaIncomplete: "verb=reinit,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=1758441600",
 	}
 
 	var d Domain
@@ -448,6 +582,12 @@ func TestApplyDomainMetadataMapsEveryField(t *testing.T) {
 	}
 	if d.VerifyFailedAtUnix != 1799999100 {
 		t.Errorf("VerifyFailedAtUnix = %d, want 1799999100", d.VerifyFailedAtUnix)
+	}
+	// Verbatim, down to the last byte: pkg/failover parses this value to
+	// decide whether to refuse a promotion, so anything this reader
+	// normalises away is a field that reads differently on the two sides.
+	if want := "verb=reinit,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=1758441600"; d.ReplicaIncomplete != want {
+		t.Errorf("ReplicaIncomplete = %q, want %q -- the marker that says these disks are a half-written rebuild never leaves the hypervisor", d.ReplicaIncomplete, want)
 	}
 	if d.Role != libvirtsync.RoleTarget || d.LastCheckpoint != "vmsync-cpt-000042" || d.ReplicaSource != "hyper01p:web01" {
 		t.Errorf("the ordinary fields did not survive the extraction: %+v", d)

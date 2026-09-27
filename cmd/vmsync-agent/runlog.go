@@ -392,6 +392,64 @@ func newRunID() string {
 	return hex.EncodeToString(b)
 }
 
+// maxActionIDLen bounds what may be passed as -action-id.
+//
+// The whole replica_incomplete value is capped at 512 bytes by the engine,
+// which truncates the HOST first to stay under it -- so an id long enough to
+// matter would cost the value the name of the host holding the disks, which
+// is the part a person reads during a disaster. Every id this agent has to
+// offer is 32 hex characters; anything near this bound is already wrong.
+const maxActionIDLen = 64
+
+// sanitizedActionID picks the correlation id to stamp into the journal, and
+// refuses one it will not vouch for.
+//
+// want wins when it is usable, falling back to the run id: a scheduled sync
+// passes only its run id, an operation passes the id the control plane's
+// operations.json is keyed by.
+//
+// The refusal is the point. An operation's id arrives over the network, and
+// this string is written into a domain's replica_incomplete metadata value
+// -- a single line of comma-separated k=v pairs, read back by
+// failover.ParseReplicaIncomplete to decide whether to refuse a promotion. A
+// comma, an equals sign or a newline in it would make that whole value
+// unreadable, and while an unreadable value still refuses (it fails closed,
+// deliberately), it refuses with no detail at all: no verb, no host, no
+// aside stamp naming the complete copy that was set aside. So an id that
+// cannot survive the grammar is dropped, and vmsync mints its own -- a
+// journal record nobody can join back to this run is a smaller loss than a
+// marker nobody can read.
+//
+// Conservative on purpose: hyphens, dots and underscores are allowed because
+// ids elsewhere in this codebase use them (newRunID's degraded "t<nanos>"
+// form among them), and everything else is refused rather than escaped.
+// Escaping would put the burden on every reader of the value, forever.
+func sanitizedActionID(want, fallback string) string {
+	for _, candidate := range []string{want, fallback} {
+		if usableActionID(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func usableActionID(s string) bool {
+	if s == "" || len(s) > maxActionIDLen {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r == '-' || r == '_' || r == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // --- redaction ---------------------------------------------------------------
 
 // argClass says what an argv element is, so the value after it is handled
@@ -427,6 +485,15 @@ var agentFlagVocabulary = map[string]argClass{
 	"-local-host-name": argValue,
 	"-run-id":          argValue,
 	"-result-json":     argValue,
+	// Both belong to the action journal. Logged rather than redacted
+	// because they are the join: -action-id is the id the journal's records
+	// and a replica_incomplete marker both carry, so a run log that redacted
+	// it would leave an operator holding a refused promotion with no way
+	// back to the launch that caused it -- which is the exact question the
+	// journal exists to answer. Neither can carry a secret: one is an id
+	// this agent minted, the other a level from a closed set.
+	"-action-id": argValue,
+	"-journal":   argValue,
 
 	// ssh
 	"-ssh-user":        argValue,

@@ -221,7 +221,7 @@ func TestEveryEmittedFlagIsInTheVocabulary(t *testing.T) {
 		"-bridge-helper-path", "-compress-level", "-io-depth", "-prometheus-textfile",
 		"-reinit-after-failures", "-retention", "-source-nbd-port", "-target-nbd-port",
 		"-target-disk-path", "-timestamp-tolerance-sec", "-use-ssh", "-no-checksum", "-run-id",
-		"-result-json",
+		"-result-json", "-action-id", "-journal",
 		"-compress", "-netbuffer", "-verify", "-verify-failure-reinit",
 		"-promote", "-promote-mode", "-promoted-by", "-force-promote", "-fence-source",
 		"-invert", "-reinit", "-force-clean", "-start", "-update-role",
@@ -231,6 +231,63 @@ func TestEveryEmittedFlagIsInTheVocabulary(t *testing.T) {
 		if _, ok := agentFlagVocabulary[f]; !ok {
 			t.Errorf("%s is emitted by a builder but missing from agentFlagVocabulary, so its value would be redacted from the run log", f)
 		}
+	}
+}
+
+// The journal's two flags must survive redaction with their values intact:
+// -action-id IS the join between this host's run log, the journal beside the
+// disks on the other host, and the action= field of a replica_incomplete
+// marker. A redacted one leaves an operator holding a refused promotion with
+// nothing to look the action up by.
+func TestJournalFlagsAreLoggedNotRedacted(t *testing.T) {
+	got := redactArgs([]string{
+		"-action-id", "9f3c1a2b4d5e6f70", "-journal=actions", "-source-domain", "web01",
+	})
+	want := []string{"-action-id", "9f3c1a2b4d5e6f70", "-journal=actions", "-source-domain", "web01"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("redactArgs(%v)\n  = %v\nwant %v", want, got, want)
+	}
+}
+
+// TestSanitizedActionID covers the one place a string from the network
+// reaches a domain's metadata.
+//
+// An operation's id is minted by the control plane and arrives over HTTP,
+// and it ends up inside replica_incomplete -- a single line of
+// comma-separated k=v pairs that pkg/failover parses to decide whether to
+// refuse a promotion. A comma, an equals sign or a newline in it makes that
+// value unreadable. Unreadable still refuses (it fails closed, deliberately)
+// but refuses with no verb, no host and no aside stamp, so nobody can find
+// the complete copy the interrupted rebuild set aside. Dropping such an id
+// and letting vmsync mint its own loses a join; passing it through loses the
+// evidence.
+func TestSanitizedActionID(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		want, fallback string
+		expect         string
+	}{
+		{"an ordinary hex id", "9f3c1a2b4d5e6f70", "", "9f3c1a2b4d5e6f70"},
+		{"a 32-character operation id", strings.Repeat("ab", 16), "", strings.Repeat("ab", 16)},
+		{"the wanted id wins over the fallback", "aaaa", "bbbb", "aaaa"},
+		{"an empty wanted id falls back", "", "bbbb", "bbbb"},
+		{"newRunID's degraded form is usable", "t1758441600123456789", "", "t1758441600123456789"},
+		{"a comma would end the k=v pair early", "no,good", "", ""},
+		{"an equals sign would invent a key", "a=b", "", ""},
+		{"a newline would end the whole value", "a\nb", "", ""},
+		{"a space would break the single-line grammar", "a b", "", ""},
+		{"xml specials never reach a domain definition", "<a>", "", ""},
+		{"an over-long id would push the host name out of the value", strings.Repeat("a", maxActionIDLen+1), "", ""},
+		{"exactly at the bound is still usable", strings.Repeat("a", maxActionIDLen), "", strings.Repeat("a", maxActionIDLen)},
+		{"a bad id falls back rather than costing the run its id too", "no,good", "9f3c1a2b", "9f3c1a2b"},
+		{"two bad ids produce nothing, and vmsync mints its own", "no,good", "also bad", ""},
+		{"nothing at all", "", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizedActionID(tc.want, tc.fallback); got != tc.expect {
+				t.Errorf("sanitizedActionID(%q, %q) = %q, want %q", tc.want, tc.fallback, got, tc.expect)
+			}
+		})
 	}
 }
 

@@ -604,20 +604,38 @@ func reportLoop(ctx context.Context, client *Client, lv *live, state *sharedStat
 			// libvirtd restarts, and an agent that exited would then need
 			// systemd to bring it back rather than simply recovering.
 			trace.Error("could not inventory the local host", "error", err)
-		} else if err := client.SendReport(ctx, report); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if errors.Is(err, ErrRevoked) {
-				trace.Error("the UI rejected this agent's credential; reporting will keep failing until it is enrolled again", "error", err)
-			} else {
-				trace.Warning("could not send report to the UI; will retry", "error", err)
-				cfg.metrics.uiFailed()
-			}
 		} else {
-			trace.Debug("reported", "domains", len(report.Domains))
-			cfg.metrics.uiContacted(time.Now())
+			// Published from the inventory, BEFORE the send and whatever the
+			// send does, because these describe this host rather than the
+			// exchange with the UI.
+			//
+			// They used to sit in the success branch below, which inverted
+			// the one case they exist for. A controlled or monitor agent does
+			// not scan again in metricsLoop, so nothing else fills these in;
+			// an agent whose control plane is unreachable -- the DR site
+			// being down is exactly that -- would then keep publishing zero
+			// for as long as it could not reach the UI, and zero here reads
+			// as "no replica on this host is a partial copy". A false
+			// all-clear on the disks this host still holds, produced by the
+			// UI's outage rather than by anything about the disks.
 			cfg.metrics.setDomains(len(report.Domains), statusCounts(report.Domains))
+			cfg.metrics.setReplicaIncomplete(incompleteReplicaVMs(report.Domains))
+
+			if err := client.SendReport(ctx, report); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if errors.Is(err, ErrRevoked) {
+					trace.Error("the UI rejected this agent's credential; reporting will keep failing until it is enrolled again", "error", err)
+				} else {
+					trace.Warning("could not send report to the UI; will retry", "error", err)
+					cfg.metrics.uiFailed()
+				}
+			} else {
+				trace.Debug("reported", "domains", len(report.Domains))
+				// The only one of these that IS about the exchange.
+				cfg.metrics.uiContacted(time.Now())
+			}
 		}
 
 		interval := time.Duration(cached.Config.ReportIntervalSeconds) * time.Second
@@ -794,41 +812,63 @@ func buildReport(cfg agentConfig, cached CachedConfig, sched *Scheduler, ledger 
 			cadence = time.Duration(s) * time.Second
 		}
 		a := inventory.Assess(d, now, cadence)
-		report.Domains = append(report.Domains, ReportDomain{
-			Name:                 d.Name,
-			UUID:                 d.UUID,
-			Active:               d.Active,
-			Role:                 d.Role,
-			LastCheckpoint:       d.LastCheckpoint,
-			LastSyncUnix:         d.LastSyncUnix,
-			FailureCount:         d.FailureCount,
-			ReplicaSource:        d.ReplicaSource,
-			ReplicaTargets:       d.ReplicaTargets,
-			VerifyState:          d.VerifyState,
-			VerifyFailedAtUnix:   d.VerifyFailedAtUnix,
-			PromotedFrom:         d.PromotedFrom,
-			PromotedAtUnix:       d.PromotedAtUnix,
-			PromotedBy:           d.PromotedBy,
-			PromotionMode:        d.PromotionMode,
-			LastReplicatedAtUnix: d.LastReplicatedAtUnix,
-			LastReplicatedTo:     d.LastReplicatedTo,
-			FenceID:              d.FenceID,
-			FenceSource:          d.FenceSource,
-			FenceArmedAtUnix:     d.FenceArmedAtUnix,
-			FenceArmedBy:         d.FenceArmedBy,
-			Fenced:               reportFenced(fenced, d.Name),
-			Disks:                reportDisks(d.Disks),
-			RestoredFrom:         d.RestoredFrom,
-			RestoredAtUnix:       d.RestoredAtUnix,
-			RestoredBy:           d.RestoredBy,
-			RestorePoints:        reportRestorePoints(d.RestorePoints),
-			Status:               a.Status.String(),
-			Reasons:              a.Reasons,
-			AgeSeconds:           a.AgeSeconds,
-		})
+		report.Domains = append(report.Domains, reportDomainFrom(d, reportFenced(fenced, d.Name), a))
 	}
 	report.Filesystems = reportFilesystems(inventory.FilesystemsFor(domains))
 	return report, nil
+}
+
+// reportDomainFrom maps one scanned domain onto the wire struct, and touches
+// nothing that needs a libvirt connection.
+//
+// Split out of buildReport for the reason inventory.applyDomainMetadata was
+// split out of describe, and it is the same defect twice over: inline, the
+// only way to reach these lines was a live libvirt holding real domains, so a
+// field nobody copied across looked exactly like a field no domain carried.
+// The contract test that builds a ReportDomain by hand went on passing while
+// the agent sent nothing under the tag it was pinning -- proving the two
+// programs agree on a key, not that anything ever arrives in it. That is how
+// the verify verdict reached a gate no reader populated, so a field added to
+// ReportDomain belongs here, where a test can see whether it is filled in.
+//
+// fenced and the assessment are passed in rather than derived: the fence
+// ledger is one lock and one map copy for the whole report rather than one per
+// domain, and judging freshness needs the cadence the UI configured, which
+// lives on the config and not on the domain.
+func reportDomainFrom(d inventory.Domain, fenced *ReportFenced, a inventory.Assessment) ReportDomain {
+	return ReportDomain{
+		Name:                 d.Name,
+		UUID:                 d.UUID,
+		Active:               d.Active,
+		Role:                 d.Role,
+		LastCheckpoint:       d.LastCheckpoint,
+		LastSyncUnix:         d.LastSyncUnix,
+		FailureCount:         d.FailureCount,
+		ReplicaSource:        d.ReplicaSource,
+		ReplicaTargets:       d.ReplicaTargets,
+		VerifyState:          d.VerifyState,
+		VerifyFailedAtUnix:   d.VerifyFailedAtUnix,
+		ReplicaIncomplete:    d.ReplicaIncomplete,
+		PromotedFrom:         d.PromotedFrom,
+		PromotedAtUnix:       d.PromotedAtUnix,
+		PromotedBy:           d.PromotedBy,
+		PromotionMode:        d.PromotionMode,
+		LastReplicatedAtUnix: d.LastReplicatedAtUnix,
+		LastReplicatedTo:     d.LastReplicatedTo,
+		FenceID:              d.FenceID,
+		FenceSource:          d.FenceSource,
+		FenceArmedAtUnix:     d.FenceArmedAtUnix,
+		FenceArmedBy:         d.FenceArmedBy,
+		Fenced:               fenced,
+		Disks:                reportDisks(d.Disks),
+		RestoredFrom:         d.RestoredFrom,
+		RestoredAtUnix:       d.RestoredAtUnix,
+		RestoredBy:           d.RestoredBy,
+		RestorePoints:        reportRestorePoints(d.RestorePoints),
+		Status:               a.Status.String(),
+		Reasons:              a.Reasons,
+		AgeSeconds:           a.AgeSeconds,
+	}
 }
 
 // reportDisks and reportFilesystems convert pkg/inventory's types to the

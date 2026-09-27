@@ -264,7 +264,31 @@ func scheduleEntryFor(schedule []ScheduleEntry, vm string) (ScheduleEntry, bool)
 //
 // The schedule is here only for reinit, which is the one kind that is a SYNC
 // and therefore needs a whole transport configuration rather than a domain name.
+//
+// Every kind carries -action-id, set to the OPERATION's id. That is the id
+// the control plane's operations.json is keyed by and the one this agent
+// writes into its own run log as operation_id, so the journal record the
+// engine leaves beside the disks joins back to both without anything having
+// to correlate timestamps across two hosts' clocks. It matters most for the
+// kinds that write a replica_incomplete marker -- reinit and force-clean --
+// because that marker carries the same id, so a promotion refused months
+// later on a host whose peer is gone still names the action that armed it.
 func operationArgs(cfg agentConfig, schedule []ScheduleEntry, op Operation) ([]string, error) {
+	// Resolved once, here, rather than per branch: a kind added later that
+	// forgot it would produce a journal record nobody can trace, and the
+	// omission would be invisible -- vmsync mints its own id and the run
+	// looks entirely normal.
+	//
+	// Empty when the id will not survive the metadata grammar it ends up in;
+	// see sanitizedActionID for why that is a refusal rather than an escape.
+	actionID := sanitizedActionID(op.ID, "")
+	withActionID := func(args []string) []string {
+		if actionID == "" {
+			return args
+		}
+		return append(args, "-action-id", actionID)
+	}
+
 	switch op.Kind {
 	case OpPromote:
 		args := []string{"-promote", "-target-uri", cfg.LibvirtURI, "-target-domain", op.VM}
@@ -287,14 +311,14 @@ func operationArgs(cfg agentConfig, schedule []ScheduleEntry, op Operation) ([]s
 		if op.CreatedBy != "" {
 			args = append(args, "-promoted-by", op.CreatedBy)
 		}
-		return args, nil
+		return withActionID(args), nil
 
 	case OpShutdown:
 		args := []string{"-shutdown-domain", "-target-uri", cfg.LibvirtURI, "-target-domain", op.VM}
 		if op.ShutdownTimeoutSec > 0 {
 			args = append(args, "-shutdown-timeout-sec", strconv.Itoa(op.ShutdownTimeoutSec))
 		}
-		return args, nil
+		return withActionID(args), nil
 
 	case OpInvert:
 		if op.PeerHost == "" {
@@ -304,17 +328,17 @@ func operationArgs(cfg agentConfig, schedule []ScheduleEntry, op Operation) ([]s
 		if peerVM == "" {
 			peerVM = op.VM
 		}
-		return []string{
+		return withActionID([]string{
 			"-invert",
 			"-source-uri", cfg.LibvirtURI, "-source-domain", op.VM,
 			"-target-uri", fmt.Sprintf(cfg.TargetURIPattern, op.PeerHost), "-target-domain", peerVM,
-		}, nil
+		}), nil
 
 	case OpSetRole:
 		if op.Mode == "" {
 			return nil, fmt.Errorf("set-role needs a role, and operation %s names none", op.ID)
 		}
-		return []string{"-update-role", op.Mode, "-target-uri", cfg.LibvirtURI, "-target-domain", op.VM}, nil
+		return withActionID([]string{"-update-role", op.Mode, "-target-uri", cfg.LibvirtURI, "-target-domain", op.VM}), nil
 
 	case OpRestore:
 		// The local URI, like promote and shutdown-domain: a restore acts on
@@ -344,7 +368,7 @@ func operationArgs(cfg agentConfig, schedule []ScheduleEntry, op Operation) ([]s
 			// on the machine most likely to be unreachable when somebody asks.
 			args = append(args, "-restored-by", op.CreatedBy)
 		}
-		return args, nil
+		return withActionID(args), nil
 
 	case OpReinit, OpForceClean:
 		// One-shot full resyncs, as their own operations rather than flags on
@@ -358,10 +382,6 @@ func operationArgs(cfg agentConfig, schedule []ScheduleEntry, op Operation) ([]s
 		// lives in the schedule, not on the operation. Built from the same
 		// SyncRequest a scheduled run uses, so they differ from an ordinary
 		// sync by exactly one flag and cannot drift from it.
-		flag := "-reinit"
-		if op.Kind == OpForceClean {
-			flag = "-force-clean"
-		}
 		entry, ok := scheduleEntryFor(schedule, op.VM)
 		if !ok {
 			return nil, fmt.Errorf("%s operation %s names %s, which this agent has no schedule entry for -- it is a full resync and needs that pair's source, target and transport settings, which live on the schedule. Note it runs on the SOURCE's agent, unlike promote and restore which run on the target's", op.Kind, op.ID, op.VM)
@@ -370,9 +390,38 @@ func operationArgs(cfg agentConfig, schedule []ScheduleEntry, op Operation) ([]s
 		if err != nil {
 			return nil, fmt.Errorf("%s operation %s: %w", op.Kind, op.ID, err)
 		}
-		return append(plan.CommandArgs(), flag), nil
+		return reinitArgs(plan, actionID, op.Kind == OpForceClean), nil
 	}
 	return nil, fmt.Errorf("operation %s has kind %q, which this agent does not understand", op.ID, op.Kind)
+}
+
+// reinitArgs finishes a reinit or force-clean once its plan has been built:
+// it stamps the operation's correlation id and adds the one flag that
+// separates these two from the ordinary sync they are otherwise identical to.
+//
+// This is the branch the marker comes from -- a reinit or force-clean is
+// precisely the run that renames the good disks aside and writes new base
+// images -- so the id stamped here is the one that ends up in
+// replica_incomplete's action= field, and the one a promotion refused months
+// later is followed back along to the control plane's operations.json. It is
+// split out of the branch above because it is the whole libvirt-free half of
+// it: buildSyncRequest needs a live libvirt holding the domain, so inline this
+// assignment could only ever be reached on a real hypervisor, which is the
+// same as saying nothing could check that it happens at all.
+//
+// Set on the plan rather than appended to the finished argv, so CommandArgs
+// emits -action-id exactly once. buildSyncRequest mints no run id, so
+// CommandArgs' own fallback finds nothing to use here -- and a later change
+// that did set one must not produce a second -action-id whose value silently
+// wins over this operation's. The plan is taken by value for the neighbouring
+// reason: a caller's copy must not come back wearing one operation's id.
+func reinitArgs(plan syncPlan, actionID string, forceClean bool) []string {
+	flag := "-reinit"
+	if forceClean {
+		flag = "-force-clean"
+	}
+	plan.ActionID = actionID
+	return append(plan.CommandArgs(), flag)
 }
 
 // localPeersFor reads the replication peers a domain records about ITSELF.

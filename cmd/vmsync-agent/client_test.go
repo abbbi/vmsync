@@ -303,6 +303,73 @@ func TestSendReportCarriesVerifyStateUnderTheAgreedNames(t *testing.T) {
 	}
 }
 
+// The agent's half of the wire contract for an interrupted full rebuild.
+//
+// Pinned exactly like verify_state above, and for a sharper version of the
+// same reason. The UI decodes with DisallowUnknownFields, so a name that
+// drifts rejects the whole report; and this particular field is the only
+// thing in a report that contradicts the rest of it. Every other value on
+// such a domain -- a recent last_sync_unix, a last_checkpoint, failure_count
+// zero -- describes the sync BEFORE the rebuild that was interrupted, so a
+// report that loses this key does not degrade a badge, it shows a
+// half-written image as a healthy replica on the screen somebody chooses a
+// failover target from.
+func TestSendReportCarriesReplicaIncompleteUnderTheAgreedName(t *testing.T) {
+	const marker = "verb=reinit,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=1758441600"
+
+	var raw map[string]any
+	c, _ := stubUI(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&raw)
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	report := Report{
+		ReportedAtUnix: 1_800_000_000,
+		Hostname:       "hyper02p",
+		Domains: []ReportDomain{
+			{
+				// Everything here says healthy except the marker, which is
+				// exactly the state an interrupted rebuild leaves behind.
+				Name: "web01", Active: false, Role: "target", Status: "critical",
+				ReplicaSource:     "hyper01p:web01",
+				LastCheckpoint:    "vmsync-cpt-000042",
+				LastSyncUnix:      1_799_999_700,
+				ReplicaIncomplete: marker,
+			},
+			{
+				Name: "db01", Active: false, Role: "target", Status: "ok",
+				ReplicaSource: "hyper01p:db01",
+			},
+		},
+	}
+	if err := c.SendReport(context.Background(), report); err != nil {
+		t.Fatalf("SendReport() error = %v", err)
+	}
+
+	domains, _ := raw["domains"].([]any)
+	if len(domains) != 2 {
+		t.Fatalf("the UI received %d domains, want 2", len(domains))
+	}
+
+	first, _ := domains[0].(map[string]any)
+	// Byte for byte: pkg/failover parses this value to decide whether to
+	// refuse a promotion, and the console shows the action id and the
+	// .vmsync-replaced stamp out of it. A value normalised in transit is a
+	// value that reads differently on the two sides.
+	if got := first["replica_incomplete"]; got != marker {
+		t.Errorf("replica_incomplete = %v, want %q -- vmsync_ui's store.ReportDomain pins the same key", got, marker)
+	}
+
+	// A replica whose rebuilds all finished must send no key at all.
+	// Absence is what the UI reads as "no interrupted rebuild", and an empty
+	// string arriving for every healthy domain in the estate would be
+	// indexed and rendered as though it meant something.
+	second, _ := domains[1].(map[string]any)
+	if _, present := second["replica_incomplete"]; present {
+		t.Error("a replica with no interrupted rebuild must omit replica_incomplete entirely")
+	}
+}
+
 func TestRevokedCredentialIsDistinguishedFromEveryOtherFailure(t *testing.T) {
 	// Worth its own error: every other failure is worth retrying, this one
 	// never succeeds until an operator issues a fresh enrolment token. An
