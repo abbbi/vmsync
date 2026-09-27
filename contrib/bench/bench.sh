@@ -72,6 +72,7 @@ Options:
                                             15  commit-barrier
                                             16  interrupted-reinit
                                             17  journal
+                                            18  colocated
                            Runs in whichever order LIST gives them, not a
                            fixed canonical one.
                            (default: matrix,verify,reinit,snapshot,journal,
@@ -80,10 +81,12 @@ Options:
                            where the target filesystem cannot reflink. define,
                            failover, fence-agent, verify-long, restore,
                            invert, wedge, checksum, verify-failure,
-                           commit-barrier and interrupted-reinit are opt-in,
-                           see below. commit-barrier additionally needs a
-                           source domain with two or more qcow2 disks, and
-                           skips cleanly without one)
+                           commit-barrier, interrupted-reinit and colocated
+                           are opt-in, see below. commit-barrier additionally
+                           needs a source domain with two or more qcow2 disks,
+                           and skips cleanly without one. colocated needs
+                           TARGET_DISK_PATH set and a target filesystem that
+                           can reflink, and skips cleanly without either)
   --dry-run               print every vmsync command line; touch nothing
                            (no ssh/qemu-io/vmsync calls actually made)
   -h, --help              this text
@@ -276,6 +279,19 @@ action that DIED, where the intent is written and the outcome never is, and a
 journal that had quietly stopped being written would look exactly like an
 estate where nothing ever crashed. Every other stage here would keep reporting
 PASS either way. It reads past the existing file rather than truncating it.
+
+Stage 18 (colocated) is opt-in, and needs TARGET_DISK_PATH set. It proves that
+two target domains sharing one replica directory keep independent restore point
+histories. Restore points used to be keyed by that DIRECTORY rather than by the
+domain, so every policy decision was taken over the union of both machines'
+points: one domain's copy satisfied the other's interval floor (a replica could
+go for days taking none), a retention count meant for one machine was spread
+across several, the sweep of abandoned staging directories removed a
+concurrently running sibling's in-flight set, and a -reinit of one replica
+rm -rf'd every co-located replica's entire history in a single command. The
+co-located domain is planted rather than replicated -- a second live pair would
+race the first, and what has to be proved is only that this domain's sync never
+touches directories that are not its own.
 EOF
 }
 
@@ -3429,7 +3445,7 @@ stage_fence_agent() {
 # run passing --stages matrix,commit-barrier or matrix,interrupted-reinit
 # would report Stage 1 as FAILED on the strength of a deliberate kill in
 # another stage. commit-barrier was missing when this line was last touched.
-NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$)'
+NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$|colocated$)'
 
 # stage_pattern STAGE -> the regex matching that stage's scenario column.
 # --- Stage 8: verify after a long incremental chain --------------------------
@@ -3682,11 +3698,20 @@ stage_retention() {
 	reset_pair_state "$sc" || return 0
 	require_target_syncable "$sc" || return 0
 
-	local rp_dir="${TARGET_DISK_PATH%/}/.vmsync-rp"
+	# This TARGET DOMAIN's own store, not the shared directory above it.
+	# Restore points are kept per target domain, and the directory this sits in
+	# is shared with every other domain replicating into TARGET_DISK_PATH.
+	local rp_dir
+	rp_dir="$(rp_store_dir)"
 
 	# Start from nothing, so every count below is this stage's own doing and
 	# not a leftover from an earlier run.
-	ssh_host_cmd "$TARGET_HOST" "rm -rf '$rp_dir'" >/dev/null 2>&1 || true
+	#
+	# One store, never the shared root. Clearing the root would delete every
+	# co-located replica's entire history -- which is the defect the per-domain
+	# layout fixed, and a harness that did it would be reintroducing it on
+	# whatever target it was pointed at.
+	rp_clear_store
 
 	# --- does the target support this at all? --------------------------------
 	# An interval of 0 means "every sync", which is what a test wants: the
@@ -3908,6 +3933,50 @@ rp_list() {
 	ssh_host_cmd "$TARGET_HOST" "ls -1 '$1' 2>/dev/null | grep '^[0-9][0-9]*-' | sort -n || true" | tr '\n' ' '
 }
 
+# rp_root -> the SHARED restore point directory, which holds one subdirectory
+# per target domain plus anything left flat in it by a pre-change vmsync.
+#
+# Nothing in this harness may rm -rf this path. It is shared by every target
+# domain replicating into TARGET_DISK_PATH, and deleting it to get a clean slate
+# is the same mistake the engine used to make -- it would destroy a co-located
+# replica's entire recovery history. Use rp_store_dir and clear one store.
+rp_root() {
+	printf '%s/.vmsync-rp' "${TARGET_DISK_PATH%/}"
+}
+
+# rp_store_dir [DOMAIN] -> one target domain's own restore point directory.
+#
+# Defaults to TARGET_DOMAIN. The segment is "vm-" plus the same reversible
+# encoding the journal path uses (journal_safe_key, which is util.SafeKey):
+# there is deliberately no second encoder here, because a shell copy that
+# disagreed with the Go one would make every count in this stage read the wrong
+# directory and then report a retention bug that does not exist. Stage 18
+# asserts the agreement end to end, against the directory vmsync creates.
+rp_store_dir() {
+	printf '%s/vm-%s' "$(rp_root)" "$(journal_safe_key "${1:-$TARGET_DOMAIN}")"
+}
+
+# rp_plant_point DIR TAG SOURCE -- create a restore point directory by hand,
+# with a sidecar naming SOURCE, as a sync would have left it.
+#
+# Used to stand up a CO-LOCATED domain's history without running a second
+# replication pair. What the per-domain layout has to guarantee is that this
+# domain's sync does not read, prune or delete those directories -- and a
+# planted set proves that as well as a real one while being deterministic,
+# which a second pair racing the first would not be.
+rp_plant_point() {
+	local dir="$1" tag="$2" source="$3" at="${2%%-*}"
+	ssh_host_cmd "$TARGET_HOST" "mkdir -p '$dir/$tag' && printf '%s' '{\"checkpoint\":\"vmsync-cpt-000001\",\"checkpoint_at\":$at,\"taken_at\":$at,\"source\":\"$source\",\"verify\":\"not-run\",\"disks\":[\"planted.qcow2\"]}' > '$dir/$tag/status.json'" >/dev/null
+}
+
+# rp_clear_store [DOMAIN] -- remove ONE domain's restore points, leaving every
+# other domain's and anything flat in the shared root untouched.
+rp_clear_store() {
+	local dir
+	dir="$(rp_store_dir "${1:-$TARGET_DOMAIN}")"
+	ssh_host_cmd "$TARGET_HOST" "rm -rf '$dir'" >/dev/null 2>&1 || true
+}
+
 # fs_free_bytes HOST PATH -> free bytes on the filesystem holding PATH.
 #
 # df, never du. A reflink copy shares extents and du counts a shared extent
@@ -3959,8 +4028,11 @@ stage_restore() {
 	reset_pair_state "$sc" || return 0
 	require_target_syncable "$sc" || return 0
 
-	local rp_dir="${TARGET_DISK_PATH%/}/.vmsync-rp"
-	ssh_host_cmd "$TARGET_HOST" "rm -rf '$rp_dir'" >/dev/null 2>&1 || true
+	# This target domain's own store. Cleared alone, never the shared directory
+	# above it: that one holds every co-located replica's history too.
+	local rp_dir
+	rp_dir="$(rp_store_dir)"
+	rp_clear_store
 
 	# --- two restore points, with different contents between them ------------
 	bench_sync "$sc" baseline -reinit "-retention=3,0"
@@ -6908,6 +6980,179 @@ stage_journal() {
 	return 0
 }
 
+# Stage 18: two target domains in one directory.
+#
+# Restore points used to be keyed by the DIRECTORY the replica's disks live in,
+# so every domain replicating into one -target-disk-path shared a single store
+# and every policy decision was taken over the union of their points. Four
+# distinct failures followed, and this stage proves each is closed:
+#
+#   1. STARVATION. The interval floor was measured against the newest point in
+#      the whole directory, so one domain's point satisfied another's floor.
+#      With a staggered cron the same domain lost every time, and a probe
+#      measured one replica taking zero restore points in seventy-two hours.
+#   2. CROSS-EVICTION. The retention count was applied to the union, so a count
+#      meant for one machine was spread across several and a busy domain's
+#      churn evicted a quiet one's history.
+#   3. STAGING THEFT. The sweep of abandoned ".incomplete-" directories ran
+#      over the shared directory, so it removed a concurrently running
+#      sibling's in-flight set -- failing a sync whose data had already landed,
+#      and counting that failure toward -reinit-after-failures.
+#   4. CROSS-SWEEP. A -reinit rm -rf'd the whole shared directory, destroying
+#      every co-located domain's entire history in one command.
+#
+# The co-located domain is PLANTED rather than replicated. A second real pair
+# would race the first, so a failure could be a race rather than the defect --
+# and what has to be proved is only that this domain's sync never reads, prunes
+# or deletes directories that are not its own, which a planted set establishes
+# deterministically. It also plants the one thing a real second pair could not
+# conveniently produce: an in-flight staging directory, which is what sub-test 3
+# needs and which a live run would only have for the seconds it was copying.
+stage_colocated() {
+	log "=== Stage 18: two target domains in one directory ==="
+	local sc=colocated
+	local fo_ok=0
+
+	if [ "$DRY_RUN" = yes ]; then
+		bench_sync "$sc" baseline -reinit "-retention=2,0"
+		fo_check "$sc" "the sync keeps this domain's restore points in its own subdirectory" 0
+		fo_check "$sc" "a co-located domain's point does not satisfy this domain's interval floor" 0
+		fo_check "$sc" "pruning leaves a co-located domain's restore points alone" 0
+		fo_check "$sc" "pruning still enforces the count on this domain's own points" 0
+		fo_check "$sc" "the staging sweep leaves a co-located domain's in-flight set alone" 0
+		fo_check "$sc" "the staging sweep leaves the shared directory alone" 0
+		fo_check "$sc" "-reinit removes only this domain's restore points" 0
+		return 0
+	fi
+
+	if [ -z "${TARGET_DISK_PATH:-}" ]; then
+		warn "SKIP stage 18: TARGET_DISK_PATH is not set, so there is no shared directory to put two domains' stores in. Set it in $CONF."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP TARGET_DISK_PATH unset"
+		return 0
+	fi
+	stage_needs_target_shutoff "$CSV" "$sc" "stage colocated" || return 0
+	reset_pair_state "$sc" || return 0
+	require_target_syncable "$sc" || return 0
+
+	local root mine theirs
+	root="$(rp_root)"
+	mine="$(rp_store_dir)"
+	# A name no real domain on a bench target will have, so nothing else in
+	# this run can be confused with it -- and a legal domain name, so the
+	# encoding is exercised rather than sidestepped.
+	theirs="$(rp_store_dir bench-colocated-peer)"
+
+	rp_clear_store
+	ssh_host_cmd "$TARGET_HOST" "rm -rf '$theirs'" >/dev/null 2>&1 || true
+
+	# Does the target support restore points at all? Same gate the retention
+	# stage uses, and for the same reason: without reflink every copy here
+	# would be a full one.
+	bench_sync "$sc" baseline -reinit "-retention=3,0"
+	if [ "$RUN_RC" != 0 ]; then
+		if grep -q "does not support reflink copies" "$RUN_LOG" 2>/dev/null; then
+			warn "SKIP stage colocated: $TARGET_DISK_PATH on $TARGET_HOST does not support reflink copies (needs XFS with reflink=1, or btrfs)"
+			results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP target filesystem has no reflink support"
+			return 0
+		fi
+		warn "FAIL: the baseline sync this stage is built on did not succeed (see $RUN_LOG)$(bench_sync_hint)"
+		results_row "$CSV" "$sc" sync-result 1 "" "" "" "" "" "FAIL the baseline sync failed"
+		return 1
+	fi
+
+	# The layout itself, asserted end to end: vmsync must have created exactly
+	# the directory this harness computes. That is what pins the shell copy of
+	# the domain-name encoding against the engine's, without a second table of
+	# cases to keep in step.
+	if ssh_host_cmd "$TARGET_HOST" "test -d '$mine'" >/dev/null 2>&1; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the sync keeps this domain's restore points in its own subdirectory" "$fo_ok" \
+		"expected $mine on $TARGET_HOST after a sync with -retention, and it is not there. Either restore points are not being kept per target domain, or this harness and vmsync disagree about how a domain name becomes a directory name -- in which case every count in this stage is reading the wrong directory"
+	if [ "$fo_ok" != 0 ]; then
+		return 1
+	fi
+
+	# --- 1. starvation -------------------------------------------------------
+	#
+	# THE conditions that make this red against a pre-change binary, and they
+	# have to be exactly these:
+	#
+	#   * this domain's own store is EMPTY, so its own floor cannot have been
+	#     satisfied by anything of its own;
+	#   * the co-located domain has a point dated NOW;
+	#   * the interval is NON-ZERO.
+	#
+	# A floor measured over the shared directory then finds that fresh foreign
+	# point, answers "not due", and takes nothing -- count stays 0. A floor
+	# measured over this domain's store finds nothing, answers "due", and takes
+	# one -- count becomes 1. An interval of 0 would make every sync due under
+	# either rule and the sub-test could not tell them apart, which is what the
+	# first version of it got wrong.
+	rp_clear_store
+	local now_ts
+	now_ts="$(ssh_host_cmd "$TARGET_HOST" "date +%s" | tr -d '[:space:]')"
+	case "$now_ts" in '' | *[!0-9]*) now_ts=2000000000 ;; esac
+	rp_plant_point "$theirs" "${now_ts}-vmsync-cpt-000099" "bench01:bench-colocated-peer"
+
+	local before after
+	before="$(rp_count "$mine")"
+	bench_sync "$sc" not-starved "-retention=3,6h"
+	after="$(rp_count "$mine")"
+	if [ "${before:-1}" = 0 ] && [ "${after:-0}" = 1 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "a co-located domain's point does not satisfy this domain's interval floor" "$fo_ok" \
+		"$mine went from ${before:-0} to ${after:-0} restore points; it must go from 0 to 1. Its own store was emptied first and $theirs holds a point dated now, so a run that took none measured its six-hour floor against the OTHER domain's history. That is how one replica goes for days taking no restore points while a busier co-located one keeps resetting the clock -- with every sync still reporting success"
+
+	# --- 2. cross-eviction ---------------------------------------------------
+	#
+	# The foreign store gets three points; this domain's retention keeps one. A
+	# prune over the shared directory would see four and delete three.
+	rp_plant_point "$theirs" "1700000001-vmsync-cpt-000001" "bench01:bench-colocated-peer"
+	rp_plant_point "$theirs" "1700000002-vmsync-cpt-000002" "bench01:bench-colocated-peer"
+	rp_plant_point "$theirs" "1700000003-vmsync-cpt-000003" "bench01:bench-colocated-peer"
+	local theirs_before theirs_after mine_after
+	theirs_before="$(rp_count "$theirs")"
+	bench_sync "$sc" no-cross-prune "-retention=1,0"
+	theirs_after="$(rp_count "$theirs")"
+	if [ "$theirs_before" = "$theirs_after" ] && [ "${theirs_after:-0}" -gt 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "pruning leaves a co-located domain's restore points alone" "$fo_ok" \
+		"$theirs held ${theirs_before:-0} restore points before a sync of $TARGET_DOMAIN with -retention=1,0 and ${theirs_after:-0} after. A retention count applied to the union of several domains' points means one machine's churn silently deletes another's recovery history"
+
+	# This domain's own prune must still work, or the assertion above would
+	# pass on a build that had simply stopped pruning.
+	mine_after="$(rp_count "$mine")"
+	if [ "$mine_after" = 1 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "pruning still enforces the count on this domain's own points" "$fo_ok" \
+		"expected exactly 1 restore point in $mine under -retention=1,0, found ${mine_after:-0}. Without this the check above would pass on a build that had stopped pruning altogether"
+
+	# --- 3. staging theft ----------------------------------------------------
+	#
+	# An in-flight set in the foreign store, and one left flat in the shared
+	# root by a pre-change run. Neither is this domain's to sweep.
+	local peer_staging root_staging
+	peer_staging="$theirs/.incomplete-1700000009-vmsync-cpt-000009"
+	root_staging="$root/.incomplete-1700000008-vmsync-cpt-000008"
+	ssh_host_cmd "$TARGET_HOST" "mkdir -p '$peer_staging' '$root_staging'" >/dev/null
+	bench_sync "$sc" no-staging-theft "-retention=2,0"
+	if ssh_host_cmd "$TARGET_HOST" "test -d '$peer_staging'" >/dev/null 2>&1; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the staging sweep leaves a co-located domain's in-flight set alone" "$fo_ok" \
+		"the staging directory planted in $theirs is gone after a sync of $TARGET_DOMAIN. On a real target that set belongs to a run still copying into it: its own rename then fails, so a sync whose data had already landed is reported as a failure -- and that failure counts toward -reinit-after-failures"
+	if ssh_host_cmd "$TARGET_HOST" "test -d '$root_staging'" >/dev/null 2>&1; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the staging sweep leaves the shared directory alone" "$fo_ok" \
+		"the staging directory planted directly in $root is gone. Nothing may sweep the shared directory: whose interrupted run left an entry there cannot be determined from its name, which is the whole reason restore points are now kept per domain"
+
+	# --- 4. cross-sweep (last: it discards this domain's store) --------------
+	local reinit_before reinit_after
+	reinit_before="$(rp_count "$theirs")"
+	bench_sync "$sc" reinit-scope -reinit -replaced-disk-action=delete "-retention=2,0"
+	reinit_after="$(rp_count "$theirs")"
+	fo_ok=0
+	[ "$reinit_after" = "$reinit_before" ] || fo_ok=1
+	fo_check "$sc" "-reinit removes only this domain's restore points" "$fo_ok" \
+		"a -reinit of $TARGET_DOMAIN with -replaced-disk-action=delete removed restore points that are not its own: $theirs went from ${reinit_before:-0} to ${reinit_after:-0}. This used to be an rm -rf of $root, which destroyed every co-located replica's entire history in one command while logging that it had removed the replaced replica's"
+
+	ssh_host_cmd "$TARGET_HOST" "rm -rf '$theirs' '$root_staging'" >/dev/null 2>&1 || true
+	return 0
+}
+
 stage_pattern() {
 	case "$1" in
 	# Anchored to the named sub-tests rather than a bare ^verify- , so a
@@ -6936,6 +7181,10 @@ stage_pattern() {
 	# fold into each other on a run doing both.
 	interrupted-reinit) printf '^interrupted-reinit$' ;;
 	journal) printf '^journal$' ;;
+	# "precondition" is in the list because this stage stands down on a target
+	# whose filesystem has no reflink support, and that row has to belong to
+	# stage 18's verdict rather than to whichever stage ran before it.
+	colocated) printf '^(colocated|precondition)$' ;;
 	*) printf '$^' ;; # matches nothing
 	esac
 }
@@ -7184,6 +7433,16 @@ generate_report() {
                         echo "_not run (it is a default stage, so this means --stages named something else)_"
                 fi
                 echo
+                echo "## Stage 18: two target domains in one directory"
+                echo
+                if awk -F, 'NR>1 && $1=="colocated" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| check | exit | wall (s) | result |"
+                        echo "|---|---|---|---|"
+                        awk -F, 'NR>1 && $1=="colocated" { printf "| %s | %s | %s | %s |\n", $2, $3, $4, $9 }' "$CSV"
+                else
+                        echo "_not run (opt in with \`--stages colocated\`; it plants a second target domain's restore points beside this one's and checks that no sync, prune, staging sweep or reinit of this domain touches them, and needs TARGET_DISK_PATH set)_"
+                fi
+                echo
                 echo "## Stage 8: verify after a long incremental chain"
                 echo
                 if awk -F, 'NR>1 && $1=="verify-long" { found=1 } END { exit !found }' "$CSV"; then
@@ -7321,7 +7580,8 @@ for s in "${stage_list[@]}"; do
         commit-barrier) stage_commit_barrier || stage_rc=$? ;;
         interrupted-reinit) stage_interrupted_reinit || stage_rc=$? ;;
         journal) stage_journal || stage_rc=$? ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure,commit-barrier,interrupted-reinit,journal)" ;;
+        colocated) stage_colocated || stage_rc=$? ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure,commit-barrier,interrupted-reinit,journal,colocated)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
                 warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."

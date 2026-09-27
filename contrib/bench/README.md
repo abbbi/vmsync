@@ -103,6 +103,7 @@ vmsync itself to work at all).
 ./bench.sh --stages invert       # 11 opt-in: reversing a pair; STOPS THE SOURCE VM
 ./bench.sh --stages interrupted-reinit   # 16 opt-in: kill a rebuild mid-copy, then try to promote it
 ./bench.sh --stages journal      # 17 the action journal beside the replica's disks
+./bench.sh --stages colocated    # 18 opt-in: two target domains sharing one replica directory
 ```
 
 Stages 2, 3, 4, 9, 10 and 11 each run their own baseline `-reinit` full
@@ -1169,6 +1170,36 @@ disks are in — and skips, saying so, when it cannot.
 
 The interrupted half of the journal's story is Stage 16's, where
 `-test=die-writing-base` provides the death this stage cannot stage.
+
+### Stage 18 (`colocated`), opt-in
+
+Proves that two target domains sharing one replica directory keep independent
+restore point histories. Needs `TARGET_DISK_PATH` set and a reflink-capable
+target filesystem; skips cleanly, saying which, without either.
+
+Restore points used to be keyed by the **directory** the replica's disks live in
+rather than by the domain, so every domain replicating into one
+`-target-disk-path` shared a single store and every policy decision was taken
+over the union of both machines' points. Four separate failures followed, and
+each is a sub-test here:
+
+| sub-test | what it would catch |
+| --- | --- |
+| the sync keeps this domain's restore points in its own subdirectory | the layout itself, asserted against the directory vmsync actually creates — which is also what pins this harness's copy of the domain-name encoding against the engine's, so the counts below are known to be reading the right directory |
+| a co-located domain's point does not satisfy this domain's interval floor | **starvation.** The floor was measured against the newest point in the shared directory, so with a staggered cron the same replica lost every time; a probe measured one taking zero restore points in 72 hours, while every sync reported success |
+| pruning leaves a co-located domain's restore points alone | **cross-eviction.** A retention count meant for one machine was applied to the union, so a busy domain's churn silently deleted a quiet one's history |
+| pruning still enforces the count on this domain's own points | that the check above has not passed merely because pruning stopped working altogether |
+| the staging sweep leaves a co-located domain's in-flight set alone | **staging theft.** The sweep of abandoned `.incomplete-` directories ran over the shared directory, removing a running sibling's in-flight set — so its rename failed and a sync whose data had already landed was reported as a failure, counting toward `-reinit-after-failures` |
+| the staging sweep leaves the shared directory alone | the same, one level up: whose interrupted run left an entry directly in `.vmsync-rp/` cannot be told from its name |
+| `-reinit` removes only this domain's restore points | **cross-sweep.** This used to be an `rm -rf` of the whole shared directory, destroying every co-located replica's entire history in one command — while logging that it had removed "the restore points belonging to the replaced replica" |
+
+The co-located domain is **planted**, not replicated: a second live pair would
+race the first, so a failure could be a race rather than the defect, and what has
+to be proved is only that this domain's sync never reads, prunes or deletes
+directories that are not its own. Planting also produces the one thing a second
+pair could not conveniently arrange: an in-flight staging directory, which a live
+run only has for the seconds it is copying. Everything it plants is removed when
+the stage ends.
 
 ## Files
 
