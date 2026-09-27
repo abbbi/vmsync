@@ -514,6 +514,23 @@ preflight() {
         log "preflight OK"
 }
 
+# bridge_helper_path -> the ONE vmsync-bridge-helper path this whole harness
+# uses: the one it checks in the preflight, the one the checksum shims wrap, and
+# the one it passes to every vmsync it launches as -bridge-helper-path.
+#
+# It is resolved in one place and passed EXPLICITLY rather than left to each
+# side's default, because the two defaults did not agree: vmsync's flag defaults
+# to /usr/local/bin/vmsync-bridge-helper (cmd/vmsync/main.go) and this harness
+# used to fall back to /usr/bin/vmsync-bridge-helper. With BRIDGE_HELPER_PATH
+# unset, the preflight therefore version-checked a binary vmsync would never
+# open, and reported "integrity check available" for a helper that was not the
+# one in use -- the same shape of false green as testing a stale vmsync, and just
+# as invisible. Passing it everywhere means the binary this harness verified is
+# provably the binary the runs used.
+bridge_helper_path() {
+	printf '%s\n' "${BRIDGE_HELPER_PATH:-/usr/bin/vmsync-bridge-helper}"
+}
+
 # preflight_bridge_helper reports what vmsync-bridge-helper is on the target
 # and whether its version matches the vmsync under test.
 #
@@ -530,7 +547,7 @@ preflight() {
 # would notice.
 preflight_bridge_helper() {
 	local helper vmsync_version helper_version
-	helper="${BRIDGE_HELPER_PATH:-/usr/bin/vmsync-bridge-helper}"
+	helper="$(bridge_helper_path)"
 
 	if ! ssh_host_cmd "$TARGET_HOST" "test -x '$helper'" >/dev/null 2>&1; then
 		warn "vmsync-bridge-helper is not present (or not executable) at $helper on $TARGET_HOST. -compress/-netbuffer cannot run, and the pre-commit integrity check will be SKIPPED on every sync -- it is on by default but needs that binary. Deploy it, set BRIDGE_HELPER_PATH in $CONF, or set BENCH_SYNC_ARGS=\"\" to stop asking for compression."
@@ -571,7 +588,10 @@ vmsync_common_args() {
         [ -n "${SSH_KEY:-}" ] && VMSYNC_ARGS+=(-ssh-key "$SSH_KEY")
         [ -n "${SSH_PORT:-}" ] && VMSYNC_ARGS+=(-ssh-port "$SSH_PORT")
         [ -n "${SSH_KNOWN_HOSTS:-}" ] && VMSYNC_ARGS+=(-ssh-known-hosts "$SSH_KNOWN_HOSTS")
-        [ -n "${BRIDGE_HELPER_PATH:-}" ] && VMSYNC_ARGS+=(-bridge-helper-path "$BRIDGE_HELPER_PATH")
+        # Always, not only when BRIDGE_HELPER_PATH is set: unset, the two sides
+        # default to different paths, so the preflight would check one helper and
+        # the run would use another. See bridge_helper_path.
+        VMSYNC_ARGS+=(-bridge-helper-path "$(bridge_helper_path)")
         [ -n "${REPLACED_DISK_ACTION:-}" ] && VMSYNC_ARGS+=(-replaced-disk-action "$REPLACED_DISK_ACTION")
         return 0
 }
@@ -2429,6 +2449,15 @@ vmsync_on_host() {
 	local log_file="$RUN_DIR/logs/${scenario}.${phase}.log"
 	RUN_LOG="$log_file"
 
+	# The helper path goes to these runs too, for the same reason it goes to
+	# every other one: the harness must not leave it to vmsync's own default,
+	# which is a different path from the one the preflight checked. None of the
+	# modes reached through here moves data today -- -promote, -update-role and
+	# the fence reads need no bridge -- so this changes nothing about what they
+	# do; it means the next mode that does use the helper cannot silently pick
+	# up a different binary than the one this harness verified.
+	set -- -bridge-helper-path "$(bridge_helper_path)" "$@"
+
 	log "-> $scenario/$phase (on $host)"
 	log "   $bin $*"
 	if [ "$DRY_RUN" = yes ]; then
@@ -3179,10 +3208,12 @@ stage_fence_agent() {
 	local local_uri="qemu:///system"
 	local agent_dir="${AGENT_WORK_DIR:-/var/tmp/vmsync-bench-agent}"
 	local src_pid="" tgt_pid=""
-	# Where each agent finds vmsync on its OWN host. SOURCE_VMSYNC_BIN falls
-	# back to VMSYNC_BIN, which is correct in the common SOURCE_LOCAL=yes
-	# setup where this harness runs on the source host itself.
-	local src_vmsync="${SOURCE_VMSYNC_BIN:-$VMSYNC_BIN}"
+	# Where the source's agent finds vmsync on its own host. VMSYNC_BIN, because
+	# this stage already requires SOURCE_LOCAL=yes -- the harness is running on
+	# the source, so its own binary is the source's binary. There used to be a
+	# SOURCE_VMSYNC_BIN override defaulting to this; it was one more path to keep
+	# in step and never a different value in any working configuration.
+	local src_vmsync="$VMSYNC_BIN"
 
 	if [ "$DRY_RUN" = yes ]; then
 		log "   (dry run: stage 7 starts real background agents and stops the source VM, so it does nothing here)"
@@ -4417,10 +4448,10 @@ rp_status_field() {
 # flag rather than the wrapper being installed over anything.
 CHECKSUM_SHIM_DIR="/tmp/vmsync-bench-checksum-shim"
 
-# checksum_real_helper -> the helper path vmsync would use by default, which
-# is what the shims wrap.
+# checksum_real_helper -> the helper the shims wrap, which is the one every
+# vmsync this harness launches is pointed at.
 checksum_real_helper() {
-	printf '%s\n' "${BRIDGE_HELPER_PATH:-/usr/bin/vmsync-bridge-helper}"
+	bridge_helper_path
 }
 
 # checksum_install_shim NAME AWK_PROGRAM -- writes a wrapper at

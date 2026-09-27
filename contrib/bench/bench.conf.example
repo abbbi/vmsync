@@ -312,10 +312,6 @@ DEFINE_ROLLBACK_WAIT_SECONDS=300
 # must skip anything whose role is not source).
 #TARGET_AGENT_BIN=/usr/bin/vmsync-agent
 
-# Path to vmsync on the SOURCE host, for the agent to shell out to. Defaults
-# to VMSYNC_BIN, which is right whenever SOURCE_LOCAL=yes.
-#SOURCE_VMSYNC_BIN=/usr/bin/vmsync
-
 # Scratch directory on each host for the throwaway standalone agent's config,
 # state dir and log. Removed by nothing -- inspect agent.log there when a
 # fence does not fire.
