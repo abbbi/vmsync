@@ -92,10 +92,16 @@ const (
 
 // Root is the journal directory for a set of disks, named by any one of them.
 //
-// Mirrors restorepoint.Root exactly, including taking a DISK path rather than a
-// directory: every caller already has a disk path in hand, and the two
-// functions being the same shape is what stops the journal and the restore
-// points ending up in different places for the same replica.
+// Takes a DISK path rather than a directory, the way restorepoint.StoreFor
+// does: every caller already has a disk path in hand, and deriving both the
+// journal and the restore points from the same value is what stops them ending
+// up in different places for the same replica.
+//
+// Unlike a restore point store this is NOT keyed per domain, and does not need
+// to be: the journal is one append-only file per domain already
+// (<domain>.jsonl), so two domains sharing a directory get two files rather than
+// one shared inventory to take decisions over. That difference is the whole of
+// why restore points had to move and this did not.
 func Root(diskPath string) string {
 	return path.Join(path.Dir(diskPath), DirName)
 }

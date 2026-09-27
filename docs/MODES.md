@@ -92,10 +92,21 @@ line you already tested by hand:
 22 * * * * root /usr/local/bin/vmsync -source-domain db01  -target-uri qemu+ssh://hv02/system -target-domain db01  -target-disk-path /vm_data >>/var/log/vmsync-db01.log 2>&1
 ```
 
+Two VMs into one `-target-disk-path` as above is fine **only while their source
+disks have different basenames**, which they do here (`web01-…` and `db01-…`).
+The replica file is named after the source disk's basename, so two sources whose
+disks are both called `disk0.qcow2` would derive the same replica path and
+overwrite each other — nothing refuses that today. Their restore points are safe
+either way: those are kept per target domain, so neither replica's retention,
+pruning or `-reinit` can touch the other's history. Give each pair its own
+directory if you are not certain about the basenames.
+
 What you take on yourself: staggering the VMs so they do not fight for bandwidth,
 allocating non-overlapping NBD port ranges if you run any of them concurrently, and
 noticing when one stops working. Exit **75** means "another run holds the lock" and is
-not a failure — do not alert on it.
+not a failure — do not alert on it. With `-retention`, also alert on
+`vmsync_restore_point_overdue_seconds > 0`: a cron that quietly stops taking
+restore points is otherwise invisible, because every sync still succeeds.
 
 If you outgrow this, the next step up is `vmsync-parallel.sh`, which is the same idea
 with the bookkeeping done for you. If you want a console, add a `--monitor` agent

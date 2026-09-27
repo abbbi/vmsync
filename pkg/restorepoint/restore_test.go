@@ -5,8 +5,6 @@ import (
 	"testing"
 )
 
-const testReplicaDir = "/data/replicas"
-
 // --- staging ------------------------------------------------------------------
 
 func TestRestoreTempPathIsNotMistakableForAnOverlay(t *testing.T) {
@@ -32,7 +30,7 @@ func TestRestoreTempPathIsNotMistakableForAnOverlay(t *testing.T) {
 func TestRestoreStageCommand(t *testing.T) {
 	tag := testTag(t)
 	temp := RestoreTempPath(testReplicaDir+"/vm.qcow2", 99)
-	cmd, err := RestoreStageCommand(testRoot, tag, "vm.qcow2", temp)
+	cmd, err := RestoreStageCommand(testStore(t).Point(tag), "vm.qcow2", temp)
 	if err != nil {
 		t.Fatalf("RestoreStageCommand: %v", err)
 	}
@@ -42,7 +40,11 @@ func TestRestoreStageCommand(t *testing.T) {
 	if strings.Contains(cmd, "reflink=auto") {
 		t.Errorf("stage must not fall back to a full byte copy: %s", cmd)
 	}
-	if !strings.Contains(cmd, shQuote(Dir(testRoot, tag)+"/vm.qcow2")) {
+	pointDir, err := testStore(t).Point(tag).Dir()
+	if err != nil {
+		t.Fatalf("Point.Dir: %v", err)
+	}
+	if !strings.Contains(cmd, shQuote(pointDir+"/vm.qcow2")) {
 		t.Errorf("stage does not read from the restore point: %s", cmd)
 	}
 	if !strings.Contains(cmd, shQuote(temp)) {
@@ -62,7 +64,7 @@ func TestRestoreStageCommand(t *testing.T) {
 func TestRestoreStageCommandRefusesAPathForADiskName(t *testing.T) {
 	tag := testTag(t)
 	for _, bad := range []string{"", "../../etc/passwd", "sub/dir.qcow2", "/abs.qcow2", ".", "..", "a/"} {
-		if _, err := RestoreStageCommand(testRoot, tag, bad, "/tmp/x"); err == nil {
+		if _, err := RestoreStageCommand(testStore(t).Point(tag), bad, "/tmp/x"); err == nil {
 			t.Errorf("RestoreStageCommand accepted %q as a disk name", bad)
 		}
 	}
@@ -71,7 +73,7 @@ func TestRestoreStageCommandRefusesAPathForADiskName(t *testing.T) {
 func TestRestoreStageCommandQuotesHostilePaths(t *testing.T) {
 	tag := testTag(t)
 	temp := "/data/it's here/vm.qcow2.vmsync-restoring-1"
-	cmd, err := RestoreStageCommand(testRoot, tag, "vm.qcow2", temp)
+	cmd, err := RestoreStageCommand(testStore(t).Point(tag), "vm.qcow2", temp)
 	if err != nil {
 		t.Fatalf("RestoreStageCommand: %v", err)
 	}

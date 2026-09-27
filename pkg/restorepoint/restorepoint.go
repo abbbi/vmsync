@@ -182,16 +182,11 @@ func ParseTag(name string) (Tag, error) {
 	return NewTag(time.Unix(secs, 0).UTC(), checkpoint)
 }
 
-// Root is the restore point directory for a replica disk.
-func Root(diskPath string) string {
-	return path.Join(path.Dir(diskPath), DirName)
-}
-
-// Dir is where a finished restore point lives.
-func Dir(root string, t Tag) string { return path.Join(root, t.String()) }
-
-// StagingDir is where one is assembled before being renamed into place.
-func StagingDir(root string, t Tag) string { return path.Join(root, StagingPrefix+t.String()) }
+// Addressing a store, a point or a staging directory lives in store.go, behind
+// types that cannot be built without naming a target domain. The free functions
+// that used to be here -- Root(diskPath), Dir(root, t), StagingDir(root, t) --
+// took a bare directory, which is what made one domain able to read, prune and
+// delete another's restore points; see the note at the top of store.go.
 
 // DiskPath is where one replica disk's copy lives inside a restore point.
 // Named after the disk's own basename, so a restore point is a drop-in set.
@@ -251,6 +246,23 @@ func Due(latest time.Time, now time.Time, p Policy) bool {
 		return false
 	}
 	if latest.IsZero() {
+		return true
+	}
+	// A newest point dated in the FUTURE is due, and this is the one place that
+	// can be fixed. The instant comes from the SOURCE's checkpoint, so a source
+	// whose clock runs two days ahead dates every point two days ahead -- and
+	// "has enough time passed since the newest" then answers NO for two days
+	// plus the interval. The replica takes no restore point for that whole
+	// window, the run reports not_due, and every other number about it stays
+	// healthy: this is the silent starvation the whole feature exists to avoid,
+	// arriving by way of NTP rather than by way of a co-located domain.
+	//
+	// Taking one is the fail-closed answer. The cost is extra points while the
+	// skew lasts, bounded by the retention count and pruned like any other; the
+	// cost of the alternative is a replica with no recoverable history and
+	// nothing saying so. It is visible either way -- the newest timestamp this
+	// publishes is in the future, which no healthy pair ever shows.
+	if latest.After(now) {
 		return true
 	}
 	return !now.Before(latest.Add(p.Interval))
@@ -313,4 +325,91 @@ func Latest(existing []Tag) time.Time {
 		}
 	}
 	return newest
+}
+
+// Oldest returns the oldest tag, or the zero time when there are none.
+//
+// Latest's twin, and the one an operator actually reaches for during an
+// incident: time() minus this is how far back the replica can be taken, which
+// is the question a retention policy is bought to answer. Exported so the
+// metric and the console can report the same number rather than each deriving
+// its own.
+func Oldest(existing []Tag) time.Time {
+	var oldest time.Time
+	for _, t := range existing {
+		if oldest.IsZero() || t.At.Before(oldest) {
+			oldest = t.At
+		}
+	}
+	return oldest
+}
+
+// Summary is what one domain's store holds, reduced to the numbers that are
+// worth publishing.
+//
+// Pure, and computed from a Listing the caller already has, so the metrics cost
+// no extra round trip to the target.
+type Summary struct {
+	// Count is published restore points in this domain's store. Directories,
+	// including any whose sidecar cannot be read: the depth the store holds
+	// and the depth that is provably restorable are different questions, and
+	// conflating them is how a gauge comes to disagree with what an operator
+	// sees listed.
+	Count int
+	// Staging is abandoned staging directories. Non-zero means runs are dying
+	// between the first reflink and the rename.
+	Staging int
+	// Newest and Oldest are the instants the extremes correspond to, zero when
+	// there are none.
+	Newest time.Time
+	Oldest time.Time
+	// Over is how many points are beyond what the policy asks to keep. It
+	// should be zero after any successful prune; a number that stays positive
+	// means pruning is failing, which is only a warning on the run itself.
+	Over int
+}
+
+// Summarize reduces a listing under a policy.
+func Summarize(l Listing, p Policy) Summary {
+	s := Summary{
+		Count:   len(l.Points),
+		Staging: len(l.Staging),
+		Newest:  Latest(l.Points),
+		Oldest:  Oldest(l.Points),
+	}
+	if p.Enabled() && len(l.Points) > p.Count {
+		s.Over = len(l.Points) - p.Count
+	}
+	return s
+}
+
+// OverdueBy is how long ago another restore point became due and was not
+// produced.
+//
+// Zero unless the floor had genuinely elapsed, which is what makes it safe to
+// alert on directly: it is NOT derived from the interval by anybody guessing a
+// multiple of it. The interval is a floor and not a cadence (see Due), so a
+// healthy pair whose syncs are far apart legitimately has points far apart, and
+// any staleness threshold computed from the policy would fire on it. This
+// answers the only question that has one answer -- "had the floor passed, and
+// did a point appear" -- and the caller zeroes it once one has.
+func OverdueBy(latest time.Time, now time.Time, p Policy) time.Duration {
+	if !p.Enabled() || latest.IsZero() {
+		// No policy means nothing is owed. No points at all is reported by the
+		// count being zero, which is unambiguous on its own; calling that
+		// "infinitely overdue" would need an instant to measure from that
+		// nobody has.
+		return 0
+	}
+	// A newest point dated in the FUTURE is not overdue, and does not need to be:
+	// Due treats that case as due, so points keep being taken and the store keeps
+	// advancing. See Due for why.
+	if latest.After(now) {
+		return 0
+	}
+	due := latest.Add(p.Interval)
+	if now.Before(due) {
+		return 0
+	}
+	return now.Sub(due)
 }

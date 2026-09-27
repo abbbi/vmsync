@@ -520,10 +520,12 @@ func describe(dom *libvirt.Domain, verboseSkips bool) (Domain, error) {
 			paths = append(paths, qd.Path())
 		}
 		d.Disks = inspectDisks(paths)
-		// After the disks, because it is derived from where they are -- the
-		// same rule the sync path uses to place them, rather than any
+		// After the disks, because the store is derived from where they are --
+		// the same rule the sync path uses to place them, rather than any
 		// configured target_disk_path, which agrees only when it happens to
-		// name the directory the disks are really in.
+		// name the directory the disks are really in. It also needs d.Name,
+		// which libvirt gave us before this function read any XML: restore
+		// points are kept per target domain.
 		d.RestorePoints = RestorePointsFor(d)
 	}
 

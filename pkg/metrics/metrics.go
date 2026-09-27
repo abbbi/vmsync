@@ -84,6 +84,39 @@ const (
 	CheckStateNotPerformed = 2
 )
 
+// RestorePointOutcome* are the values RunMetric.RestorePointOutcome takes, and
+// they are published as a LABEL SET rather than as an integer enum: one series
+// per outcome, exactly one of them 1, all of them present from the first run.
+//
+// The same shape vmsync_agent_mode uses, and for the same reason given there --
+// the question has more than two answers. A bare
+// vmsync_restore_point_taken 0/1 cannot separate "the interval floor had not
+// elapsed" from "one was due and could not be produced", and those two need
+// opposite responses: the first is the ordinary state of a healthy pair, the
+// second means the recovery history has stopped growing. Collapsed onto one
+// value, the alert for the second fires continuously on every pair whose syncs
+// are further apart than its floor.
+const (
+	// RestorePointTaken: one was published by this run.
+	RestorePointTaken = "taken"
+	// RestorePointNotDue: the floor had not elapsed, so none was attempted.
+	// The ordinary outcome, and not a degraded one.
+	RestorePointNotDue = "not_due"
+	// RestorePointFailed: it was due and this run did not publish one.
+	RestorePointFailed = "failed"
+	// RestorePointUndetermined: the run never reached the decision -- it was
+	// refused earlier, or retention is off -- so nothing here says anything
+	// about what the store holds.
+	RestorePointUndetermined = "undetermined"
+)
+
+// restorePointOutcomes is the complete label set, written out so every series
+// exists from the first run. An alert cannot use a `for:` clause over a window
+// that begins before the series it reads came into existence.
+var restorePointOutcomes = []string{
+	RestorePointTaken, RestorePointNotDue, RestorePointFailed, RestorePointUndetermined,
+}
+
 // DiskMetric holds one disk's sync result, ready to be rendered into the
 // Prometheus text exposition format for a node_exporter textfile collector.
 type DiskMetric struct {
@@ -218,6 +251,87 @@ type RunMetric struct {
 	// Zero on a run that wrote nothing, which is ordinary for an
 	// incremental against an idle source.
 	ChecksumBytes uint64
+
+	// --- restore points -------------------------------------------------
+	//
+	// Until these existed there was no restore-point metric at all, which is
+	// how a replica came to take none for seventy-two hours with nothing to
+	// alert on: the sync itself succeeded every time, so vmsync_sync_state,
+	// the verification series and the agent's domain counts were all healthy
+	// and none of them described the history that had stopped growing.
+	//
+	// TargetVM labels these families and nothing else. The existing run-level
+	// series are labelled by `vm`, which is the SOURCE domain; a restore point
+	// store is addressed by the TARGET domain, and labelling the two the same
+	// would make a series claim to describe a directory it does not name. One
+	// bounded value per run, so no cardinality growth.
+	TargetVM string
+	// RetentionAsked is whether -retention was set. It gates every series
+	// below, because a run with no policy has looked at no store -- and a
+	// vmsync_restore_points 0 from such a run is not "the store is empty", it
+	// is "nobody asked". Taken from configuration before any I/O, so it is
+	// known even on a run refused at the reflink probe.
+	RetentionAsked bool
+	// RestorePointsListed is whether this run actually read the store. False
+	// when it was refused before getting there -- a filesystem without reflink
+	// support, a domain with no disks -- and the counts below then mean
+	// nothing and are not rendered.
+	RestorePointsListed bool
+	// RestorePointOutcome is one of the RestorePoint* values above.
+	RestorePointOutcome string
+	// RestorePointsPolicyCount and RestorePointsPolicyIntervalSeconds are what
+	// -retention asked for, published beside the counts so that "is this
+	// replica as deep as it was meant to be" is answerable without joining
+	// against a configuration file that lives on another host.
+	RestorePointsPolicyCount           int
+	RestorePointsPolicyIntervalSeconds float64
+	// RestorePointsStoreReadable is whether the store could be read at all.
+	// Its own series rather than an outcome value, because it is orthogonal:
+	// a run can fail to read the store and still be perfectly healthy in every
+	// other respect, and this is the one that says "this number is missing
+	// because nobody could look", which no count can express.
+	RestorePointsStoreReadable bool
+	// RestorePointOverdueSeconds is how long ago another restore point became
+	// due and was not produced. Zero on every healthy run.
+	//
+	// The engine computes it rather than leaving it to PromQL, and that is the
+	// point of it. The retention interval is a FLOOR and not a cadence, so a
+	// threshold derived from it -- "stale if older than 3x the interval" --
+	// fires on every healthy pair whose syncs are further apart than that,
+	// which is the normal configuration for a long history. This answers the
+	// only question with one answer: had the floor passed, and did a point
+	// appear. Alert on `> 0` with no arithmetic and no clock comparison.
+	RestorePointOverdueSeconds float64
+	// RestorePoints is how many published restore points this target domain's
+	// store holds after this run. Directories, including any whose sidecar
+	// could not be read: what the store holds and what is provably restorable
+	// are different questions, and RestorePointsStaging plus the agent's
+	// unreadable count carry the difference. Points still flat in the shared
+	// directory are outside every store, so nothing here can see them.
+	RestorePoints int
+	// RestorePointsOverCount is how many are beyond what the policy keeps.
+	// Zero after any successful prune, so a number that stays positive means
+	// pruning is failing -- which is only a warning on the run itself, and is
+	// otherwise how a target silently fills up.
+	//
+	// Computed in-process rather than left to a `kept > policy_count`
+	// expression, which would straddle two scrapes and can read as true while
+	// a prune is in progress.
+	RestorePointsOverCount int
+	// RestorePointsStaging is how many abandoned staging directories are in
+	// this domain's store. Non-zero means runs are dying between the first
+	// reflink and the rename that publishes the set.
+	RestorePointsStaging int
+	// RestorePointNewestUnix and RestorePointOldestUnix are the instants the
+	// newest and oldest points correspond to.
+	//
+	// The TAG instant, which is the checkpoint time the contents belong to and
+	// the same value the agent publishes, so a dashboard and an alert cannot
+	// disagree about the age of one copy. `time() - oldest` is the only
+	// restore-point number an operator uses during an incident: how far back
+	// this replica can actually be taken.
+	RestorePointNewestUnix int64
+	RestorePointOldestUnix int64
 }
 
 // WriteTextfile renders disks and run in the Prometheus text exposition
@@ -352,7 +466,86 @@ func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 			run.SourceHost, run.TargetHost, run.VM, run.ChecksumBytes)
 	}
 
+	writeRestorePoints(&b, run)
+
 	return writeAtomic(path, b.String())
+}
+
+// writeRestorePoints renders the restore-point families.
+//
+// Gated in two stages, and which stage a series is under is the whole of its
+// meaning:
+//
+//   - RetentionAsked: nothing at all for a run with no -retention. A zero count
+//     there would assert an empty store to anybody reading it, when in fact
+//     nothing looked.
+//   - RestorePointsListed: the counts, on top of the above. A run refused at
+//     the reflink probe still publishes its outcome, its policy and
+//     store_readable=0 -- but not a last_taken of 0, which would say "this
+//     store holds nothing" about a directory it never opened.
+//
+// The distinction matters because this file PERSISTS between runs: a series
+// written on every run is scrapeable for the whole inter-run gap and can carry
+// any `for:` clause, while one omitted on some runs flickers and can carry none.
+func writeRestorePoints(b *strings.Builder, run RunMetric) {
+	if !run.RetentionAsked {
+		return
+	}
+	lbl := fmt.Sprintf("source_host=%q,target_host=%q,vm=%q,target_vm=%q",
+		run.SourceHost, run.TargetHost, run.VM, run.TargetVM)
+
+	// HELP and TYPE once for the family, then one sample line per outcome. A
+	// per-sample HELP would make node_exporter reject the entire file, taking
+	// down every metric in it including the ones being alerted on.
+	outcome := run.RestorePointOutcome
+	if outcome == "" {
+		outcome = RestorePointUndetermined
+	}
+	fmt.Fprintln(b, "# HELP vmsync_restore_point_outcome What this run did about a restore point; exactly one of these series is 1. taken=one was published. not_due=the retention interval floor had not elapsed, which is the ordinary state of a healthy pair and not a fault. failed=one was due and none appeared, so the recovery history has stopped growing. undetermined=the run never reached the decision. Alert on failed, never on not_due.")
+	fmt.Fprintln(b, "# TYPE vmsync_restore_point_outcome gauge")
+	for _, o := range restorePointOutcomes {
+		fmt.Fprintf(b, "vmsync_restore_point_outcome{%s,outcome=%q} %d\n", lbl, o, boolMetric(o == outcome))
+	}
+
+	fmt.Fprintln(b, "# HELP vmsync_restore_points_policy_count How many restore points -retention asks to keep for this pair. Published beside the count so \"is this replica as deep as it was meant to be\" needs no join against a configuration file on another host.")
+	fmt.Fprintln(b, "# TYPE vmsync_restore_points_policy_count gauge")
+	fmt.Fprintf(b, "vmsync_restore_points_policy_count{%s} %d\n", lbl, run.RestorePointsPolicyCount)
+
+	fmt.Fprintln(b, "# HELP vmsync_restore_points_policy_interval_seconds The minimum spacing -retention asks for. A FLOOR, not a cadence: vmsync does not decide when it runs, so restore points end up as far apart as the syncs are. Do not build a staleness threshold from this -- use vmsync_restore_point_overdue_seconds, which the engine computes.")
+	fmt.Fprintln(b, "# TYPE vmsync_restore_points_policy_interval_seconds gauge")
+	fmt.Fprintf(b, "vmsync_restore_points_policy_interval_seconds{%s} %.3f\n", lbl, run.RestorePointsPolicyIntervalSeconds)
+
+	fmt.Fprintln(b, "# HELP vmsync_restore_points_store_readable 1 when this run read its own restore point directory. At 0 every count below is ABSENT rather than zero, because this run learned nothing about the store -- either it could not be listed, or the run was refused before it got that far (a target filesystem with no reflink support, a domain with no disks). Either way the depth is unknown, not zero. Alert on 0 with a `for:` clause.")
+	fmt.Fprintln(b, "# TYPE vmsync_restore_points_store_readable gauge")
+	fmt.Fprintf(b, "vmsync_restore_points_store_readable{%s} %d\n", lbl, boolMetric(run.RestorePointsStoreReadable))
+
+	fmt.Fprintln(b, "# HELP vmsync_restore_point_overdue_seconds How long ago another restore point became due and was not produced. Zero on every healthy run: zero while the interval floor has not elapsed, and zero once one is published. Positive ONLY when the floor had passed and no restore point appeared. Alert on > 0 directly -- no threshold arithmetic, and in particular do not derive one from the policy interval, which is a floor and not a cadence.")
+	fmt.Fprintln(b, "# TYPE vmsync_restore_point_overdue_seconds gauge")
+	fmt.Fprintf(b, "vmsync_restore_point_overdue_seconds{%s} %.3f\n", lbl, run.RestorePointOverdueSeconds)
+
+	if !run.RestorePointsListed {
+		return
+	}
+
+	fmt.Fprintln(b, "# HELP vmsync_restore_points How many published restore points this TARGET DOMAIN's store holds. Directories, including any whose sidecar could not be read.")
+	fmt.Fprintln(b, "# TYPE vmsync_restore_points gauge")
+	fmt.Fprintf(b, "vmsync_restore_points{%s} %d\n", lbl, run.RestorePoints)
+
+	fmt.Fprintln(b, "# HELP vmsync_restore_points_over_count How many restore points are beyond what -retention keeps. Zero after any successful prune, so a value that stays positive means pruning keeps failing -- which is only a warning on the run itself, and is otherwise how a target quietly fills up. Computed in-process rather than as kept > policy_count, which would straddle two scrapes.")
+	fmt.Fprintln(b, "# TYPE vmsync_restore_points_over_count gauge")
+	fmt.Fprintf(b, "vmsync_restore_points_over_count{%s} %d\n", lbl, run.RestorePointsOverCount)
+
+	fmt.Fprintln(b, "# HELP vmsync_restore_points_staging Abandoned staging directories in this domain's store. Non-zero means runs are dying between the first reflink and the rename that publishes the set. Named _staging and not _incomplete: vmsync_agent_replica_incomplete already means a half-written REPLICA, which is a different fault.")
+	fmt.Fprintln(b, "# TYPE vmsync_restore_points_staging gauge")
+	fmt.Fprintf(b, "vmsync_restore_points_staging{%s} %d\n", lbl, run.RestorePointsStaging)
+
+	fmt.Fprintln(b, "# HELP vmsync_restore_point_last_taken_timestamp_seconds The instant the NEWEST restore point's contents correspond to. The tag instant, which is what the agent publishes too, so a dashboard and an alert cannot disagree about the age of one copy.")
+	fmt.Fprintln(b, "# TYPE vmsync_restore_point_last_taken_timestamp_seconds gauge")
+	fmt.Fprintf(b, "vmsync_restore_point_last_taken_timestamp_seconds{%s} %d\n", lbl, run.RestorePointNewestUnix)
+
+	fmt.Fprintln(b, "# HELP vmsync_restore_point_oldest_timestamp_seconds The instant the OLDEST restore point's contents correspond to. time() minus this is how far back this replica can actually be taken, which is the one restore-point number an operator reaches for during an incident.")
+	fmt.Fprintln(b, "# TYPE vmsync_restore_point_oldest_timestamp_seconds gauge")
+	fmt.Fprintf(b, "vmsync_restore_point_oldest_timestamp_seconds{%s} %d\n", lbl, run.RestorePointOldestUnix)
 }
 
 // writeAtomic writes content to a temp file next to path and renames it into

@@ -72,11 +72,11 @@ type RestorePointInfo struct {
 
 // RestorePointsFor lists what a domain can be rolled back to.
 //
-// The directory is derived the same way the sync path derives it --
-// restorepoint.Root of an actual disk path -- and NOT from a configured
-// target_disk_path. Those agree only when the configured value names the
-// directory the disks are really in, so deriving is what makes this agree with
-// what a sync actually wrote.
+// The store is derived the same way the sync path derives it --
+// restorepoint.StoreFor of an actual disk path, plus this domain's name -- and
+// NOT from a configured target_disk_path. Those agree only when the configured
+// value names the directory the disks are really in, so deriving is what makes
+// this agree with what a sync actually wrote.
 //
 // A domain whose disks span several directories has no single restore point
 // set (retention refuses such a domain outright, because a restore point is a
@@ -89,24 +89,48 @@ type RestorePointInfo struct {
 // not using -retention -- is the ordinary case, not an error worth a line in
 // the log on every cycle.
 func RestorePointsFor(d Domain) []RestorePointInfo {
-	dir, ok := restorePointDirFor(d)
+	store, ok := restorePointStoreFor(d)
 	if !ok {
 		return nil
 	}
-	entries, err := os.ReadDir(dir)
+	root, err := store.Path()
 	if err != nil {
 		return nil
 	}
 
+	out := readRestorePointDir(root)
+
+	// Newest first: an operator reaching for one of these is usually asking
+	// "what is the most recent copy from before the damage", and reads down
+	// until they reach it.
+	sort.Slice(out, func(i, j int) bool { return out[i].TakenAtUnix > out[j].TakenAtUnix })
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// readRestorePointDir reads one store's restore points.
+//
+// Split out of RestorePointsFor so the predicate that decides what counts as a
+// restore point is stated once, and stated the same way -list-restore-points
+// states it -- the two views cannot then disagree about what is there.
+func readRestorePointDir(dir string) []RestorePointInfo {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
 	out := make([]RestorePointInfo, 0, len(entries))
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
 		// ParseTag is what separates a restore point from staging left by an
-		// interrupted run (".incomplete-") and from anything else that found
-		// its way in. Same predicate -list-restore-points uses, so the two
-		// views cannot disagree about what counts.
+		// interrupted run (".incomplete-"), from a per-domain store ("vm-"),
+		// from a set an earlier reinit moved aside (".replaced-") and from
+		// anything else that found its way in. Same predicate
+		// -list-restore-points uses, so the two views cannot disagree about
+		// what counts.
 		tag, err := restorepoint.ParseTag(e.Name())
 		if err != nil {
 			continue
@@ -134,20 +158,17 @@ func RestorePointsFor(d Domain) []RestorePointInfo {
 		}
 		out = append(out, info)
 	}
-
-	// Newest first: an operator reaching for one of these is usually asking
-	// "what is the most recent copy from before the damage", and reads down
-	// until they reach it.
-	sort.Slice(out, func(i, j int) bool { return out[i].TakenAtUnix > out[j].TakenAtUnix })
-	if len(out) == 0 {
-		return nil
-	}
 	return out
 }
 
-// restorePointDirFor finds the one directory a domain's restore points would
-// be in, or reports that there is no single one.
-func restorePointDirFor(d Domain) (string, bool) {
+// restorePointStoreFor finds the one store a domain's restore points would be
+// in, or reports that there is no single one.
+//
+// Keyed by this domain's NAME as well as by the directory, which is the fix for
+// the defect this reader shared with the sync path: reading the directory alone
+// reported every co-located domain's points as this one's, so the control plane
+// offered another pair's copies as a rollback target for this machine.
+func restorePointStoreFor(d Domain) (restorepoint.Store, bool) {
 	var dir string
 	for _, disk := range d.Disks {
 		// A missing disk file still names a directory, and that directory is
@@ -159,11 +180,19 @@ func restorePointDirFor(d Domain) (string, bool) {
 			continue
 		}
 		if this != dir {
-			return "", false
+			return restorepoint.Store{}, false
 		}
 	}
 	if dir == "" {
-		return "", false
+		return restorepoint.Store{}, false
 	}
-	return filepath.Join(dir, restorepoint.DirName), true
+	// filepath.ToSlash so a Store built here is spelled the same way the sync
+	// path spells it. The agent runs on Linux, where the two already agree, but
+	// the store's own validation insists on a clean slash path and a test run on
+	// any other OS would otherwise fail for a reason that says nothing.
+	store, err := restorepoint.StoreForDir(filepath.ToSlash(dir), d.Name)
+	if err != nil {
+		return restorepoint.Store{}, false
+	}
+	return store, true
 }

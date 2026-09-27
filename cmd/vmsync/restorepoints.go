@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"vmsync/pkg/metrics"
 	"vmsync/pkg/remotessh"
 	"vmsync/pkg/restorepoint"
 	"vmsync/pkg/trace"
@@ -52,8 +53,12 @@ type remoteRunner interface {
 
 type restorePoints struct {
 	runner remoteRunner
-	root   string
-	tag    restorepoint.Tag
+	// store addresses ONE target domain's restore points. Not a directory:
+	// keying this by the directory the disks live in is what let two co-located
+	// domains starve, prune and sweep each other's history -- see the note at
+	// the top of pkg/restorepoint/store.go.
+	store  restorepoint.Store
+	point  restorepoint.Point
 	policy restorepoint.Policy
 
 	// armed is false when retention is off, or when the interval has not
@@ -61,8 +66,72 @@ type restorePoints struct {
 	// conditionals of their own.
 	armed bool
 
+	// wantDisks is how many disks this run is copying, so commit can refuse to
+	// publish a set that is short of one. take() fails the run if any single
+	// reflink fails, so a short set can only come from an accounting error in
+	// here -- which is worth failing on rather than publishing a restore point
+	// that would silently restore a machine missing a disk.
+	wantDisks int
+
+	// stats is what this run will publish about the store. Filled at the
+	// decision point and updated by commit and prune, so a run that never
+	// takes a point still reports what is there and whether it was overdue.
+	stats restorePointStats
+
 	mu    sync.Mutex
 	disks []string
+}
+
+// Outcomes reported by restorePointStats.Outcome, one of which is always true.
+//
+// Aliases of the metrics package's vocabulary rather than a second copy of it:
+// these strings become Prometheus LABEL VALUES, and two spellings of "not_due"
+// would file a pair's history under a series nobody alerts on. See
+// metrics.RestorePointTaken for why the outcome is a label set and not a 0/1
+// gauge.
+const (
+	rpOutcomeTaken        = metrics.RestorePointTaken
+	rpOutcomeNotDue       = metrics.RestorePointNotDue
+	rpOutcomeFailed       = metrics.RestorePointFailed
+	rpOutcomeUndetermined = metrics.RestorePointUndetermined
+)
+
+// restorePointStats is what one run publishes about one domain's store.
+//
+// Separate from the metrics package's own types so that nothing on the
+// retention path has to know how a Prometheus textfile is rendered, and so this
+// can be asserted on in a test that needs no libvirt.
+type restorePointStats struct {
+	// Asked is whether -retention was set at all. Everything else is gated on
+	// it: a run with no retention policy must publish no restore point series,
+	// because a zero count would assert the store is empty when it was never
+	// looked at.
+	Asked bool
+	// Listed is whether this run actually read the store. False when the run
+	// was refused before it got there -- a filesystem without reflink support,
+	// a domain with no disks -- and the counts below then mean nothing.
+	Listed bool
+	// Outcome is one of the rpOutcome* values above.
+	Outcome string
+	// Count, Over, Staging, Newest and Oldest describe the store AFTER this run
+	// -- see restorepoint.Summary for what each one is.
+	Count   int
+	Over    int
+	Staging int
+	Newest  int64
+	Oldest  int64
+	// OverdueSeconds is how long ago another point became due and was not
+	// produced, and it is zero on every healthy run: zero when the floor has
+	// not elapsed, and zero once a point is published. It is deliberately NOT a
+	// staleness threshold derived from the interval, because the interval is a
+	// floor and not a cadence -- a healthy pair whose syncs are far apart has
+	// points far apart, and any multiple-of-the-interval rule fires on it.
+	OverdueSeconds float64
+	// PolicyCount and PolicyInterval are what -retention asked for, published
+	// beside the counts so that "is this replica as deep as it was meant to be"
+	// needs no join against a configuration file on another host.
+	PolicyCount    int
+	PolicyInterval float64
 }
 
 // newRestorePoints decides whether this run takes a restore point, and refuses
@@ -75,7 +144,7 @@ type restorePoints struct {
 //
 // A nil return with no error means "not this run" -- retention is off, or the
 // interval has not elapsed -- and every method below then does nothing.
-func newRestorePoints(ctx context.Context, policy restorepoint.Policy, runner remoteRunner, targetDiskPaths []string, checkpoint string, at time.Time) (*restorePoints, error) {
+func newRestorePoints(ctx context.Context, policy restorepoint.Policy, runner remoteRunner, targetDiskPaths []string, targetDomain, checkpoint string, at time.Time) (*restorePoints, error) {
 	if !policy.Enabled() {
 		return &restorePoints{}, nil
 	}
@@ -86,9 +155,16 @@ func newRestorePoints(ctx context.Context, policy restorepoint.Policy, runner re
 	// A restore point is a SET: one disk from this sync beside another from
 	// a different one is not a recoverable machine. That only works if they
 	// share a directory, so refuse rather than scatter them.
-	root := restorepoint.Root(targetDiskPaths[0])
+	store, err := restorepoint.StoreFor(targetDiskPaths[0], targetDomain)
+	if err != nil {
+		return nil, fmt.Errorf("-retention: %w", err)
+	}
 	for _, p := range targetDiskPaths[1:] {
-		if other := restorepoint.Root(p); other != root {
+		other, err := restorepoint.StoreFor(p, targetDomain)
+		if err != nil {
+			return nil, fmt.Errorf("-retention: %w", err)
+		}
+		if other.ReplicaDir() != store.ReplicaDir() {
 			return nil, fmt.Errorf("-retention needs every target disk in one directory so a restore point is a single consistent set, but %s and %s are in different ones; set -target-disk-path",
 				targetDiskPaths[0], p)
 		}
@@ -110,13 +186,29 @@ func newRestorePoints(ctx context.Context, policy restorepoint.Policy, runner re
 			policy.String(), path.Dir(targetDiskPaths[0]))
 	}
 
-	existing, err := listRestorePoints(ctx, runner, root)
+	existing, err := listRestorePoints(ctx, runner, store)
 	if err != nil {
 		return nil, fmt.Errorf("-retention: %w", err)
 	}
+
+	// Everything published about the store is decided here, including on the
+	// paths that take no point: a run that reports nothing is indistinguishable
+	// from a host that is not running, and a domain quietly taking none is the
+	// exact failure the per-domain layout was introduced to end.
+	stats := restorePointStats{
+		Asked:          true,
+		Listed:         true,
+		Outcome:        rpOutcomeFailed,
+		PolicyCount:    policy.Count,
+		PolicyInterval: policy.Interval.Seconds(),
+	}
+	applyRestorePointSummary(&stats, restorepoint.Summarize(existing, policy))
+	stats.OverdueSeconds = restorepoint.OverdueBy(restorepoint.Latest(existing.Points), at, policy).Seconds()
+
 	if !restorepoint.Due(restorepoint.Latest(existing.Points), at, policy) {
-		trace.Info("restore point not due yet", "kept", len(existing.Points), "interval", policy.Interval.String(), "dir", root)
-		return &restorePoints{}, nil
+		trace.Info("restore point not due yet", "kept", len(existing.Points), "interval", policy.Interval.String(), "dir", store.String())
+		stats.Outcome = rpOutcomeNotDue
+		return &restorePoints{store: store, policy: policy, stats: stats}, nil
 	}
 
 	// The tag names the checkpoint this run is creating. In the rare case
@@ -129,17 +221,61 @@ func newRestorePoints(ctx context.Context, policy restorepoint.Policy, runner re
 		return nil, fmt.Errorf("-retention: %w", err)
 	}
 
-	if _, err := runner.Run(ctx, restorepoint.StageCommand(root, tag)); err != nil {
+	point := store.Point(tag)
+	stage, err := restorepoint.StageCommand(point)
+	if err != nil {
+		return nil, fmt.Errorf("-retention: %w", err)
+	}
+	// mkdir -p, so this is where the domain's store and the shared root above
+	// it come into being on a pair's first run with -retention.
+	if _, err := runner.Run(ctx, stage); err != nil {
 		return nil, fmt.Errorf("-retention: create the staging directory for restore point %s: %w", tag, err)
 	}
-	trace.Info("taking a restore point", "tag", tag.String(), "keep", policy.Count, "dir", root)
-	return &restorePoints{runner: runner, root: root, tag: tag, policy: policy, armed: true}, nil
+	trace.Info("taking a restore point", "tag", tag.String(), "keep", policy.Count, "dir", store.String())
+	return &restorePoints{
+		runner:    runner,
+		store:     store,
+		point:     point,
+		policy:    policy,
+		armed:     true,
+		wantDisks: len(targetDiskPaths),
+		stats:     stats,
+	}, nil
 }
 
-func listRestorePoints(ctx context.Context, runner remoteRunner, root string) (restorepoint.Listing, error) {
-	out, err := runner.Run(ctx, restorepoint.ListCommand(root))
+// applyRestorePointSummary copies a pure Summary onto the stats a run reports.
+func applyRestorePointSummary(s *restorePointStats, sum restorepoint.Summary) {
+	s.Count, s.Over, s.Staging = sum.Count, sum.Over, sum.Staging
+	s.Newest, s.Oldest = 0, 0
+	if !sum.Newest.IsZero() {
+		s.Newest = sum.Newest.Unix()
+	}
+	if !sum.Oldest.IsZero() {
+		s.Oldest = sum.Oldest.Unix()
+	}
+}
+
+// snapshot is what the run publishes about restore points. Safe on a nil
+// receiver, which is what a run refused before the retention decision holds.
+func (r *restorePoints) snapshot() restorePointStats {
+	if r == nil {
+		return restorePointStats{Outcome: rpOutcomeUndetermined}
+	}
+	if r.stats.Outcome == "" {
+		// Retention off: nothing was asked and nothing was looked at.
+		return restorePointStats{Outcome: rpOutcomeUndetermined}
+	}
+	return r.stats
+}
+
+func listRestorePoints(ctx context.Context, runner remoteRunner, store restorepoint.Store) (restorepoint.Listing, error) {
+	cmd, err := restorepoint.ListCommand(store)
 	if err != nil {
-		return restorepoint.Listing{}, fmt.Errorf("list existing restore points in %s: %w", root, err)
+		return restorepoint.Listing{}, err
+	}
+	out, err := runner.Run(ctx, cmd)
+	if err != nil {
+		return restorepoint.Listing{}, fmt.Errorf("list existing restore points in %s: %w", store, err)
 	}
 	return restorepoint.ParseListing(out)
 }
@@ -155,8 +291,12 @@ func (r *restorePoints) take(ctx context.Context, diskPath string) error {
 	if r == nil || !r.armed {
 		return nil
 	}
-	if _, err := r.runner.Run(ctx, restorepoint.CopyCommand(r.root, r.tag, diskPath)); err != nil {
-		return fmt.Errorf("-retention: copy %s into restore point %s: %w", diskPath, r.tag, err)
+	cmd, err := restorepoint.CopyCommand(r.point, diskPath)
+	if err != nil {
+		return fmt.Errorf("-retention: %w", err)
+	}
+	if _, err := r.runner.Run(ctx, cmd); err != nil {
+		return fmt.Errorf("-retention: copy %s into restore point %s: %w", diskPath, r.point.Tag(), err)
 	}
 	r.mu.Lock()
 	r.disks = append(r.disks, path.Base(diskPath))
@@ -179,6 +319,16 @@ func (r *restorePoints) commit(ctx context.Context, verifyState, source string, 
 	disks := append([]string(nil), r.disks...)
 	r.mu.Unlock()
 
+	// A published set that is short of a disk would restore a machine missing
+	// one of its volumes, and would look like any other restore point while
+	// doing it. take() fails the run on any single reflink failure, so the only
+	// way to be here with a short set is an accounting mistake in this file --
+	// which is worth failing the run over rather than publishing.
+	if len(disks) != r.wantDisks {
+		return fmt.Errorf("-retention: refusing to publish restore point %s: it holds %d disk(s) but this sync copied %d -- a set missing a disk would restore an incomplete machine",
+			r.point.Tag(), len(disks), r.wantDisks)
+	}
+
 	status := restorepoint.Status{
 		Checkpoint:   effectiveCheckpoint,
 		CheckpointAt: checkpointAt.Unix(),
@@ -187,17 +337,28 @@ func (r *restorePoints) commit(ctx context.Context, verifyState, source string, 
 		Verify:       verifyState,
 		Disks:        disks,
 	}
-	cmd, err := restorepoint.StatusCommand(r.root, r.tag, status)
+	cmd, err := restorepoint.StatusCommand(r.point, status)
 	if err != nil {
 		return fmt.Errorf("-retention: %w", err)
 	}
 	if _, err := r.runner.Run(ctx, cmd); err != nil {
-		return fmt.Errorf("-retention: write the status sidecar for restore point %s: %w", r.tag, err)
+		return fmt.Errorf("-retention: write the status sidecar for restore point %s: %w", r.point.Tag(), err)
 	}
-	if _, err := r.runner.Run(ctx, restorepoint.CommitCommand(r.root, r.tag)); err != nil {
-		return fmt.Errorf("-retention: publish restore point %s: %w", r.tag, err)
+	commit, err := restorepoint.CommitCommand(r.point)
+	if err != nil {
+		return fmt.Errorf("-retention: %w", err)
 	}
-	trace.Info("restore point taken", "tag", r.tag.String(), "disks", len(disks), "verify", verifyState, "path", restorepoint.Dir(r.root, r.tag))
+	if _, err := r.runner.Run(ctx, commit); err != nil {
+		return fmt.Errorf("-retention: publish restore point %s: %w", r.point.Tag(), err)
+	}
+	dir, _ := r.point.Dir()
+	trace.Info("restore point taken", "tag", r.point.Tag().String(), "disks", len(disks), "verify", verifyState, "path", dir)
+
+	// Published, so nothing is owed any more whatever the floor said on the way
+	// in. Recorded before the prune, because a prune failure must not make a
+	// run that DID take a point report as overdue.
+	r.stats.Outcome = rpOutcomeTaken
+	r.stats.OverdueSeconds = 0
 
 	r.prune(ctx)
 	return nil
@@ -211,19 +372,28 @@ func (r *restorePoints) commit(ctx context.Context, verifyState, source string, 
 // succeeded. What it must not do is stay silent -- a prune that keeps failing
 // is how a target fills up.
 func (r *restorePoints) prune(ctx context.Context) {
-	listing, err := listRestorePoints(ctx, r.runner, r.root)
+	listing, err := listRestorePoints(ctx, r.runner, r.store)
 	if err != nil {
 		trace.Warning("could not list restore points to prune them; they will accumulate until this succeeds", "error", err)
 		return
 	}
 	for _, name := range listing.Unknown {
-		trace.Warning("ignoring an unrecognised entry in the restore point directory; vmsync will not delete something it cannot identify", "entry", name, "dir", r.root)
+		trace.Warning("ignoring an unrecognised entry in the restore point directory; vmsync will not delete something it cannot identify", "entry", name, "dir", r.store.String())
 	}
 
 	// Abandoned staging directories are junk from an interrupted run, and
 	// are swept whatever the retention count says.
+	//
+	// Scoped to THIS domain's store, which is the fix for the third way a
+	// shared store went wrong: this sweep used to run over the directory every
+	// co-located domain staged into, so it removed a concurrently running
+	// sibling's in-flight set -- and the rename that sibling then attempted
+	// failed, failing a sync whose data had already landed, and counting toward
+	// -reinit-after-failures. Two runs of the SAME domain cannot collide here
+	// because the target run lock is held for the whole run (see
+	// util.AcquireRunLock and the target lock in cmd/vmsync/main.go).
 	for _, name := range listing.Staging {
-		cmd, err := restorepoint.RemoveStagingCommand(r.root, name)
+		cmd, err := restorepoint.RemoveStagingCommand(r.store, name)
 		if err != nil {
 			trace.Warning("leaving an unrecognised staging directory in place", "entry", name, "error", err)
 			continue
@@ -235,19 +405,48 @@ func (r *restorePoints) prune(ctx context.Context) {
 		trace.Info("removed an abandoned restore point staging directory left by an interrupted run", "entry", name)
 	}
 
+	// Over this domain's own points only. It used to be over every point in the
+	// shared directory, so a retention count meant for one machine was applied
+	// to the sum of several and one domain's churn silently evicted another's
+	// history.
 	plan := restorepoint.Prune(listing.Points, r.policy)
 	for _, tag := range plan.Remove {
-		if _, err := r.runner.Run(ctx, restorepoint.RemoveCommand(r.root, tag)); err != nil {
+		cmd, err := restorepoint.RemoveCommand(r.store.Point(tag))
+		if err != nil {
+			trace.Warning("leaving a restore point in place", "tag", tag.String(), "error", err)
+			continue
+		}
+		if _, err := r.runner.Run(ctx, cmd); err != nil {
 			trace.Warning("could not remove an expired restore point; restore points will accumulate until this succeeds", "tag", tag.String(), "error", err)
 			continue
 		}
 		trace.Info("removed an expired restore point", "tag", tag.String())
 	}
-	trace.Info("restore points on target", "kept", len(plan.Keep), "removed", len(plan.Remove), "dir", r.root)
+	trace.Info("restore points on target", "kept", len(plan.Keep), "removed", len(plan.Remove), "dir", r.store.String())
+
+	// Re-read rather than computed from the plan, so what is published is what
+	// the store actually holds and not what the prune intended. A prune failure
+	// is only a warning on the run itself -- Over staying positive is how it
+	// becomes visible from outside.
+	if after, err := listRestorePoints(ctx, r.runner, r.store); err == nil {
+		applyRestorePointSummary(&r.stats, restorepoint.Summarize(after, r.policy))
+	}
 }
 
 // sweepRestorePointsForReinit decides what a -reinit does to the restore
 // points of the replica it is about to discard.
+//
+// THIS TARGET DOMAIN'S ONLY. It used to act on the shared directory, so
+// reinitialising one replica deleted or orphaned the entire restore point
+// history of every other domain replicating into the same -target-disk-path --
+// in one rm -rf, while logging that it had removed "the restore points
+// belonging to the replaced replica". A co-located domain's store is now a
+// sibling this function cannot name: restorepoint.RemoveStoreCommand takes a
+// Store, and a Store cannot be built without a domain.
+//
+// Anything else in the shared directory is likewise left alone, including
+// restore points a pre-change vmsync left flat in it: this addresses one store,
+// so there is no expression here that could name them.
 //
 // An operator-initiated reinit takes them with it, following
 // -replaced-disk-action exactly as the replica disks do: one knob, and the
@@ -262,9 +461,16 @@ func (r *restorePoints) prune(ctx context.Context) {
 // kept, loudly: refusing the reinit instead would turn an auto-heal into stuck
 // replication, which is worse again.
 func sweepRestorePointsForReinit(ctx context.Context, cfg syncConfig, runner remoteRunner, aTargetDiskPath string) error {
-	root := restorepoint.Root(aTargetDiskPath)
+	store, err := restorepoint.StoreFor(aTargetDiskPath, cfg.TargetDomain)
+	if err != nil {
+		// Not fatal, for the same reason a failed listing is not: refusing a
+		// reinit over restore point bookkeeping would block a recovery.
+		trace.Warning("reinit: could not locate this domain's restore points; leaving them in place", "error", err)
+		return nil
+	}
+	root := store.String()
 
-	listing, err := listRestorePoints(ctx, runner, root)
+	listing, err := listRestorePoints(ctx, runner, store)
 	if err != nil {
 		// Not fatal: failing a reinit because the restore point directory
 		// could not be listed would block recovery over bookkeeping.
@@ -302,16 +508,16 @@ func sweepRestorePointsForReinit(ctx context.Context, cfg syncConfig, runner rem
 
 	switch cfg.ReplacedDiskAction {
 	case replacedDiskDelete:
-		cmd, err := restorepoint.RemoveRootCommand(root)
+		cmd, err := restorepoint.RemoveStoreCommand(store)
 		if err != nil {
 			return fmt.Errorf("reinit: %w", err)
 		}
 		if _, err := runner.Run(ctx, cmd); err != nil {
 			return fmt.Errorf("reinit: remove restore points in %s: %w", root, err)
 		}
-		trace.Info("reinit: removed the restore points belonging to the replaced replica", "removed", len(listing.Points), "dir", root)
+		trace.Info("reinit: removed the restore points belonging to the replaced replica. Only this target domain's: any other domain replicating into the same directory keeps its own", "removed", len(listing.Points), "domain", cfg.TargetDomain, "dir", root)
 	default:
-		cmd, aside, err := restorepoint.RenameRootCommand(root, time.Now())
+		cmd, aside, err := restorepoint.RenameStoreCommand(store, time.Now())
 		if err != nil {
 			return fmt.Errorf("reinit: %w", err)
 		}
@@ -419,7 +625,7 @@ func targetRunnerForRestorePoints(cfg syncConfig) (remoteRunner, func(), error) 
 	return client, func() { client.Close() }, nil
 }
 
-// restorePointRoot derives the restore point directory from -target-disk-path,
+// restorePointStore derives this target domain's restore point store from
 // for the two READ-ONLY verbs.
 //
 // Deliberately not by asking libvirt what disks the target has: these verbs
@@ -433,16 +639,22 @@ func targetRunnerForRestorePoints(cfg syncConfig) (remoteRunner, func(), error) 
 // looks the domain has already said where its disks are. See that function for
 // why deriving is the more correct answer rather than merely the convenient
 // one.
-func restorePointRoot(cfg syncConfig) (string, error) {
+// It needs -target-domain as well, and that is new: restore points are kept per
+// target domain, so a directory alone no longer names a set. It cannot be
+// defaulted from -source-domain the way a sync's can, because these verbs
+// dispatch before that defaulting happens -- and defaulting it would be worse
+// than refusing anyway, since the domain given here has to be the same string
+// the sync used or the history reads as empty.
+func restorePointStore(cfg syncConfig) (restorepoint.Store, error) {
 	if cfg.TargetDiskPath == "" {
-		return "", fmt.Errorf("-target-disk-path is required to locate restore points; they live in %s inside it. (-restore-restore-point reads it off the target domain instead, but these verbs are built to work on a target whose domain is gone, so they cannot)", restorepoint.DirName)
+		return restorepoint.Store{}, fmt.Errorf("-target-disk-path is required to locate restore points; they live in %s inside it. (-restore-restore-point reads it off the target domain instead, but these verbs are built to work on a target whose domain is gone, so they cannot)", restorepoint.DirName)
 	}
-	return path.Join(cfg.TargetDiskPath, restorepoint.DirName), nil
+	return restorepoint.StoreForDir(cfg.TargetDiskPath, cfg.TargetDomain)
 }
 
 // runListRestorePoints prints what is available to go back to.
 func runListRestorePoints(ctx context.Context, cfg syncConfig) error {
-	root, err := restorePointRoot(cfg)
+	store, err := restorePointStore(cfg)
 	if err != nil {
 		return err
 	}
@@ -452,12 +664,12 @@ func runListRestorePoints(ctx context.Context, cfg syncConfig) error {
 	}
 	defer closeRunner()
 
-	listing, err := listRestorePoints(ctx, client, root)
+	listing, err := listRestorePoints(ctx, client, store)
 	if err != nil {
 		return err
 	}
 	if len(listing.Points) == 0 {
-		trace.Info("no restore points on the target", "dir", root)
+		trace.Info("no restore points on the target for this domain", "domain", cfg.TargetDomain, "dir", store.String())
 	}
 
 	// Oldest first: read top to bottom, this is the history in the order it
@@ -468,12 +680,14 @@ func runListRestorePoints(ctx context.Context, cfg syncConfig) error {
 	fmt.Printf("%-20s  %-20s  %-10s  %s\n", "TAKEN", "CHECKPOINT", "VERIFY", "TAG")
 	for _, tag := range points {
 		verify, checkpoint := "unknown", tag.Checkpoint
-		out, err := client.Run(ctx, restorepoint.ReadStatusCommand(root, tag))
-		if err == nil {
-			if s, derr := restorepoint.DecodeStatus([]byte(out)); derr == nil {
-				verify = s.Verify
-				if s.Checkpoint != "" {
-					checkpoint = s.Checkpoint
+		if cmd, cerr := restorepoint.ReadStatusCommand(store.Point(tag)); cerr == nil {
+			out, rerr := client.Run(ctx, cmd)
+			if rerr == nil {
+				if s, derr := restorepoint.DecodeStatus([]byte(out)); derr == nil {
+					verify = s.Verify
+					if s.Checkpoint != "" {
+						checkpoint = s.Checkpoint
+					}
 				}
 			}
 		}
@@ -492,6 +706,25 @@ func runListRestorePoints(ctx context.Context, cfg syncConfig) error {
 		trace.Warning("an unrecognised entry is present in the restore point directory; vmsync will not touch it", "entry", name)
 	}
 	return nil
+}
+
+// findRestorePoint resolves a tag to a point in this target domain's store, and
+// confirms it is there before anything is written.
+//
+// Separate from just building the Point so that a mistyped tag fails naming the
+// tag, rather than failing later on a missing file -- and so a clone leaves no
+// half-written destination behind.
+func findRestorePoint(ctx context.Context, client remoteRunner, store restorepoint.Store, tag restorepoint.Tag) (restorepoint.Point, error) {
+	listing, err := listRestorePoints(ctx, client, store)
+	if err != nil {
+		return restorepoint.Point{}, err
+	}
+	for _, t := range listing.Points {
+		if t.String() == tag.String() {
+			return store.Point(t), nil
+		}
+	}
+	return restorepoint.Point{}, fmt.Errorf("no restore point %q in %s -- run -list-restore-points to see what is there", tag, store)
 }
 
 // runCloneRestorePoint materialises one restore point's disks somewhere the
@@ -514,7 +747,7 @@ func runCloneRestorePoint(ctx context.Context, cfg syncConfig, tagName, dest str
 	if err != nil {
 		return fmt.Errorf("%w -- run -list-restore-points to see the available tags", err)
 	}
-	root, err := restorePointRoot(cfg)
+	store, err := restorePointStore(cfg)
 	if err != nil {
 		return err
 	}
@@ -527,7 +760,7 @@ func runCloneRestorePoint(ctx context.Context, cfg syncConfig, tagName, dest str
 	// Beside the replica's disks rather than beside the clone: the journal
 	// belongs with the machine this copy was taken FROM, which is what anybody
 	// later asking "where did that second copy come from" is standing in front
-	// of. cfg.TargetDiskPath is required by this verb (restorePointRoot refuses
+	// of. cfg.TargetDiskPath is required by this verb (restorePointStore refuses
 	// without it), so the directory is known.
 	journal := newRecorderInDir(cfg, client, cfg.TargetDiskPath, journalDomainName(cfg))
 	journal.Intent(ctx, journalVerbCloneRestorePoint, map[string]string{
@@ -538,22 +771,16 @@ func runCloneRestorePoint(ctx context.Context, cfg syncConfig, tagName, dest str
 
 	// Confirm it is actually there before writing anything, so a mistyped tag
 	// fails clean instead of leaving an empty destination behind.
-	listing, err := listRestorePoints(ctx, client, root)
+	point, err := findRestorePoint(ctx, client, store, tag)
 	if err != nil {
 		return err
 	}
-	found := false
-	for _, t := range listing.Points {
-		if t.String() == tag.String() {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("no restore point %q in %s -- run -list-restore-points to see what is there", tag, root)
-	}
 
-	out, err := client.Run(ctx, restorepoint.ReadStatusCommand(root, tag))
+	statusCmd, err := restorepoint.ReadStatusCommand(point)
+	if err != nil {
+		return err
+	}
+	out, err := client.Run(ctx, statusCmd)
 	if err != nil {
 		return fmt.Errorf("read the status sidecar of restore point %s: %w", tag, err)
 	}
@@ -573,14 +800,30 @@ func runCloneRestorePoint(ctx context.Context, cfg syncConfig, tagName, dest str
 		return fmt.Errorf("create %s on the target: %w", dest, err)
 	}
 	for _, name := range status.Disks {
+		// A bare name, checked before it is joined onto either end. These come
+		// out of a sidecar on the target -- a file this run did not write and
+		// cannot vouch for -- and both ends of the cp are built from them, so a
+		// sidecar listing "../../etc/passwd" would read outside the restore
+		// point and write outside -clone-to. The restore path applies the same
+		// check in RestoreStageCommand; this one had nothing.
+		if name == "" || name == "." || name == ".." || name != path.Base(name) {
+			return fmt.Errorf("restore point %s lists %q as one of its disks, which is not a bare file name -- refusing to copy it", tag, name)
+		}
 		to := path.Join(dest, name)
-		if _, err := client.Run(ctx, restorepoint.CloneCommand(root, tag, name, to)); err != nil {
+		clone, err := restorepoint.CloneCommand(point, name, to)
+		if err != nil {
+			return err
+		}
+		if _, err := client.Run(ctx, clone); err != nil {
 			return fmt.Errorf("clone %s from restore point %s: %w", name, tag, err)
 		}
 		trace.Info("cloned a restore point disk", "disk", name, "to", to)
 	}
 
-	trace.Info("restore point cloned; the replica and its replication state are untouched", "tag", tag.String(), "disks", len(status.Disks), "dir", dest, "verify", status.Verify)
+	// "from" names the store the copy came out of, so an operator comparing a
+	// clone against a replica later has a way back to it.
+
+	trace.Info("restore point cloned; the replica and its replication state are untouched", "tag", tag.String(), "from", store.String(), "disks", len(status.Disks), "dir", dest, "verify", status.Verify)
 	trace.Info("to inspect it, define a throwaway domain pointing at these files and boot it -- nothing here has changed the replica or its metadata")
 	return nil
 }

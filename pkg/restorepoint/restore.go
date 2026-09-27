@@ -84,13 +84,24 @@ func RestoreTempPath(replicaPath string, stamp int64) string {
 // obvious way to say that and is the wrong one: GNU cp -n SKIPS silently and
 // exits 0, so a collision would look like a successful stage and the promote
 // would then rename a stranger's file onto the replica.
-func RestoreStageCommand(root string, t Tag, disk, tempPath string) (string, error) {
+// It takes a pointRef, so a restore can be staged from this domain's own store
+// or from a point still flat in the shared root. The legacy case is the one an
+// operator reaches for after upgrading a host whose history predates the
+// per-domain layout, and refusing it would destroy the recovery capability the
+// history was kept for -- so it is supported, behind an explicit flag, and
+// never selected by a search order. Whose point it is remains checked by the
+// caller against the sidecar's Source (see checkRestoreIdentity in cmd/vmsync).
+func RestoreStageCommand(p Point, disk, tempPath string) (string, error) {
 	// "." and ".." survive a path.Base round trip unchanged, so the obvious
 	// check alone would accept them and build a cp whose source is a directory.
 	if disk == "" || disk == "." || disk == ".." || disk != path.Base(disk) {
 		return "", fmt.Errorf("restore: %q is not a bare disk name", disk)
 	}
-	src := path.Join(Dir(root, t), disk)
+	dir, err := p.dir()
+	if err != nil {
+		return "", err
+	}
+	src := path.Join(dir, disk)
 	return fmt.Sprintf("if [ -e %s ]; then echo 'restore staging path already exists' >&2; exit 1; fi; cp --reflink=always -- %s %s",
 		shQuote(tempPath), shQuote(src), shQuote(tempPath)), nil
 }

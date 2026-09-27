@@ -53,6 +53,7 @@ import (
 
 	"vmsync/pkg/inventory"
 	"vmsync/pkg/libvirtsync"
+	"vmsync/pkg/restorepoint"
 	"vmsync/pkg/trace"
 	"vmsync/pkg/util"
 	"vmsync/pkg/version"
@@ -620,6 +621,7 @@ func reportLoop(ctx context.Context, client *Client, lv *live, state *sharedStat
 			// UI's outage rather than by anything about the disks.
 			cfg.metrics.setDomains(len(report.Domains), statusCounts(report.Domains))
 			cfg.metrics.setReplicaIncomplete(incompleteReplicaVMs(report.Domains))
+			cfg.metrics.setRestorePoints(restorePointGauges(report.Domains))
 
 			if err := client.SendReport(ctx, report); err != nil {
 				if ctx.Err() != nil {
@@ -943,4 +945,54 @@ func reportFilesystems(in []inventory.Filesystem) []ReportFilesystem {
 		})
 	}
 	return out
+}
+
+// restorePointGauges reduces a report to what each replica's restore point
+// store holds.
+//
+// Taken from the REPORT rather than from a second filesystem walk, for the same
+// reason incompleteReplicaVMs is: the gauge and the console then describe one
+// sweep, and a host publishing numbers that disagree with what an operator is
+// looking at for the same minute is worse than one publishing neither.
+//
+// Only for a TARGET. A source has no store, and publishing a zero for one would
+// make the fleet look half-starved of restore points on every hypervisor that
+// runs production VMs.
+func restorePointGauges(domains []ReportDomain) map[string]restorePointGauge {
+	out := map[string]restorePointGauge{}
+	for _, d := range domains {
+		if d.ReplicaSource == "" {
+			continue
+		}
+		out[d.Name] = restorePointGaugeFor(d.RestorePoints)
+	}
+	return out
+}
+
+// restorePointGaugeFor is the pure reduction, shared by the report path above
+// and by standalone's own inventory sweep, so the two cannot count differently.
+func restorePointGaugeFor(points []ReportRestorePoint) restorePointGauge {
+	var g restorePointGauge
+	for _, p := range points {
+		g.Count++
+		if p.Incomplete {
+			g.Unreadable++
+		}
+		if p.Verify == restorepoint.VerifyFailed {
+			g.VerifyFailed++
+		}
+		// The TAG instant, never CheckpointAtUnix, so this is the same number
+		// the engine publishes as vmsync_restore_point_last_taken_timestamp_seconds.
+		// The two are equal by construction today -- the tag is built from the
+		// same checkpoint instant the sidecar records -- and an alert and a
+		// screen disagreeing about the age of one copy would be worse than
+		// either being slightly off.
+		if p.TakenAtUnix > g.NewestUnix {
+			g.NewestUnix = p.TakenAtUnix
+		}
+		if g.OldestUnix == 0 || p.TakenAtUnix < g.OldestUnix {
+			g.OldestUnix = p.TakenAtUnix
+		}
+	}
+	return g
 }

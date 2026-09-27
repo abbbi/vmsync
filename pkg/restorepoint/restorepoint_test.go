@@ -1,6 +1,7 @@
 package restorepoint
 
 import (
+	"path"
 	"strings"
 	"testing"
 	"time"
@@ -137,33 +138,90 @@ func TestNewTagRefusesAZeroInstant(t *testing.T) {
 // and a match blocks promotion.
 func TestLayoutStaysOutOfThePromotionGlob(t *testing.T) {
 	disk := "/data/replicas/web01-disk0.qcow2"
-	root := Root(disk)
-	if got, want := root, "/data/replicas/.vmsync-rp"; got != want {
-		t.Fatalf("Root(%q) = %q, want %q", disk, got, want)
+	store, err := StoreFor(disk, "web01")
+	if err != nil {
+		t.Fatalf("StoreFor(%q, web01): %v", disk, err)
+	}
+	root, err := store.Path()
+	if err != nil {
+		t.Fatalf("Store.Path: %v", err)
+	}
+	if got, want := root, "/data/replicas/.vmsync-rp/vm-web01"; got != want {
+		t.Fatalf("store for %q = %q, want %q -- a domain's restore points live one level below the shared root, which is what keeps two domains in one directory from sharing a history", disk, got, want)
 	}
 
 	tag := mustTag(t, 1756041600, "vmsync-cpt-000042")
-	for _, p := range []string{
-		Dir(root, tag),
-		StagingDir(root, tag),
-		DiskPath(Dir(root, tag), disk),
-	} {
-		if !strings.HasPrefix(p, root+"/") {
-			t.Errorf("%q escapes the restore point directory", p)
+	p := store.Point(tag)
+	dir, err := p.Dir()
+	if err != nil {
+		t.Fatalf("Point.Dir: %v", err)
+	}
+	staging, err := p.staging()
+	if err != nil {
+		t.Fatalf("Point.staging: %v", err)
+	}
+	for _, candidate := range []string{dir, staging, DiskPath(dir, disk)} {
+		if !strings.HasPrefix(candidate, root+"/") {
+			t.Errorf("%q escapes this domain's restore point directory", candidate)
 		}
 		// The glob is <disk>_* in the disk's OWN directory. Anything one
 		// level down cannot match it, which is the property being pinned.
-		if strings.HasPrefix(p, disk+"_") {
-			t.Errorf("%q would be read as an uncommitted overlay and block promotion", p)
+		if strings.HasPrefix(candidate, disk+"_") {
+			t.Errorf("%q would be read as an uncommitted overlay and block promotion", candidate)
 		}
+	}
+}
+
+// Two domains whose disks sit in one directory must not share a single path.
+// This is the defect CI-06 recorded, asserted at the layout level: everything
+// else in the package is scoped by construction, so if these two agree here,
+// nothing downstream can separate them.
+func TestTwoDomainsInOneDirectoryGetSeparateStores(t *testing.T) {
+	web, err := StoreFor("/data/replicas/web01-disk0.qcow2", "web01")
+	if err != nil {
+		t.Fatalf("StoreFor(web01): %v", err)
+	}
+	db, err := StoreFor("/data/replicas/db01-disk0.qcow2", "db01")
+	if err != nil {
+		t.Fatalf("StoreFor(db01): %v", err)
+	}
+	a, err := web.Path()
+	if err != nil {
+		t.Fatalf("web01 Store.Path: %v", err)
+	}
+	b, err := db.Path()
+	if err != nil {
+		t.Fatalf("db01 Store.Path: %v", err)
+	}
+	if a == b {
+		t.Fatalf("web01 and db01 both address %q: one domain's point would satisfy the other's interval floor, one domain's prune would evict the other's history, and one domain's reinit would delete both", a)
+	}
+	if strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/") {
+		t.Errorf("one domain's store is inside the other's (%q, %q), so a reinit of the outer would take the inner with it", a, b)
+	}
+	// They do share the directory above them, which is what makes the level
+	// below it load-bearing -- and what makes this test exercise the co-located
+	// case at all rather than two unrelated replicas.
+	if path.Dir(a) != path.Dir(b) {
+		t.Errorf("the two stores are not in one shared directory (%q, %q), so this test is not exercising the co-located case", a, b)
+	}
+	if want := "/data/replicas/" + DirName; path.Dir(a) != want {
+		t.Errorf("the shared directory is %q, want %q", path.Dir(a), want)
 	}
 }
 
 func TestDiskPathKeepsTheBasename(t *testing.T) {
 	tag := mustTag(t, 1756041600, "vmsync-cpt-000042")
-	root := Root("/data/replicas/web01-disk0.qcow2")
-	got := DiskPath(Dir(root, tag), "/data/replicas/web01-disk0.qcow2")
-	want := "/data/replicas/.vmsync-rp/1756041600-vmsync-cpt-000042/web01-disk0.qcow2"
+	store, err := StoreFor("/data/replicas/web01-disk0.qcow2", "web01")
+	if err != nil {
+		t.Fatalf("StoreFor: %v", err)
+	}
+	dir, err := store.Point(tag).Dir()
+	if err != nil {
+		t.Fatalf("Point.Dir: %v", err)
+	}
+	got := DiskPath(dir, "/data/replicas/web01-disk0.qcow2")
+	want := "/data/replicas/.vmsync-rp/vm-web01/1756041600-vmsync-cpt-000042/web01-disk0.qcow2"
 	if got != want {
 		t.Errorf("DiskPath = %q, want %q", got, want)
 	}

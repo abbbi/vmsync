@@ -831,6 +831,11 @@ The seven skip reasons:
 | `vmsync_agent_domains` | gauge | `status` | Domains by assessed replication status. |
 | `vmsync_agent_replica_incomplete_vms` | gauge | — | VMs here whose disks a full copy started replacing and never finished. **The one to alert on.** Always emitted, including as a zero: a missing series and a clean host look identical to a query, and one of those is a design choice while the other is a scrape that is not happening. |
 | `vmsync_agent_replica_incomplete` | gauge | `vm` | 1 while that VM carries the marker. The count above says *whether*; this says *which* — and which is what an operator needs before a failover, because `-promote` will refuse exactly these. |
+| `vmsync_agent_restore_points` | gauge | `vm` | Restore points that replica holds in its own per-domain store, including any whose record cannot be read. Emitted for every replica here, at zero included: a series that appears only once a replica *has* copies can never alert on its having none. |
+| `vmsync_agent_restore_points_unreadable` | gauge | `vm` | How many of those have an unreadable record. Counted above as well, because the directory is the inventory — but a restore from one is refused, so this is the gap between what the store holds and what can be used. |
+| `vmsync_agent_restore_points_verify_failed` | gauge | `vm` | How many recorded a FAILED verification. Not a reason to delete them — they may be the only copies from before the damage — but a replica where this equals the count above has no copy that was ever shown to be clean. |
+| `vmsync_agent_restore_point_newest_timestamp_seconds` | gauge | `vm` | The instant the newest copy's contents correspond to. The same value the engine publishes as `vmsync_restore_point_last_taken_timestamp_seconds`, so a dashboard and an alert cannot disagree about the age of one copy. |
+| `vmsync_agent_restore_point_oldest_timestamp_seconds` | gauge | `vm` | The oldest. `time() -` this is how far back that replica can actually be taken, which is the only restore-point number an operator reaches for during an incident. |
 
 **Control plane**
 
@@ -1281,7 +1286,7 @@ that a value the agent accepts is one vmsync will accept:
 | `verify` | `""`, `"fast"`, `"full"`, `"qemu-img"`. All three compare against the same frozen source snapshot the copy read from; only `qemu-img` suspends the source, and only to keep the snapshot's scratch space empty. |
 | `verify_failure_reinit` | boolean, default `false`. Answers a verification failure with one full recopy and a second verification. If that also fails, the replica is recorded as faulty on its own domain XML: later syncs into it are refused, and a promotion is refused too unless `-force-promote` is passed, until a human clears it. Refused without `verify`. Worth setting here even though vmsync defaults it off — a one-off run has an operator to decide what to do about a mismatch, a scheduled one does not, and without it the next run syncs straight over the finding. |
 | `reinit_after_failures` | 0 to disable, otherwise up to 100 |
-| `target_disk_path` | absolute and clean |
+| `target_disk_path` | absolute and clean. Two VMs may share one, and their restore points stay independent (kept per target domain under `.vmsync-rp/vm-<domain>/`) — but the replica file is named after the *source* disk's basename, so two sources whose disks are both `disk0.qcow2` would derive the same replica path and overwrite each other. Give each pair its own directory unless you know the basenames differ. |
 | `timestamp_tolerance_sec` | 0 to compare exactly, otherwise up to 3600 |
 | `retention` | `"<count>,<interval>"`, e.g. `"24,3h"`. Empty keeps no restore points, so an estate run entirely through the schedule takes none. |
 | `source_port_range`, `target_port_range` | a range (`20000-20100`), or one fixed port to pin it. Both **default to a range**, so leaving these empty is right for almost every profile — and is what makes two concurrent syncs on one host not collide. They used to default to a single fixed port, and since nothing here or in the UI ever set them, every VM in an estate shared it. |

@@ -23,6 +23,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"vmsync/pkg/restorepoint"
 )
 
 // checkPrometheusText is a strict reader of the text exposition format,
@@ -268,5 +270,99 @@ func TestIncompleteReplicaVMs(t *testing.T) {
 	}
 	if n := len(incompleteReplicaVMs(nil)); n != 0 {
 		t.Errorf("incompleteReplicaVMs(nil) returned %d entries", n)
+	}
+}
+
+// A replica with no restore points must still produce a gauge, because the
+// series has to exist before the alert window that reads it does. A series that
+// appears only once a replica HAS restore points can never fire "this replica
+// has none".
+func TestRestorePointGaugesArePublishedAtZeroForAReplicaWithNone(t *testing.T) {
+	g := restorePointGaugeFor(nil)
+	if g.Count != 0 || g.NewestUnix != 0 || g.OldestUnix != 0 {
+		t.Errorf("an empty store gave %+v, want zeroes", g)
+	}
+
+	// And they are published for every TARGET, including that one -- while a
+	// source is left out entirely, since it has no store and a zero for one
+	// would read as a starved replica on every hypervisor running production
+	// VMs.
+	got := restorePointGauges([]ReportDomain{
+		{Name: "web01", ReplicaSource: "prod01:web01"},
+		{Name: "db01", ReplicaSource: "prod01:db01", RestorePoints: []ReportRestorePoint{
+			{Tag: "1756041600-vmsync-cpt-000042", TakenAtUnix: 1756041600},
+		}},
+		{Name: "app01"}, // a source: no replica_source
+	})
+	if _, ok := got["web01"]; !ok {
+		t.Error("a target with no restore points was left out, so no alert could ever fire on its depth being zero")
+	}
+	if got["db01"].Count != 1 {
+		t.Errorf("db01 Count = %d, want 1", got["db01"].Count)
+	}
+	if _, ok := got["app01"]; ok {
+		t.Error("a source was given a restore point gauge; it has no store, and a zero for one reads as a fault")
+	}
+}
+
+// renderWithRestorePoints renders one metrics file for a host holding the given
+// replicas' restore point stores.
+func renderWithRestorePoints(vms map[string]restorePointGauge) string {
+	m := newAgentMetrics("test", "hyper02p", modeStandalone)
+	m.setRestorePoints(vms)
+	return m.render(CachedConfig{}, nil, 0, time.Unix(1_800_000_000, 0))
+}
+
+// Every restore-point family must declare HELP and TYPE exactly once while
+// carrying one sample line per replica, and every replica must appear even at
+// zero.
+//
+// Two separate failures are being kept out. A second HELP line for one family
+// makes node_exporter reject the ENTIRE textfile -- so two replicas on one host
+// would have taken down every metric this agent publishes, including the ones
+// being alerted on, while the file still looked fine read by eye. And a series
+// that only appears once a replica HAS restore points cannot carry a `for:`
+// clause over a window beginning before it did, so the alert for "this replica
+// has stopped taking them" could never fire.
+func TestRenderRestorePointGauges(t *testing.T) {
+	body := renderWithRestorePoints(map[string]restorePointGauge{
+		"web01": {Count: 24, Unreadable: 1, VerifyFailed: 1, NewestUnix: 1756052400, OldestUnix: 1756041600},
+		"db01":  {},
+	})
+	checkPrometheusText(t, body)
+
+	families := []string{
+		"vmsync_agent_restore_points",
+		"vmsync_agent_restore_points_unreadable",
+		"vmsync_agent_restore_points_verify_failed",
+		"vmsync_agent_restore_point_newest_timestamp_seconds",
+		"vmsync_agent_restore_point_oldest_timestamp_seconds",
+	}
+	for _, name := range families {
+		if n := strings.Count(body, "# HELP "+name+" "); n != 1 {
+			t.Errorf("%s declares HELP %d times, want exactly 1: node_exporter rejects the whole file otherwise and every series in it vanishes", name, n)
+		}
+		for _, vm := range []string{"web01", "db01"} {
+			want := fmt.Sprintf("%s{host=%q,vm=%q} ", name, "hyper02p", vm)
+			if !strings.Contains(body, want) {
+				t.Errorf("%s has no sample line for %s", name, vm)
+			}
+		}
+	}
+
+	// The replica with nothing is published as zero, not omitted.
+	if !strings.Contains(body, `vmsync_agent_restore_points{host="hyper02p",vm="db01"} 0`) {
+		t.Error("a replica with no restore points was not published at zero, so no alert could ever fire on its depth")
+	}
+}
+
+// A host with no replicas at all emits no restore-point families -- and the file
+// stays valid, which is the thing that would break if the block were written
+// with the per-metric helper instead of one HELP followed by its samples.
+func TestRenderWithNoRestorePointsIsStillValid(t *testing.T) {
+	body := renderWithRestorePoints(nil)
+	checkPrometheusText(t, body)
+	if strings.Contains(body, "vmsync_agent_restore_points") {
+		t.Error("a host with no replicas published restore point series")
 	}
 }

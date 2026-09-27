@@ -830,7 +830,7 @@ func main() {
 		// Said out loud on every run that asks for it. A feature whose whole
 		// value is "there will be a copy to go back to tomorrow" should never
 		// be something an operator has to infer from the absence of errors.
-		trace.Info("restore points enabled", "retention", cfg.RetentionPolicy.String(), "keep", cfg.RetentionPolicy.Count, "interval", cfg.RetentionPolicy.Interval.String())
+		trace.Info("restore points enabled", "retention", cfg.RetentionPolicy.String(), "keep", cfg.RetentionPolicy.Count, "interval", cfg.RetentionPolicy.Interval.String(), "kept_per", "target domain")
 	}
 
 	// Fault injection, off in every real run. Validated before anything else
@@ -2400,6 +2400,22 @@ func run(cfg syncConfig) (runErr error) {
 	var checksumDecided bool
 	var checksumBytes uint64
 
+	// What this run will publish about its restore points, guarded by metricsMu
+	// for the same reason as everything above it: the signal handler writes the
+	// textfile from its own goroutine and can reach it at any point, including
+	// while the retention path is filling this in.
+	//
+	// Kept here rather than read off the restorePoints value directly, because
+	// that value does not exist until well into the run and a forced shutdown
+	// before then must still publish an honest "undetermined" rather than race
+	// on a pointer being assigned.
+	var restorePointsStats restorePointStats
+	setRestorePointStats := func(s restorePointStats) {
+		metricsMu.Lock()
+		restorePointsStats = s
+		metricsMu.Unlock()
+	}
+
 	// writeMetricsTextfile is called from two places: the deferred call
 	// below (the normal return path, any outcome) and the signal handler
 	// further down (which calls os.Exit directly on a forced shutdown --
@@ -2443,6 +2459,7 @@ func run(cfg syncConfig) (runErr error) {
 			srcBridgeRecv = sourceBridgeCounters.ReceivedSnapshot()
 			srcBridgeSent = sourceBridgeCounters.SentSnapshot()
 		}
+		rps := restorePointsStats
 		metricsMu.Unlock()
 		now := time.Now().Unix()
 		run := metrics.RunMetric{
@@ -2489,6 +2506,39 @@ func run(cfg syncConfig) (runErr error) {
 			ChecksumRan:   checksumRan,
 			ChecksumState: checksumState,
 			ChecksumBytes: checksumChecked,
+
+			// Restore points. RetentionAsked comes from configuration rather
+			// than from rps, so it is true even on a run refused before the
+			// retention decision -- which is exactly the run whose silence
+			// would otherwise be indistinguishable from a host not using the
+			// feature at all.
+			TargetVM:                           cfg.TargetDomain,
+			RetentionAsked:                     cfg.RetentionPolicy.Enabled(),
+			RestorePointsListed:                rps.Listed,
+			RestorePointOutcome:                rps.Outcome,
+			RestorePointsPolicyCount:           rps.PolicyCount,
+			RestorePointsPolicyIntervalSeconds: rps.PolicyInterval,
+			RestorePointsStoreReadable:         rps.Listed,
+			RestorePointOverdueSeconds:         rps.OverdueSeconds,
+			RestorePoints:                      rps.Count,
+			RestorePointsOverCount:             rps.Over,
+			RestorePointsStaging:               rps.Staging,
+			RestorePointNewestUnix:             rps.Newest,
+			RestorePointOldestUnix:             rps.Oldest,
+			RestorePointsLegacyFlat:            rps.LegacyFlat,
+			RestorePointStoreDomains:           rps.Stores,
+		}
+		// A run with -retention that never reached the decision reports
+		// undetermined rather than an empty label value, which would render a
+		// fifth outcome series nothing alerts on.
+		if run.RetentionAsked && run.RestorePointOutcome == "" {
+			run.RestorePointOutcome = metrics.RestorePointUndetermined
+		}
+		// PolicyCount and PolicyInterval are published even then, because they
+		// come from the flag and are true whatever the run did.
+		if run.RetentionAsked && !rps.Listed {
+			run.RestorePointsPolicyCount = cfg.RetentionPolicy.Count
+			run.RestorePointsPolicyIntervalSeconds = cfg.RetentionPolicy.Interval.Seconds()
 		}
 		if err := metrics.WriteTextfile(cfg.PrometheusTextfile, disksSnapshot, run); err != nil {
 			trace.Warning("failed to write prometheus textfile", "path", cfg.PrometheusTextfile, "error", err)
@@ -6259,10 +6309,16 @@ func run(cfg syncConfig) (runErr error) {
 	stampMu.Lock()
 	stampDisks = stamps
 	stampMu.Unlock()
-	rp, err := newRestorePoints(ctx, cfg.RetentionPolicy, targetSSHClient, targetDiskPaths, checkpointName, checkpointAt)
+	rp, err := newRestorePoints(ctx, cfg.RetentionPolicy, targetSSHClient, targetDiskPaths, cfg.TargetDomain, checkpointName, checkpointAt)
 	if err != nil {
 		return err
 	}
+	// Published as soon as the decision is taken, not only after a point is
+	// committed. A run that found one was due and then died copying disks must
+	// report overdue -- reporting nothing would leave the previous run's
+	// healthy-looking numbers standing in the textfile, which persists between
+	// runs. rp.commit() replaces this with the taken outcome.
+	setRestorePointStats(rp.snapshot())
 
 	// Per-disk state that has to survive the barrier: phase two needs what
 	// phase one measured, and the metric spans both.
@@ -6621,10 +6677,15 @@ func run(cfg syncConfig) (runErr error) {
 	if cfg.Verify != "" {
 		verifyState = restorepoint.VerifyPassed
 	}
-	if err := rp.commit(ctx, verifyState,
+	rpErr := rp.commit(ctx, verifyState,
 		util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName)+":"+cfg.SourceDomain,
-		checkpointAt, effectiveCheckpoint); err != nil {
-		return err
+		checkpointAt, effectiveCheckpoint)
+	// Before the error check: commit records what it published and what the
+	// prune left behind, and a publish that succeeded followed by a prune that
+	// did not is exactly the state worth reporting.
+	setRestorePointStats(rp.snapshot())
+	if rpErr != nil {
+		return rpErr
 	}
 	// Re-read the target's role and re-check it here, immediately before the
 	// redefine, rather than trusting the read at the top of run().

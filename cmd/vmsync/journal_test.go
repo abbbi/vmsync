@@ -121,7 +121,13 @@ func journalTestConfig() syncConfig {
 // renames the restore point set aside, an interrupted reinit leaves no record
 // of itself anywhere.
 func TestTheSyncIntentReachesTheTargetBeforeAnythingIsDisplaced(t *testing.T) {
-	runner := &recordingRunner{listing: "__VMSYNC_RP_LIST__\n1756041600-vmsync-cpt-000042\n"}
+	// The trailing slash is not decoration. The listing command is `ls -1Ap`,
+	// which marks directories, and ParseListing reports an unmarked entry as
+	// Unknown however it is named -- so without it this fixture yields no points
+	// and no staging, the reinit sweep returns early having displaced nothing,
+	// and the test dies at its own "displaced nothing" guard instead of checking
+	// the ordering it exists for.
+	runner := &recordingRunner{listing: "__VMSYNC_RP_LIST__\n1756041600-vmsync-cpt-000042/\n"}
 	cfg := journalTestConfig()
 	cfg.Reinit = true
 
@@ -140,10 +146,10 @@ func TestTheSyncIntentReachesTheTargetBeforeAnythingIsDisplaced(t *testing.T) {
 	if appendAt != 0 {
 		t.Fatalf("the journal append is command %d of %v; it must be the first thing this sync sends to the target", appendAt, runner.commands)
 	}
-	// restorepoint.AsideSuffix, not "mv": the journal's own append command
+	// restorepoint.AsidePrefix, not "mv": the journal's own append command
 	// rotates with mv too, so matching on the verb would find the journal and
 	// this test would pass while proving nothing.
-	displaceAt := runner.indexOfCommand(restorepoint.AsideSuffix)
+	displaceAt := runner.indexOfCommand(restorepoint.AsidePrefix)
 	if displaceAt < 0 {
 		t.Fatalf("the sweep displaced nothing, so this test proves nothing about ordering: %v", runner.commands)
 	}

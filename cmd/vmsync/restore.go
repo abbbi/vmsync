@@ -60,8 +60,13 @@ import (
 type restorePlan struct {
 	tag    restorepoint.Tag
 	status restorepoint.Status
-	root   string
-	dir    string
+	// store is this TARGET DOMAIN's restore point store, and point is the one
+	// being restored from.
+	store restorepoint.Store
+	point restorepoint.Point
+	// root is the store's path, for messages only.
+	root string
+	dir  string
 	// replicaDir is the directory the replica's disks live in -- taken from
 	// -target-disk-path when given, otherwise read off the domain itself. Kept
 	// on the plan rather than passed around so every message names the
@@ -121,11 +126,11 @@ func runRestoreRestorePoint(ctx context.Context, cfg syncConfig, tagName string)
 		return err
 	}
 
-	replicaDir, root, err := restoreRootFor(cfg, plan)
+	replicaDir, store, err := restoreRootFor(cfg, plan)
 	if err != nil {
 		return err
 	}
-	plan.replicaDir, plan.root, plan.dir = replicaDir, root, restorepoint.Dir(root, tag)
+	plan.replicaDir, plan.store = replicaDir, store
 
 	client, closeRunner, err := targetRunnerForRestorePoints(cfg)
 	if err != nil {
@@ -193,27 +198,32 @@ func runRestoreRestorePoint(ctx context.Context, cfg syncConfig, tagName string)
 // already told us where its disks are.
 //
 // Deriving is also MORE correct than the flag, not merely more convenient. The
-// sync path puts restore points at restorepoint.Root(the actual disk path);
-// the verbs look in path.Join(-target-disk-path, DirName). Those agree only
-// when the flag names the directory the disks are really in -- so a sync run
-// WITHOUT -target-disk-path (target path defaults to the source's own) takes
-// restore points the verbs then cannot find. Reading the path back off the
-// domain uses the same rule the sync used, whatever the flags were.
+// sync path builds its store with restorepoint.StoreFor(the actual disk path,
+// target domain); the read-only verbs build theirs with StoreForDir(
+// -target-disk-path, target domain). Those agree only when the flag names the
+// directory the disks are really in -- so a sync run WITHOUT -target-disk-path
+// (target path defaults to the source's own) takes restore points the verbs
+// then cannot find. Reading the path back off the domain uses the same rule the
+// sync used, whatever the flags were.
+//
+// The DOMAIN half of that coordinate is not optional either way: restore points
+// are kept per target domain, so a directory alone names no set.
 //
 // An explicit flag still wins, so an operator can point at a directory
 // deliberately; checkRestoreIdentity then verifies it against this same domain
 // and refuses if they disagree.
-func restoreRootFor(cfg syncConfig, plan restorePlan) (replicaDir, root string, err error) {
+func restoreRootFor(cfg syncConfig, plan restorePlan) (replicaDir string, store restorepoint.Store, err error) {
 	if cfg.TargetDiskPath != "" {
-		return cfg.TargetDiskPath, path.Join(cfg.TargetDiskPath, restorepoint.DirName), nil
+		store, err = restorepoint.StoreForDir(cfg.TargetDiskPath, cfg.TargetDomain)
+		return cfg.TargetDiskPath, store, err
 	}
 
 	disks, err := disk.ParseQcowDisks(plan.domXML)
 	if err != nil {
-		return "", "", fmt.Errorf("read the disks of target domain %s to locate its restore points: %w -- or name the directory with -target-disk-path", cfg.TargetDomain, err)
+		return "", restorepoint.Store{}, fmt.Errorf("read the disks of target domain %s to locate its restore points: %w -- or name the directory with -target-disk-path", cfg.TargetDomain, err)
 	}
 	if len(disks) == 0 {
-		return "", "", fmt.Errorf("target domain %s lists no qcow2 disks, so there is nowhere for its restore points to be -- name the directory with -target-disk-path if they are somewhere else", cfg.TargetDomain)
+		return "", restorepoint.Store{}, fmt.Errorf("target domain %s lists no qcow2 disks, so there is nowhere for its restore points to be -- name the directory with -target-disk-path if they are somewhere else", cfg.TargetDomain)
 	}
 
 	// A restore point is a SET, and a set only exists if the disks share a
@@ -224,12 +234,13 @@ func restoreRootFor(cfg syncConfig, plan restorePlan) (replicaDir, root string, 
 	replicaDir = path.Dir(disks[0].Source)
 	for _, d := range disks[1:] {
 		if other := path.Dir(d.Source); other != replicaDir {
-			return "", "", fmt.Errorf("target domain %s keeps its disks in more than one directory (%s and %s), so it has no single restore point set -- -retention refuses such a domain for the same reason; name the directory with -target-disk-path if you know where to look",
+			return "", restorepoint.Store{}, fmt.Errorf("target domain %s keeps its disks in more than one directory (%s and %s), so it has no single restore point set -- -retention refuses such a domain for the same reason; name the directory with -target-disk-path if you know where to look",
 				cfg.TargetDomain, replicaDir, other)
 		}
 	}
 	trace.Debug("located the restore points from the target domain's own disks", "vm", cfg.TargetDomain, "dir", replicaDir)
-	return replicaDir, restorepoint.Root(disks[0].Source), nil
+	store, err = restorepoint.StoreFor(disks[0].Source, cfg.TargetDomain)
+	return replicaDir, store, err
 }
 
 // acquireTargetRunLock takes the target-side run lock, whichever side of the
@@ -378,22 +389,20 @@ func loadRestorePlan(ctx context.Context, client remoteRunner, cfg syncConfig, p
 	replicaDir := plan.replicaDir
 	// Confirm the tag is really there before reading anything out of it, so a
 	// mistyped tag fails naming the tag rather than naming a missing file.
-	listing, err := listRestorePoints(ctx, client, plan.root)
+	point, err := findRestorePoint(ctx, client, plan.store, plan.tag)
 	if err != nil {
 		return err
 	}
-	found := false
-	for _, t := range listing.Points {
-		if t.String() == plan.tag.String() {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("no restore point %q in %s -- run -list-restore-points to see what is there", plan.tag, plan.root)
+	plan.point, plan.root = point, plan.store.String()
+	if plan.dir, err = point.Dir(); err != nil {
+		return err
 	}
 
-	out, err := client.Run(ctx, restorepoint.ReadStatusCommand(plan.root, plan.tag))
+	statusCmd, err := restorepoint.ReadStatusCommand(point)
+	if err != nil {
+		return err
+	}
+	out, err := client.Run(ctx, statusCmd)
 	if err != nil {
 		return fmt.Errorf("read the status sidecar of restore point %s: %w", plan.tag, err)
 	}
@@ -615,7 +624,7 @@ func applyRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.
 		}
 	}
 	for i, name := range plan.status.Disks {
-		cmd, err := restorepoint.RestoreStageCommand(plan.root, plan.tag, name, plan.temps[i])
+		cmd, err := restorepoint.RestoreStageCommand(plan.point, name, plan.temps[i])
 		if err != nil {
 			discardStaged()
 			return fmt.Errorf("restore: %w", err)

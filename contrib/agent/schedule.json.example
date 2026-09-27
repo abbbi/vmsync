@@ -38,7 +38,7 @@
         "netbuffer": "128k,1G",
         "io_depth": 16,
         "verify": "full",
-        "target_disk_path": "/data/replicas",
+        "target_disk_path": "/data/replicas/db01",
         "retention": "48,3h"
       }
     }

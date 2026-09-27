@@ -147,6 +147,39 @@ type agentMetrics struct {
 	// other number it publishes about such a domain -- its status, its last
 	// sync -- describes the sync BEFORE the interrupted rebuild.
 	incompleteVMs map[string]bool
+
+	// restorePoints is what each replica on this host can be rolled back to.
+	//
+	// The fleet half of the restore-point metrics, and the half that answers
+	// the question the engine's per-run file cannot: that file is rewritten by
+	// each invocation, so it describes the last RUN, while an operator during an
+	// incident is asking about the STORE -- how deep it is and how far back it
+	// goes. It is also the only source for a pair whose syncs are not running at
+	// all, which is precisely when the depth stops growing.
+	//
+	// Replaced wholesale from one complete sweep, like the two sets above, so a
+	// replica that goes away stops being reported instead of latching forever.
+	restorePointVMs map[string]restorePointGauge
+}
+
+// restorePointGauge is one replica's restore point store, reduced to numbers.
+type restorePointGauge struct {
+	// Count is published restore points in this domain's own store:
+	// directories, including any whose sidecar cannot be read.
+	Count int
+	// Unreadable is how many of Count have a sidecar that could not be read.
+	// Count minus this is the depth that is provably restorable, which is why
+	// both are published rather than one netted figure.
+	Unreadable int
+	// VerifyFailed is how many recorded a FAILED verification. Not a reason to
+	// discard them -- they may still be the only copies from before the damage
+	// -- but an operator choosing one needs to know, and "every copy I have
+	// failed verification" is worth an alert of its own.
+	VerifyFailed int
+	// NewestUnix and OldestUnix are the tag instants of the extremes, zero when
+	// there are none.
+	NewestUnix int64
+	OldestUnix int64
 }
 
 // setSplitBrain replaces the whole set from one complete sweep.
@@ -185,6 +218,23 @@ func (m *agentMetrics) setReplicaIncomplete(vms map[string]bool) {
 	m.incompleteVMs = make(map[string]bool, len(vms))
 	for vm := range vms {
 		m.incompleteVMs[vm] = true
+	}
+}
+
+// setRestorePoints replaces the whole map from one complete sweep, for the same
+// reason setSplitBrain and setReplicaIncomplete do: replacing is what lets a
+// replica that has gone away -- inverted, removed, failed over -- stop being
+// reported, where a merge would keep publishing an age that never advances for a
+// store nothing writes to any more.
+func (m *agentMetrics) setRestorePoints(vms map[string]restorePointGauge) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.restorePointVMs = make(map[string]restorePointGauge, len(vms))
+	for vm, g := range vms {
+		m.restorePointVMs[vm] = g
 	}
 }
 
@@ -468,6 +518,11 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	split := len(m.splitBrainVMs)
 	splitVMs := sortedKeys(m.splitBrainVMs)
 	incompleteVMs := sortedKeys(m.incompleteVMs)
+	rpVMs := sortedKeys(m.restorePointVMs)
+	rpGauges := make(map[string]restorePointGauge, len(m.restorePointVMs))
+	for vm, gg := range m.restorePointVMs {
+		rpGauges[vm] = gg
+	}
 	m.mu.Unlock()
 
 	g("vmsync_agent_split_brain_vms", "VMs running on this host that a peer reports having been failed over from. Non-zero means one VM is live in two places; alert on it.", split, "")
@@ -520,6 +575,41 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 		fmt.Fprintf(&b, "# HELP vmsync_agent_replica_incomplete 1 while a replica on this host carries an interrupted full rebuild (replica_incomplete). It clears by itself when a sync completes, because the define that records the sync clears the marker.\n# TYPE vmsync_agent_replica_incomplete gauge\n")
 		for _, vm := range incompleteVMs {
 			fmt.Fprintf(&b, "vmsync_agent_replica_incomplete{host=%q,vm=%q} 1\n", host, vm)
+		}
+	}
+
+	// --- restore points ---------------------------------------------------
+	//
+	// The fleet view of what each replica can be rolled back to. The engine's
+	// own textfile describes the last RUN and is rewritten by the next one;
+	// these describe the STORE, and they keep describing it when no sync is
+	// running at all -- which is exactly when the depth stops growing and
+	// nothing else notices.
+	//
+	// Emitted for every replica INCLUDING at zero, and that is the point: a
+	// series that appears only once a replica has restore points cannot carry a
+	// `for:` clause over a window that starts before it did, so the alert for
+	// "this replica has none" could never fire. Gated on being a target, because
+	// a source has no store and a zero for one would read as a fault.
+	//
+	// One HELP and TYPE per family, then one sample line per VM, for the reason
+	// spelled out at the split-brain gauge above: g() per VM would emit a second
+	// HELP for one family and node_exporter would reject the entire file.
+	if len(rpVMs) > 0 {
+		for _, fam := range []struct {
+			name, help string
+			value      func(restorePointGauge) int64
+		}{
+			{"vmsync_agent_restore_points", "How many restore points each replica on this host holds in its own per-domain store. Directories, including any whose sidecar cannot be read -- subtract vmsync_agent_restore_points_unreadable for the depth that is provably restorable. Zero for a replica with -retention configured means the history has stopped growing: alert on it together with the engine's vmsync_restore_point_overdue_seconds.", func(g restorePointGauge) int64 { return int64(g.Count) }},
+			{"vmsync_agent_restore_points_unreadable", "How many of a replica's restore points have a sidecar that could not be read. Still counted in vmsync_agent_restore_points, because the directory is the inventory -- but a restore from one is refused, so this is the gap between what the store holds and what can actually be used.", func(g restorePointGauge) int64 { return int64(g.Unreadable) }},
+			{"vmsync_agent_restore_points_verify_failed", "How many of a replica's restore points recorded a FAILED verification. Not a reason to delete them -- they may be the only copies from before the damage -- but an operator choosing one must know, and a replica where this equals vmsync_agent_restore_points has no copy that was ever shown to be clean.", func(g restorePointGauge) int64 { return int64(g.VerifyFailed) }},
+			{"vmsync_agent_restore_point_newest_timestamp_seconds", "The instant the NEWEST restore point's contents correspond to, per replica. The tag instant, the same value the engine publishes as vmsync_restore_point_last_taken_timestamp_seconds, so a dashboard and an alert cannot disagree about the age of one copy. Zero when there are none.", func(g restorePointGauge) int64 { return g.NewestUnix }},
+			{"vmsync_agent_restore_point_oldest_timestamp_seconds", "The instant the OLDEST restore point's contents correspond to, per replica. time() minus this is how far back the replica can actually be taken, which is the number an operator reaches for during an incident. Zero when there are none.", func(g restorePointGauge) int64 { return g.OldestUnix }},
+		} {
+			fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s gauge\n", fam.name, fam.help, fam.name)
+			for _, vm := range rpVMs {
+				fmt.Fprintf(&b, "%s{host=%q,vm=%q} %d\n", fam.name, host, vm, fam.value(rpGauges[vm]))
+			}
 		}
 	}
 
@@ -592,13 +682,18 @@ func metricsLoop(ctx context.Context, lv *live, state *sharedState, sched *Sched
 		// ceiling in a single file always come from the same generation.
 		cfg := *lv.get()
 		if scanInventory {
-			if total, byStatus, incomplete, err := scanDomainStatus(cfg); err == nil {
-				m.setDomains(total, byStatus)
+			if scan, err := scanDomainStatus(cfg); err == nil {
+				m.setDomains(scan.total, scan.byStatus)
 				// From the same sweep, so the two can never describe
 				// different moments -- and so a standalone host, which has
 				// no console to show a report on, still publishes the one
 				// signal that a replica's disks are a partial copy.
-				m.setReplicaIncomplete(incomplete)
+				m.setReplicaIncomplete(scan.incomplete)
+				// Likewise the restore point depth. A standalone host is the
+				// one place these numbers have no other route out: there is
+				// no control plane to send a report to, so without this a
+				// replica quietly taking no restore points is invisible.
+				m.setRestorePoints(scan.restorePoints)
 			}
 		}
 		if err := m.writeMetrics(cfg.PrometheusDir, state.get(), sched, cfg.MaxConcurrentSyncs, time.Now()); err != nil {
@@ -621,30 +716,46 @@ func metricsLoop(ctx context.Context, lv *live, state *sharedState, sched *Sched
 	}
 }
 
-// scanDomainStatus inventories the host and counts domains by assessed
-// status, and names the ones carrying an interrupted full rebuild.
+// inventoryScan is one sweep of this host, reduced to what the metrics need.
+//
+// A struct rather than a list of unnamed returns: it gained a fourth reading and
+// the call site was assigning positionally, which is how a feeder comes to
+// publish the right numbers under the wrong name.
+//
+// The incomplete set is carried by NAME rather than folded into the status
+// counts, because the alert an operator writes is about a specific VM: "one
+// of your replicas is a partial copy" without saying which is an alert that
+// cannot be acted on at 3am. restorePoints is per VM for the same reason.
+type inventoryScan struct {
+	total         int
+	byStatus      map[string]int
+	incomplete    map[string]bool
+	restorePoints map[string]restorePointGauge
+}
+
+// scanDomainStatus inventories the host: domains counted by assessed status, the
+// ones carrying an interrupted full rebuild named, and each replica's restore
+// point depth.
 //
 // Only used in standalone mode. With a control plane, reportLoop already
 // scans on its own interval and feeds the result in, so doing it here as
 // well would double the libvirt work for the same numbers.
-//
-// The incomplete set is returned by NAME rather than folded into the status
-// counts, because the alert an operator writes is about a specific VM: "one
-// of your replicas is a partial copy" without saying which is an alert that
-// cannot be acted on at 3am.
-func scanDomainStatus(cfg agentConfig) (int, map[string]int, map[string]bool, error) {
+func scanDomainStatus(cfg agentConfig) (inventoryScan, error) {
 	mgr, err := libvirtsync.Connect(cfg.LibvirtURI)
 	if err != nil {
-		return 0, nil, nil, err
+		return inventoryScan{}, err
 	}
 	defer mgr.Close()
 
+	// inventory.Scan fills RestorePoints as part of describing each domain, so
+	// the depth below costs no extra walk -- see pkg/inventory/restorepoints.go.
 	domains, err := inventory.Scan(mgr)
 	if err != nil {
-		return 0, nil, nil, err
+		return inventoryScan{}, err
 	}
 	byStatus := map[string]int{}
 	incomplete := map[string]bool{}
+	restorePoints := map[string]restorePointGauge{}
 	now := time.Now()
 	for _, d := range domains {
 		// Presence is the state, exactly as pkg/inventory documents it: any
@@ -664,8 +775,16 @@ func scanDomainStatus(cfg agentConfig) (int, map[string]int, map[string]bool, er
 		// draw them from. Freshness is then simply not judged, rather than
 		// judged against a number invented locally.
 		byStatus[inventory.Assess(d, now, 0).Status.String()]++
+
+		// Through the same reduction the report path uses, fed by the same
+		// conversion, so a standalone host and a controlled one cannot count a
+		// store differently. Targets only: a source has no store, and a zero
+		// for one would read as a starved replica.
+		if d.IsTarget() {
+			restorePoints[d.Name] = restorePointGaugeFor(reportRestorePoints(d.RestorePoints))
+		}
 	}
-	return len(domains), byStatus, incomplete, nil
+	return inventoryScan{total: len(domains), byStatus: byStatus, incomplete: incomplete, restorePoints: restorePoints}, nil
 }
 
 // statusCounts tallies a report's domains by status, for the gauge.

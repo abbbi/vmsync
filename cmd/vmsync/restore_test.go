@@ -214,19 +214,38 @@ func TestRestoreRootForDerivesFromTheDomainWhenTheFlagIsAbsent(t *testing.T) {
 	cfg := restoreTestCfg()
 	cfg.TargetDiskPath = ""
 
-	replicaDir, root, err := restoreRootFor(cfg, restoreTestPlan(t))
+	replicaDir, store, err := restoreRootFor(cfg, restoreTestPlan(t))
 	if err != nil {
 		t.Fatalf("restoreRootFor: %v", err)
 	}
 	if replicaDir != "/data/replicas" {
 		t.Errorf("replicaDir = %q, want /data/replicas", replicaDir)
 	}
-	// The SAME rule the sync path uses, restorepoint.Root(actual disk path) --
-	// not path.Join(flag, DirName). Those agree only when the flag names the
-	// directory the disks are really in, so a sync run without the flag takes
-	// restore points the verbs cannot find.
-	if want := restorepoint.Root("/data/replicas/web01.qcow2"); root != want {
-		t.Errorf("root = %q, want %q (the same expression the sync path uses)", root, want)
+	// The SAME rule the sync path uses, StoreFor(actual disk path, target
+	// domain) -- not StoreForDir(flag, …). Those agree only when the flag names
+	// the directory the disks are really in, so a sync run without the flag
+	// takes restore points the verbs cannot find.
+	want, err := restorepoint.StoreFor("/data/replicas/web01.qcow2", cfg.TargetDomain)
+	if err != nil {
+		t.Fatalf("StoreFor: %v", err)
+	}
+	got, err := store.Path()
+	if err != nil {
+		t.Fatalf("Store.Path: %v", err)
+	}
+	wantPath, err := want.Path()
+	if err != nil {
+		t.Fatalf("Store.Path: %v", err)
+	}
+	if got != wantPath {
+		t.Errorf("store = %q, want %q (the same expression the sync path uses)", got, wantPath)
+	}
+	// And it is keyed by the DOMAIN, not just the directory. Two replicas
+	// sharing this directory must not resolve to one store -- that is the whole
+	// of CI-06, and a restore is the path where addressing another pair's
+	// history would be worst.
+	if want := "/data/replicas/" + restorepoint.DirName + "/" + restorepoint.DomainPrefix + cfg.TargetDomain; got != want {
+		t.Errorf("store = %q, want %q", got, want)
 	}
 }
 
@@ -234,12 +253,17 @@ func TestRestoreRootForPrefersAnExplicitFlag(t *testing.T) {
 	cfg := restoreTestCfg()
 	cfg.TargetDiskPath = "/elsewhere"
 
-	replicaDir, root, err := restoreRootFor(cfg, restoreTestPlan(t))
+	replicaDir, store, err := restoreRootFor(cfg, restoreTestPlan(t))
 	if err != nil {
 		t.Fatalf("restoreRootFor: %v", err)
 	}
-	if replicaDir != "/elsewhere" || root != "/elsewhere/"+restorepoint.DirName {
-		t.Fatalf("an explicit -target-disk-path was ignored: dir=%q root=%q", replicaDir, root)
+	got, err := store.Path()
+	if err != nil {
+		t.Fatalf("Store.Path: %v", err)
+	}
+	want := "/elsewhere/" + restorepoint.DirName + "/" + restorepoint.DomainPrefix + cfg.TargetDomain
+	if replicaDir != "/elsewhere" || got != want {
+		t.Fatalf("an explicit -target-disk-path was ignored: dir=%q store=%q, want dir=/elsewhere store=%q", replicaDir, got, want)
 	}
 	// Ignored, not trusted: checkRestoreIdentity refuses it against this same
 	// domain, so a wrong flag cannot silently aim the restore elsewhere.
