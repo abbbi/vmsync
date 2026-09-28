@@ -148,6 +148,18 @@ type agentMetrics struct {
 	// sync -- describes the sync BEFORE the interrupted rebuild.
 	incompleteVMs map[string]bool
 
+	// fencedRunningVMs is the set of VMs on this host marked
+	// replication_role=fenced that are STILL RUNNING: a fence suspended their
+	// replication without stopping the domain, while the peer that displaced
+	// them serves the same VM.
+	//
+	// Its own set rather than folded into splitBrainVMs, because the two need
+	// different remedies. Split brain asks which copy wins; this is past that --
+	// the decision is already made and the shutdown did not take, so the answer
+	// is always "stop this domain by hand". They overlap deliberately: a VM here
+	// is also counted as split brain, so alerts already written keep firing.
+	fencedRunningVMs map[string]bool
+
 	// restorePoints is what each replica on this host can be rolled back to.
 	//
 	// The fleet half of the restore-point metrics, and the half that answers
@@ -235,6 +247,28 @@ func (m *agentMetrics) setRestorePoints(vms map[string]restorePointGauge) {
 	m.restorePointVMs = make(map[string]restorePointGauge, len(vms))
 	for vm, g := range vms {
 		m.restorePointVMs[vm] = g
+	}
+}
+
+// setFencedRunning replaces the whole set from one complete sweep, for the same
+// reason setSplitBrain and setReplicaIncomplete do: replacing is what lets the
+// condition clear on its own once somebody stops the domain or changes its role.
+//
+// This one clears differently from the others, and the difference is the point. A
+// displaced source leaves the split-brain set because the agent's own fence
+// stopped it. A fenced-and-running domain leaves this set only when a PERSON acts,
+// because a fence is never retried -- so a gauge that has not moved in a day is
+// not a stuck metric, it is an unresolved split brain, and that it persists is
+// exactly what was missing.
+func (m *agentMetrics) setFencedRunning(vms map[string]bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.fencedRunningVMs = make(map[string]bool, len(vms))
+	for vm := range vms {
+		m.fencedRunningVMs[vm] = true
 	}
 }
 
@@ -518,6 +552,7 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	split := len(m.splitBrainVMs)
 	splitVMs := sortedKeys(m.splitBrainVMs)
 	incompleteVMs := sortedKeys(m.incompleteVMs)
+	fencedRunningVMs := sortedKeys(m.fencedRunningVMs)
 	rpVMs := sortedKeys(m.restorePointVMs)
 	rpGauges := make(map[string]restorePointGauge, len(m.restorePointVMs))
 	for vm, gg := range m.restorePointVMs {
@@ -525,7 +560,7 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	}
 	m.mu.Unlock()
 
-	g("vmsync_agent_split_brain_vms", "VMs running on this host that a peer reports having been failed over from. Non-zero means one VM is live in two places; alert on it.", split, "")
+	g("vmsync_agent_split_brain_vms", "VMs running on this host that a peer reports having been failed over from, OR that this host has already marked replication_role=fenced and is still running. Non-zero means one VM is live in two places; alert on it. The second case needs no peer query, so it is reported even when the peer is unreachable -- see vmsync_agent_fenced_running, which says what to DO about it.", split, "")
 	// HELP and TYPE once, then one sample line per VM -- NOT g() per VM.
 	//
 	// g() emits its own HELP and TYPE on every call, and the Prometheus text
@@ -538,7 +573,7 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	// The same rule governs vmsync_agent_mode and the per-VM timestamps
 	// above, which is why they are written out longhand too.
 	if len(splitVMs) > 0 {
-		fmt.Fprintf(&b, "# HELP vmsync_agent_split_brain 1 while this host still runs a VM another host has been promoted for.\n# TYPE vmsync_agent_split_brain gauge\n")
+		fmt.Fprintf(&b, "# HELP vmsync_agent_split_brain 1 while this host still runs a VM another host has been promoted for -- either because a reachable peer says so, or because this host already marked the VM replication_role=fenced and it is still running.\n# TYPE vmsync_agent_split_brain gauge\n")
 		for _, vm := range splitVMs {
 			fmt.Fprintf(&b, "vmsync_agent_split_brain{host=%q,vm=%q} 1\n", host, vm)
 		}
@@ -575,6 +610,31 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 		fmt.Fprintf(&b, "# HELP vmsync_agent_replica_incomplete 1 while a replica on this host carries an interrupted full rebuild (replica_incomplete). It clears by itself when a sync completes, because the define that records the sync clears the marker.\n# TYPE vmsync_agent_replica_incomplete gauge\n")
 		for _, vm := range incompleteVMs {
 			fmt.Fprintf(&b, "vmsync_agent_replica_incomplete{host=%q,vm=%q} 1\n", host, vm)
+		}
+	}
+
+	// --- a fence that did not stop the domain ------------------------------
+	//
+	// The state every other signal used to miss. A fence writes
+	// replication_role=fenced even when the ACPI shutdown fails -- deliberately,
+	// because that role is the only thing stopping replication resuming into the
+	// split brain -- and the sweep then skipped the domain precisely BECAUSE it
+	// was fenced, so the split-brain gauge fell back to zero about a minute
+	// later while one VM stayed live in two places. The only surviving trace was
+	// a failure COUNTER, which says "once, at some point" and resets when the
+	// agent restarts.
+	//
+	// Emitted unconditionally, at zero when nothing is wrong, for the reason
+	// given at the split-brain gauge above: an alert cannot use a `for:` clause
+	// over a window that begins before the series it reads came into existence.
+	g("vmsync_agent_fenced_running_vms", "VMs on this host that a fence marked replication_role=fenced and that are STILL RUNNING. The fence suspended replication but did not stop the domain, so it is live beside the peer that displaced it and both are taking writes. This is NOT the same question as split brain: which copy wins is already decided, so the remedy is always to stop THIS domain by hand and then set its role. It is never retried automatically, so it does not clear by itself -- a value that has not moved in a day is an unresolved split brain, not a stuck metric. Alert on it.", len(fencedRunningVMs), "")
+	// HELP and TYPE once, then one sample line per VM -- NOT g() per VM, for the
+	// reason spelled out at the split-brain gauge: a second HELP line for one
+	// family makes node_exporter reject the whole file.
+	if len(fencedRunningVMs) > 0 {
+		fmt.Fprintf(&b, "# HELP vmsync_agent_fenced_running 1 while that VM is marked replication_role=fenced and still running. Stop the domain by hand, then -invert if the failover stands or -update-role=source if the fence was wrong.\n# TYPE vmsync_agent_fenced_running gauge\n")
+		for _, vm := range fencedRunningVMs {
+			fmt.Fprintf(&b, "vmsync_agent_fenced_running{host=%q,vm=%q} 1\n", host, vm)
 		}
 	}
 
@@ -689,6 +749,7 @@ func metricsLoop(ctx context.Context, lv *live, state *sharedState, sched *Sched
 				// no console to show a report on, still publishes the one
 				// signal that a replica's disks are a partial copy.
 				m.setReplicaIncomplete(scan.incomplete)
+				m.setFencedRunning(scan.fencedRunning)
 				// Likewise the restore point depth. A standalone host is the
 				// one place these numbers have no other route out: there is
 				// no control plane to send a report to, so without this a
@@ -730,6 +791,7 @@ type inventoryScan struct {
 	total         int
 	byStatus      map[string]int
 	incomplete    map[string]bool
+	fencedRunning map[string]bool
 	restorePoints map[string]restorePointGauge
 }
 
@@ -755,6 +817,7 @@ func scanDomainStatus(cfg agentConfig) (inventoryScan, error) {
 	}
 	byStatus := map[string]int{}
 	incomplete := map[string]bool{}
+	fencedRunning := map[string]bool{}
 	restorePoints := map[string]restorePointGauge{}
 	now := time.Now()
 	for _, d := range domains {
@@ -764,6 +827,12 @@ func scanDomainStatus(cfg agentConfig) (inventoryScan, error) {
 		// engine's marker publish a zero.
 		if d.ReplicaIncomplete != "" {
 			incomplete[d.Name] = true
+		}
+		// A fence that suspended replication without stopping the domain. In
+		// standalone mode there is no control plane and no report, so this sweep
+		// is the only thing that would ever notice.
+		if fenceFailedOpen(d.Role, d.Active) {
+			fencedRunning[d.Name] = true
 		}
 		// .String(), not a string() conversion: inventory.Status is an int
 		// enum, so converting it would compile and silently yield a one-rune
@@ -784,7 +853,7 @@ func scanDomainStatus(cfg agentConfig) (inventoryScan, error) {
 			restorePoints[d.Name] = restorePointGaugeFor(reportRestorePoints(d.RestorePoints))
 		}
 	}
-	return inventoryScan{total: len(domains), byStatus: byStatus, incomplete: incomplete, restorePoints: restorePoints}, nil
+	return inventoryScan{total: len(domains), byStatus: byStatus, incomplete: incomplete, fencedRunning: fencedRunning, restorePoints: restorePoints}, nil
 }
 
 // statusCounts tallies a report's domains by status, for the gauge.

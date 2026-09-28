@@ -621,6 +621,10 @@ func reportLoop(ctx context.Context, client *Client, lv *live, state *sharedStat
 			// UI's outage rather than by anything about the disks.
 			cfg.metrics.setDomains(len(report.Domains), statusCounts(report.Domains))
 			cfg.metrics.setReplicaIncomplete(incompleteReplicaVMs(report.Domains))
+			// Same sweep, same reason: a fence that did not stop the domain is
+			// invisible everywhere else, and in monitor mode this is the only
+			// feeder that runs at all -- monitor agents execute no fence sweep.
+			cfg.metrics.setFencedRunning(fencedRunningVMs(report.Domains))
 			cfg.metrics.setRestorePoints(restorePointGauges(report.Domains))
 
 			if err := client.SendReport(ctx, report); err != nil {
@@ -995,4 +999,24 @@ func restorePointGaugeFor(points []ReportRestorePoint) restorePointGauge {
 		}
 	}
 	return g
+}
+
+// fencedRunningVMs names the domains in a report that a fence marked
+// replication_role=fenced and that are still RUNNING.
+//
+// Taken from the REPORT rather than from a second libvirt walk, for the same
+// reason incompleteReplicaVMs is: the gauge and the console then describe one
+// sweep, and a host publishing numbers that disagree with what an operator is
+// looking at for the same minute is worse than one publishing neither.
+//
+// The predicate is fenceFailedOpen, shared with the fence sweep that warns about
+// it, so the metric and the log cannot disagree about which VMs are live twice.
+func fencedRunningVMs(domains []ReportDomain) map[string]bool {
+	out := map[string]bool{}
+	for _, d := range domains {
+		if fenceFailedOpen(d.Role, d.Active) {
+			out[d.Name] = true
+		}
+	}
+	return out
 }

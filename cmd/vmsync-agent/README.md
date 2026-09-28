@@ -1,3 +1,7 @@
+| `vmsync_agent_split_brain_vms` | gauge | — | VMs running here that a peer reports having been failed over from, **or** that this host already marked `replication_role=fenced` and is still running. **The one to alert on.** The second case needs no peer query, so it is reported even when the peer is unreachable — which is when a failover usually happens. |
+| `vmsync_agent_split_brain` | gauge | `vm` | 1 while this host still runs a VM another host has been promoted for — either because a reachable peer says so, or because this host marked the VM `fenced` and it is running anyway. |
+| `vmsync_agent_fenced_running_vms` | gauge | — | VMs here that a fence marked `fenced` and that are **still running**: the fence suspended replication and did not stop the domain, so it is live beside the copy that displaced it and both are taking writes. Counted as split brain too, so existing alerts keep firing — but published separately because the remedy differs. Split brain asks which copy wins; this is past that, so the answer is always "stop this domain by hand, then set its role". Emitted at zero on a healthy host, because a fence is never retried and this does **not** clear by itself: a value that has not moved in a day is an unresolved split brain, not a stuck metric. |
+| `vmsync_agent_fenced_running` | gauge | `vm` | 1 while that VM is `fenced` and running. The count says *whether*, this says *which* — and which is what an operator needs before touching anything. |
 # vmsync-agent
 
 The per-hypervisor half of vmsync's control plane. It inventories the domains

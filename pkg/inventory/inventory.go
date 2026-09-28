@@ -358,11 +358,28 @@ func assessReplication(d Domain, now time.Time, cadence time.Duration) Assessmen
 		a.Reasons = append(a.Reasons, "replication administratively paused (replication_role=paused)")
 		return a
 	case libvirtsync.RoleFenced:
-		// Reported as paused because the consequence is the same -- nothing is
-		// replicating into it, and that is expected rather than broken -- but
-		// with its own reason, because the cause and the fix are not the same
-		// at all. Somebody paused a paused domain and will unpause it; nobody
-		// chose this one, a peer took over, and the usual repair is -invert.
+		// A fence that did not stop the domain is CRITICAL, and it is the one
+		// case this branch used to bury. The role is written even when the ACPI
+		// shutdown fails -- deliberately, because it is the only thing stopping
+		// replication resuming into the split brain -- so "fenced" alone says
+		// nothing about whether the domain actually stopped. Still running means
+		// it is live beside the peer that displaced it and both are taking
+		// writes, which is the worst state in the product; reporting it as an
+		// expected administrative pause is how it stayed invisible.
+		//
+		// Same predicate the agent's fence sweep and its gauge use, so the
+		// console and the metrics cannot disagree about which VMs are live twice.
+		if d.Active {
+			a.Status = StatusCritical
+			a.Reasons = append(a.Reasons, "FENCED BUT STILL RUNNING: a fence suspended this domain's replication and did not stop the domain (replication_role=fenced, and it is running), so it is live beside the peer that was promoted over it and both are taking writes. A fence is never retried: stop this domain by hand, then run -invert if the failover stands, or -update-role=source if the fence was wrong")
+			return a
+		}
+		// Stopped, as a fence intends. Reported as paused because the
+		// consequence is the same -- nothing is replicating into it, and that is
+		// expected rather than broken -- but with its own reason, because the
+		// cause and the fix are not the same at all. Somebody paused a paused
+		// domain and will unpause it; nobody chose this one, a peer took over,
+		// and the usual repair is -invert.
 		a.Status = StatusPaused
 		a.Reasons = append(a.Reasons, "stopped by an automatic fence after a peer was promoted over it (replication_role=fenced); run -invert if the failover stands, or -update-role=target if the fence was wrong")
 		return a

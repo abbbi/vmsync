@@ -277,3 +277,60 @@ func TestFenceReportRoundTripsThroughTheWireFormat(t *testing.T) {
 		}
 	}
 }
+
+// The state a fence that did not take leaves behind, and the one thing that
+// recognises it.
+//
+// role=fenced is written by a fence whether or not the ACPI shutdown worked --
+// deliberately, because that role is the only thing stopping replication resuming
+// into the split brain. So the role alone says nothing about whether the domain
+// stopped; the role AND still running says the fence suspended replication and
+// left the guest serving beside the copy that displaced it.
+//
+// Before this predicate existed, that state was the one state in which every
+// signal read clear: the sweep skipped the domain precisely BECAUSE it was fenced,
+// so it left the split-brain set and the gauge fell back to zero about a minute
+// after the failure, with only an in-memory failure counter -- reset on restart --
+// recording that anything had happened.
+func TestFenceFailedOpen(t *testing.T) {
+	if !fenceFailedOpen(libvirtsync.RoleFenced, true) {
+		t.Error("fenced and running is a fence that did not stop the domain; it is the whole condition this exists to report")
+	}
+	// Stopped is a fence that worked. The ordinary resting state of every fenced
+	// domain in an estate, and it must never alarm -- nor must the condition
+	// latch, which is what lets it clear when somebody finally stops the guest.
+	if fenceFailedOpen(libvirtsync.RoleFenced, false) {
+		t.Error("a fenced domain that is stopped is a fence that worked")
+	}
+
+	// Deliberately NOT generalised to paused. `paused` claims nothing about a
+	// peer, so a running domain whose replication was paused by hand is one live
+	// copy and an ordinary state; alarming on it would teach an operator to
+	// ignore the series that matters. This is also why a pause may not overwrite
+	// a fence -- see roleToRecord in cmd/vmsync.
+	for _, role := range []string{
+		libvirtsync.RolePaused, libvirtsync.RoleSource, libvirtsync.RoleTarget,
+		libvirtsync.RolePromoted, libvirtsync.RoleNone, "", "something-newer-wrote",
+	} {
+		if fenceFailedOpen(role, true) {
+			t.Errorf("role %q while running is not a failed fence", role)
+		}
+	}
+}
+
+// The gauge and the sweep's warning must name the same VMs, so the console and
+// the metrics cannot disagree about which machines are live in two places.
+func TestFencedRunningVMsUsesTheSamePredicateAsTheSweep(t *testing.T) {
+	got := fencedRunningVMs([]ReportDomain{
+		{Name: "web01", Role: libvirtsync.RoleFenced, Active: true},
+		{Name: "db01", Role: libvirtsync.RoleFenced, Active: false},
+		{Name: "app01", Role: libvirtsync.RolePaused, Active: true},
+		{Name: "mail01", Role: libvirtsync.RoleSource, Active: true},
+	})
+	if len(got) != 1 || !got["web01"] {
+		t.Errorf("fencedRunningVMs = %v, want only web01 -- db01's fence worked, app01 is an administrative pause with one live copy, mail01 is an ordinary source", got)
+	}
+	if n := len(fencedRunningVMs(nil)); n != 0 {
+		t.Errorf("fencedRunningVMs(nil) = %d entries", n)
+	}
+}

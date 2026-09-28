@@ -648,3 +648,51 @@ func TestApplyDomainMetadataKeepsAVerdictWithAnUnreadableDate(t *testing.T) {
 		t.Errorf("Assess() status = %v, want critical: a finding with no usable date is still a finding", a.Status)
 	}
 }
+
+// A fence that did not stop the domain is CRITICAL, and a fence that did is not.
+//
+// One word of metadata distinguishes them, and this branch used to ignore it.
+// role=fenced is written whether or not the ACPI shutdown worked -- deliberately,
+// because it is the only thing stopping replication resuming into the split brain
+// -- so "fenced" alone says nothing about whether the guest stopped. Still running
+// means it is live beside the copy that was promoted over it and both are taking
+// writes, which is the worst state this product has; it was reported as
+// StatusPaused, "expected rather than broken", which is how it stayed invisible on
+// the console while the agent's gauges were being cleared for the same reason.
+func TestAFenceThatDidNotStopTheDomainIsCritical(t *testing.T) {
+	running := target(90 * 86400)
+	running.Role = libvirtsync.RoleFenced
+	running.Active = true
+
+	got := Assess(running, now, 15*time.Minute)
+	if got.Status != StatusCritical {
+		t.Errorf("Assess(fenced, running) = %v, want critical -- one VM is live in two places; reasons: %v", got.Status, got.Reasons)
+	}
+	// The reason has to say what to DO, because which copy wins is already
+	// decided and the remedy is not the one a split brain gets.
+	joined := strings.Join(got.Reasons, " ")
+	for _, want := range []string{"STILL RUNNING", "stop this domain by hand", "never retried"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("the reason does not mention %q: %q", want, joined)
+		}
+	}
+
+	// Stopped, as a fence intends: still not a fault, and still explained.
+	stopped := target(90 * 86400)
+	stopped.Role = libvirtsync.RoleFenced
+	stopped.Active = false
+
+	got = Assess(stopped, now, 15*time.Minute)
+	if got.Status != StatusPaused {
+		t.Errorf("Assess(fenced, stopped) = %v, want paused -- the fence worked, nothing is replicating into it, and that is expected", got.Status)
+	}
+	if s := strings.Join(got.Reasons, " "); !strings.Contains(s, "automatic fence") {
+		t.Errorf("a successfully fenced domain lost its explanation: %q", s)
+	}
+
+	// Ninety days stale either way, so neither verdict comes from the age: the
+	// role and Active are doing all the work.
+	if running.LastSyncUnix != stopped.LastSyncUnix {
+		t.Fatal("fixture drift: both rows must be equally stale for this to isolate the role")
+	}
+}

@@ -318,6 +318,14 @@ func sweepFences(ctx context.Context, cfg agentConfig, state *sharedState, ledge
 	// get the same answer.
 	cached := state.get().Config
 
+	// Read once per sweep, and used only to put WORDS on a finding -- never to
+	// establish one. LatestByVM takes the mutex and copies the map, which a pass
+	// over every domain on the host must not pay for per domain.
+	var acted map[string]fenceRecord
+	if ledger != nil {
+		acted = ledger.LatestByVM()
+	}
+
 	split := map[string]bool{}
 	completed := false
 	defer func() {
@@ -337,19 +345,63 @@ func sweepFences(ctx context.Context, cfg agentConfig, state *sharedState, ledge
 		if !d.Active {
 			continue
 		}
+		// role=fenced AND running: a fence suspended this domain's replication
+		// and did not stop the domain. Either the shutdown never took -- the
+		// realistic case, a guest that ignores ACPI -- or somebody started it
+		// again afterwards, which a host reboot does on its own for any domain
+		// whose autostart flag survived the fence.
+		//
+		// Reported HERE, above both guards below, and each of them is a reason
+		// this had to move up rather than a filter worth reusing:
+		//
+		//   - replica_targets is what makes a PEER QUERY worth paying for, and
+		//     this finding needs none. It is two fields of this host's own
+		//     metadata, which is the whole point: during a DR event the peer is
+		//     the half that is usually unreachable, and a detector that had to
+		//     ask it would go blind exactly when it is needed.
+		//   - the role filter skips `fenced` deliberately, so a fence is not
+		//     attempted again every minute. That is right about the ACTION and
+		//     wrong about the REPORT -- this is the one state in which every
+		//     gauge otherwise reads clear, and what silenced them was the very
+		//     record written to make the failure safe.
+		//
+		// Nothing is retried and nothing here can retry: the finding is made and
+		// the domain is skipped on the next line. The ledger is consulted only
+		// to put words on it, never to establish it -- the role lives on the
+		// domain and outlives losing fences.json, and a fence run by hand with
+		// `vmsync -fence-domain` leaves no ledger entry at all.
+		if fenceFailedOpen(d.Role, d.Active) {
+			split[d.Name] = true
+			fields := []any{"vm", d.Name}
+			if rec, ok := acted[d.Name]; ok {
+				fields = append(fields, "fence_id", rec.FenceID, "peer", rec.PeerRef, "ledger_state", rec.State)
+			}
+			trace.Warning("FENCED BUT STILL RUNNING: this domain is marked replication_role=fenced and is running, so a fence suspended its replication without stopping the domain -- and the peer that displaced it is serving the same VM. Which copy wins is already decided, so this is not that question: stop THIS domain by hand, then run -invert if the failover stands, or -update-role=source if the fence was wrong. It will NOT be retried automatically",
+				fields...)
+			continue
+		}
 		// Only where this host is the source. A promoted domain is the one
 		// doing the displacing, and a target is not serving anything.
+		//
+		// Below the fenced check above, deliberately: this guard decides whether
+		// a PEER QUERY is worth paying for, and that finding needs no peer. A
+		// fenced domain whose replica_targets have been cleared -- by an
+		// inversion, or by hand -- is still reported.
 		if len(d.ReplicaTargets) == 0 {
 			continue
 		}
 		switch d.Role {
 		case libvirtsync.RoleSource, "":
 		default:
-			// fenced (a fence already stopped this one), paused
-			// (administratively stopped), promoted (this host is the one that
-			// took over), target (not serving). None of them is a source that
-			// could still be writing. fenced landing here is what stops a
-			// domain being swept again every minute after it has been fenced.
+			// paused (administratively stopped), promoted (this host is the one
+			// that took over), target (not serving), or a role a newer build
+			// wrote. None of them is a source that could still be writing.
+			//
+			// `fenced` no longer reaches here at all: one that stopped is
+			// skipped as inactive above, and one still running is reported and
+			// skipped by the branch above that. Both still end in a skip, which
+			// is what stops a domain being swept again every minute after it has
+			// been fenced.
 			continue
 		}
 		for _, ref := range d.ReplicaTargets {
@@ -616,6 +668,30 @@ func shutdownTimeoutFor(cached UIConfig, vm string) int {
 		sec = maxShutdownTimeoutSec
 	}
 	return sec
+}
+
+// fenceFailedOpen reports the one state a fence that did not take leaves behind:
+// the role says a fence happened, and the domain is still running.
+//
+// Pure, and its own function rather than an inline condition, because three
+// callers must agree about it -- the sweep that warns, the feeder that publishes
+// the gauge, and inventory.Assess by way of the same rule. Two spellings of this
+// would let the console and the metric disagree about whether a VM is live in two
+// places.
+//
+// role=fenced is the whole of the evidence, and it is enough: nothing writes it
+// except a fence (or an operator saying a fence happened), and it carries the
+// claim that a PEER TOOK OVER. That is why this does not generalise to
+// paused-and-running, which looks identical and is not: `paused` claims nothing
+// about a peer, so a running domain whose replication was paused by hand is one
+// live copy and an ordinary state. Alarming on it would train an operator to
+// ignore the series that matters.
+//
+// Nor does it consult the ledger. The role is on the domain, so it survives
+// losing fences.json, an agent that never ran, and a fence performed by hand with
+// `vmsync -fence-domain`; the ledger records only fences THIS agent performed.
+func fenceFailedOpen(role string, active bool) bool {
+	return active && role == libvirtsync.RoleFenced
 }
 
 // shutdownProcessBound is how long vmsync itself gets, given how long the

@@ -364,3 +364,60 @@ func TestRenderWithNoRestorePointsIsStillValid(t *testing.T) {
 		t.Error("a host with no replicas published restore point series")
 	}
 }
+
+// renderWithFencedRunning renders one metrics file for a host holding the given
+// fenced-but-still-running replicas.
+func renderWithFencedRunning(vms ...string) string {
+	m := newAgentMetrics("test", "hyper02p", modeStandalone)
+	set := map[string]bool{}
+	for _, vm := range vms {
+		set[vm] = true
+	}
+	m.setFencedRunning(set)
+	return m.render(CachedConfig{}, nil, 0, time.Unix(1_800_000_000, 0))
+}
+
+// The gauge that was missing, with the two properties that make it usable.
+//
+// It must exist at ZERO on a healthy host, because an alert cannot carry a `for:`
+// clause over a window that begins before the series it reads came into existence
+// -- and this condition, unlike split brain, does not clear by itself: a fence is
+// never retried, so it clears only when a person acts. A series that appeared only
+// once the estate was broken would be useless for exactly the alert it exists for.
+//
+// And it must declare HELP/TYPE once with one sample line per VM. g() per VM emits
+// a second HELP for one family, which makes node_exporter reject the WHOLE
+// textfile -- so two fenced-and-running VMs on one host would have taken down
+// every metric this agent publishes, including this one, while the file still
+// looked fine read by eye. That is the failure CI-08 recorded for the split-brain
+// gauge, and the reason this block is written out longhand beside it.
+func TestRenderFencedRunningGauge(t *testing.T) {
+	clean := renderWithFencedRunning()
+	checkPrometheusText(t, clean)
+	if !strings.Contains(clean, `vmsync_agent_fenced_running_vms{host="hyper02p"} 0`) {
+		t.Errorf("the count is not published at zero on a healthy host, so no alert can sit on it between failures:\n%s", clean)
+	}
+	if strings.Contains(clean, "vmsync_agent_fenced_running{") {
+		t.Error("a healthy host published a per-VM series")
+	}
+
+	two := renderWithFencedRunning("web01", "db01")
+	checkPrometheusText(t, two)
+	if !strings.Contains(two, `vmsync_agent_fenced_running_vms{host="hyper02p"} 2`) {
+		t.Errorf("the count is wrong:\n%s", two)
+	}
+	if n := strings.Count(two, "# HELP vmsync_agent_fenced_running "); n != 1 {
+		t.Errorf("HELP for vmsync_agent_fenced_running appears %d times, want 1; node_exporter rejects the whole file otherwise and every series in it vanishes", n)
+	}
+	for _, vm := range []string{"web01", "db01"} {
+		if !strings.Contains(two, fmt.Sprintf(`vmsync_agent_fenced_running{host="hyper02p",vm=%q} 1`, vm)) {
+			t.Errorf("%s has no sample line; the count says WHETHER, this says WHICH, and which is what an operator needs before touching anything", vm)
+		}
+	}
+
+	// It says what to do, because the remedy is not the one a split brain gets:
+	// which copy wins is already decided.
+	if !strings.Contains(two, "stop THIS domain by hand") {
+		t.Errorf("the HELP does not say what to do about it:\n%s", two)
+	}
+}

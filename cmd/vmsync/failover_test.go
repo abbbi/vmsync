@@ -312,3 +312,46 @@ func TestReinitVerbNamesTheFlavourThatRan(t *testing.T) {
 		t.Errorf("reinitVerb(-force-clean) = %q, want %q", got, libvirtsync.ReplicaIncompleteVerbForceClean)
 	}
 }
+
+// A pause must never overwrite a fence, and this is the decision that stops it.
+//
+// The two roles look interchangeable — both mean "not replicating" — and they are
+// not: only `fenced` says a PEER TOOK OVER and is serving this VM. Everything
+// that recognises a fence which failed to stop its guest keys on that word: the
+// agent's sweep, vmsync_agent_fenced_running, the console's alarm and
+// inventory.Assess. `paused` cannot stand in for it, because a running domain
+// whose replication was paused by hand is an ordinary state with one live copy.
+//
+// The path that made it reachable is the remedy itself. When a fence does not stop
+// the guest, the advice is to shut the domain down; the console offers that button
+// on exactly those rows; and shutdownAndMark records the role whether or not the
+// shutdown succeeds. Against the guest that was ignoring ACPI in the first place,
+// following the advice rewrote `fenced` as `paused` — and the split-brain gauge,
+// the fenced-running gauge and the critical status all went quiet while both
+// copies kept taking writes. The same fault, one click later, under a role nothing
+// watches.
+func TestAPauseNeverOverwritesAFence(t *testing.T) {
+	if got := roleToRecord(libvirtsync.RolePaused, libvirtsync.RoleFenced); got != libvirtsync.RoleFenced {
+		t.Errorf("roleToRecord(paused, fenced) = %q, want %q -- a failed shutdown must not erase the record that a peer took over, or the remedy for a failed fence destroys the evidence of it", got, libvirtsync.RoleFenced)
+	}
+
+	// Every other combination is untouched. Only the one downgrade is blocked;
+	// an explicit -update-role does not come through here, and it is how an
+	// operator says the fence is resolved.
+	for _, tc := range []struct{ requested, current, want string }{
+		{libvirtsync.RolePaused, "", libvirtsync.RolePaused},
+		{libvirtsync.RolePaused, libvirtsync.RoleSource, libvirtsync.RolePaused},
+		{libvirtsync.RolePaused, libvirtsync.RoleTarget, libvirtsync.RolePaused},
+		{libvirtsync.RolePaused, libvirtsync.RolePaused, libvirtsync.RolePaused},
+		{libvirtsync.RolePaused, libvirtsync.RolePromoted, libvirtsync.RolePaused},
+		// A fence over a fence is still a fence, and a fence over anything else
+		// is what -fence-domain is for.
+		{libvirtsync.RoleFenced, libvirtsync.RoleFenced, libvirtsync.RoleFenced},
+		{libvirtsync.RoleFenced, libvirtsync.RoleSource, libvirtsync.RoleFenced},
+		{libvirtsync.RoleFenced, "", libvirtsync.RoleFenced},
+	} {
+		if got := roleToRecord(tc.requested, tc.current); got != tc.want {
+			t.Errorf("roleToRecord(%q, %q) = %q, want %q", tc.requested, tc.current, got, tc.want)
+		}
+	}
+}

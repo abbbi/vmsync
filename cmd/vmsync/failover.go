@@ -566,6 +566,39 @@ func runFenceDomain(ctx context.Context, cfg syncConfig) error {
 // The return is named so the journal's outcome record is written on every path
 // out -- including the one where the shutdown failed and the role was recorded
 // anyway, which is the outcome most worth having a record of.
+
+// roleToRecord decides which replication role a shutdown actually writes, given
+// what it was asked for and what the domain already carries.
+//
+// Pure, and its own function, because it is the one decision in shutdownAndMark
+// that is not I/O -- and because getting it wrong is silent. It answers exactly
+// one question: may a pause overwrite a fence?
+//
+// It may not. `fenced` and `paused` both mean "not replicating", but only
+// `fenced` carries the claim that a PEER TOOK OVER and is serving this VM, and
+// that claim is the witness a still-running fenced domain is recognised by --
+// the agent's sweep, vmsync_agent_fenced_running, the console's alarm and
+// inventory.Assess all key on it. None of them can infer it from `paused`,
+// because a running domain whose replication was paused by hand is an ordinary
+// state with one live copy.
+//
+// What made this necessary: the documented remedy for a fence that did not stop
+// the guest is to shut the domain down, the console offers exactly that on
+// exactly those rows, and shutdownAndMark writes the role whether or not the
+// shutdown worked. Against the guest that was already ignoring ACPI, following
+// the advice turned `fenced` into `paused` and every alarm went quiet while both
+// copies stayed live -- the same fault one click later, under a role nothing
+// watches.
+//
+// Only this one direction is blocked. An explicit -update-role is how an operator
+// says a fence is resolved, and it does not come through here.
+func roleToRecord(requested, current string) string {
+	if requested == libvirtsync.RolePaused && current == libvirtsync.RoleFenced {
+		return libvirtsync.RoleFenced
+	}
+	return requested
+}
+
 func shutdownAndMark(ctx context.Context, cfg syncConfig, mode, role string) (runErr error) {
 	if cfg.TargetURI == "" || cfg.TargetDomain == "" {
 		return fmt.Errorf("%s needs -target-uri and -target-domain naming the domain to stop", mode)
@@ -635,6 +668,50 @@ func shutdownAndMark(ctx context.Context, cfg syncConfig, mode, role string) (ru
 	// thing that differs between them: paused means a person chose this and
 	// will resume when ready, fenced means a peer took over and nobody here
 	// chose anything.
+	// A fence is never downgraded to a pause.
+	//
+	// `fenced` and `paused` both mean "not replicating", but only `fenced`
+	// carries the claim that a PEER TOOK OVER and is serving this VM. That
+	// claim is the witness a still-running fenced domain is recognised by --
+	// the agent's sweep, the split-brain gauge, the console's warning and
+	// inventory.Assess all key on it, and none of them can infer it from
+	// `paused`, because a running domain whose replication was paused by hand
+	// is an ordinary state with one live copy.
+	//
+	// Without this, the documented remedy for a failed fence destroyed the
+	// evidence of it. The console offers "Shut down cleanly" on exactly these
+	// rows (CanShutdown is AgentID plus Active), the agent runs it as
+	// -shutdown-domain, and this function writes the role UNCONDITIONALLY --
+	// the same property a failed fence relies on. So an operator following the
+	// warning, against the guest that was ignoring ACPI in the first place,
+	// turned `fenced` into `paused` and every alarm went quiet while both
+	// copies stayed live. One click, and the fault reappeared under a role
+	// nothing watches.
+	//
+	// Keeping the stronger record is safe in the other direction too: a
+	// -shutdown-domain that DOES stop the guest leaves `fenced` standing, which
+	// is true -- a peer is still serving it -- and the domain is no longer
+	// running, so nothing alarms. -update-role is how an operator says the
+	// fence is resolved, which is the one place that decision belongs.
+	//
+	// The restore path writes `paused` the same way (restorepoint.MetadataPlan)
+	// and is deliberately left alone: a restore refuses a running domain
+	// outright, so it cannot produce the live case this guards.
+	// Read before deciding, and tolerate a read failure: not being able to see
+	// the current role is not a reason to refuse the write, because the write is
+	// the thing keeping replication out of a split brain.
+	current, rerr := libvirtsync.ReadReplicationRole(mgr, cfg.TargetDomain)
+	if rerr != nil {
+		trace.Warning("could not read this domain's current replication role before recording the new one; recording it anyway, but a fence already on it cannot be preserved",
+			"vm", cfg.TargetDomain, "requested_role", role, "error", rerr)
+		current = ""
+	}
+	if kept := roleToRecord(role, current); kept != role {
+		trace.Warning("keeping replication_role=fenced rather than recording paused: a fence already stopped this domain's replication because a peer took over, and that is a stronger statement than an administrative pause. Run -update-role once the failover is resolved",
+			"vm", cfg.TargetDomain, "requested_role", role, "kept_role", kept)
+		role = kept
+	}
+
 	previous, err := libvirtsync.SetReplicationRole(mgr, cfg.TargetDomain, role)
 	if err != nil {
 		if shutdownErr != nil {
