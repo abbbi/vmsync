@@ -884,3 +884,99 @@ func TestInversionStripsAnInterruptedCopyFromBothEnds(t *testing.T) {
 		}
 	}
 }
+
+// TestAssessInvertAfterATidyShutdown is the lockout this whole trace exists to
+// prevent, and it is worth stating as a scenario rather than a table row.
+//
+// Every refusal in vmsync that concerns a failed-over pair ends by naming
+// -invert. Reaching -invert means the promoted copy is no longer needed as a
+// running guest, so an operator shuts it down first -- and a clean shutdown
+// records replication_role=paused, while a fence records fenced. Assessing only
+// role==promoted therefore refused the inversion in exactly the state the
+// advice produces: the operator's remaining options were to re-promote a domain
+// in order to reverse it, or to -force-clean the copy holding the live data.
+//
+// The trace is what makes the acceptance safe: it is written when a domain
+// becomes promoted and survives every demotion, so a domain carrying it HAS
+// held live data whatever its role says now.
+func TestAssessInvertAfterATidyShutdown(t *testing.T) {
+	for _, role := range []string{RolePaused, RoleFenced, RoleTarget} {
+		t.Run("demoted to "+role, func(t *testing.T) {
+			st := invertible()
+			st.Promoted.Role = role
+			st.Promoted.Active = false
+			st.Promoted.LastPromotedAt = "1700000000"
+
+			plan, err := AssessInvert(st)
+			if err != nil {
+				t.Fatalf("AssessInvert refused a pair whose promoted end was demoted to %s: %v", role, err)
+			}
+			if plan.AlreadyInverted {
+				t.Fatal("reported a pre-inversion pair as already inverted")
+			}
+			// The recovery has to actually recover: not merely be permitted,
+			// but produce the same swap a promoted end produces. A plan that
+			// was accepted and then wrote nothing useful would look like a
+			// success and leave the pair exactly as wedged.
+			if plan.NewSourceUpdates[FieldReplicationRole] != RoleSource ||
+				plan.NewSourceUpdates[FieldReplicaTargets] != "prod01:web01" {
+				t.Errorf("new source updates = %v", plan.NewSourceUpdates)
+			}
+			if plan.NewTargetUpdates[FieldReplicationRole] != RoleTarget ||
+				plan.NewTargetUpdates[FieldReplicaSource] != "dr01:web01" {
+				t.Errorf("new target updates = %v", plan.NewTargetUpdates)
+			}
+		})
+	}
+}
+
+// TestAssessInvertRefusesADemotedEndWithNoTrace: the check still has a job.
+// Without the trace, accepting a paused end would accept reversing a pair that
+// was never failed over at all -- which is what -update-role=paused on an
+// ordinary replica looks like.
+func TestAssessInvertRefusesADemotedEndWithNoTrace(t *testing.T) {
+	for _, role := range []string{RolePaused, RoleFenced, RoleTarget} {
+		st := invertible()
+		st.Promoted.Role = role
+		st.Promoted.LastPromotedAt = ""
+		_, err := AssessInvert(st)
+		if err == nil {
+			t.Fatalf("inverted a pair whose %s end carries no record of ever having been promoted", role)
+		}
+		if !strings.Contains(err.Error(), "no record of ever having been promoted") {
+			t.Errorf("role %s: err = %v, want a refusal naming the missing record", role, err)
+		}
+	}
+}
+
+// TestAssessInvertKeepsTheTraceOnTheNewSourceAndReleasesItOnTheNewTarget pins
+// the asymmetry, which is the whole of the field's lifecycle in one plan.
+//
+// The promoted copy keeps it: it served live, it still holds that data, and it
+// is the reason the pair is being reversed. Carried into role=source it costs
+// nothing and protects the domain if it is ever made somebody's replica again.
+//
+// The old source loses it: an inversion is a deliberate, operator-issued
+// decision that this end is the replica now, which is exactly the
+// acknowledgement the trace exists to demand. Left in place, a pair failed over
+// back and forth would end with both ends permanently refusing their own
+// restores.
+func TestAssessInvertKeepsTheTraceOnTheNewSourceAndReleasesItOnTheNewTarget(t *testing.T) {
+	st := invertible()
+	st.Promoted.LastPromotedAt = "1700000000"
+	// The old source carries one of its own: it was promoted in an earlier
+	// cycle and inverted into the source role, which is how a pair that has
+	// failed over twice actually looks.
+	st.OldSource.LastPromotedAt = "1600000000"
+
+	plan, err := AssessInvert(st)
+	if err != nil {
+		t.Fatalf("AssessInvert: %v", err)
+	}
+	if contains(plan.NewSourceRemovals, FieldLastPromotedAt) {
+		t.Error("the promoted end's record of having served live is stripped as it becomes the source; it is the reason this data is being kept")
+	}
+	if !contains(plan.NewTargetRemovals, FieldLastPromotedAt) {
+		t.Error("the old source keeps its record of having served live while becoming a replica; every restore and force-clean against it would then refuse for ever")
+	}
+}

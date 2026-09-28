@@ -2955,3 +2955,197 @@ func TestReplicaIncompleteRoundTripsThroughTheParserThatRefuses(t *testing.T) {
 		t.Errorf("a full sync's own value read back as %+v", got)
 	}
 }
+
+// --- the durable promotion trace -----------------------------------------
+
+// TestServedLiveAllowsOverwrite covers the gate the ROLE gates cannot be.
+//
+// TargetRoleAllowsSync and TargetRoleAllowsRestore both key on
+// replication_role, and every route out of `promoted` rewrites it: a clean
+// shutdown records paused, a fence records fenced, -update-role records
+// whatever was asked. TargetRoleAllowsRestore then deliberately PERMITS paused
+// and fenced, because rolling a paused replica back is the ordinary reason the
+// verb exists. So a copy that served production for a week, shut down and
+// recorded paused, was indistinguishable to every gate in this file from a
+// replica that had never done anything -- and a restore or a -force-clean would
+// overwrite it without a word.
+func TestServedLiveAllowsOverwrite(t *testing.T) {
+	if err := ServedLiveAllowsOverwrite("", "restore a restore point over it"); err != nil {
+		t.Fatalf("an ordinary replica, which is nearly every domain, was refused: %v", err)
+	}
+
+	err := ServedLiveAllowsOverwrite("1756000000", "force-clean it")
+	if err == nil {
+		t.Fatal("a copy that has served live and not been released was allowed to be overwritten")
+	}
+	// The sentinel, because callers treat this differently from a broken sync:
+	// it is exempt from failure_count, like the other administrative refusals,
+	// and unlike them it is cleared only by somebody saying so.
+	if !errors.Is(err, ErrServedLive) {
+		t.Errorf("the refusal does not wrap ErrServedLive, so a caller cannot tell it from a sync that broke: %v", err)
+	}
+	// What the message has to contain, and each for a reason: the date so an
+	// operator can recognise WHICH failover this was, the operation so they
+	// know which of their commands was stopped, and both ways out -- because a
+	// refusal that names no way forward is one somebody works around.
+	for _, want := range []string{"2025-08-24", "force-clean it", "-" + FlagReleasePromotion, "-invert"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not mention %q", err, want)
+		}
+	}
+
+	// Presence is the finding. A value written by a newer vmsync, or one torn
+	// mid-splice, still means this copy served -- so it must refuse, and say
+	// the time is unrecorded rather than print a date derived from nothing.
+	err = ServedLiveAllowsOverwrite("not-a-number", "replicate over it")
+	if err == nil {
+		t.Fatal("an unreadable record was treated as 'never promoted', which is the one direction this must not fail in")
+	}
+	if !strings.Contains(err.Error(), "at an unrecorded time") {
+		t.Errorf("refusal for an unreadable record = %q, want it to say the time is unrecorded", err)
+	}
+}
+
+// TestPromotionFieldsDoNotStripTheTrace pins the one exclusion the whole
+// mechanism rests on.
+//
+// SetReplicationRole strips the promotion record on every transition away from
+// `promoted`, and that strip is correct for the four present-tense fields: a
+// domain marked target beside a promoted_at describes a failover still in
+// force. The trace is past tense and must survive, because the transition that
+// strips those four is the console's own advice -- shut the copy down, then
+// clean it -- and taking the trace with them is what made a week of production
+// data overwritable in two operations.
+//
+// Asserted against the list rather than through a live domain because this is
+// the kind of mistake a later tidy-up makes: the field looks like it belongs
+// with the other four, and nothing about the name says otherwise.
+func TestPromotionFieldsDoNotStripTheTrace(t *testing.T) {
+	stripped := promotionFields
+	if slices.Contains(stripped, MetadataFieldLastPromotedAt) {
+		t.Fatalf("%s is in SetReplicationRole's strip list. Every route out of `promoted` then erases the "+
+			"only record that these disks held live data, and the documented remedy for an unwanted "+
+			"promotion -- shut it down, then -update-role -- becomes the thing that removes the "+
+			"protection", MetadataFieldLastPromotedAt)
+	}
+	// The four it MUST contain, so this test cannot pass by the list being
+	// empty or by the function having been renamed out from under it.
+	for _, f := range []string{
+		MetadataFieldPromotedAt, MetadataFieldPromotedBy,
+		MetadataFieldPromotedFrom, MetadataFieldPromotionMode,
+	} {
+		if !slices.Contains(stripped, f) {
+			t.Errorf("%s is no longer stripped when a domain stops being promoted", f)
+		}
+	}
+	// And the fence, which dies with the promotion that armed it.
+	for _, f := range []string{
+		MetadataFieldFenceID, MetadataFieldFenceSource,
+		MetadataFieldFenceArmedAt, MetadataFieldFenceArmedBy,
+	} {
+		if !slices.Contains(stripped, f) {
+			t.Errorf("%s is no longer stripped when a domain stops being promoted", f)
+		}
+	}
+}
+
+// TestUpdateSyncMetadataStripsTheTraceFromARedefinedTarget is the other half,
+// and it points the opposite way.
+//
+// UpdateSyncMetadata merges the SOURCE's XML and defines the TARGET, so a field
+// it does not explicitly remove is INHERITED. A source that was itself promoted
+// once -- the normal state after an -invert -- carries the trace, and leaving
+// the key out would stamp it onto every replica built from that source. Those
+// replicas never served anything, and they would start refusing their own
+// restores because the domain they were copied from once did.
+func TestUpdateSyncMetadataStripsTheTraceFromARedefinedTarget(t *testing.T) {
+	removed := syncRedefineStrips
+	if !slices.Contains(removed, MetadataFieldLastPromotedAt) {
+		t.Fatalf("%s is not removed when a target is redefined from its source's XML, so a replica "+
+			"inherits the promotion history of the domain it was copied FROM and refuses operations "+
+			"on the strength of a failover it had no part in", MetadataFieldLastPromotedAt)
+	}
+}
+
+// TestPromotionTraceUpdate is the decision table for the one field that keeps a
+// copy which served production from being silently overwritten.
+//
+// Every case here is about a transition SetReplicationRole performs, and none of
+// them could be reached by a test before the decision was pulled out of it: they
+// all need a live libvirt holding a real promoted domain. That is why the rule
+// lives in a pure function.
+func TestPromotionTraceUpdate(t *testing.T) {
+	const now = int64(1800000000)
+	nowStr := strconv.FormatInt(now, 10)
+
+	for _, tc := range []struct {
+		name                            string
+		previous, role                  string
+		existingTrace, promotedAt, want string
+		why                             string
+	}{
+		{
+			name: "becoming promoted records it", previous: RoleTarget, role: RolePromoted,
+			want: nowStr,
+			why:  "-update-role promoted is a statement that this copy is the one serving; a copy brought up that way is no less dangerous to overwrite than one -promote brought up",
+		},
+		{
+			name: "re-running promoted keeps the original time", previous: RolePromoted, role: RolePromoted,
+			existingTrace: "1700000000", want: "",
+			why: "re-running the command must not push the recorded time forward",
+		},
+		{
+			name: "promoting a copy that served before keeps the older record", previous: RolePaused, role: RolePromoted,
+			existingTrace: "1700000000", want: "",
+			why: "an existing record wins; the field says THAT this copy has served, and the earliest answer is still true",
+		},
+		{
+			name: "demoting a copy that already has one writes nothing", previous: RolePromoted, role: RolePaused,
+			existingTrace: "1700000000", promotedAt: "1700000000", want: "",
+			why: "promotionFields does not strip it, so there is nothing to carry",
+		},
+		{
+			name: "demoting an OLDER binary's promotion carries promoted_at across", previous: RolePromoted, role: RolePaused,
+			promotedAt: "1690000000", want: "1690000000",
+			why: "a domain promoted before the field existed carries promoted_at and no trace, and the demotion is the LAST moment anything knows it was promoted -- these are exactly the domains the mechanism exists to protect",
+		},
+		{
+			name: "demoting a promotion with no recorded time at all still records one", previous: RolePromoted, role: RolePaused,
+			want: nowStr,
+			why:  "an old -update-role promoted by hand left no promoted_at either; the field's job is to answer 'did this serve live', and answering an hour late beats not answering",
+		},
+		{
+			name: "to target is a demotion like any other", previous: RolePromoted, role: RoleTarget,
+			promotedAt: "1690000000", want: "1690000000",
+			why: "the destination does not change whether this copy served",
+		},
+		{
+			name: "to none is a demotion like any other", previous: RolePromoted, role: RoleNone,
+			promotedAt: "1690000000", want: "1690000000",
+			why: "clearing the role returns the domain to the state the sync gate treats as permission, which is the most dangerous destination of the three",
+		},
+		{
+			name: "pausing an ordinary replica invents nothing", previous: RoleTarget, role: RolePaused,
+			want: "",
+			why:  "a domain that never served anything must not start refusing its own restores and force-cleans",
+		},
+		{
+			name: "fencing an ordinary replica invents nothing", previous: RoleTarget, role: RoleFenced,
+			want: "",
+			why:  "a fenced domain is usually the DISPLACED SOURCE, which was never promoted at all",
+		},
+		{
+			name: "a stale promoted_at on a never-promoted domain is ignored", previous: RoleTarget, role: RolePaused,
+			promotedAt: "1690000000", want: "",
+			why: "promoted_at is only read on a transition out of promoted; a leftover one elsewhere must not manufacture a history",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := promotionTraceUpdate(tc.previous, tc.role, tc.existingTrace, tc.promotedAt, now)
+			if got != tc.want {
+				t.Errorf("promotionTraceUpdate(%q -> %q, trace=%q, promoted_at=%q) = %q, want %q\n  %s",
+					tc.previous, tc.role, tc.existingTrace, tc.promotedAt, got, tc.want, tc.why)
+			}
+		})
+	}
+}

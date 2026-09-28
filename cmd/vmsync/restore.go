@@ -292,6 +292,20 @@ func checkRestoreTargetState(tgtMgr *libvirtsync.Manager, cfg syncConfig, plan *
 	if err := libvirtsync.TargetRoleAllowsRestore(role); err != nil {
 		return err
 	}
+	// The role gate above passes `paused` and `fenced` on purpose -- rolling a
+	// paused replica back is the ordinary reason this verb exists. That is
+	// exactly what leaves this verb reachable against a copy that was failed
+	// over to and then shut down, because shutting a promoted domain down
+	// records `paused`. Same read shape as the role, and refused rather than
+	// warned past for the same reason: a trace that could not be read is
+	// indistinguishable from one that says this copy served production.
+	servedLive, err := libvirtsync.ReadPromotionTrace(tgtMgr, cfg.TargetDomain)
+	if err != nil {
+		return fmt.Errorf("read the target domain's %s: %w -- refusing to restore over a domain whose promotion history could not be established", libvirtsync.MetadataFieldLastPromotedAt, err)
+	}
+	if err := libvirtsync.ServedLiveAllowsOverwrite(servedLive, "restore a restore point over it"); err != nil {
+		return err
+	}
 	plan.role = role
 
 	// DOMAIN_XML_INACTIVE, matching every other metadata read in vmsync: the
@@ -623,6 +637,34 @@ func applyRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.
 				"paths", plan.temps[:staged], "error", err)
 		}
 	}
+	// asided counts how many aside copies exist, so a stand-down can remove
+	// exactly those and no more.
+	//
+	// It is tracked for the same reason `staged` is, and the omission was worse:
+	// an aside is a full-size reflink copy of a replica disk, and a run that
+	// created some and then stood down left one per disk behind with nothing
+	// recording them, nothing reaping them, and a message reading "no disk has
+	// been replaced" -- which is true, and which an operator reads as "nothing
+	// was left behind". They share extents at first and diverge as the replica
+	// is written, so the cost arrives later, on the target's filesystem, with
+	// no artefact pointing at the run that caused it.
+	//
+	// Only safe to remove on the paths where NO disk was ever replaced, which is
+	// what makes each aside provably byte-identical to the live file beside it
+	// and therefore worth nothing. discardAsides is called from exactly those
+	// paths; see undoRestore for the one that keeps them.
+	asided := 0
+	discardAsides := func() {
+		if asided == 0 {
+			return
+		}
+		if _, err := client.Run(ctx, restorepoint.RestoreDiscardCommand(plan.asides[:asided]...)); err != nil {
+			trace.Warning("restore: could not remove the aside copies after standing down. No disk was replaced, so each of these is an exact copy of the live disk beside it and holds nothing -- but they are full-size files that will diverge as the replica is written, so remove them by hand",
+				"paths", plan.asides[:asided], "error", err)
+			return
+		}
+		trace.Info("restore: removed the aside copies made before standing down", "count", asided)
+	}
 	for i, name := range plan.status.Disks {
 		cmd, err := restorepoint.RestoreStageCommand(plan.point, name, plan.temps[i])
 		if err != nil {
@@ -657,11 +699,21 @@ func applyRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.
 	for i, d := range plan.disks {
 		if out, err := client.Run(ctx, restorepoint.RestoreAsideCommand(d, plan.asides[i])); err != nil {
 			discardStaged()
+			discardAsides()
 			return fmt.Errorf("restore: preserve the current contents of %s before replacing it: %w: %s -- no disk has been replaced", d, err, out)
 		}
+		asided = i + 1
 	}
 	for i, d := range plan.disks {
 		if out, err := client.Run(ctx, restorepoint.RestorePromoteCommand(plan.temps[i], d)); err != nil {
+			if i == 0 {
+				// Nothing was replaced, so every aside is an exact copy of the
+				// file beside it. Removed HERE rather than inside undoRestore
+				// because that function's job is putting disks back, and on
+				// this one path there are none to put back -- it is the
+				// stand-down case wearing the rollback's clothes.
+				discardAsides()
+			}
 			undoRestore(ctx, client, tgtMgr, cfg, plan, i, owners)
 			return fmt.Errorf("restore: replace %s with the restored copy: %w: %s", d, err, out)
 		}
@@ -759,8 +811,13 @@ func applyRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.
 // nobody should have to work out from a stack trace.
 func undoRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.Manager, cfg syncConfig, plan restorePlan, upTo int, owners []util.DiskOwner) {
 	if upTo == 0 {
-		trace.Warning("restore: no disk had been replaced yet, so the replica is exactly as it was. The staged copies and the aside copies are left in place for inspection",
-			"staged", plan.temps, "asides", plan.asides)
+		// The asides are removed by the caller on this path, not left "for
+		// inspection": nothing was replaced, so each one is a byte-identical
+		// copy of the live disk beside it and there is nothing in it to
+		// inspect. The staged copies DO stay -- the mv that just failed is the
+		// thing somebody will want to look at, and its source is one of them.
+		trace.Warning("restore: no disk had been replaced yet, so the replica is exactly as it was. The staged copies are left in place for inspection; the aside copies are being removed, because with nothing replaced each is an exact duplicate of a disk that is still there",
+			"staged", plan.temps)
 		return
 	}
 	failed := 0
@@ -800,6 +857,13 @@ func undoRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.M
 			"disks", len(plan.disks), "not_put_back", failed, "asides", plan.asides)
 		return
 	}
-	trace.Warning("restore: a disk could not be replaced, so every disk already replaced was put back. The replica is as it was before this ran, but its replication metadata was already invalidated -- it is paused, its metadata describes the restore point rather than its contents, and the record saying a restore was in flight is deliberately left armed so -promote refuses it. Re-run the restore, or run -update-role=target followed by a -reinit full sync",
-		"disks", len(plan.disks))
+	// The asides are KEPT here, unlike the no-disk-replaced path above, and the
+	// difference is that these disks were genuinely modified and then written
+	// back from these files. The put-back is a cp across a link that has just
+	// proved unreliable, so this is the wrong moment to delete the only second
+	// copy of the pre-restore contents. They are named so they are not a leak
+	// nobody can find: full-size files, one per disk, that share extents now and
+	// stop sharing them as the replica is written.
+	trace.Warning("restore: a disk could not be replaced, so every disk already replaced was put back. The replica is as it was before this ran, but its replication metadata was already invalidated -- it is paused, its metadata describes the restore point rather than its contents, and the record saying a restore was in flight is deliberately left armed so -promote refuses it. Re-run the restore, or run -update-role=target followed by a -reinit full sync. The pre-restore contents are kept in the aside files listed here; remove them once this replica has been confirmed good",
+		"disks", len(plan.disks), "asides", plan.asides)
 }

@@ -57,6 +57,18 @@ type Explanation struct {
 	ReplicaIncomplete     string
 	ReplicaIncompleteNote string
 
+	// ServedLiveNote is what the caller makes of the domain's durable
+	// promotion trace, rendered rather than decided here -- same split as
+	// ReplicaIncompleteNote, and for the same reason.
+	//
+	// Reported by this verb specifically because it is the verb somebody runs
+	// when a command has just been refused and the reason is not on screen any
+	// more. The trace is the one refusal that survives a role change, so it is
+	// also the one an operator is most likely to be looking at without knowing
+	// it: the domain reads `paused`, everything else about it reads healthy,
+	// and three separate commands say no.
+	ServedLiveNote string
+
 	Reading Reading
 
 	// Limit caps how many actions are listed, newest kept. Zero lists them
@@ -99,6 +111,21 @@ func (e Explanation) Render(w io.Writer) {
 			for _, line := range wrapNote(e.ReplicaIncompleteNote) {
 				fmt.Fprintf(w, "  %s\n", line)
 			}
+		}
+	}
+
+	// --- has this copy ever served live? -------------------------------------
+	//
+	// Its own section directly under the marker, because the two are the pair
+	// of findings that refuse things while everything else about the domain
+	// reads clean -- and unlike the marker, this one is not cleared by
+	// re-running anything. Printed only when there is something to say: a
+	// "(none)" line here on every ordinary replica would push the action list
+	// down the terminal for no information.
+	if e.ServedLiveNote != "" {
+		fmt.Fprintf(w, "\nlast_promoted_at\n")
+		for _, line := range wrapNote(e.ServedLiveNote) {
+			fmt.Fprintf(w, "  %s\n", line)
 		}
 	}
 

@@ -365,6 +365,37 @@ const (
 	// window, so it is recorded rather than inferred.
 	MetadataFieldPromotionMode = "promotion_mode"
 
+	// MetadataFieldLastPromotedAt records that this domain HAS SERVED LIVE at
+	// least once, and when the last such promotion was. It is the only field in
+	// this block that deliberately outlives the state it describes.
+	//
+	// It exists because every other trace of a failover is stripped the moment
+	// the domain stops being promoted (see SetReplicationRole), and the
+	// console's own advice routes through that strip: to force-clean a replica
+	// you must shut it down first, and shutting down a promoted copy records
+	// `paused` and takes the promotion record with it. A copy that served
+	// production for a week therefore became, in two operations with nothing
+	// refusing either, an ordinary paused replica that -restore-restore-point
+	// and -force-clean will both overwrite from the source it displaced.
+	//
+	// Its own field rather than simply not stripping promoted_at, because those
+	// four are an audit trail written in the PRESENT tense: a domain carrying
+	// replication_role=target beside a promoted_at describes a failover that is
+	// still in force, which no promotion ever wrote and which anything
+	// reasoning about "was this displaced, and by whom" would read as fact.
+	// UpdateSyncMetadata says the same in its own words. This one is past tense
+	// by name, so role=target beside it is not a contradiction -- it is the true
+	// and useful statement that this replica once held live data.
+	//
+	// WHAT IT IS NOT: proof the domain ever booted. It is written when a domain
+	// BECOMES promoted, atomically with the promotion record, because a second
+	// write after the guest started would leave a window in which a serving
+	// domain carries no trace at all -- and this field only earns its place by
+	// failing closed. So it over-records a promotion nobody ever started, such
+	// as a drill, and the price of that is one deliberate -update-role rather
+	// than a silently destroyed replica.
+	MetadataFieldLastPromotedAt = "last_promoted_at"
+
 	// The restore record: this domain's disks were rolled back to one of its
 	// restore points, rather than being what the last sync copied.
 	//
@@ -810,6 +841,7 @@ var metadataFieldOrder = []string{
 	MetadataFieldPromotedBy,
 	MetadataFieldPromotedFrom,
 	MetadataFieldPromotionMode,
+	MetadataFieldLastPromotedAt,
 	MetadataFieldCheckpointAt,
 	MetadataFieldSourceStoppedAtSync,
 	MetadataFieldRestoredFrom,
@@ -1612,6 +1644,70 @@ func SetMetadataFields(domainXML string, updates map[string]string, removeFields
 // the key would stamp that onto this target, so the next run would compare
 // this host's disks against mtimes taken on a different host at a different
 // time.
+// syncRedefineStrips is what a successful sync's full redefine removes from the
+// definition it builds.
+//
+// UpdateSyncMetadata merges the SOURCE's XML and defines the TARGET, so this is
+// not tidiness: any field NOT named here is INHERITED by the target from the
+// source. That is the direction that matters, and it is the opposite of
+// promotionFields' -- there the danger is stripping too much, here it is
+// stripping too little.
+//
+// A package-level list for the same reason promotionFields is one: these lists
+// ARE the mechanism, "forgot one of the strip lists" is this codebase's
+// documented failure mode for target-only fields (see
+// MetadataFieldReplicaWrittenAt, which names every place), and a list nothing
+// can enumerate is a list nothing can check. Its caller clones it, because two
+// entries are added per run depending on what that run found.
+var syncRedefineStrips = []string{
+	// A successful define means the target has accepted last_checkpoint,
+	// so nothing is pending. Cleared HERE rather than in a separate
+	// write so that accepting and clearing are one atomic
+	// DomainDefineXML: never both set, never neither.
+	// Cleared on every successful sync. Safe without a parameter because
+	// a domain carrying a verify failure refuses to sync at all, so any
+	// run reaching here either verified and passed or came through a
+	// recovery path meant to clear it. See MetadataFieldVerifyState.
+	MetadataFieldVerifyState,
+	MetadataFieldVerifyFailedAt,
+	MetadataFieldPendingCheckpoint,
+	// Cleared HERE and nowhere else on the success path, for exactly the
+	// reason pending_checkpoint is: reaching this function means the copy
+	// finished and is about to be recorded, so accepting the new replica
+	// and withdrawing the warning about the old one are ONE atomic
+	// DomainDefineXML. A separate write afterwards could leave a healthy
+	// replica permanently refusing promotion, and a separate write before
+	// could leave a half-written one accepted.
+	//
+	// Unconditional, like verify_state: this function merges into the
+	// SOURCE's XML, so a source that was once somebody's replica can
+	// carry a stale value of its own, and omitting the key would stamp
+	// that onto a target the copy has just proved complete.
+	MetadataFieldReplicaIncomplete,
+	MetadataFieldReplicaTargets,
+	MetadataFieldPromotedAt,
+	MetadataFieldPromotedBy,
+	MetadataFieldPromotedFrom,
+	MetadataFieldPromotionMode,
+	// Stripped here even though it is the one promotion field meant to
+	// OUTLIVE the promotion, and for the same reason the four above are:
+	// this function merges the SOURCE's XML and defines the TARGET, so
+	// leaving the key out would copy the source's history onto a replica
+	// that has none -- a copy that never served live would start
+	// refusing restores because the domain it was copied FROM once did.
+	//
+	// Losing the target's own trace here is not a hole, because a domain
+	// still carrying it cannot reach this function: the trace only exists
+	// alongside paused/fenced/promoted, and TargetRoleAllowsSync refuses
+	// all three. The only way to a syncable role is a deliberate
+	// -update-role target, which clears the trace itself.
+	MetadataFieldLastPromotedAt,
+	MetadataFieldFenceID,
+	MetadataFieldFenceSource,
+	MetadataFieldFenceArmedAt,
+	MetadataFieldFenceArmedBy,
+}
+
 func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetRole string, checkpointAtUnix int64, sourceStopped bool, replicaWrittenAt, autostartIntent string) (string, error) {
 	updates := map[string]string{
 		MetadataFieldLastCheckpoint: checkpoint,
@@ -1628,41 +1724,10 @@ func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetR
 		// one sync rather than at the next full copy.
 		MetadataFieldAutostartIntent: autostartIntent,
 	}
-	remove := []string{
-		// A successful define means the target has accepted last_checkpoint,
-		// so nothing is pending. Cleared HERE rather than in a separate
-		// write so that accepting and clearing are one atomic
-		// DomainDefineXML: never both set, never neither.
-		// Cleared on every successful sync. Safe without a parameter because
-		// a domain carrying a verify failure refuses to sync at all, so any
-		// run reaching here either verified and passed or came through a
-		// recovery path meant to clear it. See MetadataFieldVerifyState.
-		MetadataFieldVerifyState,
-		MetadataFieldVerifyFailedAt,
-		MetadataFieldPendingCheckpoint,
-		// Cleared HERE and nowhere else on the success path, for exactly the
-		// reason pending_checkpoint is: reaching this function means the copy
-		// finished and is about to be recorded, so accepting the new replica
-		// and withdrawing the warning about the old one are ONE atomic
-		// DomainDefineXML. A separate write afterwards could leave a healthy
-		// replica permanently refusing promotion, and a separate write before
-		// could leave a half-written one accepted.
-		//
-		// Unconditional, like verify_state: this function merges into the
-		// SOURCE's XML, so a source that was once somebody's replica can
-		// carry a stale value of its own, and omitting the key would stamp
-		// that onto a target the copy has just proved complete.
-		MetadataFieldReplicaIncomplete,
-		MetadataFieldReplicaTargets,
-		MetadataFieldPromotedAt,
-		MetadataFieldPromotedBy,
-		MetadataFieldPromotedFrom,
-		MetadataFieldPromotionMode,
-		MetadataFieldFenceID,
-		MetadataFieldFenceSource,
-		MetadataFieldFenceArmedAt,
-		MetadataFieldFenceArmedBy,
-	}
+	// A clone, because the conditional appends below must not grow the shared
+	// list: every sync would otherwise inherit the last one's decisions about
+	// source_stopped_at_sync and replica_written_at.
+	remove := append([]string(nil), syncRedefineStrips...)
 	// Recorded only when true, and actively removed otherwise: a stale "the
 	// source was stopped" from an earlier sync would make a later promotion
 	// claim a verified zero it has no right to.
@@ -1969,6 +2034,10 @@ var recordReplicaTargetStrips = []string{
 	// UpdateSyncMetadata would inherit onto a real replica -- which would
 	// refuse a promotion of a replica nothing was ever copying.
 	MetadataFieldReplicaIncomplete,
+	// NOT MetadataFieldLastPromotedAt, which is not a target-only field: a
+	// source that reached that role by being promoted and then inverted has
+	// genuinely served live, and the record of it belongs to the domain for
+	// the rest of its life. See the field's own comment.
 }
 
 // ReadTargetFailureCount reconnects to the target and returns the
@@ -2178,6 +2247,113 @@ func TargetRoleAllowsRestore(role string) error {
 	}
 }
 
+// ErrServedLive marks every refusal ServedLiveAllowsOverwrite produces, so a
+// caller can tell "this copy has served live and nobody has released it" from
+// a role refusal or a genuine failure.
+//
+// Its own sentinel rather than ErrRoleRefusesSync for the reason that one is
+// not ErrVerifyStateRefusesSync: the three are cleared by different things,
+// and only this one needs a human to say out loud that the data is disposable.
+// It shares the exemption from failure_count for the same reason as the
+// others -- a refusal is not a broken sync, and a reinit cannot heal it.
+var ErrServedLive = errors.New("this domain has served live and has not been released")
+
+// ServedLiveAllowsOverwrite refuses an operation that would destroy the disk
+// contents of a domain that has been promoted at some point and never released.
+//
+// This is the check the role gates cannot make. A role says what a domain is
+// FOR right now, and every route out of `promoted` rewrites it: a clean
+// shutdown records paused, a fence records fenced, -update-role records
+// whatever was asked. So by the time an operator reaches for a restore or a
+// force-clean, the copy that spent a week serving production looks exactly
+// like a replica that has never done anything -- and TargetRoleAllowsRestore
+// deliberately permits paused and fenced, because rolling back a paused
+// replica is normally the right thing to do. The distinction those gates are
+// missing is not the role. It is whether these particular disks were ever
+// live, and that is what the trace records.
+//
+// what names the operation in the message ("restore a restore point over it",
+// "force-clean it"), because the correct next step is the same for all of them
+// and the thing an operator needs to read back is which of their commands was
+// stopped.
+//
+// Pure and standalone, like TargetRoleAllowsSync and TargetRoleAllowsRestore,
+// so the decision standing between one wrong command and a week of production
+// data is testable without libvirt.
+func ServedLiveAllowsOverwrite(lastPromotedAt, what string) error {
+	if lastPromotedAt == "" {
+		return nil
+	}
+	when := "at an unrecorded time"
+	if unix, err := strconv.ParseInt(lastPromotedAt, 10, 64); err == nil {
+		when = "on " + time.Unix(unix, 0).UTC().Format(time.RFC3339)
+	}
+	return fmt.Errorf("%w: this domain was promoted %s, so its disks hold data that served live and may be the only copy of it -- refusing to %s. If that data is genuinely disposable, say so with -%s (which refuses while the domain is running) and then re-run this command; if it is not, -invert reverses the pair and keeps it",
+		ErrServedLive, when, what, FlagReleasePromotion)
+}
+
+// FlagReleasePromotion is the name of the one flag that clears the durable
+// promotion trace, held here rather than in main so every refusal message can
+// name it without the engine and the CLI drifting apart.
+//
+// One flag, and deliberately not a field on anything the control plane can
+// send. The console can compute that a release is needed and print this
+// command; it cannot issue it. That is the whole design: every other guard in
+// vmsync can be satisfied by a button, and this is the one that requires
+// somebody to have typed the words.
+const FlagReleasePromotion = "release-promotion"
+
+// ReleasePromotionTrace clears a domain's durable promotion trace, which is
+// the operator's statement that the data this copy served is disposable.
+//
+// Refuses while the domain is RUNNING. A release is only ever wanted in order
+// to overwrite the disks afterwards, and a running domain is the one case
+// where that is certainly wrong -- and where it is also most tempting, since a
+// copy still serving traffic is exactly the state an operator mistakes for
+// "the failover I meant to undo".
+//
+// Refuses while the role is still `promoted`, for a narrower reason: the
+// demotion carries the trace forward (see SetReplicationRole), so releasing
+// first and demoting second would simply write it again. Making the order
+// explicit avoids an operator concluding the flag does not work.
+//
+// Returns the value that was cleared, so the caller can log and journal what
+// was given up rather than just that something was.
+func ReleasePromotionTrace(mgr *Manager, domainName string) (released string, err error) {
+	dom, err := mgr.Conn.LookupDomainByName(domainName)
+	if err != nil {
+		return "", fmt.Errorf("look up domain %s: %w", domainName, err)
+	}
+	active, activeErr := dom.IsActive()
+	dom.Free()
+	if activeErr != nil {
+		return "", fmt.Errorf("domain %s: could not determine whether it is running, and releasing a promotion record on a running domain is refused: %w", domainName, activeErr)
+	}
+	if active {
+		return "", fmt.Errorf("domain %s is RUNNING -- refusing to release its promotion record while it is serving; shut it down first (-shutdown-domain), confirm it is the copy you mean to discard, and re-run", domainName)
+	}
+
+	role, err := ReadReplicationRole(mgr, domainName)
+	if err != nil {
+		return "", err
+	}
+	if role == RolePromoted {
+		return "", fmt.Errorf("domain %s is still marked replication_role=%s -- demote it first (-update-role=%s or -update-role=%s); a demotion re-records the promotion, so releasing before demoting would have no effect", domainName, RolePromoted, RolePaused, RoleFenced)
+	}
+
+	released, err = ReadDomainMetadataField(mgr, domainName, MetadataFieldLastPromotedAt)
+	if err != nil {
+		return "", err
+	}
+	if released == "" {
+		return "", nil // nothing recorded; a no-op, not an error
+	}
+	if err := SetDomainMetadataFields(mgr, domainName, nil, MetadataFieldLastPromotedAt); err != nil {
+		return "", err
+	}
+	return released, nil
+}
+
 // ValidateRole reports whether role is one a caller may ask
 // SetReplicationRole to store. Shared by the -update-role flag's own
 // pre-flight check and by SetReplicationRole itself, so the CLI can reject
@@ -2221,6 +2397,46 @@ func ReadReplicationRole(mgr *Manager, domainName string) (string, error) {
 		return "", nil
 	}
 	return role, nil
+}
+
+// ReadPromotionTrace returns the durable record that a domain has served live
+// (MetadataFieldLastPromotedAt), or "" when it never has.
+//
+// A domain that does not exist at all is reported as "" with a nil error, for
+// the same reason ReadReplicationRole does it: a target that has not been
+// created yet cannot have been promoted, so it has nothing to protect and the
+// first full sync must be free to create it. Its own function rather than
+// ReadDomainMetadataField at each call site precisely because of that
+// tolerance -- the generic reader treats a missing domain as a lookup failure,
+// which on this path would refuse every first sync of every new pair.
+func ReadPromotionTrace(mgr *Manager, domainName string) (string, error) {
+	dom, err := mgr.Conn.LookupDomainByName(domainName)
+	if err != nil {
+		if lvErr, ok := err.(libvirt.Error); ok && lvErr.Code == libvirt.ERR_NO_DOMAIN {
+			return "", nil
+		}
+		return "", fmt.Errorf("look up domain %s to read its promotion history: %w", domainName, err)
+	}
+	defer dom.Free()
+
+	// DOMAIN_XML_INACTIVE, matching every other metadata read: the field is
+	// written with AFFECT_CONFIG, so a running domain's live document -- which
+	// is exactly the document a promoted copy has -- would not carry it.
+	domXML, err := dom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE)
+	if err != nil {
+		return "", fmt.Errorf("read domain %s xml to get its promotion history: %w", domainName, err)
+	}
+	// Unlike ReadReplicationRole, an unparsable domain document is RETURNED as
+	// an error rather than flattened to "": it is indistinguishable from a
+	// document carrying a trace that says this copy served production, and the
+	// caller's job on this path is to refuse rather than to proceed on a
+	// blank. An ABSENT field is not that case -- ParseMetadata reports it as
+	// ("", nil), which is the ordinary answer for nearly every domain.
+	served, err := ParseMetadata(domXML, MetadataFieldLastPromotedAt)
+	if err != nil {
+		return "", fmt.Errorf("read domain %s %s: %w", domainName, MetadataFieldLastPromotedAt, err)
+	}
+	return served, nil
 }
 
 // ReadDomainAutostart reports a domain's real autostart flag, and whether it
@@ -2345,6 +2561,107 @@ func ReadVerifyState(mgr *Manager, domainName string) (verifyState, failedAt str
 // second vmsync could have its write silently discarded. That matters more
 // here than for a failure counter: losing a promoted marker is exactly the
 // failure this whole field exists to prevent.
+// promotionFields is what moving away from `promoted` takes with it.
+//
+// Those fields describe a failover that is, by that very call, no longer in
+// force. Leaving them behind lets a domain carry replication_role=target
+// alongside a promoted_at and a promoted_from -- a combination no promotion
+// ever wrote, which anything reasoning about "was this displaced, and by whom"
+// would read as fact. The one documented remedy for an unwanted promotion is
+// -update-role=target (see TargetRoleAllowsSync's own message), so this is the
+// common path, not an edge case.
+//
+// Only UpdateSyncMetadata and an inversion stripped them before, and the first
+// of those runs only after a SUCCESSFUL sync -- which a domain stuck
+// mid-recovery is precisely not getting.
+//
+// A package-level list rather than a literal inside SetReplicationRole, for the
+// reason recordReplicaTargetStrips gives: "forgot one of the strip lists" is
+// this codebase's documented failure mode for these fields, and a list nothing
+// can enumerate is a list nothing can check. What must be checked here is an
+// ABSENCE, which is the one thing a live-domain test cannot demonstrate -- see
+// TestPromotionFieldsDoNotStripTheTrace.
+var promotionFields = []string{
+	MetadataFieldPromotedAt,
+	MetadataFieldPromotedBy,
+	MetadataFieldPromotedFrom,
+	MetadataFieldPromotionMode,
+	// The fence that promotion armed dies with it: a domain that is
+	// no longer promoted is not displacing anybody.
+	MetadataFieldFenceID,
+	MetadataFieldFenceSource,
+	MetadataFieldFenceArmedAt,
+	MetadataFieldFenceArmedBy,
+	// MetadataFieldLastPromotedAt is DELIBERATELY ABSENT from this list, and
+	// the absence is the entire point of the field.
+	//
+	// Everything above describes a failover in force and goes when the failover
+	// does. The trace describes one that HAPPENED, and outliving the demotion is
+	// its only job: without it, SetReplicationRole is itself the hole -- the
+	// console's own advice is to shut a promoted copy down and then clean it,
+	// and the shutdown records `paused` through this very list, taking every
+	// trace of the promotion with it. Two operations later the copy that served
+	// production for a week is an ordinary paused replica that
+	// -restore-restore-point and -force-clean will both overwrite.
+	//
+	// It is cleared by exactly one thing, ReleasePromotionTrace, reached by
+	// exactly one flag. Do not add it here, and do not add it to a strip list
+	// for tidiness: a strip on any path an operator can reach by accident puts
+	// the hole back.
+}
+
+// promotionTraceUpdate decides what a role transition must write to keep the
+// durable promotion trace correct. It returns the value to store in
+// MetadataFieldLastPromotedAt, or "" for "write nothing".
+//
+// Pure, and its own function, because it is the decision that keeps a copy which
+// served production from being overwritten, it has five cases, and not one of
+// them is reachable by a test without a live libvirt holding a real promoted
+// domain. Same reasoning as roleToRecord and fenceFailedOpen.
+//
+// The cases, and why each is what it is:
+//
+//   - BECOMING promoted with no trace recorded -> now. `-update-role promoted`
+//     is a deliberate statement that this copy is the one serving, and a copy
+//     brought up that way is no less dangerous to overwrite than one -promote
+//     brought up.
+//
+//   - BECOMING promoted with a trace already there -> nothing. An existing
+//     record wins, and re-running the command must not push the time forward.
+//
+//   - LEAVING promoted with a trace already there -> nothing. The strip about to
+//     happen does not touch it (see promotionFields), so there is nothing to do.
+//
+//   - LEAVING promoted with NO trace -> promoted_at, else now. This is the
+//     migration, and it is the whole reason this case exists: a domain promoted
+//     by a binary that predated the field carries promoted_at and no trace, and
+//     the demotion is the LAST moment anything knows it was promoted. Those
+//     domains are precisely the population the mechanism exists to protect, so
+//     the value is carried across rather than assumed to be there. A promotion
+//     whose time was never recorded at all -- an old `-update-role promoted` by
+//     hand -- is stamped with the demotion's own time: the field's job is to
+//     answer "did this serve live", and answering that an hour late beats not
+//     answering it.
+//
+//   - anything else -> nothing. In particular, pausing or fencing an ORDINARY
+//     replica must not invent a promotion history for it, which would refuse
+//     every restore and force-clean against a domain that never served anything.
+func promotionTraceUpdate(previous, role, existingTrace, promotedAt string, nowUnix int64) string {
+	if existingTrace != "" {
+		return ""
+	}
+	switch {
+	case role == RolePromoted && previous != RolePromoted:
+		return strconv.FormatInt(nowUnix, 10)
+	case previous == RolePromoted && role != RolePromoted:
+		if promotedAt != "" {
+			return promotedAt
+		}
+		return strconv.FormatInt(nowUnix, 10)
+	}
+	return ""
+}
+
 func SetReplicationRole(mgr *Manager, domainName, role string) (previous string, err error) {
 	if err := ValidateRole(role); err != nil {
 		return "", err
@@ -2355,47 +2672,47 @@ func SetReplicationRole(mgr *Manager, domainName, role string) (previous string,
 		return "", err
 	}
 
-	// Moving away from `promoted` takes the promotion record with it.
+	// The durable promotion trace. Two fields are read for it, and only for
+	// the transitions that can possibly need them -- every other role change
+	// pays nothing.
 	//
-	// Those fields describe a failover that is, by this very call, no longer
-	// in force. Leaving them behind lets a domain carry
-	// replication_role=target alongside a promoted_at and a promoted_from --
-	// a combination no promotion ever wrote, which anything reasoning about
-	// "was this displaced, and by whom" would read as fact. The one
-	// documented remedy for an unwanted promotion is -update-role=target
-	// (see TargetRoleAllowsSync's own message), so this is the common path,
-	// not an edge case.
-	//
-	// Only UpdateSyncMetadata and an inversion stripped them before, and the
-	// first of those runs only after a SUCCESSFUL sync -- which a domain
-	// stuck mid-recovery is precisely not getting.
-	promotionFields := []string{
-		MetadataFieldPromotedAt,
-		MetadataFieldPromotedBy,
-		MetadataFieldPromotedFrom,
-		MetadataFieldPromotionMode,
-		// The fence that promotion armed dies with it: a domain that is
-		// no longer promoted is not displacing anybody.
-		MetadataFieldFenceID,
-		MetadataFieldFenceSource,
-		MetadataFieldFenceArmedAt,
-		MetadataFieldFenceArmedBy,
+	// The DECISION is promotionTraceUpdate's, not this function's, for the
+	// reason roleToRecord and fenceFailedOpen exist: it is a small rule with
+	// several cases, all of them about whether a copy's disks stay protected,
+	// and none of them reachable by a test that needs a live libvirt holding a
+	// real promoted domain. Inline here it would be a decision table nothing
+	// could check.
+	trace := map[string]string{}
+	if previous == RolePromoted || role == RolePromoted {
+		existing, readErr := ReadDomainMetadataField(mgr, domainName, MetadataFieldLastPromotedAt)
+		if readErr != nil {
+			return "", fmt.Errorf("domain %s: could not read %s before changing its role to %s: %w", domainName, MetadataFieldLastPromotedAt, role, readErr)
+		}
+		promotedAt, readErr := ReadDomainMetadataField(mgr, domainName, MetadataFieldPromotedAt)
+		if readErr != nil {
+			return "", fmt.Errorf("domain %s: could not read %s before changing its role to %s: %w", domainName, MetadataFieldPromotedAt, role, readErr)
+		}
+		if v := promotionTraceUpdate(previous, role, existing, promotedAt, time.Now().Unix()); v != "" {
+			trace[MetadataFieldLastPromotedAt] = v
+		}
 	}
+	// Whatever it decided goes in the SAME SetDomainMetadataFields call as the
+	// role write and the strip, so there is never a window in which the
+	// promotion record is gone and the trace is not yet there.
 	switch {
 	case role == RoleNone:
-		err = SetDomainMetadataFields(mgr, domainName, nil,
+		err = SetDomainMetadataFields(mgr, domainName, trace,
 			append([]string{MetadataFieldReplicationRole}, promotionFields...)...)
 	case role == RolePromoted:
 		// Promotion itself is written by -promote, which records the whole
 		// record atomically. Setting the role to promoted by hand must not
-		// invent one, but must not destroy an existing one either.
-		err = SetDomainMetadataFields(mgr, domainName, map[string]string{
-			MetadataFieldReplicationRole: role,
-		})
+		// invent one, but must not destroy an existing one either -- so
+		// promotionFields is deliberately not applied here.
+		trace[MetadataFieldReplicationRole] = role
+		err = SetDomainMetadataFields(mgr, domainName, trace)
 	default:
-		err = SetDomainMetadataFields(mgr, domainName, map[string]string{
-			MetadataFieldReplicationRole: role,
-		}, promotionFields...)
+		trace[MetadataFieldReplicationRole] = role
+		err = SetDomainMetadataFields(mgr, domainName, trace, promotionFields...)
 	}
 	if err != nil {
 		return "", err

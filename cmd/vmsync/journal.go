@@ -26,6 +26,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -74,12 +75,18 @@ const (
 // the call sites, because these strings are the vocabulary bench and the docs
 // describe and a typo would produce a verb nothing can search for.
 const (
-	journalVerbSync              = "sync"
-	journalVerbPromote           = "promote"
-	journalVerbInvert            = "invert"
-	journalVerbShutdownDomain    = "shutdown-domain"
-	journalVerbFenceDomain       = "fence-domain"
-	journalVerbUpdateRole        = "update-role"
+	journalVerbSync           = "sync"
+	journalVerbPromote        = "promote"
+	journalVerbInvert         = "invert"
+	journalVerbShutdownDomain = "shutdown-domain"
+	journalVerbFenceDomain    = "fence-domain"
+	journalVerbUpdateRole     = "update-role"
+	// The one verb whose whole content is a decision rather than an action:
+	// nothing on disk changes, an operator simply states that the data a copy
+	// served is disposable. Journalled for exactly that reason -- it is the
+	// permission slip every destructive command that follows relies on, and
+	// the only place it is written down.
+	journalVerbReleasePromotion  = "release-promotion"
 	journalVerbRestoreRestore    = "restore-restore-point"
 	journalVerbCloneRestorePoint = "clone-restore-point"
 )
@@ -534,6 +541,7 @@ func runExplainDomain(cfg syncConfig, domain string) error {
 	if st.Exists {
 		exp.ReplicaIncomplete = st.ReplicaIncomplete
 		exp.ReplicaIncompleteNote = explainReplicaIncomplete(st.ReplicaIncomplete)
+		exp.ServedLiveNote = explainServedLive(st.LastPromotedAt, st.Role)
 	} else if cfg.TargetDiskPath == "" {
 		// Nothing to read the disks off, so there is nothing to find. The
 		// remedy is named rather than left implicit, because the case below is
@@ -693,5 +701,42 @@ func explainReplicaIncomplete(raw string) string {
 	if ri.ActionID != "" {
 		fmt.Fprintf(&b, " The action list below shows that run under %s.", ri.ActionID)
 	}
+	return b.String()
+}
+
+// explainServedLive turns the durable promotion trace into the sentence an
+// operator needs, or "" when there is nothing to say.
+//
+// This is the note that answers "why did that just get refused". By the time
+// somebody runs -explain-domain the refusal has usually scrolled away, and the
+// domain in front of them reads `paused` with a healthy checkpoint, a zero
+// failure count and a recent sync -- nothing on it looks like a reason. The
+// trace is the reason, and it is the only one that no amount of re-running
+// clears.
+//
+// role is taken so the note can say which of the two situations this is: a
+// promotion still in force needs no warning about what it blocks, because the
+// role already blocks everything. One that has been demoted does, because
+// nothing else on the domain says so any more.
+func explainServedLive(lastPromotedAt, role string) string {
+	if lastPromotedAt == "" {
+		return ""
+	}
+	var b strings.Builder
+	// Parsed for the wording only, exactly as the refusal does it: presence is
+	// the finding, and a value this build cannot read is still a copy that
+	// served.
+	if unix, err := strconv.ParseInt(lastPromotedAt, 10, 64); err == nil {
+		fmt.Fprintf(&b, "This copy was promoted at %s", time.Unix(unix, 0).UTC().Format("2006-01-02 15:04:05 UTC"))
+	} else {
+		fmt.Fprintf(&b, "This copy has been promoted (the recorded time, %q, could not be read, which changes nothing about what it means)", lastPromotedAt)
+	}
+	b.WriteString(", so its disks have held data that was serving live and may be the only copy of it.")
+	if role == libvirtsync.RolePromoted {
+		b.WriteString(" It is still marked promoted, so the role interlock already refuses every sync, restore and clean over it. This record is what will keep refusing them after the role changes -- a shutdown records paused, and takes the rest of the promotion record with it.")
+		return b.String()
+	}
+	b.WriteString(" It is no longer marked promoted, and this is the ONLY field still saying it ever was: every other trace of the failover was erased when the role changed. It is what refuses a sync, a restore and a -force-clean over these disks, and nothing clears it by being re-run.")
+	fmt.Fprintf(&b, " If the failover stands, -invert reverses the pair and keeps this data. If the data is genuinely disposable, -%s says so, refuses while the domain is running, and records the decision in the action list below.", libvirtsync.FlagReleasePromotion)
 	return b.String()
 }

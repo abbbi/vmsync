@@ -1,7 +1,3 @@
-| `vmsync_agent_split_brain_vms` | gauge | — | VMs running here that a peer reports having been failed over from, **or** that this host already marked `replication_role=fenced` and is still running. **The one to alert on.** The second case needs no peer query, so it is reported even when the peer is unreachable — which is when a failover usually happens. |
-| `vmsync_agent_split_brain` | gauge | `vm` | 1 while this host still runs a VM another host has been promoted for — either because a reachable peer says so, or because this host marked the VM `fenced` and it is running anyway. |
-| `vmsync_agent_fenced_running_vms` | gauge | — | VMs here that a fence marked `fenced` and that are **still running**: the fence suspended replication and did not stop the domain, so it is live beside the copy that displaced it and both are taking writes. Counted as split brain too, so existing alerts keep firing — but published separately because the remedy differs. Split brain asks which copy wins; this is past that, so the answer is always "stop this domain by hand, then set its role". Emitted at zero on a healthy host, because a fence is never retried and this does **not** clear by itself: a value that has not moved in a day is an unresolved split brain, not a stuck metric. |
-| `vmsync_agent_fenced_running` | gauge | `vm` | 1 while that VM is `fenced` and running. The count says *whether*, this says *which* — and which is what an operator needs before touching anything. |
 # vmsync-agent
 
 The per-hypervisor half of vmsync's control plane. It inventories the domains
@@ -835,6 +831,8 @@ The seven skip reasons:
 | `vmsync_agent_domains` | gauge | `status` | Domains by assessed replication status. |
 | `vmsync_agent_replica_incomplete_vms` | gauge | — | VMs here whose disks a full copy started replacing and never finished. **The one to alert on.** Always emitted, including as a zero: a missing series and a clean host look identical to a query, and one of those is a design choice while the other is a scrape that is not happening. |
 | `vmsync_agent_replica_incomplete` | gauge | `vm` | 1 while that VM carries the marker. The count above says *whether*; this says *which* — and which is what an operator needs before a failover, because `-promote` will refuse exactly these. |
+| `vmsync_agent_served_live_unreleased_vms` | gauge | — | Copies here that have been promoted at some point (`last_promoted_at`), are **no longer** marked `promoted`, and whose promotion record nobody has released. Their disks may hold the only copy of data that was serving, so vmsync refuses to sync, restore or force-clean over them — force-clean included. **Alert on it, with a long `for:`.** Nothing clears it automatically: a person runs `-release-promotion` if the data is disposable, or `-invert` if the failover stands, so a value that has not moved in days is an undecided failover rather than a stuck series. Always emitted, zero included. Domains still marked `promoted` are excluded, so a failover in progress and a successful DR test never register. |
+| `vmsync_agent_served_live_unreleased` | gauge | `vm` | 1 while that VM is in the state above. This is the only place it shows up on a standalone host: the refusals it causes are exempt from `failure_count` (they are administrative, and a reinit cannot fix them), and the domain's own role reads `paused` exactly like a replica somebody paused for maintenance. |
 | `vmsync_agent_restore_points` | gauge | `vm` | Restore points that replica holds in its own per-domain store, including any whose record cannot be read. Emitted for every replica here, at zero included: a series that appears only once a replica *has* copies can never alert on its having none. |
 | `vmsync_agent_restore_points_unreadable` | gauge | `vm` | How many of those have an unreadable record. Counted above as well, because the directory is the inventory — but a restore from one is refused, so this is the gap between what the store holds and what can be used. |
 | `vmsync_agent_restore_points_verify_failed` | gauge | `vm` | How many recorded a FAILED verification. Not a reason to delete them — they may be the only copies from before the damage — but a replica where this equals the count above has no copy that was ever shown to be clean. |
@@ -853,8 +851,10 @@ The seven skip reasons:
 
 | metric | type | labels | meaning |
 | --- | --- | --- | --- |
-| `vmsync_agent_split_brain_vms` | gauge | — | VMs running here that a peer reports having been failed over from. **The one to alert on.** |
-| `vmsync_agent_split_brain` | gauge | `vm` | 1 while this host still runs a VM another host has been promoted for. |
+| `vmsync_agent_split_brain_vms` | gauge | — | VMs running here that a peer reports having been failed over from, **or** that this host already marked `replication_role=fenced` and is still running. **The one to alert on.** The second case needs no peer query, so it is reported even when the peer is unreachable — which is when a failover usually happens. |
+| `vmsync_agent_split_brain` | gauge | `vm` | 1 while this host still runs a VM another host has been promoted for — either because a reachable peer says so, or because this host marked the VM `fenced` and it is running anyway. |
+| `vmsync_agent_fenced_running_vms` | gauge | — | VMs here that a fence marked `fenced` and that are **still running**: the fence suspended replication and did not stop the domain, so it is live beside the copy that displaced it and both are taking writes. Counted as split brain too, so existing alerts keep firing — but published separately because the remedy differs. Split brain asks which copy wins; this is past that, so the answer is always "stop this domain by hand, then set its role". Emitted at zero on a healthy host, because a fence is never retried and this does **not** clear by itself: a value that has not moved in a day is an unresolved split brain, not a stuck metric. |
+| `vmsync_agent_fenced_running` | gauge | `vm` | 1 while that VM is `fenced` and running. The count says *whether*, this says *which* — and which is what an operator needs before touching anything. |
 | `vmsync_agent_fences_total` | counter | `result="success"\|"failure"` | Fences acted on. A failure needs a person: fences are never retried automatically. |
 | `vmsync_agent_fences_unrecorded_total` | counter | — | Fences that proceeded without a durable ledger record, because writing it failed and a split brain is the worse outcome. Independent of the two above — a fence can be unrecorded and still succeed. Non-zero means the audit trail has a hole and the ledger's filesystem is in trouble. |
 
@@ -1036,6 +1036,22 @@ operations loop at all.
 | `invert` | the **old source**'s agent | Reverses the pair's direction. Needs the promoted peer named on the operation, and spans both ends — so it runs where the old source's disks are, which is also the side that already has the SSH path. |
 | `reinit` | the **source**'s agent | A one-shot full resync. |
 | `force-clean` | the **source**'s agent | A `reinit` that also removes the target domain and overrides the `promoted`/`paused` interlock. See the [main README](../../README.md#when-a-reinit-itself-will-not-go-through). |
+
+**There is no operation kind for `-release-promotion`, and that is the point.** A
+domain that has been promoted carries `last_promoted_at`, which survives every
+role change, and while it is set the engine refuses a sync into that domain
+(`force-clean` included — it is the one interlock force-clean does not
+override), a restore over it, and `set-role` to `target` or `none`. Clearing it
+is a person's decision, so it is reachable only from a shell on the host holding
+the copy. The agent has no kind for it, `store.Operation` carries no field for
+it, and `opexec.go`'s argv builders are closed sets — so no operation this agent
+can be published will ever release one. The console works out that a release is
+needed and prints the command instead.
+
+`set-role` therefore fails, honestly, when asked for `target` on such a domain.
+That is not a bug in the operation: the console already withholds the option and
+explains it, and an operation that reached the agent is one somebody constructed
+by hand.
 
 The split in that middle column is the one operators get wrong. Most kinds act
 on a domain where it sits and use a local URI. But `invert`, `reinit` and

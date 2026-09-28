@@ -634,6 +634,12 @@ type DomainEnd struct {
 	// objects are what a later sync would try to chain onto, and they are
 	// meaningless once the direction reverses.
 	HasCheckpoints bool
+	// LastPromotedAt is the durable trace that this end has served live at
+	// least once (libvirtsync.MetadataFieldLastPromotedAt), "" when it never
+	// has. Read on BOTH ends: on the promoted one it is what allows an
+	// inversion after the copy has been shut down and recorded as paused, and
+	// on the old source it is a trace to be released as it becomes a target.
+	LastPromotedAt string
 }
 
 // Ref renders this end the way replica_source/replica_targets spell it.
@@ -687,6 +693,13 @@ const (
 	FieldPromotedFrom      = "promoted_from"
 	FieldPromotionMode     = "promotion_mode"
 
+	// FieldLastPromotedAt mirrors libvirtsync.MetadataFieldLastPromotedAt;
+	// same pinning. Unlike the four above it is PAST tense and outlives the
+	// promotion -- it is the record that this domain once served live, which
+	// is what lets an inversion still be assessed after the promoted copy has
+	// been tidily shut down and recorded as paused. See that field.
+	FieldLastPromotedAt = "last_promoted_at"
+
 	// The fence a promotion armed, written on the PROMOTED domain. See
 	// fence.go for why the decision is armed rather than inferred.
 	FieldFenceID      = "fence_id"
@@ -712,10 +725,42 @@ func AssessInvert(st PairState) (InvertPlan, error) {
 		return InvertPlan{AlreadyInverted: true}, nil
 	}
 
+	// The end becoming the new source must be one that was actually failed
+	// over to. `promoted` says so in the present tense; the durable trace
+	// says so in the past tense, and BOTH have to be accepted here.
+	//
+	// Accepting only `promoted` made inversion unreachable by the exact route
+	// the documentation sends operators down. Shutting a promoted copy down
+	// records `paused` (roleToRecord), and fencing it records `fenced` -- so
+	// "shut it down, then reverse the pair", and every refusal elsewhere that
+	// ends in "run -invert", both landed on this error. The operator's only
+	// way out was to re-promote a domain in order to invert it, or to
+	// force-clean the copy holding the live data.
+	//
+	// `target` is accepted for the same reason and one more: an operator who
+	// already ran -update-role=target on the copy that served, and only then
+	// realised the pair needs reversing rather than re-replicating, is
+	// describing exactly this operation. The trace is what makes all three
+	// safe to accept -- it is written when a domain becomes promoted and
+	// survives every demotion, so a domain carrying it HAS held live data
+	// whatever its role says now. Without it, this would accept reversing a
+	// pair that was never failed over at all, which is the check's real job.
 	if st.Promoted.Role != RolePromoted {
-		return InvertPlan{}, fmt.Errorf(
-			"the domain to become the new source is marked replication_role=%q, not %q -- inversion reverses a pair that has been failed over, and this one has not",
-			st.Promoted.Role, RolePromoted)
+		switch {
+		case st.Promoted.LastPromotedAt == "":
+			return InvertPlan{}, fmt.Errorf(
+				"the domain to become the new source is marked replication_role=%q, not %q, and carries no record of ever having been promoted -- inversion reverses a pair that has been failed over, and this one has not",
+				st.Promoted.Role, RolePromoted)
+		case st.Promoted.Role != RolePaused && st.Promoted.Role != RoleFenced && st.Promoted.Role != RoleTarget:
+			// RoleSource is the AlreadyInverted case above when both ends
+			// agree; reaching here with it means they do not, and inventing
+			// a second interpretation of a half-inverted pair is worse than
+			// making the operator look at it.
+			return InvertPlan{}, fmt.Errorf(
+				"the domain to become the new source has served live (%s=%s) but is now marked replication_role=%q -- inversion accepts %q, or a domain demoted to %q, %q or %q; this state needs resolving by hand",
+				FieldLastPromotedAt, st.Promoted.LastPromotedAt, st.Promoted.Role,
+				RolePromoted, RolePaused, RoleFenced, RoleTarget)
+		}
 	}
 	// The domain about to become a replication target must be down. A
 	// running target is one scheduled sync away from being overwritten
@@ -769,6 +814,14 @@ func AssessInvert(st PairState) (InvertPlan, error) {
 			FieldVerifyState, FieldVerifyFailedAt,
 			FieldFailureCount,
 			FieldPromotedAt, FieldPromotedBy, FieldPromotedFrom, FieldPromotionMode,
+			// Released HERE and on no other path that produces a target: an
+			// inversion is a deliberate, operator-issued decision that this
+			// end is the replica now, which is precisely the acknowledgement
+			// the trace exists to demand before anything overwrites a copy
+			// that served live. Leaving it would make every pair that had
+			// ever been failed over back and forth refuse its own restores
+			// for ever.
+			FieldLastPromotedAt,
 			FieldFenceID, FieldFenceSource, FieldFenceArmedAt, FieldFenceArmedBy,
 		},
 
@@ -793,6 +846,11 @@ func AssessInvert(st PairState) (InvertPlan, error) {
 			FieldVerifyState, FieldVerifyFailedAt,
 			FieldFailureCount,
 			FieldPromotedAt, FieldPromotedBy, FieldPromotedFrom, FieldPromotionMode,
+			// NOT FieldLastPromotedAt. This domain served live and still
+			// holds that data -- it is the reason the pair is being reversed.
+			// The trace follows it into its new role as source, where it
+			// costs nothing, and is there to protect it if this domain is
+			// ever made somebody's replica again.
 			FieldFenceID, FieldFenceSource, FieldFenceArmedAt, FieldFenceArmedBy,
 		},
 	}

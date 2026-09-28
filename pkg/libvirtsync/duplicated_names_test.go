@@ -59,6 +59,7 @@ func TestFailoverFieldNamesMatch(t *testing.T) {
 		{MetadataFieldPromotedBy, failover.FieldPromotedBy, "promoted_by"},
 		{MetadataFieldPromotedFrom, failover.FieldPromotedFrom, "promoted_from"},
 		{MetadataFieldPromotionMode, failover.FieldPromotionMode, "promotion_mode"},
+		{MetadataFieldLastPromotedAt, failover.FieldLastPromotedAt, "last_promoted_at"},
 		{MetadataFieldFenceID, failover.FieldFenceID, "fence_id"},
 		{MetadataFieldFenceSource, failover.FieldFenceSource, "fence_source"},
 		{MetadataFieldFenceArmedAt, failover.FieldFenceArmedAt, "fence_armed_at"},

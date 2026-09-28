@@ -167,6 +167,38 @@ not only at startup: a sync runs for minutes or hours, and a role set part
 way through would otherwise be silently reverted by the run that was
 already in flight when it was set.
 
+**The role is not enough on its own, because every way out of it rewrites
+it.** Shutting a promoted copy down records `paused`. A fence records
+`fenced`. `-update-role` records whatever was asked. So an hour after a
+failover the copy that is holding the only up-to-date data reads exactly like
+an ordinary idle replica — same role, same checkpoint, same zero failure
+count — and `-restore-restore-point`, `-force-clean` and the next scheduled
+sync would all overwrite it.
+
+So a promotion also records **`last_promoted_at`**, which is the one field in
+the promotion record that deliberately outlives it. While it is set, vmsync
+refuses to sync, restore or force-clean over that domain, and refuses
+`-update-role=target` and `-update-role=none` — the two values that hand the
+domain back to the replication machinery. `-force-clean` does **not** override
+it; nothing does except saying so:
+
+```bash
+# on the host holding the copy, once it is shut down and demoted
+vmsync -target-uri qemu:///system -target-domain myvm -release-promotion
+```
+
+That command refuses while the domain is running, refuses while the role still
+says `promoted` (demote it first — a demotion re-records the trace), records
+the decision in the journal, and is deliberately **not** available from the
+console: the web UI computes that it is needed, explains why, and prints the
+command. Every other guard in vmsync can be satisfied by a control plane; this
+is the one that asks for a person.
+
+If the failover stands, `-invert` is the other way out and the one that keeps
+the data: it reverses the pair, makes the promoted copy the source, and now
+accepts a promoted end that has already been shut down and demoted — the trace
+is what tells it that end really did serve.
+
 **`-promote` is gated separately, on evidence.** The role says what a domain
 *is*; promoting it also asks whether there is a usable replica there to make
 live. `-promote` refuses on missing disks, no completed sync, no recorded
@@ -444,9 +476,12 @@ earlier copies on the target so there is something to go back to.
 vmsync ... -retention=24,3h      # keep 24, take one at most every 3 hours
 ```
 
-They live in a `.vmsync-rp/` subdirectory beside the replica's own disks,
+They live in `.vmsync-rp/vm-<target domain>/` beside the replica's own disks,
 named by the instant and checkpoint they correspond to, each with a
-`status.json` recording what is known about it. Each is a **reflink copy**:
+`status.json` recording what is known about it. One subdirectory per target
+domain, so two replicas sharing a `-target-disk-path` keep independent
+histories — neither one's retention, pruning or `-reinit` can reach the
+other's. Each is a **reflink copy**:
 it shares extents with the replica rather than duplicating it, so taking one
 costs milliseconds and a few metadata blocks whatever the image size, and
 twenty-four of them cost roughly one image plus the deltas between them.

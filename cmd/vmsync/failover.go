@@ -248,10 +248,25 @@ func runPromote(ctx context.Context, cfg syncConfig) (runErr error) {
 		// TargetRoleAllowsSync. The other order would leave a RUNNING
 		// domain still marked as an ordinary replica, which the next
 		// scheduled sync would overwrite underneath a live workload.
+		promotedAt := strconv.FormatInt(time.Now().Unix(), 10)
 		updates := map[string]string{
 			libvirtsync.MetadataFieldReplicationRole: libvirtsync.RolePromoted,
-			libvirtsync.MetadataFieldPromotedAt:      strconv.FormatInt(time.Now().Unix(), 10),
+			libvirtsync.MetadataFieldPromotedAt:      promotedAt,
 			libvirtsync.MetadataFieldPromotionMode:   string(mode),
+			// The durable half of the promotion record, written in the SAME
+			// call and from the SAME clock reading as promoted_at, so the two
+			// can never disagree about when this copy took over.
+			//
+			// It is here, before the domain is started, rather than after a
+			// successful start, for the reason the whole block is: a process
+			// that dies between the two must leave a domain that is OVER-
+			// protected, not under-protected. Written after the start, a
+			// promotion interrupted at the wrong instant would leave a running
+			// guest whose disks nothing recognises as having served -- which is
+			// exactly the state one -force-clean discards. The cost of the
+			// other direction is a drill that never booted leaving a trace
+			// behind, and that costs one -release-promotion.
+			libvirtsync.MetadataFieldLastPromotedAt: promotedAt,
 		}
 		if plan.PromotedFrom != "" {
 			updates[libvirtsync.MetadataFieldPromotedFrom] = plan.PromotedFrom
@@ -800,12 +815,12 @@ func runInvert(ctx context.Context, cfg syncConfig) (runErr error) {
 		OldSource: failover.DomainEnd{
 			Host: srcHost, Domain: cfg.SourceDomain, Role: oldSrc.Role, Active: oldSrc.Active,
 			ReplicaSource: oldSrc.ReplicaSource, ReplicaTargets: oldSrc.ReplicaTargets,
-			HasCheckpoints: oldSrc.HasCheckpoints,
+			HasCheckpoints: oldSrc.HasCheckpoints, LastPromotedAt: oldSrc.LastPromotedAt,
 		},
 		Promoted: failover.DomainEnd{
 			Host: tgtHost, Domain: cfg.TargetDomain, Role: promoted.Role, Active: promoted.Active,
 			ReplicaSource: promoted.ReplicaSource, ReplicaTargets: promoted.ReplicaTargets,
-			HasCheckpoints: promoted.HasCheckpoints,
+			HasCheckpoints: promoted.HasCheckpoints, LastPromotedAt: promoted.LastPromotedAt,
 		},
 	})
 	if err != nil {

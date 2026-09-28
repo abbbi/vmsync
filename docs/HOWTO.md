@@ -344,8 +344,8 @@ vmsync **refuses to sync into any domain whose role is not `target` or unset**.
 | `target` | the normal receiving side | — |
 | *(unset)* | never recorded; a first sync may create it | — |
 | `source` | this domain is the primary of its pair | **never overridden.** Your `-source-uri`/`-target-uri` are reversed |
-| `promoted` | failed over to; serving live | `-update-role=target` (discards its disks), or `-force-clean` |
-| `paused` | a person suspended replication — maintenance, or a restore | `-update-role=target`, or `-force-clean` |
+| `promoted` | failed over to; serving live | `-release-promotion`, then `-update-role=target` (discards its disks) |
+| `paused` | a person suspended replication — maintenance, or a restore | `-update-role=target`, or `-force-clean`. If it was promoted before it was paused, `-release-promotion` first |
 | `fenced` | an automatic fence stopped it after a peer was promoted | usually `-invert`; or `-update-role=target` if the fence was wrong |
 
 `paused` and `fenced` are distinct on purpose. `paused` means somebody chose
@@ -360,6 +360,56 @@ brain.
 Set a role with `-update-role`, which changes it and exits. It addresses the
 domain with `-target-uri`/`-target-domain` regardless of which direction it
 currently replicates in. `-update-role=none` clears the field.
+
+### A copy that has served live
+
+The table above has a gap that the role cannot close, because **every way out
+of `promoted` rewrites the role**. Shut the copy down and it records `paused`.
+Fence it and it records `fenced`. Either way the promotion record is erased in
+the same write — and an hour after a failover the copy holding the only
+up-to-date data looks exactly like an ordinary idle replica: same role, same
+checkpoint, same recent sync, same zero failure count.
+
+So a promotion also records **`last_promoted_at`**, and that one field survives
+every role change. While it is present, vmsync refuses to:
+
+- sync into that domain, `-force-clean` **included** — this is the one
+  interlock force-clean does not override;
+- `-restore-restore-point` over it, `-force-restore` included;
+- `-update-role=target` or `-update-role=none`, the two values that hand the
+  domain back to the replication machinery.
+
+`-update-role=source`, `=paused` and `=fenced` are all still available: they
+destroy nothing, and `source` is how you keep this copy.
+
+There is exactly one way to clear it:
+
+```bash
+vmsync -target-uri qemu:///system -target-domain myvm -release-promotion
+```
+
+It refuses while the domain is **running**. It refuses while the role still
+says `promoted` — demote it first, because a demotion re-records the trace, so
+releasing before demoting would silently do nothing. It logs at ERROR level on
+success, because that line is the last thing that will ever say those disks
+held live data, and it records the decision in the journal.
+
+It is deliberately **not** a button in the console. The web UI works out that a
+release is needed, says so on the row, withholds the controls the engine would
+refuse, and prints this command. Everything else vmsync guards can be satisfied
+by a control plane; this is the one that asks for a person.
+
+**If the failover stands, use `-invert` instead** — it reverses the pair, makes
+the promoted copy the source, and keeps the data. It now accepts a promoted end
+that has already been shut down and demoted to `paused`, `fenced` or `target`,
+as long as it carries the trace; before, shutting the copy down was enough to
+make the inversion refuse, which left force-cleaning the live data as the only
+way forward.
+
+A drill leaves a trace too, since it is written when the domain *becomes*
+promoted rather than after a guest starts — a promotion interrupted between
+those two points must leave the disks over-protected, not under-protected. The
+price is one `-release-promotion` after a test you never booted.
 
 ### A recorded verification failure
 
@@ -496,11 +546,26 @@ almost nothing until they diverge. The target filesystem must support it (XFS
 with `reflink=1`, or btrfs) and vmsync refuses the run at startup where it does
 not, rather than silently making every copy a full one.
 
+They live in `.vmsync-rp/vm-<target domain>/` beside the replica's disks — one
+directory per target domain, so two replicas sharing a `-target-disk-path` keep
+independent histories and neither one's retention, pruning or `-reinit` touches
+the other's.
+
+If you have copies from before vmsync kept them per domain, they are still
+directly under `.vmsync-rp/`, one level up. Nothing reads, prunes or deletes
+them — vmsync no longer has any way to name a path outside a domain's own
+store — so they will sit there taking up space until you remove the directories
+yourself. `cp` the disks out of one first if you want what is in it.
+
 ### Using them
 
 **`-list-restore-points`** lists what is on the target and exits. Needs
-`-target-uri` and `-target-disk-path`; reads the target filesystem only, and
-touches neither the replica nor libvirt.
+`-target-uri`, `-target-disk-path` and `-target-domain`; reads the target
+filesystem only, and touches neither the replica nor libvirt.
+
+`-target-domain` is required because restore points are kept per target domain,
+so a directory alone does not name a set — and it has to be the same name the
+sync used, or you will be shown an empty history for a replica that has one.
 
 **`-clone-restore-point TAG -clone-to DIR`** copies one restore point's disks
 to a directory and exits. This is how to answer *"is that copy clean?"* — boot
@@ -623,6 +688,17 @@ The metrics that repay attention: `vmsync_sync_state`,
 tri-state — passed, mismatch, or *not performed* — because "the comparator
 could not run" and "the replica differs" call for opposite responses and must
 not be the same number.
+
+With `-retention`, add **`vmsync_restore_point_overdue_seconds`**: it is zero on
+every healthy run and goes positive only when another copy was genuinely due and
+none appeared. Alert on `> 0` directly. Do **not** build a staleness rule out of
+the retention interval — it is a floor, not a schedule, so a pair syncing every
+6h with a 3h floor is perfectly healthy with 6h spacing, and any "older than
+N× the interval" rule would page you about it. `vmsync_restore_points` against
+`vmsync_restore_points_policy_count` answers "is this replica as deep as I asked
+for", and the agent's `vmsync_agent_restore_point_oldest_timestamp_seconds`
+answers the one question you actually have during an incident: how far back can
+this replica go.
 
 **`-result-json`** writes this run's *degradations* to a path as JSON, for a
 supervising agent to read back. A degradation is something an exit code cannot

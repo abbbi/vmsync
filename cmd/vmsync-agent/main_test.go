@@ -62,6 +62,8 @@ func fullyRecordedDomain() inventory.Domain {
 		PromotedAtUnix:       1799999500,
 		PromotedBy:           "promoted-by@example.org",
 		PromotionMode:        "forced",
+		LastPromotedAtRaw:    "1799999500",
+		LastPromotedAtUnix:   1799999500,
 		FenceID:              "0123456789abcdef0123456789abcdef",
 		FenceSource:          "hyper03p:web01",
 		FenceArmedAtUnix:     1799999400,
@@ -119,6 +121,18 @@ func TestReportDomainFromMapsEveryField(t *testing.T) {
 	}
 	if got.VerifyState != d.VerifyState || got.VerifyFailedAtUnix != d.VerifyFailedAtUnix {
 		t.Errorf("the verify verdict did not survive the mapping: %q/%d", got.VerifyState, got.VerifyFailedAtUnix)
+	}
+	// Both forms, and the raw one checked verbatim like replica_incomplete.
+	// Presence is the finding: a value this build cannot parse still means this
+	// copy served live, and a console that received only the parsed form would
+	// read an unparsable record as a zero -- "never promoted" -- on exactly the
+	// domain where that mistake offers Roll back and Force clean resync over
+	// the only copy of production data.
+	if got.LastPromotedAt != d.LastPromotedAtRaw {
+		t.Errorf("LastPromotedAt = %q, want %q verbatim -- without it the console cannot tell a copy that served live from an ordinary paused replica, and offers every control the engine will refuse", got.LastPromotedAt, d.LastPromotedAtRaw)
+	}
+	if got.LastPromotedAtUnix != d.LastPromotedAtUnix {
+		t.Errorf("LastPromotedAtUnix = %d, want %d", got.LastPromotedAtUnix, d.LastPromotedAtUnix)
 	}
 	// The two values that do not come off the domain at all, checked by
 	// value so a walk finding them non-zero cannot be satisfied by the wrong

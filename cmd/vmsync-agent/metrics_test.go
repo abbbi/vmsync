@@ -23,6 +23,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"vmsync/pkg/libvirtsync"
 )
 
 // checkPrometheusText is a strict reader of the text exposition format,
@@ -419,5 +421,121 @@ func TestRenderFencedRunningGauge(t *testing.T) {
 	// which copy wins is already decided.
 	if !strings.Contains(two, "stop THIS domain by hand") {
 		t.Errorf("the HELP does not say what to do about it:\n%s", two)
+	}
+}
+
+// TestRenderServedLiveUnreleasedGauge gets the same proof as the other per-VM
+// families, and for the same reason: with one affected VM a duplicated HELP is
+// invisible, and the file only becomes invalid on the second — so a host with
+// one undecided failover publishes fine and a host with two publishes nothing
+// at all, which is the failure mode node_exporter turns a small mistake into.
+//
+// Three VMs is not far-fetched here. A site failover moves every VM at once, so
+// the ordinary way to reach this state is with the whole estate in it.
+func TestRenderServedLiveUnreleasedGauge(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		vms  []string
+	}{
+		{"no undecided failover", nil},
+		{"one copy awaiting a decision", []string{"web01"}},
+		{"a whole site failed over and not resolved", []string{"web01", "db01", "mail01"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newAgentMetrics("test", "hyper02p", modeStandalone)
+			set := map[string]bool{}
+			for _, vm := range tc.vms {
+				set[vm] = true
+			}
+			m.setServedLiveUnreleased(set)
+			body := m.render(CachedConfig{}, nil, 0, time.Unix(1_800_000_000, 0))
+			checkPrometheusText(t, body)
+
+			// Emitted at zero: this is the one condition in the file that never
+			// clears by itself, so an alert on it wants a long `for:` — and a
+			// `for:` cannot span a window that begins before the series exists.
+			wantTotal := fmt.Sprintf("vmsync_agent_served_live_unreleased_vms{host=\"hyper02p\"} %d\n", len(tc.vms))
+			if !strings.Contains(body, wantTotal) {
+				t.Errorf("rendered file does not contain %q", strings.TrimSuffix(wantTotal, "\n"))
+			}
+
+			for _, vm := range tc.vms {
+				want := fmt.Sprintf("vmsync_agent_served_live_unreleased{host=\"hyper02p\",vm=%q} 1\n", vm)
+				if !strings.Contains(body, want) {
+					t.Errorf("rendered file does not contain %q -- the count says whether, this says which, and which is what an operator needs before deciding", strings.TrimSuffix(want, "\n"))
+				}
+			}
+			if len(tc.vms) == 0 && strings.Contains(body, "vmsync_agent_served_live_unreleased{") {
+				t.Error("a host with no undecided failover published a per-VM series anyway")
+			}
+
+			if n := strings.Count(body, "# HELP vmsync_agent_served_live_unreleased "); n > 1 {
+				t.Errorf("vmsync_agent_served_live_unreleased declares HELP %d times for %d VMs", n, len(tc.vms))
+			}
+			if n := strings.Count(body, "# TYPE vmsync_agent_served_live_unreleased "); n > 1 {
+				t.Errorf("vmsync_agent_served_live_unreleased declares TYPE %d times for %d VMs", n, len(tc.vms))
+			}
+		})
+	}
+}
+
+// TestSetServedLiveUnreleasedClearsWhenTheDecisionIsMade: the setter replaces
+// the whole set, so a copy that has been released — or inverted into being the
+// source, or removed — stops being reported. A merge would keep alerting about a
+// decision somebody already made, which is how an operator learns to ignore the
+// series.
+func TestSetServedLiveUnreleasedClearsWhenTheDecisionIsMade(t *testing.T) {
+	m := newAgentMetrics("test", "hyper02p", modeStandalone)
+	m.setServedLiveUnreleased(map[string]bool{"web01": true, "db01": true})
+	m.setServedLiveUnreleased(map[string]bool{"db01": true})
+
+	body := m.render(CachedConfig{}, nil, 0, time.Unix(1_800_000_000, 0))
+	if strings.Contains(body, `vmsync_agent_served_live_unreleased{host="hyper02p",vm="web01"}`) {
+		t.Error("web01 is still reported after its promotion was released")
+	}
+	if !strings.Contains(body, `vmsync_agent_served_live_unreleased{host="hyper02p",vm="db01"}`) {
+		t.Error("db01 stopped being reported although nobody decided about it")
+	}
+	if !strings.Contains(body, `vmsync_agent_served_live_unreleased_vms{host="hyper02p"} 1`) {
+		t.Error("the count did not follow the set")
+	}
+}
+
+// TestServedLiveUnreleasedVMsExcludesADomainStillPromoted is the predicate's
+// only judgement, and it is the difference between a signal and noise.
+//
+// A domain still marked `promoted` is a failover in progress or a drill:
+// nothing is waiting on anybody, the role interlock already refuses everything,
+// and counting it would make this gauge non-zero for the whole duration of
+// every successful failover.
+func TestServedLiveUnreleasedVMsExcludesADomainStillPromoted(t *testing.T) {
+	got := servedLiveUnreleasedVMs([]ReportDomain{
+		// Serving right now. Not undecided.
+		{Name: "web01", Role: libvirtsync.RolePromoted, Active: true, LastPromotedAt: "1700000000"},
+		// Promoted, then shut down. This is the one.
+		{Name: "db01", Role: libvirtsync.RolePaused, LastPromotedAt: "1700000000"},
+		// Fenced after a peer took over, and it was promoted earlier itself.
+		{Name: "mail01", Role: libvirtsync.RoleFenced, LastPromotedAt: "1600000000"},
+		// Already released, or never promoted: the overwhelming majority.
+		{Name: "app01", Role: libvirtsync.RoleTarget},
+		// Inverted into being the source. It carries the trace, and it is not
+		// waiting on a decision -- but it IS still refused as somebody's target,
+		// so it is reported. Being the source of its own pair does not make
+		// those disks disposable.
+		{Name: "cache01", Role: libvirtsync.RoleSource, LastPromotedAt: "1500000000"},
+	})
+
+	for _, vm := range []string{"db01", "mail01", "cache01"} {
+		if !got[vm] {
+			t.Errorf("%s carries a promotion record and is not marked promoted, so it must be reported", vm)
+		}
+	}
+	for _, vm := range []string{"web01", "app01"} {
+		if got[vm] {
+			t.Errorf("%s must not be reported: %q", vm, "a domain still promoted, or one with no record at all")
+		}
+	}
+	if len(got) != 3 {
+		t.Errorf("got %d VMs, want 3: %v", len(got), got)
 	}
 }

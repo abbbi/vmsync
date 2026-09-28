@@ -426,6 +426,16 @@ type syncConfig struct {
 	// Handled in main(), never read by run() -- see the type's own comment.
 	UpdateRole  string
 	ShowVersion bool
+	// ReleasePromotion clears a domain's durable record of having served live
+	// (libvirtsync.MetadataFieldLastPromotedAt), which is the operator's
+	// statement that the data on those disks is disposable.
+	//
+	// Its own mode rather than a modifier on -force-clean or -update-role, and
+	// that is the entire design: a flag that rides along with a destructive
+	// command is a flag a control plane can add to an argv, and this is the one
+	// guard in vmsync meant to require a person. See
+	// libvirtsync.FlagReleasePromotion.
+	ReleasePromotion bool
 
 	// The failover modes, all handled in main() like -update-role: each
 	// changes state and exits, syncing nothing.
@@ -470,8 +480,8 @@ var flagGroups = []struct {
 }{
 	{"ACTIONS", "each does one thing and exits; at most one per run", []string{
 		"promote", "invert", "shutdown-domain", "fence-domain", "read-fence",
-		"update-role", "list-restore-points", "clone-restore-point",
-		"restore-restore-point", "explain-domain",
+		"update-role", "release-promotion", "list-restore-points",
+		"clone-restore-point", "restore-restore-point", "explain-domain",
 	}},
 	{"CONNECTION", "which domains, and how to reach libvirt", []string{
 		"source-uri", "target-uri", "source-domain", "target-domain",
@@ -696,6 +706,7 @@ func main() {
 			{cfg.FenceDomain, "-fence-domain"},
 			{cfg.ReadFence, "-read-fence"},
 			{cfg.UpdateRole != "", "-update-role"},
+			{cfg.ReleasePromotion, "-" + libvirtsync.FlagReleasePromotion},
 			{cfg.ListRestorePoints, "-list-restore-points"},
 			{cfg.CloneRestorePoint != "", "-clone-restore-point"},
 			{cfg.RestoreRestorePoint != "", "-restore-restore-point"},
@@ -753,6 +764,59 @@ func main() {
 		}
 	}
 
+	if cfg.ReleasePromotion {
+		relDomain := cfg.TargetDomain
+		if relDomain == "" {
+			relDomain = cfg.SourceDomain
+		}
+		if cfg.TargetURI == "" || relDomain == "" {
+			trace.Error("invalid release-promotion configuration", "error", fmt.Errorf("-%s needs -target-uri and -target-domain (or -source-domain) naming the copy whose promotion record to release", libvirtsync.FlagReleasePromotion))
+			os.Exit(2)
+		}
+		mgr, err := libvirtsync.Connect(cfg.TargetURI)
+		if err != nil {
+			trace.Error("release-promotion: connect to libvirt", "uri", cfg.TargetURI, "error", err)
+			os.Exit(1)
+		}
+		defer mgr.Close()
+
+		// Journalled like -update-role, and for a sharper version of the same
+		// reason: this record IS the authorisation for whatever destructive
+		// command follows it. Everything else in the journal says what vmsync
+		// did; this says what a person decided, and it is the only place that
+		// decision is written down at all. Explicit rather than deferred
+		// because both paths exit the process.
+		relCtx := context.Background()
+		journal := newLocalDomainRecorder(cfg, mgr, cfg.TargetURI, relDomain)
+		journal.Intent(relCtx, journalVerbReleasePromotion, map[string]string{"uri": cfg.TargetURI})
+
+		released, err := libvirtsync.ReleasePromotionTrace(mgr, relDomain)
+		if err != nil {
+			finishAction(relCtx, journal, err, nil)
+			trace.Error("release-promotion: refused", "vm", relDomain, "error", err)
+			os.Exit(1)
+		}
+		if released == "" {
+			// A no-op is a success, not a failure: an operator who reaches for
+			// this after an -invert already cleared the trace, or against a
+			// replica that was never promoted, has nothing left to do and
+			// should be told so rather than made to wonder what went wrong.
+			finishAction(relCtx, journal, nil, map[string]string{"released": ""})
+			trace.Info("no promotion record to release; this copy has none recorded", "vm", relDomain, "uri", cfg.TargetURI)
+			os.Exit(0)
+		}
+		finishAction(relCtx, journal, nil, map[string]string{"released": released})
+		// ERROR level, on a command that succeeded, and deliberately. This line
+		// is the last thing that will ever say those disks held live data: the
+		// field is gone, and the -force-clean or -restore-restore-point that
+		// follows will report only a role. If a promotion later turns out to
+		// have been thrown away, this is the entry that explains why nothing
+		// refused it.
+		trace.Error("released this copy's promotion record -- it has been declared disposable, and nothing will now refuse a sync, restore or force-clean over it",
+			"vm", relDomain, "uri", cfg.TargetURI, "was_promoted_at", released)
+		os.Exit(0)
+	}
+
 	if cfg.UpdateRole != "" {
 		// Validated before connecting, so a typo costs an immediate,
 		// readable error rather than a libvirt round trip first.
@@ -792,6 +856,37 @@ func main() {
 			"role": cfg.UpdateRole,
 			"uri":  cfg.TargetURI,
 		})
+
+		// target and none are the two destinations that hand this domain back
+		// to the replication machinery: target is what TargetRoleAllowsSync
+		// permits outright, and none returns it to the no-role-recorded state
+		// that same gate also treats as permission. Every other destination --
+		// paused, fenced, source, promoted -- leaves the copy protected or
+		// makes it the primary, so none of them needs asking about.
+		//
+		// This is the step the whole trace exists to interpose on, because it
+		// is where a copy that served live stops being protected. Refused
+		// rather than waved through with a warning: a warning on a command that
+		// then succeeds is read after the fact, and the next thing to run is a
+		// scheduled sync.
+		//
+		// Journalled BEFORE the check, deliberately, so the refusal is on the
+		// record too -- an operator who tried three times to re-target a copy
+		// that served production is exactly the history somebody needs later.
+		if cfg.UpdateRole == libvirtsync.RoleTarget || cfg.UpdateRole == libvirtsync.RoleNone {
+			servedLive, traceErr := libvirtsync.ReadPromotionTrace(mgr, roleDomain)
+			if traceErr != nil {
+				finishAction(roleCtx, journal, traceErr, nil)
+				trace.Error("update-role: read promotion history", "vm", roleDomain, "error", traceErr)
+				os.Exit(1)
+			}
+			if err := libvirtsync.ServedLiveAllowsOverwrite(servedLive, fmt.Sprintf("record it as replication_role=%s, which is what makes it syncable again", cfg.UpdateRole)); err != nil {
+				finishAction(roleCtx, journal, err, nil)
+				trace.Error("update-role: refused", "vm", roleDomain, "role", cfg.UpdateRole, "error", err)
+				os.Exit(1)
+			}
+		}
+
 		previous, err := libvirtsync.SetReplicationRole(mgr, roleDomain, cfg.UpdateRole)
 		if err != nil {
 			finishAction(roleCtx, journal, err, nil)
@@ -1166,9 +1261,21 @@ func main() {
 		// unreachable, and a reinit does not repair it either, so the
 		// exemption is right whichever cause it was. See
 		// nbdsync.ErrExportUnreachable.
+		// A served-live refusal is exempt for the role gate's reason, taken one
+		// step further. It is an administrative state; the reinit this counter
+		// would force is refused by the same check, so the count could only
+		// climb without ever triggering anything; and the one thing that clears
+		// it is a person typing -release-promotion, which no amount of counting
+		// brings closer. It is also the exemption whose absence would do the
+		// most harm: the domain holding the trace is a copy that served
+		// production, a non-zero failure_count is itself reported by
+		// evidenceProblems, so counting these would make the copy an operator
+		// most needs to be able to promote progressively less promotable the
+		// longer nobody noticed. See ErrServedLive.
 		if cfg.ReinitAfterFailures > 0 && !isVerifyMismatch(err) &&
 			!errors.Is(err, libvirtsync.ErrRoleRefusesSync) &&
 			!errors.Is(err, libvirtsync.ErrVerifyStateRefusesSync) &&
+			!errors.Is(err, libvirtsync.ErrServedLive) &&
 			!errors.Is(err, nbdsync.ErrExportUnreachable) {
 			if count, rerr := libvirtsync.RecordTargetSyncFailure(cfg.TargetURI, cfg.TargetDomain); rerr != nil {
 				trace.Warning("failed to record sync failure in target metadata", "error", rerr)
@@ -2719,6 +2826,34 @@ func run(cfg syncConfig) (runErr error) {
 	}
 	if targetRole != "" {
 		trace.Debug("target replication role permits this sync", "vm", cfg.TargetDomain, "role", targetRole)
+	}
+
+	// The one interlock -force-clean does NOT override, checked immediately
+	// after the one it does.
+	//
+	// The block above is where this sync becomes possible at all, and the
+	// override in it is the hole: `promoted` is on that list because getting
+	// out of a failover is what a deliberate clean is for, but it cannot tell
+	// a failover somebody wants undone from the copy that is currently the
+	// only place a week of production data exists. Nor can the role, three
+	// minutes after a shutdown recorded `paused`. So a promoted peer could be
+	// discarded by one -force-clean, with a warning naming a role rather than
+	// the data -- and the console offered exactly that button, over a peer it
+	// showed as promoted, with nothing between the click and a full recopy.
+	//
+	// Not an override, and deliberately no flag combination that makes it one:
+	// the release is its own command, it refuses while the domain is running,
+	// and it has to be typed. Everything else in vmsync can be satisfied by a
+	// control plane; this is the one guard that asks for a person. It costs an
+	// operator who genuinely wants the recopy one extra command, and it is the
+	// only thing standing between a mis-aimed -force-clean and data with no
+	// other copy.
+	servedLive, err := libvirtsync.ReadPromotionTrace(tgtMgr, cfg.TargetDomain)
+	if err != nil {
+		return fmt.Errorf("read target domain promotion history: %w", err)
+	}
+	if err := libvirtsync.ServedLiveAllowsOverwrite(servedLive, "replicate over it"); err != nil {
+		return fmt.Errorf("refusing to sync into %s: %w", cfg.TargetDomain, err)
 	}
 
 	// The verification interlock, immediately after the role one and for the
@@ -7025,6 +7160,7 @@ func registerFlags(fs *flag.FlagSet, cfg *syncConfig) (compressArg, fenceSourceA
 	fs.BoolVar(&cfg.FenceDomain, "fence-domain", false, "stop a domain because a peer was promoted over it; records role=fenced")
 	fs.BoolVar(&cfg.ReadFence, "read-fence", false, "ask a peer whether its promotion fenced this host; prints JSON")
 	fs.StringVar(&cfg.UpdateRole, "update-role", "", "set a domain's replication role and exit: "+strings.Join(libvirtsync.ValidRoles, "|"))
+	fs.BoolVar(&cfg.ReleasePromotion, libvirtsync.FlagReleasePromotion, false, "declare that a copy which served live holds disposable data, and exit; refuses while it is running")
 	fs.BoolVar(&cfg.ListRestorePoints, "list-restore-points", false, "list the restore points kept on the target and exit")
 	fs.StringVar(&cfg.CloneRestorePoint, "clone-restore-point", "", "copy one restore point's disks to -clone-to and exit")
 	fs.StringVar(&cfg.RestoreRestorePoint, "restore-restore-point", "", "put a restore point back over the replica; needs -force-restore")

@@ -311,6 +311,14 @@ type Provenance struct {
 // one blocks promotion), replica_targets, last_replicated_at/to (they describe
 // a life as a SOURCE), and the promotion and fence records (an audit trail of a
 // failover that rolling a disk back does not undo).
+//
+// last_promoted_at is in that last group and is the one worth naming, because
+// it is the field a future tidy-up is most likely to think belongs in the list
+// above. It must not be cleared here: a restore never reaches a domain still
+// carrying it (the restore gate refuses one), so the only way this code could
+// clear a trace is if that gate were bypassed -- in which case clearing it
+// would destroy the evidence that a copy which served live has just been
+// overwritten, on the one path where somebody will need it.
 func MetadataPlan(s Status, r Provenance) (updates map[string]string, removals []string) {
 	updates = map[string]string{
 		FieldFailureCount:    "0",

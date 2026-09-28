@@ -128,6 +128,31 @@ type Domain struct {
 	PromotedBy     string `json:"promoted_by,omitempty"`
 	PromotionMode  string `json:"promotion_mode,omitempty"`
 
+	// LastPromotedAtUnix is the durable record that this domain HAS SERVED
+	// LIVE at least once, and is the one field of the promotion record that
+	// survives the demotion (libvirtsync.MetadataFieldLastPromotedAt). Zero on
+	// a domain that never has.
+	//
+	// Reported because the console cannot work it out from anything else here,
+	// and because every one of its buttons over a replica -- restore,
+	// force-clean, set role -- is refused by the engine while it is set. A
+	// control plane that cannot see it offers those buttons anyway and turns
+	// a guard into a failed operation the operator has no way to have
+	// predicted. Its absence is what says "this replica is ordinary".
+	//
+	// Kept as unix seconds like PromotedAtUnix rather than raw: a control
+	// plane renders a date, and unlike the engine's own gates nothing here
+	// decides anything on the value -- Assess and the console key on presence,
+	// which an unparsable value would also report via LastPromotedAtRaw.
+	LastPromotedAtUnix int64 `json:"last_promoted_at_unix,omitempty"`
+	// LastPromotedAtRaw is that same field exactly as the domain holds it, and
+	// exists so presence survives a value this build cannot parse. A trace
+	// written by a newer vmsync, or torn mid-splice, still means this copy
+	// served live -- and reporting only the parsed form would turn it into a
+	// zero that reads as "never promoted" on precisely the domain where that
+	// mistake overwrites the only copy of the data.
+	LastPromotedAtRaw string `json:"last_promoted_at,omitempty"`
+
 	// The fence this promotion armed, present only on a promoted domain and
 	// only when the promotion was explicitly asked to arm one.
 	//
@@ -333,6 +358,33 @@ func Assess(d Domain, now time.Time, cadence time.Duration) Assessment {
 		a.Reasons = append([]string{fmt.Sprintf(
 			"a full rebuild of this replica was STARTED and never recorded as finished (replica_incomplete=%s), so these disks are a partial copy: the previous complete replica was renamed aside as .vmsync-replaced-<unix> and new base images were being written over it when the run stopped. Everything else recorded here -- last_checkpoint, last_sync_timestamp, failure_count -- describes the sync BEFORE that rebuild and must not be read as describing what is on disk now. Re-run the sync to completion, or recover the set-aside copy; do NOT promote this domain",
 			d.ReplicaIncomplete)}, a.Reasons...)
+	}
+
+	// The durable promotion trace, reported OUTSIDE assessReplication for the
+	// same reason the verification finding is: that function returns early for
+	// every administrative role, and `paused` is exactly the role a promoted
+	// copy lands in when it is shut down. A reason attached inside it would be
+	// dropped on the one domain it is about.
+	//
+	// The status is deliberately left alone. A copy that served live and is
+	// waiting for a decision is not a fault -- it is the ordinary state of the
+	// hours after a failover -- and promoting it to a warning would put every
+	// successful DR test into somebody's alert feed. What it is NOT is
+	// ordinary, which is the whole gap: without this line the console shows a
+	// plain paused replica and offers restore, force-clean and set-role over
+	// it, all three of which the engine will refuse, for a reason nothing
+	// visible explains.
+	//
+	// Skipped while the role still says `promoted`, where the reason above
+	// already says it in the present tense.
+	if d.LastPromotedAtRaw != "" && d.Role != libvirtsync.RolePromoted {
+		when := "at an unrecorded time"
+		if d.LastPromotedAtUnix > 0 {
+			when = "on " + time.Unix(d.LastPromotedAtUnix, 0).UTC().Format(time.RFC3339)
+		}
+		a.Reasons = append(a.Reasons, fmt.Sprintf(
+			"HAS SERVED LIVE: this copy was promoted %s and has not been released, so its disks may hold the only copy of data that was serving then (last_promoted_at is kept deliberately -- every other trace of a failover is erased when the role changes). vmsync will refuse to sync, restore or force-clean over it. If the failover stands, -invert reverses the pair and keeps this data; if it is genuinely disposable, -%s says so and refuses while the domain is running",
+			when, libvirtsync.FlagReleasePromotion))
 	}
 	return a
 }
@@ -590,6 +642,15 @@ func applyDomainMetadata(xml string, d *Domain) {
 	if raw, err := libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldPromotedAt); err == nil && raw != "" {
 		if n, convErr := strconv.ParseInt(raw, 10, 64); convErr == nil {
 			d.PromotedAtUnix = n
+		}
+	}
+	// The raw value is recorded whatever it says, and the parse is a bonus on
+	// top: a trace this build cannot read still has to reach the console as
+	// present. See the two fields' own comments.
+	d.LastPromotedAtRaw, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldLastPromotedAt)
+	if d.LastPromotedAtRaw != "" {
+		if n, convErr := strconv.ParseInt(d.LastPromotedAtRaw, 10, 64); convErr == nil {
+			d.LastPromotedAtUnix = n
 		}
 	}
 

@@ -93,6 +93,21 @@ type FailoverState struct {
 	// Zero on every domain that was never promoted, and on every promotion
 	// that did not ask for one -- a drill, for instance.
 	Fence failover.FenceToken
+	// LastPromotedAt is the durable record that this domain has served live
+	// at least once, RAW as written (see MetadataFieldLastPromotedAt), and
+	// empty for every domain that never has.
+	//
+	// Raw rather than parsed, for the same reason ReplicaIncomplete is: the
+	// PRESENCE of the field is the finding, and a value this build cannot
+	// parse must still refuse the overwrite rather than be dropped into a
+	// zero that reads as "never promoted". ServedLiveAllowsOverwrite does the
+	// parsing, and only to word the refusal.
+	//
+	// Read here specifically because Role cannot answer the question. Every
+	// route out of `promoted` rewrites the role -- so a copy that served for
+	// a week and was then shut down is, to every other field in this struct,
+	// indistinguishable from a replica that has never done anything.
+	LastPromotedAt string
 }
 
 // ReadFailoverState collects everything a promotion or an inversion needs
@@ -208,6 +223,13 @@ func failoverStateFromXML(domXML string) FailoverState {
 	// one signal that an interrupted full copy ever happened into silence,
 	// which is the direction that promotes a half-written image.
 	st.ReplicaIncomplete, _ = ParseMetadata(domXML, MetadataFieldReplicaIncomplete)
+
+	// Raw and unconditioned, like ReplicaIncomplete above and for the same
+	// reason: presence is the finding. A value written by a newer vmsync, or
+	// one torn mid-splice, must still reach the overwrite gates -- dropping
+	// it would turn "this copy served live" into silence on exactly the
+	// domains where that silence overwrites the only copy of the data.
+	st.LastPromotedAt, _ = ParseMetadata(domXML, MetadataFieldLastPromotedAt)
 
 	st.Fence.ID, _ = ParseMetadata(domXML, MetadataFieldFenceID)
 	st.Fence.Source, _ = ParseMetadata(domXML, MetadataFieldFenceSource)

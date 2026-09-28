@@ -258,6 +258,26 @@ type ReportDomain struct {
 	PromotedAtUnix int64  `json:"promoted_at_unix,omitempty"`
 	PromotedBy     string `json:"promoted_by,omitempty"`
 	PromotionMode  string `json:"promotion_mode,omitempty"`
+	// LastPromotedAt is the durable record that this domain HAS SERVED LIVE
+	// at least once, and is the only part of the promotion record above that
+	// survives the demotion. LastPromotedAtUnix is the same value parsed.
+	//
+	// It has to travel for the same reason ReplicaIncomplete does, and the
+	// case is sharper. The four fields above are erased the instant the role
+	// changes, so a copy that served production for a week and was then shut
+	// down reports role=paused, a recent sync, failure_count=0 and no
+	// promotion record at all -- indistinguishable, in this report, from a
+	// replica that has never done anything. The console's Restore, Full
+	// resync and Force clean resync controls are all offered on that
+	// appearance, and the engine refuses all three. Without this field the
+	// console cannot know that, so it offers the buttons anyway and the
+	// operator meets a refusal nothing on the page predicted.
+	//
+	// Raw AND parsed, deliberately: presence is the finding, so a value this
+	// build cannot parse must still arrive as present rather than as a zero
+	// that reads "never promoted".
+	LastPromotedAt     string `json:"last_promoted_at,omitempty"`
+	LastPromotedAtUnix int64  `json:"last_promoted_at_unix,omitempty"`
 	// LastReplicatedAtUnix / LastReplicatedTo are the SOURCE side of the
 	// same fact LastSyncUnix records on a target: when this VM last
 	// replicated, and where to. Reported so the question can be answered

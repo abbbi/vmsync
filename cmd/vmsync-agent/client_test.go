@@ -520,3 +520,73 @@ func TestNewClientRefusesPlaintextAndTrustsAGivenCA(t *testing.T) {
 		}
 	})
 }
+
+// TestSendReportCarriesLastPromotedAtUnderTheAgreedNames pins the two keys the
+// console keys its withheld controls on.
+//
+// Both forms travel, and the raw one is checked byte for byte for the reason
+// replica_incomplete is: presence is the finding. A record this build cannot
+// parse still means the copy served live, and a console receiving only the
+// parsed form would read it as a zero -- "never promoted" -- on exactly the
+// domain where that mistake offers Roll back and Force clean resync over what
+// may be the only copy of production data.
+//
+// And absence must be absence. Every replica in an estate that has never been
+// failed over sends no key at all; a zero or an empty string arriving for all of
+// them would be indexed, rendered, and would put a "has served live" warning on
+// every row in the fleet.
+func TestSendReportCarriesLastPromotedAtUnderTheAgreedNames(t *testing.T) {
+	const raw40Ago = "1799999500"
+
+	var body map[string]any
+	c, _ := stubUI(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&body)
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	report := Report{
+		ReportedAtUnix: 1_800_000_000,
+		Hostname:       "hyper02p",
+		Domains: []ReportDomain{
+			{
+				// The state this field exists for: promoted, then shut down.
+				// The role says `paused`, the promotion record is gone, and
+				// everything else reads like an ordinary idle replica.
+				Name: "web01", Active: false, Role: "paused", Status: "paused",
+				ReplicaSource:      "hyper01p:web01",
+				LastCheckpoint:     "vmsync-cpt-000042",
+				LastSyncUnix:       1_799_999_700,
+				LastPromotedAt:     raw40Ago,
+				LastPromotedAtUnix: 1_799_999_500,
+			},
+			{
+				Name: "db01", Active: false, Role: "target", Status: "ok",
+				ReplicaSource: "hyper01p:db01",
+			},
+		},
+	}
+	if err := c.SendReport(context.Background(), report); err != nil {
+		t.Fatalf("SendReport() error = %v", err)
+	}
+
+	domains, _ := body["domains"].([]any)
+	if len(domains) != 2 {
+		t.Fatalf("the UI received %d domains, want 2", len(domains))
+	}
+
+	first, _ := domains[0].(map[string]any)
+	if got := first["last_promoted_at"]; got != raw40Ago {
+		t.Errorf("last_promoted_at = %v, want %q -- vmsync_ui's store.ReportDomain pins the same key", got, raw40Ago)
+	}
+	if got, ok := first["last_promoted_at_unix"].(float64); !ok || int64(got) != 1_799_999_500 {
+		t.Errorf("last_promoted_at_unix = %v, want 1799999500", first["last_promoted_at_unix"])
+	}
+
+	second, _ := domains[1].(map[string]any)
+	for _, key := range []string{"last_promoted_at", "last_promoted_at_unix"} {
+		if _, present := second[key]; present {
+			t.Errorf("a replica that has never been promoted must omit %s entirely, or every row in "+
+				"the estate carries a served-live warning", key)
+		}
+	}
+}

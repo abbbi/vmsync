@@ -625,6 +625,10 @@ func reportLoop(ctx context.Context, client *Client, lv *live, state *sharedStat
 			// invisible everywhere else, and in monitor mode this is the only
 			// feeder that runs at all -- monitor agents execute no fence sweep.
 			cfg.metrics.setFencedRunning(fencedRunningVMs(report.Domains))
+			// Same sweep again. This one is the only signal a demoted copy that
+			// served live produces anywhere: the refusals it causes are exempt
+			// from failure_count, and its own role reads `paused`.
+			cfg.metrics.setServedLiveUnreleased(servedLiveUnreleasedVMs(report.Domains))
 			cfg.metrics.setRestorePoints(restorePointGauges(report.Domains))
 
 			if err := client.SendReport(ctx, report); err != nil {
@@ -859,6 +863,8 @@ func reportDomainFrom(d inventory.Domain, fenced *ReportFenced, a inventory.Asse
 		PromotedAtUnix:       d.PromotedAtUnix,
 		PromotedBy:           d.PromotedBy,
 		PromotionMode:        d.PromotionMode,
+		LastPromotedAt:       d.LastPromotedAtRaw,
+		LastPromotedAtUnix:   d.LastPromotedAtUnix,
 		LastReplicatedAtUnix: d.LastReplicatedAtUnix,
 		LastReplicatedTo:     d.LastReplicatedTo,
 		FenceID:              d.FenceID,

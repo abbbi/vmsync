@@ -148,6 +148,27 @@ type agentMetrics struct {
 	// sync -- describes the sync BEFORE the interrupted rebuild.
 	incompleteVMs map[string]bool
 
+	// servedLiveVMs is the set of VMs on this host that carry
+	// last_promoted_at and are no longer marked promoted: copies that have
+	// served live, have been demoted, and whose promotion record nobody has
+	// released.
+	//
+	// A gauge, like the two sets around it, because the question is "is this
+	// true right now". It clears when a person runs -release-promotion or an
+	// -invert makes the copy the source, and it is the one set here that
+	// nothing clears by itself -- which is precisely why it is worth
+	// publishing. The copy is holding data that was serving; the source
+	// facing it is having every sync refused; and none of that shows up
+	// anywhere else a standalone host can see, because the refusals are
+	// exempt from failure_count and the domain's own role reads `paused`
+	// like any replica somebody paused for maintenance.
+	//
+	// Promoted-and-still-serving domains are deliberately EXCLUDED. Those are
+	// not waiting on anybody -- a failover in progress is the expected state
+	// for hours -- and counting them would make this gauge fire on every
+	// successful DR test, which is how a signal stops being read.
+	servedLiveVMs map[string]bool
+
 	// fencedRunningVMs is the set of VMs on this host marked
 	// replication_role=fenced that are STILL RUNNING: a fence suspended their
 	// replication without stopping the domain, while the peer that displaced
@@ -230,6 +251,22 @@ func (m *agentMetrics) setReplicaIncomplete(vms map[string]bool) {
 	m.incompleteVMs = make(map[string]bool, len(vms))
 	for vm := range vms {
 		m.incompleteVMs[vm] = true
+	}
+}
+
+// setServedLiveUnreleased replaces the whole set from one complete sweep, for
+// the reason every setter here does: replacing is what lets a copy that has
+// been released, inverted or removed stop being reported, where a merge would
+// keep alerting about a decision somebody already made.
+func (m *agentMetrics) setServedLiveUnreleased(vms map[string]bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.servedLiveVMs = make(map[string]bool, len(vms))
+	for vm := range vms {
+		m.servedLiveVMs[vm] = true
 	}
 }
 
@@ -552,6 +589,7 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	split := len(m.splitBrainVMs)
 	splitVMs := sortedKeys(m.splitBrainVMs)
 	incompleteVMs := sortedKeys(m.incompleteVMs)
+	servedLiveVMs := sortedKeys(m.servedLiveVMs)
 	fencedRunningVMs := sortedKeys(m.fencedRunningVMs)
 	rpVMs := sortedKeys(m.restorePointVMs)
 	rpGauges := make(map[string]restorePointGauge, len(m.restorePointVMs))
@@ -610,6 +648,36 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 		fmt.Fprintf(&b, "# HELP vmsync_agent_replica_incomplete 1 while a replica on this host carries an interrupted full rebuild (replica_incomplete). It clears by itself when a sync completes, because the define that records the sync clears the marker.\n# TYPE vmsync_agent_replica_incomplete gauge\n")
 		for _, vm := range incompleteVMs {
 			fmt.Fprintf(&b, "vmsync_agent_replica_incomplete{host=%q,vm=%q} 1\n", host, vm)
+		}
+	}
+
+	// --- a copy that served live and nobody has decided about --------------
+	//
+	// The state that is silent everywhere else. A copy failed over to and then
+	// shut down records replication_role=paused and loses the whole promotion
+	// record, so its status reads `paused`, its last sync reads recent, and its
+	// failure count reads zero -- and the source facing it has every sync
+	// refused while none of those refusals touch failure_count, deliberately
+	// (they are administrative, and a reinit cannot fix them). So the pair goes
+	// quiet in both directions, and the only thing holding the data is a
+	// replica that looks like somebody paused it for maintenance.
+	//
+	// It is the one gauge in this file that nothing clears by itself. A person
+	// runs -release-promotion, or an -invert makes the copy the source. That is
+	// the point rather than a defect: a value that has not moved in a week is a
+	// decision nobody has made about production data, not a stuck series.
+	//
+	// Emitted unconditionally, at zero when there is nothing to say, for the
+	// reason given at the split-brain gauge: an alert cannot use a `for:` clause
+	// over a window that begins before the series it reads came into existence.
+	g("vmsync_agent_served_live_unreleased_vms", "Copies on this host that have been promoted at some point (last_promoted_at), are no longer marked promoted, and whose promotion record has not been released. Their disks may hold the only copy of data that was serving, so vmsync refuses to sync, restore or force-clean over them -- force-clean included. Nothing clears this automatically: an operator runs -release-promotion if the data is disposable, or -invert if the failover stands. A value that has not moved in days is an undecided failover, not a stuck metric. Domains still marked promoted are excluded, so a failover in progress and a successful DR test do not register.", len(servedLiveVMs), "")
+	// HELP and TYPE once, then one sample line per VM -- NOT g() per VM, for the
+	// reason spelled out at the split-brain gauge: a second HELP line for one
+	// family makes node_exporter reject the whole file.
+	if len(servedLiveVMs) > 0 {
+		fmt.Fprintf(&b, "# HELP vmsync_agent_served_live_unreleased 1 while that VM has served live, is no longer marked promoted, and its promotion record has not been released. Decide: -invert if the failover stands and this copy is the real one, or -release-promotion on this host if its data is disposable.\n# TYPE vmsync_agent_served_live_unreleased gauge\n")
+		for _, vm := range servedLiveVMs {
+			fmt.Fprintf(&b, "vmsync_agent_served_live_unreleased{host=%q,vm=%q} 1\n", host, vm)
 		}
 	}
 
@@ -750,6 +818,7 @@ func metricsLoop(ctx context.Context, lv *live, state *sharedState, sched *Sched
 				// signal that a replica's disks are a partial copy.
 				m.setReplicaIncomplete(scan.incomplete)
 				m.setFencedRunning(scan.fencedRunning)
+				m.setServedLiveUnreleased(scan.servedLive)
 				// Likewise the restore point depth. A standalone host is the
 				// one place these numbers have no other route out: there is
 				// no control plane to send a report to, so without this a
@@ -792,6 +861,7 @@ type inventoryScan struct {
 	byStatus      map[string]int
 	incomplete    map[string]bool
 	fencedRunning map[string]bool
+	servedLive    map[string]bool
 	restorePoints map[string]restorePointGauge
 }
 
@@ -818,6 +888,7 @@ func scanDomainStatus(cfg agentConfig) (inventoryScan, error) {
 	byStatus := map[string]int{}
 	incomplete := map[string]bool{}
 	fencedRunning := map[string]bool{}
+	servedLive := map[string]bool{}
 	restorePoints := map[string]restorePointGauge{}
 	now := time.Now()
 	for _, d := range domains {
@@ -827,6 +898,16 @@ func scanDomainStatus(cfg agentConfig) (inventoryScan, error) {
 		// engine's marker publish a zero.
 		if d.ReplicaIncomplete != "" {
 			incomplete[d.Name] = true
+		}
+		// A copy that served live, was demoted, and that nobody has decided
+		// about. Standalone matters most for this one: there is no console to
+		// show the row on, the refusals it causes are exempt from
+		// failure_count, and the domain's own role reads `paused` -- so without
+		// this gauge nothing on the host says anything at all. Same predicate
+		// as the report path's, and the `promoted` exclusion is the same
+		// judgement; see servedLiveUnreleasedVMs.
+		if d.LastPromotedAtRaw != "" && d.Role != libvirtsync.RolePromoted {
+			servedLive[d.Name] = true
 		}
 		// A fence that suspended replication without stopping the domain. In
 		// standalone mode there is no control plane and no report, so this sweep
@@ -853,7 +934,7 @@ func scanDomainStatus(cfg agentConfig) (inventoryScan, error) {
 			restorePoints[d.Name] = restorePointGaugeFor(reportRestorePoints(d.RestorePoints))
 		}
 	}
-	return inventoryScan{total: len(domains), byStatus: byStatus, incomplete: incomplete, fencedRunning: fencedRunning, restorePoints: restorePoints}, nil
+	return inventoryScan{total: len(domains), byStatus: byStatus, incomplete: incomplete, fencedRunning: fencedRunning, servedLive: servedLive, restorePoints: restorePoints}, nil
 }
 
 // statusCounts tallies a report's domains by status, for the gauge.
@@ -880,6 +961,28 @@ func incompleteReplicaVMs(domains []ReportDomain) map[string]bool {
 	out := map[string]bool{}
 	for _, d := range domains {
 		if d.ReplicaIncomplete != "" {
+			out[d.Name] = true
+		}
+	}
+	return out
+}
+
+// servedLiveUnreleasedVMs is the same shape for the promotion trace, taken from
+// the same report for the same reason.
+//
+// Presence is the state, including a value this build cannot parse: reading an
+// unfamiliar record as "never promoted" is the failure this field exists to
+// close, and it is the direction that overwrites production data.
+//
+// The `promoted` exclusion is the whole of the predicate's judgement. A domain
+// still marked promoted is a failover in progress or a drill: nothing is waiting
+// on anybody, the role interlock already refuses everything, and counting it
+// would make this gauge non-zero for the duration of every successful failover
+// -- which is how a signal that matters stops being read.
+func servedLiveUnreleasedVMs(domains []ReportDomain) map[string]bool {
+	out := map[string]bool{}
+	for _, d := range domains {
+		if d.LastPromotedAt != "" && d.Role != libvirtsync.RolePromoted {
 			out[d.Name] = true
 		}
 	}
