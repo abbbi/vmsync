@@ -312,6 +312,24 @@ standing down is a warning rather than a failed sync -- the run it happens insid
 is the one repairing the replica. Ages are faked by rewriting the unix stamp in
 each name rather than by moving a clock: the stamp is what vmsync reads, and
 moving the host's time would invalidate every other timestamp the replica carries.
+
+Stage 20 (reinit-order) is opt-in, and is the ONLY stage that deliberately starts
+a target domain. It proves that a reinit refused because the target is running
+has destroyed nothing -- on either host. That check used to sit after the source's
+checkpoint chain had already been dropped, so forgetting to shut the replica down
+cost a full recopy of the whole machine, left replica_incomplete armed on a target
+the run never touched, and with -force-clean undefined the target first and only
+then noticed it was running (DomainExists uses LookupDomainByName, which still
+finds a RUNNING domain after its definition is gone). The replica is started
+PAUSED, which is what makes this safe to ship: libvirtsync.DomainActive is
+`state != SHUTOFF`, so a paused domain trips the guard exactly like a running one
+while the guest never executes an instruction, so it cannot write to the replica
+or appear on the network as a second copy of a production machine. qemu does open
+the images, so the stage rewrites the replica before it finishes. It skips
+cleanly, saying which, when the target domain is absent, when the replica will
+not boot on the DR host (a definition inherited from the source can name a bridge
+or a CPU model that host does not have), or when the source carries no checkpoint
+for the assertions to protect.
 EOF
 }
 
@@ -1452,8 +1470,10 @@ verify_mode_subtest() {
 # than investigating one, and -verify-failure-reinit would additionally spend a
 # full-image compare per heal to re-prove a replica nothing doubts. Against a
 # running source it does what -reinit did (the chain is rebuilt either way); its
-# extra powers -- removing the target definition first, clearing a shut-down
-# source's bitmaps -- do not change the end state here.
+# one extra power that could matter here -- removing the target definition first
+# -- does not change the end state. Clearing a shut-down source's bitmaps is NOT
+# one of its extra powers, though this comment used to say so: every reinit does
+# that, and which route it takes is decided by the source's own state.
 #
 # Note this means the heal path no longer exercises the refusal, so nothing here
 # would notice if it broke. That is stage 14's job, which asserts a plain
@@ -7770,6 +7790,158 @@ stage_leftovers() {
 	return 0
 }
 
+stage_reinit_order() {
+	log "=== Stage 20: a reinit refused for a running target must have destroyed nothing ==="
+	local sc=reinit-order
+	local fo_ok=0
+
+	if [ "$DRY_RUN" = yes ]; then
+		# rename, like stages 16 and 19: this stage asserts that NOTHING was
+		# displaced, so a dry run printing the harness's usual `delete` would
+		# advertise a command line that cannot test what the stage tests.
+		RO_SAVED_REPLACED_DISK_ACTION="$REPLACED_DISK_ACTION"
+		REPLACED_DISK_ACTION=rename
+		bench_sync "$sc" baseline -reinit
+		bench_sync "$sc" running-reinit -reinit
+		bench_sync "$sc" running-force-clean -force-clean
+		bench_sync "$sc" repaired -reinit
+		REPLACED_DISK_ACTION="$RO_SAVED_REPLACED_DISK_ACTION"
+		fo_check "$sc" "-reinit over a running target is refused" 0
+		fo_check "$sc" "the refused -reinit left the source's checkpoint chain intact" 0
+		fo_check "$sc" "the refused -reinit did not arm replica_incomplete" 0
+		fo_check "$sc" "-force-clean over a running target is refused" 0
+		fo_check "$sc" "the refused -force-clean left the source's checkpoint chain intact" 0
+		fo_check "$sc" "the refused -force-clean did not arm replica_incomplete" 0
+		fo_check "$sc" "the refused -force-clean left the target domain defined" 0
+		return 0
+	fi
+
+	# This is the ONE stage that deliberately starts a target domain, so it
+	# checks it can put things back before it touches anything.
+	if ! domain_exists "$TARGET_URI" "$TARGET_DOMAIN"; then
+		warn "SKIP stage 20: $TARGET_DOMAIN does not exist on the target${VIRSH_ERR:+: $VIRSH_ERR}. The whole stage is about what a reinit does while the target is RUNNING, and there is nothing to run."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP target domain absent"
+		return 0
+	fi
+	stage_needs_target_shutoff "$CSV" "$sc" "stage reinit-order" || return 0
+
+	local saved_action="$REPLACED_DISK_ACTION"
+	REPLACED_DISK_ACTION=rename
+	# shellcheck disable=SC2064
+	trap "REPLACED_DISK_ACTION='$saved_action'" RETURN
+
+	# target_is_persistent -> 0 when the target domain still has a definition.
+	#
+	# Not domain_exists: dominfo succeeds for a TRANSIENT domain too, which is
+	# exactly the state a -force-clean that undefined a running domain leaves
+	# behind, and telling those apart is the point of sub-test 20f.
+	target_is_persistent() {
+		virsh_uri "$TARGET_URI" dominfo "$TARGET_DOMAIN" 2>/dev/null \
+			| grep -qE '^Persistent:[[:space:]]+yes'
+	}
+
+	# A baseline so there IS a checkpoint chain to protect and a replica to boot.
+	bench_sync "$sc" baseline -reinit || {
+		bench_sync_hint
+		fo_check "$sc" "-reinit over a running target is refused" 1 "the baseline sync itself failed, see $RUN_LOG"
+		return 0
+	}
+
+	local cpts_before
+	cpts_before="$(vmsync_checkpoint_count "$SOURCE_URI" "$SOURCE_DOMAIN")"
+	if [ "${cpts_before:-0}" -lt 1 ]; then
+		# Every assertion below compares against this number. Zero would make
+		# them all pass without proving anything, which is worse than skipping.
+		warn "SKIP stage 20: $SOURCE_DOMAIN carries no vmsync checkpoints after a baseline sync, so \"the chain survived\" cannot be told from \"there was no chain\"."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP no source checkpoint to protect"
+		return 0
+	fi
+
+	# --- boot the replica, PAUSED --------------------------------------------
+	#
+	# Paused rather than running, and that is the whole reason this stage is
+	# safe to ship. libvirtsync.DomainActive is `state != SHUTOFF`, so a paused
+	# domain trips the guard exactly like a running one -- while the guest never
+	# executes a single instruction, so it cannot write to the replica or start
+	# talking on the network as a second copy of a production machine. qemu does
+	# open the images, so the qcow2 headers are touched; the stage rewrites the
+	# replica at the end for that reason.
+	if ! virsh_uri "$TARGET_URI" start "$TARGET_DOMAIN" --paused >/dev/null 2>&1; then
+		warn "SKIP stage 20: could not start $TARGET_DOMAIN in paused mode on the target. A replica's definition comes from its source, so it can name a bridge, a CPU model or a host device that does not exist on the DR host -- which is a legitimate state, not a failure. Nothing was changed."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP target would not start paused"
+		return 0
+	fi
+	log "   started $TARGET_DOMAIN paused on the target; the guest is not executing"
+
+	# From here on the domain MUST be put back, on every path.
+	local started_paused=yes
+	ro_cleanup() {
+		[ "$started_paused" = yes ] || return 0
+		started_paused=no
+		if ! target_is_persistent; then
+			# Only reachable when a sub-test below already failed: destroying a
+			# transient domain removes it outright. Said out loud, with the way
+			# back, because a silent vanishing target is how a bench run gets
+			# blamed on the harness.
+			warn "$TARGET_DOMAIN is TRANSIENT -- something undefined it while it was running, which is the defect 20f tests for. Destroying it now removes the domain entirely; the final -reinit below defines it again from $SOURCE_DOMAIN."
+		fi
+		virsh_uri "$TARGET_URI" destroy "$TARGET_DOMAIN" >/dev/null 2>&1 || true
+	}
+
+	# ro_assert_nothing_destroyed VERB PHASE -- the three things a refused run
+	# must not have done, checked in the order they would have happened.
+	ro_assert_nothing_destroyed() {
+		local verb="$1" phase="$2"
+		local rc="${RUN_RC:-0}"
+
+		if [ "$rc" != 0 ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "$verb over a running target is refused" "$fo_ok" \
+			"the run exited $rc; a target whose qemu holds the disks open must never be reinitialised -- the replica ends up an unlinked inode a running guest is still writing to"
+
+		local cpts_after
+		cpts_after="$(vmsync_checkpoint_count "$SOURCE_URI" "$SOURCE_DOMAIN")"
+		if [ "${cpts_after:-0}" = "$cpts_before" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the refused $verb left the source's checkpoint chain intact" "$fo_ok" \
+			"$SOURCE_DOMAIN went from $cpts_before to ${cpts_after:-?} vmsync checkpoints on a run that REFUSED -- the chain is dropped before the running-target check, so forgetting to shut the replica down costs a full recopy of the whole machine"
+
+		local ri
+		ri="$(replica_incomplete "$TARGET_URI" "$TARGET_DOMAIN")"
+		if [ -z "$ri" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the refused $verb did not arm replica_incomplete" "$fo_ok" \
+			"$TARGET_DOMAIN carries replica_incomplete=$ri after a run that refused and touched nothing; that record refuses every later promotion until a sync clears it"
+
+		# Only -force-clean can undefine, so only it is asked.
+		if [ "$verb" = "-force-clean" ]; then
+			if target_is_persistent; then fo_ok=0; else fo_ok=1; fi
+			fo_check "$sc" "the refused $verb left the target domain defined" "$fo_ok" \
+				"$TARGET_DOMAIN is no longer persistent: -force-clean undefined it and only then noticed it was running. DomainExists uses LookupDomainByName, which still finds a RUNNING domain after its definition is gone, so the guard fired one step too late and left the replica as a transient domain with no definition at all"
+		fi
+		[ -n "$phase" ] || true
+	}
+
+	# --- 20a-c. a plain -reinit ----------------------------------------------
+	bench_sync "$sc" running-reinit -reinit || true
+	ro_assert_nothing_destroyed "-reinit" running-reinit
+
+	# --- 20d-f. and -force-clean, which has one more way to be wrong ---------
+	#
+	# Separate from the above rather than folded into it: -force-clean reaches
+	# the same guard through forceCleanTargetDomain, which used to run FIRST.
+	bench_sync "$sc" running-force-clean -force-clean || true
+	ro_assert_nothing_destroyed "-force-clean" running-force-clean
+
+	ro_cleanup
+
+	# Leave the replica clean. qemu opened the images to start the domain, so
+	# their headers have been written even though the guest never ran, and the
+	# next stage inherits this target.
+	bench_sync "$sc" repaired -reinit \
+		|| warn "stage 20 could not leave $TARGET_DOMAIN with a freshly written replica; the next stage starts from a replica whose qcow2 headers were touched by a paused boot"
+
+	unset -f target_is_persistent ro_cleanup ro_assert_nothing_destroyed
+	return 0
+}
+
 stage_pattern() {
 	case "$1" in
 	# Anchored to the named sub-tests rather than a bare ^verify- , so a
@@ -7805,6 +7977,10 @@ stage_pattern() {
 	# Same shape as stage 18: this one stands down on a target with no
 	# TARGET_DISK_PATH, and that row belongs to stage 19's verdict.
 	leftovers) printf '^(leftovers|precondition)$' ;;
+	# Stage 20 stands down on several preconditions (no target domain, a target
+	# that will not boot, no source chain to protect), and those rows belong to
+	# its own verdict rather than to whichever stage ran before it.
+	reinit-order) printf '^(reinit-order|precondition)$' ;;
 	*) printf '$^' ;; # matches nothing
 	esac
 }
@@ -8202,7 +8378,8 @@ for s in "${stage_list[@]}"; do
         journal) stage_journal || stage_rc=$? ;;
         colocated) stage_colocated || stage_rc=$? ;;
         leftovers) stage_leftovers || stage_rc=$? ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers)" ;;
+        reinit-order) stage_reinit_order || stage_rc=$? ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
                 warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."

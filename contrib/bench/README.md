@@ -105,6 +105,7 @@ vmsync itself to work at all).
 ./bench.sh --stages journal      # 17 the action journal beside the replica's disks
 ./bench.sh --stages colocated    # 18 opt-in: two target domains sharing one replica directory
 ./bench.sh --stages leftovers    # 19 opt-in: displaced sets reported, reclaimed only when asked
+./bench.sh --stages reinit-order # 20 opt-in: a refused reinit destroyed nothing; STARTS THE TARGET (paused)
 ```
 
 Stages 2, 3, 4, 9, 10 and 11 each run their own baseline `-reinit` full
@@ -1288,6 +1289,35 @@ the stamp is what vmsync reads, and changing the host's time would invalidate
 every other timestamp the replica carries. The co-located aside is planted rather
 than produced by a second pair, for the same reason stage 18 plants its own. The
 stage leaves the replica complete and removes everything it planted.
+
+### Stage 20 (`reinit-order`), opt-in — the only stage that starts a target
+
+Proves that a reinit refused because the target is running has destroyed nothing,
+on either host. Needs the target domain to exist; skips cleanly, saying which, if
+it is absent, if the replica will not boot on the DR host, or if the source has no
+checkpoint for the assertions to protect.
+
+The running-target check used to sit ~85 lines *after* the source's checkpoint
+chain was dropped. So the most ordinary way for a reinit not to go through —
+somebody forgot to shut the replica down — cost three things, and each is a
+sub-test:
+
+| sub-test | what it would catch |
+| --- | --- |
+| `-reinit` / `-force-clean` over a running target is refused | the guard itself. It passed before the reorder too: the old code did refuse, just too late, which is why the three below are the ones that matter |
+| the refused run left the source's checkpoint chain intact | **a full recopy of the whole machine**, for a typo. The chain was dropped before the check, so the next sync had no baseline to diff against |
+| the refused run did not arm `replica_incomplete` | a target the run never touched left carrying a record that refuses every later promotion until some sync clears it |
+| the refused `-force-clean` left the target domain defined | the sharpest one. `forceCleanTargetDomain` ran first, and `DomainExists` uses `LookupDomainByName`, which still finds a **running** domain after its definition is gone — so the guard fired one step too late and left the replica as a transient domain with no persistent definition at all |
+
+**Why starting the target is safe here.** The replica is started **paused**.
+`libvirtsync.DomainActive` is `state != SHUTOFF`, so a paused domain trips the
+guard exactly like a running one, while the guest never executes an instruction —
+it cannot write to the replica, and it cannot appear on the network as a second
+copy of a production machine. qemu does open the images, so their qcow2 headers
+are written even though nothing else is; the stage finishes with a `-reinit` to
+leave a freshly written replica. If a sub-test fails in the way 20f describes, the
+target is transient by then and destroying it removes the domain outright — the
+stage says so at WARNING and the final `-reinit` defines it again from the source.
 
 ## Files
 
