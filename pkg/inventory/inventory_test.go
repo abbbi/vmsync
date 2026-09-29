@@ -572,6 +572,11 @@ func TestApplyDomainMetadataMapsEveryField(t *testing.T) {
 		libvirtsync.MetadataFieldVerifyState:       libvirtsync.VerifyStateFailed,
 		libvirtsync.MetadataFieldVerifyFailedAt:    "1799999100",
 		libvirtsync.MetadataFieldReplicaIncomplete: "verb=reinit,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=1758441600",
+		// Both forms of the durable promotion record come from this one field:
+		// the raw value, so presence survives a value this build cannot parse,
+		// and the parsed one for rendering. A target carrying it is the real
+		// state of a copy that served and was then re-targeted.
+		libvirtsync.MetadataFieldLastPromotedAt: "1799999000",
 	}
 
 	var d Domain

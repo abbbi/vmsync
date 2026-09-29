@@ -97,6 +97,7 @@ func TestFailoverStateFromXML(t *testing.T) {
 				MetadataFieldFenceSource:         "prod01:web01",
 				MetadataFieldFenceArmedBy:        "ops@example.org",
 				MetadataFieldFenceArmedAt:        "1700000400",
+				MetadataFieldLastPromotedAt:      "1700000200",
 			},
 			want: FailoverState{
 				Role:                RoleTarget,
@@ -115,6 +116,11 @@ func TestFailoverStateFromXML(t *testing.T) {
 				// would also have to decide what an unreadable value means,
 				// and the answer -- refuse anyway -- is not a metadata rule.
 				ReplicaIncomplete: "verb=reinit,at=1700000100,action=9f3c1a2b4d5e6f70,host=prod01,aside=1700000100",
+				// Raw and unparsed for the same reason, and a target carrying it
+				// alongside role=target is a real state rather than a contrived
+				// one: it is what a promoted copy looks like after somebody
+				// re-targeted it, and it is what refuses the next sync into it.
+				LastPromotedAt: "1700000200",
 				Fence: failover.FenceToken{
 					ID:      "0123456789abcdef0123456789abcdef",
 					Source:  "prod01:web01",
