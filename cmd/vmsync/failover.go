@@ -159,6 +159,14 @@ func runPromote(ctx context.Context, cfg syncConfig) (runErr error) {
 	// deliberately compute their lock path through the same helper.
 	lock, err := util.AcquireRunLock(runLockDir, targetLockKey(cfg.TargetDomain))
 	if err != nil {
+		// Naming the holder, because "another vmsync is busy" is not something
+		// an operator can act on during a disaster -- and the most likely holder
+		// here is a session belonging to a driver that is already gone. The
+		// description says which, and says when the lock can be cleared.
+		if errors.Is(err, util.ErrLockHeld) {
+			return fmt.Errorf("promote %s: the target-side run lock is held -- %s: %w",
+				cfg.TargetDomain, util.DescribeLockHolder(runLockDir, targetLockKey(cfg.TargetDomain)), err)
+		}
 		return fmt.Errorf("promote %s: %w", cfg.TargetDomain, err)
 	}
 	defer lock.Close()

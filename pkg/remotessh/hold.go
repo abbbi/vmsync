@@ -32,13 +32,19 @@ import (
 // heldCommand is a remote command kept running for as long as the handle is
 // open, rather than run to completion like Run does.
 //
-// The lifetime coupling is the entire point. The remote command blocks
-// reading its stdin, so it exits when this handle is closed -- and also
-// when the SSH connection drops, when the local process is killed, and when
-// the network partitions, because every one of those closes the channel and
-// delivers EOF. Anything the remote command holds is therefore released by
-// the same event that ends the local run, with no timeout to tune, no
-// heartbeat to miss, and no stale state to reason about afterwards.
+// The remote command blocks reading its stdin, so it exits when this handle is
+// closed, when the SSH connection drops, and when the local process is killed:
+// each of those closes the channel and delivers EOF, and anything the remote
+// command holds is released with it.
+//
+// A PARTITION OR A POWER LOSS IS DIFFERENT, and the difference is the whole of
+// CI-10. Nothing is delivered to the far end at all -- no FIN, no reset -- so the
+// remote command blocks on a stdin that will never close, and sshd notices only
+// when TCP keepalive gives up, roughly two hours later. Callers that hold
+// something whose release matters cannot rely on EOF for it. Write to this
+// handle periodically instead, and have the remote side give up on silence:
+// util.AcquireRemoteRunLock does exactly that, and the heartbeat is why Write
+// exists here.
 type heldCommand struct {
 	session *ssh.Session
 	stdin   io.WriteCloser
@@ -53,13 +59,19 @@ type heldCommand struct {
 var ErrHoldRefused = errors.New("remote command refused")
 
 // HoldCommand starts command on the remote host and waits for it to print
-// readyLine on stdout, then returns a handle whose Close ends it.
+// readyLine on stdout, then returns a handle whose Close ends it and whose Write
+// reaches the command's stdin.
 //
 // Any other line the command prints before readyLine is treated as a
 // refusal and returned in the error, so a caller can distinguish "could not
 // do this" from "did not answer". A command that neither answers nor exits
 // is bounded by ctx like everything else here.
-func (c *Client) HoldCommand(ctx context.Context, command, readyLine string) (io.Closer, error) {
+//
+// Nothing drains the command's stdout after the ready line. A command a caller
+// writes to must therefore not echo what it reads, or the channel's window fills
+// and both ends block -- see the remote script in util.AcquireRemoteRunLock,
+// which sends its reader's output to /dev/null for that reason.
+func (c *Client) HoldCommand(ctx context.Context, command, readyLine string) (io.WriteCloser, error) {
 	if c == nil || c.client == nil {
 		return nil, errors.New("ssh client is not connected")
 	}
@@ -120,6 +132,18 @@ func (c *Client) HoldCommand(ctx context.Context, command, readyLine string) (io
 			return nil, fmt.Errorf("%w: %s", ErrHoldRefused, r.line)
 		}
 	}
+}
+
+// Write sends bytes to the remote command's stdin.
+//
+// A failure means the channel is gone, which is the one signal this side gets
+// that the remote command -- and anything it was holding on our behalf -- is no
+// longer reachable. Callers treat that as having lost whatever they held.
+func (h *heldCommand) Write(p []byte) (int, error) {
+	if h.stdin == nil {
+		return 0, errors.New("remote command has no stdin")
+	}
+	return h.stdin.Write(p)
 }
 
 // Close ends the remote command by closing its stdin, then tears the

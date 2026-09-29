@@ -55,6 +55,7 @@ import (
 
 	"vmsync/pkg/netbuffer"
 	"vmsync/pkg/streamrelay"
+	"vmsync/pkg/util"
 	"vmsync/pkg/version"
 )
 
@@ -158,6 +159,12 @@ func main() {
 	checksumNBD := flag.String("nbd", "", "With -checksum: where to reach the qemu-nbd export to hash -- either a Unix socket path (anything starting with \"/\") or a host:port. Always local to this host, since the point of computing digests here is that the bytes already are. vmsync uses a socket for the pre-commit check, which is why that check costs no TCP port at all, and 127.0.0.1:<port> for the -verify export, which it needs on TCP for its own reads")
 	checksumExport := flag.String("export", "", "With -checksum: NBD export name to ask for. Required, and not merely for symmetry -- asking by name is what makes a stale export from an earlier run fail the handshake instead of being hashed as if it were this disk")
 	checksumTimeout := flag.Duration("nbd-timeout", time.Minute, "With -checksum: deadline for each individual NBD socket operation. Not a deadline for the whole pass, which legitimately takes many round trips on a large disk")
+	// The target-side run lock, held here under a lease instead of by a remote
+	// shell parked on `cat`, so it is released when the driver holding it dies
+	// rather than when TCP keepalive eventually gives up. See runlock.go.
+	holdRunLockPath := flag.String("hold-run-lock", "", "Hold vmsync's target-side run lock on this path until stdin goes quiet, instead of running the bridge relay. Prints "+util.RemoteLockReady+" once held, then releases the lock if no heartbeat line arrives within -lock-lease. -listen/-connect are not used")
+	lockLease := flag.Duration("lock-lease", 90*time.Second, "With -hold-run-lock: how long the lock survives silence from the driver. vmsync beats at a third of this, so two lost beats do not release a lock whose driver is healthy")
+	lockStamp := flag.String("lock-stamp", "", "With -hold-run-lock: provenance to record in the lock file, as the JSON of a run lock identity. Read by whoever has to decide whether breaking the lock is safe; the pid and boot id in it are filled in by this process, which is the only one that knows them")
 	showVersion := flag.Bool("v", false, "Show version and exit")
 	showVersionLong := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
@@ -177,6 +184,34 @@ func main() {
 	if flag.NArg() > 0 {
 		fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: unexpected extra argument(s) %v -- if you meant to pass a value to -compress or -netbuffer, use -compress=value / -netbuffer=value (with an \"=\"), not a space\n", flag.Args())
 		os.Exit(2)
+	}
+
+	if *holdRunLockPath != "" {
+		// Refused rather than ignored, for the same reason -checksum refuses
+		// the relay flags below: a caller that passed both has a wrong idea of
+		// what this process will do, and doing the other thing silently is how
+		// that stays undiscovered. Here it matters more than usual -- a caller
+		// that thinks it holds a lock and does not would run concurrently with
+		// whoever really does.
+		if *listenAddr != "" || *connectAddr != "" || *checksumMode {
+			fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -hold-run-lock holds a lock and does nothing else, so -listen/-connect/-checksum must not be given with it")
+			os.Exit(2)
+		}
+		err := holdRunLock(runLockConfig{
+			Path:  *holdRunLockPath,
+			Lease: *lockLease,
+			Stamp: *lockStamp,
+		}, os.Stdin, os.Stdout)
+		marker, code := runLockExit(err)
+		if marker != "" {
+			// On stdout, where the caller's ready-line reader is looking. The
+			// detail goes to stderr so the marker stays the whole first line.
+			fmt.Println(marker)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
+		}
+		os.Exit(code)
 	}
 
 	if *checksumMode {

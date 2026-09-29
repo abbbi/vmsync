@@ -456,6 +456,16 @@ type syncConfig struct {
 	// guard in vmsync meant to require a person. See
 	// libvirtsync.FlagReleasePromotion.
 	ReleasePromotion bool
+	// BreakTargetLock clears a target-side run lock whose holder is provably
+	// gone, so a replica is not held hostage by a session that outlived the
+	// driver that opened it. See runBreakTargetLock.
+	BreakTargetLock bool
+	// RemoteLockLease overrides how long the target waits before releasing a
+	// leased run lock. Empty means util.DefaultRemoteLockLease.
+	//
+	// Exposed for the bench, which cannot spend 90 s per assertion, and for an
+	// estate whose links stall longer than the default tolerates.
+	RemoteLockLease string
 
 	// The failover modes, all handled in main() like -update-role: each
 	// changes state and exits, syncing nothing.
@@ -500,7 +510,7 @@ var flagGroups = []struct {
 }{
 	{"ACTIONS", "each does one thing and exits; at most one per run", []string{
 		"promote", "invert", "shutdown-domain", "fence-domain", "read-fence",
-		"update-role", "release-promotion", "list-restore-points",
+		"update-role", "release-promotion", "break-target-lock", "list-restore-points",
 		"clone-restore-point", "restore-restore-point", "explain-domain",
 	}},
 	{"CONNECTION", "which domains, and how to reach libvirt", []string{
@@ -517,6 +527,7 @@ var flagGroups = []struct {
 	}},
 	{"STORAGE", "where the replica's disks live and who owns them", []string{
 		"target-disk-path", "replaced-disk-action", "target-disk-owner",
+		"remote-lock-lease",
 		"reclaim-leftovers-after",
 	}},
 	{"TRANSPORT", "how the bytes cross between hosts", []string{
@@ -728,6 +739,7 @@ func main() {
 			{cfg.ReadFence, "-read-fence"},
 			{cfg.UpdateRole != "", "-update-role"},
 			{cfg.ReleasePromotion, "-" + libvirtsync.FlagReleasePromotion},
+			{cfg.BreakTargetLock, "-break-target-lock"},
 			{cfg.ListRestorePoints, "-list-restore-points"},
 			{cfg.CloneRestorePoint != "", "-clone-restore-point"},
 			{cfg.RestoreRestorePoint != "", "-restore-restore-point"},
@@ -767,6 +779,8 @@ func main() {
 				err = runRestoreRestorePoint(ctx, cfg, cfg.RestoreRestorePoint)
 			case cfg.ExplainDomain != "":
 				err = runExplainDomain(cfg, cfg.ExplainDomain)
+			case cfg.BreakTargetLock:
+				err = runBreakTargetLock(ctx, cfg)
 			}
 			if err != nil {
 				// Nothing was done, so this must not read as a failure. The
@@ -3962,12 +3976,38 @@ func run(cfg syncConfig) (runErr error) {
 	// target host, so every operation that writes that domain excludes every
 	// other one, wherever it was started from.
 	//
-	// Held by a remote process blocking on its stdin, so it is released by
-	// this SSH connection closing -- which covers a clean exit, a SIGKILL,
-	// and the network dropping alike. Nothing to expire, and no stale lock
-	// to clear by hand afterwards.
+	// Held on the target by vmsync-bridge-helper under a lease when it is
+	// there, and by a POSIX shell otherwise. The difference matters during a
+	// disaster: a leased lock is released by the TARGET when this process stops
+	// beating, so a promotion on that host is possible a lease later. Without
+	// the helper the lock is released only when the SSH channel closes, and a
+	// power loss or a partition closes nothing -- the lock, and every
+	// `-promote` and `-restore` on that host, waits for TCP keepalive.
+	lockLease := time.Duration(0)
+	if cfg.RemoteLockLease != "" {
+		d, err := time.ParseDuration(cfg.RemoteLockLease)
+		switch {
+		case err != nil:
+			return fmt.Errorf("-remote-lock-lease %q is not a duration: %w", cfg.RemoteLockLease, err)
+		case d < util.MinRemoteLockLease:
+			// A lease shorter than the stalls a healthy driver legitimately has
+			// -- a hypervisor pausing the guest, a long GC, a link retransmitting
+			// -- would hand the lock to a promotion while this run is still
+			// writing to the replica. That is worse than the two hours the lease
+			// exists to avoid.
+			return fmt.Errorf("-remote-lock-lease %q is %s, under the %s floor: a shorter lease releases the lock while a healthy driver is still writing to the replica", cfg.RemoteLockLease, d, util.MinRemoteLockLease)
+		}
+		lockLease = d
+	}
 	targetLockCtx, cancelTargetLock := context.WithTimeout(ctx, targetLockTimeout)
-	targetLock, lockErr := util.AcquireRemoteRunLock(targetLockCtx, targetSSHClient, runLockDir, targetLockKey(cfg.TargetDomain))
+	targetLock, lockErr := util.AcquireRemoteRunLock(targetLockCtx, targetSSHClient, runLockDir, targetLockKey(cfg.TargetDomain),
+		util.RemoteLockOptions{
+			HelperPath: cfg.BridgeHelperPath,
+			Lease:      lockLease,
+			Identity: util.NewRunLockIdentity("sync", cfg.SourceDomain,
+				util.ReplicaHost(cfg.TargetURI, cfg.LocalHostName)+":"+cfg.TargetDomain,
+				cfg.ActionID, time.Now().Unix()),
+		})
 	cancelTargetLock()
 	if lockErr != nil {
 		// Wrapped, not swallowed: main() reads ErrLockHeld off this and
@@ -3987,7 +4027,25 @@ func run(cfg syncConfig) (runErr error) {
 		return fmt.Errorf("target %s on %s: %w", cfg.TargetDomain, util.HostFromURIOrLocal(cfg.TargetURI), lockErr)
 	}
 	defer targetLock.Close()
-	trace.Debug("holding the target-side run lock", "vm", cfg.TargetDomain, "host", util.HostFromURIOrLocal(cfg.TargetURI))
+	// Set by the lock gate before the commit, and read again before the define.
+	var commitErrFromLock error
+	if targetLock.Leased() {
+		trace.Debug("holding the target-side run lock under a lease", "vm", cfg.TargetDomain,
+			"host", util.HostFromURIOrLocal(cfg.TargetURI), "lease", targetLock.Lease().String())
+	} else {
+		// Loud, and every run, because the consequence lands on somebody else at
+		// the worst possible moment: if this host dies mid-sync, the replica on
+		// the target cannot be promoted until TCP keepalive expires the session
+		// holding this lock.
+		reason := "no vmsync-bridge-helper path is configured for this run"
+		if err := targetLock.FellBackBecause(); err != nil {
+			reason = err.Error()
+		}
+		trace.Warning("the target-side run lock is NOT leased on this target, so a power loss or a partition here will block -promote and -restore on the target for as long as its sshd takes to notice (about two hours by default)",
+			"vm", cfg.TargetDomain, "host", util.HostFromURIOrLocal(cfg.TargetURI),
+			"reason", reason,
+			"remedy", "deploy a matching vmsync-bridge-helper at "+cfg.BridgeHelperPath+" on the target; until then vmsync -break-target-lock is the way past a stale lock")
+	}
 
 	// Check the two clocks agree before anything depends on them.
 	//
@@ -6795,7 +6853,27 @@ func run(cfg syncConfig) (runErr error) {
 	runsMu.Lock()
 	allDisksReady := phase1Done == len(qcowDisks)
 	runsMu.Unlock()
-	commitErr := commitStaged(allDisksReady)
+
+	// The lock gate, immediately before the commit, because the commit is the
+	// last thing that writes a replica disk and the first thing that cannot be
+	// taken back.
+	//
+	// Losing the lock does not mean the target is idle: a leased lock the target
+	// released on silence may already have been taken by a `-promote` there, so
+	// the replica's disks could be a running guest's by now. Committing into
+	// them would corrupt whatever that guest has written. Recorded as a commit
+	// failure rather than returned here, so the run still lands its replica
+	// stamp and clears its NBD state below -- skipping those is what makes the
+	// NEXT run refuse forever, blaming an out-of-band writer that was this one.
+	if lost := targetLock.Lost(); lost != nil && commitErrFromLock == nil {
+		commitErrFromLock = fmt.Errorf("refusing to commit to %s: %w", cfg.TargetDomain, lost)
+		trace.Error("REFUSING to commit: this run can no longer prove it holds the target-side run lock, so the replica's disks may belong to a promoted guest by now",
+			"vm", cfg.TargetDomain, "host", util.HostFromURIOrLocal(cfg.TargetURI), "error", lost)
+	}
+	commitErr := commitStaged(allDisksReady && commitErrFromLock == nil)
+	if commitErr == nil {
+		commitErr = commitErrFromLock
+	}
 
 	// Phase two: everything that needs the delta to be in the base --
 	// restore points and -verify. Skipped when a disk failed to copy or a
@@ -7095,6 +7173,24 @@ func run(cfg syncConfig) (runErr error) {
 	for _, d := range qcowDisks {
 		rootSourceByLiveSource[d.Source] = d.RootSource
 	}
+	// The second lock gate. DefineDomain undefines the target and defines it
+	// again from this run's XML, so it decides what the replica IS -- its role,
+	// its checkpoint, its metadata. Doing that without the lock would overwrite
+	// whatever took the lock in the meantime, and the thing most likely to have
+	// taken it is a `-promote` on that host: the redefine would then hand a
+	// promoted domain a replica's role and last_checkpoint, which reads as
+	// healthy and is not.
+	//
+	// Returned rather than recorded, unlike the commit gate: nothing below this
+	// point has to run for the replica to be consistent, and the stamp and NBD
+	// cleanup the commit gate was careful to preserve have already happened.
+	if lost := targetLock.Lost(); lost != nil {
+		trace.Error("REFUSING to redefine the target domain: this run can no longer prove it holds the target-side run lock",
+			"vm", cfg.TargetDomain, "host", util.HostFromURIOrLocal(cfg.TargetURI), "error", lost,
+			"note", "the replica's disks are committed and stamped; its definition and metadata still describe the previous run, which is the state a later sync can complete from")
+		return fmt.Errorf("refusing to redefine %s: %w", cfg.TargetDomain, lost)
+	}
+
 	defineDomainMu.Lock()
 	defineDomainInFlight = true
 	defineDomainMu.Unlock()
@@ -7303,6 +7399,8 @@ func registerFlags(fs *flag.FlagSet, cfg *syncConfig) (compressArg, fenceSourceA
 	fs.BoolVar(&cfg.ReadFence, "read-fence", false, "ask a peer whether its promotion fenced this host; prints JSON")
 	fs.StringVar(&cfg.UpdateRole, "update-role", "", "set a domain's replication role and exit: "+strings.Join(libvirtsync.ValidRoles, "|"))
 	fs.BoolVar(&cfg.ReleasePromotion, libvirtsync.FlagReleasePromotion, false, "declare that a copy which served live holds disposable data, and exit; refuses while it is running")
+	fs.BoolVar(&cfg.BreakTargetLock, "break-target-lock", false, "clear a target-side run lock whose holder is gone, and exit; refuses unless it can prove that")
+	fs.StringVar(&cfg.RemoteLockLease, "remote-lock-lease", "", "how long the target holds its run lock after this run stops heartbeating (default 90s); needs vmsync-bridge-helper there")
 	fs.BoolVar(&cfg.ListRestorePoints, "list-restore-points", false, "list the restore points kept on the target and exit")
 	fs.StringVar(&cfg.CloneRestorePoint, "clone-restore-point", "", "copy one restore point's disks to -clone-to and exit")
 	fs.StringVar(&cfg.RestoreRestorePoint, "restore-restore-point", "", "put a restore point back over the replica; needs -force-restore")

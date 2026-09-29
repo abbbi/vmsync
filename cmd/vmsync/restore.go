@@ -253,7 +253,12 @@ func restoreRootFor(cfg syncConfig, plan restorePlan) (replicaDir string, store 
 func acquireTargetRunLock(ctx context.Context, cfg syncConfig, runner remoteRunner) (io.Closer, error) {
 	key := targetLockKey(cfg.TargetDomain)
 	if holder, ok := runner.(util.CommandHolder); ok {
-		return util.AcquireRemoteRunLock(ctx, holder, runLockDir, key)
+		return util.AcquireRemoteRunLock(ctx, holder, runLockDir, key, util.RemoteLockOptions{
+			HelperPath: cfg.BridgeHelperPath,
+			Identity: util.NewRunLockIdentity("restore", cfg.SourceDomain,
+				util.ReplicaHost(cfg.TargetURI, cfg.LocalHostName)+":"+cfg.TargetDomain,
+				cfg.ActionID, time.Now().Unix()),
+		})
 	}
 	// Local: the same flock the source-side lock in main() uses.
 	return util.AcquireRunLock(runLockDir, key)

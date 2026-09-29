@@ -79,8 +79,12 @@ const (
 	journalVerbPromote        = "promote"
 	journalVerbInvert         = "invert"
 	journalVerbShutdownDomain = "shutdown-domain"
-	journalVerbFenceDomain    = "fence-domain"
-	journalVerbUpdateRole     = "update-role"
+	// journalVerbBreakTargetLock records that an interlock was removed by hand,
+	// which is the first thing anybody investigating two writers on one replica
+	// will look for.
+	journalVerbBreakTargetLock = "break-target-lock"
+	journalVerbFenceDomain     = "fence-domain"
+	journalVerbUpdateRole      = "update-role"
 	// The one verb whose whole content is a decision rather than an action:
 	// nothing on disk changes, an operator simply states that the data a copy
 	// served is disposable. Journalled for exactly that reason -- it is the

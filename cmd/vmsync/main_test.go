@@ -1071,7 +1071,7 @@ func TestFlagHelpIsOneLineAndGrouped(t *testing.T) {
 		// action in one place and not the other is what fails.
 		want := []string{
 			"promote", "invert", "shutdown-domain", "fence-domain", "read-fence",
-			"update-role", "release-promotion", "list-restore-points",
+			"update-role", "release-promotion", "break-target-lock", "list-restore-points",
 			"clone-restore-point", "restore-restore-point", "explain-domain",
 		}
 		var got []string

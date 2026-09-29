@@ -23,7 +23,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 )
 
 // ErrLockHeld indicates AcquireRunLock failed specifically because another
@@ -145,7 +144,7 @@ func AcquireRunLock(dir, key string) (*os.File, error) {
 		if err != nil {
 			return nil, fmt.Errorf("open lock file %s: %w", path, err)
 		}
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if err := FlockExclusiveNB(f); err != nil {
 			f.Close()
 			return nil, fmt.Errorf("another vmsync is already running for %q (lock %s held): %w (%v)", key, path, ErrLockHeld, err)
 		}
