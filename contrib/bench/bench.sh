@@ -330,6 +330,23 @@ cleanly, saying which, when the target domain is absent, when the replica will
 not boot on the DR host (a definition inherited from the source can name a bridge
 or a CPU model that host does not have), or when the source carries no checkpoint
 for the assertions to protect.
+
+Stage 21 (lock-lease) is opt-in and needs TARGET_HOST. It proves the target stops
+holding its run lock for a driver that has gone. The driver is SIGSTOPped rather
+than killed, and that distinction is the stage: killing a process closes its
+sockets, so the target gets a FIN and releases the lock promptly -- the case that
+always worked. A stopped process keeps every socket open and sends nothing, which
+is exactly what a partitioned or powered-off host looks like from the target, and
+it needs no firewall rule and is fully reversible. With vmsync-bridge-helper on
+the target the lock is leased and the target releases it once the heartbeats stop;
+the stage checks it is still held BEFORE the lease is up, because a lock that goes
+early can be handed to a promotion while the driver is still writing. It then
+re-runs the same scenario with -bridge-helper-path pointing at nothing, and
+asserts the opposite: an unleased lock is still held long afterwards, and
+-break-target-lock refuses it because a shell lock records no holder to prove gone.
+Both halves matter -- the second is what makes the WARNING every unleased run
+prints worth trusting. Finally it resumes the stalled driver and checks it refuses
+to commit, since by then the lock may belong to a promotion.
 EOF
 }
 
@@ -7942,6 +7959,175 @@ stage_reinit_order() {
 	return 0
 }
 
+stage_lock_lease() {
+	log "=== Stage 21: a dead driver must not hold the target's lock ==="
+	local sc=lock-lease
+	local fo_ok=0
+
+	if [ "$DRY_RUN" = yes ]; then
+		bench_sync "$sc" baseline -reinit
+		log "   (a background sync would be SIGSTOPped here, then the lock watched)"
+		fo_check "$sc" "a leased lock is taken when the helper is there" 0
+		fo_check "$sc" "a silent driver still holds the lock before the lease is up" 0
+		fo_check "$sc" "the target releases a leased lock once the driver goes silent" 0
+		fo_check "$sc" "an unleased lock is still held long after the lease" 0
+		fo_check "$sc" "-break-target-lock refuses a lock it cannot attribute" 0
+		fo_check "$sc" "the resumed driver refuses to commit after losing its lock" 0
+		return 0
+	fi
+
+	if [ -z "${TARGET_HOST:-}" ]; then
+		warn "SKIP stage 21: TARGET_HOST is not set, and every assertion here reads the lock file on the target over ssh."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP TARGET_HOST unset"
+		return 0
+	fi
+	stage_needs_target_shutoff "$CSV" "$sc" "stage lock-lease" || return 0
+
+	local lock_path="/run/vmsync-locks/target-${TARGET_DOMAIN}.lock"
+	local lease=10
+	# A lease far shorter than the 90 s default, so the stage takes seconds
+	# rather than minutes. The number under test is the MECHANISM, not the
+	# default: whether B's clock releases the lock at all.
+	local grace=$((lease * 3))
+
+	# lock_free -> 0 when nothing holds the lock on the target.
+	#
+	# flock -n on the same path the engine uses. A read of the file would not do:
+	# the lock lives on the open file description, so the only way to ask whether
+	# it is held is to try to take it.
+	lock_free() {
+		ssh_host_cmd "$TARGET_HOST" "flock -n 9 9>'$lock_path' -c true" >/dev/null 2>&1
+	}
+
+	# start_stalled_sync PATH_TO_HELPER -> sets STALLED_PID, or returns 1.
+	#
+	# SIGSTOP, not SIGKILL, and that is the whole point of this stage. Killing a
+	# process closes its sockets, so the target gets a FIN and releases the lock
+	# promptly -- which is the case that always worked. A stopped process holds
+	# every socket open and sends nothing, which is exactly what a partitioned or
+	# powered-off driver looks like from the target: no heartbeat, and no FIN
+	# either. It needs no firewall rule and it is fully reversible.
+	start_stalled_sync() {
+		local helper="$1"
+		vmsync_common_args "${IO_DEPTH:-8}"
+		local -a args=("${VMSYNC_ARGS[@]}" -bridge-helper-path "$helper" -remote-lock-lease "${lease}s")
+		"$VMSYNC_BIN" "${args[@]}" >"$RUN_DIR/logs/${sc}.stalled.log" 2>&1 &
+		STALLED_PID=$!
+
+		# Wait for it to actually hold the lock before stopping it; stopping it
+		# earlier would prove nothing about a lock it never took.
+		local i=0
+		while [ $i -lt 120 ]; do
+			if ! lock_free; then
+				kill -STOP "$STALLED_PID" 2>/dev/null || return 1
+				return 0
+			fi
+			# It may also have exited already, which is a failure to set up.
+			kill -0 "$STALLED_PID" 2>/dev/null || return 1
+			sleep 0.5
+			i=$((i + 1))
+		done
+		return 1
+	}
+
+	cleanup_stalled() {
+		[ -n "${STALLED_PID:-}" ] || return 0
+		kill -CONT "$STALLED_PID" 2>/dev/null || true
+		kill -9 "$STALLED_PID" 2>/dev/null || true
+		wait "$STALLED_PID" 2>/dev/null || true
+		STALLED_PID=""
+	}
+
+	bench_sync "$sc" baseline -reinit || {
+		bench_sync_hint
+		fo_check "$sc" "a leased lock is taken when the helper is there" 1 "the baseline sync failed, see $RUN_LOG"
+		return 0
+	}
+
+	# --- 21a-c. with the helper: the target's own clock frees the lock --------
+	local helper
+	helper="$(bridge_helper_path)"
+	if ! ssh_host_cmd "$TARGET_HOST" "test -x '$helper'" >/dev/null 2>&1; then
+		warn "SKIP stage 21's leased half: no executable $helper on $TARGET_HOST, so there is nothing to hold a lease. This is exactly the configuration the unleased half below tests."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP no bridge helper on target"
+	elif ! start_stalled_sync "$helper"; then
+		warn "SKIP stage 21's leased half: could not get a sync to hold the lock and then stall it. See $RUN_DIR/logs/${sc}.stalled.log"
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP could not stall a lock-holding sync"
+		cleanup_stalled
+	else
+		if grep -q "holding the target-side run lock under a lease" "$RUN_DIR/logs/${sc}.stalled.log" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "a leased lock is taken when the helper is there" "$fo_ok" \
+			"the run did not report a leased lock, so it fell back to the shell and this half tests nothing -- see $RUN_DIR/logs/${sc}.stalled.log"
+
+		# Before the lease is up the lock must still be held: a lock that goes
+		# early can be handed to a promotion while its driver is still writing.
+		if lock_free; then fo_ok=1; else fo_ok=0; fi
+		fo_check "$sc" "a silent driver still holds the lock before the lease is up" "$fo_ok" \
+			"the lock was already free within a second of the driver going silent, well inside its ${lease}s lease"
+
+		sleep "$grace"
+		if lock_free; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the target releases a leased lock once the driver goes silent" "$fo_ok" \
+			"the lock on $TARGET_HOST was still held ${grace}s after the driver stopped beating (lease ${lease}s) -- this is CI-10: -promote and -restore there stay blocked until sshd expires the session"
+
+		# --- 21f. and the driver, on resuming, must not write ----------------
+		#
+		# The other half of the same defect. The lock is gone and may belong to a
+		# promotion by now, so the run that lost it must refuse rather than
+		# commit into disks that are no longer its own.
+		kill -CONT "$STALLED_PID" 2>/dev/null || true
+		local i=0
+		while kill -0 "$STALLED_PID" 2>/dev/null && [ $i -lt 120 ]; do sleep 0.5; i=$((i + 1)); done
+		if grep -qE "can no longer prove it holds the target-side run lock" "$RUN_DIR/logs/${sc}.stalled.log" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the resumed driver refuses to commit after losing its lock" "$fo_ok" \
+			"the run resumed and said nothing about having lost its lock; if a promotion took that lock, committing into those disks corrupts what the promoted guest has written -- see $RUN_DIR/logs/${sc}.stalled.log"
+		cleanup_stalled
+	fi
+
+	# --- 21d-e. without a usable helper: the lock has no clock --------------
+	#
+	# Asserted rather than assumed, because the WARNING every such run prints is
+	# only worth trusting if the consequence it names is real.
+	if ! start_stalled_sync "/nonexistent/vmsync-bridge-helper"; then
+		warn "SKIP stage 21's unleased half: could not get a sync to hold the lock and then stall it."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP could not stall an unleased sync"
+		cleanup_stalled
+	else
+		sleep "$grace"
+		if lock_free; then fo_ok=1; else fo_ok=0; fi
+		fo_check "$sc" "an unleased lock is still held long after the lease" "$fo_ok" \
+			"the lock was released without a helper holding a lease, which means something other than this stage's mechanism freed it and the leased half above proves less than it appears to"
+
+		# And the escape refuses, because the shell lock records no holder. The
+		# refusal is the designed answer, not a gap: breaking a lock that cannot
+		# be attributed is how two writers end up on one replica.
+		local out="" rc=0
+		if [ -z "${TARGET_VMSYNC_BIN:-}" ]; then
+			log "   SKIP: TARGET_VMSYNC_BIN is not set, so -break-target-lock cannot be run on $TARGET_HOST"
+			results_row "$CSV" "$sc" break_target_lock_refuses_a_lock_it_cannot_attribute SKIP "" "" "" "" "" "SKIP TARGET_VMSYNC_BIN unset"
+			rc=-1
+		else
+			out="$(ssh_host_cmd "$TARGET_HOST" "'$TARGET_VMSYNC_BIN' -break-target-lock -target-uri qemu:///system -target-domain '$TARGET_DOMAIN'" 2>&1)" && rc=0 || rc=$?
+		fi
+		if [ "$rc" = -1 ]; then
+			: # already recorded as a skip above
+		elif [ "$rc" != 0 ] && printf '%s' "$out" | grep -q "records no holder"; then
+			fo_check "$sc" "-break-target-lock refuses a lock it cannot attribute" 0
+		else
+			fo_check "$sc" "-break-target-lock refuses a lock it cannot attribute" 1 \
+				"it exited $rc saying: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200). An unleased lock records no holder, so nothing can prove its holder is gone and breaking it must be refused"
+		fi
+		cleanup_stalled
+	fi
+
+	# The stalled runs were killed mid-copy, so leave a complete replica behind.
+	bench_sync "$sc" repaired -reinit \
+		|| warn "stage 21 could not leave $TARGET_DOMAIN with a complete replica; the next stage starts from a replica a killed sync was part way through"
+
+	unset -f lock_free start_stalled_sync cleanup_stalled
+	return 0
+}
+
 stage_pattern() {
 	case "$1" in
 	# Anchored to the named sub-tests rather than a bare ^verify- , so a
@@ -7981,6 +8167,9 @@ stage_pattern() {
 	# that will not boot, no source chain to protect), and those rows belong to
 	# its own verdict rather than to whichever stage ran before it.
 	reinit-order) printf '^(reinit-order|precondition)$' ;;
+	# Stage 21 stands down on several preconditions (no TARGET_HOST, no helper on
+	# the target, a sync it could not stall), and those rows belong to its verdict.
+	lock-lease) printf '^(lock-lease|precondition)$' ;;
 	*) printf '$^' ;; # matches nothing
 	esac
 }
@@ -8379,7 +8568,8 @@ for s in "${stage_list[@]}"; do
         colocated) stage_colocated || stage_rc=$? ;;
         leftovers) stage_leftovers || stage_rc=$? ;;
         reinit-order) stage_reinit_order || stage_rc=$? ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order)" ;;
+        lock-lease) stage_lock_lease || stage_rc=$? ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
                 warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."
