@@ -3149,3 +3149,214 @@ func TestPromotionTraceUpdate(t *testing.T) {
 		})
 	}
 }
+
+// TestDemotionRefusedWhileActive is the decision that was missing entirely:
+// SetReplicationRole read no runtime state at all, so one command could relabel
+// a domain that was serving production and take its fence token with it.
+//
+// Every case is about a live production domain, which is why the rule is a pure
+// function — none of this is reachable through a real libvirt in a test.
+func TestDemotionRefusedWhileActive(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		previous, role string
+		active         bool
+		want           bool
+		why            string
+	}{
+		{
+			name: "paused over a running promoted copy", previous: RolePromoted, role: RolePaused,
+			active: true, want: true,
+			why: "this is the misclick CI-36 is about: the console's one-click Set role, or a -shutdown-domain whose guest ignored ACPI. It records that something else is the live copy while this one takes writes, and drops the fence",
+		},
+		{
+			name: "FENCED over a running promoted copy is allowed", previous: RolePromoted, role: RoleFenced,
+			active: true, want: false,
+			why: "the second exemption, and it looks wrong until CI-07: `fenced` on a RUNNING domain is the " +
+				"honest record of a fence that failed to stop the guest, it is the only thing keeping " +
+				"replication out of the resulting split brain, and it is what vmsync_agent_fenced_running " +
+				"and the split-brain gauge key on. Refusing it would leave a hand-run -fence-domain against " +
+				"an ACPI-ignoring promoted copy recorded as `promoted`+running -- the NORMAL healthy " +
+				"post-failover state, which alarms on nothing. That is the silence roleToRecord was written " +
+				"to prevent, reintroduced from the other side",
+		},
+		{
+			name: "target over a running promoted copy", previous: RolePromoted, role: RoleTarget,
+			active: true, want: true,
+			why: "also refused by the promotion trace, but this rule must not depend on that: a drill released by hand would otherwise re-open it",
+		},
+		{
+			name: "none over a running promoted copy", previous: RolePromoted, role: RoleNone,
+			active: true, want: true,
+			why: "clearing the role returns the domain to the state the sync gate reads as permission -- the most dangerous of the four",
+		},
+		{
+			name: "SOURCE over a running promoted copy is allowed", previous: RolePromoted, role: RoleSource,
+			active: true, want: false,
+			why: "the one value still TRUE of a running copy: `source` says this is the authoritative copy of its pair, which is what a promoted domain is. It is also how an operator keeps a copy that took over, so refusing it would close the route that loses nothing",
+		},
+		{
+			name: "the same demotion once it is stopped", previous: RolePromoted, role: RolePaused,
+			active: false, want: false,
+			why: "the documented flow -- shut it down, then record it. ShutdownDomain polls to SHUTOFF before the role write, so the success path always looks like this",
+		},
+		{
+			name: "re-recording promoted on a running copy", previous: RolePromoted, role: RolePromoted,
+			active: true, want: false,
+			why: "not leaving promoted at all; -promote re-runs to arm a fence on an already-promoted domain",
+		},
+		{
+			name: "a running TARGET being paused", previous: RoleTarget, role: RolePaused,
+			active: true, want: false,
+			why: "nothing to do with this rule. A running replica is refused by other gates for other reasons, and pausing it destroys nothing",
+		},
+		{
+			name: "a running source being fenced", previous: RoleSource, role: RoleFenced,
+			active: true, want: false,
+			why: "exactly what a fence does, and it must not be blocked: the fence writes `fenced` on a displaced source that is still running, which is the only thing keeping replication out of the split brain",
+		},
+		{
+			name: "a domain with no role recorded", previous: "", role: RolePaused,
+			active: true, want: false,
+			why: "no promotion to leave",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := demotionRefusedWhileActive(tc.previous, tc.role, tc.active); got != tc.want {
+				t.Errorf("demotionRefusedWhileActive(%q -> %q, active=%v) = %v, want %v\n  %s",
+					tc.previous, tc.role, tc.active, got, tc.want, tc.why)
+			}
+		})
+	}
+}
+
+// TestTheFenceStripIsStillPinnedAndNowReported: the strip itself is correct and
+// stays pinned by TestPromotionFieldsDoNotStripTheTrace — a domain that is no
+// longer promoted is not displacing anybody, and a token left on one is a
+// credential authorising a shutdown that nothing justifies.
+//
+// What was wrong is that it happened in silence. This asserts the two halves of
+// the contract a caller depends on: promotionFields still carries all four fence
+// fields, and SetReplicationRole's signature hands the dropped token back so
+// both callers can journal it. The log line itself needs a live libvirt; the
+// return value is what makes it testable at all.
+func TestTheFenceStripIsStillPinnedAndNowReported(t *testing.T) {
+	for _, f := range []string{
+		MetadataFieldFenceID, MetadataFieldFenceSource,
+		MetadataFieldFenceArmedAt, MetadataFieldFenceArmedBy,
+	} {
+		if !slices.Contains(promotionFields, f) {
+			t.Errorf("%s is no longer stripped when a domain stops being promoted. The token must die with "+
+				"the promotion -- a fence on a non-promoted domain authorises a shutdown nothing justifies", f)
+		}
+	}
+	// The reporting contract: three results, and the middle one is the dropped
+	// token. A caller that cannot see it cannot record it, and no role operation
+	// can put it back.
+	var fn func(*Manager, string, string) (string, string, error) = SetReplicationRole
+	_ = fn
+}
+
+// TestStrippedPromotionFieldsKeepsTheTokenOnPromotedToSource is the distinction
+// that was missing and that made clause 1's exemption a hole rather than a
+// concession.
+//
+// The promotion record describes a failover that is over the moment the role
+// changes, so it always goes. The fence token describes a RELATIONSHIP — "this
+// copy is displacing that one" — and `-update-role source` rewrites only this
+// end, so the displaced domain is still out there calling itself a source and the
+// arrangement is still in force. Stripping the token there destroyed the only
+// record of it, on the one transition the console offers a serving copy.
+func TestStrippedPromotionFieldsKeepsTheTokenOnPromotedToSource(t *testing.T) {
+	kept := strippedPromotionFields(RolePromoted, RoleSource)
+	for _, f := range fenceTokenFields {
+		if slices.Contains(kept, f) {
+			t.Errorf("%s is stripped on promoted->source. That is the audit's own named harm -- \"a misclick "+
+				"disarms the fence against the returning source\" -- on the ONE transition still offered "+
+				"for a live promoted copy", f)
+		}
+	}
+	for _, f := range promotionRecordFields {
+		if !slices.Contains(kept, f) {
+			t.Errorf("%s survives promoted->source; a domain marked source beside a promoted_at describes a "+
+				"failover still in force, which no promotion ever wrote", f)
+		}
+	}
+
+	// Every other transition takes both, which is the common case.
+	for _, role := range []string{RoleTarget, RolePaused, RoleFenced, RoleNone} {
+		got := strippedPromotionFields(RolePromoted, role)
+		for _, f := range append(append([]string{}, promotionRecordFields...), fenceTokenFields...) {
+			if !slices.Contains(got, f) {
+				t.Errorf("promoted->%s does not strip %s: this copy is not the live one any more, so a token "+
+					"left on it authorises a shutdown nothing justifies", role, f)
+			}
+		}
+	}
+	// And the exemption is keyed on BOTH ends of the transition: an ordinary
+	// target->source has no token to keep, and must not become a path that
+	// preserves a stale one.
+	if !slices.Contains(strippedPromotionFields(RoleTarget, RoleSource), MetadataFieldFenceID) {
+		t.Error("target->source keeps the fence fields; the exemption must apply only when leaving `promoted`")
+	}
+}
+
+// TestDroppedFenceToReport is clause 2's own rule, which was inline and therefore
+// the one decision in this file that nothing could check.
+func TestDroppedFenceToReport(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef"
+	for _, tc := range []struct {
+		name           string
+		previous, role string
+		fenceID, want  string
+		why            string
+	}{
+		{
+			name: "demoted to paused", previous: RolePromoted, role: RolePaused,
+			fenceID: id, want: id,
+			why: "the token is stripped and its loss is invisible everywhere else",
+		},
+		{
+			name: "demoted to target", previous: RolePromoted, role: RoleTarget,
+			fenceID: id, want: id,
+		},
+		{
+			name: "role cleared", previous: RolePromoted, role: RoleNone,
+			fenceID: id, want: id,
+		},
+		{
+			name: "promoted to SOURCE keeps it", previous: RolePromoted, role: RoleSource,
+			fenceID: id, want: "",
+			why: "nothing was stripped, so reporting a discarded token would send an operator hunting for a loss that did not happen",
+		},
+		{
+			name: "re-recording promoted", previous: RolePromoted, role: RolePromoted,
+			fenceID: id, want: "",
+			why: "that arm applies no strip list at all",
+		},
+		{
+			name: "no token armed", previous: RolePromoted, role: RolePaused,
+			fenceID: "", want: "",
+			why: "a drill, or a promotion run without -fence-source. Warning about a credential that never existed teaches an operator to discount the warning that matters",
+		},
+		{
+			name: "whitespace is not a token", previous: RolePromoted, role: RolePaused,
+			fenceID: "   ", want: "",
+		},
+		{
+			name: "trimmed when it is one", previous: RolePromoted, role: RolePaused,
+			fenceID: "  " + id + "\n", want: id,
+		},
+		{
+			name: "an ordinary replica being paused", previous: RoleTarget, role: RolePaused,
+			fenceID: "", want: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := droppedFenceToReport(tc.previous, tc.role, tc.fenceID); got != tc.want {
+				t.Errorf("droppedFenceToReport(%q -> %q, %q) = %q, want %q\n  %s",
+					tc.previous, tc.role, tc.fenceID, got, tc.want, tc.why)
+			}
+		})
+	}
+}

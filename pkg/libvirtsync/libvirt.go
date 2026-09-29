@@ -24,6 +24,7 @@ import (
 	"io"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2581,17 +2582,11 @@ func ReadVerifyState(mgr *Manager, domainName string) (verifyState, failedAt str
 // can enumerate is a list nothing can check. What must be checked here is an
 // ABSENCE, which is the one thing a live-domain test cannot demonstrate -- see
 // TestPromotionFieldsDoNotStripTheTrace.
-var promotionFields = []string{
+var promotionRecordFields = []string{
 	MetadataFieldPromotedAt,
 	MetadataFieldPromotedBy,
 	MetadataFieldPromotedFrom,
 	MetadataFieldPromotionMode,
-	// The fence that promotion armed dies with it: a domain that is
-	// no longer promoted is not displacing anybody.
-	MetadataFieldFenceID,
-	MetadataFieldFenceSource,
-	MetadataFieldFenceArmedAt,
-	MetadataFieldFenceArmedBy,
 	// MetadataFieldLastPromotedAt is DELIBERATELY ABSENT from this list, and
 	// the absence is the entire point of the field.
 	//
@@ -2608,6 +2603,154 @@ var promotionFields = []string{
 	// exactly one flag. Do not add it here, and do not add it to a strip list
 	// for tidiness: a strip on any path an operator can reach by accident puts
 	// the hole back.
+}
+
+// fenceTokenFields is the credential a promotion armed against the source it
+// displaced: the thing that authorises the agent on THAT host to stop THAT
+// domain, once, when it comes back.
+//
+// Its own list, separate from the promotion record, because the two do not
+// always die together and treating them as one was a real hole. A promotion
+// record describes a failover that is over the moment the role changes. The
+// token describes a RELATIONSHIP -- "this copy is displacing that one" -- and
+// whether that relationship is over depends on which role the domain moves to:
+//
+//   - to paused, fenced, target or none: over. This copy is not the live one any
+//     more, so it is not displacing anybody, and a token left behind is a
+//     credential authorising a shutdown nothing justifies.
+//   - to SOURCE: NOT over. `source` says this copy is the authoritative one --
+//     the same claim `promoted` made -- and `-update-role source` rewrites only
+//     this end, so the domain it displaced is still out there still calling
+//     itself a source. Stripping the token there destroyed the only record of an
+//     arrangement that was still in force, on the one transition the console
+//     offers for a live promoted copy.
+//
+// Note what keeping it does NOT do: the agent's sweep requires role=promoted to
+// act (AssessFence), so a token on a `source` is inert until an -invert or a
+// re-promotion resolves the pair. What it preserves is the RECORD -- readable by
+// -read-fence and -explain-domain -- rather than the action.
+var fenceTokenFields = []string{
+	MetadataFieldFenceID,
+	MetadataFieldFenceSource,
+	MetadataFieldFenceArmedAt,
+	MetadataFieldFenceArmedBy,
+}
+
+// promotionFields is what a transition out of `promoted` strips in the ordinary
+// case: the record and the token together. Kept as one name because that is what
+// every arm but promoted->source applies, and because the pairing is the common
+// case rather than the exception.
+var promotionFields = append(append([]string{}, promotionRecordFields...), fenceTokenFields...)
+
+// strippedPromotionFields is what a transition FROM previous TO role removes of
+// the promotion record and the fence token.
+//
+// Pure, and its own function, because it is the difference between two lists
+// that look interchangeable and are not: the record is always dropped, the token
+// only when the relationship it describes has ended. Inline in the write switch
+// this was a single `promotionFields...` that quietly destroyed a live
+// credential on the one transition the console offers a serving copy.
+func strippedPromotionFields(previous, role string) []string {
+	if previous == RolePromoted && role == RoleSource {
+		return promotionRecordFields
+	}
+	return promotionFields
+}
+
+// droppedFenceToReport is the fence id a role change discarded, or "" when it
+// discarded none: what SetReplicationRole returns and logs.
+//
+// Pure so the reporting rule has a test of its own. It was inline, which made
+// the one decision in this file that clause 2 of the audit is about the one
+// decision nothing could check.
+//
+// TrimSpace because a whitespace-only value is not a token, and reporting one as
+// a discarded credential would send an operator hunting for a fence that never
+// existed.
+func droppedFenceToReport(previous, role, fenceID string) string {
+	id := strings.TrimSpace(fenceID)
+	if id == "" {
+		return ""
+	}
+	// Nothing was stripped, so nothing was dropped: the promoted arm applies no
+	// strip list at all, and promoted->source deliberately keeps the token.
+	if role == RolePromoted {
+		return ""
+	}
+	if !slices.Contains(strippedPromotionFields(previous, role), MetadataFieldFenceID) {
+		return ""
+	}
+	return id
+}
+
+// ErrDemotesLiveCopy marks the refusal demotionRefusedWhileActive produces, so a
+// caller can tell "this domain is serving and you are recording that it is not"
+// from a metadata write that broke.
+var ErrDemotesLiveCopy = errors.New("refusing to record a RUNNING promoted domain as anything but the live copy")
+
+// domainIsActive answers "is this domain running" by name, for the callers that
+// hold only a Manager. A domain that does not exist is reported as not running
+// rather than as an error, matching ReadReplicationRole: there is no guest to
+// protect.
+func domainIsActive(mgr *Manager, domainName string) (bool, error) {
+	dom, err := mgr.Conn.LookupDomainByName(domainName)
+	if err != nil {
+		if lvErr, ok := err.(libvirt.Error); ok && lvErr.Code == libvirt.ERR_NO_DOMAIN {
+			return false, nil
+		}
+		return false, fmt.Errorf("look up domain %s: %w", domainName, err)
+	}
+	defer dom.Free()
+	return DomainActive(dom)
+}
+
+// demotionRefusedWhileActive reports whether a role transition must be refused
+// because it would record a domain that is SERVING RIGHT NOW as something other
+// than the copy that serves.
+//
+// SetReplicationRole read no runtime state at all before this. It is the single
+// place every role transition passes through, so it was also the single place a
+// live promoted copy could be relabelled by one command -- and the relabel takes
+// the fence token with it (see promotionFields), which is the credential that
+// authorises stopping the source when it comes back. One `-update-role paused`,
+// or one click of the console's "Shut down cleanly" against a guest that ignores
+// ACPI, and a domain still taking writes was recorded as an administratively
+// paused replica with no fence and nothing watching it.
+//
+// TWO destinations are still allowed, for opposite reasons, and neither is a
+// loophole:
+//
+//   - `source` is the only value that remains TRUE of a running copy. It says
+//     "this is the authoritative copy of its pair", which is what a promoted
+//     domain is -- the label changes, the claim does not. It is also the
+//     documented way to keep a copy that took over (the console's own advice,
+//     and what an operator reaches for short of a full -invert), so refusing it
+//     would close the one route that loses no data. The fence token survives
+//     this transition precisely because the claim does; see fenceTokenFields.
+//   - `fenced` is allowed because it is the honest record of a fence that FAILED
+//     to stop the guest, and CI-07 exists because that record is the only thing
+//     that keeps replication out of the resulting split brain and the only thing
+//     the fenced-and-running alarms can key on. Refusing it would reintroduce
+//     exactly the silence roleToRecord was written to prevent, from the other
+//     side: a hand-run -fence-domain against a running promoted copy would leave
+//     it marked `promoted` and running, which is the NORMAL healthy
+//     post-failover state and alarms on nothing.
+//
+// Every other value says "something else is the live copy", which is false while
+// this one is serving.
+//
+// -invert is unaffected because it does not come through here: it writes both
+// ends with ApplyMetadata, having made its own checks about both. That is
+// deliberate -- reversing a pair is exactly the case where a running promoted
+// domain legitimately stops being promoted.
+//
+// Pure, like roleToRecord and fenceFailedOpen, because it is a small rule about
+// a live production domain and no test could reach it through a real libvirt.
+func demotionRefusedWhileActive(previous, role string, active bool) bool {
+	if !active || previous != RolePromoted || role == RolePromoted {
+		return false
+	}
+	return role != RoleSource && role != RoleFenced
 }
 
 // promotionTraceUpdate decides what a role transition must write to keep the
@@ -2662,60 +2805,106 @@ func promotionTraceUpdate(previous, role, existingTrace, promotedAt string, nowU
 	return ""
 }
 
-func SetReplicationRole(mgr *Manager, domainName, role string) (previous string, err error) {
+func SetReplicationRole(mgr *Manager, domainName, role string) (previous, droppedFence string, err error) {
 	if err := ValidateRole(role); err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	previous, err = ReadDomainMetadataField(mgr, domainName, MetadataFieldReplicationRole)
+	// Everything this function decides from, in ONE read: the current role, the
+	// two fields the promotion trace's lifecycle needs, and the fence token it
+	// may be about to strip. Five separate reads were five LookupDomain plus
+	// GetXMLDesc pairs against a host that may be mid-incident.
+	before, err := ReadDomainMetadataFields(mgr, domainName,
+		MetadataFieldReplicationRole, MetadataFieldLastPromotedAt, MetadataFieldPromotedAt,
+		MetadataFieldFenceID, MetadataFieldFenceSource)
 	if err != nil {
-		return "", err
+		return "", "", err
+	}
+	previous = before[MetadataFieldReplicationRole]
+
+	// Is this domain SERVING right now? Asked only for a transition out of
+	// `promoted`, which is the only one where the answer changes anything, so an
+	// ordinary role change still costs no runtime query.
+	//
+	// Fails CLOSED, unlike the role read in shutdownAndMark, and the difference
+	// is which direction the write protects in. There, the write ADDS a refusal
+	// and not being able to read the old role is no reason to withhold it. Here
+	// the domain is already `promoted`, which refuses everything there is to
+	// refuse -- so declining to change it on an unreadable state leaves the
+	// strongest possible interlock in place, and proceeding would remove it
+	// without knowing whether a guest is live behind it.
+	if previous == RolePromoted && role != RolePromoted {
+		active, activeErr := domainIsActive(mgr, domainName)
+		if activeErr != nil {
+			return "", "", fmt.Errorf("domain %s: could not determine whether it is still running before recording it as %s: %w -- leaving it marked %s, which refuses every sync, restore and clean over it", domainName, role, activeErr, RolePromoted)
+		}
+		if demotionRefusedWhileActive(previous, role, active) {
+			return "", "", fmt.Errorf("%w: domain %s is marked %s and is RUNNING, so recording it as %q would say something else is the live copy while this one is taking writes -- and it would take the fence against the displaced source with it. Shut it down first (-shutdown-domain) and then record %q, or -update-role=%s if this copy IS the primary now, or -invert to reverse the pair",
+				ErrDemotesLiveCopy, domainName, RolePromoted, role, role, RoleSource)
+		}
 	}
 
-	// The durable promotion trace. Two fields are read for it, and only for
-	// the transitions that can possibly need them -- every other role change
-	// pays nothing.
-	//
-	// The DECISION is promotionTraceUpdate's, not this function's, for the
-	// reason roleToRecord and fenceFailedOpen exist: it is a small rule with
-	// several cases, all of them about whether a copy's disks stay protected,
-	// and none of them reachable by a test that needs a live libvirt holding a
-	// real promoted domain. Inline here it would be a decision table nothing
-	// could check.
-	trace := map[string]string{}
-	if previous == RolePromoted || role == RolePromoted {
-		existing, readErr := ReadDomainMetadataField(mgr, domainName, MetadataFieldLastPromotedAt)
-		if readErr != nil {
-			return "", fmt.Errorf("domain %s: could not read %s before changing its role to %s: %w", domainName, MetadataFieldLastPromotedAt, role, readErr)
-		}
-		promotedAt, readErr := ReadDomainMetadataField(mgr, domainName, MetadataFieldPromotedAt)
-		if readErr != nil {
-			return "", fmt.Errorf("domain %s: could not read %s before changing its role to %s: %w", domainName, MetadataFieldPromotedAt, role, readErr)
-		}
-		if v := promotionTraceUpdate(previous, role, existing, promotedAt, time.Now().Unix()); v != "" {
-			trace[MetadataFieldLastPromotedAt] = v
-		}
+	// The durable promotion trace, decided by promotionTraceUpdate rather than
+	// here for the reason roleToRecord and fenceFailedOpen exist: it is a small
+	// rule with several cases, all of them about whether a copy's disks stay
+	// protected, and none of them reachable by a test that needs a live libvirt
+	// holding a real promoted domain. Inline it would be a decision table
+	// nothing could check.
+	updates := map[string]string{}
+	if v := promotionTraceUpdate(previous, role, before[MetadataFieldLastPromotedAt], before[MetadataFieldPromotedAt], time.Now().Unix()); v != "" {
+		updates[MetadataFieldLastPromotedAt] = v
 	}
 	// Whatever it decided goes in the SAME SetDomainMetadataFields call as the
 	// role write and the strip, so there is never a window in which the
 	// promotion record is gone and the trace is not yet there.
 	switch {
 	case role == RoleNone:
-		err = SetDomainMetadataFields(mgr, domainName, trace,
-			append([]string{MetadataFieldReplicationRole}, promotionFields...)...)
+		err = SetDomainMetadataFields(mgr, domainName, updates,
+			append([]string{MetadataFieldReplicationRole}, strippedPromotionFields(previous, role)...)...)
 	case role == RolePromoted:
 		// Promotion itself is written by -promote, which records the whole
 		// record atomically. Setting the role to promoted by hand must not
 		// invent one, but must not destroy an existing one either -- so
 		// promotionFields is deliberately not applied here.
-		trace[MetadataFieldReplicationRole] = role
-		err = SetDomainMetadataFields(mgr, domainName, trace)
+		updates[MetadataFieldReplicationRole] = role
+		err = SetDomainMetadataFields(mgr, domainName, updates)
 	default:
-		trace[MetadataFieldReplicationRole] = role
-		err = SetDomainMetadataFields(mgr, domainName, trace, promotionFields...)
+		// The promotion record always goes. The fence token goes with it EXCEPT
+		// on promoted->source, where the arrangement it describes is still in
+		// force: `source` makes the same claim `promoted` did, and
+		// `-update-role source` rewrites only this end, so the domain this copy
+		// displaced is still out there calling itself a source. See
+		// fenceTokenFields.
+		updates[MetadataFieldReplicationRole] = role
+		err = SetDomainMetadataFields(mgr, domainName, updates, strippedPromotionFields(previous, role)...)
 	}
 	if err != nil {
-		return "", err
+		return "", "", err
+	}
+
+	// An armed fence token must never go SILENTLY, and until now it did.
+	//
+	// Where it dies, dying is correct: a domain that is no longer the live copy
+	// is not displacing anybody, and a token left on one is a credential
+	// authorising a shutdown nothing justifies. What was wrong is that nothing
+	// said so. The token is the only thing that authorises the agent on the
+	// displaced source's host to stop that source when it comes back, its loss is
+	// invisible in every other field, and NO role change restores it --
+	// re-promoting by hand writes no promotion record (see the RolePromoted arm)
+	// and `-promote -fence-source` is refused on a domain already marked
+	// `source`, so the way back is `-update-role promoted` and then
+	// `-promote -fence-source`. An operator not told has no way to know there was
+	// anything to re-arm.
+	//
+	// Reported after the write rather than before, and as an ERROR on a command
+	// that succeeded, for the reason -release-promotion logs the way it does:
+	// this line is the last trace of the token, so it has to be the one an
+	// operator finds. Returned as well, so the callers can journal it -- a
+	// terminal is not a record.
+	if droppedFence = droppedFenceToReport(previous, role, before[MetadataFieldFenceID]); droppedFence != "" {
+		trace.Error("this role change DISCARDED an armed fence token: nothing now authorises stopping the displaced source if it comes back, and no role change restores it. If the failover still stands, re-arm with -update-role promoted followed by -promote -fence-source against this domain",
+			"vm", domainName, "from_role", previous, "to_role", role,
+			"fence_id", droppedFence, "fence_named_source", before[MetadataFieldFenceSource])
 	}
 
 	// Autostart follows the role, and this is the single place every role
@@ -2744,9 +2933,9 @@ func SetReplicationRole(mgr *Manager, domainName, role string) (previous string,
 		intent = AutostartIntentUnknown
 	}
 	if _, err := ApplyAutostartForRole(mgr, domainName, role, intent); err != nil {
-		return previous, fmt.Errorf("domain %s was recorded as %s but its autostart flag could not be set to match: %w", domainName, role, err)
+		return previous, droppedFence, fmt.Errorf("domain %s was recorded as %s but its autostart flag could not be set to match: %w", domainName, role, err)
 	}
-	return previous, nil
+	return previous, droppedFence, nil
 }
 
 // RecordTargetSyncFailure reconnects to the target, increments

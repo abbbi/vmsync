@@ -887,13 +887,26 @@ func main() {
 			}
 		}
 
-		previous, err := libvirtsync.SetReplicationRole(mgr, roleDomain, cfg.UpdateRole)
+		previous, droppedFence, err := libvirtsync.SetReplicationRole(mgr, roleDomain, cfg.UpdateRole)
+		// The armed fence this write discarded, if it discarded one. Journalled
+		// because the log line SetReplicationRole emits is the only other trace,
+		// and no role change puts the token back.
+		//
+		// Built BEFORE the error check, and recorded on the failure path too:
+		// SetReplicationRole hands the dropped token back alongside an error on
+		// the autostart failure, which is precisely the path where the metadata
+		// write already happened. See SetReplicationRole.
+		outcome := map[string]string{}
+		if droppedFence != "" {
+			outcome["dropped_fence_id"] = droppedFence
+		}
 		if err != nil {
-			finishAction(roleCtx, journal, err, nil)
+			finishAction(roleCtx, journal, err, outcome)
 			trace.Error("update-role: set replication role", "vm", roleDomain, "role", cfg.UpdateRole, "error", err)
 			os.Exit(1)
 		}
-		finishAction(roleCtx, journal, nil, map[string]string{"previous_role": previous})
+		outcome["previous_role"] = previous
+		finishAction(roleCtx, journal, nil, outcome)
 		displayRole := func(r string) string {
 			if r == "" || r == libvirtsync.RoleNone {
 				return "(none)"

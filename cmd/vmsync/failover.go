@@ -20,6 +20,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -643,7 +644,19 @@ func shutdownAndMark(ctx context.Context, cfg syncConfig, mode, role string) (ru
 		"role":             role,
 		"shutdown_timeout": strconv.Itoa(cfg.ShutdownTimeoutSec),
 	})
-	defer func() { finishAction(ctx, journal, runErr, nil) }()
+	// Carried out of the closure below rather than passed in, because the one
+	// thing worth recording beyond success or failure is not known until the role
+	// has been written: whether that write discarded an armed fence token. The
+	// log says so too, but a log is a terminal and this is the only durable trace
+	// that the token ever existed. See SetReplicationRole.
+	var droppedFenceID string
+	defer func() {
+		var detail map[string]string
+		if droppedFenceID != "" {
+			detail = map[string]string{"dropped_fence_id": droppedFenceID}
+		}
+		finishAction(ctx, journal, runErr, detail)
+	}()
 
 	// The role is recorded even when the shutdown FAILS, and unconditionally
 	// -- for a fence and for a planned failover alike.
@@ -727,8 +740,22 @@ func shutdownAndMark(ctx context.Context, cfg syncConfig, mode, role string) (ru
 		role = kept
 	}
 
-	previous, err := libvirtsync.SetReplicationRole(mgr, cfg.TargetDomain, role)
+	previous, droppedFence, err := libvirtsync.SetReplicationRole(mgr, cfg.TargetDomain, role)
+	// BEFORE the error check, not after, and that ordering is the whole reason
+	// SetReplicationRole returns three values. It deliberately hands back
+	// `previous` and the dropped token ALONGSIDE an error on the autostart
+	// failure -- the one path where the metadata write has already happened, so
+	// the token is gone and the journal is the only place that will ever say so.
+	// Assigning below the error check threw it away on exactly that path.
+	droppedFenceID = droppedFence
 	if err != nil {
+		// The refusal that protects a live copy is not a missing interlock, and
+		// the generic message below says it is. Told "nothing is recorded to stop
+		// replication resuming" mid-DR, an operator reaches for force.
+		if errors.Is(err, libvirtsync.ErrDemotesLiveCopy) {
+			return fmt.Errorf("domain %s could not be shut down (%v) and is therefore STILL RUNNING, so vmsync refused to record it as %s: %w -- it stays marked %s, which already refuses every sync, restore and clean over it, and its fence is intact. Stop the guest by hand and re-run this, rather than forcing anything",
+				cfg.TargetDomain, shutdownErr, role, err, libvirtsync.RolePromoted)
+		}
 		if shutdownErr != nil {
 			// Both halves failed. Report both: "the fence did not stop it" and
 			// "nothing records that" are separate emergencies, and an operator
@@ -809,7 +836,22 @@ func runInvert(ctx context.Context, cfg syncConfig) (runErr error) {
 		"old_role":      oldSrc.Role,
 		"promoted_role": promoted.Role,
 	})
-	defer func() { finishAction(ctx, journal, runErr, nil) }()
+	// The armed token this inversion discards, recorded for the reason
+	// SetReplicationRole records its own: a fence token's loss is invisible in
+	// every other field and no role change restores it. AssessInvert's
+	// NewSourceRemovals strips all four fence fields -- correctly, because after
+	// an inversion the old source is properly recorded as a replica and there is
+	// nothing left to fence -- but it was doing so in complete silence, which is
+	// the literal counter-example to "never drop an armed token silently". The id
+	// is already in hand from ReadFailoverState.
+	var droppedFenceID string
+	defer func() {
+		var detail map[string]string
+		if droppedFenceID != "" {
+			detail = map[string]string{"dropped_fence_id": droppedFenceID}
+		}
+		finishAction(ctx, journal, runErr, detail)
+	}()
 
 	plan, err := failover.AssessInvert(failover.PairState{
 		OldSource: failover.DomainEnd{
@@ -902,6 +944,15 @@ func runInvert(ctx context.Context, cfg syncConfig) (runErr error) {
 	} else if changed {
 		trace.Info("turned off autostart on the new replica; its previous setting is recorded so a later promotion restores it",
 			"vm", cfg.SourceDomain, "autostart_intent", plan.NewTargetUpdates[libvirtsync.MetadataFieldAutostartIntent])
+	}
+	// Before the write, because after it the token is unreadable. Unlike
+	// SetReplicationRole's case this loss needs no remedy printed: the inversion
+	// is what made the fence unnecessary -- the old source is a recorded replica
+	// now -- so this is an audit line, not a warning.
+	if promoted.Fence.ID != "" {
+		droppedFenceID = promoted.Fence.ID
+		trace.Info("this inversion discards the fence token the promotion armed, which is correct: the old source is a recorded replication target now, so there is nothing left to fence. Recorded because no role change restores a token",
+			"vm", cfg.TargetDomain, "fence_id", promoted.Fence.ID, "fence_named_source", promoted.Fence.Source)
 	}
 	if err := libvirtsync.ApplyMetadata(tgtMgr, cfg.TargetDomain, plan.NewSourceUpdates, plan.NewSourceRemovals...); err != nil {
 		return fmt.Errorf("%s is now a replication target, but %s could not be made the new source -- re-run this to finish: %w",

@@ -192,6 +192,37 @@ func readDomainMetadataFields(dom *libvirt.Domain) (map[string]string, error) {
 	return metadataFieldsFromFragment(frag)
 }
 
+// ReadDomainMetadataFields returns several fields from a domain's vmsync
+// metadata in ONE lookup and one parse, with "" for each absent one.
+//
+// Its own function rather than calling ReadDomainMetadataField in a loop,
+// because that is a LookupDomain plus a GetXMLDesc per field. SetReplicationRole
+// needs five to make its decisions -- the current role, the promotion trace and
+// promoted_at for the trace's lifecycle, and the fence id and source so a token
+// it is about to strip can be named before it goes -- and five round trips to
+// answer one question about one domain is five chances for a flaky connection to
+// turn a role change into a failure.
+//
+// A field the caller does not ask for is simply not in the result. The map is
+// never nil on success, so a caller can index it without checking.
+func ReadDomainMetadataFields(mgr *Manager, domainName string, fields ...string) (map[string]string, error) {
+	dom, err := mgr.Conn.LookupDomainByName(domainName)
+	if err != nil {
+		return nil, fmt.Errorf("look up domain %s: %w", domainName, err)
+	}
+	defer dom.Free()
+
+	all, err := readDomainMetadataFields(dom)
+	if err != nil {
+		return nil, fmt.Errorf("domain %s: %w", domainName, err)
+	}
+	out := make(map[string]string, len(fields))
+	for _, f := range fields {
+		out[f] = all[f]
+	}
+	return out, nil
+}
+
 // ReadDomainMetadataField returns one field from a domain's vmsync
 // metadata, "" when absent.
 func ReadDomainMetadataField(mgr *Manager, domainName, field string) (string, error) {
