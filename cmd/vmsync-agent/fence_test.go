@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"vmsync/pkg/util"
+	"vmsync/pkg/libvirtsync"
 )
 
 // replicaSelfRef must produce the SAME string vmsync stamps into replication
