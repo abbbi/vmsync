@@ -21,7 +21,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 
+	"vmsync/pkg/failover"
 	"vmsync/pkg/restorepoint"
 )
 
@@ -195,4 +198,210 @@ func restorePointStoreFor(d Domain) (restorepoint.Store, bool) {
 		return restorepoint.Store{}, false
 	}
 	return store, true
+}
+
+// LeftoverInfo is one set of files a rebuild or a restore displaced and nobody
+// has removed: a full-size copy of a replica's disk, or a whole restore-point
+// store moved out of the way.
+//
+// Reported because the alternative is what CI-54 describes: they are created by
+// the default -replaced-disk-action, nothing reaps them, and until now nothing
+// named them either. They share extents with the live file at the moment they
+// are made -- so `du` shows almost nothing and an operator reasonably concludes
+// the space is free -- and then diverge as the replica is written, until a
+// reinit that renames a fresh set aside on a host that has run out of room
+// fails a commit for every VM on it.
+//
+// They are deliberately NOT reaped automatically. These are the recovery copy:
+// the whole documented cure for an interrupted rebuild is to move a
+// .vmsync-replaced-<stamp> set back over the half-written disks
+// (MetadataFieldReplicaIncomplete says so at length), and a sweep that deleted
+// them would delete exactly the thing an operator in trouble is reaching for.
+// What was missing is not a reaper, it is the number.
+type LeftoverInfo struct {
+	// Path is the file or directory, as this host spells it.
+	Path string `json:"path"`
+	// Kind says which mechanism produced it, because the recovery differs:
+	// "replaced-disk" is a displaced replica disk (move it back), "aside-store"
+	// is a whole restore-point store a reinit set aside (its points are outside
+	// every store, so no command can name them), "restore-staging" is a copy a
+	// restore staged and did not consume.
+	Kind string `json:"kind"`
+	// Bytes is what it actually occupies now, not its apparent size: the shared
+	// extents are the reason a fresh aside looks free, and the divergence is the
+	// thing worth watching.
+	Bytes int64 `json:"bytes"`
+	// AtUnix is the stamp in the name, 0 when it carries none. Age is what tells
+	// an operator whether this is yesterday's rebuild or one from six months ago.
+	AtUnix int64 `json:"at_unix,omitempty"`
+}
+
+// LeftoversFor finds every displaced set beside a domain's disks.
+//
+// Silent on every failure, for the reason RestorePointsFor is: this runs for
+// every domain on every report cycle, and a host with nothing to find is the
+// ordinary case rather than an error.
+//
+// Scoped to the directories the domain's own disks live in, plus its restore
+// point root. That is deliberately narrow -- it will not find leftovers beside
+// disks the domain no longer references, which is exactly what an interrupted
+// -force-clean can leave (it undefines the domain before rewriting the disks, so
+// there may be no domain to scan from at all). -explain-domain covers that case
+// with -target-disk-path; this covers the one the fleet can see by itself.
+// Everything reported is attributed to THIS domain, which on a shared
+// directory means matching names against this domain's own disks and store
+// rather than reading the directory as if the domain owned it. That is the
+// defect CI-06 recorded at this end: two replicas in one directory saw each
+// other's restore points, and a scan written the obvious way makes the same
+// mistake with displaced sets -- every co-located replica's aside counted in
+// every co-located replica's bytes, an operator told web01 is holding 200 GiB
+// that belongs to db01, and a path pointing at another machine's only good
+// copy offered as this machine's reclaimable space.
+func LeftoversFor(d Domain) []LeftoverInfo {
+	// Per directory, the basenames of the disks THIS domain has there. A
+	// displaced set is named after the disk it displaced, so the basename is
+	// what ties it to a domain; nothing else in the name does.
+	dirs := map[string]map[string]bool{}
+	for _, disk := range d.Disks {
+		dir := filepath.Dir(disk.Path)
+		if dirs[dir] == nil {
+			dirs[dir] = map[string]bool{}
+		}
+		dirs[dir][filepath.Base(disk.Path)] = true
+	}
+	var out []LeftoverInfo
+	for dir, bases := range dirs {
+		out = append(out, scanLeftoverDir(dir, bases)...)
+	}
+	// The aside restore-point stores sit one level up from the store root, beside
+	// the per-domain stores rather than inside them -- which is why no listing has
+	// ever shown them. See restorepoint.RenameStoreCommand.
+	if store, ok := restorePointStoreFor(d); ok {
+		if root, err := store.Path(); err == nil {
+			out = append(out, scanAsideStores(filepath.Dir(root), d.Name)...)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AtUnix != out[j].AtUnix {
+			return out[i].AtUnix > out[j].AtUnix
+		}
+		return out[i].Path < out[j].Path
+	})
+	return out
+}
+
+// scanLeftoverDir finds displaced disk files and restore staging copies in one
+// directory, for the disks named in bases and no others.
+//
+// bases is what keeps a shared directory's answer per-domain: both namings are
+// "<the disk's own name><suffix><stamp>", so the part before the suffix has to
+// be one of this domain's disks. A name that merely CONTAINS the suffix belongs
+// to whichever domain owns that disk, and on a directory holding ten replicas
+// that is nine times out of ten not this one.
+func scanLeftoverDir(dir string, bases map[string]bool) []LeftoverInfo {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []LeftoverInfo
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		kind := ""
+		var at int64
+		switch {
+		case displacedFrom(name, failover.ReplicaReplacedSuffix, bases):
+			kind = "replaced-disk"
+			at = trailingUnix(name, failover.ReplicaReplacedSuffix)
+		case displacedFrom(name, restorepoint.RestoreTempSuffix, bases):
+			kind = "restore-staging"
+		default:
+			continue
+		}
+		// The allocated size, not the apparent one: a fresh reflink aside shares
+		// every extent with the live file, so its apparent size is a full disk
+		// image and its real cost is nothing. Reporting the apparent size would
+		// cry wolf on the day it is made and understate nothing afterwards.
+		out = append(out, LeftoverInfo{Path: filepath.Join(dir, name), Kind: kind, Bytes: allocatedBytes(filepath.Join(dir, name)), AtUnix: at})
+	}
+	return out
+}
+
+// scanAsideStores finds the restore-point stores a reinit moved out of the way
+// for THIS domain.
+//
+// These are the ones RST-021 calls invisible to every listing, and it is right:
+// they are named `.replaced-<segment>-<unix>` and they sit BESIDE the stores, so
+// -list-restore-points -- which reads inside one store -- cannot see them, and
+// the points inside them are outside every store, so no command can name them.
+// Only the directory's size says they are there at all.
+//
+// The stores parent holds every co-located domain's stores and every co-located
+// domain's asides, so "starts with AsidePrefix" is not this domain's answer --
+// it is the whole directory's. The name is matched in full instead: this
+// domain's own segment, then a dash, then the stamp and nothing else. Exact
+// rather than a prefix test, because a prefix test also matches the asides of
+// every domain whose name merely STARTS with this one's -- web01 would be
+// charged for web01-old and web01-staging. The price is that an aside somebody
+// renamed by hand goes unreported, which is the right way round: a set this
+// scan misses still shows in df, while one it misattributes sends an operator
+// to delete another machine's restore points.
+func scanAsideStores(storesParent, domain string) []LeftoverInfo {
+	segment, err := restorepoint.DomainSegment(domain)
+	if err != nil {
+		return nil
+	}
+	prefix := restorepoint.AsidePrefix + segment + "-"
+	entries, err := os.ReadDir(storesParent)
+	if err != nil {
+		return nil
+	}
+	var out []LeftoverInfo
+	for _, e := range entries {
+		name := e.Name()
+		if !e.IsDir() || !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		stamp, err := strconv.ParseInt(name[len(prefix):], 10, 64)
+		if err != nil {
+			continue
+		}
+		p := filepath.Join(storesParent, name)
+		out = append(out, LeftoverInfo{
+			Path:   p,
+			Kind:   "aside-store",
+			Bytes:  dirAllocatedBytes(p),
+			AtUnix: stamp,
+		})
+	}
+	return out
+}
+
+// displacedFrom reports whether name is one of bases displaced with sep.
+//
+// Anchored on the base: the suffix has to come immediately after a disk this
+// domain owns, so a longer name that happens to contain both is not a match.
+func displacedFrom(name, sep string, bases map[string]bool) bool {
+	i := strings.Index(name, sep)
+	if i <= 0 {
+		return false
+	}
+	return bases[name[:i]]
+}
+
+// trailingUnix reads the unix stamp a displaced name ends with, after the last
+// occurrence of sep. 0 when there is none to read -- an older build's naming, or
+// a name somebody changed by hand.
+func trailingUnix(name, sep string) int64 {
+	i := strings.LastIndex(name, sep)
+	if i < 0 {
+		return 0
+	}
+	n, err := strconv.ParseInt(name[i+len(sep):], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }

@@ -193,6 +193,10 @@ type agentMetrics struct {
 	// Replaced wholesale from one complete sweep, like the two sets above, so a
 	// replica that goes away stops being reported instead of latching forever.
 	restorePointVMs map[string]restorePointGauge
+	// leftoverVMs is the displaced-set cost per replica: full-size copies a
+	// rebuild or a restore left behind that nothing reaps. See
+	// inventory.LeftoverInfo for why they are reported rather than deleted.
+	leftoverVMs map[string]leftoverGauge
 }
 
 // restorePointGauge is one replica's restore point store, reduced to numbers.
@@ -592,6 +596,11 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	servedLiveVMs := sortedKeys(m.servedLiveVMs)
 	fencedRunningVMs := sortedKeys(m.fencedRunningVMs)
 	rpVMs := sortedKeys(m.restorePointVMs)
+	lvVMs := sortedKeys(m.leftoverVMs)
+	lvGauges := make(map[string]leftoverGauge, len(m.leftoverVMs))
+	for vm, gg := range m.leftoverVMs {
+		lvGauges[vm] = gg
+	}
 	rpGauges := make(map[string]restorePointGauge, len(m.restorePointVMs))
 	for vm, gg := range m.restorePointVMs {
 		rpGauges[vm] = gg
@@ -749,6 +758,37 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 		}
 	}
 
+	// --- displaced sets nothing reaps ---------------------------------------
+	//
+	// Made by the DEFAULT replaced-disk action, removed by no sweep, and until now
+	// named by nothing: the aside restore-point STORES in particular are invisible
+	// to every listing vmsync has, because they sit beside the per-domain stores
+	// and the points inside them are outside every store. They also share extents
+	// when new, so a df or du on the day one is made reports almost nothing and an
+	// operator reasonably concludes the space is free. A number that grows is the
+	// only warning available, and the failure it ends in is an ENOSPC on the DR
+	// host that fails a commit for every VM on it.
+	//
+	// Emitted for every replica INCLUDING at zero, like the restore-point families
+	// above and for the same reason: a series that appears only once a host has
+	// leftovers cannot alert on them appearing, and cannot show the flat line that
+	// says a cleanup held.
+	if len(lvVMs) > 0 {
+		for _, fam := range []struct {
+			name, help string
+			value      func(leftoverGauge) int64
+		}{
+			{"vmsync_agent_replaced_sets", "Displaced sets beside each replica on this host that nothing has removed: disks a rebuild renamed aside, whole restore-point stores a reinit set aside, and restore copies staged and never used. No sweep reaps them, deliberately -- the aside disks are the documented recovery for an interrupted rebuild, so deleting them automatically would delete what an operator in trouble reaches for. Alert on the bytes below rather than on this count.", func(g leftoverGauge) int64 { return int64(g.Count) }},
+			{"vmsync_agent_replaced_bytes", "What those displaced sets actually occupy per replica: allocated, not apparent. A fresh aside is a reflink sharing every extent with the live file, so its apparent size is a whole disk image while its real cost is nothing; this is the divergence, and it grows as the replica is written. THE ONE TO ALERT ON, against the free space on that filesystem -- the end state is an ENOSPC on the DR host that fails a commit for every VM there, and the first symptom is a reinit that cannot rename its aside.", func(g leftoverGauge) int64 { return g.Bytes }},
+			{"vmsync_agent_replaced_oldest_timestamp_seconds", "The earliest stamp among a replica's displaced sets, 0 when none carries one. time() minus this is how long the oldest has been sitting there, which separates last night's rebuild from one nobody has looked at in months.", func(g leftoverGauge) int64 { return g.OldestUnix }},
+		} {
+			fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s gauge\n", fam.name, fam.help, fam.name)
+			for _, vm := range lvVMs {
+				fmt.Fprintf(&b, "%s{host=%q,vm=%q} %d\n", fam.name, host, vm, fam.value(lvGauges[vm]))
+			}
+		}
+	}
+
 	return b.String()
 }
 
@@ -832,6 +872,7 @@ func metricsLoop(ctx context.Context, lv *live, state *sharedState, sched *Sched
 				// no control plane to send a report to, so without this a
 				// replica quietly taking no restore points is invisible.
 				m.setRestorePoints(scan.restorePoints)
+				m.setLeftovers(scan.leftovers)
 			}
 		}
 		if err := m.writeMetrics(cfg.PrometheusDir, state.get(), sched, cfg.MaxConcurrentSyncs, time.Now()); err != nil {
@@ -871,6 +912,9 @@ type inventoryScan struct {
 	fencedRunning map[string]bool
 	servedLive    map[string]bool
 	restorePoints map[string]restorePointGauge
+	// leftovers is the displaced-set cost per replica, from the same walk: on a
+	// standalone host nothing else will ever report it.
+	leftovers map[string]leftoverGauge
 }
 
 // scanDomainStatus inventories the host: domains counted by assessed status, the
@@ -898,6 +942,7 @@ func scanDomainStatus(cfg agentConfig) (inventoryScan, error) {
 	fencedRunning := map[string]bool{}
 	servedLive := map[string]bool{}
 	restorePoints := map[string]restorePointGauge{}
+	leftovers := map[string]leftoverGauge{}
 	now := time.Now()
 	for _, d := range domains {
 		// Presence is the state, exactly as pkg/inventory documents it: any
@@ -942,9 +987,14 @@ func scanDomainStatus(cfg agentConfig) (inventoryScan, error) {
 		// for one would read as a starved replica.
 		if d.IsTarget() {
 			restorePoints[d.Name] = restorePointGaugeFor(reportRestorePoints(d.RestorePoints))
+			// Through the same reducer the report path uses, so a standalone host
+			// and a controlled one cannot disagree about what is sitting there.
+			for _, g := range leftoverGauges([]ReportDomain{{Name: d.Name, ReplicaSource: d.ReplicaSource, Leftovers: reportLeftovers(d.Leftovers)}}) {
+				leftovers[d.Name] = g
+			}
 		}
 	}
-	return inventoryScan{total: len(domains), byStatus: byStatus, incomplete: incomplete, fencedRunning: fencedRunning, servedLive: servedLive, restorePoints: restorePoints}, nil
+	return inventoryScan{total: len(domains), byStatus: byStatus, incomplete: incomplete, fencedRunning: fencedRunning, servedLive: servedLive, restorePoints: restorePoints, leftovers: leftovers}, nil
 }
 
 // statusCounts tallies a report's domains by status, for the gauge.
@@ -1093,4 +1143,61 @@ func (m *agentMetrics) recordUIClockSkew(d time.Duration) {
 		trace.Warning("this host's clock disagrees with the control plane's; vmsync compares timestamps written by different machines, so replication ages and failover data-loss windows will be wrong until NTP is fixed",
 			"skew_seconds", int64(d.Seconds()), "threshold_seconds", int64(clockSkewWarnAt.Seconds()))
 	}
+}
+
+// leftoverGauge is one replica's displaced-set cost.
+type leftoverGauge struct {
+	// Count is how many displaced sets there are, and Bytes what they actually
+	// occupy right now -- allocated, not apparent, because a fresh reflink aside
+	// shares every extent with the live file and only diverges as the replica is
+	// written. Apparent size would alarm on the day the aside was made and never
+	// move; allocated size is the number that grows.
+	Count int
+	Bytes int64
+	// Oldest is the earliest stamp among them, 0 when none carries one. Age is
+	// what separates yesterday's rebuild from one nobody has looked at since
+	// spring.
+	OldestUnix int64
+}
+
+// setLeftovers replaces the whole map from one sweep, for the reason every setter
+// here does: a replica whose leftovers were cleaned up by hand must stop being
+// reported, and a merge would keep publishing a cost that is no longer there.
+func (m *agentMetrics) setLeftovers(vms map[string]leftoverGauge) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.leftoverVMs = make(map[string]leftoverGauge, len(vms))
+	for vm, g := range vms {
+		m.leftoverVMs[vm] = g
+	}
+}
+
+// leftoverGauges reduces a report's domains to the per-VM cost.
+//
+// From the REPORT rather than a second filesystem walk, like every other gauge
+// here, so the number the console shows and the number the metric publishes come
+// from one sweep and cannot disagree for the same minute.
+func leftoverGauges(domains []ReportDomain) map[string]leftoverGauge {
+	out := map[string]leftoverGauge{}
+	for _, d := range domains {
+		// Emitted for every replica, INCLUDING at zero, and that is the point: a
+		// series that appears only once a host has leftovers cannot alert on them
+		// appearing, and cannot show the flat line that says a cleanup held.
+		if d.ReplicaSource == "" {
+			continue
+		}
+		g := leftoverGauge{}
+		for _, l := range d.Leftovers {
+			g.Count++
+			g.Bytes += l.Bytes
+			if l.AtUnix > 0 && (g.OldestUnix == 0 || l.AtUnix < g.OldestUnix) {
+				g.OldestUnix = l.AtUnix
+			}
+		}
+		out[d.Name] = g
+	}
+	return out
 }

@@ -371,6 +371,17 @@ func checkRestoreIdentity(cfg syncConfig, plan restorePlan) error {
 
 	// 3. Has this domain served as a SOURCE since the point was taken?
 	//
+	// NOTE ON SCOPE, because this check is narrower than it reads and was once
+	// the only thing standing here: it detects OUTWARD replication only. A domain
+	// that served live and replicated nowhere -- a promoted copy with no target of
+	// its own, which is the ordinary post-failover shape -- moves no
+	// last_replicated_at at all and sails straight through. That gap is closed by
+	// last_promoted_at (see ServedLiveAllowsOverwrite, applied before the plan is
+	// even loaded), and by TargetRoleAllowsRestore refusing `fenced` for the
+	// displaced end. This check remains worth keeping for what it alone catches:
+	// a domain that genuinely replicated outward after the point, which neither
+	// of those two can see.
+	//
 	// This is what tells the two meanings of replication_role=paused apart.
 	// TargetRoleAllowsRestore allows paused, deliberately -- an operator who
 	// paused replication to investigate is exactly the one who then wants to

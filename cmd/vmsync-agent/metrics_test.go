@@ -622,3 +622,81 @@ func TestUpdateRoleSourceDoesNotSilenceANonReplicatingPair(t *testing.T) {
 		t.Error("a domain with no promotion record was reported")
 	}
 }
+
+// TestLeftoverGaugesReducesWhatTheReportCarries is the reporting half of CI-54.
+//
+// Emitted for every REPLICA including at zero, because a series that appears only
+// once a host has leftovers cannot alert on them appearing, and cannot show the
+// flat line that says a cleanup held. Sources are skipped: the displaced sets are
+// made on the receiving end.
+func TestLeftoverGaugesReducesWhatTheReportCarries(t *testing.T) {
+	got := leftoverGauges([]ReportDomain{
+		{
+			Name: "web01", Role: libvirtsync.RoleTarget, ReplicaSource: "hyper01p:web01",
+			Leftovers: []ReportLeftover{
+				{Path: "/vm/web01.qcow2.vmsync-replaced-1758441600", Kind: "replaced-disk", Bytes: 30 << 30, AtUnix: 1758441600},
+				{Path: "/vm/.vmsync-rp/.replaced-vm-web01-1758300000", Kind: "aside-store", Bytes: 5 << 30, AtUnix: 1758300000},
+				// No stamp: an older build's naming. Still costs, so still counted.
+				{Path: "/vm/web01.qcow2.vmsync-restoring-", Kind: "restore-staging", Bytes: 1 << 30},
+			},
+		},
+		// A replica with nothing to report still gets a series, at zero.
+		{Name: "db01", Role: libvirtsync.RoleTarget, ReplicaSource: "hyper01p:db01"},
+		// A source is not where these are made.
+		{Name: "mail01", Role: libvirtsync.RoleSource, ReplicaTargets: []string{"dr01:mail01"}},
+	})
+
+	if len(got) != 2 {
+		t.Fatalf("got %d VMs, want 2 (both replicas, not the source): %+v", len(got), got)
+	}
+	w := got["web01"]
+	if w.Count != 3 {
+		t.Errorf("web01 Count = %d, want 3", w.Count)
+	}
+	if want := int64(36 << 30); w.Bytes != want {
+		t.Errorf("web01 Bytes = %d, want %d -- the sum is the number to alert on against free space", w.Bytes, want)
+	}
+	if w.OldestUnix != 1758300000 {
+		t.Errorf("web01 OldestUnix = %d, want the earliest stamp; an unstamped entry must not win it by being zero", w.OldestUnix)
+	}
+	if g, ok := got["db01"]; !ok || g.Count != 0 || g.Bytes != 0 {
+		t.Errorf("db01 = %+v present=%v, want a zero series so growth can be alerted on", g, ok)
+	}
+	if _, ok := got["mail01"]; ok {
+		t.Error("a source was given a leftovers series; the displaced sets are made on the receiving end")
+	}
+}
+
+// TestRenderLeftoverGaugesStaysParseable: the same one-HELP-per-family rule every
+// per-VM family here obeys. With one VM a duplicated HELP is invisible; the file
+// only becomes invalid on the second, so a host with one affected replica
+// publishes fine and a host with two publishes nothing at all.
+func TestRenderLeftoverGaugesStaysParseable(t *testing.T) {
+	m := newAgentMetrics("test", "hyper02p", modeStandalone)
+	m.setLeftovers(map[string]leftoverGauge{
+		"web01": {Count: 2, Bytes: 30 << 30, OldestUnix: 1758441600},
+		"db01":  {Count: 1, Bytes: 5 << 30},
+		"app01": {},
+	})
+	body := m.render(CachedConfig{}, nil, 0, time.Unix(1_800_000_000, 0))
+	checkPrometheusText(t, body)
+
+	for _, fam := range []string{
+		"vmsync_agent_replaced_sets",
+		"vmsync_agent_replaced_bytes",
+		"vmsync_agent_replaced_oldest_timestamp_seconds",
+	} {
+		if n := strings.Count(body, "# HELP "+fam+" "); n != 1 {
+			t.Errorf("%s declares HELP %d times, want exactly 1", fam, n)
+		}
+		for _, vm := range []string{"web01", "db01", "app01"} {
+			want := fmt.Sprintf("%s{host=\"hyper02p\",vm=%q}", fam, vm)
+			if !strings.Contains(body, want) {
+				t.Errorf("rendered file does not contain %q -- a replica with none must still get a zero series", want)
+			}
+		}
+	}
+	if !strings.Contains(body, fmt.Sprintf("vmsync_agent_replaced_bytes{host=\"hyper02p\",vm=\"web01\"} %d\n", int64(30<<30))) {
+		t.Error("the byte total did not render")
+	}
+}

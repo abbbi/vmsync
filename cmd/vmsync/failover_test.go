@@ -24,6 +24,7 @@ import (
 
 	"vmsync/pkg/failover"
 	"vmsync/pkg/libvirtsync"
+	"vmsync/pkg/restorepoint"
 )
 
 // promoteTestNowUnix is the promoting host's clock for these tests, fixed so
@@ -290,13 +291,25 @@ func TestPromoteCarriesAnInterruptedFullCopyIntoTheDecision(t *testing.T) {
 	})
 }
 
-// The aside suffix is spelled in two packages that cannot import each other
-// -- a library cannot import a main package at all -- and the refusal is only
-// useful if the name it prints is the name the files really have.
+// The aside suffix is spelled in three packages that cannot import each other
+// -- a library cannot import a main package at all -- and each copy is only
+// useful if the name it uses is the name the files really have.
+//
+// The third copy is the sharpest of the three, and it is why this test is worth
+// more than it looks. cmd/vmsync CREATES the files, pkg/failover NAMES them in a
+// refusal, and pkg/restorepoint builds the command that DELETES them. A drift
+// between the first and the second sends an operator hunting for files that do
+// not exist; a drift between the first and the third means the sweep silently
+// matches nothing and the asides accumulate for ever, which is the exact defect
+// the sweep was added to end -- and it would do so without one error anywhere.
 func TestAsideSuffixMatchesTheOneTheRefusalNames(t *testing.T) {
 	if replacedDiskSuffix != failover.ReplicaReplacedSuffix {
 		t.Errorf("cmd/vmsync renames disks aside with %q but the promotion refusal tells operators to look for %q -- one of them sends people to files that do not exist",
 			replacedDiskSuffix, failover.ReplicaReplacedSuffix)
+	}
+	if replacedDiskSuffix != restorepoint.ReplicaReplacedSuffix {
+		t.Errorf("cmd/vmsync renames disks aside with %q but the reclaim sweep looks for %q -- the sweep would match nothing and the asides would accumulate for ever, with no error to show for it",
+			replacedDiskSuffix, restorepoint.ReplicaReplacedSuffix)
 	}
 }
 

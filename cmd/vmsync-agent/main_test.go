@@ -77,6 +77,11 @@ func fullyRecordedDomain() inventory.Domain {
 			Path: "/var/lib/libvirt/images/web01.qcow2", ApparentBytes: 107374182400,
 			AllocatedBytes: 42949672960, Missing: true,
 		}},
+		Leftovers: []inventory.LeftoverInfo{{
+			Path:  "/var/lib/libvirt/images/web01.qcow2.vmsync-replaced-1758441600",
+			Kind:  "replaced-disk",
+			Bytes: 42949672960, AtUnix: 1758441600,
+		}},
 		RestorePoints: []inventory.RestorePointInfo{{
 			Tag: "1756041600-vmsync-cpt-000040", TakenAtUnix: 1756041600,
 			CheckpointAtUnix: 1756041500, Checkpoint: "vmsync-cpt-000040",
@@ -148,6 +153,16 @@ func TestReportDomainFromMapsEveryField(t *testing.T) {
 	}
 	if len(got.RestorePoints) != 1 || got.RestorePoints[0].Tag != d.RestorePoints[0].Tag {
 		t.Errorf("RestorePoints = %+v, want the one point the fixture recorded", got.RestorePoints)
+	}
+	// Every field, because Kind decides which recovery an operator reaches for and
+	// Bytes is the number the whole report exists to carry.
+	if len(got.Leftovers) != 1 || got.Leftovers[0] != (ReportLeftover{
+		Path: d.Leftovers[0].Path, Kind: d.Leftovers[0].Kind,
+		Bytes: d.Leftovers[0].Bytes, AtUnix: d.Leftovers[0].AtUnix,
+	}) {
+		t.Errorf("Leftovers = %+v, want the displaced set the fixture recorded -- the aside stores are "+
+			"invisible to every listing there is, so a report that drops them is the only thing between "+
+			"an operator and an ENOSPC on the DR host", got.Leftovers)
 	}
 
 	// Every field of the result is non-zero above, so this walk can insist on

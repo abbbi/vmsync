@@ -100,6 +100,14 @@ const runLockDir = util.RunLockDir
 // delays a run which is going to fail anyway.
 const targetLockTimeout = 30 * time.Second
 
+// minReclaimLeftoversAfter is the shortest age -reclaim-leftovers-after will
+// accept.
+//
+// An alias rather than a value, so this binary and vmsync-agent -- which checks
+// the same floor when a profile is saved -- cannot drift apart. See
+// restorepoint.MinReclaimAfter for why the floor is where it is.
+const minReclaimLeftoversAfter = restorepoint.MinReclaimAfter
+
 // clockSkewWarnAt is when a difference between two hosts' clocks stops
 // being measurement noise and starts corrupting comparisons.
 //
@@ -269,6 +277,18 @@ type syncConfig struct {
 	// quote back at the operator.
 	Retention       string
 	RetentionPolicy restorepoint.Policy
+	// ReclaimLeftoversAfter is the raw -reclaim-leftovers-after value;
+	// ReclaimLeftoversAfterDur is it parsed. Empty and zero mean every run
+	// still REPORTS the displaced sets it finds and removes none of them.
+	//
+	// Kept separate from -retention on purpose, although both are about
+	// reclaiming space on the target. Retention governs copies vmsync made in
+	// order to be able to go back; this governs copies vmsync made in order to
+	// be able to UNDO A REBUILD, which are created by -reinit whether or not
+	// retention is on at all. Folding the second into the first would mean an
+	// estate that keeps no restore points also never reclaims a single aside.
+	ReclaimLeftoversAfter    string
+	ReclaimLeftoversAfterDur time.Duration
 	// ReinitAutomatic is true when -reinit-after-failures forced this reinit
 	// rather than an operator asking for one. The two are not interchangeable
 	// where restore points are concerned: see sweepRestorePointsForReinit.
@@ -497,6 +517,7 @@ var flagGroups = []struct {
 	}},
 	{"STORAGE", "where the replica's disks live and who owns them", []string{
 		"target-disk-path", "replaced-disk-action", "target-disk-owner",
+		"reclaim-leftovers-after",
 	}},
 	{"TRANSPORT", "how the bytes cross between hosts", []string{
 		"compress", "compress-level", "netbuffer", "use-ssh",
@@ -939,6 +960,30 @@ func main() {
 		// value is "there will be a copy to go back to tomorrow" should never
 		// be something an operator has to infer from the absence of errors.
 		trace.Info("restore points enabled", "retention", cfg.RetentionPolicy.String(), "keep", cfg.RetentionPolicy.Count, "interval", cfg.RetentionPolicy.Interval.String(), "kept_per", "target domain")
+	}
+
+	// Parsed and floored here, for the same reason -retention is: this value
+	// decides that a full-size copy of a replica gets deleted, and the first
+	// place it would otherwise be read is on a target host, mid-run.
+	//
+	// The floor is the substance of the check rather than a sanity limit. A
+	// mistyped "0h", or a "30" that the operator meant as days and
+	// ParseDuration will not accept at all, are the two ways this flag could
+	// sweep an aside made minutes ago -- which is the aside that is still the
+	// recovery for the rebuild that made it.
+	if cfg.ReclaimLeftoversAfter != "" {
+		d, err := time.ParseDuration(cfg.ReclaimLeftoversAfter)
+		switch {
+		case err != nil:
+			trace.Error("invalid -reclaim-leftovers-after", "error", fmt.Errorf("-reclaim-leftovers-after %q is not a duration: write it as a number and a unit, e.g. 720h for thirty days (note that Go durations have no day unit): %w", cfg.ReclaimLeftoversAfter, err))
+			os.Exit(2)
+		case d < minReclaimLeftoversAfter:
+			trace.Error("invalid -reclaim-leftovers-after", "error", fmt.Errorf("-reclaim-leftovers-after %q is %s, under the %s floor: these files are the documented recovery for a rebuild that died half way, so a value short enough to remove one made during the same working day is refused rather than obeyed", cfg.ReclaimLeftoversAfter, d, minReclaimLeftoversAfter))
+			os.Exit(2)
+		}
+		cfg.ReclaimLeftoversAfterDur = d
+		trace.Info("reclaiming displaced sets is enabled: runs will remove the disks a -reinit renamed aside, staged copies an interrupted restore left, and restore-point stores a -reinit moved aside, once they are older than this",
+			"older_than", d.String(), "note", "a replica marked incomplete is never reclaimed, because there the aside set is the only complete copy there is")
 	}
 
 	// Fault injection, off in every real run. Validated before anything else
@@ -2830,9 +2875,36 @@ func run(cfg syncConfig) (runErr error) {
 		// and no amount of force makes destroying the primary the intent. An
 		// unrecognised role was written by a newer vmsync and fails closed for
 		// the reason it always does.
-		if cfg.ForceClean && (targetRole == libvirtsync.RolePromoted || targetRole == libvirtsync.RolePaused || targetRole == libvirtsync.RoleFenced) {
+		if cfg.ForceClean && (targetRole == libvirtsync.RolePaused || targetRole == libvirtsync.RoleFenced) {
 			trace.Warning("-force-clean: overriding the replication role interlock and DISCARDING this domain's current disks",
 				"vm", cfg.TargetDomain, "role", targetRole, "refusal", err.Error())
+		} else if cfg.ForceClean && targetRole == libvirtsync.RolePromoted {
+			// `promoted` USED TO BE on the override list above, and taking it off is
+			// the whole of CI-09.
+			//
+			// The argument for having it there was consistent: paused, promoted and
+			// fenced all mean "a sync must not blunder into this", and getting out
+			// of such a state is what a deliberate clean is for. What it missed is
+			// that the three are not equivalent. `paused` and `fenced` say
+			// replication is suspended; `promoted` says THIS DOMAIN IS THE LIVE COPY
+			// -- its disks are the data a failover produced, and they may be the
+			// only copy of it. An override that discards a suspension is a
+			// convenience. An override that discards live data is the thing this
+			// whole cluster of issues is about.
+			//
+			// The durable trace already refuses every copy promoted by a current
+			// binary, so in steady state this branch is unreachable. It exists for
+			// the population that has none: a domain promoted by a build that
+			// predated last_promoted_at. That is exactly the upgrade window the
+			// migration in promotionTraceUpdate was written for, and the migration
+			// only fires on the way OUT of promoted -- so until such a domain is
+			// demoted, the role is the only evidence there is. Reading it here is
+			// what makes the guard hold at both ends of the window.
+			//
+			// The way through is unchanged from any other served-live copy, and it
+			// is the same three deliberate acts: stop it, demote it, release it.
+			return fmt.Errorf("refusing to sync into %s: %w -- and -force-clean does NOT override this one. A domain marked %s is the live copy of a failover: its disks are what that failover produced. Stop it (-shutdown-domain), demote it (-update-role=%s), release the promotion (-%s), and then -force-clean will proceed. If the failover stands, -invert reverses the pair and keeps this data instead",
+				cfg.TargetDomain, err, libvirtsync.RolePromoted, libvirtsync.RolePaused, libvirtsync.FlagReleasePromotion)
 		} else {
 			return fmt.Errorf("refusing to sync into %s: %w", cfg.TargetDomain, err)
 		}
@@ -3769,6 +3841,13 @@ func run(cfg syncConfig) (runErr error) {
 	// checkpoint from an older build, which touches the SOURCE's checkpoint
 	// metadata and not the replica. Nothing that can leave the replica
 	// half-written happens above this line.
+	// What the displaced-set sweep did, filled in further down and read by the
+	// outcome closure below. Journalled rather than only logged: this run may
+	// have deleted a full-size copy of a replica, and an operator asking later
+	// what became of an aside they were relying on has to be able to find the
+	// answer beside the replica rather than in whatever kept the run's stdout.
+	var displaced leftoverSweep
+
 	journal := newRecorder(cfg, targetSSHClient, util.SetTargetPath(cfg.TargetDiskPath, qcowDisks[0].RootSource), cfg.TargetDomain)
 	journal.Intent(ctx, journalVerbSync, map[string]string{
 		"mode":          syncJournalMode(cfg),
@@ -3793,6 +3872,19 @@ func run(cfg syncConfig) (runErr error) {
 			"mode":       syncOutcomeMode(cfg, effectiveParent),
 			"checkpoint": effective,
 			"parent":     effectiveParent,
+		}
+		// Only when there is something to say, so this does not add three keys
+		// to every record on every estate that has no displaced sets at all.
+		if len(displaced.Found) > 0 {
+			detail["displaced_sets"] = strconv.Itoa(len(displaced.Found))
+			detail["displaced_bytes"] = strconv.FormatInt(displaced.FoundBytes, 10)
+		}
+		if len(displaced.Removed) > 0 {
+			detail["reclaimed_sets"] = strconv.Itoa(len(displaced.Removed))
+			detail["reclaimed_bytes"] = strconv.FormatInt(displaced.RemovedBytes, 10)
+		}
+		if displaced.Refused != "" {
+			detail["reclaim_refused"] = displaced.Refused
 		}
 		finishAction(ctx, journal, runErr, detail)
 		if n := journal.Failures(); n > 0 {
@@ -6455,6 +6547,17 @@ func run(cfg syncConfig) (runErr error) {
 	stampMu.Lock()
 	stampDisks = stamps
 	stampMu.Unlock()
+
+	// Displaced sets, reported on every run and reclaimed when an operator has
+	// said how old is old enough.
+	//
+	// Here rather than beside the prune: the prune only runs when -retention is
+	// on, and the disks a -reinit renames aside are created whether or not
+	// anybody keeps restore points. This is also deliberately BEFORE the copy
+	// below -- the harm is an ENOSPC on the DR host, and space reclaimed after
+	// the copy that ran out of it is space reclaimed too late.
+	displaced = sweepDisplacedSets(ctx, cfg, targetSSHClient, tgtMgr, targetDiskPaths, time.Now())
+
 	rp, err := newRestorePoints(ctx, cfg.RetentionPolicy, targetSSHClient, targetDiskPaths, cfg.TargetDomain, checkpointName, checkpointAt)
 	if err != nil {
 		return err
@@ -7163,6 +7266,7 @@ func registerFlags(fs *flag.FlagSet, cfg *syncConfig) (compressArg, fenceSourceA
 	fs.BoolVar(&cfg.NoChecksum, "no-checksum", false, "disable the pre-commit integrity check, which is ON by default")
 
 	fs.StringVar(&cfg.Retention, "retention", "", "keep COUNT,INTERVAL point-in-time copies of the replica (e.g. 24,3h)")
+	fs.StringVar(&cfg.ReclaimLeftoversAfter, "reclaim-leftovers-after", "", "remove disks a -reinit renamed aside, and restore leftovers, once older than this (e.g. 720h); unset only reports them")
 	fs.StringVar(&cfg.CloneRestorePointTo, "clone-to", "", "directory on the target for -clone-restore-point's copies")
 	fs.BoolVar(&cfg.ForceRestore, "force-restore", false, "carry out -restore-restore-point instead of only assessing it")
 	fs.StringVar(&cfg.RestoredBy, "restored-by", "", "who asked for the rollback, recorded on the domain")

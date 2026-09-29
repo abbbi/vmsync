@@ -512,3 +512,74 @@ func TestCommandArgsCarriesTheJournalLevel(t *testing.T) {
 		}
 	}
 }
+
+// The two storage-reclaim settings, which between them decide whether a
+// full-size copy of every replica disk is created and when it is removed.
+//
+// Tested together because they are one decision made in two halves, and because
+// the failure modes are opposite: replaced_disk_action ignored means an operator
+// who chose "delete" to stay inside their storage keeps filling it anyway, while
+// reclaim_leftovers_after accepted too small means the documented recovery for a
+// half-finished rebuild is deleted automatically, in the hours when somebody is
+// most likely to still want it.
+func TestValidateGuardsTheStorageReclaimSettings(t *testing.T) {
+	base := SyncProfile{}
+
+	for _, ok := range []string{"", "rename", "delete"} {
+		p := base
+		p.ReplacedDiskAction = ok
+		if err := p.Validate(); err != nil {
+			t.Errorf("replaced_disk_action %q was rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"keep", "RENAME", "remove", "true"} {
+		p := base
+		p.ReplacedDiskAction = bad
+		if err := p.Validate(); err == nil {
+			t.Errorf("replaced_disk_action %q was accepted; vmsync would refuse it on the target and the pair would stop replicating at the next scheduled run", bad)
+		}
+	}
+
+	for _, ok := range []string{"", "24h", "720h", "8760h"} {
+		p := base
+		p.ReclaimLeftoversAfter = ok
+		if err := p.Validate(); err != nil {
+			t.Errorf("reclaim_leftovers_after %q was rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []struct{ value, why string }{
+		{"0h", "means \"off\" to whoever wrote it, and \"delete everything\" to a sweep that obeyed it"},
+		{"1h", "removes an aside made during the same working day, which is the aside somebody is still likely to want"},
+		{"23h59m", "is under the floor by a minute, and the floor is not a rounding suggestion"},
+		{"-720h", "is in the past, so everything is older than it"},
+		{"30", "is what somebody means by thirty days, and Go durations have no day unit"},
+		{"30d", "is the spelling people reach for, and Go does not accept it"},
+		{"soon", "is not a duration at all"},
+	} {
+		p := base
+		p.ReclaimLeftoversAfter = bad.value
+		if err := p.Validate(); err == nil {
+			t.Errorf("reclaim_leftovers_after %q was accepted, and it %s", bad.value, bad.why)
+		}
+	}
+
+	// Both reach the engine only when chosen, so an unset profile still gets
+	// vmsync's own defaults rather than this build's idea of them.
+	req := SyncRequest{
+		SourceURI: "qemu:///system", SourceDomain: "web01",
+		TargetURI: "qemu+ssh://root@dr01/system", TargetDomain: "web01",
+	}
+	for _, a := range req.CommandArgs() {
+		if strings.HasPrefix(a, "-replaced-disk-action") || strings.HasPrefix(a, "-reclaim-leftovers-after") {
+			t.Errorf("args name %q although nothing was configured", a)
+		}
+	}
+	req.Profile.ReplacedDiskAction = "delete"
+	req.Profile.ReclaimLeftoversAfter = "720h"
+	args := req.CommandArgs()
+	for _, want := range []string{"-replaced-disk-action=delete", "-reclaim-leftovers-after=720h"} {
+		if !hasArg(args, want) {
+			t.Errorf("args = %v do not contain %s", args, want)
+		}
+	}
+}

@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"vmsync/pkg/netbuffer"
 	"vmsync/pkg/portalloc"
@@ -157,6 +158,40 @@ type SyncProfile struct {
 	// nothing except the ability to answer "what happened here?", which is
 	// the entire reason anyone would be reading it.
 	Journal string `json:"journal,omitempty"`
+
+	// ReplacedDiskAction is "rename" or "delete", and empty means "leave
+	// vmsync's own default", which is rename.
+	//
+	// It exists because until now the agent could not express the choice at all,
+	// so every agent- and console-driven rebuild took the default and renamed a
+	// FULL-SIZE copy of every disk aside. Nothing reaps those, nothing used to
+	// report them, and they share extents when new -- so the cost shows up weeks
+	// later as an ENOSPC on the DR host that fails a commit for every VM on it.
+	// The pair that makes that bounded is this field and
+	// vmsync_agent_replaced_bytes: see what is accumulating, and decide per pair
+	// whether the safety copy is worth the room.
+	//
+	// "rename" stays the default, and deliberately: the aside set is the
+	// documented recovery for a rebuild that dies half way, so an operator has to
+	// choose to give it up rather than lose it by not knowing about it.
+	ReplacedDiskAction string `json:"replaced_disk_action,omitempty"`
+
+	// ReclaimLeftoversAfter is a Go duration (e.g. "720h"); empty leaves
+	// vmsync's default, which reports displaced sets and removes none of them.
+	//
+	// The other half of the pair above. ReplacedDiskAction decides whether new
+	// asides are made at all; this decides when the ones already there are
+	// removed -- and an estate that has been running for a year has the second
+	// problem rather than the first, because the asides accumulated under the
+	// default before anybody had a knob to turn.
+	//
+	// Expressed as a duration rather than a bool because the only safe form of
+	// "yes" is "yes, once they are older than X": the aside set is the documented
+	// recovery for a rebuild that died half way, so an operator has to say how
+	// long they want that recovery to stay available. vmsync refuses anything
+	// under a day, and refuses to reclaim anything at all on a replica marked
+	// incomplete, where the asides ARE the replica.
+	ReclaimLeftoversAfter string `json:"reclaim_leftovers_after,omitempty"`
 }
 
 // Preset names a built-in profile. The UI offers these so nobody has to
@@ -266,6 +301,35 @@ func (p SyncProfile) Validate() error {
 	case "", "actions", "off":
 	default:
 		return fmt.Errorf("journal %q is not one of \"\" (leave vmsync's default), \"actions\", \"off\"", p.Journal)
+	}
+
+	// Same treatment, and the stakes are higher than a typo usually carries: this
+	// setting decides whether a rebuild keeps a full-size copy of every disk. A
+	// value vmsync does not recognise stops the pair replicating, which is at
+	// least loud; a value silently ignored would mean an operator who chose
+	// "delete" to stay within their storage keeps filling it anyway.
+	switch p.ReplacedDiskAction {
+	case "", "rename", "delete":
+	default:
+		return fmt.Errorf("replaced_disk_action %q is not one of \"\" (leave vmsync's default, which is rename), \"rename\", \"delete\"", p.ReplacedDiskAction)
+	}
+
+	// Parsed here as well as by the engine, and the floor checked here too.
+	//
+	// Duplicated on purpose. A profile is written once and then runs unattended
+	// for months, so the cost of catching this only on the target is that the
+	// pair stops replicating at 02:00 on whatever night the schedule next fires
+	// -- while the cost of catching it here is an error at the moment somebody
+	// saves the profile. The engine keeps its own check because a hand-run
+	// vmsync never passes through this one.
+	if p.ReclaimLeftoversAfter != "" {
+		d, err := time.ParseDuration(p.ReclaimLeftoversAfter)
+		switch {
+		case err != nil:
+			return fmt.Errorf("reclaim_leftovers_after %q is not a duration: write it as a number and a unit, e.g. \"720h\" for thirty days (Go durations have no day unit): %w", p.ReclaimLeftoversAfter, err)
+		case d < restorepoint.MinReclaimAfter:
+			return fmt.Errorf("reclaim_leftovers_after %q is %s, under the %s floor: the disks a -reinit renames aside are the documented recovery for a rebuild that died half way, so a value short enough to remove one made during the same working day is refused", p.ReclaimLeftoversAfter, d, restorepoint.MinReclaimAfter)
+		}
 	}
 
 	// Rejected rather than ignored, matching vmsync's own startup check. A
@@ -530,6 +594,14 @@ func (r SyncRequest) CommandArgs() []string {
 	// replicating over a diagnostic setting.
 	if p.Journal != "" {
 		args = append(args, "-journal="+p.Journal)
+	}
+	// Only when chosen, so an unset profile still gets vmsync's own default and
+	// this flag does not start appearing in every run log in the estate.
+	if p.ReplacedDiskAction != "" {
+		args = append(args, "-replaced-disk-action="+p.ReplacedDiskAction)
+	}
+	if p.ReclaimLeftoversAfter != "" {
+		args = append(args, "-reclaim-leftovers-after="+p.ReclaimLeftoversAfter)
 	}
 	return args
 }

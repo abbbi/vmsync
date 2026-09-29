@@ -608,12 +608,12 @@ func TestApplyDomainMetadataMapsEveryField(t *testing.T) {
 	// defect came from.
 	//
 	// The exemptions are the fields that do not come from metadata at all:
-	// libvirt answers Name, UUID, Active and Persistent, and the disks and
-	// restore points are read off the filesystem by describe.
+	// libvirt answers Name, UUID, Active and Persistent, and the disks, restore
+	// points and leftovers are read off the filesystem by describe.
 	v := reflect.ValueOf(d)
 	for i := 0; i < v.NumField(); i++ {
 		switch name := v.Type().Field(i).Name; name {
-		case "Name", "UUID", "Active", "Persistent", "Disks", "RestorePoints":
+		case "Name", "UUID", "Active", "Persistent", "Disks", "RestorePoints", "Leftovers":
 		default:
 			if v.Field(i).IsZero() {
 				t.Errorf("Domain.%s came back zero although the fixture recorded it: applyDomainMetadata does not map it, so the agent reports nothing for it", name)

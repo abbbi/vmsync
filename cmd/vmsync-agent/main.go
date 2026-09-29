@@ -630,6 +630,10 @@ func reportLoop(ctx context.Context, client *Client, lv *live, state *sharedStat
 			// from failure_count, and its own role reads `paused`.
 			cfg.metrics.setServedLiveUnreleased(servedLiveUnreleasedVMs(report.Domains))
 			cfg.metrics.setRestorePoints(restorePointGauges(report.Domains))
+			// Same sweep again. Displaced sets are made by the default
+			// replaced-disk action and reaped by nothing, and the aside stores
+			// among them are invisible to every listing vmsync has.
+			cfg.metrics.setLeftovers(leftoverGauges(report.Domains))
 
 			if err := client.SendReport(ctx, report); err != nil {
 				if ctx.Err() != nil {
@@ -877,6 +881,7 @@ func reportDomainFrom(d inventory.Domain, fenced *ReportFenced, a inventory.Asse
 		RestoredAtUnix:       d.RestoredAtUnix,
 		RestoredBy:           d.RestoredBy,
 		RestorePoints:        reportRestorePoints(d.RestorePoints),
+		Leftovers:            reportLeftovers(d.Leftovers),
 		Status:               a.Status.String(),
 		Reasons:              a.Reasons,
 		AgeSeconds:           a.AgeSeconds,
@@ -1023,6 +1028,27 @@ func fencedRunningVMs(domains []ReportDomain) map[string]bool {
 		if fenceFailedOpen(d.Role, d.Active) {
 			out[d.Name] = true
 		}
+	}
+	return out
+}
+
+// reportLeftovers converts the displaced sets for the wire.
+//
+// nil for the empty case, like reportRestorePoints, so `omitempty` keeps them off
+// every report from every healthy host rather than sending an empty array for
+// each of a fleet's domains.
+func reportLeftovers(in []inventory.LeftoverInfo) []ReportLeftover {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]ReportLeftover, 0, len(in))
+	for _, l := range in {
+		out = append(out, ReportLeftover{
+			Path:   l.Path,
+			Kind:   l.Kind,
+			Bytes:  l.Bytes,
+			AtUnix: l.AtUnix,
+		})
 	}
 	return out
 }

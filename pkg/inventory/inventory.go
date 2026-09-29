@@ -153,6 +153,27 @@ type Domain struct {
 	// mistake overwrites the only copy of the data.
 	LastPromotedAtRaw string `json:"last_promoted_at,omitempty"`
 
+	// Leftovers is every displaced set beside this domain's disks that nothing
+	// has removed: replica disks a rebuild renamed aside, restore-point stores a
+	// reinit moved out of the way, restore copies that were staged and not used.
+	//
+	// Reported because nothing reported them, which is half of what CI-54 is:
+	// they are created by the DEFAULT -replaced-disk-action, no sweep reaps them,
+	// and the aside stores in particular are invisible to every listing there is
+	// -- they sit beside the per-domain stores, so -list-restore-points cannot see
+	// them and the points inside them are outside every store, so no command can
+	// name them. Only somebody looking at the directory would ever know.
+	//
+	// They share extents with the live files when they are made and diverge as
+	// the replica is written, so the cost arrives later, on the DR host, and the
+	// failure it ends in is an ENOSPC that fails a commit for every VM there. A
+	// number that grows is the only warning available.
+	//
+	// Deliberately not reaped. See LeftoverInfo: the .vmsync-replaced set is the
+	// documented recovery for an interrupted rebuild, and a sweep that deleted it
+	// would delete what an operator in trouble is reaching for.
+	Leftovers []LeftoverInfo `json:"leftovers,omitempty"`
+
 	// The fence this promotion armed, present only on a promoted domain and
 	// only when the promotion was explicitly asked to arm one.
 	//
@@ -618,6 +639,10 @@ func describe(dom *libvirt.Domain, verboseSkips bool) (Domain, error) {
 		// which libvirt gave us before this function read any XML: restore
 		// points are kept per target domain.
 		d.RestorePoints = RestorePointsFor(d)
+		// From the same directories, in the same pass, for the same reason: the
+		// displaced sets live beside the disks and beside the stores, so the
+		// moment both of those are known is the moment this is answerable.
+		d.Leftovers = LeftoversFor(d)
 	}
 
 	applyDomainMetadata(xml, &d)

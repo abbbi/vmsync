@@ -278,6 +278,17 @@ type ReportDomain struct {
 	// that reads "never promoted".
 	LastPromotedAt     string `json:"last_promoted_at,omitempty"`
 	LastPromotedAtUnix int64  `json:"last_promoted_at_unix,omitempty"`
+	// Leftovers is every displaced set beside this VM's disks that nothing has
+	// removed -- replica disks a rebuild renamed aside, restore-point stores a
+	// reinit set aside, restore copies staged and not used.
+	//
+	// It travels because the console is where somebody decides whether the DR
+	// host has room, and because the aside restore-point stores are invisible to
+	// every listing there is: they sit beside the per-domain stores, so
+	// -list-restore-points cannot see them, and the points inside them are
+	// outside every store, so no command can name them. Without this the only way
+	// to know is to log in and look.
+	Leftovers []ReportLeftover `json:"leftovers,omitempty"`
 	// LastReplicatedAtUnix / LastReplicatedTo are the SOURCE side of the
 	// same fact LastSyncUnix records on a target: when this VM last
 	// replicated, and where to. Reported so the question can be answered
@@ -333,6 +344,20 @@ type ReportDomain struct {
 }
 
 // ReportRestorePoint mirrors pkg/inventory.RestorePointInfo on the wire.
+// ReportLeftover is one displaced set on the wire, mirroring
+// inventory.LeftoverInfo.
+//
+// Kind is carried rather than inferred from the path because the recovery
+// differs: a "replaced-disk" is moved back over the half-written replica, an
+// "aside-store" holds restore points no command can name, and a
+// "restore-staging" copy is simply removable.
+type ReportLeftover struct {
+	Path   string `json:"path"`
+	Kind   string `json:"kind"`
+	Bytes  int64  `json:"bytes"`
+	AtUnix int64  `json:"at_unix,omitempty"`
+}
+
 type ReportRestorePoint struct {
 	Tag              string `json:"tag"`
 	TakenAtUnix      int64  `json:"taken_at_unix"`

@@ -147,3 +147,47 @@ func statFilesystem(dir string) (Filesystem, bool) {
 		UsedBytes:  total - free,
 	}, true
 }
+
+// allocatedBytes is what one file actually occupies, in the same units and by
+// the same rule inspectDisks uses.
+//
+// Shared with the leftover scan rather than duplicated there, because the whole
+// point of reporting a displaced copy is the gap between its apparent size and
+// its real one: a fresh reflink aside shares every extent with the live file, so
+// its apparent size is a full disk image and its real cost is nothing. Reporting
+// the apparent size would raise an alarm on the day the aside is made and never
+// move again; the allocated size is what grows as the two diverge.
+//
+// 0 on any failure -- a file that has gone is not a cost.
+func allocatedBytes(path string) int64 {
+	st, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+		return sys.Blocks * 512
+	}
+	return st.Size()
+}
+
+// dirAllocatedBytes is allocatedBytes summed over a directory tree, for the
+// aside restore-point stores, which are directories rather than files.
+//
+// Errors are swallowed per entry rather than aborting: a tree being written
+// while it is walked is the ordinary case on a busy host, and an
+// under-count is a better answer than none.
+func dirAllocatedBytes(root string) int64 {
+	var total int64
+	filepath.Walk(root, func(p string, fi os.FileInfo, err error) error {
+		if err != nil || fi == nil || fi.IsDir() {
+			return nil
+		}
+		if sys, ok := fi.Sys().(*syscall.Stat_t); ok {
+			total += sys.Blocks * 512
+			return nil
+		}
+		total += fi.Size()
+		return nil
+	})
+	return total
+}

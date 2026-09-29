@@ -21,8 +21,8 @@ import (
 	"strconv"
 	"testing"
 
-	"vmsync/pkg/util"
 	"vmsync/pkg/libvirtsync"
+	"vmsync/pkg/util"
 )
 
 // replicaSelfRef must produce the SAME string vmsync stamps into replication

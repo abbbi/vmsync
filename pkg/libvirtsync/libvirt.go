@@ -2237,8 +2237,28 @@ func TargetVerifyStateAllowsSync(verifyState, failedAt string) error {
 // testable without libvirt.
 func TargetRoleAllowsRestore(role string) error {
 	switch role {
-	case "", RoleTarget, RolePaused, RoleFenced:
+	case "", RoleTarget, RolePaused:
 		return nil
+	case RoleFenced:
+		// `fenced` USED TO BE accepted alongside `paused`, and the audit was right
+		// that it does not belong there.
+		//
+		// The two look alike -- neither is replicating, both are stopped -- and
+		// `paused` is accepted for a good reason: an operator who paused
+		// replication to work out what went wrong is exactly the one who then
+		// wants to roll the replica back. But a `fenced` domain is not a replica
+		// somebody paused. It is the copy a peer was promoted OVER, which means
+		// its disks hold whatever it was serving at the instant of the failover --
+		// data no restore point of its own contains, because it was the source
+		// when that point was taken. Rolling it back discards that, and unlike a
+		// promoted copy it carries no last_promoted_at to refuse on, because it
+		// was never promoted: it was displaced.
+		//
+		// Nor is a restore any documented cure for this state. A fence means the
+		// pair's direction has probably reversed, and the two answers are about
+		// direction, not about contents.
+		return fmt.Errorf("target domain is marked replication_role=%q, meaning a peer was promoted over it and a fence stopped it -- its disks hold what it was serving when that happened, which no restore point of its own contains, so rolling it back would discard exactly the data somebody may still need. If the failover stands, run -invert to reverse the pair; if the fence was wrong, run -update-role=%s first and then restore deliberately",
+			RoleFenced, RoleTarget)
 	case RoleSource:
 		return fmt.Errorf("target domain is marked replication_role=%q, meaning it is the SOURCE of a replication pair -- restoring a restore point over it would overwrite the original with an old copy of its own replica; check that -target-uri/-target-domain name the replica and not the source", RoleSource)
 	case RolePromoted:
