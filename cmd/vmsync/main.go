@@ -4226,7 +4226,58 @@ func run(cfg syncConfig) (runErr error) {
 			reinitAsideStamp = reinitStamp
 		}
 
-		// FIRST, before anything below has displaced or deleted a single
+		// Refuse a running target BEFORE anything is armed, undefined or
+		// discarded.
+		//
+		// This check used to sit ~85 lines further down, after the checkpoint
+		// chain had already been dropped -- so a -reinit refused for the most
+		// ordinary reason there is ("you forgot to shut the replica down") had
+		// already destroyed the source's baseline, forcing the next sync to be
+		// a full copy of the whole machine. It cost three things, and moving
+		// the check costs nothing because it only READS:
+		//
+		//   1. the source's checkpoint chain, dropped for a run that then
+		//      refused;
+		//   2. replica_incomplete, armed on a target this run never touched,
+		//      where it then refuses promotion until some later sync clears it;
+		//   3. worst, with -force-clean: forceCleanTargetDomain undefined the
+		//      target first, and DomainExists uses LookupDomainByName, which
+		//      still finds a RUNNING domain after its definition is gone. So
+		//      the guard did fire -- one step too late, leaving the replica
+		//      running as a transient domain with no persistent definition at
+		//      all.
+		//
+		// refuseReinitIfTargetRunning's own doc comment always said it decides
+		// whether to abort "before touching the target's disk files"; it now
+		// does that before touching anything else either.
+		//
+		// DomainExists (unlike a bare LookupDomain) distinguishes a genuine "no
+		// such domain" from any other lookup failure (auth, a transient
+		// connection hiccup, ...) -- treating those the same way used to
+		// silently skip this guard and fall straight through to replacing the
+		// target's disk files, even when the domain in fact exists and is
+		// running.
+		exists, err := libvirtsync.DomainExists(tgtMgr.Conn, cfg.TargetDomain)
+		if err != nil {
+			return fmt.Errorf("reinit: check target domain existence: %w", err)
+		}
+		running := false
+		if exists {
+			tgtDom, err := tgtMgr.LookupDomain(cfg.TargetDomain)
+			if err != nil {
+				return fmt.Errorf("reinit: look up target domain %s: %w", cfg.TargetDomain, err)
+			}
+			running, err = libvirtsync.DomainActive(tgtDom)
+			tgtDom.Free()
+			if err != nil {
+				return fmt.Errorf("reinit: check target domain state: %w", err)
+			}
+		}
+		if err := refuseReinitIfTargetRunning(cfg.TargetDomain, exists, running); err != nil {
+			return err
+		}
+
+		// THEN arm, before anything below has displaced or deleted a single
 		// thing: before -force-clean removes the target definition, before
 		// the block jobs are aborted, before the checkpoint chain is dropped,
 		// before the restore-point sweep, and before any `mv`.
@@ -4324,50 +4375,24 @@ func run(cfg syncConfig) (runErr error) {
 			return refusal
 		}
 
-		// DomainExists (unlike a bare LookupDomain) distinguishes a genuine
-		// "no such domain" from any other lookup failure (auth, a transient
-		// connection hiccup, ...) -- treating those the same way used to
-		// silently skip the "refuse if running" guard just below and fall
-		// straight through to deleting the target's disk files, even when
-		// the domain in fact exists and is running.
-		//
-		// Deliberately NOT undefining the target domain here (this used to
-		// call tgtDom.Undefine() right after this check): that left the
-		// target undefined for the entire disk-copy duration below -- often
-		// the longest part of the whole run -- so any interruption during
-		// that window (SIGINT/SIGTERM, a killed process, a network drop)
-		// left the target permanently undefined until some later run
-		// happened to complete a full sync all the way through. The target
-		// domain's definition is now left completely untouched by -reinit;
-		// DefineDomain (at the very end, only after the copy has fully
-		// succeeded) is the only place that ever undefines/redefines it,
-		// and it already does so with its own rollback-to-original-XML
-		// safety net (see its own doc comment) -- undefining early here
-		// just threw that rollback target away before it could ever be
-		// used. As a side effect, this also drops the one remaining
-		// plain Undefine() call in this file: it never passed
-		// DOMAIN_UNDEFINE_KEEP_NVRAM the way DefineDomain's own undefine
-		// does, so -reinit against any UEFI/OVMF target domain was likely
-		// already failing outright at this step.
-		exists, err := libvirtsync.DomainExists(tgtMgr.Conn, cfg.TargetDomain)
-		if err != nil {
-			return fmt.Errorf("reinit: check target domain existence: %w", err)
-		}
-		running := false
-		if exists {
-			tgtDom, err := tgtMgr.LookupDomain(cfg.TargetDomain)
-			if err != nil {
-				return fmt.Errorf("reinit: look up target domain %s: %w", cfg.TargetDomain, err)
-			}
-			running, err = libvirtsync.DomainActive(tgtDom)
-			tgtDom.Free()
-			if err != nil {
-				return fmt.Errorf("reinit: check target domain state: %w", err)
-			}
-		}
-		if err := refuseReinitIfTargetRunning(cfg.TargetDomain, exists, running); err != nil {
-			return err
-		}
+		// Deliberately NOT undefining the target domain anywhere in this block
+		// (this used to call tgtDom.Undefine() right after the running check,
+		// which now sits at the top): that left the target undefined for the
+		// entire disk-copy duration below -- often the longest part of the
+		// whole run -- so any interruption during that window (SIGINT/SIGTERM,
+		// a killed process, a network drop) left the target permanently
+		// undefined until some later run happened to complete a full sync all
+		// the way through. The target domain's definition is left completely
+		// untouched by a plain -reinit; DefineDomain (at the very end, only
+		// after the copy has fully succeeded) is the only place that ever
+		// undefines/redefines it, and it already does so with its own
+		// rollback-to-original-XML safety net (see its own doc comment) --
+		// undefining early here just threw that rollback target away before it
+		// could ever be used. As a side effect, this also drops the one
+		// remaining plain Undefine() call in this file: it never passed
+		// DOMAIN_UNDEFINE_KEEP_NVRAM the way DefineDomain's own undefine does,
+		// so -reinit against any UEFI/OVMF target domain was likely already
+		// failing outright at this step.
 
 		// What happens to the existing target disks is the operator's call,
 		// not vmsync's, because the two answers differ in what they risk.

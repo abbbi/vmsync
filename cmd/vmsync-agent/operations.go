@@ -118,10 +118,17 @@ const (
 	OpSetRole  = "set-role"
 	OpReinit   = "reinit"
 	// OpForceClean is a reinit for a target that an ordinary reinit cannot
-	// get past: it undefines the target domain, overrides the promoted and
-	// paused role interlocks, and clears a shut-down source's checkpoint
-	// chain including its bitmaps. Like OpReinit it runs on the SOURCE's
-	// agent, because it is a sync.
+	// get past: it undefines the target domain and overrides the paused and
+	// fenced role interlocks. It does NOT override `promoted`, nor any copy
+	// still carrying last_promoted_at -- those disks may hold the only copy of
+	// data that was serving, and the release is its own command.
+	//
+	// It does not clear the source's checkpoint chain either, although an
+	// earlier version of this comment said it did: EVERY reinit does that,
+	// plain OpReinit included, and whether the bitmaps are removed with
+	// qemu-img is decided by the source's own state rather than by this flag.
+	//
+	// Like OpReinit it runs on the SOURCE's agent, because it is a sync.
 	//
 	// Separate from OpReinit rather than a flag on it so that the audit
 	// trail names what actually happened: these two destroy different
