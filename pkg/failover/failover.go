@@ -848,9 +848,21 @@ func AssessInvert(st PairState) (InvertPlan, error) {
 			FieldPromotedAt, FieldPromotedBy, FieldPromotedFrom, FieldPromotionMode,
 			// NOT FieldLastPromotedAt. This domain served live and still
 			// holds that data -- it is the reason the pair is being reversed.
-			// The trace follows it into its new role as source, where it
-			// costs nothing, and is there to protect it if this domain is
-			// ever made somebody's replica again.
+			// The trace follows it into its new role as source, where it is
+			// what protects it if this domain is ever made somebody's replica
+			// again: -update-role target on a live primary is exactly as
+			// destructive as overwriting a promoted copy, and the trace is the
+			// only thing that refuses it.
+			//
+			// It does NOT follow that the trace is free here, and an earlier
+			// version of this comment claimed it was. Anything that reads the
+			// record as "a copy waiting on a decision" fires for ever on the
+			// primary this inversion just produced -- the domain is running, so
+			// -release-promotion refuses it, and the inversion is the very thing
+			// that put the record there. Every such reader must exclude
+			// RoleSource: see the agent's servedLiveUnresolved, inventory.Assess
+			// and the console's ServedLiveUnresolved, which is the whole of that
+			// fix. The GATES read presence alone and are right to.
 			FieldFenceID, FieldFenceSource, FieldFenceArmedAt, FieldFenceArmedBy,
 		},
 	}

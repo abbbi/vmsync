@@ -541,7 +541,7 @@ func runExplainDomain(cfg syncConfig, domain string) error {
 	if st.Exists {
 		exp.ReplicaIncomplete = st.ReplicaIncomplete
 		exp.ReplicaIncompleteNote = explainReplicaIncomplete(st.ReplicaIncomplete)
-		exp.ServedLiveNote = explainServedLive(st.LastPromotedAt, st.Role)
+		exp.ServedLiveNote = explainServedLive(st.LastPromotedAt, st.Role, st.ReplicaSource)
 	} else if cfg.TargetDiskPath == "" {
 		// Nothing to read the disks off, so there is nothing to find. The
 		// remedy is named rather than left implicit, because the case below is
@@ -714,11 +714,27 @@ func explainReplicaIncomplete(raw string) string {
 // trace is the reason, and it is the only one that no amount of re-running
 // clears.
 //
-// role is taken so the note can say which of the two situations this is: a
-// promotion still in force needs no warning about what it blocks, because the
-// role already blocks everything. One that has been demoted does, because
-// nothing else on the domain says so any more.
-func explainServedLive(lastPromotedAt, role string) string {
+// role and replicaSource are taken so the note can say which of THREE
+// situations this is, and getting that down to two was a real defect:
+//
+//   - still `promoted`: no warning about what it blocks is needed, because the
+//     role already blocks everything.
+//   - `source` and nobody's replica: the primary an -invert produced. The record
+//     is kept there deliberately and nothing is outstanding.
+//   - anything else: demoted, and this record is the only thing left saying the
+//     disks served. That is the case the note exists for.
+//
+// The middle one used to fall through to the last, so -explain-domain told the
+// live primary of a resolved pair that it was "no longer marked promoted", that
+// this record was the only thing saying it ever served (the role says it is
+// authoritative), and to run -release-promotion -- which is refused while the
+// domain runs, and which would strip the guard if it were not.
+//
+// replicaSource is what separates a real inversion from `-update-role source`
+// typed at a promoted copy: the first clears it, the second leaves it, and only
+// the first has resolved anything. Same rule as the agent's
+// servedLiveUnresolved and inventory.Assess's.
+func explainServedLive(lastPromotedAt, role, replicaSource string) string {
 	if lastPromotedAt == "" {
 		return ""
 	}
@@ -736,7 +752,12 @@ func explainServedLive(lastPromotedAt, role string) string {
 		b.WriteString(" It is still marked promoted, so the role interlock already refuses every sync, restore and clean over it. This record is what will keep refusing them after the role changes -- a shutdown records paused, and takes the rest of the promotion record with it.")
 		return b.String()
 	}
-	b.WriteString(" It is no longer marked promoted, and this is the ONLY field still saying it ever was: every other trace of the failover was erased when the role changed. It is what refuses a sync, a restore and a -force-clean over these disks, and nothing clears it by being re-run.")
+	if role == libvirtsync.RoleSource && replicaSource == "" {
+		fmt.Fprintf(&b, " It is now the SOURCE of its pair and is nobody's replica, which is where an inversion leaves the copy that served -- so this pair is resolved and nothing is outstanding. The record is kept here deliberately: it is what refuses -update-role=%s on this domain, and turning the live primary of a pair into a replica is exactly as destructive as overwriting a promoted copy. Do NOT -%s it; that would remove the only thing standing in the way of that.",
+			libvirtsync.RoleTarget, libvirtsync.FlagReleasePromotion)
+		return b.String()
+	}
+	b.WriteString(" It is no longer the authoritative copy of its pair, and this is the ONLY field still saying it ever served: every other trace of the failover was erased when the role changed. It is what refuses a sync, a restore and a -force-clean over these disks, and nothing clears it by being re-run.")
 	fmt.Fprintf(&b, " If the failover stands, -invert reverses the pair and keeps this data. If the data is genuinely disposable, -%s says so, refuses while the domain is running, and records the decision in the action list below.", libvirtsync.FlagReleasePromotion)
 	return b.String()
 }

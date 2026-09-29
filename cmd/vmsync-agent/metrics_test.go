@@ -501,41 +501,124 @@ func TestSetServedLiveUnreleasedClearsWhenTheDecisionIsMade(t *testing.T) {
 	}
 }
 
-// TestServedLiveUnreleasedVMsExcludesADomainStillPromoted is the predicate's
-// only judgement, and it is the difference between a signal and noise.
+// TestServedLiveUnreleasedVMsReportsOnlyTheUndecided is the predicate's only
+// judgement, and it is the difference between a signal and noise.
 //
-// A domain still marked `promoted` is a failover in progress or a drill:
-// nothing is waiting on anybody, the role interlock already refuses everything,
-// and counting it would make this gauge non-zero for the whole duration of
-// every successful failover.
-func TestServedLiveUnreleasedVMsExcludesADomainStillPromoted(t *testing.T) {
+// Presence of the record is necessary and NOT sufficient. Two roles mean this
+// copy is the authoritative one, so nothing is pending: `promoted` (a failover
+// in force -- counting it would make the gauge non-zero for the whole duration
+// of every successful failover) and `source` (the primary an inversion
+// produced, which is the resolved state by definition).
+func TestServedLiveUnreleasedVMsReportsOnlyTheUndecided(t *testing.T) {
 	got := servedLiveUnreleasedVMs([]ReportDomain{
 		// Serving right now. Not undecided.
 		{Name: "web01", Role: libvirtsync.RolePromoted, Active: true, LastPromotedAt: "1700000000"},
-		// Promoted, then shut down. This is the one.
+		// Promoted, then shut down. This is the one the gauge exists for.
 		{Name: "db01", Role: libvirtsync.RolePaused, LastPromotedAt: "1700000000"},
 		// Fenced after a peer took over, and it was promoted earlier itself.
 		{Name: "mail01", Role: libvirtsync.RoleFenced, LastPromotedAt: "1600000000"},
+		// Already re-targeted but not released: the gates still refuse every
+		// sync into it, so it is still waiting on somebody.
+		{Name: "shop01", Role: libvirtsync.RoleTarget, LastPromotedAt: "1650000000"},
+		// No role recorded at all, with a record. Only reachable by hand-edited
+		// metadata (-update-role none is gated), and it is the most dangerous
+		// spelling of the state: the sync gate reads "" as permission.
+		{Name: "wiki01", Role: "", LastPromotedAt: "1640000000"},
 		// Already released, or never promoted: the overwhelming majority.
 		{Name: "app01", Role: libvirtsync.RoleTarget},
-		// Inverted into being the source. It carries the trace, and it is not
-		// waiting on a decision -- but it IS still refused as somebody's target,
-		// so it is reported. Being the source of its own pair does not make
-		// those disks disposable.
+		// The primary an inversion produced. It carries the record -- the
+		// inversion keeps it deliberately -- and it is NOT waiting on anybody.
 		{Name: "cache01", Role: libvirtsync.RoleSource, LastPromotedAt: "1500000000"},
 	})
 
-	for _, vm := range []string{"db01", "mail01", "cache01"} {
+	for _, vm := range []string{"db01", "mail01", "shop01", "wiki01"} {
 		if !got[vm] {
-			t.Errorf("%s carries a promotion record and is not marked promoted, so it must be reported", vm)
+			t.Errorf("%s has served live and is not the authoritative copy of its pair, so it must be reported", vm)
 		}
 	}
-	for _, vm := range []string{"web01", "app01"} {
-		if got[vm] {
-			t.Errorf("%s must not be reported: %q", vm, "a domain still promoted, or one with no record at all")
-		}
+	if got["web01"] {
+		t.Error("a domain still marked promoted was reported, so the gauge is non-zero for the whole duration of every failover")
 	}
-	if len(got) != 3 {
-		t.Errorf("got %d VMs, want 3: %v", len(got), got)
+	if got["app01"] {
+		t.Error("a domain with no record at all was reported")
+	}
+	if got["cache01"] {
+		t.Error("the primary an -invert produced was reported as an undecided failover. That series can never " +
+			"clear: the inversion is what put the record there, -release-promotion refuses a running domain, " +
+			"and the primary is running -- so the only way to clear it would be to shut production down, on a " +
+			"metric documented as 'not a stuck metric'")
+	}
+	if len(got) != 4 {
+		t.Errorf("got %d VMs, want 4: %v", len(got), got)
+	}
+}
+
+// TestACorrectlyInvertedPairReportsNothing is the regression as a scenario,
+// because the table above states the rule and this states the consequence.
+//
+// A pair is failed over and then resolved the way the documentation asks: the
+// promoted copy becomes the source, the old source becomes its replica. Both
+// ends are healthy, both are where they should be, and the estate is finished
+// with that incident. The gauge must be silent.
+//
+// The first version of this gauge was not. It keyed on the record minus
+// `promoted`, so the new source -- running, carrying the record the inversion
+// deliberately kept -- sat at 1 for ever, and the only way to clear it was to
+// shut the live primary down.
+func TestACorrectlyInvertedPairReportsNothing(t *testing.T) {
+	// hyper02p:web01 was promoted, then inverted into being the source.
+	// hyper01p:web01, the old source, is now its target and never served.
+	got := servedLiveUnreleasedVMs([]ReportDomain{
+		{Name: "web01", Role: libvirtsync.RoleSource, Active: true, LastPromotedAt: "1700000000",
+			ReplicaTargets: []string{"hyper01p:web01"}},
+	})
+	if len(got) != 0 {
+		t.Errorf("a resolved pair reported %v; the failover is over and nobody owes a decision", got)
+	}
+
+	// And the alert must come back the moment that same copy stops being the
+	// authoritative one, which is what makes the exclusion safe rather than a
+	// blanket suppression.
+	demoted := servedLiveUnreleasedVMs([]ReportDomain{
+		{Name: "web01", Role: libvirtsync.RolePaused, LastPromotedAt: "1700000000"},
+	})
+	if !demoted["web01"] {
+		t.Error("excluding `source` also suppressed the paused case, which is the state the gauge exists for")
+	}
+}
+
+// TestUpdateRoleSourceDoesNotSilenceANonReplicatingPair is the second half of
+// the `source` exclusion, and without it that exclusion was a way to switch the
+// alarm off.
+//
+// A real -invert clears replica_source on the copy it makes the source
+// (pkg/failover's NewSourceRemovals lists it first), so that copy is nobody's
+// replica and the pair genuinely works. `-update-role source` typed at a promoted
+// copy writes the role through SetReplicationRole's default branch, which strips
+// only promotionFields — replica_source survives. Both ends then read `source`,
+// TargetRoleAllowsSync refuses every sync between them, and that refusal is
+// exempt from failure_count. Nothing else on the host reports it.
+//
+// The console advertises this exact route ("`source` makes this copy the primary
+// and keeps the data"), so it is not a hypothetical.
+func TestUpdateRoleSourceDoesNotSilenceANonReplicatingPair(t *testing.T) {
+	// The real inversion: source, no replica_source. Resolved, silent.
+	if servedLiveUnresolved("1700000000", libvirtsync.RoleSource, "") {
+		t.Error("the primary an -invert produced is reported as undecided")
+	}
+	// The hand-written claim: source, still somebody's replica. Not resolved.
+	if !servedLiveUnresolved("1700000000", libvirtsync.RoleSource, "hyper01p:web01") {
+		t.Error("a domain marked `source` that is STILL somebody's replica went silent. That is " +
+			"-update-role source rather than an inversion: both ends read source, every sync between " +
+			"them is refused, failure_count stays 0, and this was the only series saying so")
+	}
+	// The role still wins for `promoted`, whatever replica_source says — a
+	// promoted copy is a replica by construction.
+	if servedLiveUnresolved("1700000000", libvirtsync.RolePromoted, "hyper01p:web01") {
+		t.Error("a promoted copy was reported; the role interlock already refuses everything")
+	}
+	// And no record is still no record.
+	if servedLiveUnresolved("", libvirtsync.RolePaused, "") {
+		t.Error("a domain with no promotion record was reported")
 	}
 }

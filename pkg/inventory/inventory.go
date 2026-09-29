@@ -375,9 +375,31 @@ func Assess(d Domain, now time.Time, cadence time.Duration) Assessment {
 	// it, all three of which the engine will refuse, for a reason nothing
 	// visible explains.
 	//
-	// Skipped while the role still says `promoted`, where the reason above
-	// already says it in the present tense.
-	if d.LastPromotedAtRaw != "" && d.Role != libvirtsync.RolePromoted {
+	// Skipped for the two states that mean this copy IS the authoritative one,
+	// so nothing is pending:
+	//
+	//   - `promoted`: the reason above already says it, in the present tense.
+	//   - `source` with no replica_source: the primary of its pair, which is
+	//     where an -invert leaves the copy that served. Saying "has not been
+	//     released ... -invert reverses the pair" on that domain is worse than
+	//     saying nothing: the inversion already happened, this IS the live
+	//     primary, and an operator who followed the advice would strip the guard
+	//     that protects it from being turned back into a replica. The trace is
+	//     still kept there and still gates -update-role target; it is simply not
+	//     a decision anyone owes.
+	//
+	// The replica_source clause is what separates a real inversion from
+	// `-update-role source` typed at a promoted copy: the first clears
+	// replica_source, the second leaves it, and without the clause that second
+	// one silences this reason on a pair whose ends both read `source` and
+	// between which nothing replicates at all.
+	//
+	// Same rule as the agent's servedLiveUnresolved and the console's
+	// ServedLiveUnresolved, and they must stay the same rule: a console row, a
+	// metric and an inventory reason that disagree about which copies are
+	// waiting are worse than any one of them alone.
+	if d.LastPromotedAtRaw != "" && d.Role != libvirtsync.RolePromoted &&
+		!(d.Role == libvirtsync.RoleSource && d.ReplicaSource == "") {
 		when := "at an unrecorded time"
 		if d.LastPromotedAtUnix > 0 {
 			when = "on " + time.Unix(d.LastPromotedAtUnix, 0).UTC().Format(time.RFC3339)

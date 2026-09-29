@@ -667,15 +667,23 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	// the point rather than a defect: a value that has not moved in a week is a
 	// decision nobody has made about production data, not a stuck series.
 	//
+	// Both of those must actually CLEAR it, which is what servedLiveUnresolved
+	// is for. The first version of this gauge keyed on the record minus
+	// `promoted`, so the -invert route did not clear it at all -- the inversion
+	// keeps the trace on the copy it makes the source, that copy is running, and
+	// -release-promotion refuses a running domain. The series sat at 1 for ever
+	// on a fully resolved pair, which on a gauge that says "not a stuck series"
+	// is the one thing it must never do.
+	//
 	// Emitted unconditionally, at zero when there is nothing to say, for the
 	// reason given at the split-brain gauge: an alert cannot use a `for:` clause
 	// over a window that begins before the series it reads came into existence.
-	g("vmsync_agent_served_live_unreleased_vms", "Copies on this host that have been promoted at some point (last_promoted_at), are no longer marked promoted, and whose promotion record has not been released. Their disks may hold the only copy of data that was serving, so vmsync refuses to sync, restore or force-clean over them -- force-clean included. Nothing clears this automatically: an operator runs -release-promotion if the data is disposable, or -invert if the failover stands. A value that has not moved in days is an undecided failover, not a stuck metric. Domains still marked promoted are excluded, so a failover in progress and a successful DR test do not register.", len(servedLiveVMs), "")
+	g("vmsync_agent_served_live_unreleased_vms", "Copies on this host that have been promoted at some point (last_promoted_at), are NOT the authoritative copy of their pair, and whose promotion record has not been released. Their disks may hold the only copy of data that was serving, so vmsync refuses to sync, restore or force-clean over them -- force-clean included -- and replication into them is stopped with failure_count deliberately left at 0, so this is the only series that says so. Alert on it with a long for:. Two things clear it, both deliberate: -release-promotion on the copy while it is shut down, or an -invert that makes this copy the primary of its pair. Excluded: a domain marked promoted (a failover in force), and one marked source that is nobody's replica (the primary an inversion produced) -- both are resolved states, not pending ones. A source that still records a replica_source is NOT excluded: that is -update-role source typed at a promoted copy rather than a real inversion, both ends then read source, and nothing replicates between them. A DR drill that was promoted and then demoted DOES register, and does block replication until somebody decides -- the engine cannot know whether that copy was ever booted, so it protects the disks either way.", len(servedLiveVMs), "")
 	// HELP and TYPE once, then one sample line per VM -- NOT g() per VM, for the
 	// reason spelled out at the split-brain gauge: a second HELP line for one
 	// family makes node_exporter reject the whole file.
 	if len(servedLiveVMs) > 0 {
-		fmt.Fprintf(&b, "# HELP vmsync_agent_served_live_unreleased 1 while that VM has served live, is no longer marked promoted, and its promotion record has not been released. Decide: -invert if the failover stands and this copy is the real one, or -release-promotion on this host if its data is disposable.\n# TYPE vmsync_agent_served_live_unreleased gauge\n")
+		fmt.Fprintf(&b, "# HELP vmsync_agent_served_live_unreleased 1 while that VM has served live, is not the authoritative copy of its pair, and its promotion record has not been released. Decide: -invert if the failover stands and this copy is the real one (which makes it the source and clears this), or shut it down and run -release-promotion here if its data is disposable.\n# TYPE vmsync_agent_served_live_unreleased gauge\n")
 		for _, vm := range servedLiveVMs {
 			fmt.Fprintf(&b, "vmsync_agent_served_live_unreleased{host=%q,vm=%q} 1\n", host, vm)
 		}
@@ -899,14 +907,16 @@ func scanDomainStatus(cfg agentConfig) (inventoryScan, error) {
 		if d.ReplicaIncomplete != "" {
 			incomplete[d.Name] = true
 		}
-		// A copy that served live, was demoted, and that nobody has decided
-		// about. Standalone matters most for this one: there is no console to
-		// show the row on, the refusals it causes are exempt from
+		// A copy that served live, is not the authoritative one, and that nobody
+		// has decided about. Standalone matters most for this one: there is no
+		// console to show the row on, the refusals it causes are exempt from
 		// failure_count, and the domain's own role reads `paused` -- so without
-		// this gauge nothing on the host says anything at all. Same predicate
-		// as the report path's, and the `promoted` exclusion is the same
-		// judgement; see servedLiveUnreleasedVMs.
-		if d.LastPromotedAtRaw != "" && d.Role != libvirtsync.RolePromoted {
+		// this gauge nothing on the host says anything at all.
+		//
+		// Through the SAME function the report path uses, so a standalone host
+		// and a controlled one cannot disagree about which copies are waiting.
+		// The two used to carry the role test separately.
+		if servedLiveUnresolved(d.LastPromotedAtRaw, d.Role, d.ReplicaSource) {
 			servedLive[d.Name] = true
 		}
 		// A fence that suspended replication without stopping the domain. In
@@ -982,11 +992,67 @@ func incompleteReplicaVMs(domains []ReportDomain) map[string]bool {
 func servedLiveUnreleasedVMs(domains []ReportDomain) map[string]bool {
 	out := map[string]bool{}
 	for _, d := range domains {
-		if d.LastPromotedAt != "" && d.Role != libvirtsync.RolePromoted {
+		if servedLiveUnresolved(d.LastPromotedAt, d.Role, d.ReplicaSource) {
 			out[d.Name] = true
 		}
 	}
 	return out
+}
+
+// servedLiveUnresolved reports whether a copy has served live and is STILL
+// WAITING ON A DECISION. Pure, and shared by both feeders, because the two used
+// to carry the role test separately and that is how they would drift apart.
+//
+// Presence of the record is necessary but not sufficient, and getting that wrong
+// was a real defect in this gauge's first version. It reported on the record
+// alone minus `promoted`, which made it fire FOR EVER on the primary of every
+// correctly inverted pair: an inversion deliberately keeps the trace on the copy
+// it makes the source (pkg/failover's NewSourceRemovals says so in as many
+// words), that copy is running by definition, and -release-promotion refuses a
+// running domain -- so the only way to clear the series was to shut production
+// down. On a metric documented as "a value that has not moved in days is an
+// undecided failover", that is the worst possible failure.
+//
+// Two states mean this copy IS the authoritative one and nothing is pending:
+//
+//   - `promoted`: a failover in force. The role interlock already refuses
+//     everything, and counting it would make the gauge non-zero for the whole
+//     duration of every successful failover.
+//   - `source` AND no replica_source: the primary of its pair, which is where an
+//     -invert leaves the copy that served. The pair is RESOLVED -- that is what
+//     the inversion did. TargetRoleAllowsSync refuses `source` outright and
+//     -force-clean does not override it, so the trace guards nothing here that
+//     the role does not guard harder.
+//
+// THE replica_source CLAUSE IS NOT DECORATION, and leaving it out was a real
+// hole. `source` alone is a claim, and an operator can write it by hand: a
+// promoted copy demoted with `-update-role source` gets the role and keeps its
+// replica_source, because SetReplicationRole strips only promotionFields. Both
+// ends of the pair then read `source`, every sync between them is refused, that
+// refusal is exempt from failure_count -- and if this function trusted the role
+// alone, every signal would go quiet on a pair that had stopped replicating in
+// both directions. A real -invert is what clears replica_source (pkg/failover's
+// NewSourceRemovals lists it first), so requiring it empty is exactly the
+// difference between "an inversion resolved this" and "somebody typed a word
+// at it".
+//
+// Every other state -- paused, fenced, target, no role recorded, or a `source`
+// that is still somebody's replica -- is a copy that holds data which served
+// live while something else is, or is about to be, the authoritative copy. That
+// is the state nothing else on the host reports.
+//
+// The trace is still KEPT on a source, and this function deliberately does not
+// change that: it gates -update-role target, and making the live primary of a
+// pair into a replica is exactly as destructive as overwriting a promoted copy.
+// What is decided here is the REPORTING, not the protection.
+func servedLiveUnresolved(lastPromotedAt, role, replicaSource string) bool {
+	if lastPromotedAt == "" {
+		return false
+	}
+	if role == libvirtsync.RolePromoted {
+		return false
+	}
+	return !(role == libvirtsync.RoleSource && replicaSource == "")
 }
 
 // clockSkewWarnAt is when a UI clock difference stops being noise.
