@@ -104,6 +104,7 @@ vmsync itself to work at all).
 ./bench.sh --stages interrupted-reinit   # 16 opt-in: kill a rebuild mid-copy, then try to promote it
 ./bench.sh --stages journal      # 17 the action journal beside the replica's disks
 ./bench.sh --stages colocated    # 18 opt-in: two target domains sharing one replica directory
+./bench.sh --stages leftovers    # 19 opt-in: displaced sets reported, reclaimed only when asked
 ```
 
 Stages 2, 3, 4, 9, 10 and 11 each run their own baseline `-reinit` full
@@ -503,8 +504,9 @@ real-life coverage at all before it existed. Opt in with `--stages
 
 It is deliberately **power-neutral and direction-neutral**: it never stops
 a domain and never reverses a pair. The sequence is baseline `-reinit` →
-promote → inspect → arm a fence → inspect → `-update-role=target` → sync
-again, ending exactly where it started. What it asserts:
+promote → inspect → arm a fence → inspect → demote to `paused` →
+`-release-promotion` → `-update-role=target` → sync again, ending exactly where
+it started. What it asserts:
 
 - a promotion records `role=promoted`, a timestamp, and a `promoted_from`
   matching the `replica_source` the sync itself wrote — which also catches
@@ -528,8 +530,25 @@ again, ending exactly where it started. What it asserts:
   noticed the old source is still serving";
 - `-shutdown-domain` **refuses a remote libvirt URI**, which is what keeps
   a failover working when the other site is unreachable;
-- `-update-role=target` takes the promotion record *and* the fence with
-  it, and replication actually resumes afterwards.
+- a promotion records **`last_promoted_at`** as well, from the same clock
+  reading as `promoted_at` so the two cannot disagree — the durable half of the
+  record, and the only one that will still be there after the role changes;
+- **the whole way back, in order, with the refusals and the recovery both
+  asserted.** A gate proven only by its refusals is a gate that might be a
+  lockout, so every step checks both directions:
+  1. `-release-promotion` **refuses** a domain still marked `promoted` — a
+     demotion re-records the trace, so releasing first would be a silent no-op;
+  2. `-update-role=paused` succeeds and **keeps** `last_promoted_at` while
+     taking `promoted_at` and the fence. This is the assertion the whole of
+     CI-09 rests on: `paused` is what a clean shutdown records, and before the
+     trace existed that one command left the copy that had been serving
+     production looking like an ordinary idle replica;
+  3. `-update-role=target` is **refused** while the trace stands — the act
+     every unattended path is behind;
+  4. `-release-promotion` succeeds on the demoted copy and clears it;
+  5. `-update-role=target` then succeeds, the fence and the promotion record
+     are still gone, the released record does **not** come back, and
+     replication actually resumes.
 
 It also checks **who owns the target's disks**, which is the check that
 would have caught the bug the ownership handling was written for: vmsync
@@ -634,8 +653,30 @@ What it asserts:
   the promoted copy**. A fence sweep must skip anything whose role is not
   `source`, and a bug there would stop the copy that just took over.
 
+**7g — a live promoted copy cannot be relabelled out from under itself.** This is
+the only place on the harness where a promoted domain is actually *running* and
+carrying an armed fence, which makes it the only place that guard can be
+exercised at all: the engine reads the domain's runtime state, and no unit test
+can reach that read. Four assertions, and the last two are why it is not just a
+refusal test:
+
+- `-update-role=paused` is **refused**. Recording a serving copy as an
+  administratively paused replica is the misclick the issue is about, and the
+  same write would discard the fence against the source it displaced.
+- the refusal left the role **and the armed fence** untouched — a half-applied
+  refusal would be worse than none.
+- `-update-role=source` **is accepted**, because `source` says the same thing
+  about a running copy that `promoted` does. Refusing it would close the one
+  route that keeps the data, which every served-live refusal points at.
+- and that transition **keeps the fence token**, because it rewrites this end
+  only: the domain this copy displaced still calls itself a source, so the
+  arrangement the token describes is still in force.
+
+It puts the role back to `promoted` afterwards (which writes no promotion record
+and strips nothing) because everything below it needs a promoted target.
+
 Needs `SOURCE_AGENT_BIN` (the agent that gets fenced) and
-`TARGET_VMSYNC_BIN` (to promote). `TARGET_AGENT_BIN`, `SOURCE_VMSYNC_BIN`,
+`TARGET_VMSYNC_BIN` (to promote). `TARGET_AGENT_BIN`,
 `AGENT_WORK_DIR` and `FENCE_WAIT_SECONDS` are optional — see
 `bench.conf.example`. Without the two required ones the stage skips rather
 than failing. When a fence does not fire, the agent's own log is at
@@ -778,8 +819,23 @@ exactly like a healthy run. So the stage runs a real sync afterwards and
 asserts both that it **refused** and that the restored bytes are **still on
 disk** when it did.
 
+**The role gate is checked in two halves, and the second is the interesting
+one.** A restore is refused on a domain marked `promoted` — that has always been
+asserted. But shutting a promoted copy down records `paused`, and the restore
+gate *permits* `paused` on purpose, because rolling a paused replica back is the
+ordinary reason the verb exists. So one command turned the strongest refusal in
+this stage into an allowance. The stage now demotes the promoted copy to
+`paused` and asserts the restore is **still refused** — by `last_promoted_at`
+this time, with `-force-restore` included — then runs `-release-promotion` and
+asserts it is **permitted again**, because a refusal with no way past it would
+make every replica that had ever been failed over permanently unrestorable.
+That last check is an assessment (no `-force-restore`) deliberately: both gates
+run before the assessment prints, so it still proves the refusal has lifted,
+without replacing the disks in the middle of a stage whose own restore has not
+run yet.
+
 The rest: the assessment (no `-force-restore`) changes neither the replica nor
-its metadata; a restore is refused on a domain marked `promoted`; the metadata
+its metadata; the metadata
 afterwards names the restored point's checkpoint and `checkpoint_at`, has
 `source_stopped_at_sync` cleared and `replication_role=paused`; the three
 fields `pkg/failover` reads as promotion evidence are all still satisfied
@@ -1200,6 +1256,38 @@ directories that are not its own. Planting also produces the one thing a second
 pair could not conveniently arrange: an in-flight staging directory, which a live
 run only has for the seconds it is copying. Everything it plants is removed when
 the stage ends.
+
+### Stage 19 (`leftovers`), opt-in
+
+Proves the two halves of `-reclaim-leftovers-after`: that every run **reports**
+the displaced sets beside a replica whether or not reclaiming is on, and that
+reclaiming takes only what it was asked for. Needs `TARGET_DISK_PATH` set; skips
+cleanly saying so without it.
+
+Three of vmsync's own operations leave a full-size copy behind, and nothing used
+to remove or even name any of them. The disk asides are made by the **default**
+`-replaced-disk-action`, one per disk per rebuild, and they share extents on the
+day they are made — so they cost nothing when they appear and approach a whole
+replica as the live disk is rewritten around them. The bill arrives as an ENOSPC
+on the DR host that fails a commit for every VM on it.
+
+| sub-test | what it would catch |
+| --- | --- |
+| a rebuild leaves one aside file per disk | the premise. Without it the rest of the stage is asserting things about files that are not there, which would pass silently |
+| a run with no duration reports the sets and removes none | **the reporting half**, which is what an estate that has been running a year needs first: the files are already there, and nothing named them. Also pins the default — a sweep that removed anything without being asked would have deleted the documented recovery for a failed rebuild on every estate that upgraded |
+| a duration under the floor is refused at startup | `0h` is what somebody writes meaning "off", and `30` is what they write meaning thirty days, which Go will not parse at all. Either obeyed would remove an aside made minutes earlier. Checked by exit code *and* by the files still being there, because "refused" has to mean before acting |
+| a fresh aside is not reclaimed | that the age test is doing the work, rather than the sweep taking everything it finds |
+| an aside older than the duration is reclaimed | that it does anything at all — the negative tests above all pass trivially against a sweep that is broken |
+| a co-located domain's aside is left alone | **stage 18's lesson in a new reader.** Replicas normally share one images directory, so a sweep reading the DIRECTORY rather than this domain's own disks charges every machine's asides to every machine, and offers one VM's only good copy as another's reclaimable space |
+| a restore point store moved aside is reclaimed | the sub-case nothing could previously name: these directories sit *beside* the per-domain stores, so `-list-restore-points` cannot see them and every point inside them is outside every store. Recorded as SKIP rather than PASS when `-reinit` had no store to move aside |
+| nothing is reclaimed while the replica is marked incomplete | **the interlock this feature could not ship without.** While `replica_incomplete` is set, the aside files *are* the complete replica the rebuild replaced and putting them back is the documented recovery; a sweep that took them would leave a half-written image whose metadata still reads healthy |
+| the refusal does not fail the sync | that standing down is a warning. The run it happens inside is the one repairing the replica, so failing it would turn a protection into an outage |
+
+Ages are faked by rewriting the unix stamp in each name, not by moving a clock:
+the stamp is what vmsync reads, and changing the host's time would invalidate
+every other timestamp the replica carries. The co-located aside is planted rather
+than produced by a second pair, for the same reason stage 18 plants its own. The
+stage leaves the replica complete and removes everything it planted.
 
 ## Files
 

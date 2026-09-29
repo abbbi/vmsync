@@ -292,6 +292,26 @@ rm -rf'd every co-located replica's entire history in a single command. The
 co-located domain is planted rather than replicated -- a second live pair would
 race the first, and what has to be proved is only that this domain's sync never
 touches directories that are not its own.
+
+Stage 19 (leftovers) is opt-in, and needs TARGET_DISK_PATH set. It proves the
+two halves of -reclaim-leftovers-after: that every run REPORTS the displaced sets
+beside a replica whether or not reclaiming is on, and that reclaiming takes only
+what it was asked for. The files are made by the DEFAULT -replaced-disk-action,
+one full-size copy per disk per rebuild, sharing extents on the day they are made
+and approaching a whole replica afterwards -- and before this existed nothing
+removed or even named any of them, so the cost surfaced as an ENOSPC that failed
+a commit for every VM on the DR host. Four of the sub-tests are negative, and
+they are the ones worth having: a duration under the 24h floor must stop the run
+before it acts, a fresh aside must survive a year-long duration, a co-located
+domain's aside must be left alone (the sweep reads this domain's disks, not the
+directory -- stage 18's lesson in a new reader), and a replica marked
+replica_incomplete must have nothing reclaimed at all, because there the aside
+set is the only complete copy of the replica there is. That last one is produced
+with the same injected fault stage 16 uses, and it also checks that the sweep
+standing down is a warning rather than a failed sync -- the run it happens inside
+is the one repairing the replica. Ages are faked by rewriting the unix stamp in
+each name rather than by moving a clock: the stamp is what vmsync reads, and
+moving the host's time would invalidate every other timestamp the replica carries.
 EOF
 }
 
@@ -2581,10 +2601,55 @@ FAILOVER_FAILURES=0
 # reset state some other way would hide that it had stopped working. The
 # PRE-condition reset deliberately does not use it -- see reset_pair_state.
 clear_target_promotion() {
+	# Three commands, in this order, because -update-role=target is now gated
+	# on the durable promotion record and a promotion writes one.
+	#
+	# paused first: the release refuses a domain still marked promoted, since a
+	# demotion re-records the trace and releasing before demoting would be a
+	# silent no-op. Then the release, then the retarget. Failures of the first
+	# two are deliberately NOT fatal here -- this runs on the cleanup path
+	# against a target that may be in any state, including one that was never
+	# promoted at all (where both are no-ops, and the release exits 0 saying
+	# there was nothing to release). What decides the outcome is the role read
+	# at the end, which is the only thing later stages care about.
+	ssh_host_cmd "$TARGET_HOST" "$TARGET_VMSYNC_BIN" \
+		-update-role paused -target-uri qemu:///system -target-domain "$TARGET_DOMAIN" \
+		>/dev/null 2>&1 || true
+	ssh_host_cmd "$TARGET_HOST" "$TARGET_VMSYNC_BIN" \
+		-release-promotion -target-uri qemu:///system -target-domain "$TARGET_DOMAIN" \
+		>/dev/null 2>&1 || true
 	ssh_host_cmd "$TARGET_HOST" "$TARGET_VMSYNC_BIN" \
 		-update-role target -target-uri qemu:///system -target-domain "$TARGET_DOMAIN" \
 		>/dev/null 2>&1 || return 1
 	[ "$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)" = target ]
+}
+
+# retarget_promoted_target SC LABEL LOCAL_URI -- put a PROMOTED target back to
+# role=target, through vmsync, with each command logged like any other run.
+#
+# Three commands, and the order is forced: a promotion writes a durable
+# last_promoted_at, -update-role=target is refused while it stands, and
+# -release-promotion refuses a domain still marked promoted (a demotion
+# re-records the trace, so releasing first would silently do nothing).
+#
+# Its own helper rather than three lines repeated at each site, because the
+# sites are all cleanup paths in stages whose real subject is something else --
+# a verify failure, an interrupted rebuild -- and a stage that fails to put the
+# role back does not merely fail its own sub-test. Every later sync into the
+# target is refused, and several of these stages heal their replica with a sync
+# from a RETURN trap, so leaving the role wrong turns one cleanup slip into a
+# die() with a knowingly corrupted replica still in place.
+#
+# Sets RUN_RC from the last command, so a caller can check the outcome the same
+# way it would check a single run.
+retarget_promoted_target() {
+	local sc="$1" label="$2" local_uri="$3"
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" "${label}-demote" \
+		-update-role paused -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" "${label}-release" \
+		-release-promotion -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" "$label" \
+		-update-role target -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
 }
 
 # has_vmsync_metadata URI DOMAIN -> true when the domain carries a vmsync
@@ -2644,7 +2709,9 @@ reset_pair_state() {
 # target is "marked promoted" when it is not sends them looking for a failover
 # that never happened.
 warn_target_still_promoted() {
-	warn "$TARGET_DOMAIN on $TARGET_HOST is still marked ${1:-promoted}. Every sync into it -- this harness's later stages included -- will be refused until that is cleared. Run this on $TARGET_HOST:  ${TARGET_VMSYNC_BIN:-vmsync} -update-role target -target-uri qemu:///system -target-domain $TARGET_DOMAIN"
+	warn "$TARGET_DOMAIN on $TARGET_HOST is still marked ${1:-promoted}. Every sync into it -- this harness's later stages included -- will be refused until that is cleared. Run these on $TARGET_HOST, in this order:  ${TARGET_VMSYNC_BIN:-vmsync} -update-role paused -target-uri qemu:///system -target-domain $TARGET_DOMAIN  &&  ${TARGET_VMSYNC_BIN:-vmsync} -release-promotion -target-uri qemu:///system -target-domain $TARGET_DOMAIN  &&  ${TARGET_VMSYNC_BIN:-vmsync} -update-role target -target-uri qemu:///system -target-domain $TARGET_DOMAIN"
+	warn "the middle command is why there are three: a copy that has been promoted keeps a durable last_promoted_at, and -update-role=target is refused while it stands. The demotion first, because the release refuses a domain still marked promoted."
+	warn "if $TARGET_DOMAIN is also RUNNING, stop it before any of the three: vmsync refuses to record a running promoted domain as anything but source, and -release-promotion refuses a running domain outright. No bench stage starts a promoted target, so this should not happen -- if it has, something started it."
 }
 
 # require_target_syncable -- confirms the reset actually took.
@@ -2669,6 +2736,25 @@ require_target_syncable() {
 		return 1
 		;;
 	esac
+
+	# The role is not the only thing that refuses a sync any more. A copy that
+	# has been promoted keeps last_promoted_at through every role change, and
+	# the sync gate reads it -- so a leftover trace from an interrupted stage
+	# refuses the baseline below with a message about production data, three
+	# minutes into a full copy, on a domain whose role reads perfectly fine.
+	#
+	# reset_pair_state removes the whole metadata block so this should never
+	# fire; it is here because "should never" is exactly the class of thing that
+	# cost a debugging session the last time a new field was added to the
+	# refusals and not to this check.
+	local served
+	served="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_promoted_at)"
+	if [ -n "$served" ]; then
+		warn "$stage: the target still carries last_promoted_at='$served' after resetting it, so every sync into it would be refused as an overwrite of data that served live -- skipping."
+		warn "clear it on $TARGET_HOST with:  ${TARGET_VMSYNC_BIN:-vmsync} -release-promotion -target-uri qemu:///system -target-domain $TARGET_DOMAIN"
+		results_row "$CSV" "$stage" skipped 0 "" "" "" "" "" "SKIPPED target carries last_promoted_at"
+		return 1
+	fi
 	return 0
 }
 
@@ -2942,6 +3028,22 @@ stage_failover() {
 		fo_check "$sc" "promoted_from names the source the replica came from" "$fo_ok" \
 			"got '$promoted_from' want '$src_ref'"
 
+		# The durable half, written by the promotion itself and in the same
+		# metadata call. Asserted separately from promoted_at because the two
+		# have opposite lifetimes and the whole design rests on that: this one
+		# is the only field that will still be here after the role changes, so
+		# a promotion that failed to write it leaves nothing at all protecting
+		# these disks once the copy is shut down.
+		local served_live
+		served_live="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_promoted_at)"
+		if [ -n "$served_live" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the promotion records that this copy has served live" "$fo_ok" \
+			"last_promoted_at empty -- nothing will refuse a sync, restore or force-clean over this copy once its role changes"
+
+		if [ "$served_live" = "$promoted_at" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the durable record and the promotion agree on the time" "$fo_ok" \
+			"last_promoted_at='$served_live' promoted_at='$promoted_at' -- written from one clock reading in one call, so they cannot disagree"
+
 		fence_src="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" fence_source)"
 		if [ -z "$fence_src" ]; then fo_ok=0; else fo_ok=1; fi
 		fo_check "$sc" "a promotion with no -fence-source arms NOTHING" "$fo_ok" \
@@ -3063,26 +3165,108 @@ stage_failover() {
 	# and it must take the promotion record and the fence with it: a domain
 	# carrying role=target alongside a live fence_source would be a token
 	# authorising a shutdown that nothing justifies.
+	#
+	# It is now also gated, and the order below is the whole mechanism in
+	# sequence: the release is refused before the demotion, the demotion keeps
+	# the durable record, -update-role=target is refused while that record
+	# stands, the release then clears it, and only then does the way back open.
+	# Every step asserts the refusal AND the recovery -- a gate proven only by
+	# its refusals is a gate that might be a lockout.
+
+	# 1. The release refuses to run before the demotion. Not pedantry: a
+	#    demotion re-records the trace from promoted_at, so releasing first
+	#    and demoting second would silently have no effect, and an operator
+	#    would conclude the flag does not work.
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" release-before-demote \
+		-release-promotion -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+	if [ "$RUN_RC" != 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "-release-promotion refuses a domain still marked promoted" "$fo_ok" \
+		"exit $RUN_RC -- a demotion re-records the trace, so releasing first would be a no-op that looks like success"
+
+	# 2. Demote to paused, which is exactly what the console's "Shut down
+	#    cleanly" does, and the state CI-09 was about. The record must SURVIVE
+	#    it -- that survival is the entire point of the field, and it is the
+	#    one assertion in this stage that no other check can substitute for.
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" demote-to-paused \
+		-update-role paused -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "-update-role=paused succeeds on a promoted copy" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
+
+	if [ "$DRY_RUN" != yes ]; then
+		local paused_trace paused_promoted_at
+		paused_trace="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_promoted_at)"
+		if [ -n "$paused_trace" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "demoting a promoted copy KEEPS the record that it served live" "$fo_ok" \
+			"last_promoted_at is empty after -update-role=paused -- every trace of the failover is then gone, and a restore or force-clean over these disks is refused by nothing"
+
+		# And the present-tense record does go, because a domain marked paused
+		# beside a promoted_at describes a failover still in force.
+		paused_promoted_at="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" promoted_at)"
+		if [ -z "$paused_promoted_at" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "demoting still takes the present-tense promotion record" "$fo_ok" \
+			"promoted_at is still '$paused_promoted_at'"
+	fi
+
+	# 3. The gate itself: the one act that makes this copy syncable again is
+	#    refused while the record stands. This is the step every unattended
+	#    path is behind -- a scheduled sync and -reinit-after-failures both
+	#    need role=target, and neither can reach it on its own.
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" retarget-refused \
+		-update-role target -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+	if [ "$RUN_RC" != 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "-update-role=target is refused on a copy that has served live" "$fo_ok" \
+		"exit $RUN_RC -- without this refusal the next scheduled sync overwrites a copy that held production data, unattended"
+
+	# 4. The release, which is the one override and has to be typed. After it,
+	#    the way back must open -- a gate with no key is a lockout, and the
+	#    documented alternative (-invert) is not available to an operator who
+	#    has decided the data is disposable.
+	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" release-promotion \
+		-release-promotion -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "-release-promotion succeeds on a demoted copy" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
+
+	if [ "$DRY_RUN" != yes ]; then
+		local released_trace
+		released_trace="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_promoted_at)"
+		if [ -z "$released_trace" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the release clears the record" "$fo_ok" \
+			"last_promoted_at is still '$released_trace', so the release did nothing and the pair is wedged"
+	fi
+
+	# 5. And now the way back works, which is what the whole sequence is for.
 	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" update-role-back \
 		-update-role target -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
 	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
-	fo_check "$sc" "-update-role=target succeeds" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
+	fo_check "$sc" "-update-role=target succeeds once the promotion is released" "$fo_ok" "exit $RUN_RC see $RUN_LOG"
 
 	if [ "$DRY_RUN" != yes ]; then
-		local role_back fence_back promoted_back
+		local role_back fence_back promoted_back trace_back
 		role_back="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
 		if [ "$role_back" = target ]; then fo_ok=0; else fo_ok=1; fi
 		fo_check "$sc" "the target is a target again" "$fo_ok" "got '$role_back'"
 
+		# Both were cleared by the demotion in step 2 above, which is where
+		# they are asserted. Re-read here anyway, because these are the two
+		# fields whose survival would be worst and the demotion is not the only
+		# write between then and now: the release and this -update-role have
+		# both touched the metadata since, and a merge that resurrected either
+		# would leave a domain marked target carrying a token that authorises
+		# shutting its source down.
 		fence_back="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" fence_source)"
 		if [ -z "$fence_back" ]; then fo_ok=0; else fo_ok=1; fi
-		fo_check "$sc" "clearing the role takes the fence with it" "$fo_ok" \
-			"fence_source is still '$fence_back'"
+		fo_check "$sc" "the fence is still gone at the end of the way back" "$fo_ok" \
+			"fence_source is '$fence_back' on a domain marked target"
 
 		promoted_back="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" promoted_at)"
 		if [ -z "$promoted_back" ]; then fo_ok=0; else fo_ok=1; fi
-		fo_check "$sc" "clearing the role takes the promotion record with it" "$fo_ok" \
-			"promoted_at is still '$promoted_back'"
+		fo_check "$sc" "the promotion record is still gone at the end of the way back" "$fo_ok" \
+			"promoted_at is '$promoted_back' on a domain marked target"
+
+		trace_back="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_promoted_at)"
+		if [ -z "$trace_back" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the released record does not come back" "$fo_ok" \
+			"last_promoted_at is '$trace_back' again -- a domain marked target carrying it refuses its own syncs for ever"
 
 		# Recording the failure is not enough. A target left promoted refuses
 		# every later sync, so a stage that merely noted it and moved on would
@@ -3158,8 +3342,14 @@ agent_standalone_config() {
 # file to read now lives in this document. Mode is the ABSENCE of a
 # "control_plane" block, which is what makes this a standalone agent -- there
 # is no --standalone flag to pass and no way for the two to disagree.
+#
+# prometheus_dir is set to the same scratch directory, which is what makes the
+# agent write metrics at all: the loop that produces them is gated on this being
+# non-empty (cmd/vmsync-agent/main.go), so without it a stage cannot assert on
+# anything the agent publishes -- and the split-brain and fenced-running gauges
+# are the only place some conditions are ever reported.
 agent_local_config() {
-	printf '{\n  "config_version": 1,\n  "state_dir": "%s",\n  "vmsync_path": "%s",\n  "schedule_file": "%s/schedule.json",\n  "log": { "debug": true }\n}\n' "$1" "$2" "$1"
+	printf '{\n  "config_version": 1,\n  "state_dir": "%s",\n  "vmsync_path": "%s",\n  "schedule_file": "%s/schedule.json",\n  "prometheus_dir": "%s",\n  "log": { "debug": true }\n}\n' "$1" "$2" "$1" "$1"
 }
 
 # agent_start HOST IS_LOCAL AGENT_BIN VMSYNC_BIN_THERE VM WORKDIR -> prints
@@ -3292,10 +3482,12 @@ stage_fence_agent() {
 			-update-role none -target-uri "$local_uri" -target-domain "$SOURCE_DOMAIN" \
 			>/dev/null 2>&1 \
 			|| warn "could not clear the source's replication role -- do it by hand: vmsync -update-role none -target-uri $local_uri -target-domain $SOURCE_DOMAIN"
-		ssh_host_cmd "$TARGET_HOST" "$TARGET_VMSYNC_BIN" \
-			-update-role target -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN" \
-			>/dev/null 2>&1 \
-			|| warn "could not put the target back to role=target -- do it by hand, or every later sync into it will be refused"
+		# Through clear_target_promotion rather than a bare -update-role: this
+		# target was promoted, so it carries the durable last_promoted_at that
+		# -update-role=target is now refused on. That helper does the demote,
+		# the release and the retarget in the one order that works.
+		clear_target_promotion \
+			|| warn "could not put the target back to role=target -- do it by hand, or every later sync into it will be refused; see the three commands warn_target_still_promoted prints"
 
 		if [ "$src_state" = running ]; then
 			local now_state
@@ -3339,6 +3531,64 @@ stage_fence_agent() {
 	tgt_state="$(dom_state "$TARGET_URI" "$TARGET_DOMAIN" 2>/dev/null || true)"
 	if [ "$tgt_state" = running ]; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "the promoted copy is running, which the fence requires" "$fo_ok" "got '$tgt_state'"
+
+	# --- 7g: a LIVE promoted copy cannot be relabelled out from under itself --
+	#
+	# This stage is the only place on the harness where a promoted domain is
+	# actually RUNNING and carrying an armed fence, which makes it the only place
+	# the CI-36 guard can be exercised at all: SetReplicationRole reads the
+	# domain's runtime state, and no unit test can reach that read.
+	#
+	# Three assertions, and the third is the one that matters most. The refusal
+	# alone would be satisfied by a build that refused everything.
+	if [ "$DRY_RUN" != yes ] && [ "$tgt_state" = running ]; then
+		vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" relabel-live-refused \
+			-update-role paused -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+		if [ "$RUN_RC" != 0 ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "-update-role=paused is refused on a RUNNING promoted copy" "$fo_ok" \
+			"exit $RUN_RC -- recording a serving copy as an administratively paused replica is the misclick CI-36 is about, and the same write discards the fence against the source it displaced; see $RUN_LOG"
+
+		local live_role live_fence
+		live_role="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
+		if [ "$live_role" = promoted ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the refused relabel left the role untouched" "$fo_ok" \
+			"role is '$live_role' -- a refusal that half-applied would be worse than none"
+
+		live_fence="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" fence_id)"
+		if [ "$live_fence" = "$fence_id" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the refused relabel left the armed fence intact" "$fo_ok" \
+			"fence_id is '$live_fence', was '$fence_id' -- the token is the credential that authorises stopping the displaced source, and no role change restores it"
+
+		# And the exemption, which is what keeps this a gate rather than a wall:
+		# `source` says the same thing `promoted` does about a running copy, so it
+		# is accepted -- and it is the one transition that KEEPS the token, because
+		# the arrangement the token describes is still in force.
+		vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" relabel-live-source \
+			-update-role source -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+		if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "-update-role=source IS accepted on a RUNNING promoted copy" "$fo_ok" \
+			"exit $RUN_RC -- refusing this would close the one route that keeps the data, which every served-live refusal points at; see $RUN_LOG"
+
+		live_fence="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" fence_id)"
+		if [ "$live_fence" = "$fence_id" ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "promoted->source KEEPS the armed fence" "$fo_ok" \
+			"fence_id is '$live_fence', was '$fence_id' -- this end alone was rewritten, so the domain it displaced still calls itself a source and the arrangement the token describes is still in force"
+
+		# Back to promoted for the rest of the stage, which is all about the fence
+		# firing against the source. -update-role promoted writes no promotion
+		# record and strips nothing, so the token and the trace both survive it.
+		vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" relabel-live-restore \
+			-update-role promoted -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+		live_role="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
+		if [ "$live_role" = promoted ]; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "7g put the role back to promoted for the rest of the stage" "$fo_ok" \
+			"role is '$live_role' -- everything below this needs a promoted target"
+		if [ "$live_role" != promoted ]; then
+			warn "7g could not restore replication_role=promoted on $TARGET_DOMAIN; the fence assertions below will not mean anything"
+		fi
+	else
+		results_row "$CSV" "$sc" live_promoted_guard "" "" "" "" "" "" "SKIP the promoted target is not running"
+	fi
 
 	# --- the agents ----------------------------------------------------------
 	log "starting a standalone agent on the source host (schedule disabled -- only its fence loop matters)"
@@ -3426,6 +3676,81 @@ stage_fence_agent() {
 		# carries the reason.
 		fo_check "$sc" "the ledger records the fence as done" "$fo_ok" \
 			"ledger state after ${lwaited}s: ${lstate:-never reached a terminal state}; ledger: $(printf '%s' "$ledger" | tr -d '\n' | cut -c1-200)"
+
+		# --- 7f: a fence that did not stop the domain must stay visible -------
+		#
+		# The state CI-07 was about, reached the safe way. A genuinely failed
+		# ACPI shutdown needs a guest that ignores it, which cannot be staged
+		# here -- but the state the agent must react to is "role=fenced AND the
+		# domain is running", and `virsh start` produces exactly that, writing
+		# no metadata at all. That is not a weaker test of the detector: the
+		# detector reads those two facts and nothing else, and this is also a
+		# real path into the state, because nothing clears a fenced domain's
+		# autostart flag and a host reboot starts it again on its own.
+		#
+		# Against a pre-change binary every assertion below reads the opposite:
+		# the sweep skipped the domain BECAUSE it was fenced, so no warning was
+		# logged, vmsync_agent_fenced_running did not exist at all, and
+		# vmsync_agent_split_brain_vms stayed at 0 with one VM live in two
+		# places.
+		local ametrics="$agent_dir/vmsync-agent.prom"
+		local before_file
+		before_file="$RUN_DIR/logs/${sc}.agent-metrics-before.prom"
+		run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "cat '$ametrics' 2>/dev/null || true" >"$before_file" 2>/dev/null || true
+		# Anchored on a series that is always present, so "the gauge is absent"
+		# can never be satisfied by an empty or missing file.
+		if prom_has "$before_file" vmsync_agent_domains_total; then fo_ok=0; else fo_ok=1; fi
+		fo_check "$sc" "the agent's metrics file is readable before the check" "$fo_ok" \
+			"no vmsync_agent_domains_total in $ametrics on $SOURCE_HOST -- every assertion below would otherwise pass on a file that does not exist"
+
+		if [ "$fo_ok" = 0 ]; then
+			if [ "$(prom_first "$before_file" vmsync_agent_fenced_running_vms)" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+			fo_check "$sc" "the fenced-and-running gauge exists at zero while the fence holds" "$fo_ok" \
+				"expected vmsync_agent_fenced_running_vms 0 with the source correctly fenced and stopped; a gauge that only appears once the estate is broken cannot carry a for: clause"
+
+			# Start it again: fenced role, running domain, no metadata written.
+			run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "virsh -c '$SOURCE_URI' start '$SOURCE_DOMAIN'" >/dev/null 2>&1 || true
+			local fwaited=0 fstate=""
+			while [ "$fwaited" -lt 60 ]; do
+				fstate="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN" 2>/dev/null || true)"
+				[ "$fstate" = running ] && break
+				sleep 2
+				fwaited=$((fwaited + 2))
+			done
+			if [ "$fstate" = running ]; then fo_ok=0; else fo_ok=1; fi
+			fo_check "$sc" "the fenced source can be started again for the check" "$fo_ok" \
+				"the domain did not reach running after ${fwaited}s (state '$fstate'), so 7f could not be exercised"
+
+			if [ "$fo_ok" = 0 ]; then
+				local frole
+				frole="$(vmsync_meta_field "$SOURCE_URI" "$SOURCE_DOMAIN" replication_role)"
+				if [ "$frole" = fenced ]; then fo_ok=0; else fo_ok=1; fi
+				fo_check "$sc" "starting the domain leaves its fenced role intact" "$fo_ok" \
+					"role is '$frole' after virsh start -- 7f needs role=fenced AND running, and if a plain start rewrote the role the rest of this proves nothing"
+
+				# One sweep interval plus one metrics write, generously.
+				local awaited=0 after_file="$RUN_DIR/logs/${sc}.agent-metrics-after.prom" seen=""
+				while [ "$awaited" -lt "${FENCE_WAIT_SECONDS:-120}" ]; do
+					run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "cat '$ametrics' 2>/dev/null || true" >"$after_file" 2>/dev/null || true
+					if [ "$(prom_first "$after_file" vmsync_agent_fenced_running_vms)" = 1 ]; then seen=yes; break; fi
+					sleep 3
+					awaited=$((awaited + 3))
+				done
+				if [ "$seen" = yes ]; then fo_ok=0; else fo_ok=1; fi
+				fo_check "$sc" "a fence that left the domain running raises its own gauge" "$fo_ok" \
+					"vmsync_agent_fenced_running_vms did not reach 1 within ${awaited}s of $SOURCE_DOMAIN running while marked fenced. This is the alarm for one VM live in two places, and before it existed the sweep skipped the domain precisely BECAUSE it was fenced -- see $after_file"
+
+				if grep -q "vmsync_agent_fenced_running{.*vm=\"$SOURCE_DOMAIN\"" "$after_file" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+				fo_check "$sc" "the gauge names which VM is live twice" "$fo_ok" \
+					"no vmsync_agent_fenced_running series for $SOURCE_DOMAIN -- the count says whether, this says which, and which is what an operator needs before touching anything"
+
+				# And it must also keep the pre-existing split-brain alarm up,
+				# which is the one operators already have rules for.
+				if [ "$(prom_first "$after_file" vmsync_agent_split_brain_vms)" -ge 1 ] 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+				fo_check "$sc" "a failed fence still counts as split brain" "$fo_ok" \
+					"vmsync_agent_split_brain_vms is $(prom_first "$after_file" vmsync_agent_split_brain_vms) -- the domain is live beside the promoted copy, so alerts already written against this series must keep firing"
+			fi
+		fi
 	fi
 
 	# --- the target's own agent must have left the promoted copy alone --------
@@ -4216,6 +4541,57 @@ stage_restore() {
 		fi
 		fo_check "$sc" "a restore is refused on a promoted domain" "$fo_ok" \
 			"the restore was ALLOWED to overwrite a domain marked replication_role=promoted -- see $RUN_LOG"
+
+		# And now the part the role cannot do, which is the whole of CI-09.
+		#
+		# The refusal above rests on replication_role=promoted, and the first
+		# thing anybody does with a promoted copy they want rid of is shut it
+		# down -- which records `paused`. The restore gate deliberately PERMITS
+		# paused, because rolling a paused replica back is the ordinary reason
+		# the verb exists. So one operation turned the strongest refusal in this
+		# stage into an allowance, and the copy that had been serving production
+		# became restorable with nothing left on the domain to say otherwise.
+		#
+		# The durable record is what closes it. Asserted here rather than in
+		# stage 6 because this is where a restore is actually attempted: stage 6
+		# proves the record survives the demotion, and this proves that
+		# surviving it changes the outcome.
+		if vmsync_verb "$sc" demote-to-paused -update-role paused >/dev/null 2>&1; then
+			if vmsync_verb "$sc" served-live-refused -restore-restore-point "$rp_old" -force-restore; then
+				fo_ok=1
+			else
+				fo_ok=0
+			fi
+			fo_check "$sc" "a restore is still refused after the promoted copy is demoted to paused" "$fo_ok" \
+				"the restore was ALLOWED over a copy that had been promoted, because shutting it down recorded 'paused' and the role gate permits paused -- -force-restore included; the disks it overwrote may have been the only copy of the data that was serving -- see $RUN_LOG"
+
+			# The other half, and it is not optional: a refusal with no way past
+			# it would make every replica that had ever been failed over
+			# permanently unrestorable, which is a worse fault than the one
+			# being fixed.
+			if vmsync_verb "$sc" release-promotion -release-promotion >/dev/null 2>&1; then
+				# Deliberately WITHOUT -force-restore: the assessment is
+				# enough. Both gates run before it is printed, so a refusal
+				# still refuses it, and this way the proof that the way back
+				# opens does not itself replace the replica's disks -- which
+				# would land in the middle of a stage whose own restore has not
+				# run yet and whose later assertions compare these files.
+				if vmsync_verb "$sc" restore-after-release -restore-restore-point "$rp_old"; then
+					fo_ok=0
+				else
+					fo_ok=1
+				fi
+				fo_check "$sc" "and it is permitted again once the promotion is released" "$fo_ok" \
+					"the restore was still refused after -release-promotion cleared the record, so there is no way back for any replica that has ever been failed over -- see $RUN_LOG"
+			else
+				warn "SKIP the release check: -release-promotion failed on the demoted copy"
+				results_row "$CSV" "$sc" served_live_release "" "" "" "" "" "" "SKIP could not release the promotion"
+			fi
+		else
+			warn "SKIP the served-live gate check: could not demote the promoted copy to paused"
+			results_row "$CSV" "$sc" served_live_gate "" "" "" "" "" "" "SKIP could not demote to paused"
+		fi
+
 		clear_target_role "put replication_role back after the role gate check"
 	else
 		warn "SKIP the role gate check: could not set replication_role=promoted"
@@ -5502,8 +5878,7 @@ verify_failure_refuses_promote_subtest() {
 	# into a die() that ends the whole run with a knowingly corrupted replica
 	# still in place. -update-role=target is the same documented way back
 	# stage 6 uses, and it takes the promotion record with it.
-	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" verify-failure restore-role \
-		-update-role target -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+	retarget_promoted_target verify-failure restore-role "$local_uri"
 	role="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)"
 	if [ "$role" = target ]; then
 		# Verified back, so the stage's EXIT trap has nothing left to undo.
@@ -6769,8 +7144,7 @@ stage_interrupted_reinit() {
 		results_row "$CSV" "$sc" forced_window "" "" "" "" "" "" "SKIP the forced promotion did not happen"
 	fi
 
-	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" role-back-after-force \
-		-update-role target -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+	retarget_promoted_target "$sc" role-back-after-force "$local_uri"
 	if [ "$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)" = target ]; then
 		IR_PROMOTED=no
 	else
@@ -6838,8 +7212,7 @@ stage_interrupted_reinit() {
 	fo_check "$sc" "the restored replica can still be promoted during the outage" "$fo_ok" \
 		"-force-promote failed (exit $RUN_RC) against the complete replica the aside files just put back, so the documented recovery ends with a copy nobody can boot -- see $RUN_LOG"
 
-	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" role-back-after-recovery \
-		-update-role target -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+	retarget_promoted_target "$sc" role-back-after-recovery "$local_uri"
 	if [ "$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)" = target ]; then
 		IR_PROMOTED=no
 	else
@@ -6888,8 +7261,7 @@ stage_interrupted_reinit() {
 		results_row "$CSV" "$sc" healed_window "" "" "" "" "" "" "SKIP the promotion after the heal did not happen"
 	fi
 
-	vmsync_on_host "$TARGET_HOST" no "$TARGET_VMSYNC_BIN" "$sc" role-back \
-		-update-role target -target-uri "$local_uri" -target-domain "$TARGET_DOMAIN"
+	retarget_promoted_target "$sc" role-back "$local_uri"
 	if [ "$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" replication_role)" = target ]; then
 		IR_PROMOTED=no
 	else
@@ -7196,6 +7568,208 @@ stage_colocated() {
 	return 0
 }
 
+stage_leftovers() {
+	log "=== Stage 19: displaced sets are reported, and reclaimed only when asked ==="
+	local sc=leftovers
+	local fo_ok=0
+
+	if [ "$DRY_RUN" = yes ]; then
+		# rename, not the harness's usual delete: this stage is about the files
+		# a rename LEAVES, so a dry run printing `delete` would advertise a
+		# command line that cannot test what the stage tests. Same reason
+		# stage 16 overrides it.
+		LO_SAVED_REPLACED_DISK_ACTION="$REPLACED_DISK_ACTION"
+		REPLACED_DISK_ACTION=rename
+		bench_sync "$sc" baseline
+		bench_sync "$sc" rebuild -reinit
+		bench_sync "$sc" report
+		bench_sync "$sc" under-floor "-reclaim-leftovers-after=1h"
+		bench_sync "$sc" too-new "-reclaim-leftovers-after=8760h"
+		bench_sync "$sc" reclaim "-reclaim-leftovers-after=24h"
+		bench_sync "$sc" incomplete -reinit "-test=$VMSYNC_TEST_DIE_WRITING_BASE"
+		bench_sync "$sc" refused "-reclaim-leftovers-after=24h"
+		bench_sync "$sc" repaired -reinit
+		REPLACED_DISK_ACTION="$LO_SAVED_REPLACED_DISK_ACTION"
+		fo_check "$sc" "a rebuild leaves one aside file per disk" 0
+		fo_check "$sc" "a run with no duration reports the sets and removes none" 0
+		fo_check "$sc" "a duration under the floor is refused at startup" 0
+		fo_check "$sc" "a fresh aside is not reclaimed" 0
+		fo_check "$sc" "an aside older than the duration is reclaimed" 0
+		fo_check "$sc" "a co-located domain's aside is left alone" 0
+		fo_check "$sc" "a restore point store moved aside is reclaimed" 0
+		fo_check "$sc" "nothing is reclaimed while the replica is marked incomplete" 0
+		fo_check "$sc" "the refusal does not fail the sync" 0
+		return 0
+	fi
+
+	if [ -z "${TARGET_DISK_PATH:-}" ]; then
+		warn "SKIP stage 19: TARGET_DISK_PATH is not set in $CONF. Every path this stage inspects is derived from it, and guessing where the replica's disks live is how a sweep test deletes something else."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP TARGET_DISK_PATH unset"
+		return 0
+	fi
+	stage_needs_target_shutoff "$CSV" "$sc" "stage leftovers" || return 0
+
+	# rename for the whole stage, restored on every exit path below.
+	local saved_action="$REPLACED_DISK_ACTION"
+	REPLACED_DISK_ACTION=rename
+	# shellcheck disable=SC2064
+	trap "REPLACED_DISK_ACTION='$saved_action'" RETURN
+
+	local replica="${TARGET_DISK_PATH%/}/${TARGET_DOMAIN}.qcow2"
+	# aside_count -> how many aside files sit beside the replica right now.
+	aside_count() {
+		ssh_host_cmd "$TARGET_HOST" "ls -1d '${replica}'.vmsync-replaced-* 2>/dev/null | wc -l" \
+			2>/dev/null | tr -d '[:space:]' || true
+	}
+
+	# --- 19a. a rebuild leaves an aside set -----------------------------------
+	bench_sync "$sc" baseline || { bench_sync_hint; fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "the baseline sync itself failed, see $RUN_LOG"; return 0; }
+	bench_sync "$sc" rebuild -reinit || { fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "the rebuild failed, see $RUN_LOG"; return 0; }
+
+	local n
+	n="$(aside_count)"
+	if [ "${n:-0}" -ge 1 ]; then
+		fo_check "$sc" "a rebuild leaves one aside file per disk" 0
+	else
+		fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "no ${replica}.vmsync-replaced-* on $TARGET_HOST after a -reinit with -replaced-disk-action=rename; the rest of this stage has nothing to act on"
+		return 0
+	fi
+
+	# --- 19b. no duration: reported, not removed ------------------------------
+	#
+	# The reporting half is the one that matters on an estate that has been
+	# running for a year: the files are already there, and until a run said so
+	# nothing named them at all.
+	bench_sync "$sc" report || fo_ok=1
+	if [ "$(aside_count)" = "$n" ] && grep -q "displaced sets beside the replica" "$RUN_LOG" 2>/dev/null; then
+		fo_check "$sc" "a run with no duration reports the sets and removes none" 0
+	else
+		fo_check "$sc" "a run with no duration reports the sets and removes none" 1 "expected $n aside files still present and a report line in $RUN_LOG, found $(aside_count)"
+	fi
+
+	# --- 19c. under the floor is refused at startup ---------------------------
+	#
+	# Refused BEFORE anything is touched, and that is the point: "0h" is what
+	# somebody writes meaning "off", and a sweep that obeyed it would delete an
+	# aside made minutes earlier.
+	bench_sync "$sc" under-floor "-reclaim-leftovers-after=1h" || true
+	if [ "${RUN_RC:-0}" != 0 ] && [ "$(aside_count)" = "$n" ]; then
+		fo_check "$sc" "a duration under the floor is refused at startup" 0
+	else
+		fo_check "$sc" "a duration under the floor is refused at startup" 1 "the run exited ${RUN_RC:-0} and left $(aside_count) of $n aside files; an under-floor duration must stop the run before it acts"
+	fi
+
+	# --- 19d. old enough is the only thing that gets swept -------------------
+	#
+	# A year's duration against a set made a minute ago, so the age test is the
+	# only thing that can keep it.
+	bench_sync "$sc" too-new "-reclaim-leftovers-after=8760h" || fo_ok=1
+	if [ "$(aside_count)" = "$n" ]; then
+		fo_check "$sc" "a fresh aside is not reclaimed" 0
+	else
+		fo_check "$sc" "a fresh aside is not reclaimed" 1 "$(aside_count) of $n aside files left after a run whose duration was a year"
+	fi
+
+	# Age them by rewriting the stamp in the name rather than by touching a
+	# clock: the stamp is what vmsync reads, and moving the host's time would
+	# invalidate every other timestamp this replica carries.
+	local old_stamp=1000000000
+	ssh_host_cmd "$TARGET_HOST" "for f in '${replica}'.vmsync-replaced-*; do [ -e \"\$f\" ] || continue; mv -n \"\$f\" \"\${f%.vmsync-replaced-*}.vmsync-replaced-${old_stamp}\"; done" >/dev/null 2>&1 || true
+
+	# A co-located domain's aside, planted beside ours in the same directory.
+	# This is the check that a sweep reading the DIRECTORY rather than this
+	# domain's disks would fail, and failing it means pointing an operator at
+	# another machine's only good copy.
+	local theirs="${TARGET_DISK_PATH%/}/not-${TARGET_DOMAIN}.qcow2.vmsync-replaced-${old_stamp}"
+	ssh_host_cmd "$TARGET_HOST" "dd if=/dev/zero of='$theirs' bs=1k count=8 2>/dev/null" >/dev/null 2>&1 || true
+
+	bench_sync "$sc" reclaim "-reclaim-leftovers-after=24h" || fo_ok=1
+	if [ "$(aside_count)" = 0 ]; then
+		fo_check "$sc" "an aside older than the duration is reclaimed" 0
+	else
+		fo_check "$sc" "an aside older than the duration is reclaimed" 1 "$(aside_count) aside files older than the duration were left behind; see $RUN_LOG"
+	fi
+	if ssh_host_cmd "$TARGET_HOST" "test -e '$theirs'" >/dev/null 2>&1; then
+		fo_check "$sc" "a co-located domain's aside is left alone" 0
+	else
+		fo_check "$sc" "a co-located domain's aside is left alone" 1 "$theirs was removed although it belongs to another domain -- the sweep is reading the directory instead of this domain's own disks, so its bytes are charged to the wrong machine and the path it offers as reclaimable is another machine's data"
+	fi
+	ssh_host_cmd "$TARGET_HOST" "rm -f '$theirs'" >/dev/null 2>&1 || true
+
+	# --- 19e. the store a rebuild moved aside --------------------------------
+	#
+	# The sub-case no listing can reach: these directories sit BESIDE the
+	# per-domain stores, so -list-restore-points cannot see them and the points
+	# inside them are outside every store.
+	local rp_parent="${TARGET_DISK_PATH%/}/.vmsync-rp"
+	bench_sync "$sc" store-baseline "-retention=2,0" || fo_ok=1
+	bench_sync "$sc" store-rebuild -reinit "-retention=2,0" || fo_ok=1
+	local asides
+	asides="$(ssh_host_cmd "$TARGET_HOST" "ls -1d '$rp_parent'/.replaced-vm-${TARGET_DOMAIN}-* 2>/dev/null | wc -l" 2>/dev/null | tr -d '[:space:]' || true)"
+	if [ "${asides:-0}" -ge 1 ]; then
+		# Age it the same way, then sweep.
+		ssh_host_cmd "$TARGET_HOST" "for d in '$rp_parent'/.replaced-vm-${TARGET_DOMAIN}-*; do [ -d \"\$d\" ] || continue; mv -n \"\$d\" \"${rp_parent}/.replaced-vm-${TARGET_DOMAIN}-${old_stamp}\"; done" >/dev/null 2>&1 || true
+		bench_sync "$sc" store-reclaim "-reclaim-leftovers-after=24h" || fo_ok=1
+		local left
+		left="$(ssh_host_cmd "$TARGET_HOST" "ls -1d '$rp_parent'/.replaced-vm-${TARGET_DOMAIN}-* 2>/dev/null | wc -l" 2>/dev/null | tr -d '[:space:]' || true)"
+		if [ "${left:-1}" = 0 ]; then
+			fo_check "$sc" "a restore point store moved aside is reclaimed" 0
+		else
+			fo_check "$sc" "a restore point store moved aside is reclaimed" 1 "$left aside stores remain under $rp_parent; nothing else in vmsync can name these, so what this sweep leaves is invisible again"
+		fi
+	else
+		# Not a failure of the sweep: this build's -reinit may not have needed
+		# to move a store aside (no points existed yet). Recorded rather than
+		# passed, because a PASS here would claim the invisible sub-case was
+		# tested when nothing was there to test.
+		log "   SKIP: -reinit left no aside restore point store to reclaim"
+		results_row "$CSV" "$sc" a_restore_point_store_moved_aside_is_reclaimed SKIP "" "" "" "" "" "SKIP no aside store was created"
+	fi
+
+	# --- 19f. an incomplete replica is never swept ---------------------------
+	#
+	# The interlock the feature could not ship without. A fault-injected rebuild
+	# leaves replica_incomplete AND a fresh aside set, and that aside set is the
+	# complete replica the rebuild replaced -- putting it back is the documented
+	# recovery. A sweep that took it would leave a half-written image whose
+	# metadata still reads healthy.
+	if bench_sync "$sc" incomplete -reinit "-test=$VMSYNC_TEST_DIE_WRITING_BASE"; then
+		warn "the injected failure did not take effect: -test=$VMSYNC_TEST_DIE_WRITING_BASE exited 0. Is $VMSYNC_BIN older than the flag?"
+	fi
+	n="$(aside_count)"
+	if [ "${n:-0}" -lt 1 ]; then
+		log "   SKIP: the interrupted rebuild left no aside set, so there is nothing for the refusal to protect"
+		results_row "$CSV" "$sc" nothing_is_reclaimed_while_the_replica_is_marked_incomplete SKIP "" "" "" "" "" "SKIP no aside set after the injected failure"
+	else
+		ssh_host_cmd "$TARGET_HOST" "for f in '${replica}'.vmsync-replaced-*; do [ -e \"\$f\" ] || continue; mv -n \"\$f\" \"\${f%.vmsync-replaced-*}.vmsync-replaced-${old_stamp}\"; done" >/dev/null 2>&1 || true
+		# The sync is EXPECTED to run here -- re-running it is the documented
+		# repair for replica_incomplete -- so what is being tested is that the
+		# sweep inside it stood down, not that the run was refused.
+		bench_sync "$sc" refused "-reclaim-leftovers-after=24h"
+		local rc_refused="${RUN_RC:-0}" log_refused="$RUN_LOG"
+		if [ "$(aside_count)" = "$n" ]; then
+			fo_check "$sc" "nothing is reclaimed while the replica is marked incomplete" 0
+		else
+			fo_check "$sc" "nothing is reclaimed while the replica is marked incomplete" 1 "$(aside_count) of $n aside files survived; these ARE the complete replica while replica_incomplete is set, so the sweep has just deleted the recovery it is documented to leave alone"
+		fi
+		# And the refusal must not be an error: a sweep standing down is a
+		# warning on a run whose job is to repair the replica.
+		if grep -q "REFUSING to reclaim displaced sets" "$log_refused" 2>/dev/null; then
+			fo_check "$sc" "the refusal does not fail the sync" "$rc_refused" "the run that repaired the replica exited $rc_refused; the sweep standing down must be a warning, not a failure"
+		else
+			fo_check "$sc" "the refusal does not fail the sync" 1 "no refusal line in $log_refused, so it cannot be told from a sweep that simply found nothing"
+		fi
+	fi
+
+	# Leave the replica complete and clean, whatever happened above: the next
+	# stage inherits this target.
+	bench_sync "$sc" repaired -reinit || warn "stage 19 could not leave $TARGET_DOMAIN with a complete replica -- the next stage starts from a replica marked incomplete"
+	ssh_host_cmd "$TARGET_HOST" "rm -f '${replica}'.vmsync-replaced-* ; rm -rf '$rp_parent'/.replaced-vm-${TARGET_DOMAIN}-*" >/dev/null 2>&1 || true
+
+	unset -f aside_count
+	return 0
+}
+
 stage_pattern() {
 	case "$1" in
 	# Anchored to the named sub-tests rather than a bare ^verify- , so a
@@ -7228,6 +7802,9 @@ stage_pattern() {
 	# whose filesystem has no reflink support, and that row has to belong to
 	# stage 18's verdict rather than to whichever stage ran before it.
 	colocated) printf '^(colocated|precondition)$' ;;
+	# Same shape as stage 18: this one stands down on a target with no
+	# TARGET_DISK_PATH, and that row belongs to stage 19's verdict.
+	leftovers) printf '^(leftovers|precondition)$' ;;
 	*) printf '$^' ;; # matches nothing
 	esac
 }
@@ -7624,7 +8201,8 @@ for s in "${stage_list[@]}"; do
         interrupted-reinit) stage_interrupted_reinit || stage_rc=$? ;;
         journal) stage_journal || stage_rc=$? ;;
         colocated) stage_colocated || stage_rc=$? ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure,commit-barrier,interrupted-reinit,journal,colocated)" ;;
+        leftovers) stage_leftovers || stage_rc=$? ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
                 warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."
