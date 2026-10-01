@@ -125,8 +125,21 @@ func TestBreakAllowsAHolderThatIsGone(t *testing.T) {
 	if !d.Break {
 		t.Fatalf("a lock naming a pid that cannot exist was not breakable: %s -- during a DR event this is the whole escape", d.Reason)
 	}
-	if !strings.Contains(d.Reason, "gone") {
-		t.Errorf("reason %q does not say the holder is gone", d.Reason)
+	// The reason has to name the evidence, because it is what an operator reads
+	// before removing an interlock, and it is journalled as the justification.
+	// Matched against the three proofs holderProvablyGone accepts rather than
+	// against one wording: which one applies depends on the host, and pinning a
+	// phrase would fail on a host that answered correctly by a different route.
+	proofs := []string{"no such process", "before the last reboot", "started at a different time"}
+	named := false
+	for _, p := range proofs {
+		if strings.Contains(d.Reason, p) {
+			named = true
+			break
+		}
+	}
+	if !named {
+		t.Errorf("reason %q names none of the proofs that justify breaking a lock (%v), so the journalled justification would not say why it was safe", d.Reason, proofs)
 	}
 }
 
@@ -177,5 +190,90 @@ func TestDescribeLockHolderIsActionable(t *testing.T) {
 	// And it tells the operator the lock is stale, which is the actionable half.
 	if !strings.Contains(got, "-break-target-lock") {
 		t.Errorf("description %q does not name the way past a stale lock", got)
+	}
+}
+
+// Every branch of the break decision, on any host.
+//
+// This is the function that removes the interlock between two writers on one
+// replica, and until the host's answers were made an argument it could only be
+// exercised where /proc happened to be in the right state -- which is how an
+// assertion in this file shipped having never run. Each case below is a state a
+// real host reaches; none of them needs that host.
+func TestProveHolderGoneCoversEveryBranch(t *testing.T) {
+	const boot = "11111111-2222-3333-4444-555555555555"
+	live := RunLockIdentity{PID: 4242, BootID: boot, StartTicks: 900}
+
+	for _, tc := range []struct {
+		name      string
+		id        RunLockIdentity
+		facts     hostFacts
+		wantBreak bool
+		wantSays  string
+	}{
+		{
+			// The proof that needs no /proc entry at all, and the only one that
+			// works for a pid the kernel has since handed to something else.
+			name: "the host rebooted since the lock was taken",
+			id:   live, facts: hostFacts{bootID: "99999999-0000-0000-0000-000000000000", startTick: 900},
+			wantBreak: true, wantSays: "before the last reboot",
+		},
+		{
+			name: "the process is simply gone",
+			id:   live, facts: hostFacts{bootID: boot, tickErr: os.ErrNotExist},
+			wantBreak: true, wantSays: "no such process",
+		},
+		{
+			// Something answers to the pid, but it started at a different time,
+			// so it is not the holder this lock describes.
+			name: "the pid was reused by something else",
+			id:   live, facts: hostFacts{bootID: boot, startTick: 51234},
+			wantBreak: true, wantSays: "started at a different time",
+		},
+		{
+			name: "the holder is still running",
+			id:   live, facts: hostFacts{bootID: boot, startTick: 900},
+			wantBreak: false, wantSays: "still running",
+		},
+		// Every refusal below is a "cannot tell". They must all refuse: this is
+		// the direction RunLockHeld gets wrong for this caller, where guessing
+		// costs a replica rather than a wasted process.
+		{
+			name: "the boot id cannot be read",
+			id:   live, facts: hostFacts{bootErr: os.ErrPermission, startTick: 900},
+			wantBreak: false, wantSays: "boot id could not be read",
+		},
+		{
+			name: "the record carries no boot id",
+			id:   RunLockIdentity{PID: 4242, StartTicks: 900}, facts: hostFacts{bootID: boot, startTick: 900},
+			wantBreak: false, wantSays: "no boot id",
+		},
+		{
+			name: "proc could not be consulted for any other reason",
+			id:   live, facts: hostFacts{bootID: boot, tickErr: os.ErrPermission},
+			wantBreak: false, wantSays: "could not be established",
+		},
+		{
+			// A partial record: something is running under that pid and there is
+			// no start time to rule out reuse, so reuse cannot be ruled out.
+			name: "the record carries no start time",
+			id:   RunLockIdentity{PID: 4242, BootID: boot}, facts: hostFacts{bootID: boot, startTick: 900},
+			wantBreak: false, wantSays: "no start time",
+		},
+		{
+			name: "the record names no pid",
+			id:   RunLockIdentity{BootID: boot}, facts: hostFacts{bootID: boot},
+			wantBreak: false, wantSays: "not a pid",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gone, why := proveHolderGone(tc.id, tc.facts)
+			if gone != tc.wantBreak {
+				t.Errorf("proveHolderGone = %v, want %v (%s)", gone, tc.wantBreak, why)
+			}
+			if !strings.Contains(why, tc.wantSays) {
+				t.Errorf("reason %q does not mention %q, and the reason is what an operator reads before removing an interlock", why, tc.wantSays)
+			}
+		})
 	}
 }

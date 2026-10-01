@@ -116,36 +116,61 @@ func BreakRunLockDecision(dir, key, expectBinary string) BreakLockDecision {
 //   - a /proc entry whose start time differs: the pid was reused, so the holder
 //     this lock describes is gone even though something answers to its number.
 func holderProvablyGone(id RunLockIdentity) (bool, string) {
+	return proveHolderGone(id, gatherHostFacts(id.PID))
+}
+
+// hostFacts is everything the host was able to say about a pid, including the
+// failures to say it.
+//
+// It exists so proveHolderGone can be a pure function. The decision it makes is
+// the one that removes the interlock between two writers on a replica, and every
+// branch of it -- including "there is no such process", "the pid was reused" and
+// each way of failing to find out -- has to be provable by a test on any machine,
+// not only on one that can be made to have the right /proc state.
+type hostFacts struct {
+	bootID    string
+	bootErr   error
+	startTick uint64
+	tickErr   error
+}
+
+func gatherHostFacts(pid int) hostFacts {
+	var f hostFacts
+	f.bootID, f.bootErr = CurrentBootID()
+	if pid > 0 {
+		f.startTick, f.tickErr = ProcStartTicks(pid)
+	}
+	return f
+}
+
+// proveHolderGone is the decision, with the host's answers already gathered.
+func proveHolderGone(id RunLockIdentity, f hostFacts) (bool, string) {
 	if id.PID <= 0 {
 		return false, "that is not a pid, so nothing can be proven about it"
 	}
-
-	if id.BootID != "" {
-		boot, err := CurrentBootID()
-		switch {
-		case err != nil:
-			return false, fmt.Sprintf("this host's boot id could not be read (%v), so a lock from a previous boot cannot be told from a live one", err)
-		case boot != id.BootID:
-			return true, "it was taken before the last reboot, so that process cannot exist any more"
-		}
-	} else {
-		// Without a boot id a reboot and a crash are indistinguishable, and a
-		// pid recycled since the reboot would look like the original holder.
+	if id.BootID == "" {
+		// Without a boot id a reboot and a crash are indistinguishable, and a pid
+		// recycled since the reboot would look like the original holder.
 		return false, "its record carries no boot id, so a pid reused since the last reboot could not be told from the original holder"
 	}
-
-	ticks, err := ProcStartTicks(id.PID)
 	switch {
-	case os.IsNotExist(err):
+	case f.bootErr != nil:
+		return false, fmt.Sprintf("this host's boot id could not be read (%v), so a lock from a previous boot cannot be told from a live one", f.bootErr)
+	case f.bootID != id.BootID:
+		return true, "it was taken before the last reboot, so that process cannot exist any more"
+	}
+
+	switch {
+	case os.IsNotExist(f.tickErr):
 		return true, "there is no such process on this host"
-	case err != nil:
-		return false, fmt.Sprintf("its liveness could not be established (%v)", err)
+	case f.tickErr != nil:
+		return false, fmt.Sprintf("its liveness could not be established (%v)", f.tickErr)
 	case id.StartTicks == 0:
 		// Nothing to compare against, so a reused pid is indistinguishable from
 		// the original holder -- and something IS running under that number.
 		return false, "something is running under that pid and its record carries no start time to rule out pid reuse"
-	case ticks != id.StartTicks:
-		return true, fmt.Sprintf("the process under that pid started at a different time (%d, not %d), so the holder was replaced by an unrelated one", ticks, id.StartTicks)
+	case f.startTick != id.StartTicks:
+		return true, fmt.Sprintf("the process under that pid started at a different time (%d, not %d), so the holder was replaced by an unrelated one", f.startTick, id.StartTicks)
 	default:
 		return false, "it is still running"
 	}
