@@ -92,6 +92,28 @@ func startHeartbeat(handle io.WriteCloser, path string, lease time.Duration, lea
 	if interval <= 0 {
 		interval = lease
 	}
+	// A holder that can say when it exited is watched for it, which is the
+	// prompt signal: a leased holder whose lease ran out EXITS, and that is the
+	// instant the lock became somebody else's. Found by shape rather than by a
+	// named type, because this package deliberately does not import the SSH one;
+	// a holder without it still works, just discovering the loss on the next
+	// beat instead.
+	if ex, ok := handle.(interface{ Exited() <-chan error }); ok {
+		l.beating.Add(1)
+		go func() {
+			defer l.beating.Done()
+			select {
+			case <-l.stop:
+				return
+			case err, open := <-ex.Exited():
+				if !open {
+					return
+				}
+				l.setLost(fmt.Errorf("%w: the process holding %s on the target exited (%v)", ErrRemoteLockLost, path, err))
+			}
+		}()
+	}
+
 	l.beating.Add(1)
 	go func() {
 		defer l.beating.Done()

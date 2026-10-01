@@ -51,6 +51,8 @@ type fakeHolder struct {
 type fakeCloser struct {
 	closed *bool
 
+	exited chan error
+
 	mu       sync.Mutex
 	beats    int
 	writeErr error
@@ -366,3 +368,74 @@ func TestCloseStopsTheHeartbeatBeforeClosingTheHandle(t *testing.T) {
 		t.Error("Close did not end the remote command holding the lock")
 	}
 }
+
+// A holder that exits is the PROMPT signal that the lock is gone, and the reason
+// the whole lease mechanism is trustworthy from this side.
+//
+// Without it this side learns only when a heartbeat write fails -- and a write
+// into a socket whose peer has vanished succeeds into the local send buffer and
+// keeps succeeding until the kernel gives up its retransmissions, around fifteen
+// minutes on Linux. The target hands the lock on at the lease, 90 seconds. The
+// gap between those two numbers is a window where this run believes it holds a
+// lock a promoted guest is already writing behind.
+func TestAHolderThatExitsIsReportedAtOnce(t *testing.T) {
+	h := &fakeHolder{handle: &fakeCloser{exited: make(chan error, 1)}}
+	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
+		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		// Long, so nothing here can pass by way of a heartbeat tick.
+		Lease: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("AcquireRemoteRunLock: %v", err)
+	}
+	defer lock.Close()
+	if lock.Lost() != nil {
+		t.Fatalf("a freshly taken lock reports itself lost: %v", lock.Lost())
+	}
+
+	// The lease expired on the target: the holder let go and exited cleanly.
+	h.handle.exited <- nil
+
+	deadline := time.Now().Add(3 * time.Second)
+	for lock.Lost() == nil && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	lost := lock.Lost()
+	if lost == nil {
+		t.Fatal("the holder exited and the lock still reports itself held; with an hour-long lease nothing else would have noticed for an hour")
+	}
+	if !errors.Is(lost, ErrRemoteLockLost) {
+		t.Errorf("Lost() = %v, want it to wrap ErrRemoteLockLost", lost)
+	}
+	if !strings.Contains(lost.Error(), "exited") {
+		t.Errorf("Lost() = %q, which does not say the holder exited -- the two causes need telling apart in a log", lost)
+	}
+}
+
+// Closing deliberately must not look like losing the lock, or every clean
+// release would log a scary line and the signal would stop meaning anything.
+func TestADeliberateCloseIsNotALoss(t *testing.T) {
+	h := &fakeHolder{handle: &fakeCloser{exited: make(chan error, 1)}}
+	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
+		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		Lease:      time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("AcquireRemoteRunLock: %v", err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// The remote command ends because we ended it, which is what Close means.
+	select {
+	case h.handle.exited <- nil:
+	default:
+	}
+	time.Sleep(50 * time.Millisecond)
+	if lost := lock.Lost(); lost != nil {
+		t.Errorf("a deliberately closed lock reports itself lost: %v", lost)
+	}
+}
+
+// Exited is the optional hook AcquireRemoteRunLock looks for by shape.
+func (f *fakeCloser) Exited() <-chan error { return f.exited }

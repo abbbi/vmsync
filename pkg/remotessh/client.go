@@ -52,6 +52,7 @@ type Config struct {
 type Client struct {
 	cfg    Config
 	client *ssh.Client
+	keepaliveState
 }
 
 // LoopbackSelfAddress returns 127.0.0.1:<ssh-port> for this client's remote
@@ -303,13 +304,20 @@ func Dial(cfg Config) (*Client, error) {
 	}
 
 	c := ssh.NewClient(sshConn, chans, reqs)
-	return &Client{cfg: cfg, client: c}, nil
+	out := &Client{cfg: cfg, client: c}
+	// Started with the connection, so every caller gets a bounded detection
+	// window without having to ask for one.
+	out.startKeepalive()
+	return out, nil
 }
 
 func (c *Client) Close() error {
 	if c == nil || c.client == nil {
 		return nil
 	}
+	// The prober first, so it cannot be probing a connection this call is
+	// closing and report that as a peer that stopped answering.
+	c.stopKeepalive()
 	return c.client.Close()
 }
 

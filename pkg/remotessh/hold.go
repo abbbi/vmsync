@@ -50,9 +50,23 @@ type heldCommand struct {
 	stdin   io.WriteCloser
 	desc    string
 
+	// exited carries the remote command's own exit, once. It is what makes a
+	// caller's loss of whatever the command held PROMPT rather than discovered
+	// on the next write: a lock holder that releases on its own exits, and that
+	// exit arrives here.
+	exited chan error
+
 	once     sync.Once
 	closeErr error
 }
+
+// Exited delivers the remote command's exit and is closed afterwards.
+//
+// A nil error means it ended cleanly, which for a command holding something on
+// the caller's behalf means it let go deliberately -- a lease that expired, for
+// instance. Either way, receiving anything here means the caller no longer holds
+// what the command was holding.
+func (h *heldCommand) Exited() <-chan error { return h.exited }
 
 // ErrHoldRefused reports that the remote command started but signalled a
 // refusal rather than readiness.
@@ -95,7 +109,16 @@ func (c *Client) HoldCommand(ctx context.Context, command, readyLine string) (io
 		return nil, fmt.Errorf("start remote command: %w", err)
 	}
 
-	h := &heldCommand{session: session, stdin: stdin, desc: readyLine}
+	h := &heldCommand{session: session, stdin: stdin, desc: readyLine, exited: make(chan error, 1)}
+	// Reaped here rather than in Close, so the exit is observable while the
+	// handle is still open. Wait returns for every reason the command can end,
+	// including the connection being closed under it, which is what the
+	// keepalive prober does to an unreachable peer.
+	go func() {
+		err := session.Wait()
+		h.exited <- err
+		close(h.exited)
+	}()
 
 	type firstLine struct {
 		line string
@@ -168,3 +191,13 @@ func (h *heldCommand) Close() error {
 	})
 	return h.closeErr
 }
+
+// The handle reports its command's exit as well as being a WriteCloser, which
+// util.AcquireRemoteRunLock looks for to learn promptly that a lock holder let
+// go. Asserted here so renaming the method breaks the build rather than quietly
+// costing that promptness: pkg/util finds it by shape, because it deliberately
+// does not import this package.
+var _ interface {
+	io.WriteCloser
+	Exited() <-chan error
+} = (*heldCommand)(nil)
