@@ -677,12 +677,12 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	// decision nobody has made about production data, not a stuck series.
 	//
 	// Both of those must actually CLEAR it, which is what servedLiveUnresolved
-	// is for. The first version of this gauge keyed on the record minus
-	// `promoted`, so the -invert route did not clear it at all -- the inversion
-	// keeps the trace on the copy it makes the source, that copy is running, and
-	// -release-promotion refuses a running domain. The series sat at 1 for ever
-	// on a fully resolved pair, which on a gauge that says "not a stuck series"
-	// is the one thing it must never do.
+	// is for and why presence of the record is not the test. An inversion KEEPS
+	// the trace on the copy it makes the source; that copy is running, and
+	// -release-promotion refuses a running domain. So a gauge keyed on the record
+	// minus `promoted` would sit at 1 for ever on a fully resolved pair -- which
+	// on a gauge whose whole claim is "this is not a stuck series" is the one
+	// thing it must never do.
 	//
 	// Emitted unconditionally, at zero when there is nothing to say, for the
 	// reason given at the split-brain gauge: an alert cannot use a `for:` clause
@@ -700,14 +700,13 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 
 	// --- a fence that did not stop the domain ------------------------------
 	//
-	// The state every other signal used to miss. A fence writes
+	// The state no other signal here can express. A fence writes
 	// replication_role=fenced even when the ACPI shutdown fails -- deliberately,
 	// because that role is the only thing stopping replication resuming into the
-	// split brain -- and the sweep then skipped the domain precisely BECAUSE it
-	// was fenced, so the split-brain gauge fell back to zero about a minute
-	// later while one VM stayed live in two places. The only surviving trace was
-	// a failure COUNTER, which says "once, at some point" and resets when the
-	// agent restarts.
+	// split brain -- so a sweep that skipped fenced domains would let the
+	// split-brain gauge fall back to zero about a minute later while one VM
+	// stayed live in two places. The alternative trace is a failure COUNTER,
+	// which says "once, at some point" and resets when the agent restarts.
 	//
 	// Emitted unconditionally, at zero when nothing is wrong, for the reason
 	// given at the split-brain gauge above: an alert cannot use a `for:` clause
@@ -960,7 +959,8 @@ func scanDomainStatus(cfg agentConfig) (inventoryScan, error) {
 		//
 		// Through the SAME function the report path uses, so a standalone host
 		// and a controlled one cannot disagree about which copies are waiting.
-		// The two used to carry the role test separately.
+		// Two copies of the role test would be two places to fix the next time
+		// the resolved states change.
 		if servedLiveUnresolved(d.LastPromotedAtRaw, d.Role, d.ReplicaSource) {
 			servedLive[d.Name] = true
 		}

@@ -561,10 +561,11 @@ func TestServedLiveUnreleasedVMsReportsOnlyTheUndecided(t *testing.T) {
 // ends are healthy, both are where they should be, and the estate is finished
 // with that incident. The gauge must be silent.
 //
-// The first version of this gauge was not. It keyed on the record minus
-// `promoted`, so the new source -- running, carrying the record the inversion
-// deliberately kept -- sat at 1 for ever, and the only way to clear it was to
-// shut the live primary down.
+// Keying on the record alone would not be: an inversion deliberately KEEPS
+// last_promoted_at on the copy it makes the source, so a gauge that fired on
+// presence would sit at 1 for ever on a healthy primary, and the only way to
+// clear it would be to shut the live machine down. Presence is not the finding;
+// an outstanding decision is.
 func TestACorrectlyInvertedPairReportsNothing(t *testing.T) {
 	// hyper02p:web01 was promoted, then inverted into being the source.
 	// hyper01p:web01, the old source, is now its target and never served.

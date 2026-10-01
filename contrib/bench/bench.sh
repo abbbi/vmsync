@@ -1489,7 +1489,7 @@ verify_mode_subtest() {
 # running source it does what -reinit did (the chain is rebuilt either way); its
 # one extra power that could matter here -- removing the target definition first
 # -- does not change the end state. Clearing a shut-down source's bitmaps is NOT
-# one of its extra powers, though this comment used to say so: every reinit does
+# one of its extra powers, easy as that is to assume: every reinit does
 # that, and which route it takes is decided by the source's own state.
 #
 # Note this means the heal path no longer exercises the refusal, so nothing here
@@ -4579,7 +4579,7 @@ stage_restore() {
 		fo_check "$sc" "a restore is refused on a promoted domain" "$fo_ok" \
 			"the restore was ALLOWED to overwrite a domain marked replication_role=promoted -- see $RUN_LOG"
 
-		# And now the part the role cannot do, which is the whole of CI-09.
+		# And now the part the role cannot do.
 		#
 		# The refusal above rests on replication_role=promoted, and the first
 		# thing anybody does with a promoted copy they want rid of is shut it
@@ -7943,7 +7943,8 @@ stage_reinit_order() {
 	# --- 20d-f. and -force-clean, which has one more way to be wrong ---------
 	#
 	# Separate from the above rather than folded into it: -force-clean reaches
-	# the same guard through forceCleanTargetDomain, which used to run FIRST.
+	# the same guard through forceCleanTargetDomain, which runs before it and would
+	# undefine the target on the way there if the guard sat any later.
 	bench_sync "$sc" running-force-clean -force-clean || true
 	ro_assert_nothing_destroyed "-force-clean" running-force-clean
 

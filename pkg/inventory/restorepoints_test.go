@@ -180,18 +180,17 @@ func TestTrailingUnix(t *testing.T) {
 	}
 }
 
-// TestScanLeftoverDirFindsOnlyDisplacedSets is the discovery half of CI-54: the
-// files exist, they are made by the default action, and until now nothing named
-// them.
+// Only this domain's displaced sets, and only the ones vmsync made.
 //
 // The negative cases matter as much as the positive ones. This runs for every
 // domain on every report cycle, and a scan that mistook a live replica disk for a
 // leftover would report the working set as reclaimable space.
 //
-// web02's aside is the sharpest of them, and it is the case the first version of
-// this code and of this test both got wrong: co-located replicas share one
-// directory, so a scan that reads the directory rather than this domain's disks
-// charges every displaced set to every domain in it.
+// web02's aside is the sharpest of them. Co-located replicas share one images
+// directory, so a scan anchored on the directory rather than on this domain's own
+// disks charges every displaced set to every domain in it -- a tenfold
+// over-report on a busy host, and a path offered as this machine's reclaimable
+// space that is another machine's only good copy.
 func TestScanLeftoverDirFindsOnlyDisplacedSets(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name string) {

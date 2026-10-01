@@ -162,14 +162,13 @@ type SyncProfile struct {
 	// ReplacedDiskAction is "rename" or "delete", and empty means "leave
 	// vmsync's own default", which is rename.
 	//
-	// It exists because until now the agent could not express the choice at all,
-	// so every agent- and console-driven rebuild took the default and renamed a
-	// FULL-SIZE copy of every disk aside. Nothing reaps those, nothing used to
-	// report them, and they share extents when new -- so the cost shows up weeks
-	// later as an ENOSPC on the DR host that fails a commit for every VM on it.
-	// The pair that makes that bounded is this field and
-	// vmsync_agent_replaced_bytes: see what is accumulating, and decide per pair
-	// whether the safety copy is worth the room.
+	// It exists so an unattended rebuild is not obliged to take the default.
+	// Every agent- and console-driven rebuild that does renames a FULL-SIZE copy
+	// of every disk aside, and those copies share extents while they are new --
+	// so the cost is invisible when it is incurred and shows up weeks later as an
+	// ENOSPC on the DR host that fails a commit for every VM on it. This field
+	// and vmsync_agent_replaced_bytes are the pair that bounds it: see what is
+	// accumulating, and decide per pair whether the safety copy is worth the room.
 	//
 	// "rename" stays the default, and deliberately: the aside set is the
 	// documented recovery for a rebuild that dies half way, so an operator has to

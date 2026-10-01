@@ -2240,11 +2240,10 @@ func TargetRoleAllowsRestore(role string) error {
 	case "", RoleTarget, RolePaused:
 		return nil
 	case RoleFenced:
-		// `fenced` USED TO BE accepted alongside `paused`, and the audit was right
-		// that it does not belong there.
+		// Refused, although it looks like `paused` above: neither is replicating
+		// and both are stopped.
 		//
-		// The two look alike -- neither is replicating, both are stopped -- and
-		// `paused` is accepted for a good reason: an operator who paused
+		// `paused` is accepted for a good reason -- an operator who paused
 		// replication to work out what went wrong is exactly the one who then
 		// wants to roll the replica back. But a `fenced` domain is not a replica
 		// somebody paused. It is the copy a peer was promoted OVER, which means

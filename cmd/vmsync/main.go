@@ -2893,30 +2893,24 @@ func run(cfg syncConfig) (runErr error) {
 			trace.Warning("-force-clean: overriding the replication role interlock and DISCARDING this domain's current disks",
 				"vm", cfg.TargetDomain, "role", targetRole, "refusal", err.Error())
 		} else if cfg.ForceClean && targetRole == libvirtsync.RolePromoted {
-			// `promoted` USED TO BE on the override list above, and taking it off is
-			// the whole of CI-09.
+			// `promoted` is NOT on the override list above, and the three roles the
+			// interlock refuses are not equivalent. `paused` and `fenced` say
+			// replication is suspended, and discarding a suspension is a
+			// convenience worth having a flag for. `promoted` says THIS DOMAIN IS
+			// THE LIVE COPY -- its disks are the data a failover produced, and they
+			// may be the only copy of it. No flag discards that.
 			//
-			// The argument for having it there was consistent: paused, promoted and
-			// fenced all mean "a sync must not blunder into this", and getting out
-			// of such a state is what a deliberate clean is for. What it missed is
-			// that the three are not equivalent. `paused` and `fenced` say
-			// replication is suspended; `promoted` says THIS DOMAIN IS THE LIVE COPY
-			// -- its disks are the data a failover produced, and they may be the
-			// only copy of it. An override that discards a suspension is a
-			// convenience. An override that discards live data is the thing this
-			// whole cluster of issues is about.
+			// Reachable only during an upgrade window. The durable trace refuses
+			// every copy promoted by a current binary, so in steady state the
+			// served-live gate has already returned before this branch; what
+			// reaches here is a domain promoted by a build that predated
+			// last_promoted_at. The migration in promotionTraceUpdate fires only on
+			// the way OUT of promoted, so until such a domain is demoted its role
+			// is the only evidence there is, and reading it here is what holds the
+			// guard at both ends of that window.
 			//
-			// The durable trace already refuses every copy promoted by a current
-			// binary, so in steady state this branch is unreachable. It exists for
-			// the population that has none: a domain promoted by a build that
-			// predated last_promoted_at. That is exactly the upgrade window the
-			// migration in promotionTraceUpdate was written for, and the migration
-			// only fires on the way OUT of promoted -- so until such a domain is
-			// demoted, the role is the only evidence there is. Reading it here is
-			// what makes the guard hold at both ends of the window.
-			//
-			// The way through is unchanged from any other served-live copy, and it
-			// is the same three deliberate acts: stop it, demote it, release it.
+			// The way through is the same three deliberate acts as for any other
+			// served-live copy: stop it, demote it, release it.
 			return fmt.Errorf("refusing to sync into %s: %w -- and -force-clean does NOT override this one. A domain marked %s is the live copy of a failover: its disks are what that failover produced. Stop it (-shutdown-domain), demote it (-update-role=%s), release the promotion (-%s), and then -force-clean will proceed. If the failover stands, -invert reverses the pair and keeps this data instead",
 				cfg.TargetDomain, err, libvirtsync.RolePromoted, libvirtsync.RolePaused, libvirtsync.FlagReleasePromotion)
 		} else {
@@ -4287,27 +4281,22 @@ func run(cfg syncConfig) (runErr error) {
 		// Refuse a running target BEFORE anything is armed, undefined or
 		// discarded.
 		//
-		// This check used to sit ~85 lines further down, after the checkpoint
-		// chain had already been dropped -- so a -reinit refused for the most
-		// ordinary reason there is ("you forgot to shut the replica down") had
-		// already destroyed the source's baseline, forcing the next sync to be
-		// a full copy of the whole machine. It cost three things, and moving
-		// the check costs nothing because it only READS:
+		// First because it is the only step in this block that neither writes
+		// nor destroys anything, and because it is the most ordinary reason a
+		// reinit does not go through: somebody forgot to shut the replica down.
+		// Refusing after any of the three steps below costs something that
+		// cannot be taken back, and the check only READS, so there is nothing
+		// to trade:
 		//
 		//   1. the source's checkpoint chain, dropped for a run that then
-		//      refused;
+		//      refuses, forcing the next sync to copy the whole machine;
 		//   2. replica_incomplete, armed on a target this run never touched,
-		//      where it then refuses promotion until some later sync clears it;
-		//   3. worst, with -force-clean: forceCleanTargetDomain undefined the
-		//      target first, and DomainExists uses LookupDomainByName, which
-		//      still finds a RUNNING domain after its definition is gone. So
-		//      the guard did fire -- one step too late, leaving the replica
-		//      running as a transient domain with no persistent definition at
-		//      all.
-		//
-		// refuseReinitIfTargetRunning's own doc comment always said it decides
-		// whether to abort "before touching the target's disk files"; it now
-		// does that before touching anything else either.
+		//      where it refuses promotion until some later sync clears it;
+		//   3. with -force-clean, the target's definition. DomainExists uses
+		//      LookupDomainByName, which still finds a RUNNING domain after its
+		//      definition is gone -- so a guard placed after the undefine fires
+		//      correctly and one step too late, leaving the replica running as
+		//      a transient domain with no persistent definition at all.
 		//
 		// DomainExists (unlike a bare LookupDomain) distinguishes a genuine "no
 		// such domain" from any other lookup failure (auth, a transient
@@ -4434,8 +4423,8 @@ func run(cfg syncConfig) (runErr error) {
 		}
 
 		// Deliberately NOT undefining the target domain anywhere in this block
-		// (this used to call tgtDom.Undefine() right after the running check,
-		// which now sits at the top): that left the target undefined for the
+		// (this used to call tgtDom.Undefine() right after the running check):
+		// that left the target undefined for the
 		// entire disk-copy duration below -- often the longest part of the
 		// whole run -- so any interruption during that window (SIGINT/SIGTERM,
 		// a killed process, a network drop) left the target permanently
