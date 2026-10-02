@@ -30,8 +30,8 @@ import (
 // Asserted against the TYPE rather than against behaviour, because behaviour
 // can be restored by a later edit while the type cannot. If somebody adds an
 // Operations field to ScheduleDoc, this fails immediately and says why --
-// which is the whole reason the guard moved out of LoadCache and into the
-// type system.
+// which is the whole reason the guard lives in the type system rather than
+// in LoadCache.
 func TestScheduleDocCannotCarryAnOperation(t *testing.T) {
 	rt := reflect.TypeOf(ScheduleDoc{})
 	for i := 0; i < rt.NumField(); i++ {
@@ -49,8 +49,8 @@ func TestScheduleDocCannotCarryAnOperation(t *testing.T) {
 	}
 }
 
-// An "operations" key in a hand-written schedule is now an ERROR naming the
-// key. It used to decode into UIConfig, be accepted, and then vanish -- since
+// An "operations" key in a hand-written schedule is an ERROR naming the key.
+// Decoding it into UIConfig and accepting it would make it vanish -- since
 // standalone starts no operations loop -- so an operator could put one there
 // and watch nothing happen, indefinitely.
 func TestScheduleFileRefusesAnOperationsKey(t *testing.T) {
@@ -141,7 +141,7 @@ func TestScheduleDocRoundTripsEverySetting(t *testing.T) {
 	}
 }
 
-// Every silently-coerced value must now say so. The failure this closes is an
+// Every silently-coerced value must say so. The failure this closes is an
 // operator typing a setting, the agent quietly substituting something else,
 // and nothing anywhere saying the typed value never applied -- which does not
 // look like a mistake, it looks like the feature not working.

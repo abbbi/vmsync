@@ -135,9 +135,9 @@ type ScheduleEntry struct {
 
 // UIConfig is the configuration the UI hands out.
 //
-// Phases 1 and 2 carried no executable instruction at all. Phase 3 adds
-// Schedule, which is the first thing here the agent acts on -- and the
-// reason SyncProfile validates every field before a command is built.
+// Schedule is the one thing here the agent ACTS on rather than merely
+// reports -- and the reason SyncProfile validates every field before a
+// command is built.
 type UIConfig struct {
 	// ReportIntervalSeconds is how often to send an inventory report.
 	ReportIntervalSeconds int `json:"report_interval_seconds"`
@@ -259,12 +259,12 @@ func (s Store) LoadCache() (CachedConfig, bool, error) {
 	}
 	// Decoded as a ScheduleDoc, which has NO Operations field.
 	//
-	// This used to decode CachedConfig -- which carries them -- and then set
-	// c.Config.Operations = nil immediately afterwards. That line was correct
-	// and well-reasoned, and it was a runtime guard on a type that permitted
-	// exactly what it guarded against, which every future decoder of that
-	// type had to remember. Now the type cannot express an operation at all,
-	// so no edit here can start replaying failovers off a disk.
+	// Decoding CachedConfig -- which carries them -- and setting
+	// c.Config.Operations = nil immediately afterwards would be correct and
+	// well-reasoned, and would still be a runtime guard on a type that permits
+	// exactly what it guards against, which every future decoder of that
+	// type has to remember. This type cannot express an operation at all, so
+	// no edit here can start replaying failovers off a disk.
 	//
 	// Lenient about unknown keys, unlike the standalone file: this copy is
 	// written by this same binary, so an unknown key means a downgrade, and
@@ -293,10 +293,10 @@ func (s Store) LoadCache() (CachedConfig, bool, error) {
 // diagnose from a shell.
 func (s Store) SaveCache(c CachedConfig) error {
 	// Written as a StoredSchedule, so operations are dropped on the way OUT
-	// by construction too: there is no field to copy them into. Previously
-	// the whole CachedConfig went to disk, operations and all, and only the
-	// READ side removed them -- which meant a live failover instruction sat
-	// in a 0644 file on the host for as long as the UI kept publishing it.
+	// by construction too: there is no field to copy them into. Writing the
+	// whole CachedConfig, operations and all, and removing them only on the
+	// READ side would leave a live failover instruction sitting in a 0644
+	// file on the host for as long as the UI kept publishing it.
 	return atomicjson.Write(s.cachePath(), StoredSchedule{
 		ScheduleDoc: scheduleDocFrom(c.Config),
 		Source:      ScheduleSource{ETag: c.ETag, FetchedAtUnix: c.FetchedAtUnix},

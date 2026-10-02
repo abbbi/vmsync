@@ -278,13 +278,13 @@ func (l *operationLedger) Begin(op Operation, now time.Time) error {
 	})
 	if err != nil {
 		// Undo the in-memory half. put() records there before it writes, so a
-		// failed write used to leave this operation marked `running` having
-		// never started -- and that is not a harmless inconsistency: Seen()
-		// refuses to re-execute ANY recorded id, so the operation could never
-		// be retried, while the UI kept publishing it forever. A later Load()
-		// then relabelled the orphan "the agent stopped while this operation
-		// was in progress", which is a statement about something that never
-		// began.
+		// failed write would otherwise leave this operation marked `running`
+		// having never started -- and that is not a harmless inconsistency:
+		// Seen() refuses to re-execute ANY recorded id, so the operation could
+		// never be retried, while the UI keeps publishing it forever. A later
+		// Load() would then relabel the orphan "the agent stopped while this
+		// operation was in progress", which is a statement about something
+		// that never began.
 		//
 		// writeJSONAtomic renames or fails, so on this path the file still
 		// holds the pre-Begin state and only memory is out of step. Dropping

@@ -34,14 +34,14 @@ func paris(t *testing.T) *time.Location { return zone(t, "Europe/Paris") }
 
 // zone is a Fatal, never a Skip.
 //
-// It used to skip when the host had no tzdata, which turned the entire DST
-// suite into something that could vanish into a green build -- the exact
-// failure this package exists to prevent, applied to its own tests. A slim CI
-// container is enough to trigger it, and nothing would have said so.
+// Skipping when the host has no tzdata would turn the entire DST suite into
+// something that can vanish into a green build -- the exact failure this
+// package exists to prevent, applied to its own tests. A slim CI container is
+// enough to trigger that, and nothing would say so.
 //
 // Importing time/tzdata above embeds the IANA database in the test binary, so
-// a load failure is now a real bug rather than a property of the machine, and
-// the DST coverage is the same wherever it runs.
+// a load failure is a real bug rather than a property of the machine, and the
+// DST coverage is the same wherever it runs.
 func zone(t *testing.T, name string) *time.Location {
 	t.Helper()
 	loc, err := time.LoadLocation(name)
@@ -481,8 +481,8 @@ func TestCrossingWindowUsesCalendarDaysNotDurations(t *testing.T) {
 	}
 }
 
-// Four ways a malformed expression used to be accepted and silently mean
-// something the operator did not write. Each is a schedule that looks
+// Four ways a malformed expression would otherwise be accepted and silently
+// mean something the operator did not write. Each is a schedule that looks
 // configured and is not, which is the failure mode this package exists to
 // prevent -- so each is a refusal, not a warning.
 func TestSilentMisreadingsAreRefused(t *testing.T) {

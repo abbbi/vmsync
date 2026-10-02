@@ -384,14 +384,14 @@ func (r *restorePoints) prune(ctx context.Context) {
 	// Abandoned staging directories are junk from an interrupted run, and
 	// are swept whatever the retention count says.
 	//
-	// Scoped to THIS domain's store, which is the fix for the third way a
-	// shared store went wrong: this sweep used to run over the directory every
-	// co-located domain staged into, so it removed a concurrently running
-	// sibling's in-flight set -- and the rename that sibling then attempted
-	// failed, failing a sync whose data had already landed, and counting toward
-	// -reinit-after-failures. Two runs of the SAME domain cannot collide here
-	// because the target run lock is held for the whole run (see
-	// util.AcquireRunLock and the target lock in cmd/vmsync/main.go).
+	// Scoped to THIS domain's store, one of the several ways a shared store
+	// goes wrong: a sweep over the directory every co-located domain stages
+	// into removes a concurrently running sibling's in-flight set -- and the
+	// rename that sibling then attempts fails, failing a sync whose data has
+	// already landed, and counting toward -reinit-after-failures. Two runs of
+	// the SAME domain cannot collide here because the target run lock is held
+	// for the whole run (see util.AcquireRunLock and the target lock in
+	// cmd/vmsync/main.go).
 	for _, name := range listing.Staging {
 		cmd, err := restorepoint.RemoveStagingCommand(r.store, name)
 		if err != nil {
@@ -405,10 +405,9 @@ func (r *restorePoints) prune(ctx context.Context) {
 		trace.Info("removed an abandoned restore point staging directory left by an interrupted run", "entry", name)
 	}
 
-	// Over this domain's own points only. It used to be over every point in the
-	// shared directory, so a retention count meant for one machine was applied
-	// to the sum of several and one domain's churn silently evicted another's
-	// history.
+	// Over this domain's own points only. Pruning every point in the shared
+	// directory applies a retention count meant for one machine to the sum of
+	// several, and one domain's churn silently evicts another's history.
 	plan := restorepoint.Prune(listing.Points, r.policy)
 	for _, tag := range plan.Remove {
 		cmd, err := restorepoint.RemoveCommand(r.store.Point(tag))
@@ -436,17 +435,17 @@ func (r *restorePoints) prune(ctx context.Context) {
 // sweepRestorePointsForReinit decides what a -reinit does to the restore
 // points of the replica it is about to discard.
 //
-// THIS TARGET DOMAIN'S ONLY. It used to act on the shared directory, so
-// reinitialising one replica deleted or orphaned the entire restore point
+// THIS TARGET DOMAIN'S ONLY. Acting on the shared directory would mean that
+// reinitialising one replica deletes or orphans the entire restore point
 // history of every other domain replicating into the same -target-disk-path --
 // in one rm -rf, while logging that it had removed "the restore points
-// belonging to the replaced replica". A co-located domain's store is now a
-// sibling this function cannot name: restorepoint.RemoveStoreCommand takes a
-// Store, and a Store cannot be built without a domain.
+// belonging to the replaced replica". A co-located domain's store is a sibling
+// this function cannot name: restorepoint.RemoveStoreCommand takes a Store,
+// and a Store cannot be built without a domain.
 //
-// Anything else in the shared directory is likewise left alone, including
-// restore points a pre-change vmsync left flat in it: this addresses one store,
-// so there is no expression here that could name them.
+// Anything else in the shared directory is likewise left alone, including any
+// restore points sitting flat in it rather than under a domain's store: this
+// addresses one store, so there is no expression here that could name them.
 //
 // An operator-initiated reinit takes them with it, following
 // -replaced-disk-action exactly as the replica disks do: one knob, and the
@@ -639,12 +638,12 @@ func targetRunnerForRestorePoints(cfg syncConfig) (remoteRunner, func(), error) 
 // looks the domain has already said where its disks are. See that function for
 // why deriving is the more correct answer rather than merely the convenient
 // one.
-// It needs -target-domain as well, and that is new: restore points are kept per
-// target domain, so a directory alone no longer names a set. It cannot be
-// defaulted from -source-domain the way a sync's can, because these verbs
-// dispatch before that defaulting happens -- and defaulting it would be worse
-// than refusing anyway, since the domain given here has to be the same string
-// the sync used or the history reads as empty.
+// It needs -target-domain as well: restore points are kept per target domain,
+// so a directory alone does not name a set. It cannot be defaulted from
+// -source-domain the way a sync's can, because these verbs dispatch before
+// that defaulting happens -- and defaulting it would be worse than refusing
+// anyway, since the domain given here has to be the same string the sync used
+// or the history reads as empty.
 func restorePointStore(cfg syncConfig) (restorepoint.Store, error) {
 	if cfg.TargetDiskPath == "" {
 		return restorepoint.Store{}, fmt.Errorf("-target-disk-path is required to locate restore points; they live in %s inside it. (-restore-restore-point reads it off the target domain instead, but these verbs are built to work on a target whose domain is gone, so they cannot)", restorepoint.DirName)

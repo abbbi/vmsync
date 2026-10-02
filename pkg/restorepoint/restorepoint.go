@@ -183,10 +183,10 @@ func ParseTag(name string) (Tag, error) {
 }
 
 // Addressing a store, a point or a staging directory lives in store.go, behind
-// types that cannot be built without naming a target domain. The free functions
-// that used to be here -- Root(diskPath), Dir(root, t), StagingDir(root, t) --
-// took a bare directory, which is what made one domain able to read, prune and
-// delete another's restore points; see the note at the top of store.go.
+// types that cannot be built without naming a target domain. Free functions
+// here -- Root(diskPath), Dir(root, t), StagingDir(root, t) -- would take a
+// bare directory, which is what lets one domain read, prune and delete
+// another's restore points; see the note at the top of store.go.
 
 // DiskPath is where one replica disk's copy lives inside a restore point.
 // Named after the disk's own basename, so a restore point is a drop-in set.

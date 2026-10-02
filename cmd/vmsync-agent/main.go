@@ -18,12 +18,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // vmsync-agent runs on every hypervisor and reports what that host knows
 // about its own replication state to the control-plane UI.
 //
-// Through phase 2 this binary was read-only by construction. Phase 3 adds
-// scheduling: it now runs vmsync for the VMs the UI's schedule names. What
-// it still cannot do is change a replication role or touch a domain
-// directly -- and vmsync's own replication_role check remains the backstop
-// under all of it, refusing to overwrite a promoted or paused target no
-// matter what any schedule says.
+// It runs vmsync for the VMs the UI's schedule names. What it cannot do is
+// change a replication role or touch a domain directly -- and vmsync's own
+// replication_role check is the backstop under all of it, refusing to
+// overwrite a promoted or paused target no matter what any schedule says.
 //
 // The schedule is typed data, never a command line. The agent owns the flag
 // vocabulary (see SyncProfile.CommandArgs), validates every field before
@@ -105,7 +103,7 @@ type agentConfig struct {
 	// Empty in every other mode, where the schedule is agent-written state
 	// under StateDir.
 	//
-	// It no longer doubles as the mode marker. Mode does that, and says so.
+	// It does not double as the mode marker. Mode does that, and says so.
 	StandaloneFile string
 
 	// Mode is what this invocation is for, taken from the command line. See
@@ -131,7 +129,7 @@ type agentConfig struct {
 	runLog *runLog
 }
 
-// Everything else this agent needs now lives in the config file. These remain
+// Everything else this agent needs lives in the config file. These remain
 // because none of them is a SETTING: they select a file, or they say what this
 // one invocation is for.
 //
@@ -142,10 +140,10 @@ type agentConfig struct {
 // "can a network service stop VMs on this host?" is answered by looking rather
 // than by reading a JSON document and knowing a rule about it.
 //
-// The nineteen that went are not merely relocated. A flag can only be changed
-// by restarting the process, and a daemon whose settings can only be changed
-// by restarting it is one an operator hesitates to touch during an incident --
-// which is when they most need to.
+// Keeping a setting out of this list is not mere tidiness. A flag can only be
+// changed by restarting the process, and a daemon whose settings can only be
+// changed by restarting it is one an operator hesitates to touch during an
+// incident -- which is when they most need to.
 func main() {
 	var (
 		configPath     = flag.String("config", "/etc/vmsync/agent.json", "Path to this agent's configuration. Everything except the flags listed here lives in that file; see the agent README")
@@ -247,8 +245,8 @@ func main() {
 	// Not an error -- both names are doing their job -- but it is worth saying
 	// once, because everything about a pair (fence tokens, replica_source,
 	// which row in the console) then keys off a name that is not the one in
-	// the file. It is also exactly the configuration in which the fence check
-	// used to compare the wrong string and silently never fire.
+	// the file. It is also exactly the configuration in which a fence check
+	// comparing the wrong string would silently never fire.
 	if h := util.ReplicaHost(cfg.LibvirtURI, cfg.Hostname); h != cfg.Hostname {
 		trace.Warning("this agent reports under one name and appears in replication metadata under another, because libvirt_uri names a remote host",
 			"reports_as", cfg.Hostname, "replica_identity", h, "libvirt_uri", cfg.LibvirtURI)
@@ -326,8 +324,8 @@ func run(lv *live, reloads *reloader) error {
 	}()
 
 	// SIGHUP is a RELOAD, not a shutdown. Registering it matters beyond the
-	// feature: Go terminates on an unhandled SIGHUP, so before this,
-	// `systemctl reload` was `systemctl kill` -- and the natural fallback,
+	// feature: Go terminates on an unhandled SIGHUP, so without this handler
+	// `systemctl reload` is `systemctl kill` -- and the natural fallback,
 	// `systemctl kill -s HUP`, signals the whole control group and would take
 	// every in-flight vmsync down without its unwind path.
 	hupCh := make(chan os.Signal, 1)
@@ -610,9 +608,9 @@ func reportLoop(ctx context.Context, client *Client, lv *live, state *sharedStat
 			// send does, because these describe this host rather than the
 			// exchange with the UI.
 			//
-			// They used to sit in the success branch below, which inverted
-			// the one case they exist for. A controlled or monitor agent does
-			// not scan again in metricsLoop, so nothing else fills these in;
+			// Sitting in the success branch below would invert the one case
+			// they exist for. A controlled or monitor agent does not scan
+			// again in metricsLoop, so nothing else fills these in;
 			// an agent whose control plane is unreachable -- the DR site
 			// being down is exactly that -- would then keep publishing zero
 			// for as long as it could not reach the UI, and zero here reads

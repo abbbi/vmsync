@@ -47,15 +47,15 @@ const scheduleDocVersion = 1
 // merely restarted by a package upgrade, performing a failover from an
 // instruction nobody re-issued and which may be hours stale.
 //
-// That used to be enforced by a line of code -- LoadCache set
-// c.Config.Operations = nil on every load. Correct, well-reasoned, and a
-// runtime guard on a type that permitted the very thing it guarded against,
-// which every future decoder had to remember. A type with no such field
-// cannot carry an operation off a disk at all, however the file got there.
-// DisallowUnknownFields then turns an "operations" key in a hand-written file
-// into a parse error NAMING it -- which standalone mode silently swallowed
-// before, decoding them into a struct and then never starting an operations
-// loop to run them.
+// Enforcing that with a line of code -- LoadCache setting
+// c.Config.Operations = nil on every load -- would be correct and
+// well-reasoned, and still a runtime guard on a type that permits the very
+// thing it guards against, which every future decoder has to remember. A type
+// with no such field cannot carry an operation off a disk at all, however the
+// file got there. DisallowUnknownFields then turns an "operations" key in a
+// hand-written file into a parse error NAMING it, rather than letting
+// standalone mode swallow it silently -- decoding it into a struct and never
+// starting an operations loop to run it.
 type ScheduleDoc struct {
 	ConfigVersion int `json:"config_version"`
 
@@ -105,7 +105,7 @@ type StoredSchedule struct {
 //
 // Operations is left nil, and cannot be anything else: ScheduleDoc has no
 // field to carry one. This is where "an operation never survives a restart"
-// stopped being a line somebody has to remember.
+// is enforced by the type rather than by a line somebody has to remember.
 func (d ScheduleDoc) toUIConfig() UIConfig {
 	return UIConfig{
 		ReportIntervalSeconds:  d.ReportIntervalSeconds,
@@ -144,7 +144,7 @@ func scheduleDocFrom(c UIConfig) ScheduleDoc {
 // These are not refusals. The UI is a separately-versioned program, and
 // refusing its document outright would let a newer UI take an estate offline
 // by adding a field or overshooting a range -- so a bad value is clamped or
-// ignored, exactly as before. What changes is that it is no longer SILENT.
+// ignored. What it is never is SILENT.
 //
 // The failure this closes: an operator sets an interval of 0, or a slot count
 // of -1, and the agent quietly substitutes something else. Nothing is wrong,

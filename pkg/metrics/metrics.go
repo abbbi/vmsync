@@ -49,13 +49,13 @@ const (
 // replica, a check that could not run means the replica's state is simply
 // unknown and the tooling needs fixing.
 //
-// VerificationState used to mirror RunMetric.State, so both collapsed onto
-// 1. That is not a theoretical loss. A -verify=qemu-img that could not open
-// its export at all -- it was asking for an unnamed export against a named
-// one, and exited before comparing a byte -- reported 1 on every run, and
-// the bench stage that tampers a replica and expects a detection scored
-// three consecutive PASSes on a comparator that had never compared
-// anything. Only the sub-test expecting a CLEAN result could tell.
+// Mirroring RunMetric.State would collapse both onto 1, and that is not a
+// theoretical loss. A -verify=qemu-img that cannot open its export at all --
+// asking for an unnamed export against a named one, and exiting before
+// comparing a byte -- then reports 1 on every run, and the bench stage that
+// tampers a replica and expects a detection scores PASS after PASS on a
+// comparator that has never compared anything. Only the sub-test expecting a
+// CLEAN result can tell.
 //
 // Deliberately NOT split by cause. A failed SSH, a missing helper, a version
 // skew, an export that would not start and a source read error are one
@@ -168,8 +168,8 @@ type RunMetric struct {
 	// Received is the payload direction here, and that is not a detail. The
 	// bridge's Sent counts the outbound leg, which on the source side is the
 	// local NBD client's REQUESTS; the disk data comes back inbound. Reading
-	// Sent -- which this used to do -- measured the command stream and
-	// reported it as transferred data.
+	// Sent would measure the command stream and report it as transferred
+	// data.
 	SourceBridgeReceivedBytes uint64
 	SourceBridgeSentBytes     uint64
 	// FSFreezeFailed is true when the guest filesystems could not be
@@ -227,10 +227,10 @@ type RunMetric struct {
 	// VerificationState is one of the CheckState* values: did -verify find
 	// a difference, or could it not run at all?
 	//
-	// It used to mirror State, which made it a duplicate of vmsync_sync_state
-	// carrying no information of its own -- and, worse, made "the replica
-	// differs from its source" indistinguishable from "the comparator could
-	// not connect". See the CheckState* comment for what that cost.
+	// Mirroring State would make it a duplicate of vmsync_sync_state carrying
+	// no information of its own -- and, worse, would make "the replica differs
+	// from its source" indistinguishable from "the comparator could not
+	// connect". See the CheckState* comment for what that costs.
 	VerificationState int
 	// VerificationTimestamp is the Unix time (seconds) this run's
 	// verification finished, success or failure -- same staleness-detection

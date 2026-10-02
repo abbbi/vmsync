@@ -198,11 +198,11 @@ func ChangedExtentsTCP(ctx context.Context, host string, port int, exportName, c
 		// less than the requested range (e.g. a server-side limit on how
 		// many extents fit in one reply), or for the final extent to run
 		// past it. Advancing the scan by the raw requested chunk size
-		// regardless (as this used to do) either silently drops whatever
-		// sub-range the server declined to describe -- those bytes are
-		// never re-queried and never copied, with the run still reporting
-		// success -- or, in the overrun case, re-queries and duplicates a
-		// sub-range already covered. See nextExtentScanOffset below.
+		// regardless would either silently drop whatever sub-range the
+		// server declined to describe -- those bytes never re-queried and
+		// never copied, with the run still reporting success -- or, in the
+		// overrun case, re-query and duplicate a sub-range already
+		// covered. See nextExtentScanOffset below.
 		describedEnd := offset
 		err = h.BlockStatus(chunk, offset, func(meta string, offs uint64, entries []uint32, cbErr *int) int {
 			if cbErr != nil && *cbErr != 0 {
@@ -1101,14 +1101,13 @@ func CompareTCPCollect(ctx context.Context, aHost string, aPort int, aExport str
 // is read, so this costs a handful of round trips regardless of disk size.
 //
 // It exists as a separate step from the hashing SO THAT BOTH SIDES CAN HASH
-// AT ONCE. The first version of this path computed the source digests and
-// only then asked the target for its own, which made a verify cost
-// source-read PLUS target-read -- serialising two reads that the byte
-// comparator it replaced had always overlapped in one AIO pipeline. That
-// traded away parallelism to save network, and on a link fast enough that
-// disk is the wall it was a straight loss: the digests saved the transfer
-// and the serialisation gave the saving back. With the plan settled first,
-// the two hashes are independent and a verify costs max(source, target).
+// AT ONCE. Computing the source digests and only then asking the target for
+// its own makes a verify cost source-read PLUS target-read -- serialising
+// two reads that the byte comparator overlaps in one AIO pipeline. That
+// trades away parallelism to save network, and on a link fast enough that
+// disk is the wall it is a straight loss: the digests save the transfer and
+// the serialisation gives the saving back. With the plan settled first, the
+// two hashes are independent and a verify costs max(source, target).
 //
 // Both exports are consulted because the skip logic needs both. A range is
 // skipped only when BOTH sides report it as reading zeros; skipping on the

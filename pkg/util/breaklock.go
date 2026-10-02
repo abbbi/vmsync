@@ -179,7 +179,7 @@ func proveHolderGone(id RunLockIdentity, f hostFacts) (bool, string) {
 // DescribeLockHolder renders a holder for an operator, or says plainly that
 // nothing is recorded.
 //
-// Used by the refusals that used to be a bare exit 75. "Another vmsync is
+// Used by the refusals that must not be a bare exit 75. "Another vmsync is
 // working on this" is not actionable during a disaster; "the sync from hv-a that
 // started at 02:14 holds it, run id 0b9f5c2e" is.
 func DescribeLockHolder(dir, key string) string {

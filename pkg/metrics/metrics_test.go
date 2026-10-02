@@ -136,11 +136,11 @@ func TestFreezeAndThawAreSeparateSignals(t *testing.T) {
 // TestPerDiskCompressedBytesAreSummable is the contract the source/target
 // split exists to create.
 //
-// CompressedTransferredBytes used to include the SOURCE bridge, which is one
-// shared listener for the whole run. Adding a run-wide total to every disk
-// meant the obvious query -- sum by (vm) -- counted it once per disk, and
-// per-disk compression ratios were nonsense. This asserts the per-disk
-// series now carries only what is genuinely per-disk.
+// Including the SOURCE bridge in CompressedTransferredBytes adds a run-wide
+// total -- one shared listener for the whole run -- to every disk, so the
+// obvious query, sum by (vm), counts it once per disk and per-disk
+// compression ratios are nonsense. This asserts the per-disk series carries
+// only what is genuinely per-disk.
 func TestPerDiskCompressedBytesAreSummable(t *testing.T) {
 	disks := []DiskMetric{
 		{VM: "db01", Disk: "vda", TransferredBytes: 1000, CompressedTransferredBytes: 300},
@@ -227,12 +227,11 @@ func TestNoSourceBridgeEmitsNoSeries(t *testing.T) {
 // The distinction the CheckState* values exist for: "the replica differs"
 // and "the check could not run" must be different numbers.
 //
-// They used to be the same one -- VerificationState mirrored State, so any
-// failing verify reported 1. That is what let a -verify=qemu-img which could
-// not even open its export (it asked for an unnamed export against a named
-// one, and exited before comparing a byte) report a mismatch on every run,
-// and score three consecutive PASSes in a bench stage whose whole job is
-// detecting a tampered replica.
+// One number for both -- VerificationState mirroring State, so any failing
+// verify reports 1 -- is what lets a -verify=qemu-img which cannot even open
+// its export (asking for an unnamed export against a named one, and exiting
+// before comparing a byte) report a mismatch on every run, and pass a bench
+// stage whose whole job is detecting a tampered replica.
 func TestVerificationStateSeparatesMismatchFromCouldNotRun(t *testing.T) {
 	mismatch := writeAndRead(t, RunMetric{
 		VM: "web01", State: StateFailure,

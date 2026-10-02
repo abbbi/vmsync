@@ -192,11 +192,10 @@ func TestRenderReplicaIncompleteGauge(t *testing.T) {
 	}
 }
 
-// The split-brain gauge is the metric this defect was first found in, and it
-// is rendered by the same file, so it gets the same proof. Two split-brain
-// VMs used to emit two HELP lines for one family and take the whole textfile
-// down with them -- on a host that is, by definition, in the worst state
-// this agent can report.
+// The split-brain gauge is exposed to the same defect and is rendered by the
+// same file, so it gets the same proof. Two split-brain VMs emitting two HELP
+// lines for one family would take the whole textfile down with them -- on a
+// host that is, by definition, in the worst state this agent can report.
 func TestRenderSplitBrainGaugeStaysParseableWithSeveralVMs(t *testing.T) {
 	m := newAgentMetrics("test", "hyper02p", modeStandalone)
 	m.setSplitBrain(map[string]bool{"web01": true, "db01": true, "mail01": true})

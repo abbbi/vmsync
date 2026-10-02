@@ -317,16 +317,15 @@ func TestRefuseReinitIfTargetRunning(t *testing.T) {
 
 // TestTargetPortsNeeded pins the count against what a run actually BINDS.
 //
-// The expectations changed when the fixed-offset layout went away, and the
-// verify-without-bridging case is why. It used to assert 3N, mirroring a
-// layout that put the verify block at +2N whether or not bridging was on --
-// so a run reserved through 3N and bound 2N, holding the middle block idle.
-// The test was correct about the code and both were wrong about the need: a
-// four-disk -verify=qemu-img run with no compression demanded twelve
-// consecutive ports to use eight, and was refused on a fragmented range that
-// could have served it. Nothing reserves a block now (see
-// portalloc.Allocator: each export binds its own port), so the padding has no
-// layout left to mirror and the answer is the count.
+// The verify-without-bridging case is the one to get right. Asserting 3N
+// there would mirror a fixed-offset layout that puts the verify block at +2N
+// whether or not bridging is on -- so a run reserves through 3N and binds 2N,
+// holding the middle block idle. Such a test is correct about the code, and
+// both are wrong about the need: a four-disk -verify=qemu-img run with no
+// compression then demands twelve consecutive ports to use eight, and is
+// refused on a fragmented range that could have served it. Nothing reserves a
+// block (see portalloc.Allocator: each export binds its own port), so padding
+// has no layout to mirror and the answer is the count.
 //
 // One port per disk for the write export, plus one per disk for its bridge
 // when bridging, plus one per disk for the verify export when verifying, plus
@@ -363,13 +362,12 @@ func TestTargetPortsNeeded(t *testing.T) {
 		})
 	}
 
-	// The same invariant stated independently of the table, and restated for
-	// the new model: the total must be the sum of the per-stage counts, each
-	// of which is one port per disk. It used to check the total against the
-	// highest offset a code path bound at (base+4N-1), which was the right
-	// check for a contiguous layout and is meaningless without one -- and it
-	// passed while the 3N padding was in place, because that case is not
-	// fully-enabled.
+	// The same invariant stated independently of the table: the total must be
+	// the sum of the per-stage counts, each of which is one port per disk.
+	// Checking the total against the highest offset a code path binds at
+	// (base+4N-1) is the right check only for a contiguous layout and is
+	// meaningless without one -- and it passes even with the 3N padding in
+	// place, because that case is not fully-enabled.
 	const disks = 4
 	if got, want := targetPortsNeeded(disks, false, false), disks; got != want {
 		t.Errorf("plain: got %d, want %d (write export only)", got, want)
@@ -427,7 +425,7 @@ func TestChecksumCheckCostsNoPorts(t *testing.T) {
 			case tc.verify:
 				// Two per disk, not three: the write export and the verify
 				// export, with nothing held between them. See
-				// TestTargetPortsNeeded for why this used to be 3N.
+				// TestTargetPortsNeeded for why 3N here would be wrong.
 				want = 2 * disks
 			case tc.bridging:
 				want = 2 * disks
@@ -1001,12 +999,12 @@ func TestBindOnFreePort(t *testing.T) {
 	})
 }
 
-// TestFlagHelpIsOneLineAndGrouped enforces what -help was just rescued from.
+// TestFlagHelpIsOneLineAndGrouped is what keeps -help readable.
 //
-// Every flag's help used to carry its own reasoning; several ran past a
-// thousand characters, and the effect was a -help nobody read. Nothing stopped
-// that happening, and nothing would stop the next flag doing it again -- so
-// this is the guard, and registerFlags takes a *flag.FlagSet precisely so a
+// Help text that carries each flag's own reasoning runs past a thousand
+// characters a flag, and the effect is a -help nobody reads. Nothing else
+// stops that happening, and nothing else would stop the next flag doing it --
+// so this is the guard, and registerFlags takes a *flag.FlagSet precisely so a
 // test can register into a throwaway set and inspect what it got.
 func TestFlagHelpIsOneLineAndGrouped(t *testing.T) {
 	var cfg syncConfig
@@ -1103,11 +1101,11 @@ func TestFlagHelpIsOneLineAndGrouped(t *testing.T) {
 // A thaw that TIMES OUT is not a thaw that FAILED.
 //
 // The bug this pins: callWithTimeout abandons its goroutine but does not stop
-// it, so a guest agent that answers a second late used to leave the run
-// reporting "the guest filesystems are still FROZEN" about a guest that was
-// never frozen -- confirmed in the field by `virsh domfsthaw` replying
-// "0 filesystems thawed". Spending the loudest alarm in this program on a
-// healthy guest is how operators learn to scroll past it.
+// it, so without this distinction a guest agent that answers a second late
+// leaves the run reporting "the guest filesystems are still FROZEN" about a
+// guest that was never frozen -- seen in the field, with `virsh domfsthaw`
+// replying "0 filesystems thawed". Spending the loudest alarm in this program
+// on a healthy guest is how operators learn to scroll past it.
 func TestThawTrackerDistinguishesTimeoutFromFailure(t *testing.T) {
 	t.Run("a late success retracts the timeout", func(t *testing.T) {
 		// The observed sequence: run() gives up at the timeout, then the

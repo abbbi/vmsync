@@ -55,14 +55,13 @@ import (
 // recognizable: a host already allowing 10809/20809 only needs the range
 // widened, not moved.
 //
-// These used to be reachable only by typing "auto", with the default being
-// the single fixed port. That was the wrong way round. A range costs nothing
-// when one run is active and is the difference between working and colliding
-// when two are, so it is what an operator who has not thought about ports
-// should get -- and an operator who HAS thought about them can still pin one.
-// Nothing in an agent-managed estate ever set a port range (no preset, no form
-// field, no handler), so every VM took the fixed port and any two concurrent
-// syncs to one target host shared every port.
+// A range, not a single fixed port, is what an operator who has not thought
+// about ports gets: a range costs nothing when one run is active and is the
+// difference between working and colliding when two are -- while an operator
+// who HAS thought about them can still pin one. Nothing in an agent-managed
+// estate sets a port range (no preset, no form field, no handler), so a fixed
+// default gives every VM the same port and leaves any two concurrent syncs to
+// one target host sharing every port.
 //
 // Sized in the unit that actually matters, which is ports per DISK on the
 // target: a run takes 4 per disk with -verify and -compress together (3 with
@@ -114,17 +113,16 @@ func (s Spec) String() string {
 // different firewall policies, so a range belongs per side, and this CLI
 // already overloads -compress, -verify and -netbuffer the same way.
 //
-// There used to be a third form, the keyword "auto", meaning "choose inside
-// [defLow, defHigh]". It is gone because the default became a range: "auto"
-// then meant precisely what passing nothing means, and a keyword whose only
-// effect is to restate the default is a thing to explain rather than a thing
-// to use. An empty value is still an error rather than silently defaulting --
-// the flag has a default, so an empty string reaching here means a caller
-// built one, which is a bug worth surfacing rather than papering over.
+// The keyword "auto" is accepted below as an alias for [defLow, defHigh] but
+// is not a documented form: with the default already a range, "auto" means
+// precisely what passing nothing means, and a keyword whose only effect is to
+// restate the default is a thing to explain rather than a thing to use. An
+// empty value is an error rather than a silent default -- the flag has a
+// default, so an empty string reaching here means a caller built one, which
+// is a bug worth surfacing rather than papering over.
 //
-// defLow/defHigh are still parameters because callers pass the side-specific
-// range and the error text quotes it; they are no longer selected by a
-// keyword.
+// defLow/defHigh are parameters because callers pass the side-specific range,
+// which the error text quotes and the "auto" alias resolves to.
 func ParseSpec(value string, defLow, defHigh int) (Spec, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -279,19 +277,19 @@ type Allocator struct {
 // rather than something computed here so this package stays pure and its
 // tests stay deterministic.
 //
-// Random rather than derived from the vm's name, which is what it used to be.
-// The point is not collision probability: a collision is handled, since the
-// caller simply binds the next candidate. The point is that a DERIVED offset
-// makes a vm permanently unlucky. If FNV(domain)%span happens to land where
-// some unrelated long-lived service sits, that vm starts there on every run
-// for the life of the deployment and pays the same wasted attempts each time.
-// A random start makes that a one-off rather than a property of the name.
+// Random rather than derived from the vm's name. The point is not collision
+// probability: a collision is handled, since the caller simply binds the next
+// candidate. The point is that a DERIVED offset makes a vm permanently
+// unlucky. If FNV(domain)%span happens to land where some unrelated
+// long-lived service sits, that vm starts there on every run for the life of
+// the deployment and pays the same wasted attempts each time. A random start
+// makes that a one-off rather than a property of the name.
 //
-// What it costs is run-to-run port stability, which was the original argument
-// for deriving it. That argument was weak: every port a run binds is logged as
-// it is bound, so a firewall log is read against what happened rather than
-// against what a hash predicted -- and vmsync logs the starting offset too, so
-// a run remains reproducible from its own log.
+// What deriving it would buy is run-to-run port stability, and that argument
+// is weak: every port a run binds is logged as it is bound, so a firewall log
+// is read against what happened rather than against what a hash predicted --
+// and vmsync logs the starting offset too, so a run remains reproducible from
+// its own log.
 //
 // For a FIXED spec the order is fixed, fixed+1, ... up to 65535. That matches
 // what a fixed spec has always meant in practice: the old scheme returned it

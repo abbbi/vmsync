@@ -43,7 +43,7 @@ const RunLockDir = "/run/vmsync-locks"
 // qemu-nbd exports need: their Unix sockets and their pidfiles. Overridable
 // with -target-runtime-dir.
 //
-// It used to be /tmp, and /tmp is the one directory that cannot be relied on
+// This must not be /tmp, which is the one directory that cannot be relied on
 // for this. Hosts running SELinux with pam_namespace POLYINSTANTIATE it: every
 // SSH session gets a private mount namespace in which /tmp is bound to its own
 // instance under /tmp-inst. vmsync drives the target over SSH, so a socket

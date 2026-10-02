@@ -19,7 +19,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
 //   - recoverRelayPanic, which turns a panic on one of handleConn's two
 //     relay-direction goroutines into a returned error instead of letting it
-//     crash the whole (now long-lived, multi-connection) helper process.
+//     crash the whole (long-lived, multi-connection) helper process.
 //
 //   - handleConn itself, end to end, over real loopback TCP connections on
 //     both sides -- deliberately not net.Pipe(), because handleConn only
@@ -115,12 +115,12 @@ func newLoopbackPair(t *testing.T) (accepted, dialed net.Conn) {
 // outbound relay direction can in turn see EOF and finish.
 //
 // It reads a KNOWN LENGTH via io.ReadFull rather than everything-until-EOF
-// via io.ReadAll, which is what it used to do. io.ReadAll cannot tell "the
-// peer sent the whole request and then half-closed" apart from "the peer sent
-// nothing at all and closed" -- both are a nil error and a slice, differing
-// only in length. That made a genuine truncation surface far away from where
-// it happened, as a puzzling byte-comparison mismatch in the caller, and it
-// made the content assertion depend on FIN timing rather than on the bytes
+// via io.ReadAll. io.ReadAll cannot tell "the peer sent the whole request
+// and then half-closed" apart from "the peer sent nothing at all and
+// closed" -- both are a nil error and a slice, differing only in length.
+// That would surface a genuine truncation far away from where it happened,
+// as a puzzling byte-comparison mismatch in the caller, and would make the
+// content assertion depend on FIN timing rather than on the bytes
 // themselves.
 //
 // The distinction matters most for -compress=s2: s2's reader treats EOF at a
@@ -129,9 +129,9 @@ func newLoopbackPair(t *testing.T) (accepted, dialed net.Conn) {
 // stream that ends early decodes to zero bytes with NO error anywhere in the
 // pipeline -- RelayFromWire returns nil, handleConn half-closes, and the only
 // evidence left is an empty read here. zstd reports the same event as an
-// error instead, which is why this only ever showed up on the s2 case.
-// io.ReadFull turns it back into an explicit "unexpected EOF" naming the
-// moment it occurred.
+// error instead, so the s2 case is the only one where a truncation can hide
+// completely. io.ReadFull makes it an explicit "unexpected EOF" naming the
+// moment it occurs.
 //
 // After the request, it confirms EOF actually follows: that half-close is a
 // real behavior of handleConn's inbound direction worth asserting, it just
@@ -144,21 +144,21 @@ func newLoopbackPair(t *testing.T) (accepted, dialed net.Conn) {
 // separate is what makes this usable from a select.
 //
 // errCh carries ONLY a real failure -- it never receives a nil to mean
-// success. An earlier version signalled completion by sending nil on the same
-// channel, which made the caller's
+// success. Signalling completion by sending nil on the same channel would
+// make the caller's
 //
 //	select {
 //	case got = <-receivedCh:
 //	case err := <-exportErrCh:
 //	}
 //
-// a coin flip whenever this goroutine ran to completion before the caller
-// reached the select: both channels were ready, Go picks a ready case at
-// random, and picking the nil error left got nil and failed the test with
+// a coin flip whenever this goroutine runs to completion before the caller
+// reaches the select: both channels are ready, Go picks a ready case at
+// random, and picking the nil error leaves got nil and fails the test with
 // "received 0 bytes ... the relay corrupted the payload in transit" -- an
-// accusation against the relay for something the test did to itself. It
-// reproduced roughly half the time under -race -count 4, and every time with
-// a 50ms sleep before the select.
+// accusation against the relay for something the test does to itself. It
+// would show up roughly half the time under -race -count 4, and every time
+// with a 50ms sleep before the select.
 //
 // doneCh closes when the goroutine has finished, whatever the outcome, so
 // waiting for it never consumes the error a later check wants to read.
@@ -287,9 +287,8 @@ func TestRecoverRelayPanicPropagatesOrdinaryError(t *testing.T) {
 // arrives back at the client end unchanged, and that handleConn itself
 // returns promptly once both directions have drained -- rather than hanging,
 // which is exactly the class of bug the CloseWrite half-closes in handleConn
-// exist to prevent (see main.go's comments on why they matter now that this
-// is a persistent, multi-connection daemon rather than a one-shot,
-// exec'd-per-connection process).
+// exist to prevent (see main.go's comments on why they matter in a
+// persistent, multi-connection daemon).
 func TestHandleConnRelaysBothDirections(t *testing.T) {
 	const timeout = 5 * time.Second
 

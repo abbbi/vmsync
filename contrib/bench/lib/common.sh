@@ -97,11 +97,11 @@ virsh_uri() {
 }
 
 # dom_state/domain_exists both leave virsh's own stderr text (if any) in
-# $VIRSH_ERR on failure -- e.g. "-source-uri has the wrong scheme" and "the
-# domain genuinely doesn't exist" and "SSH auth failed" all used to look
-# identically like a bare "not found"/"cannot query state" with nothing
-# else to go on. Callers that die/warn on failure should fold
-# ${VIRSH_ERR:+: $VIRSH_ERR} into their own message.
+# $VIRSH_ERR on failure -- without it, "-source-uri has the wrong scheme",
+# "the domain genuinely doesn't exist" and "SSH auth failed" are
+# indistinguishable: each reaches the caller as a bare "not found"/"cannot
+# query state" with nothing else to go on. Callers that die/warn on failure
+# should fold ${VIRSH_ERR:+: $VIRSH_ERR} into their own message.
 
 # dom_state URI DOMAIN -> "running", "shut off", etc (whitespace collapsed).
 dom_state() {

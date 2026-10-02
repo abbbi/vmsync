@@ -61,15 +61,15 @@ const bridgeStateDir = "/run/vmsync-bridge"
 // It is part of the pidfile's name, and that is a correctness requirement
 // rather than a readability one.
 //
-// These files used to be named by port alone, which is host-wide: two runs
-// that landed on the same bridge port shared one pidfile. The start command
-// records the pid BEFORE the helper binds, so the later run would overwrite
-// the earlier one's pid, and the readiness check -- which matches the
-// recorded pid against whoever is actually listening -- could then match the
-// OTHER run's helper and report success. The loser then relayed through a
-// helper connected to a different VM's qemu-nbd, writing its data into
-// another VM's disk. The same clobbered pid also made the stop command's
-// `kill -9 -$(cat ...)` a group kill against a recycled pid.
+// Naming these files by port alone would be host-wide: two runs that land on
+// the same bridge port would share one pidfile. The start command records the
+// pid BEFORE the helper binds, so the later run would overwrite the earlier
+// one's pid, and the readiness check -- which matches the recorded pid
+// against whoever is actually listening -- could then match the OTHER run's
+// helper and report success. The loser would relay through a helper connected
+// to a different VM's qemu-nbd, writing its data into another VM's disk. The
+// same clobbered pid would also make the stop command's `kill -9 -$(cat ...)`
+// a group kill against a recycled pid.
 //
 // With the key in the name, the loser's readiness check reads its own dead
 // pid, does not match the winner's listener, and fails loudly. That is the
@@ -144,23 +144,21 @@ func killOrphanedRemoteBridge(client *remotessh.Client, pidFile, logFile string,
 // attempting a real TCP connection, or that *anything* is listening on the
 // port at all.
 //
-// A real TCP connect-and-close probe was used here originally and caused a
-// deadlock: vmsync-bridge-helper's accept loop treats ANY accepted
-// connection as a real one and immediately dials the real NBD export for
-// it -- which, by qemu-nbd's default --shared=1, only allows a single
-// simultaneous client. A disposable readiness probe occupied that one slot
-// until its side of the relay fully unwound, racing against (and usually
-// losing to) the real data connection that immediately followed it, wedging
-// the whole sync.
+// A real TCP connect-and-close probe deadlocks: vmsync-bridge-helper's
+// accept loop treats ANY accepted connection as a real one and immediately
+// dials the real NBD export for it -- which, by qemu-nbd's default
+// --shared=1, only allows a single simultaneous client. A disposable
+// readiness probe occupies that one slot until its side of the relay fully
+// unwinds, racing against (and usually losing to) the real data connection
+// that immediately follows it, wedging the whole sync.
 //
-// A "kill -0" liveness check was used after that, but only proves the
-// process exists, not that it has reached bind()/listen() yet -- under
-// enough load/latency the local relay could dial in before the remote
-// listener was actually up, getting connection-refused and tearing down the
-// client connection it was serving. Reading the socket table directly avoids
-// both problems: it's a passive read of kernel state, so it can never
-// trigger the helper's accept-and-dial machinery, and it only succeeds once
-// the socket is genuinely listening.
+// A "kill -0" liveness check only proves the process exists, not that it has
+// reached bind()/listen() yet -- under enough load/latency the local relay
+// can dial in before the remote listener is actually up, getting
+// connection-refused and tearing down the client connection it was serving.
+// Reading the socket table directly avoids both problems: it's a passive
+// read of kernel state, so it can never trigger the helper's accept-and-dial
+// machinery, and it only succeeds once the socket is genuinely listening.
 //
 // Checking the port alone (without -p/pid) isn't enough either: an
 // uncleanly-killed prior run (OOM, host reboot, kill -9) can leave a stale

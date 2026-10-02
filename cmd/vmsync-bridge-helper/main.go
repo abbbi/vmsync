@@ -22,9 +22,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // pkg/nbdbridge/command.go), listening on -listen; for each accepted
 // connection it dials the real, plaintext NBD endpoint (-connect) and relays
 // bytes between the two, optionally compressing and/or buffering the
-// wire-facing side natively via pkg/streamrelay -- replacing what used to be
-// an external CLI shell pipe, which was proven unable to flush data through
-// a long-lived, synchronous, small-message connection like NBD's.
+// wire-facing side natively via pkg/streamrelay rather than through an
+// external CLI shell pipe, which cannot flush data through a long-lived,
+// synchronous, small-message connection like NBD's.
 //
 // The digest pass (-checksum) is a one-shot command, run over SSH and gone:
 // it reads a digest request on stdin, hashes the ranges it names off a local
@@ -113,11 +113,11 @@ func validateCompressLevel(algo streamrelay.Algo, level string) error {
 // runs with: built once in main() from the flags, then passed unchanged to
 // serve and on to every handleConn.
 //
-// A struct rather than the positional parameter list these two functions
-// used to take. That list had grown to seven arguments, four of them plain
-// strings and three of those adjacent (Level, NetBufferBlock,
+// A struct rather than a positional parameter list for these two
+// functions. As positional arguments these fields number seven, four of
+// them plain strings and three of those adjacent (Level, NetBufferBlock,
 // NetBufferSize), with ListenAddr/ConnectAddr an adjacent pair of their
-// own. Transposing any same-typed pair compiled perfectly and failed at
+// own. Transposing any same-typed pair compiles perfectly and fails at
 // runtime instead: swapped netbuffer arguments configure the buffer
 // backwards and merely relay badly, swapped addresses make the helper
 // listen where it should dial, and a compression level landing in a
@@ -296,8 +296,8 @@ func main() {
 
 // serve listens on listenAddr and hands each accepted connection to
 // handleConn on its own goroutine, indefinitely -- the same "listen, fork
-// per connection" role socat's "TCP-LISTEN:...,fork" used to play, now done
-// natively so the remote host no longer needs socat installed at all.
+// per connection" role as socat's "TCP-LISTEN:...,fork", done natively so
+// the remote host needs no socat installed at all.
 func serve(cfg helperConfig) error {
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -335,9 +335,8 @@ func recoverRelayPanic(label string, fn func() error) (err error) {
 
 // handleConn serves exactly one accepted connection: dial the real NBD
 // endpoint and relay bidirectionally until either side is done. It never
-// lets a panic escape -- unlike the old one-process-per-connection model
-// (each connection was a separate socat-exec'd process, crash-isolated by
-// the OS), all connections now share this one long-lived process, so an
+// lets a panic escape -- every connection shares this one long-lived
+// process, with no per-connection crash isolation from the OS, so an
 // unrecovered panic here would take down every other connection this helper
 // is currently serving, not just this one.
 func handleConn(conn net.Conn, cfg helperConfig) {
@@ -380,14 +379,12 @@ func handleConn(conn net.Conn, cfg helperConfig) {
 
 	// real (plaintext, from the real NBD server) -> [compress+flush] -> [buffer] -> conn (wire, back to the client)
 	//
-	// The explicit CloseWrite here matters now in a way it didn't when this
-	// was a one-shot, exec'd-per-connection process: process exit used to
-	// implicitly close stdout, signaling "done" to the peer for free. This
-	// helper is now a persistent daemon serving many connections, so nothing
+	// The explicit CloseWrite here is what signals "done" to the peer: this
+	// helper is a persistent daemon serving many connections, so nothing
 	// else will ever half-close conn's write side -- without this, the local
 	// relay on the other end of the SSH channel would block forever waiting
-	// for an EOF that can now never arrive (the same class of hang
-	// diagnosed via a SIGQUIT goroutine dump on the opposite direction).
+	// for an EOF that can never arrive (the same class of hang a SIGQUIT
+	// goroutine dump exposes on the opposite direction).
 	go func() {
 		defer wg.Done()
 		reportErr(recoverRelayPanic("outbound relay (real -> conn)", func() error {

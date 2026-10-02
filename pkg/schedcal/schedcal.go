@@ -569,10 +569,10 @@ func (s Schedule) IsZero() bool { return s.Days.text == "" && s.Window.IsZero() 
 // What time.Date does with a start time that does NOT exist -- 02:00 on a
 // spring-forward day -- is resolve the gap by the offset change, and that can
 // go either way: Europe/Paris moves it forward to 03:00, while a zone whose
-// gap begins at midnight moves it BACKWARD, onto the previous evening. This
-// comment used to claim it always normalises forward, and that mistake is
-// what made AddDate look safe in the crossing-midnight branch below, where it
-// silently cost half an occurrence in three zones.
+// gap begins at midnight moves it BACKWARD, onto the previous evening.
+// Assuming it always normalises forward is what makes AddDate look safe in
+// the crossing-midnight branch below, where it would silently cost half an
+// occurrence in three zones.
 //
 // The firing is correct either way, which is why this is a note rather than a
 // bug: the resolved instant is a pure function of the inputs, so both passes

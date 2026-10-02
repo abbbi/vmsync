@@ -188,14 +188,12 @@ const (
 	// mismatch and the question becomes whether vmsync's own comparator is
 	// the thing at fault.
 	//
-	// It is also the only mode that still suspends, and the reason is not
-	// the one the code gave for years. -verify originally read the source
-	// as a local FILE (disk.CompareImages(d.RootSource, ...)), where a
-	// running guest genuinely would have corrupted the comparison; the
-	// suspend was added in that same commit. A later change repointed the
-	// source at the frozen NBD backup export and left the suspend behind,
-	// so every mode paused production guests to protect a file read that no
-	// longer happened. The suspend survives HERE on its own merits: a
+	// It is also the only mode that suspends, and not for the obvious
+	// reason: -verify reads the source through the frozen NBD backup
+	// export, not as a local FILE (disk.CompareImages(d.RootSource, ...))
+	// that a running guest would genuinely corrupt mid-comparison. Pausing
+	// production guests to protect a file read nobody performs would be
+	// pure cost. The suspend earns its place HERE on its own merits: a
 	// stopped guest issues no writes, so the fleecing scratch behind the
 	// source export stays empty across what is otherwise the longest read
 	// in the tool.
@@ -205,14 +203,14 @@ const (
 // syncConfig is every value the CLI accepts, parsed once in main() and
 // passed to run() by value.
 //
-// Deliberately a named type rather than the anonymous struct this used to
-// be, declared identically in both places. Two anonymous struct types are
+// Deliberately a named type rather than an anonymous struct declared
+// identically in main() and run(). Two anonymous struct types are
 // identical in Go only when their fields match name-for-name,
-// type-for-type, IN ORDER -- so adding a flag meant editing two lists and
-// keeping them in step, and getting it wrong produced a compiler error that
-// prints both 30-field type literals in full without naming the field that
-// differs. Naming the type makes adding a flag a one-line change and turns
-// a mismatch into an "unknown field" error pointing at the actual mistake.
+// type-for-type, IN ORDER -- so adding a flag would mean editing two lists
+// and keeping them in step, and getting it wrong produces a compiler error
+// that prints both 30-field type literals in full without naming the field
+// that differs. Naming the type makes adding a flag a one-line change and
+// turns a mismatch into an "unknown field" error pointing at the mistake.
 //
 // Not every field is read by run(): UpdateRole and ShowVersion are handled
 // entirely in main(), which exits before run() is called. They live here
@@ -1213,15 +1211,15 @@ func main() {
 	// a failure by discarding the checkpoint chain and recopying, which for
 	// a corruption finding would destroy the evidence before anybody saw it.
 	//
-	// Everything else on a -verify run counts, and that is the fix. This
-	// used to be gated on `cfg.Verify != ""` -- "verification was REQUESTED"
-	// -- which is not the same question at all. It exempted the SSH session
-	// that died, the copy that failed, the preflight refusal, and the
-	// checkpoint-chain inconsistency that contrib/bench/bench.sh's Stage 3
-	// uses as the canonical thing auto-reinit exists to heal. An operator
-	// running -verify on their scheduled syncs, which is the whole point of
-	// having it, therefore had -reinit-after-failures silently doing
-	// nothing: nothing was ever counted, so the threshold was never reached.
+	// Everything else on a -verify run counts. Gating the exemption on
+	// `cfg.Verify != ""` -- "verification was REQUESTED" -- is not the same
+	// question at all: it would exempt the SSH session that died, the copy
+	// that failed, the preflight refusal, and the checkpoint-chain
+	// inconsistency that contrib/bench/bench.sh's Stage 3 uses as the
+	// canonical thing auto-reinit exists to heal. An operator running
+	// -verify on their scheduled syncs, which is the whole point of having
+	// it, would then have -reinit-after-failures silently doing nothing:
+	// nothing would ever be counted, so the threshold would never be hit.
 	//
 	// The codebase already draws this line elsewhere -- verificationRan()
 	// exists because cfg.Verify alone stays true for a run that never
@@ -1911,21 +1909,21 @@ func formatRemoteStderr(stderr string) string {
 // targetPortsNeeded returns how many ports a run will BIND on the TARGET
 // host, given its disk count and which optional stages are on.
 //
-// Ports actually bound, not the span of a layout -- and that is a correction,
-// not a rewording. This used to describe four contiguous blocks of N at fixed
-// offsets, with the verify block at +2N whether or not bridging was on. The
-// consequence was that verification WITHOUT bridging reserved through 3N and
-// bound only 2N, leaving the middle block held and idle: a four-disk
-// -verify=qemu-img run with no compression reserved twelve consecutive ports
-// and used eight. Harmless for correctness, since it never under-reserved, but
-// it demanded a 50% larger contiguous span than the run needed -- so it hit
-// "no consecutive free ports" on a fragmented range that could have served it.
+// Ports actually bound, not the span of a layout -- and the difference is a
+// correction, not a rewording. Describing four contiguous blocks of N at fixed
+// offsets, with the verify block at +2N whether or not bridging is on, would
+// mean verification WITHOUT bridging reserves through 3N and binds only 2N,
+// leaving the middle block held and idle: a four-disk -verify=qemu-img run
+// with no compression reserving twelve consecutive ports and using eight.
+// Harmless for correctness, since it never under-reserves, but it demands a
+// 50% larger contiguous span than the run needs -- so it hits "no consecutive
+// free ports" on a fragmented range that could have served it.
 //
-// Nothing reserves a block any more (see portalloc.Allocator: each export
-// binds its own port and records what it got), so the fixed-offset layout this
-// mirrored no longer exists and the honest answer is simply the count. It is
-// used for the up-front "your range is smaller than this run wants"
-// diagnosis and for the log line, neither of which wants a padded figure.
+// Nothing reserves a block at all (see portalloc.Allocator: each export binds
+// its own port and records what it got), so there is no fixed-offset layout to
+// mirror and the honest answer is simply the count. It is used for the
+// up-front "your range is smaller than this run wants" diagnosis and for
+// the log line, neither of which wants a padded figure.
 //
 // The integrity check deliberately does NOT appear here, in either of its
 // two forms. The pre-commit check exports over a UNIX SOCKET, so it needs no
@@ -2412,17 +2410,16 @@ func run(cfg syncConfig) (runErr error) {
 	// below and cleanupOrphanedCheckpoint's own read actually need it.
 	// checkpointCleanupOnce guards cleanupOrphanedCheckpoint's actual
 	// execution to exactly once regardless of which of its two callers
-	// gets there first -- see that closure's own doc comment for why this
-	// used to be two separate, duplicated pieces of logic instead of one,
-	// and why that duplication was itself the bug: run()'s own goroutine
-	// keeps executing independently of any signal, so its own deferred
-	// cleanup is not guaranteed to be skipped just because the signal
-	// handler is heading for os.Exit -- the two can genuinely run
-	// concurrently, and a signal landing between CreateCheckpoint
-	// succeeding and checkpointAdvanced being set could make an unguarded
-	// reader observe a stale "not advanced", skip deleting a checkpoint
-	// that genuinely exists now, and leave it orphaned for the next run to
-	// trip over.
+	// gets there first -- see that closure's own doc comment for why two
+	// separate, duplicated pieces of logic instead of one would themselves
+	// be the bug: run()'s own goroutine keeps executing independently of
+	// any signal, so its own deferred cleanup is not guaranteed to be
+	// skipped just because the signal handler is heading for os.Exit --
+	// the two can genuinely run concurrently, and a signal landing between
+	// CreateCheckpoint succeeding and checkpointAdvanced being set could
+	// make an unguarded reader observe a stale "not advanced", skip
+	// deleting a checkpoint that genuinely exists, and leave it orphaned
+	// for the next run to trip over.
 	var checkpointMu sync.Mutex
 	var checkpointCleanupOnce sync.Once
 	var checkpointName string
@@ -2450,9 +2447,9 @@ func run(cfg syncConfig) (runErr error) {
 	// successful sync.
 	var dataCopySucceeded bool
 	// copyCommitted is closed at the exact same moment dataCopySucceeded is
-	// set to true, below. A single snapshot read of dataCopySucceeded (as
-	// the signal handler's checkpoint-delete goroutine used to rely on
-	// exclusively) is not enough on its own to decide whether to delete the
+	// set to true, below. A single snapshot read of dataCopySucceeded (all
+	// the signal handler's checkpoint-delete goroutine would otherwise have
+	// to go on) is not enough on its own to decide whether to delete the
 	// checkpoint: run()'s goroutine keeps executing independently of the
 	// signal handler regardless of what signal arrived, so a signal landing
 	// in the handful of Go statements between the disk-copy loop exiting
@@ -2488,10 +2485,12 @@ func run(cfg syncConfig) (runErr error) {
 	// waiting. It carries its own lock inside thawTracker, which is where
 	// the rule for resolving those two writers lives.
 	//
-	// fsFreezeFailed used to be safe unguarded only because nothing off this
-	// goroutine read it -- the handler passed a literal state and
-	// finalRunState ran on the normal return path. Reporting freeze as its
-	// own metric is what made it shared, so it is guarded now.
+	// fsFreezeFailed is guarded because reporting freeze as its own metric
+	// makes it shared. Unguarded would be safe only while nothing off this
+	// goroutine read it, which holds for the signal handler (it passes a
+	// literal state) and for finalRunState (it runs on the normal return
+	// path) -- so those two are the premise to re-check before adding a
+	// third reader, not a reason the lock is unnecessary.
 	//
 	// Deliberately kept as two flags: the copy can be perfect and the source
 	// still be hung, and reporting one as the other loses whichever it is not.
@@ -2526,9 +2525,9 @@ func run(cfg syncConfig) (runErr error) {
 	// observe -- it can fire before setup gets that far.
 	var sourceBridgeCounters *nbdbridge.ByteCounters
 	// Resolved immediately (rather than deferred until the backup job
-	// actually starts, as this used to be) purely from cfg -- no network
-	// calls, nothing that depends on anything fallible happening first --
-	// so vmsync_sync_state's source_host/target_host labels are populated
+	// actually starts) purely from cfg -- no network calls, nothing that
+	// depends on anything fallible happening first -- so
+	// vmsync_sync_state's source_host/target_host labels are populated
 	// even when run() fails before ever reaching the backup job, instead of
 	// silently writing empty label values for the earliest-failing runs.
 	metricsMu.Lock()
@@ -2566,10 +2565,10 @@ func run(cfg syncConfig) (runErr error) {
 	// Tracked separately from runErr on purpose. runErr is whatever failed
 	// last, which on a multi-disk run may be some unrelated later error --
 	// while these have to say what was learned about the DATA. The
-	// verification one especially: it used to be derived from the run state,
-	// which made "the replica differs" and "the comparator could not run"
-	// the same number, and a -verify=qemu-img that never compared a byte
-	// scored as three successful detections in bench.
+	// verification one especially: deriving it from the run state would make
+	// "the replica differs" and "the comparator could not run" the same
+	// number, and a -verify=qemu-img that never compared a byte would score
+	// as three successful detections in bench.
 	//
 	// Guarded by metricsMu like verificationAttempted and diskMetrics: disks
 	// verify concurrently, and the signal handler can read these while a
@@ -2677,8 +2676,8 @@ func run(cfg syncConfig) (runErr error) {
 			VerificationRan: verificationRan(cfg.Verify, attempted),
 			// What verification CONCLUDED, not whether the run succeeded.
 			// These are different questions, and deriving this from the run
-			// state (which is what it used to do) collapsed "the replica
-			// differs" onto "the comparator could not run".
+			// state would collapse "the replica differs" onto "the
+			// comparator could not run".
 			VerificationState:     verifyOutcome,
 			VerificationTimestamp: now,
 
@@ -2784,20 +2783,20 @@ func run(cfg syncConfig) (runErr error) {
 	// writeMetricsTextfile can still observe it, because vmsync_error_count
 	// is read from trace.ErrorCount() at that moment.
 	//
-	// This used to live in main()'s own post-run() error branch, which is too
+	// Logging it from main()'s own post-run() error branch would be too
 	// late: run() has already written the textfile by the time it returns, so
 	// a failure during early setup (SSH dial, URI parsing, flag validation)
 	// -- none of which log an error of their own, they just return one --
-	// produced vmsync_error_count 0 sitting next to a failure
-	// vmsync_sync_state, and any alert built on that counter missed the run
-	// entirely.
+	// would produce vmsync_error_count 0 sitting next to a failure
+	// vmsync_sync_state, and any alert built on that counter would miss the
+	// run entirely.
 	//
 	// Every other defer in run() is registered after this one and therefore
 	// runs before it, so errors logged during cleanup (a failed qemu-nbd
 	// teardown, a failed bridge stop) are still counted here too. The signal
 	// handler's own path doesn't reach this at all -- it calls
 	// writeMetricsTextfile(StateFailure) and os.Exit(1) directly, bypassing
-	// every defer, which is deliberate and unchanged.
+	// every defer, which is deliberate.
 	defer func() {
 		if runErr != nil {
 			trace.Error("sync failed", "error", runErr)
@@ -3113,9 +3112,9 @@ func run(cfg syncConfig) (runErr error) {
 				return srcDom.Resume()
 			})
 			if resumeErr != nil {
-				// Unlike abortBackup/the checkpoint cleanup, this used to
-				// have no reconnect fallback at all --
-				// despite being the most availability-critical of the four:
+				// A reconnect fallback, like abortBackup's and the
+				// checkpoint cleanup's -- and the most
+				// availability-critical of the four, because
 				// a leftover backup job or checkpoint is an annoyance the
 				// next run can clean up or route around, but a source stuck
 				// paused (because the primary connection happened to be
@@ -3141,20 +3140,20 @@ func run(cfg syncConfig) (runErr error) {
 	abortBackup := func(trigger string) {
 		abortOnce.Do(func() {
 			// wasActive gates only the backup-stop logic immediately below,
-			// not the whole closure -- this used to be an early return
-			// ("if !backupActive { unlock; return }"), which, being inside
-			// abortOnce.Do, didn't just skip the backup-stop step for this
-			// one call: it consumed abortOnce for good, permanently
-			// skipping the unrelated "destroy the VM this run itself
-			// started" step further down too, for the rest of the process's
-			// lifetime. A signal landing before the backup job ever starts
-			// (backupActive still false) but after a -start'd VM is already
-			// running would hit exactly that: abortBackup "runs" once,
-			// finds no backup to stop, returns immediately, and the started
-			// VM is never destroyed -- leaking a running VM the operator
-			// never asked to keep. These two cleanup duties are unrelated
-			// and must not be able to suppress each other just because they
-			// happen to share one Once-guarded closure.
+			// not the whole closure -- an early return here
+			// ("if !backupActive { unlock; return }"), being inside
+			// abortOnce.Do, would not just skip the backup-stop step for
+			// this one call: it would consume abortOnce for good,
+			// permanently skipping the unrelated "destroy the VM this run
+			// itself started" step further down too, for the rest of the
+			// process's lifetime. A signal landing before the backup job
+			// ever starts (backupActive still false) but after a -start'd VM
+			// is already running would hit exactly that: abortBackup "runs"
+			// once, finds no backup to stop, returns immediately, and the
+			// started VM is never destroyed -- leaking a running VM the
+			// operator never asked to keep. These two cleanup duties are
+			// unrelated and must not be able to suppress each other just
+			// because they happen to share one Once-guarded closure.
 			backupMu.Lock()
 			wasActive := backupActive
 			backupActive = false
@@ -3204,17 +3203,17 @@ func run(cfg syncConfig) (runErr error) {
 	// reverse: for each disk, the qemu-nbd export holding that disk's own
 	// write lock is registered first, its bridge helper (if any) second --
 	// registration order attempts the lock-holder first, reverse order
-	// would attempt it last. Each command already gets its own independent
-	// timeout below (a slow or hung one no longer eats into a shared
-	// budget the way one pre-existing bytes-shared context used to), but
-	// they still run one at a time, in sequence, within a batch -- if
-	// something cuts this short regardless (an operator's second Ctrl+C
-	// forcing an immediate exit, say), attempting the disk-lock holder
-	// first means it's the one most likely to have actually been reached,
-	// not the bridge helper sitting in front of it. A stray bridge helper
-	// left running is a harmless orphaned network listener; a stray
-	// qemu-nbd export left running holds the disk file open, blocking a
-	// future -reinit's rm -f or the next sync's own attempt to reopen it.
+	// would attempt it last. Each command gets its own independent
+	// timeout below, so a slow or hung one does not eat into a budget
+	// shared with the rest, but they still run one at a time, in sequence,
+	// within a batch -- if something cuts this short regardless (an
+	// operator's second Ctrl+C forcing an immediate exit, say), attempting
+	// the disk-lock holder first means it's the one most likely to have
+	// actually been reached, not the bridge helper sitting in front of it.
+	// A stray bridge helper left running is a harmless orphaned network
+	// listener; a stray qemu-nbd export left running holds the disk file
+	// open, blocking a future -reinit's rm -f or the next sync's own
+	// attempt to reopen it.
 	pollStopCommands := func(list *[]string, maxWait time.Duration, run func(cmd string)) {
 		processed := 0
 		deadline := time.Now().Add(maxWait)
@@ -3519,27 +3518,27 @@ func run(cfg syncConfig) (runErr error) {
 	// -- otherwise a failed or interrupted run leaves behind a checkpoint
 	// the next run would wrongly trust as a valid incremental baseline.
 	//
-	// This used to be two separate, hand-duplicated pieces of logic: one
-	// here as a defer in run()'s own flow, another inline in the signal
-	// handler's goroutine below, on the reasoning that "os.Exit skips
-	// defers, so only one of them ever actually runs." That reasoning does
-	// not hold: os.Exit only skips run()'s defer if it fires *before*
-	// run() returns, but nothing stops run()'s own goroutine from
-	// returning on its own (noticing ctx cancellation, or a resource the
-	// signal handler already tore down failing an in-flight call) while
+	// Deliberately ONE closure and not two hand-duplicated pieces of logic
+	// -- one here as a defer in run()'s own flow, another inline in the
+	// signal handler's goroutine below -- however tempting the reasoning
+	// that "os.Exit skips defers, so only one of them ever actually runs."
+	// That reasoning does not hold: os.Exit only skips run()'s defer if it
+	// fires *before* run() returns, but nothing stops run()'s own goroutine
+	// from returning on its own (noticing ctx cancellation, or a resource
+	// the signal handler already tore down failing an in-flight call) while
 	// the signal handler's goroutine is still mid-cleanup, heading for its
-	// own os.Exit. In that overlap, both used to read
+	// own os.Exit. In that overlap, two copies would read
 	// checkpointName/checkpointAdvanced/dataCopySucceeded independently --
-	// one of them without checkpointMu at all -- and could reach different
-	// conclusions about the exact same checkpoint from a torn or stale
-	// read, including the read that decides *not* to delete when deletion
-	// was actually warranted: precisely the "orphaned checkpoint" outcome
-	// the old comment on the signal-handler copy dismissed as prevented.
+	// one of them easily without checkpointMu at all -- and could reach
+	// different conclusions about the exact same checkpoint from a torn or
+	// stale read, including the read that decides *not* to delete when
+	// deletion was actually warranted: precisely the "orphaned checkpoint"
+	// outcome that duplication looks like it rules out.
 	//
-	// Unifying into one checkpointCleanupOnce-guarded closure, callable
-	// from both places, closes this off completely instead of narrowing
-	// the window: whichever caller gets here first is the only one that
-	// actually evaluates anything.
+	// One checkpointCleanupOnce-guarded closure, callable from both places,
+	// closes this off completely instead of narrowing the window: whichever
+	// caller gets here first is the only one that actually evaluates
+	// anything.
 	cleanupOrphanedCheckpoint := func(trigger string) {
 		checkpointCleanupOnce.Do(func() {
 			// Snapshot all three under checkpointMu, once, rather than
@@ -3603,14 +3602,14 @@ func run(cfg syncConfig) (runErr error) {
 			interrupted = true
 			interruptedMu.Unlock()
 			// A second signal arriving while the cleanup below is still
-			// running (each of its reconnect fallbacks is now bounded, but
+			// running (each of its reconnect fallbacks is bounded, but
 			// "bounded" still means up to ~10s each, run in parallel below
-			// -- not instant) used to be silently swallowed: this goroutine
-			// had already left its own select on sigCh and gone on to run
+			// -- not instant) would otherwise be swallowed: this goroutine
+			// has already left its own select on sigCh and gone on to run
 			// cleanup inline, never coming back to read sigCh again, so an
 			// operator's second Ctrl+C/SIGTERM -- a completely reasonable
-			// reaction to a process that looks stuck -- did nothing at all,
-			// leaving kill -9 from another terminal as the only way to
+			// reaction to a process that looks stuck -- would do nothing at
+			// all, leaving kill -9 from another terminal as the only way to
 			// actually force an exit (skipping this cleanup entirely,
 			// instead of just skipping the wait for it). This watcher gives
 			// a second signal real effect: an immediate, unconditional
@@ -4145,8 +4144,8 @@ func run(cfg syncConfig) (runErr error) {
 		// The source BRIDGE does draw from an allocator and bind, because it
 		// is an ordinary helper process vmsync starts -- the same clean
 		// failure semantics as the target bridges, with none of the backup
-		// job's constraints. It used to sit at export+1, which is why the
-		// export had to reserve two ports whenever bridging was on.
+		// job's constraints. Sitting at export+1 instead would force the
+		// export to reserve two ports whenever bridging is on.
 		//
 		// No coordination with the export port is needed: the bridge starts
 		// after the export is already bound, so a candidate that happens to be
@@ -4255,10 +4254,10 @@ func run(cfg syncConfig) (runErr error) {
 		// ONE stamp for the whole displaced set, fixed here rather than per
 		// disk inside the loop below.
 		//
-		// It used to be taken next to each `mv -n`, so a multi-disk reinit
-		// that crossed a second boundary produced vda.vmsync-replaced-1758441600
+		// Taken next to each `mv -n` instead, a multi-disk reinit that
+		// crossed a second boundary would produce vda.vmsync-replaced-1758441600
 		// and vdb.vmsync-replaced-1758441601 -- two suffixes, and no single
-		// stamp naming the set. That made the displaced copy unrecoverable by
+		// stamp naming the set. That makes the displaced copy unrecoverable by
 		// any one instruction: an operator restoring it has to put back the
 		// whole machine, not one disk from one moment and another from the
 		// next, and the refusal below can only name one suffix. cmd/vmsync's
@@ -4300,7 +4299,7 @@ func run(cfg syncConfig) (runErr error) {
 		//
 		// DomainExists (unlike a bare LookupDomain) distinguishes a genuine "no
 		// such domain" from any other lookup failure (auth, a transient
-		// connection hiccup, ...) -- treating those the same way used to
+		// connection hiccup, ...) -- treating those the same way would
 		// silently skip this guard and fall straight through to replacing the
 		// target's disk files, even when the domain in fact exists and is
 		// running.
@@ -4373,11 +4372,11 @@ func run(cfg syncConfig) (runErr error) {
 		// Via dropCheckpointChain rather than DeleteAllManagedCheckpoints
 		// directly, so this works on a SHUT-DOWN source too. Deleting a
 		// checkpoint merges its bitmap into the next one, which only a running
-		// qemu can do -- so a reinit of a stopped source used to fail here with
-		// libvirt's "cannot delete checkpoint for inactive domain", which is a
-		// legitimate thing to want (stop the source, reinit, promote). The
-		// offline path removes the bitmaps with qemu-img and then the metadata,
-		// always both.
+		// qemu can do -- so a reinit of a stopped source would otherwise fail
+		// here with libvirt's "cannot delete checkpoint for inactive domain",
+		// and stopping the source, reinitialising and promoting is a
+		// legitimate thing to want. The offline path removes the bitmaps with
+		// qemu-img and then the metadata, always both.
 		if err := dropCheckpointChain(srcDom, cfg.SourceDomain, cfg.SourceURI, cleanVerb(cfg)); err != nil {
 			return fmt.Errorf("reinit: delete existing checkpoints: %w", err)
 		}
@@ -4422,24 +4421,23 @@ func run(cfg syncConfig) (runErr error) {
 			return refusal
 		}
 
-		// Deliberately NOT undefining the target domain anywhere in this block
-		// (this used to call tgtDom.Undefine() right after the running check):
-		// that left the target undefined for the
-		// entire disk-copy duration below -- often the longest part of the
-		// whole run -- so any interruption during that window (SIGINT/SIGTERM,
-		// a killed process, a network drop) left the target permanently
-		// undefined until some later run happened to complete a full sync all
-		// the way through. The target domain's definition is left completely
-		// untouched by a plain -reinit; DefineDomain (at the very end, only
-		// after the copy has fully succeeded) is the only place that ever
-		// undefines/redefines it, and it already does so with its own
-		// rollback-to-original-XML safety net (see its own doc comment) --
-		// undefining early here just threw that rollback target away before it
-		// could ever be used. As a side effect, this also drops the one
-		// remaining plain Undefine() call in this file: it never passed
-		// DOMAIN_UNDEFINE_KEEP_NVRAM the way DefineDomain's own undefine does,
-		// so -reinit against any UEFI/OVMF target domain was likely already
-		// failing outright at this step.
+		// Deliberately NOT undefining the target domain anywhere in this block.
+		// A tgtDom.Undefine() right after the running check would leave the
+		// target undefined for the entire disk-copy duration below -- often
+		// the longest part of the whole run -- so any interruption during
+		// that window (SIGINT/SIGTERM, a killed process, a network drop)
+		// would leave the target permanently undefined until some later run
+		// happened to complete a full sync all the way through. The target
+		// domain's definition is left completely untouched by a plain
+		// -reinit; DefineDomain (at the very end, only after the copy has
+		// fully succeeded) is the only place that ever undefines/redefines
+		// it, and it already does so with its own rollback-to-original-XML
+		// safety net (see its own doc comment) -- undefining early here
+		// would throw that rollback target away before it could ever be
+		// used. It would also be the only plain Undefine() call in this
+		// file, passing no DOMAIN_UNDEFINE_KEEP_NVRAM the way DefineDomain's
+		// own undefine does, so -reinit against any UEFI/OVMF target domain
+		// would likely fail outright at this step.
 
 		// What happens to the existing target disks is the operator's call,
 		// not vmsync's, because the two answers differ in what they risk.
@@ -4677,11 +4675,11 @@ func run(cfg syncConfig) (runErr error) {
 			tgtDom.Free()
 
 			// Two separate error variables -- not the shared err used
-			// elsewhere in this function -- specifically because the second
-			// ParseMetadata call used to overwrite the first call's err
-			// before it was ever checked, silently discarding a genuine
-			// parse failure on the checkpoint field whenever the timestamp
-			// field happened to parse fine (or vice versa).
+			// elsewhere in this function -- specifically because sharing one
+			// would let the second ParseMetadata call overwrite the first
+			// call's err before it was ever checked, silently discarding a
+			// genuine parse failure on the checkpoint field whenever the
+			// timestamp field happened to parse fine (or vice versa).
 			var checkpointParseErr, timestampParseErr error
 			metadataEntryCheckpoint, checkpointParseErr = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastCheckpoint)
 			metadataEntryTimestamp, timestampParseErr = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldLastSync)
@@ -5055,9 +5053,9 @@ func run(cfg syncConfig) (runErr error) {
 	// stagedOverlay is one disk's copied, checksummed delta waiting to be
 	// committed into its base.
 	//
-	// The commits are deliberately held back until every disk has one. Each
-	// disk used to commit inside its own worker, so with disks copying
-	// concurrently one could commit and another then fail -- leaving the
+	// The commits are deliberately held back until every disk has one.
+	// Committing inside each disk's own worker would mean, with disks copying
+	// concurrently, one could commit and another then fail -- leaving the
 	// target holding vda at the new checkpoint and vdb at the old, a state no
 	// promotion of that replica is safe from and nothing recorded as having
 	// happened.
@@ -5080,17 +5078,17 @@ func run(cfg syncConfig) (runErr error) {
 	// Exactly one caller ever sees true, and only once every disk has got
 	// there.
 	//
-	// This is what "last disk" has to mean, and it is not what it used to
-	// mean. The fault used to pick the last disk in the DISK LIST, which is a
-	// static order, while the disks copy CONCURRENTLY -- so on a domain whose
-	// last-listed disk has the smallest delta, that disk finished first and
-	// refused while the others were still copying. The run failed, nothing
-	// committed, and the test recorded a pass for a barrier it had never
-	// reached: there was nothing staged to hold back.
+	// This is what "last disk" has to mean. Having the fault pick the last
+	// disk in the DISK LIST -- a static order, while the disks copy
+	// CONCURRENTLY -- would mean that on a domain whose last-listed disk has
+	// the smallest delta, that disk finishes first and refuses while the
+	// others are still copying. The run fails, nothing commits, and the test
+	// records a pass for a barrier it never reached: there was nothing staged
+	// to hold back.
 	//
 	// Counting arrivals instead makes the fault fire exactly where the barrier
 	// lives -- every other disk staged, this one refusing -- which is the
-	// scenario the barrier exists for and the one that used to leave a target
+	// scenario the barrier exists for: absent it, that is what leaves a target
 	// with vda at the new checkpoint and vdb at the old.
 	//
 	// Under the mutex that already guards `staged`, because it is the same
@@ -5549,13 +5547,13 @@ func run(cfg syncConfig) (runErr error) {
 		if cfg.PrometheusTextfile == "" {
 			return
 		}
-		// The TARGET leg only, and that is the fix rather than an omission.
+		// The TARGET leg only, deliberately rather than by omission.
 		//
-		// This used to add sourceBridgeCounters too. Two things were wrong
-		// with that. The source bridge is created ONCE per run (one shared
+		// Adding sourceBridgeCounters here too would be wrong twice over.
+		// The source bridge is created ONCE per run (one shared
 		// libvirt backup export, one listener), so its counter is a run-wide
-		// monotonic total -- adding it to every disk meant summing the
-		// per-disk series multi-counted it, once per disk. And a per-disk
+		// monotonic total -- adding it to every disk would make summing the
+		// per-disk series multi-count it, once per disk. And a per-disk
 		// delta cannot repair that either: both disk loops fan out one
 		// goroutine per disk, so the windows overlap and each disk's delta
 		// would absorb whatever the others pushed through the shared bridge
@@ -5585,12 +5583,11 @@ func run(cfg syncConfig) (runErr error) {
 
 	// diskPhase1Result carries what runVerify needs from copyAndStage.
 	//
-	// A struct rather than closure capture because copyAndStage and
-	// runVerify are separate closures: the two phases call one then the other and
-	// hands the result across. It dates from when the "online" mode ran them in
-	// two separate goroutine invocations either side of a whole-run barrier;
-	// that barrier is gone, but passing the values explicitly is still
-	// clearer than widening what either closure captures.
+	// A struct rather than closure capture because copyAndStage and runVerify
+	// are separate closures: the two phases call one then the other and this
+	// hands the result across. Passing the values explicitly is clearer than
+	// widening what either closure captures, and it keeps the handover
+	// readable if the two are ever driven from different goroutines again.
 	type diskPhase1Result struct {
 		diskStart            time.Time
 		targetPath           string
@@ -5724,8 +5721,8 @@ func run(cfg syncConfig) (runErr error) {
 	// for the barrier to commit, and it returns what runVerify and the
 	// metrics need from that work.
 	//
-	// It used to commit too, hence its old name -- see stagedOverlay and
-	// commitStaged for why that moved out.
+	// It deliberately does not commit -- see stagedOverlay and commitStaged
+	// for why the commit belongs outside the per-disk worker.
 	copyAndStage := func(d disk.QcowDisk) (res diskPhase1Result, err error) {
 		res.diskStart = time.Now()
 
@@ -5794,12 +5791,11 @@ func run(cfg syncConfig) (runErr error) {
 		// here that is NOT a successful commit -- a failed copy, a failed
 		// export stop, a checksum mismatch, or a cancelled context.
 		//
-		// The commit itself no longer happens here, so neither does the case
-		// that used to be exempt from this cleanup. A half-finished commit
+		// The commit itself does not happen here, so neither does the one
+		// case exempt from this cleanup: a half-finished commit
 		// leaves the base partly written, which makes the overlay the only
-		// record of the delta rather than disposable scratch -- that rule
-		// still holds, it just lives in commitStaged now, which is where the
-		// commit runs.
+		// record of the delta rather than disposable scratch. That rule
+		// lives in commitStaged, which is where the commit runs.
 		//
 		// What reaches this defer is only ever a disk that failed BEFORE the
 		// base was touched, so the overlay really is worth nothing. A disk
@@ -5953,11 +5949,10 @@ func run(cfg syncConfig) (runErr error) {
 		effectiveTargetHost := targetNBDHost
 		effectiveTargetPort := targetPort
 		if bridgeCfg.Enabled() {
-			// From the allocator, like the export it fronts. This used to be
-			// targetPort+N, on the reasoning that the exports occupied a
-			// contiguous [T, T+N) so their bridges could follow at
-			// [T+N, T+2N) -- true while a block was reserved, meaningless
-			// now that each export binds its own port.
+			// From the allocator, like the export it fronts. targetPort+N
+			// would assume the exports occupy a contiguous [T, T+N) so
+			// their bridges can follow at [T+N, T+2N) -- which holds only
+			// while a block is reserved, and each export binds its own port.
 			var bridgeStopCmd string
 			targetBridgePort, err := bindOnFreePort(
 				fmt.Sprintf("target nbd bridge for %s", d.TargetDev),
@@ -6039,7 +6034,7 @@ func run(cfg syncConfig) (runErr error) {
 		// still open, and NOTHING has been digest-checked, committed or
 		// recorded. The target domain's own metadata still describes the
 		// replica that was renamed aside, so every evidence check -promote
-		// makes reads healthy -- which is why an interrupted rebuild used to
+		// makes reads healthy -- which is why an interrupted rebuild would
 		// be promotable. See libvirtsync.TestFaultDieWritingBase for why
 		// exiting earlier, right after the rename, would be a test that
 		// passes without testing anything.
@@ -6075,9 +6070,9 @@ func run(cfg syncConfig) (runErr error) {
 		if sourceBridgeCounters != nil {
 			// ReceivedSnapshot, not Sent: on the source side the payload
 			// arrives INBOUND (the disk data being read), while Sent carries
-			// the NBD request stream. Comparing dirty bytes against Sent --
-			// which this used to do -- divided a disk's worth of data by a
-			// few MiB of requests and reported a compression ratio near 100%.
+			// the NBD request stream. Comparing dirty bytes against Sent
+			// would divide a disk's worth of data by a few MiB of requests
+			// and report a compression ratio near 100%.
 			//
 			// Still logged per disk although the counter is run-wide and the
 			// disks run concurrently, so on a multi-disk run this line is a
@@ -6225,13 +6220,12 @@ func run(cfg syncConfig) (runErr error) {
 		targetPath := res.targetPath
 
 		// A port of its own from the allocator, which is what "distinct"
-		// now means. This used to be a dedicated block at +2N, chosen so it
-		// could not collide with the write or bridge ranges whatever was
-		// enabled, and so that it did not reuse the write export's port --
+		// means here. It must not collide with the write or bridge ranges
+		// whatever is enabled, and must not reuse the write export's port --
 		// which has just been killed and may not have been released yet.
-		// Both properties still hold, for a better reason: the allocator
-		// never hands out a port twice within a run, and a port another
-		// process still holds simply fails to bind and is skipped.
+		// The allocator gives both properties: it never hands out a port
+		// twice within a run, and a port another process still holds simply
+		// fails to bind and is skipped.
 		verifyPidFile := path.Join(cfg.TargetRuntimeDir, fmt.Sprintf("vmsync-verify-qemu-nbd-%s-%s.pid", cfg.TargetDomain, d.TargetDev))
 		verifyExportName := targetExportName(cfg.TargetDomain, d.TargetDev)
 		// Same rm -f-after-kill reasoning as stopCmd in copyAndStage above:
@@ -6355,15 +6349,15 @@ func run(cfg syncConfig) (runErr error) {
 
 		// Probed HERE, after the bridge is up, rather than before it.
 		//
-		// That ordering is the F9 fix on this side. This check used to run
-		// immediately after the export started, against targetNBDHost:
-		// verifyPort -- an address that with -compress/-netbuffer plus
+		// That ordering is what F9 is about on this side. Probing
+		// immediately after the export starts, against targetNBDHost:
+		// verifyPort, uses an address that with -compress/-netbuffer plus
 		// -use-ssh this host cannot reach at all, since the whole point of
-		// -use-ssh is that only the SSH connection crosses between hosts. It
-		// timed out for ten seconds and failed the verify while the export was
-		// healthy and reachable through the bridge it had not yet built.
+		// -use-ssh is that only the SSH connection crosses between hosts: it
+		// times out for ten seconds and fails the verify while the export is
+		// healthy and reachable through the bridge not yet built.
 		//
-		// verifyTargetHost/Port is now whatever the compare will really use,
+		// verifyTargetHost/Port is whatever the compare will really use,
 		// so the probe follows the same path and speaks the same plain NBD.
 		if err := nbdsync.WaitForTCPExport(verifyTargetHost, verifyTargetPort, verifyExportName, 10*time.Second); err != nil {
 			return fmt.Errorf("verify: the read-only export for %s is not reachable: %w", d.TargetDev, err)
@@ -6407,19 +6401,17 @@ func run(cfg syncConfig) (runErr error) {
 		// the two must be byte-identical. There is no drift to excuse and no
 		// dirty-bitmap reconciliation anywhere in this function.
 		//
-		// The mode now called "full" used to do something else, under the
-		// name "online": it stopped the primary job, started a SECOND one,
-		// and so compared source@T2 against target@T0, then tried to excuse
-		// the difference using a bitmap.
-		// Every guest write during the copy showed up as a mismatch, and on
-		// a busy guest that was a near-100% false-positive rate. The
-		// exoneration logic existed only to paper over the wrong comparison;
-		// removing the second job removed the need for it entirely.
+		// Stopping the primary job and starting a SECOND one to read from
+		// would compare source@T2 against target@T0, leaving the difference
+		// to be excused with a bitmap. Every guest write during the copy
+		// then shows up as a mismatch, on a busy guest a near-100%
+		// false-positive rate, and such exoneration logic only papers over
+		// the wrong comparison; with one job there is no need for it at all.
 		//
-		// What distinguishes online from compare/fast is now ONLY that it
-		// does not suspend the source. It never needed to: see verifySuspends
-		// above, whose stated reason (a running domain's disk is not static)
-		// is about the domain, while every mode reads the frozen export.
+		// Reading the frozen export is also why no verify mode needs to
+		// suspend the source: see verifySuspends above, whose stated reason
+		// (a running domain's disk is not static) is about the domain, while
+		// every mode here reads the export rather than the domain's disk.
 		trace.Info("verify: comparing source and target images", "disk", d.TargetDev,
 			"source", sourceNBDURL, "target", targetPath, "mode", cfg.Verify)
 		var compareErr error
@@ -6593,12 +6585,11 @@ func run(cfg syncConfig) (runErr error) {
 	// of them have -- the deltas are committed and the restore points and
 	// -verify run.
 	//
-	// The barrier is NOT the one that used to exist here. That one stopped
-	// the backup job and started a second one to serve a comparison against
-	// the wrong point in time, and removing it was right. This one never
+	// The barrier is NOT one that stops the backup job and starts a second
+	// one to serve a comparison against the wrong point in time. It never
 	// touches the job: the export stays open and frozen at the instant the
-	// copy read from, so -verify still compares against exactly what it
-	// always did. All this barrier orders is when the base gets written.
+	// copy read from, so -verify compares against exactly that. All this
+	// barrier orders is when the base gets written.
 	// Decided before any disk is copied, so a target that cannot deliver what
 	// -retention promises fails the run here rather than after paying for a
 	// full copy. Returns an inert value when retention is off or the interval
@@ -6808,14 +6799,13 @@ func run(cfg syncConfig) (runErr error) {
 
 	// ONE path for every mode.
 	//
-	// There used to be a second path for the mode then called "online",
-	// which stopped the primary backup job and started another to serve a
-	// domain-wide "compare window". That existed to support a comparison
-	// against the wrong point in time, and removing it was right: the primary
+	// No mode gets a second path that stops the primary backup job and
+	// starts another to serve a domain-wide "compare window": that would
+	// only support a comparison against the wrong point in time. The primary
 	// export is still open and still frozen at the instant the copy read
 	// from, so comparing against it needs no second job at all.
 	//
-	// The barrier below is not a return of that. It leaves the backup job
+	// The barrier below is not such a path. It leaves the backup job
 	// alone and orders only when the BASE is written, which is a different
 	// question from what -verify compares against.
 	for _, d := range qcowDisks {
@@ -6978,8 +6968,8 @@ func run(cfg syncConfig) (runErr error) {
 	checkpointMu.Unlock()
 	close(copyCommitted)
 
-	// The parent checkpoint is NOT deleted here. It used to be, and that
-	// ordering is what turned a failed redefine into a lost baseline.
+	// The parent checkpoint is NOT deleted here: that ordering is what turns
+	// a failed redefine into a lost baseline.
 	//
 	// Deleting the parent before the target has accepted its successor leaves
 	// a window where the source holds only the new checkpoint while the
@@ -6989,11 +6979,12 @@ func run(cfg syncConfig) (runErr error) {
 	// source no longer has, and the only ways out are hand-editing the
 	// target's metadata or a full resync.
 	//
-	// It also defeated pending_checkpoint, which exists precisely to undo a
-	// source advance the target never accepted. That recovery needs the
-	// parent to still be there to fall back to, and this deleted it first.
+	// It would also defeat pending_checkpoint, which exists precisely to undo
+	// a source advance the target never accepted. That recovery needs the
+	// parent to still be there to fall back to, and deleting it here takes it
+	// away first.
 	//
-	// So the cleanup moved to after the redefine succeeds -- see the prune
+	// So the cleanup belongs after the redefine succeeds -- see the prune
 	// below DefineDomain. The failure it trades into is a leaked checkpoint,
 	// which the prune collects on any later run.
 	if incrementalMode && !checkpointAdvanced {
@@ -7138,10 +7129,10 @@ func run(cfg syncConfig) (runErr error) {
 		// network or libvirt call involved -- so a failure here is almost
 		// certainly a real bug (e.g. srcXML failing to parse), not a
 		// transient environmental hiccup. Silently falling back to the
-		// unmodified srcXML (as this used to do) would define the target
-		// with NO updated checkpoint/timestamp/failure_count metadata at
-		// all, quietly disabling the metadata-vs-file-timestamp consistency
-		// check (see the read of these same fields further up) for every
+		// unmodified srcXML would define the target with NO updated
+		// checkpoint/timestamp/failure_count metadata at all, quietly
+		// disabling the metadata-vs-file-timestamp consistency check
+		// (see the read of these same fields further up) for every
 		// future run -- exactly the "target file changed out-of-band
 		// between syncs" detection this metadata exists for -- with only an
 		// easy-to-miss warning log to ever reveal it happened. Data copying
@@ -7321,15 +7312,15 @@ func run(cfg syncConfig) (runErr error) {
 func registerFlags(fs *flag.FlagSet, cfg *syncConfig) (compressArg, fenceSourceArg, netBufferArg *optionalValueFlag) {
 	// Every flag's help below is ONE LINE, deliberately.
 	//
-	// It used to carry the reasoning: why a default is what it is, what breaks
-	// if it is changed, which combinations are refused. Several ran past a
-	// thousand characters, and the result was a -help nobody read -- the place
+	// Carrying the reasoning here -- why a default is what it is, what breaks
+	// if it is changed, which combinations are refused -- runs lines past a
+	// thousand characters each and produces a -help nobody reads: the place
 	// where a reader has the least context is the worst place to put the most
-	// text, and the flags a hurried operator most needs to find were buried
-	// between essays about the ones they did not.
+	// text, and the flags a hurried operator most needs to find end up buried
+	// between essays about the ones they do not.
 	//
-	// All of that prose now lives in docs/HOWTO.md, organised by task rather
-	// than by flag. Nothing was dropped: where a line here needs a caveat
+	// That prose lives in docs/HOWTO.md, organised by task rather
+	// than by flag. Nothing is dropped: where a line here needs a caveat
 	// before it can be used safely, the line says "see HOWTO" and the caveat
 	// is there under a matching heading.
 	//

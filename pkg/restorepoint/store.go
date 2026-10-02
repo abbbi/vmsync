@@ -24,29 +24,30 @@ import (
 )
 
 // Addressing. Everything in this package that names a directory on the target
-// goes through the types in this file, and the reason is a defect this layout
-// replaces.
+// goes through the types in this file, and the reason is the defect they make
+// unreachable.
 //
-// Restore points used to be keyed by the DIRECTORY the replica's disks live
-// in: Root(diskPath) returned <dir>/.vmsync-rp and every decision -- is another
+// Keying restore points by the DIRECTORY the replica's disks live in -- a
+// Root(diskPath) returning <dir>/.vmsync-rp, with every decision (is another
 // point due, which ones are surplus, which staging directories are junk, what
-// does a -reinit discard -- was taken over everything in it. Two domains
-// replicated into one -target-disk-path therefore shared one store, and the
-// shipped agent example did exactly that. The consequences were not subtle:
-// one domain's point satisfied the other's interval floor, so a domain could
-// go for days taking none; one domain's prune evicted the other's history to
-// stay inside a count meant for one machine; a prune swept a concurrently
-// running sibling's in-flight staging directory, failing a sync that had
-// already copied its data; and one domain's -reinit deleted or orphaned every
-// co-located domain's entire history in a single rm -rf.
+// does a -reinit discard) taken over everything in it -- gives two domains
+// replicated into one -target-disk-path a single shared store, which is what a
+// template-level target_disk_path in the shipped agent example hands every VM
+// that does not override it. The consequences are not subtle: one domain's
+// point satisfies the other's interval floor, so a domain can go for days
+// taking none; one domain's prune evicts the other's history to stay inside a
+// count meant for one machine; a prune sweeps a concurrently running sibling's
+// in-flight staging directory, failing a sync that has already copied its
+// data; and one domain's -reinit deletes or orphans every co-located domain's
+// entire history in a single rm -rf.
 //
-// What made all four reachable is that `root string` was the currency. A
-// directory is a legal value for it, so every call site was one forgotten
-// argument away from addressing the shared store, and nothing could tell the
-// difference. So the currency is now a Store: a struct with unexported fields
-// that only the constructors here can produce, and which cannot be built
-// without naming a domain. There is no expression outside this package that
-// addresses the directory two domains share at all.
+// What makes all four reachable is `root string` as the currency. A directory
+// is a legal value for it, so every call site is one forgotten argument away
+// from addressing the shared store, and nothing can tell the difference. The
+// currency is therefore a Store: a struct with unexported fields that only the
+// constructors here can produce, and which cannot be built without naming a
+// domain. There is no expression outside this package that addresses the
+// directory two domains share at all.
 //
 // Nothing here knows about the pre-change layout, where points sat directly in
 // DirName. There is no migration and no compatibility path: a flat point is

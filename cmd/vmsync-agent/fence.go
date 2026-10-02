@@ -75,18 +75,18 @@ const (
 // written, and this function exists so that is enforced by construction
 // rather than by two call sites happening to agree.
 //
-// It did not used to be. The fence check built this from cfg.Hostname alone,
-// while the string it is matched against is stamped by vmsync as
+// Building it from cfg.Hostname alone does not do that. The string it is
+// matched against is stamped by vmsync as
 // util.ReplicaHost(-source-uri, -local-host-name) -- and the agent passes
 // exactly cfg.LibvirtURI and cfg.Hostname for those two (scheduler.go, where
 // plan.SourceURI and plan.LocalHostName are set). ReplicaHost PREFERS the
 // URI's host and ignores the local name entirely whenever the URI has one
-// (pkg/util/util.go), so the two agreed only for a URI with no host --
-// qemu:///system, the default, which is why this was invisible.
+// (pkg/util/util.go), so the two agree only for a URI with no host --
+// qemu:///system, the default, which is what makes such a mismatch invisible.
 //
-// With a remote -libvirt-uri they disagreed permanently: every fence token
-// naming this host failed to match, verdict.Fence was false forever, and
-// split-brain protection was silently off with nothing logged, because a
+// With a remote -libvirt-uri they disagree permanently: every fence token
+// naming this host fails to match, verdict.Fence is false forever, and
+// split-brain protection is silently off with nothing logged, because a
 // non-matching token is the ordinary case the check exists to filter out.
 func replicaSelfRef(cfg agentConfig, domain string) string {
 	return libvirtsync.ReplicaEntry(util.ReplicaHost(cfg.LibvirtURI, cfg.Hostname), domain)
@@ -397,7 +397,7 @@ func sweepFences(ctx context.Context, cfg agentConfig, state *sharedState, ledge
 			// that took over), target (not serving), or a role a newer build
 			// wrote. None of them is a source that could still be writing.
 			//
-			// `fenced` no longer reaches here at all: one that stopped is
+			// `fenced` never reaches here at all: one that stopped is
 			// skipped as inactive above, and one still running is reported and
 			// skipped by the branch above that. Both still end in a skip, which
 			// is what stops a domain being swept again every minute after it has
@@ -515,21 +515,20 @@ func fenceOneDomain(ctx context.Context, cfg agentConfig, cached UIConfig, ledge
 	// Intent first, durably -- but the fence is NOT conditional on that write
 	// succeeding.
 	//
-	// This used to return here, which was wrong in two compounding ways. The
-	// harm ranking is the first: a shutdown performed twice costs one more
-	// ACPI request to a guest that is already ignoring the first, and
-	// ShutdownDomain never falls back to destroying a domain; a fence that
-	// does not fire leaves one workload live in two places writing to two
-	// diverging copies, which is unrecoverable and is the entire reason this
-	// mechanism exists.
+	// Returning here would be wrong in two compounding ways. The harm ranking
+	// is the first: a shutdown performed twice costs one more ACPI request to
+	// a guest that is already ignoring the first, and ShutdownDomain never
+	// falls back to destroying a domain; a fence that does not fire leaves one
+	// workload live in two places writing to two diverging copies, which is
+	// unrecoverable and is the entire reason this mechanism exists.
 	//
-	// The second is that refusing did not even buy the protection it claimed.
+	// The second is that refusing would not even buy the protection it claims.
 	// put() latches in memory before it writes (see its comment), with no
-	// rollback, so a fence refused here was still marked acted-on: every later
-	// sweep took the alreadyActed branch and warned that the fence "was
+	// rollback, so a fence refused here is still marked acted-on: every later
+	// sweep takes the alreadyActed branch and warns that the fence "was
 	// already acted on -- it will NOT be retried" about a shutdown that never
 	// happened, for the life of the process, unaffected by the disk clearing.
-	// Fencing anyway makes that message true.
+	// Fencing anyway keeps that message true.
 	//
 	// What is genuinely lost is the record surviving a restart, so a new
 	// process may fence the same token again. Bounded: if the shutdown

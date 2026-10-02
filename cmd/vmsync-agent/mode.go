@@ -8,13 +8,13 @@ import (
 // agentMode is what this invocation of the agent is FOR. It is declared on the
 // command line, not inferred from the configuration file.
 //
-// It used to be inferred, and there were only two of them: a "schedule_file"
-// meant standalone, a "control_plane" meant control-plane. That worked while
-// the two modes needed different files, but it made the most consequential
-// property of a host -- whether a network service can start and stop things on
-// it -- something an operator established by reading a JSON document and
-// knowing a rule about it. A flag says it in the unit, where `systemctl cat`
-// puts it on the same line as the binary.
+// Inferring it from the file instead -- a "schedule_file" means standalone, a
+// "control_plane" means control-plane -- can only work while no two modes need
+// the same key, and it makes the most consequential property of a host --
+// whether a network service can start and stop things on it -- something an
+// operator establishes by reading a JSON document and knowing a rule about it.
+// A flag says it in the unit, where `systemctl cat` puts it on the same line
+// as the binary.
 //
 // It is also the one piece of this agent's configuration that genuinely cannot
 // be reloaded: the mode decides which goroutines exist, and goroutines are not

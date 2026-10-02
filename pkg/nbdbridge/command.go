@@ -65,11 +65,10 @@ func BuildStartCommand(cfg Config, bridgePort, realPort int, pidFile, logFile st
 		if algo == "" {
 			algo = "zstd"
 		}
-		// Via streamrelay rather than inline, which is where this decision
-		// used to live: vmsync's flag, the helper's flag and this command all
-		// have to turn "unset" into the same concrete level, and three copies
-		// of the rule is three chances for a relay to run at a level nobody
-		// chose.
+		// Via streamrelay rather than inline: vmsync's flag, the helper's flag
+		// and this command all have to turn "unset" into the same concrete
+		// level, and three copies of the rule is three chances for a relay to
+		// run at a level nobody chose.
 		level := streamrelay.ResolveLevel(streamrelay.Algo(algo), cfg.CompressLevel)
 		// vmsync-bridge-helper's -compress is an "optional value" flag,
 		// same shape as vmsync's own -compress (bare -compress defaults to

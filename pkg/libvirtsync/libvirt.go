@@ -235,11 +235,10 @@ func IsManagedCheckpointName(name string) bool {
 	return strings.HasPrefix(name, CheckpointPrefix+"-")
 }
 
-// VerifyWindowCheckpointName names a checkpoint NOTHING CREATES ANY MORE.
-// The former -verify=online (now -verify=full) used to make one per run and
-// that was the near-100%-false-positive bug (see the note where
-// CreateVerifyWindowCheckpoint used to be). The name survives only so
-// DeleteVerifyWindowCheckpoint can clear leftovers from older builds.
+// VerifyWindowCheckpointName names a checkpoint NOTHING CREATES. Making one
+// per -verify run is the near-100%-false-positive bug (see the note standing
+// in place of CreateVerifyWindowCheckpoint). The name is reserved only so
+// DeleteVerifyWindowCheckpoint can clear a leftover one off a domain.
 // Deliberately NOT prefixed with
 // CheckpointPrefix+"-": ListManagedCheckpoints (and therefore
 // NextCheckpointName, and -reinit's DeleteAllManagedCheckpoints) only ever
@@ -788,15 +787,14 @@ const (
 	// RoleFenced marks a domain an automatic FENCE stopped, because its peer
 	// was promoted and this copy had been displaced.
 	//
-	// Distinct from RolePaused, which it used to share, and the difference is
-	// what an operator does next. `paused` means a person suspended
-	// replication and will resume it when they are ready. `fenced` means
-	// nobody chose this: a peer took over, and the pair's direction has
-	// probably reversed -- so the usual next step is -invert, not "resume".
-	// Collapsing the two lost that, and lost it exactly where it was most
-	// wanted; vmsync_ui carried a WasFenced heuristic that existed solely to
-	// guess which of the two had happened, because "both end up paused with
-	// nothing in libvirt telling them apart".
+	// Distinct from RolePaused, and the difference is what an operator does
+	// next. `paused` means a person suspended replication and will resume it
+	// when they are ready. `fenced` means nobody chose this: a peer took
+	// over, and the pair's direction has probably reversed -- so the usual
+	// next step is -invert, not "resume". Collapsing the two loses that
+	// exactly where it is most wanted: a consumer like vmsync_ui is left
+	// guessing which of the two happened, because both end up paused with
+	// nothing in libvirt telling them apart.
 	//
 	// It can also be recorded while the domain is STILL RUNNING, which
 	// `paused` never legitimately is. A fence that could not stop its guest
@@ -1129,7 +1127,7 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 		// here must not delete it out from under whatever provisioned it.
 		// Undefine() (no flags) unconditionally refuses to undefine any
 		// domain that has an NVRAM file present at all, which is exactly
-		// why this previously failed -- silently, since the error was
+		// why a plain Undefine() fails here -- silently, if the error is
 		// swallowed -- for every UEFI/OVMF target domain.
 		// CHECKPOINTS_METADATA is required, not optional: libvirt refuses to
 		// undefine an inactive domain that carries checkpoint metadata
@@ -1460,19 +1458,19 @@ func missingXMLElements(original, rewritten string) []string {
 // function/call-site name) listing any element names missingXMLElements
 // finds went missing between original and rewritten.
 //
-// It exists because replaceDomainName, replaceDomainDiskPath and
-// SetMetadataFields all used to go through a full libvirtxml.Domain
-// unmarshal-then-marshal round-trip, which silently dropped any element
-// that struct did not model -- hostdev passthrough, TPM/launchSecurity,
-// <qemu:commandline> and similar less-common features -- with nothing to
-// indicate anything had gone wrong until whatever that configuration was
-// for turned out to be missing on a failed-over target.
+// It exists because a full libvirtxml.Domain unmarshal-then-marshal
+// round-trip silently drops any element that struct does not model --
+// hostdev passthrough, TPM/launchSecurity, <qemu:commandline> and similar
+// less-common features -- with nothing to indicate anything has gone wrong
+// until whatever that configuration was for turns out to be missing on a
+// failed-over target.
 //
-// That round-trip is gone: those functions now patch a parsed tree (see
-// domxml.go), so unmodelled content survives by construction rather than by
-// the struct happening to model it. This check is kept as a tripwire. It
-// should never fire again, and if it does, the patching path is losing
-// something and that is worth hearing about at once.
+// replaceDomainName, replaceDomainDiskPath and SetMetadataFields avoid that
+// round-trip entirely: they patch a parsed tree (see domxml.go), so
+// unmodelled content survives by construction rather than by the struct
+// happening to model it. This check is the tripwire on that. It should never
+// fire, and if it does, the patching path is losing something and that is
+// worth hearing about at once.
 //
 // This check can't tell a genuine loss apart from a legitimate omission
 // (an empty or default-valued element the struct correctly normalizes
@@ -1538,15 +1536,15 @@ func warnIfXMLElementsDropped(context, original, rewritten string, expected ...s
 // far easier to be confident is safe.
 var metadataFieldNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]*$`)
 
-// SetMetadataFields operates on a whole domain document and is now used by
-// exactly one caller: UpdateSyncMetadata, whose output feeds DefineDomain.
+// SetMetadataFields operates on a whole domain document and has exactly one
+// caller: UpdateSyncMetadata, whose output feeds DefineDomain.
 //
 // Everything that MUTATES metadata on an existing domain goes through
 // SetDomainMetadataFields instead, which uses libvirt's own metadata API and
-// never reconstructs the domain document. This one survives because the
-// target's definition is genuinely rebuilt from the source's XML on every
-// sync -- there the round-trip is the operation, not a side effect of
-// recording a field. See metadata.go.
+// never reconstructs the domain document. This path is the one exception,
+// because the target's definition is genuinely rebuilt from the source's XML
+// on every sync -- there the round-trip is the operation, not a side effect
+// of recording a field. See metadata.go.
 //
 // SetMetadataFields merges the given vmsync:field->value pairs into
 // domainXML's <metadata> block, preserving any existing vmsync fields not
@@ -1566,12 +1564,12 @@ var metadataFieldNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]*$`)
 // digit simply cannot be expressed, and would produce malformed XML that
 // the Marshal below (or DomainDefineXML further downstream) rejects with a
 // confusing parse error pointing at the whole domain document rather than
-// at the offending key. This used to be structurally impossible, because
-// buildMetadataEntry only ever emitted names from the fixed
-// metadataFieldOrder list and silently dropped anything else; that changed
-// when it started emitting unrecognized fields too, so that
-// SetMetadataFields could keep its promise to preserve fields it doesn't
-// know about. This check is what the fixed list used to provide for free.
+// at the offending key. Nothing downstream of here constrains the name:
+// buildMetadataEntry emits unrecognized fields as well as the ones in the
+// fixed metadataFieldOrder list, so that SetMetadataFields can keep its
+// promise to preserve fields it doesn't know about. Emitting only names
+// from that list would make a bad name structurally impossible, at the
+// price of silently dropping every field vmsync does not already know.
 //
 // Only caller-supplied names are checked. Names recovered from the domain's
 // existing metadata by allMetadataFields are already valid XML element
@@ -1991,13 +1989,13 @@ func RecordReplicaTarget(mgr *Manager, sourceDomainName, targetHost, targetDomai
 	entry := ReplicaEntry(targetHost, targetDomain)
 	updatedList := appendReplicaTarget(existing, entry)
 
-	// This used to return early once the target was already recorded and no
-	// stale target-role fields remained, to skip an XML round-trip and a
-	// domain redefine per sync. That shortcut is gone, deliberately: the
-	// whole point of last_replicated_at is that it moves on EVERY successful
-	// sync, so there is no steady state left to skip.
+	// Returning early once the target is already recorded and no stale
+	// target-role fields remain would skip an XML round-trip and a domain
+	// redefine per sync, but there is no such shortcut to take: the whole
+	// point of last_replicated_at is that it moves on EVERY successful
+	// sync, so there is no steady state to skip.
 	//
-	// What made dropping it affordable is that this is no longer a redefine
+	// Paying that cost per sync is affordable because this is not a redefine
 	// at all. The write goes through libvirt's own metadata API and touches
 	// only vmsync's namespaced element, so a per-sync write to a PRODUCTION
 	// domain costs a small metadata splice rather than a full-document
@@ -2995,9 +2993,9 @@ func RecordTargetSyncFailure(targetURI, targetDomain string) (int, error) {
 	}
 	defer dom.Free()
 
-	// The whole read-modify-write is now confined to vmsync's own metadata
-	// element. It used to read the entire domain definition and define the
-	// result back, which mattered here more than anywhere: the case that
+	// The whole read-modify-write is confined to vmsync's own metadata
+	// element, rather than reading the entire domain definition and defining
+	// the result back. That matters here more than anywhere: the case that
 	// most needs a failure recorded is a target that has been promoted and
 	// is RUNNING, and rewriting a live domain's persistent definition from
 	// a typed round-trip is how configuration goes missing.
@@ -3186,9 +3184,8 @@ func buildMetadataEntry(open, close, fieldPrefix string, fields map[string]strin
 // "" when that field is absent.
 //
 // Delegates to allMetadataFields rather than walking the document itself.
-// The two used to carry their own copies of the same matching rules, and a
-// pair like that only has to drift once to leave half of vmsync able to read
-// a domain the other half reads as empty.
+// Two separate copies of the same matching rules only have to drift once to
+// leave half of vmsync able to read a domain the other half reads as empty.
 func parseMetadataValue(metadataXML string, field string) string {
 	return allMetadataFields(metadataXML)[field]
 }
@@ -3196,16 +3193,16 @@ func parseMetadataValue(metadataXML string, field string) string {
 // allMetadataFields returns every vmsync:field->id-attribute-value pair
 // actually present in metadataXML, not just the ones metadataFieldOrder
 // happens to enumerate. SetMetadataFields uses this (rather than looking
-// up each known field individually, as it used to) specifically so a field
-// outside that list -- written by a newer or older vmsync version sharing
-// the same target, say, or simply added to metadataFieldOrder after this
-// build was compiled -- survives a metadata update instead of silently
-// disappearing the moment anything else touches this domain's metadata:
-// SetMetadataFields's own doc comment already promises "preserving any
-// existing vmsync fields not mentioned in updates or removeFields...
-// untouched", a guarantee the old known-fields-only read broke for
-// anything not on that list. The wrapping <vmsync:vmsync> element itself
-// is excluded -- it's the container, not a field.
+// up each known field individually) specifically so a field outside that
+// list -- written by a newer or older vmsync version sharing the same
+// target, say, or simply added to metadataFieldOrder after this build was
+// compiled -- survives a metadata update instead of silently disappearing
+// the moment anything else touches this domain's metadata:
+// SetMetadataFields's own doc comment promises "preserving any existing
+// vmsync fields not mentioned in updates or removeFields... untouched", a
+// guarantee a known-fields-only read breaks for anything not on that
+// list. The wrapping <vmsync:vmsync> element itself is excluded -- it's
+// the container, not a field.
 func allMetadataFields(metadataXML string) map[string]string {
 	fields, _, _ := metadataFields(metadataXML)
 	return fields
@@ -3764,9 +3761,7 @@ func DeleteAllManagedCheckpoints(dom *libvirt.Domain) error {
 // behavior is the opposite direction and has no such restriction at all:
 // deleting a checkpoint merges the dirty-tracking region it owns into its
 // OWN PARENT (not a child), and succeeds unconditionally regardless of
-// whether the checkpoint being deleted has children -- an earlier version
-// of this comment had the mechanism and the restriction both backwards,
-// describing snapshot semantics instead of checkpoint semantics.
+// whether the checkpoint being deleted has children.
 //
 // Newest-first is kept anyway, not because it's required by the documented
 // behavior above, but because it costs nothing here: DeleteAllManagedCheckpoints
@@ -3993,12 +3988,12 @@ func buildPullBackupXML(
 // not just ones actively executing. This is the right check both for
 // deciding whether a domain needs starting (Create()/CreateWithFlags() only
 // work on a shut-off domain -- calling them on an already-paused one fails
-// with "domain is already running", exactly the class of error this
-// replaces a check that used to miss) and for the safety checks that refuse
-// to touch a domain's disk files while it's active: a paused domain still
-// holds those files open exactly like a running one does, so treating it as
-// safe to delete/overwrite under -- as a naive "state == DOMAIN_RUNNING"
-// check would -- is a real risk, not just an inconvenience.
+// with "domain is already running", exactly the class of error a narrower
+// check misses) and for the safety checks that refuse to touch a domain's
+// disk files while it's active: a paused domain still holds those files
+// open exactly like a running one does, so treating it as safe to
+// delete/overwrite under -- as a naive "state == DOMAIN_RUNNING" check
+// would -- is a real risk, not just an inconvenience.
 func DomainActive(dom *libvirt.Domain) (bool, error) {
 	state, _, err := dom.GetState()
 	if err != nil {

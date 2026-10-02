@@ -316,12 +316,13 @@ func TestIsCheckpointBlockedBySnapshot(t *testing.T) {
 	}
 }
 
-// TestShouldRewriteDiskPaths is a pure-function regression test for the bug
-// this was extracted to fix: DefineDomain used to gate the entire disk-path
-// rewrite on targetDiskPath alone, so an external-snapshot source with no
-// -target-disk-path set (targetDiskPath == "", rootSourceByLiveSource
-// populated with a real live-to-root mapping) silently skipped the rewrite
-// and left the target definition pointing at a file that was never copied.
+// TestShouldRewriteDiskPaths pins shouldRewriteDiskPaths, the decision
+// DefineDomain delegates here so it is testable on its own: gating the entire
+// disk-path rewrite on targetDiskPath alone would make an external-snapshot
+// source with no -target-disk-path set (targetDiskPath == "",
+// rootSourceByLiveSource populated with a real live-to-root mapping) silently
+// skip the rewrite and leave the target definition pointing at a file that
+// was never copied.
 func TestShouldRewriteDiskPaths(t *testing.T) {
 	cases := []struct {
 		name                   string
@@ -617,12 +618,12 @@ func TestSetMetadataFieldsAndParseMetadata(t *testing.T) {
 			t.Fatalf("SetMetadataFields() error = %v", err)
 		}
 		// A later update touching a completely different, known field must
-		// not silently drop the unrecognized one -- this is the exact
-		// regression: SetMetadataFields used to only ever read back fields
-		// in metadataFieldOrder, so anything else vanished the moment
-		// metadata was next written, contradicting its own doc comment's
-		// "preserving any existing vmsync fields not mentioned in updates
-		// or removeFields... untouched".
+		// not silently drop the unrecognized one. A SetMetadataFields that
+		// only ever read back the fields in metadataFieldOrder would make
+		// anything else vanish the moment metadata is next written,
+		// contradicting its own doc comment's "preserving any existing
+		// vmsync fields not mentioned in updates or removeFields...
+		// untouched".
 		updated, err := SetMetadataFields(withUnknown, map[string]string{
 			MetadataFieldFailureCount: "1",
 		})
@@ -682,13 +683,12 @@ func TestBuildMetadataEntry(t *testing.T) {
 	}
 }
 
-// TestBuildMetadataEntryUnknownFields covers the write-side half of the fix
-// for the metadata writer silently dropping fields outside
-// metadataFieldOrder: a field it doesn't itself enumerate must still be
-// emitted (after every known field, sorted alphabetically among
-// themselves so their own relative order is deterministic too), not
-// silently omitted the way it used to be even if allMetadataFields had
-// correctly read it back into the map in the first place.
+// TestBuildMetadataEntryUnknownFields covers the write-side half of not
+// silently dropping fields outside metadataFieldOrder: a field the writer
+// doesn't itself enumerate must still be emitted (after every known field,
+// sorted alphabetically among themselves so their own relative order is
+// deterministic too). Omitting it here loses the field even when
+// allMetadataFields has correctly read it back into the map.
 func TestBuildMetadataEntryUnknownFields(t *testing.T) {
 	entry := buildMetadataElement(map[string]string{
 		MetadataFieldFailureCount: "3",
@@ -1261,14 +1261,15 @@ func TestReplicationRoleRoundTripsThroughMetadata(t *testing.T) {
 }
 
 // TestSetMetadataFieldsRejectsUnsafeFieldNames pins the validation that
-// stands in for what the fixed metadataFieldOrder list used to provide for
+// stands in for what a fixed metadataFieldOrder list would provide for
 // free: buildMetadataEntry interpolates a field name straight into the tag
 // it emits (metadataPrefix + ":" + field), and an element NAME -- unlike a value --
 // has no escaping available, so an unsafe name can only ever produce
-// malformed XML. Before buildMetadataEntry started emitting unrecognized
-// fields (so SetMetadataFields could keep its promise to preserve fields it
-// doesn't know about), such a name was silently dropped and could never
-// reach the output at all.
+// malformed XML. buildMetadataEntry emits unrecognized fields (so
+// SetMetadataFields can keep its promise to preserve fields it doesn't know
+// about), which is what lets such a name reach the output at all; dropping
+// everything off the known list instead would take every unknown field
+// with it.
 //
 // Every real caller passes a metadataField* constant, so this is a guard
 // against future misuse rather than a live bug -- the point is that it fails
@@ -1403,8 +1404,8 @@ func TestStripDomainUUID(t *testing.T) {
 		}
 	})
 
-	// Regression pin: this used to silently return "" on malformed input,
-	// discarding the real parse error entirely -- a caller feeding that
+	// Regression pin: silently returning "" on malformed input would
+	// discard the real parse error entirely -- a caller feeding that
 	// empty string straight into DomainDefineXML would see a generic,
 	// misleading "empty/malformed XML" failure from libvirt with nothing
 	// pointing back at the actual problem being here, not there.

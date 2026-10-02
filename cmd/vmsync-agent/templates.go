@@ -166,9 +166,9 @@ func validateVerifyCadence(days, window string, intervalSec int, verifyMode stri
 func validateVerifyCadenceShape(days, window string, intervalSec int) error {
 	hasCal := days != "" || window != ""
 	// Checked here rather than only on the template. A NEGATIVE interval on an
-	// entry used to pass every validator and then mean "verify on every single
-	// sync", because verifyDue tests `interval <= 0` and treats that as "no
-	// cadence" -- the opposite of what somebody typing -1 intends, and the
+	// entry would otherwise pass every validator and then mean "verify on every
+	// single sync", because verifyDue tests `interval <= 0` and treats that as
+	// "no cadence" -- the opposite of what somebody typing -1 intends, and the
 	// most expensive possible reading of it.
 	if intervalSec < 0 {
 		return fmt.Errorf("has verify_interval_seconds %d: negative is meaningless, and would be read as \"verify on every sync\"", intervalSec)

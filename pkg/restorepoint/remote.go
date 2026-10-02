@@ -291,11 +291,10 @@ func RemoveCommand(p Point) (string, error) {
 // name must be something ParseListing reported as staging, and is re-checked
 // here rather than trusted: it is about to be interpolated into rm -rf.
 //
-// The store it is removed from is this domain's, which is the fix for the third
-// of the four ways a shared store went wrong: the sweep used to run over the
-// directory every co-located domain staged into, so it removed a concurrently
-// running sibling's in-flight set and failed that sync after it had already
-// copied its data.
+// The store it is removed from is this domain's, which closes the third of the
+// four ways a shared store goes wrong: a sweep over the directory every
+// co-located domain stages into removes a concurrently running sibling's
+// in-flight set and fails that sync after it has already copied its data.
 func RemoveStagingCommand(s Store, name string) (string, error) {
 	if err := s.check(); err != nil {
 		return "", err
@@ -317,11 +316,11 @@ func RemoveStagingCommand(s Store, name string) (string, error) {
 // RemoveStoreCommand deletes every restore point of ONE target domain, as
 // -reinit does when -replaced-disk-action=delete.
 //
-// Scoped to one store, which is the fix for the fourth way a shared store went
-// wrong: this used to be an rm -rf of the whole shared root, so reinitialising
-// one domain destroyed every co-located domain's entire history in one command
-// -- and said in the log that it had removed "the restore points belonging to
-// the replaced replica".
+// Scoped to one store, which closes the fourth way a shared store goes wrong:
+// an rm -rf of the whole shared root means reinitialising one domain destroys
+// every co-located domain's entire history in one command -- while the log
+// says only that it removed "the restore points belonging to the replaced
+// replica".
 //
 // The store is re-checked rather than trusted even though a constructor built
 // it: this emits rm -rf on a path derived from an operator-supplied

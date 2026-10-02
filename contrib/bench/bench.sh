@@ -434,14 +434,14 @@ TAMPER_BAND_END="${TAMPER_BAND_END:-0}" # 0 = up to the disk's virtual size
 # in pkg/nbdsync/nbd.go), so anything under 4 KiB is indistinguishable from a
 # 4 KiB tamper and buys no coverage at all.
 #
-# The old reason for the 64 KiB floor is gone: -verify used to discard a
-# reported range that overlapped a region the guest had written, and those
-# regions came from a dirty bitmap at qemu's default 64 KiB granularity, so a
-# smaller tamper could be swallowed whole. No mode reconciles against a bitmap
-# any more -- every mode compares against the same frozen snapshot the copy
-# read from, so a tamper of any size is reported. The floor is kept because a
-# tamper at bitmap granularity is still the more realistic corruption shape,
-# not because a smaller one would be missed.
+# 64 KiB specifically is a realism choice, not a detection threshold. No mode
+# reconciles a reported range against a dirty bitmap -- every mode compares
+# against the same frozen snapshot the copy read from, so a tamper of any size
+# is reported. A mode that did discard a reported range overlapping a region
+# the guest had written would take those regions from a dirty bitmap at qemu's
+# default 64 KiB granularity, and a smaller tamper could be swallowed whole.
+# The floor is kept because a tamper at bitmap granularity is the more
+# realistic corruption shape, not because a smaller one would be missed.
 TAMPER_LENGTH_MIN="${TAMPER_LENGTH_MIN:-65536}"
 TAMPER_LENGTH_MAX="${TAMPER_LENGTH_MAX:-262144}"
 TAMPER_ALIGN="${TAMPER_ALIGN:-4096}"
@@ -454,8 +454,8 @@ random | fixed) ;;
 esac
 
 # Plain decimal byte counts only, for everything this script does arithmetic
-# on. qemu-io accepts k/M/G suffixes and bench.conf.example used to advertise
-# them, but $(( 100M )) is a bash syntax error, and under `set -e` that ends
+# on. qemu-io accepts k/M/G suffixes, so they are a tempting thing to write
+# here, but $(( 100M )) is a bash syntax error, and under `set -e` that ends
 # the run with a bare arithmetic complaint rather than anything actionable.
 for _v in TAMPER_OFFSET TAMPER_LENGTH TAMPER_BAND_START TAMPER_BAND_END \
 	TAMPER_LENGTH_MIN TAMPER_LENGTH_MAX TAMPER_ALIGN; do
@@ -574,14 +574,14 @@ preflight() {
 # the one it passes to every vmsync it launches as -bridge-helper-path.
 #
 # It is resolved in one place and passed EXPLICITLY rather than left to each
-# side's default, because the two defaults did not agree: vmsync's flag defaults
+# side's default, because the two defaults do not agree: vmsync's flag defaults
 # to /usr/local/bin/vmsync-bridge-helper (cmd/vmsync/main.go) and this harness
-# used to fall back to /usr/bin/vmsync-bridge-helper. With BRIDGE_HELPER_PATH
-# unset, the preflight therefore version-checked a binary vmsync would never
-# open, and reported "integrity check available" for a helper that was not the
-# one in use -- the same shape of false green as testing a stale vmsync, and just
-# as invisible. Passing it everywhere means the binary this harness verified is
-# provably the binary the runs used.
+# falls back to /usr/bin/vmsync-bridge-helper. Left to those defaults with
+# BRIDGE_HELPER_PATH unset, the preflight would version-check a binary vmsync
+# never opens, and report "integrity check available" for a helper that was not
+# the one in use -- the same shape of false green as testing a stale vmsync, and
+# just as invisible. Passing it everywhere means the binary this harness
+# verified is provably the binary the runs used.
 bridge_helper_path() {
 	printf '%s\n' "${BRIDGE_HELPER_PATH:-/usr/bin/vmsync-bridge-helper}"
 }
@@ -776,14 +776,14 @@ bench_sync() {
 # the target.
 # bench_sync_hint -- what to suspect when a stage's baseline sync fails.
 #
-# Two causes, and the order matters because the second one used to be reported
-# as the first. A run that vmsync REFUSED at preflight ends in well under a
-# second having copied nothing, and is not a transport problem at all: a
-# recorded verify_state (stage 14's feature -- a plain -reinit is refused too,
-# by design), a replication_role, or an out-of-band write on the replica will
-# each do it. Blaming BENCH_SYNC_ARGS for those sent two separate
-# investigations after -compress and pkg/nbdsync for a vmsync that was working
-# exactly as designed, so the refusal is named first and by its signature.
+# Two causes, and the order matters. A run that vmsync REFUSED at preflight
+# ends in well under a second having copied nothing, and is not a transport
+# problem at all: a recorded verify_state (stage 14's feature -- a plain
+# -reinit is refused too, by design), a replication_role, or an out-of-band
+# write on the replica will each do it. Blaming BENCH_SYNC_ARGS for those
+# sends the reader after -compress and pkg/nbdsync for a vmsync that is
+# working exactly as designed, so the refusal is named first and by its
+# signature.
 bench_sync_hint() {
 	printf ' -- if that run ended in under a second having transferred nothing, vmsync REFUSED it at preflight rather than failing: check its log for a recorded verify_state (cleared only by -verify-failure-reinit or -force-clean), a replication_role, or an out-of-band-write refusal'
 	if [ ${#BENCH_SYNC_EXTRA[@]} -gt 0 ]; then
@@ -1224,26 +1224,26 @@ verify_cross_check_subtest() {
                 fi
         fi
 
-        # Every mode must see the SAME bytes, and since stage 14's feature
-        # landed that costs a heal-and-re-tamper between them rather than
-        # nothing at all.
+        # Every mode must see the SAME bytes, and stage 14's feature makes
+        # that cost a heal-and-re-tamper between them rather than nothing at
+        # all.
         #
-        # This loop used to tamper once and run all three modes against it, on
-        # the reasoning that nothing healed the replica in between. The tamper
-        # does still survive -- but the FINDING now survives too: a -verify
-        # that ran and found a difference records verify_state=failed on the
-        # target domain, and a domain carrying that record refuses the next
-        # sync outright. So modes two and three were refused at preflight in
-        # ~0.3s with mode=unknown, never reaching a compare, and the agreement
-        # check below read that as the skip logic dropping real differences --
-        # pointing at pkg/nbdsync for what was vmsync working as designed.
+        # Tampering once and running all three modes against it is not enough,
+        # even though the tamper itself survives: the FINDING survives too. A
+        # -verify that ran and found a difference records verify_state=failed
+        # on the target domain, and a domain carrying that record refuses the
+        # next sync outright. Modes two and three would be refused at
+        # preflight in ~0.3s with mode=unknown, never reaching a compare, and
+        # the agreement check below would read that as the skip logic dropping
+        # real differences -- pointing at pkg/nbdsync for vmsync working as
+        # designed.
         #
         # Re-establishing the state is the honest fix: heal (a -force-clean
         # full resync, which is also what clears the record) and re-apply the
         # tamper at the SAME offset, since draw_tamper ran once above and
         # TAMPER_OFF/TAMPER_LEN have not moved since. Each mode then gets a
         # byte-identical replica and a clean record, which is what this
-        # cross-check always meant to compare.
+        # cross-check is meant to compare.
         local tampered_once=no
         for mode in fast full qemu-img; do
                 if [ "$DRY_RUN" != yes ] && [ "$tampered_once" = yes ]; then
@@ -1472,13 +1472,13 @@ verify_mode_subtest() {
 # fix this: it re-copies only blocks the SOURCE's dirty bitmap says changed, and
 # the source never wrote to the offset that was corrupted on the target.
 #
-# -force-clean rather than the plain -reinit this used to pass, and that is a
-# consequence of the feature stage 14 tests rather than a preference. A -verify
-# that RAN and found a difference now records verify_state=failed on the target
-# domain, and a domain carrying that record REFUSES an ordinary sync and a plain
-# -reinit alike -- deliberately, because a reinit recopies without proving the
-# result, so allowing it would move the replica from "known bad" to "assumed
-# good, unverified" while erasing the record that said otherwise. Every tamper
+# -force-clean rather than a plain -reinit, and that is a consequence of the
+# feature stage 14 tests rather than a preference. A -verify that RAN and found
+# a difference records verify_state=failed on the target domain, and a domain
+# carrying that record REFUSES an ordinary sync and a plain -reinit alike --
+# deliberately, because a reinit recopies without proving the result, so
+# allowing it would move the replica from "known bad" to "assumed good,
+# unverified" while erasing the record that said otherwise. Every tamper
 # sub-test above leaves exactly that record behind, so the heal has to be one of
 # the two things that gets past it.
 #
@@ -1486,18 +1486,18 @@ verify_mode_subtest() {
 # corrupted the replica itself, so it is discarding a finding it created rather
 # than investigating one, and -verify-failure-reinit would additionally spend a
 # full-image compare per heal to re-prove a replica nothing doubts. Against a
-# running source it does what -reinit did (the chain is rebuilt either way); its
+# running source it matches -reinit (the chain is rebuilt either way); its
 # one extra power that could matter here -- removing the target definition first
 # -- does not change the end state. Clearing a shut-down source's bitmaps is NOT
 # one of its extra powers, easy as that is to assume: every reinit does
 # that, and which route it takes is decided by the source's own state.
 #
-# Note this means the heal path no longer exercises the refusal, so nothing here
+# Note this means the heal path does not exercise the refusal, so nothing here
 # would notice if it broke. That is stage 14's job, which asserts a plain
 # -reinit IS refused rather than assuming it.
 #
-# One of only two die()s left inside a stage, and deliberately so. Everywhere
-# else a stage now returns non-zero so the report still prints, but a heal that
+# One of only two die()s inside a stage, and deliberately so. Everywhere
+# else a stage returns non-zero so the report still prints, but a heal that
 # failed leaves a replica this harness knowingly corrupted: every later stage
 # would then measure that damage and report it as a vmsync defect. Losing the
 # report is the smaller loss.
@@ -1529,10 +1529,10 @@ heal_target() {
 #
 # That is not hypothetical. Stage 7 shuts the source down to prove the fence
 # works and starts it again on its way out, so every later stage that needs
-# the guest agent asks a guest that has been booting for about a second. Stage
-# 8 used to skip itself with "guest-exec unavailable" in every run that
-# included stage 7 -- reported as a skip, so it looked like a configuration
-# problem on the guest rather than the harness not waiting.
+# the guest agent asks a guest that has been booting for about a second.
+# Without this wait, stage 8 skips itself with "guest-exec unavailable" in
+# every run that includes stage 7 -- reported as a skip, so it looks like a
+# configuration problem on the guest rather than the harness not waiting.
 #
 # guest-ping rather than guest-info: it is the cheapest RPC that proves the
 # agent is answering, and it is enabled wherever the agent runs at all.
@@ -1978,18 +1978,16 @@ stage_external_snapshot() {
                         # version-dependent, and newer libvirt/qemu pairs allow
                         # it. When they do, vmsync's tolerance path is simply
                         # never needed and the checkpoint chain keeps advancing
-                        # normally -- a better outcome than the one this stage
-                        # was originally written to expect. Treating "the
-                        # fallback wasn't needed" as "the fallback is broken"
-                        # is what this check used to do, and it made a healthy
-                        # run report a regression.
+                        # normally. Treating "the fallback wasn't needed" as
+                        # "the fallback is broken" would make a healthy run
+                        # report a regression.
                         #
-                        # The assertions that DO still apply here -- the sync
+                        # The assertions that DO apply here -- the sync
                         # succeeded, the snapshot was genuinely visible to
                         # vmsync, and the target path did not drift -- are all
-                        # checked above, which they previously were not: they
-                        # sat behind the tolerance-log grep and were skipped
-                        # entirely whenever it didn't match.
+                        # checked above rather than behind the tolerance-log
+                        # grep, which would skip them entirely whenever it
+                        # didn't match.
                         log "   PASS: synced and verified with the external snapshot present; this libvirt permitted the checkpoint, so the tolerance path was not exercised (vmsync_external_snapshot_count=$snap_count, target path unchanged)"
                         results_row "$CSV" ext-snapshot during-result 0 "" "" "" "" "" "PASS synced+verified, checkpoint not blocked by this libvirt, count=$snap_count"
                 fi
@@ -2071,10 +2069,10 @@ stage_external_snapshot() {
 #   the redefine, to check that DefineDomain's rollback genuinely restores
 #   the target's prior definition. Scored pass/fail.
 #
-#   5b used to try to force that failure from outside instead, with a timed
-#   iptables rule on TARGET_HOST. See stage_define_domain_rollback's own
-#   comment for why that could never work and why it sometimes reported the
-#   opposite of the truth.
+#   The failure is injected by vmsync itself rather than forced from outside
+#   with a timed iptables rule on TARGET_HOST. See
+#   stage_define_domain_rollback's own comment for why an external disruption
+#   cannot work and why it can report the opposite of the truth.
 #
 # Not part of the default --stages list (see usage()): both halves are
 # deliberate failure injection rather than measurement, and 5a briefly
@@ -2249,34 +2247,34 @@ stage_define_domain_uuid_collision() {
 
 # Stage 5b: DefineDomain's rollback-on-failure.
 #
-# This used to try to force the failure from outside, by watching the log for
-# the undefine and then cutting SSH to the target with an iptables rule. That
-# could never work, for two independent reasons:
+# vmsync injects the failure itself, via -test=failure-define. That corrupts
+# the document handed to DomainDefineXML rather than skipping the call, so
+# libvirt genuinely refuses it and the rollback runs against the state a real
+# rejection leaves behind. No timing, no background process, no firewall rules
+# on anybody's hypervisor.
+#
+# Forcing the failure from outside -- watching the log for the undefine and
+# then cutting SSH to the target with an iptables rule -- cannot work, for two
+# independent reasons:
 #
 #   - The window runs from UndefineFlags returning to DomainDefineXML being
 #     called, and holds no I/O at all -- rename, strip uuid, rewrite disk
 #     paths, splice metadata, all in memory, over in about a millisecond.
-#     The harness needed up to 200ms of poll latency plus a fresh SSH
+#     The harness would need up to 200ms of poll latency plus a fresh SSH
 #     handshake to get its rule in place: two orders of magnitude late, every
 #     run.
-#   - Landing it would have been worse. The rollback restores over the SAME
-#     libvirt connection the disruption severs, so a perfectly timed hit
-#     necessarily kills the recovery being tested. No PASS was reachable.
+#   - Landing it would be worse. The rollback restores over the SAME libvirt
+#     connection the disruption severs, so a perfectly timed hit necessarily
+#     kills the recovery being tested. No PASS is reachable.
 #
-# And it could report PASS wrongly: a rule landing slightly EARLY killed the
+# It would also report PASS wrongly: a rule landing slightly EARLY kills the
 # undefine instead, which returns before the rollback closure is even
 # constructed -- leaving a non-zero exit and an unchanged definition, which is
 # exactly what a successful rollback looks like from outside.
 #
-# So vmsync injects the failure itself now, via -test=failure-define. That
-# corrupts the document handed to DomainDefineXML rather than skipping the
-# call, so libvirt genuinely refuses it and the rollback runs against the
-# state a real rejection leaves behind. No timing, no background process, no
-# firewall rules on anybody's hypervisor.
-#
-# The verdict still reads vmsync's own log rather than inferring from the exit
-# code, because "the rollback restored it" and "nothing was ever undefined"
-# remain indistinguishable from the outside.
+# The verdict reads vmsync's own log rather than inferring from the exit code,
+# because "the rollback restored it" and "nothing was ever undefined" are
+# indistinguishable from the outside.
 stage_define_domain_rollback() {
         log "--- Stage 5b: DefineDomain rollback-on-failure ---"
 
@@ -2620,9 +2618,9 @@ fo_check() {
 		results_row "$CSV" "$scenario" "${label// /_}" 0 "" "" "" "" "" "PASS"
 	else
 		warn "FAIL: $label${detail:+ -- $detail}"
-		# Commas are stripped by results_row itself now -- including from the
-		# label, which is what used to make a failing check disappear from the
-		# stage verdict entirely. Nothing to remember here.
+		# results_row strips commas itself -- including from the label, where
+		# one left in place makes a failing check disappear from the stage
+		# verdict entirely. Nothing to remember here.
 		results_row "$CSV" "$scenario" "${label// /_}" 1 "" "" "" "" "" "FAIL $detail"
 		FAILOVER_FAILURES=$((FAILOVER_FAILURES + 1))
 	fi
@@ -3437,9 +3435,9 @@ stage_fence_agent() {
 	local src_pid="" tgt_pid=""
 	# Where the source's agent finds vmsync on its own host. VMSYNC_BIN, because
 	# this stage already requires SOURCE_LOCAL=yes -- the harness is running on
-	# the source, so its own binary is the source's binary. There used to be a
-	# SOURCE_VMSYNC_BIN override defaulting to this; it was one more path to keep
-	# in step and never a different value in any working configuration.
+	# the source, so its own binary is the source's binary. A SOURCE_VMSYNC_BIN
+	# override defaulting to this would be one more path to keep in step and
+	# never a different value in any working configuration.
 	local src_vmsync="$VMSYNC_BIN"
 
 	if [ "$DRY_RUN" = yes ]; then
@@ -3657,11 +3655,11 @@ stage_fence_agent() {
 
 	# --- and left it in the right state ---------------------------------------
 	#
-	# 'fenced', not 'paused'. The two used to be the same word, which is what
-	# made this assertion weak: it could not tell a domain a fence had stopped
-	# from one an operator had suspended by hand, so it passed on either. They
-	# are separate roles now -- nobody CHOSE this one -- and the check asserts
-	# the specific one, which is the only version of it worth having.
+	# 'fenced', not 'paused'. They are separate roles, and 'fenced' is the one
+	# nobody CHOSE -- asserting that specific word is what gives this check its
+	# force. A single word covering both would leave it unable to tell a domain
+	# a fence had stopped from one an operator had suspended by hand, and it
+	# would pass on either.
 	if [ "$state" = shutoff ]; then
 		local src_role
 		src_role="$(vmsync_meta_field "$SOURCE_URI" "$SOURCE_DOMAIN" replication_role)"
@@ -3912,14 +3910,15 @@ stage_verify_long() {
 	for mode in $VERIFY_LONG_MODES; do
 		log "--- verify-long/$mode: building a fresh ${copies}-deep chain ---"
 
-		# -force-clean, not the plain -reinit this used to pass, and for the
-		# same reason heal_target changed: the PREVIOUS mode's round ended
+		# -force-clean, not a plain -reinit, and for the same reason
+		# heal_target needs one: the PREVIOUS mode's round ended
 		# with a -verify that found a difference, which records
 		# verify_state=failed on the target domain -- and a domain carrying
 		# that record refuses an ordinary sync and a plain -reinit alike,
 		# deliberately, because a reinit recopies without proving the result.
-		# So from the second mode on, this baseline was refused at preflight
-		# in ~0.3s with mode=unknown, and the stage aborted blaming -compress.
+		# With a plain -reinit this baseline is refused at preflight in ~0.3s
+		# with mode=unknown from the second mode on, and the stage aborts
+		# blaming -compress.
 		bench_sync verify-long "${mode}-baseline" -force-clean
 		if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
 			warn "baseline full sync for verify-long/$mode failed (see $RUN_LOG) -- aborting stage 8$(bench_sync_hint)"
@@ -4343,8 +4342,9 @@ rp_list() {
 #
 # Nothing in this harness may rm -rf this path. It is shared by every target
 # domain replicating into TARGET_DISK_PATH, and deleting it to get a clean slate
-# is the same mistake the engine used to make -- it would destroy a co-located
-# replica's entire recovery history. Use rp_store_dir and clear one store.
+# would destroy a co-located replica's entire recovery history -- the same
+# mistake stage 18 guards the engine against. Use rp_store_dir and clear one
+# store.
 rp_root() {
 	printf '%s/.vmsync-rp' "${TARGET_DISK_PATH%/}"
 }
@@ -4977,17 +4977,15 @@ stage_checksum() {
 	fi
 
 	# CHECKSUM_INCREMENTAL decides how every sub-test below gets vmsync to
-	# WRITE something, and that turned out to be the whole difficulty of this
-	# stage.
+	# WRITE something, and that is the whole difficulty of this stage.
 	#
 	# The check only runs when a copy actually happened: copyAndCommit returns
 	# early at "No changed extents selected, skipping copy" before the overlay
 	# is even created, so on an idle source an incremental sync is a complete
 	# no-op -- no digests, no exchange, the helper never invoked, and nothing
-	# in the log either way. The first version of this stage assumed a
-	# baseline-then-incremental pair would produce a delta, and against a
-	# quiet test VM all three of its interesting sub-tests silently tested
-	# nothing.
+	# in the log either way. Assuming a baseline-then-incremental pair produces
+	# a delta would leave all three interesting sub-tests silently testing
+	# nothing against a quiet test VM.
 	#
 	# So: dirty the guest when the agent allows it, which gives a genuine
 	# incremental and is the only way to reach the overlay-is-discarded
@@ -6817,7 +6815,8 @@ stage_commit_barrier() {
 
 # --- Stage 16: an interrupted rebuild ----------------------------------------
 #
-# The stage for the one failure a promotion used to accept without a word.
+# The stage for the one failure a promotion would otherwise accept without a
+# word.
 #
 # A full copy -- `-reinit`, `-force-clean`, or any sync whose computed parent
 # is empty -- renames the good replica disks aside and writes NEW base images
@@ -6825,11 +6824,11 @@ stage_commit_barrier() {
 # its OLD metadata until the very last write. A run killed in that window
 # leaves the target saying last_checkpoint=<old>, last_sync_timestamp=<old>,
 # replica_source=<set>, failure_count=0. Every one of those is true about the
-# replica the copy REPLACED and false about the half-written image now sitting
-# on the disks, so pkg/failover's evidence check found nothing wrong and
-# -promote booted a half-written machine reporting an ordinary data-loss
-# window -- while the complete copy sat unread in the .vmsync-replaced-<unix>
-# files beside it.
+# replica the copy REPLACED and false about the half-written image sitting on
+# the disks, so pkg/failover's evidence check finds nothing wrong and -promote
+# would boot a half-written machine reporting an ordinary data-loss window --
+# while the complete copy sits unread in the .vmsync-replaced-<unix> files
+# beside it.
 #
 # replica_incomplete closes that, and this is the only place the closure is
 # proven against a real interruption rather than against a struct literal in a
@@ -7070,10 +7069,10 @@ stage_interrupted_reinit() {
 
 	# The rest of the metadata must be untouched, and that is the point rather
 	# than a detail. That last_checkpoint, last_sync_timestamp and the others
-	# still look perfectly healthy is the whole reason this replica used to be
-	# promotable; a stage where the rebuild had cleared them would be proving
-	# the refusal against a target that any of the older checks would have
-	# caught on its own.
+	# still look perfectly healthy is the whole reason this replica is
+	# promotable without the refusal; a stage where the rebuild had cleared
+	# them would be proving the refusal against a target that the ordinary
+	# evidence checks would have caught on its own.
 	local cp_after sync_after
 	cp_after="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_checkpoint)"
 	sync_after="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_sync_timestamp)"
@@ -7434,23 +7433,24 @@ stage_journal() {
 
 # Stage 18: two target domains in one directory.
 #
-# Restore points used to be keyed by the DIRECTORY the replica's disks live in,
-# so every domain replicating into one -target-disk-path shared a single store
-# and every policy decision was taken over the union of their points. Four
-# distinct failures followed, and this stage proves each is closed:
+# Restore points are keyed by the target DOMAIN, not by the DIRECTORY the
+# replica's disks live in. Keying them by the directory would give every domain
+# replicating into one -target-disk-path a single shared store, with every
+# policy decision taken over the union of their points. Four distinct failures
+# follow from that, and this stage proves each is closed:
 #
-#   1. STARVATION. The interval floor was measured against the newest point in
-#      the whole directory, so one domain's point satisfied another's floor.
-#      With a staggered cron the same domain lost every time, and a probe
-#      measured one replica taking zero restore points in seventy-two hours.
-#   2. CROSS-EVICTION. The retention count was applied to the union, so a count
-#      meant for one machine was spread across several and a busy domain's
-#      churn evicted a quiet one's history.
-#   3. STAGING THEFT. The sweep of abandoned ".incomplete-" directories ran
-#      over the shared directory, so it removed a concurrently running
-#      sibling's in-flight set -- failing a sync whose data had already landed,
-#      and counting that failure toward -reinit-after-failures.
-#   4. CROSS-SWEEP. A -reinit rm -rf'd the whole shared directory, destroying
+#   1. STARVATION. An interval floor measured against the newest point in the
+#      whole directory lets one domain's point satisfy another's floor. With a
+#      staggered cron the same domain loses every time: measured at one replica
+#      taking zero restore points in seventy-two hours.
+#   2. CROSS-EVICTION. A retention count applied to the union spreads a count
+#      meant for one machine across several, so a busy domain's churn evicts a
+#      quiet one's history.
+#   3. STAGING THEFT. A sweep of abandoned ".incomplete-" directories running
+#      over the shared directory removes a concurrently running sibling's
+#      in-flight set -- failing a sync whose data had already landed, and
+#      counting that failure toward -reinit-after-failures.
+#   4. CROSS-SWEEP. A -reinit rm -rf'ing the whole shared directory destroys
 #      every co-located domain's entire history in one command.
 #
 # The co-located domain is PLANTED rather than replicated. A second real pair

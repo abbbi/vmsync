@@ -255,7 +255,7 @@ func (s *Scheduler) launchDue(ctx context.Context, wg *sync.WaitGroup) {
 		// inFlight is memory-only, so a new process after a restart, a crash
 		// or a package upgrade knows nothing about a vmsync the previous one
 		// launched and which is still going. Without this it launches a second
-		// one every interval for as long as the first runs. That is now
+		// one every interval for as long as the first runs. That is
 		// harmless rather than catastrophic -- the engine stands down with
 		// ExitBusy instead of exiting 0 and being recorded as a success -- but
 		// harmless is not free: it spawns a process, takes a concurrency slot
@@ -525,7 +525,7 @@ func (s *Scheduler) releaseVerifyOccurrence(entry ScheduleEntry, plan syncPlan) 
 // contention it is looking for.
 //
 // Every uncertain answer is false. A missing lock file, an empty one (which is
-// what every vmsync before this feature left behind), an unparsable one, an
+// what a vmsync that stamps no identity leaves behind), an unparsable one, an
 // unreadable /proc: all mean "launch, and let the engine decide". The reason
 // string is for the log and is never a reason to refuse.
 func (s *Scheduler) foreignRunHolds(cfg *agentConfig, vm string) (bool, string) {
@@ -567,16 +567,16 @@ func (s *Scheduler) metricsSnapshot() (running int, nextRun map[string]int64) {
 // interval is a time.Duration -- NANOSECONDS -- so an hour is 3.6e12 and a day
 // is 8.64e13, while a 32-bit hash cannot exceed 4294967295, which is 4.29
 // SECONDS. Taking that modulo any interval longer than 4.29s returns the hash
-// unchanged, so this function used to return the same handful of sub-5-second
-// offsets whether the cadence was 30 seconds or 24 hours: every entry became
+// unchanged, so a 32-bit hash here returns the same handful of sub-5-second
+// offsets whether the cadence is 30 seconds or 24 hours: every entry becomes
 // due within seconds of agent start, together, which is exactly what the doc
 // comment on due() says this exists to prevent.
 //
 // fnv.New64a spans 1.8e19, comfortably past any plausible interval, so the
 // modulo distributes across the whole cadence and the bias is one part in
 // millions. Still deterministic per VM, so a given VM keeps its slot across
-// restarts -- though not the SAME slot it had before this fix, since the hash
-// function changed. That is a one-off reshuffle, not a behaviour change.
+// restarts -- and changing the hash function reshuffles every VM's slot once,
+// which is a one-off redistribution rather than a behaviour change.
 func stagger(vm string, interval time.Duration) time.Duration {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(vm))

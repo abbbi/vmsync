@@ -656,14 +656,14 @@ func TestApplyDomainMetadataKeepsAVerdictWithAnUnreadableDate(t *testing.T) {
 
 // A fence that did not stop the domain is CRITICAL, and a fence that did is not.
 //
-// One word of metadata distinguishes them, and this branch used to ignore it.
+// One word of metadata distinguishes them, and ignoring it is the whole trap.
 // role=fenced is written whether or not the ACPI shutdown worked -- deliberately,
 // because it is the only thing stopping replication resuming into the split brain
 // -- so "fenced" alone says nothing about whether the guest stopped. Still running
 // means it is live beside the copy that was promoted over it and both are taking
-// writes, which is the worst state this product has; it was reported as
-// StatusPaused, "expected rather than broken", which is how it stayed invisible on
-// the console while the agent's gauges were being cleared for the same reason.
+// writes, which is the worst state this product has; reporting it as
+// StatusPaused, "expected rather than broken", is how it stays invisible on
+// the console while the agent's gauges are cleared for the same reason.
 func TestAFenceThatDidNotStopTheDomainIsCritical(t *testing.T) {
 	running := target(90 * 86400)
 	running.Role = libvirtsync.RoleFenced

@@ -719,7 +719,7 @@ func explainReplicaIncomplete(raw string) string {
 // clears.
 //
 // role and replicaSource are taken so the note can say which of THREE
-// situations this is, and getting that down to two was a real defect:
+// situations this is; collapsing them to two is a real defect:
 //
 //   - still `promoted`: no warning about what it blocks is needed, because the
 //     role already blocks everything.
@@ -728,11 +728,11 @@ func explainReplicaIncomplete(raw string) string {
 //   - anything else: demoted, and this record is the only thing left saying the
 //     disks served. That is the case the note exists for.
 //
-// The middle one used to fall through to the last, so -explain-domain told the
-// live primary of a resolved pair that it was "no longer marked promoted", that
-// this record was the only thing saying it ever served (the role says it is
-// authoritative), and to run -release-promotion -- which is refused while the
-// domain runs, and which would strip the guard if it were not.
+// Letting the middle one fall through to the last makes -explain-domain tell
+// the live primary of a resolved pair that it is not the authoritative copy,
+// that this record is the only thing saying it ever served (the role says it
+// is authoritative), and to run -release-promotion -- which is refused while
+// the domain runs, and which would strip the guard if it were not.
 //
 // replicaSource is what separates a real inversion from `-update-role source`
 // typed at a promoted copy: the first clears it, the second leaves it, and only

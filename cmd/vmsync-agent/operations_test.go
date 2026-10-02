@@ -41,12 +41,12 @@ const modeForcedLiteral = "forced"
 
 // A Begin whose disk write fails must leave NOTHING behind.
 //
-// put() records in memory before it writes, so a failed write used to leave
-// the operation marked `running` having never started -- and Seen() refuses to
-// re-execute any recorded id, so that operation could never run again while
-// the UI kept publishing it forever. A later Load() then relabelled the orphan
-// "the agent stopped while this operation was in progress", a statement about
-// something that never began. A transient ENOSPC was enough.
+// put() records in memory before it writes, so a failed write would otherwise
+// leave the operation marked `running` having never started -- and Seen()
+// refuses to re-execute any recorded id, so that operation could never run
+// again while the UI keeps publishing it forever. A later Load() would then
+// relabel the orphan "the agent stopped while this operation was in progress",
+// a statement about something that never began. A transient ENOSPC is enough.
 func TestLedgerBeginLeavesNothingBehindWhenItCannotBeWritten(t *testing.T) {
 	// A state dir nested under a regular FILE, so writeJSONAtomic's own
 	// os.MkdirAll fails with ENOTDIR. A merely absent directory would not do

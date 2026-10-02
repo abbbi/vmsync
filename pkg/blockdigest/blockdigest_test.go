@@ -719,13 +719,12 @@ func TestBlockSizeSkewIsCaughtByTheHeaderNotByCompare(t *testing.T) {
 
 // A missing header must name the side that actually failed to send one.
 //
-// readHeader serves both directions, and it used to say
-// "vmsync-bridge-helper produced no output" unconditionally. So a helper
-// whose own stdin arrived empty reported that IT had produced nothing --
-// which reads as a broken helper when the truth is a caller that never sent
-// the request. That misattribution cost real diagnosis time on a bench run
-// where a wrapper script was double-invoking the helper and draining its
-// stdin.
+// readHeader serves both directions, so a hard-coded "vmsync-bridge-helper
+// produced no output" makes a helper whose own stdin arrived empty report
+// that IT produced nothing -- which reads as a broken helper when the truth
+// is a caller that never sent the request. That misattribution costs real
+// diagnosis time: it is what a wrapper script double-invoking the helper and
+// draining its stdin looks like on a bench run.
 func TestMissingHeaderNamesTheRightPeer(t *testing.T) {
 	// A response is what the HELPER sends, so an empty one is the helper's
 	// silence.

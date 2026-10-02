@@ -831,13 +831,41 @@ The seven skip reasons:
 | `vmsync_agent_domains` | gauge | `status` | Domains by assessed replication status. |
 | `vmsync_agent_replica_incomplete_vms` | gauge | — | VMs here whose disks a full copy started replacing and never finished. **The one to alert on.** Always emitted, including as a zero: a missing series and a clean host look identical to a query, and one of those is a design choice while the other is a scrape that is not happening. |
 | `vmsync_agent_replica_incomplete` | gauge | `vm` | 1 while that VM carries the marker. The count above says *whether*; this says *which* — and which is what an operator needs before a failover, because `-promote` will refuse exactly these. |
-| `vmsync_agent_served_live_unreleased_vms` | gauge | — | Copies here that have been promoted at some point (`last_promoted_at`), are **no longer** marked `promoted`, and whose promotion record nobody has released. Their disks may hold the only copy of data that was serving, so vmsync refuses to sync, restore or force-clean over them — force-clean included. **Alert on it, with a long `for:`.** Nothing clears it automatically: a person runs `-release-promotion` if the data is disposable, or `-invert` if the failover stands, so a value that has not moved in days is an undecided failover rather than a stuck series. Always emitted, zero included. Domains still marked `promoted` are excluded, so a failover in progress and a successful DR test never register. |
+| `vmsync_agent_served_live_unreleased_vms` | gauge | — | Copies here that have been promoted at some point (`last_promoted_at`), are **not the authoritative copy of their pair**, and whose promotion record nobody has released. Their disks may hold the only copy of data that was serving, so vmsync refuses to sync, restore or force-clean over them — force-clean included — and replication into them stops with `failure_count` deliberately left at 0, which makes this the only series that says so. **Alert on it, with a long `for:`.** Two things clear it, both deliberate: `-release-promotion` on the copy while it is shut down, or an `-invert` that makes this copy the primary. See the notes under this table. Always emitted, zero included. |
 | `vmsync_agent_served_live_unreleased` | gauge | `vm` | 1 while that VM is in the state above. This is the only place it shows up on a standalone host: the refusals it causes are exempt from `failure_count` (they are administrative, and a reinit cannot fix them), and the domain's own role reads `paused` exactly like a replica somebody paused for maintenance. |
 | `vmsync_agent_restore_points` | gauge | `vm` | Restore points that replica holds in its own per-domain store, including any whose record cannot be read. Emitted for every replica here, at zero included: a series that appears only once a replica *has* copies can never alert on its having none. |
 | `vmsync_agent_restore_points_unreadable` | gauge | `vm` | How many of those have an unreadable record. Counted above as well, because the directory is the inventory — but a restore from one is refused, so this is the gap between what the store holds and what can be used. |
 | `vmsync_agent_restore_points_verify_failed` | gauge | `vm` | How many recorded a FAILED verification. Not a reason to delete them — they may be the only copies from before the damage — but a replica where this equals the count above has no copy that was ever shown to be clean. |
 | `vmsync_agent_restore_point_newest_timestamp_seconds` | gauge | `vm` | The instant the newest copy's contents correspond to. The same value the engine publishes as `vmsync_restore_point_last_taken_timestamp_seconds`, so a dashboard and an alert cannot disagree about the age of one copy. |
 | `vmsync_agent_restore_point_oldest_timestamp_seconds` | gauge | `vm` | The oldest. `time() -` this is how far back that replica can actually be taken, which is the only restore-point number an operator reaches for during an incident. |
+| `vmsync_agent_replaced_sets` | gauge | `vm` | Displaced sets beside that replica: disks a `-reinit` renamed aside (`<disk>.vmsync-replaced-<unix>`), copies an interrupted restore staged (`<disk>.vmsync-restoring-<unix>`), and restore-point stores a `-reinit` moved aside (`.replaced-vm-<domain>-<unix>`). Emitted for every replica here, zero included. The third kind is the reason this series exists at all: those directories sit *beside* the per-domain stores, so `-list-restore-points` — which reads *inside* one store — cannot see them, and the points in them are outside every store, so until now nothing could name them. |
+| `vmsync_agent_replaced_bytes` | gauge | `vm` | What those sets occupy, **allocated rather than apparent**. **The one to alert on**, and the distinction is the whole point: a fresh aside shares every extent with the live disk beside it, so on the day it is made it costs nearly nothing, and it grows towards a full replica as the live disk is rewritten around it. Apparent size would cry wolf on day one and then never move; this is the number that actually climbs towards the ENOSPC. |
+| `vmsync_agent_replaced_oldest_timestamp_seconds` | gauge | `vm` | When the oldest of them was displaced, from the stamp in its name (its mtime only when the name carries none). `time() -` this separates last night's rebuild, which somebody may still want to undo, from one nobody has looked at since March. |
+
+**What counts as "not the authoritative copy"** for the `served_live_unreleased`
+pair, since the exclusions are load-bearing:
+
+- **`promoted` is excluded** — a failover in force. Counting it would make the
+  gauge non-zero for the whole duration of every successful failover.
+- **`source` is excluded only when the domain is nobody's replica** (no
+  `replica_source`). That is the primary an `-invert` produced, and that pair is
+  *resolved* — the inversion is what resolved it. An inversion deliberately
+  **keeps** the record there, because it is what later refuses `-update-role
+  target` on a live primary, so a gauge keyed on the record alone sat at `1` for
+  ever on a healthy pair with no way to clear it (`-release-promotion` refuses a
+  running domain). The protection stays; only the *reporting* excludes it.
+- **A `source` that still records a `replica_source` keeps reporting.** That is
+  `-update-role source` typed at a promoted copy rather than a real inversion: it
+  writes the role and leaves `replica_source`, so both ends read `source`, every
+  sync between them is refused, and `failure_count` stays 0. Trusting the role
+  alone would make one command a way to silence the alarm on a pair that had
+  stopped replicating in both directions.
+
+A DR drill that was promoted and then demoted **does** register, and does block
+replication until somebody decides. The engine cannot know whether that copy was
+ever booted — the record is written when a domain *becomes* promoted, before the
+guest starts — so it protects the disks either way, and a drill costs one
+`-release-promotion` on the way out.
 
 **Control plane**
 
@@ -1311,6 +1339,8 @@ that a value the agent accepts is one vmsync will accept:
 | `retention` | `"<count>,<interval>"`, e.g. `"24,3h"`. Empty keeps no restore points, so an estate run entirely through the schedule takes none. |
 | `source_port_range`, `target_port_range` | a range (`20000-20100`), or one fixed port to pin it. Both **default to a range**, so leaving these empty is right for almost every profile — and is what makes two concurrent syncs on one host not collide. They used to default to a single fixed port, and since nothing here or in the UI ever set them, every VM in an estate shared it. |
 | `journal` | `""` (vmsync's default, `actions`) or `"off"`. `actions` appends one intent record before each run acts and one outcome when it stops, to `.vmsync-journal/<domain>.jsonl` beside the replica's disks on the target host. Nothing branches on it and a failed write never fails a sync — it is there so an interrupted run leaves an intent with no outcome, which is the only evidence such a run leaves at all. 8 MiB per domain at most. `off` only if that filesystem genuinely cannot take it. |
+| `replaced_disk_action` | `""` (vmsync's default, `rename`), `"rename"` or `"delete"`. Decides what a rebuild does with the replica disks it replaces: rename each aside as `<disk>.vmsync-replaced-<unix>`, or delete them. `rename` is the default and stays it — the aside set is the documented recovery for a rebuild that dies half way, so giving it up has to be a choice somebody made. Until this field existed the agent could not express the choice at all, so **every** agent- and console-driven rebuild kept a full-size copy of every disk, and `vmsync_agent_replaced_bytes` above is what that has been costing. |
+| `reclaim_leftovers_after` | a Go duration, e.g. `"720h"` for thirty days. Empty leaves vmsync's default, which **reports** displaced sets and removes none. Set it and each run removes the ones older than it, before copying anything — the harm is an ENOSPC on the DR host, and space freed after the copy that ran out of it is freed too late. Refused under `24h`, and refused outright on a replica marked incomplete, where the aside set *is* the only complete copy there is. Note that Go durations have no day unit: `"30d"` is rejected, `"720h"` is thirty days. The pair to reach for on an estate that has been running a while — `replaced_disk_action` stops new asides accumulating, this clears the ones already there. |
 
 `report_interval_seconds`, `poll_wait_seconds` and `cadence_seconds` are part of
 the same document type and are accepted here, but do nothing: there is nothing

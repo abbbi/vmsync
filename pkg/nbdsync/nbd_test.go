@@ -715,13 +715,13 @@ func TestCompareTCPCollectFindsAllMismatches(t *testing.T) {
 	}
 }
 
-// TestDiffSubRanges is a pure-function regression test for the bug this was
-// extracted to fix: compareTCP used to report any mismatch inside an AIO
-// chunk as spanning the chunk's entire offset/length, which the former -verify=online's
-// dirty-bitmap reconciliation (overlapsAnyExtent) would then discard
-// wholesale if a guest write touched the chunk anywhere -- silently hiding
-// real corruption elsewhere in the same wide chunk. Needs no qemu-nbd at
-// all.
+// TestDiffSubRanges pins the sub-block narrowing. Reporting a mismatch
+// anywhere inside an AIO chunk as spanning the chunk's entire offset/length
+// makes every MismatchRange as wide as the chunk, so any consumer that
+// discards a range because a guest write overlaps it somewhere -- which is
+// what reconciling mismatches against a dirty bitmap amounts to -- silently
+// discards real corruption elsewhere in the same wide chunk. Needs no
+// qemu-nbd at all.
 func TestDiffSubRanges(t *testing.T) {
 	const g = 4 // small granularity so cases stay readable
 
@@ -905,11 +905,10 @@ func TestNegotiateBufferSizeReturnsPositiveValue(t *testing.T) {
 	}
 }
 
-// TestClampBufferSize is a pure-function regression test for the fix this
-// was extracted to make possible: negotiateBufferSize used to trust
-// whatever a remote NBD server's advertised maximum block size worked out
-// to, with no ceiling -- letting a misconfigured or buggy server drive an
-// oversized native (cgo) AIO buffer allocation that could abort the whole
+// TestClampBufferSize pins the ceiling negotiateBufferSize applies. Trusting
+// whatever a remote NBD server's advertised maximum block size works out
+// to, with no ceiling, lets a misconfigured or buggy server drive an
+// oversized native (cgo) AIO buffer allocation that can abort the whole
 // process under memory pressure instead of failing cleanly. Needs no
 // qemu-nbd at all.
 func TestClampBufferSize(t *testing.T) {
@@ -935,13 +934,12 @@ func TestClampBufferSize(t *testing.T) {
 	}
 }
 
-// TestNextExtentScanOffset is a pure-function regression test for the bug
-// this was extracted to fix: ChangedExtentsTCP used to advance its scan
-// offset by the REQUESTED chunk size regardless of what the server's
-// BLOCK_STATUS reply actually described, silently dropping any sub-range
-// a server declined to describe (NBD_CMD_BLOCK_STATUS explicitly permits
-// replying with less than requested) and re-describing/duplicating any
-// sub-range a final extent overran into. Needs no qemu-nbd at all, unlike
+// TestNextExtentScanOffset pins how ChangedExtentsTCP advances its scan
+// offset. Advancing by the REQUESTED chunk size regardless of what the
+// server's BLOCK_STATUS reply actually described silently drops any
+// sub-range a server declined to describe (NBD_CMD_BLOCK_STATUS explicitly
+// permits replying with less than requested) and re-describes/duplicates
+// any sub-range a final extent overran into. Needs no qemu-nbd at all, unlike
 // the rest of this file -- see nbd.go's own doc comment on this function.
 func TestNextExtentScanOffset(t *testing.T) {
 	cases := []struct {
@@ -1005,12 +1003,11 @@ func TestNextExtentScanOffset(t *testing.T) {
 	}
 }
 
-// TestIsDirtyExtent is a pure-function regression test for the bug this
-// was extracted to fix: the full-mode (base:allocation) decision used to
-// enumerate the exact currently-known flag combinations (0, 1, 2, 3)
-// instead of masking just the hole bit, so any additional status bit a
-// future or non-qemu NBD server ever set on an otherwise-allocated extent
-// would silently turn it into a skipped one. Needs no qemu-nbd at all.
+// TestIsDirtyExtent pins the full-mode (base:allocation) decision to
+// masking just the hole bit. Enumerating the exact known flag combinations
+// (0, 1, 2, 3) instead means any additional status bit a future or
+// non-qemu NBD server ever sets on an otherwise-allocated extent
+// silently turns it into a skipped one. Needs no qemu-nbd at all.
 func TestIsDirtyExtent(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -1133,12 +1130,12 @@ func TestWaitForTCPExportTimesOutWhenNothingListening(t *testing.T) {
 	if elapsed > 5*time.Second {
 		t.Fatalf("WaitForTCPExport took %s to give up on a 500ms timeout -- looks hung rather than just imprecise", elapsed)
 	}
-	// Regression pin: this used to always return a generic "nbd export not
-	// ready on host:port" message, discarding the real connection failure
-	// (here, a TCP-level refusal, since nothing is listening) every single
-	// iteration. "refused" is what a real connection attempt against a
-	// closed port actually produces -- if this ever regresses back to the
-	// generic message, this substring stops appearing.
+	// Regression pin: a generic "nbd export not ready on host:port" message
+	// discards the real connection failure (here, a TCP-level refusal, since
+	// nothing is listening) on every single iteration. "refused" is what a
+	// real connection attempt against a closed port actually produces -- if
+	// the error ever collapses to the generic message, this substring stops
+	// appearing.
 	if !strings.Contains(strings.ToLower(err.Error()), "refused") {
 		t.Errorf("WaitForTCPExport error = %q, want it to mention the real underlying connection failure (e.g. \"connection refused\"), not just a generic \"not ready\" message", err)
 	}

@@ -182,16 +182,16 @@ func resolveAgentConfig(a AgentFile, mode agentMode, configPath string, once, fo
 
 		// Stated positively in the file, negatively here. The file says what
 		// IS, because "no_schedule": false is a double negative nobody reads
-		// correctly; the code kept its existing names so every call site did
-		// not have to be re-read at the same time as everything else changed.
+		// correctly; the code keeps the negative names its call sites are
+		// written against, and this boundary is the only place the two meet.
 		NoSchedule:  !boolValue(a.Features.Schedule, true),
 		NoAutoFence: !boolValue(a.Features.AutoFence, true),
 
-		// Just the path now. It used to double as the standalone marker --
+		// Just the path. It must not double as the standalone marker --
 		// "this string is non-empty" and "this agent has no control plane"
-		// were the same question -- which stopped being true the moment there
-		// were three modes rather than two. Mode says which agent this is;
-		// this says where a standalone one reads its schedule.
+		// cannot be the same question once there are three modes rather than
+		// two. Mode says which agent this is; this says where a standalone
+		// one reads its schedule.
 		StandaloneFile: a.ScheduleFile,
 	}
 
@@ -405,8 +405,8 @@ func (a AgentFile) withDefaults() AgentFile {
 
 func boolPtr(b bool) *bool { return &b }
 
-// Validate refuses a file that cannot be run, naming the JSON key rather than
-// a flag that no longer exists.
+// Validate refuses a file that cannot be run, naming the JSON key an operator
+// can edit rather than a command-line flag.
 func (a AgentFile) Validate() error {
 	// A hostname ends up in "host:domain" replica entries, and the stored
 	// list is split on commas. A comma splits one entry into two, so the

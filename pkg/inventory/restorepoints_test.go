@@ -77,11 +77,11 @@ func domainIn(t *testing.T, dir, name, source string) Domain {
 
 // Two replicas in one directory must not see each other's restore points.
 //
-// This is the defect CI-06 recorded, at the reporting end of it: this reader
-// used to walk the shared directory, so every co-located domain's points came
-// back as this domain's -- and the control plane then offered another pair's
-// copies as a rollback target for this machine. The only thing that stopped a
-// wrong restore was a check on the target that runs after the operator has
+// This is the reporting end of the shared-store defect recorded as CI-06: a
+// reader that walks the shared directory returns every co-located domain's
+// points as this domain's -- and the control plane then offers another pair's
+// copies as a rollback target for this machine. The only thing that would stop
+// a wrong restore is a check on the target that runs after the operator has
 // already committed to the operation.
 func TestCoLocatedDomainsDoNotSeeEachOthersRestorePoints(t *testing.T) {
 	dir := replicaDir(t)

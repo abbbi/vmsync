@@ -454,13 +454,13 @@ func assessReplication(d Domain, now time.Time, cadence time.Duration) Assessmen
 		return a
 	case libvirtsync.RoleFenced:
 		// A fence that did not stop the domain is CRITICAL, and it is the one
-		// case this branch used to bury. The role is written even when the ACPI
+		// case a bare "fenced" check buries. The role is written even when the ACPI
 		// shutdown fails -- deliberately, because it is the only thing stopping
 		// replication resuming into the split brain -- so "fenced" alone says
 		// nothing about whether the domain actually stopped. Still running means
 		// it is live beside the peer that displaced it and both are taking
 		// writes, which is the worst state in the product; reporting it as an
-		// expected administrative pause is how it stayed invisible.
+		// expected administrative pause is how it stays invisible.
 		//
 		// Same predicate the agent's fence sweep and its gauge use, so the
 		// console and the metrics cannot disagree about which VMs are live twice.

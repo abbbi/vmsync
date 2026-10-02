@@ -136,11 +136,11 @@ func runStandalone(lv *live, reloads *reloader) error {
 func loadStandaloneConfig(path string) (UIConfig, error) {
 	// ScheduleDoc, which has no Operations field.
 	//
-	// This used to decode UIConfig, operations and all -- and runStandalone
-	// starts no operations loop, so an "operations" block in a hand-written
-	// file parsed cleanly, was accepted, and then vanished without a word. An
-	// operator could put one there and watch nothing happen, indefinitely.
-	// Now the strict decoder reports it as an unknown key, by name.
+	// Decoding UIConfig here, operations and all, would let an "operations"
+	// block in a hand-written file parse cleanly, be accepted, and then vanish
+	// without a word -- runStandalone starts no operations loop -- so an
+	// operator could put one there and watch nothing happen, indefinitely. The
+	// strict decoder reports it as an unknown key, by name.
 	doc, err := LoadScheduleFile(path)
 	if err != nil {
 		return UIConfig{}, err
@@ -190,7 +190,7 @@ func validateStandaloneConfig(cfg UIConfig) error {
 		}
 	}
 
-	// Entries are no longer the only way to say what to sync: a "default"
+	// Entries are not the only way to say what to sync: a "default"
 	// template covers every VM whose domain records replica_targets, so a
 	// file carrying templates and no entries at all is a legitimate and
 	// rather tidy way to run an estate. Without a default, though, this file

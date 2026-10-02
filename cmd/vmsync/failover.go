@@ -934,8 +934,8 @@ func runInvert(ctx context.Context, cfg syncConfig) (runErr error) {
 		return fmt.Errorf("make %s a replication target: %w", cfg.SourceDomain, err)
 	}
 
-	// Now it is recorded, turn the flag itself off. A replica must not boot,
-	// and this is the exact path that used to leave one that would: the host
+	// With the intent recorded, turn the flag itself off. A replica must not
+	// boot, and this is the exact path that would leave one that does: the host
 	// reboots, libvirt starts the demoted domain, and a second copy of the VM
 	// is live with the same MAC and identity as the one that replaced it.
 	//

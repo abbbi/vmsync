@@ -308,10 +308,9 @@ type ReportDomain struct {
 	//
 	// The half of the picture metadata alone cannot supply.
 	//
-	// It used to be both halves: a fence that worked left a domain merely
-	// `paused`, indistinguishable from one an operator had paused
-	// deliberately, so this was the only way to tell them apart. The `fenced`
-	// role now says that much directly.
+	// Not both halves: the `fenced` role says directly that a fence was acted
+	// on, which a domain left merely `paused` cannot -- that is
+	// indistinguishable from one an operator paused deliberately.
 	//
 	// What remains is the part no role can carry: whether the fence actually
 	// WORKED. `fenced` is recorded either way -- deliberately, since a fence
