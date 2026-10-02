@@ -363,6 +363,13 @@ an orphan. It needs a RUNNING source, and it repeats the sequence while PAUSED b
 that is the state -reinit -start leaves a source in. It plants vmsync-cpt-099001, far
 outside any real chain, and if it cannot clear it again it says so at WARNING with the
 exact qemu-img command and the fact that -reinit will refuse until somebody runs it.
+Every step logs what virsh and qemu-img actually said before any verdict is read from
+it, and a check whose evidence is unreadable on the host is recorded SKIP rather than
+passed -- on a host where qemu-img reports no bitmaps for an image qemu holds open,
+"the bitmap is gone" and "it was never visible" read identically. Set the environment
+variable PROBE_MAY_STOP_SOURCE=yes to let the stage settle those by shutting the source
+down for the confirming read (the adopt and the delete still run against a RUNNING
+domain, which is the part under test); it stops and starts the source up to twice.
 EOF
 }
 
@@ -8162,10 +8169,20 @@ stage_redefine_probe() {
 	# checkpoint normally so qemu removes the bitmap through its own path. Whether
 	# libvirt accepts a redefine whose XML vmsync built by hand, and whether the
 	# delete then actually takes the bitmap away, is unverifiable without hardware.
+	#
+	# Every step prints what libvirt and qemu-img said before any verdict is
+	# derived from it, and a check whose evidence is unreadable on this host is
+	# recorded SKIP rather than passed. The first run of this stage reported only
+	# "the fixture did not appear", which named neither of the two very different
+	# causes; the discriminator below ("visible in the live image") is what tells
+	# them apart, and is a finding in its own right -- vmsync's orphan audit
+	# reads bitmaps the same way, so a no there means the audit is blind exactly
+	# where it is needed.
 
 	if [ "$DRY_RUN" = yes ]; then
 		log "   (would plant an orphan bitmap on $SOURCE_DOMAIN and try to adopt it)"
 		fo_check "$sc" "qemu-img cannot write a live image" 0
+		fo_check "$sc" "a checkpoint's bitmap is visible in the live image" 0
 		fo_check "$sc" "a metadata-only delete leaves the bitmap behind" 0
 		fo_check "$sc" "redefine from libvirt's own dumped xml is accepted" 0
 		fo_check "$sc" "redefine from a hand-built xml is accepted" 0
@@ -8214,6 +8231,54 @@ stage_redefine_probe() {
 		virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>/dev/null | grep -qx "$1"
 	}
 
+	# raw_bitmaps prints every bitmap name qemu-img reports, or says plainly that
+	# it reported none, so every verdict below has its evidence beside it in the
+	# log. A probe that only says PASS or FAIL cannot be acted on when the answer
+	# is surprising, and the answers here are expected to be surprising.
+	raw_bitmaps() {
+		local j
+		j="$(run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" \
+			"qemu-img info -U --output=json -f qcow2 '$active' 2>&1" 2>&1 | tr -d ' \n')"
+		case "$j" in
+		*'"bitmaps"'*)
+			printf '%s' "$j" | grep -oE '"name":"[^"]*"' | sed 's/"name":"//; s/"$//' | tr '\n' ' '
+			;;
+		*) printf 'no bitmaps array in qemu-img output' ;;
+		esac
+	}
+
+	# settle_stopped NAME -> 0 when NAME is in the image with the domain shut
+	# off, 1 when it genuinely is not there, 2 when the question was not asked
+	# (the operator has not allowed stopping this domain, or it would not stop).
+	#
+	# The last resort on a host where qemu-img reports no bitmaps at all while
+	# qemu holds the image: with the domain down the file is readable, so
+	# "invisible or absent" has an answer. It stops and restarts a source, which
+	# is a real intervention, so it happens only on PROBE_MAY_STOP_SOURCE=yes --
+	# and then twice, once to confirm the orphan and once to confirm it went.
+	settle_stopped() {
+		if [ "${PROBE_MAY_STOP_SOURCE:-no}" != yes ]; then
+			return 2
+		fi
+		log "   PROBE_MAY_STOP_SOURCE=yes: shutting $SOURCE_DOMAIN down to read $active directly"
+		virsh_uri "$SOURCE_URI" shutdown "$SOURCE_DOMAIN" >/dev/null 2>&1 || true
+		local i=0
+		while [ "$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN")" != "shut off" ] && [ $i -lt 120 ]; do
+			sleep 1
+			i=$((i + 1))
+		done
+		if [ "$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN")" != "shut off" ]; then
+			warn "$SOURCE_DOMAIN did not shut down within 120s, so $active could not be read directly"
+			return 2
+		fi
+		log "     qemu-img bitmaps with the domain SHUT OFF: $(raw_bitmaps)"
+		local found=1
+		bitmap_present "$1" && found=0
+		virsh_uri "$SOURCE_URI" start "$SOURCE_DOMAIN" >/dev/null 2>&1 || \
+			warn "could not restart $SOURCE_DOMAIN -- start it by hand ('virsh -c $SOURCE_URI start $SOURCE_DOMAIN')"
+		return "$found"
+	}
+
 	# Refuse to start if something of that name is already there: the stage would
 	# otherwise destroy state it did not create.
 	if bitmap_present "$probe" || cp_listed "$probe"; then
@@ -8230,6 +8295,12 @@ stage_redefine_probe() {
 			# prevent and the stage has just manufactured one.
 			warn "stage 22 LEFT $probe IN $active on $SOURCE_HOST. Nothing here can remove it while the domain runs -- that is the finding. To clear it: shut $SOURCE_DOMAIN down, then 'qemu-img bitmap --remove -f qcow2 $active $probe'. Until then a -reinit of this pair will refuse, naming this bitmap."
 			results_row "$CSV" "$sc" cleanup 1 "" "" "" "" "" "FAIL left $probe behind"
+		elif [ "${visible_live:-}" = no ]; then
+			# A silent clean exit here would be a lie: on this host a leftover
+			# bitmap looks exactly like no bitmap, so the stage cannot certify
+			# that it took its fixture away again.
+			warn "stage 22 cannot confirm it cleaned up: bitmaps in $active are not readable while $SOURCE_DOMAIN runs on $SOURCE_HOST. Check with the domain shut off ('qemu-img info --output=json -f qcow2 $active') and remove $probe by hand if it is there."
+			results_row "$CSV" "$sc" cleanup SKIP "" "" "" "" "" "SKIP cleanup unverifiable while live"
 		fi
 	}
 
@@ -8255,6 +8326,13 @@ stage_redefine_probe() {
 	# create, dump the xml, then delete METADATA_ONLY. That is precisely the
 	# sequence vmsync's own DeleteCheckpointIfExists documents as the orphan
 	# factory, so the fixture is the real defect rather than an approximation.
+	#
+	# Evidence first, verdict second. The interesting failure here is not "the
+	# fixture did not appear" but WHICH of two very different things happened:
+	# libvirt created no bitmap at all, or it created one that qemu-img cannot
+	# see while qemu holds the image. The second would mean vmsync's own orphan
+	# audit is blind on a running source, since it reads bitmaps exactly this
+	# way -- a bigger finding than the one this stage set out to test.
 	local xml="$RUN_DIR/${sc}.checkpoint.xml"
 	cat > "$xml" <<XML
 <domaincheckpoint>
@@ -8264,28 +8342,93 @@ stage_redefine_probe() {
   </disks>
 </domaincheckpoint>
 XML
-	if ! virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$xml" >/dev/null 2>&1; then
-		warn "SKIP stage 22: could not create a checkpoint on $SOURCE_DOMAIN, so no orphan can be manufactured. Does this libvirt/qemu support checkpoints (libvirt >= 5.6, qemu >= 4.2)?"
+	out="$(virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$xml" 2>&1)" && rc=0 || rc=$?
+	if [ "$rc" != 0 ]; then
+		warn "SKIP stage 22: checkpoint-create failed on $SOURCE_DOMAIN: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200). Does this libvirt/qemu support checkpoints (libvirt >= 5.6, qemu >= 4.2)?"
 		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP checkpoint-create failed"
 		probe_cleanup
 		return 0
 	fi
-	# libvirt's own description of the checkpoint it just made, which is the
-	# easy-case input for P3a.
+
+	# Taken while the checkpoint still exists, because P3a needs libvirt's own
+	# description of it and after the --metadata delete below there is nowhere
+	# left to get one -- that absence is exactly what makes an orphan an orphan.
 	local dumped="$RUN_DIR/${sc}.dumped.xml"
 	virsh_uri "$SOURCE_URI" checkpoint-dumpxml "$SOURCE_DOMAIN" "$probe" > "$dumped" 2>/dev/null || true
 
-	virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" --metadata >/dev/null 2>&1 || true
-	if bitmap_present "$probe" && ! cp_listed "$probe"; then
-		fo_check "$sc" "a metadata-only delete leaves the bitmap behind" 0
-	else
-		fo_check "$sc" "a metadata-only delete leaves the bitmap behind" 1 \
-			"bitmap_present=$(bitmap_present "$probe" && echo yes || echo no) cp_listed=$(cp_listed "$probe" && echo yes || echo no). The orphan fixture was not produced, so nothing below is testing what it claims"
+	# What each side says it has, right now, verbatim. These lines are the
+	# stage's real output: every verdict below is derived from them, so when a
+	# verdict is surprising the evidence for it is already in the log.
+	log "   EVIDENCE after checkpoint-create:"
+	log "     virsh checkpoint-list --name: $(virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>&1 | tr '\n' ' ' | cut -c1-200)"
+	log "     qemu-img bitmaps in the LIVE image: $(raw_bitmaps)"
+	log "     virsh checkpoint-dumpxml: $(tr -d '\n' < "$dumped" | tr -s ' ' | cut -c1-300)"
+
+	if ! cp_listed "$probe"; then
+		warn "SKIP stage 22: checkpoint-create returned success but $probe is not in checkpoint-list, so there is nothing to orphan. That is a libvirt-side question rather than the one this stage asks."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP checkpoint not listed after create"
 		probe_cleanup
 		return 0
 	fi
-	log "   orphan manufactured: $probe is in $active with no libvirt checkpoint"
 
+	# THE discriminator, and a finding in its own right either way.
+	#
+	# orphan_proven carries what is known about the FIXTURE from here to P4,
+	# which cannot interpret its own reading without it: on a host where the
+	# bitmap is unreadable while live, "not there now" means the delete worked
+	# only if something was there to begin with. Without this the stage reports
+	# the adopt route working on a host that never made a bitmap at all.
+	local visible_live=no orphan_proven=unknown
+	bitmap_present "$probe" && visible_live=yes
+	[ "$visible_live" = yes ] && orphan_proven=yes
+	if [ "$visible_live" = yes ]; then
+		fo_check "$sc" "a checkpoint's bitmap is visible in the live image" 0
+	else
+		fo_check "$sc" "a checkpoint's bitmap is visible in the live image" 1 \
+			"libvirt made the checkpoint but qemu-img cannot see its bitmap while $SOURCE_DOMAIN runs. vmsync's own orphan audit reads bitmaps exactly this way (cmd/vmsync/bitmaps.go via disk.BitmapNames), so on a running source that audit sees nothing -- it cannot detect the orphan it exists to refuse on, and the \"Bitmap already exists\" failure comes from qemu's own state instead. Set PROBE_MAY_STOP_SOURCE=yes to have this stage shut the domain down and settle whether the bitmap is merely INVISIBLE or genuinely ABSENT"
+	fi
+
+	virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" --metadata >/dev/null 2>&1 || true
+	log "   EVIDENCE after checkpoint-delete --metadata:"
+	log "     virsh checkpoint-list --name: $(virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>&1 | tr '\n' ' ' | cut -c1-200)"
+	log "     qemu-img bitmaps in the LIVE image: $(raw_bitmaps)"
+
+	if ! cp_listed "$probe" && [ "$visible_live" = yes ]; then
+		fo_check "$sc" "a metadata-only delete leaves the bitmap behind" 0
+		log "   orphan manufactured: $probe is in $active with no libvirt checkpoint"
+	elif ! cp_listed "$probe"; then
+		# The record is gone, which is half the fixture. Whether a bitmap
+		# survives is exactly what cannot be established from here, so this is
+		# recorded as unproven rather than as a pass or a failure.
+		log "   NOTE: the checkpoint record is gone; whether a bitmap survives cannot be read from a live image on this host"
+		results_row "$CSV" "$sc" a_metadata_only_delete_leaves_the_bitmap_behind SKIP "" "" "" "" "" "SKIP bitmap not readable while live"
+	else
+		fo_check "$sc" "a metadata-only delete leaves the bitmap behind" 1 \
+			"the checkpoint is still listed after a --metadata delete, so the orphan factory did not run"
+		probe_cleanup
+		return 0
+	fi
+
+	# Settle invisible-versus-absent. Nothing else in this stage can tell those
+	# two apart and they lead to opposite conclusions: one says the orphan is
+	# real and vmsync's audit cannot see it, the other says there is no orphan.
+	local settled=
+	if [ "$visible_live" != yes ]; then
+		settle_stopped "$probe" && settled=0 || settled=$?
+		case "$settled" in
+		0)
+			orphan_proven=yes
+			fo_check "$sc" "the bitmap was present all along, merely invisible while live" 0
+			log "   FINDING: the bitmap IS in the image; qemu-img just cannot report it while qemu holds the file. vmsync's audit therefore needs a different source of truth on a running domain -- libvirt's checkpoint list, or qemu via libvirt -- not qemu-img"
+			;;
+		1)
+			orphan_proven=no
+			fo_check "$sc" "the bitmap was present all along, merely invisible while live" 1 \
+				"with the domain shut off the bitmap is still not in $active, so libvirt's checkpoint-create did not persist one at all and the orphan this stage tried to build does not exist"
+			;;
+		*) log "   set PROBE_MAY_STOP_SOURCE=yes to settle whether that bitmap is invisible or absent (it stops and restarts $SOURCE_DOMAIN)" ;;
+		esac
+	fi
 	# --- P3a. redefine from libvirt's own dumped xml ------------------------
 	if [ -s "$dumped" ] && virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$dumped" --redefine >/dev/null 2>&1 && cp_listed "$probe"; then
 		fo_check "$sc" "redefine from libvirt's own dumped xml is accepted" 0
@@ -8324,7 +8467,44 @@ XML
 
 	# --- P4. does deleting the adopted checkpoint remove the bitmap? --------
 	out="$(virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" 2>&1)" && rc=0 || rc=$?
-	if [ "$rc" = 0 ] && ! bitmap_present "$probe" && ! cp_listed "$probe"; then
+	log "   EVIDENCE after deleting the adopted checkpoint: exit $rc, bitmaps: $(raw_bitmaps)"
+	if [ "$visible_live" != yes ]; then
+		# "the bitmap is gone" cannot be read from a live image on this host, so
+		# asserting it from a live read would pass for the wrong reason -- it was
+		# never visible. The adopt-then-delete itself still happened on a running
+		# domain, which is the part that had to be proven; only the confirming
+		# READ needs the domain down, and that is what settle_stopped is for.
+		if [ "$rc" = 0 ] && ! cp_listed "$probe" && [ "$orphan_proven" = yes ]; then
+			log "   libvirt accepted the delete of the adopted checkpoint; the bitmap half needs a read with the domain down"
+			settle_stopped "$probe" && settled=0 || settled=$?
+			case "$settled" in
+			1)
+				fo_check "$sc" "deleting the adopted checkpoint removes the bitmap" 0
+				log "   ADOPT ROUTE WORKS: the adopt and the delete both ran against a RUNNING domain and the bitmap is gone from $active"
+				;;
+			0)
+				fo_check "$sc" "deleting the adopted checkpoint removes the bitmap" 1 \
+					"libvirt accepted both the redefine and the delete, but with the domain shut off $probe is still in $active -- the adopt route clears libvirt's record and leaves the bitmap, which is the same orphan it set out to remove"
+				;;
+			*)
+				log "   whether the bitmap went with it is not readable while the domain runs; PROBE_MAY_STOP_SOURCE=yes settles it"
+				results_row "$CSV" "$sc" deleting_the_adopted_checkpoint_removes_the_bitmap SKIP "" "" "" "" "" "SKIP bitmap not readable while live"
+				;;
+			esac
+		elif [ "$rc" = 0 ] && ! cp_listed "$probe"; then
+			# libvirt took the delete, but no bitmap was ever shown to exist, so
+			# a later read finding none would mean nothing. Reading "gone" off an
+			# orphan that was never there is how this check passed on a host
+			# where the fixture had failed.
+			log "   libvirt accepted the delete of the adopted checkpoint, but no bitmap was ever shown to exist (orphan_proven=$orphan_proven), so its removal cannot be claimed"
+			results_row "$CSV" "$sc" deleting_the_adopted_checkpoint_removes_the_bitmap SKIP "" "" "" "" "" "SKIP no bitmap proven to remove"
+		else
+			fo_check "$sc" "deleting the adopted checkpoint removes the bitmap" 1 \
+				"exit $rc, still listed=$(cp_listed "$probe" && echo yes || echo no): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200). Either libvirt will not delete a checkpoint it has just accepted a redefine for, or there was no bitmap to delete and the redefine was taken on description alone -- which of the two cannot be told apart from here, since the bitmap was never readable. PROBE_MAY_STOP_SOURCE=yes settles it"
+			probe_cleanup
+			return 0
+		fi
+	elif [ "$rc" = 0 ] && ! bitmap_present "$probe" && ! cp_listed "$probe"; then
 		fo_check "$sc" "deleting the adopted checkpoint removes the bitmap" 0
 		log "   ADOPT ROUTE WORKS on a running domain: the bitmap is gone from $active"
 	else
@@ -8340,16 +8520,30 @@ XML
 	# the paused case is the maintainer's exact failing scenario rather than a
 	# variation on it.
 	if virsh_uri "$SOURCE_URI" suspend "$SOURCE_DOMAIN" >/dev/null 2>&1; then
+		# Step by step rather than one chained condition, because a paused qemu
+		# still holds the image: when the bitmap is unreadable the chain would
+		# break at the first link and report "paused does not work" when what
+		# actually happened is "this host cannot see the bitmap either way".
+		local p_adopt=1 p_del=1
 		virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$xml" >/dev/null 2>&1 || true
 		virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" --metadata >/dev/null 2>&1 || true
-		if bitmap_present "$probe" &&
-			virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$built" --redefine >/dev/null 2>&1 &&
-			virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" >/dev/null 2>&1 &&
-			! bitmap_present "$probe"; then
+		if virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$built" --redefine >/dev/null 2>&1; then
+			p_adopt=0
+			if virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" >/dev/null 2>&1; then
+				p_del=0
+			fi
+		fi
+		log "   EVIDENCE while PAUSED: redefine accepted=$p_adopt, delete accepted=$p_del (0 = accepted), bitmaps: $(raw_bitmaps)"
+		if [ "$visible_live" != yes ]; then
+			# Same reason as P4: the disappearance half of this cannot be read,
+			# so only libvirt's acceptance is recorded, and not as a pass.
+			log "   libvirt's half of the paused sequence: redefine=$p_adopt delete=$p_del (0 = accepted); the bitmap half is not readable while qemu holds the image (orphan_proven=$orphan_proven)"
+			results_row "$CSV" "$sc" the_same_works_while_the_domain_is_paused SKIP "" "" "" "" "" "SKIP bitmap not readable while paused"
+		elif [ "$p_del" = 0 ] && ! bitmap_present "$probe"; then
 			fo_check "$sc" "the same works while the domain is paused" 0
 		else
 			fo_check "$sc" "the same works while the domain is paused" 1 \
-				"the adopt-then-delete sequence did not clear $probe while $SOURCE_DOMAIN was paused -- which is the state -reinit -start puts a source into"
+				"the adopt-then-delete sequence did not clear $probe while $SOURCE_DOMAIN was paused (redefine accepted=$p_adopt, delete accepted=$p_del, 0 = accepted) -- and paused is the state -reinit -start puts a source into"
 		fi
 		virsh_uri "$SOURCE_URI" resume "$SOURCE_DOMAIN" >/dev/null 2>&1 || \
 			warn "could not resume $SOURCE_DOMAIN after the paused probe -- resume it by hand ('virsh -c $SOURCE_URI resume $SOURCE_DOMAIN')"
@@ -8359,7 +8553,7 @@ XML
 	fi
 
 	probe_cleanup
-	unset -f bitmap_present cp_listed probe_cleanup
+	unset -f bitmap_present cp_listed raw_bitmaps settle_stopped probe_cleanup
 	return 0
 }
 

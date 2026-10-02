@@ -346,4 +346,5 @@ RESULT_DIR=./results
 # replicate itself into skynet and take over the world.
 # Only run this if you fully understand it's implications.
 
+PROBE_MAY_STOP_SOURCE=no
 I_UNDERSTAND_THIS_IS_DESTRUCTIVE=no
