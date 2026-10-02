@@ -4323,6 +4323,51 @@ func run(cfg syncConfig) (runErr error) {
 			return err
 		}
 
+		// What vmsync-named bitmaps the source's images carry BEFORE anything is
+		// armed, undefined or dropped.
+		//
+		// Read here because it is readable here: the bitmaps are in the qcow2
+		// headers and need nothing this block has not already done. A bitmap
+		// with no libvirt checkpoint behind it is an orphan, and the next
+		// sync's chain would restart at a name it already holds -- qemu then
+		// refuses with "Bitmap already exists: vmsync-cpt-000001" and every
+		// later sync for the pair fails the same way.
+		//
+		// Taken before the drop rather than only after it so the set can be
+		// compared against what libvirt knew, and so a run that cannot proceed
+		// says so while the replica and the source's baseline are both still
+		// intact. Failing to RUN the check is not evidence of anything, so it
+		// warns and the run continues to the post-drop audit below.
+		preDropBitmaps, preDropErr := leftoverCheckpointBitmaps(ctx, sourceNeedsSSH, sourceSSHClient, qcowDisks)
+		if preDropErr != nil {
+			trace.Warning("could not read the source's disks for vmsync checkpoint bitmaps before starting the rebuild; an orphaned bitmap would be caught after the chain drop instead, which is later than it needs to be",
+				"vm", cfg.SourceDomain, "error", preDropErr)
+		} else if len(preDropBitmaps) > 0 {
+			known, knownErr := libvirtsync.ListManagedCheckpoints(srcDom)
+			srcActive, activeErr := libvirtsync.DomainActive(srcDom)
+			switch {
+			case knownErr != nil || activeErr != nil:
+				trace.Warning("could not tell whether the source's vmsync bitmaps are orphaned before starting the rebuild; the audit after the chain drop will catch it instead",
+					"vm", cfg.SourceDomain, "checkpoints_error", knownErr, "state_error", activeErr)
+			case len(orphanBitmaps(preDropBitmaps, known)) == 0:
+				// Every bitmap has a checkpoint behind it, so the drop below
+				// removes all of them through qemu.
+			case !srcActive:
+				// The offline half of the drop reads the bitmaps out of the
+				// images and removes them whether or not libvirt lists them, so
+				// an orphan on a stopped source is cleared a few lines below.
+			default:
+				// Refused HERE, which is the whole point of reading the bitmaps
+				// this early. qemu holds these images open, so neither qemu-img
+				// nor the drop below can take an orphan away, and the audit
+				// after the drop would refuse the same run having already armed
+				// replica_incomplete, undefined the target under -force-clean,
+				// and discarded the source's baseline. Nothing is touched yet.
+				return fmt.Errorf("refusing to rebuild %s: %w", cfg.SourceDomain,
+					leftoverBitmapRefusal(cfg.SourceDomain, orphanBitmaps(preDropBitmaps, known)))
+			}
+		}
+
 		// THEN arm, before anything below has displaced or deleted a single
 		// thing: before -force-clean removes the target definition, before
 		// the block jobs are aborted, before the checkpoint chain is dropped,

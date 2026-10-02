@@ -106,6 +106,8 @@ vmsync itself to work at all).
 ./bench.sh --stages colocated    # 18 opt-in: two target domains sharing one replica directory
 ./bench.sh --stages leftovers    # 19 opt-in: displaced sets reported, reclaimed only when asked
 ./bench.sh --stages reinit-order # 20 opt-in: a refused reinit destroyed nothing; STARTS THE TARGET (paused)
+./bench.sh --stages lock-lease   # 21 opt-in: a dead driver must not keep the target's run lock
+./bench.sh --stages redefine-probe # 22 PROBE: can libvirt clear an orphaned bitmap on a live domain?
 ```
 
 Stages 2, 3, 4, 9, 10 and 11 each run their own baseline `-reinit` full
@@ -1297,14 +1299,14 @@ on either host. Needs the target domain to exist; skips cleanly, saying which, i
 it is absent, if the replica will not boot on the DR host, or if the source has no
 checkpoint for the assertions to protect.
 
-The running-target check used to sit ~85 lines *after* the source's checkpoint
-chain was dropped. So the most ordinary way for a reinit not to go through —
-somebody forgot to shut the replica down — cost three things, and each is a
-sub-test:
+The running-target check runs before anything is armed, undefined or discarded.
+If it sat after any of those, the most ordinary way for a reinit not to go
+through — somebody forgot to shut the replica down — would cost three things,
+and each is a sub-test:
 
 | sub-test | what it would catch |
 | --- | --- |
-| `-reinit` / `-force-clean` over a running target is refused | the guard itself. It passed before the reorder too: the old code did refuse, just too late, which is why the three below are the ones that matter |
+| `-reinit` / `-force-clean` over a running target is refused | the guard itself. A guard in the wrong place still refuses, which is why the three below are the ones that matter |
 | the refused run left the source's checkpoint chain intact | **a full recopy of the whole machine**, for a typo. The chain was dropped before the check, so the next sync had no baseline to diff against |
 | the refused run did not arm `replica_incomplete` | a target the run never touched left carrying a record that refuses every later promotion until some sync clears it |
 | the refused `-force-clean` left the target domain defined | the sharpest one. `forceCleanTargetDomain` ran first, and `DomainExists` uses `LookupDomainByName`, which still finds a **running** domain after its definition is gone — so the guard fired one step too late and left the replica as a transient domain with no persistent definition at all |
@@ -1318,6 +1320,63 @@ are written even though nothing else is; the stage finishes with a `-reinit` to
 leave a freshly written replica. If a sub-test fails in the way 20f describes, the
 target is transient by then and destroying it removes the domain outright — the
 stage says so at WARNING and the final `-reinit` defines it again from the source.
+
+### Stage 21 (`lock-lease`), opt-in
+
+Proves the target stops holding its run lock for a driver that is no longer there
+— CI-10, and a launch blocker. Needs `TARGET_HOST`; skips cleanly saying which if
+that, the helper, or a stallable sync is missing.
+
+**`SIGSTOP`, not `SIGKILL`, and that is the whole stage.** Killing a process
+closes its sockets, so the target receives a FIN and drops the lock promptly —
+the case that always worked. A *stopped* process keeps every socket open and sends
+nothing, which is precisely what a partitioned or powered-off host looks like from
+the target: no heartbeat, and no FIN either. It needs no firewall rule, touches no
+routing, and is reversible with one signal.
+
+| sub-test | what it would catch |
+| --- | --- |
+| a leased lock is taken when the helper is there | that the leased half is being tested at all, rather than silently falling back and asserting nothing |
+| a silent driver still holds the lock before the lease is up | **a lock that goes early**, which can be handed to a promotion while the driver is still writing to the replica — worse than the defect being fixed |
+| the target releases a leased lock once the driver goes silent | CI-10 itself: without it, `-promote` and `-restore` on the target stay blocked until sshd expires the session |
+| an unleased lock is still held long after the lease | that the leased result above is really the lease's doing. It also makes the WARNING every unleased run prints worth trusting, by showing the consequence it names is real |
+| `-break-target-lock` refuses a lock it cannot attribute | the escape refusing correctly. A shell lock records no holder, so nothing can prove its holder is gone, and breaking it anyway is how two writers end up on one replica |
+| the resumed driver refuses to commit after losing its lock | the other half of the defect. By the time it resumes the lock may belong to a promotion, so committing into those disks would corrupt what the promoted guest wrote |
+
+The lease is shortened with `-remote-lock-lease 10s` so the stage takes seconds
+rather than minutes; what is under test is the mechanism, not the 90-second
+default. Both stalled runs are killed mid-copy, so the stage ends with a `-reinit`
+to leave a complete replica.
+
+### Stage 22 (`redefine-probe`) — a probe, not a test
+
+The only stage here that grades **libvirt** rather than vmsync. vmsync implements
+none of what it exercises: the stage asks whether a thing *can* be implemented, so
+its answer decides a design rather than grading one. Needs a **running** source,
+plus `SOURCE_HOST` and `TAMPER_DISK_DEV`.
+
+**The question.** `-reinit` cannot clear a `vmsync-cpt-*` bitmap that libvirt holds
+no checkpoint for while the source is running: qemu has the image open, so
+`qemu-img` cannot write it, and libvirt's delete only walks checkpoints it knows
+about. The proposed way out is to **adopt** the orphan — redefine checkpoint
+metadata naming the existing bitmap, then delete that checkpoint so *qemu* removes
+the bitmap through its own path, with no `qemu-img` anywhere.
+
+| check | what the answer decides |
+| --- | --- |
+| qemu-img cannot write a live image | the premise of the whole design. If this *passes*, the simple fix was available all along and the rest is moot — so it is worth knowing either way |
+| a metadata-only delete leaves the bitmap behind | that the fixture is the real defect rather than an approximation of it. This is the documented orphan factory, and if it does not produce one, nothing below tests what it claims |
+| redefine from libvirt's own dumped xml is accepted | the mechanism, in its easiest form. A failure here means the adopt route does not exist on this libvirt at all |
+| **redefine from a hand-built xml is accepted** | **the check the stage exists for.** A real orphan has no dumped xml anywhere — that is what makes it an orphan — so vmsync would have to construct the metadata from the bitmap name and the disk it sits on. If this fails while the one above passes, the route only works where the metadata was never actually lost, which is not the reported case |
+| deleting the adopted checkpoint removes the bitmap | the other half. Adoption succeeding proves nothing if the delete leaves the bitmap where it was |
+| the same works while the domain is paused | `-reinit -start` brings a shut-off source up **paused** before the chain drop, so this is the reported failing case rather than a variation on it |
+
+It plants `vmsync-cpt-099001` — a name that satisfies vmsync's own prefix test so
+the probe exercises the same classification, but far outside any real chain. If it
+cannot clear that again it says so at **WARNING** with the exact `qemu-img` command
+and the fact that `-reinit` will refuse until somebody runs it. It refuses to start
+at all if a bitmap or checkpoint of that name already exists, rather than destroying
+state it did not create.
 
 ## Files
 

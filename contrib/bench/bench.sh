@@ -347,6 +347,22 @@ asserts the opposite: an unleased lock is still held long afterwards, and
 Both halves matter -- the second is what makes the WARNING every unleased run
 prints worth trusting. Finally it resumes the stalled driver and checks it refuses
 to commit, since by then the lock may belong to a promotion.
+
+Stage 22 (redefine-probe) is a PROBE, not a test, and it is the only stage here that
+grades libvirt rather than vmsync. vmsync implements none of what it exercises; the
+stage asks whether it CAN be implemented, so its answer decides a design. The question:
+-reinit cannot clear a vmsync-cpt-* bitmap that libvirt holds no checkpoint for while
+the source is running, because qemu has the image open and qemu-img cannot write it. The
+proposed way out is to ADOPT the orphan -- redefine checkpoint metadata naming the
+existing bitmap, then delete that checkpoint so qemu removes the bitmap through its own
+path. The stage manufactures a real orphan the way reality does (create a checkpoint,
+then delete it --metadata, which is the documented orphan factory), then tries to adopt
+it both from libvirt's own dumped xml and from an xml built by hand. The hand-built case
+is the one that matters: a real orphan has no dumped xml anywhere, which is what makes it
+an orphan. It needs a RUNNING source, and it repeats the sequence while PAUSED because
+that is the state -reinit -start leaves a source in. It plants vmsync-cpt-099001, far
+outside any real chain, and if it cannot clear it again it says so at WARNING with the
+exact qemu-img command and the fact that -reinit will refuse until somebody runs it.
 EOF
 }
 
@@ -8129,6 +8145,224 @@ stage_lock_lease() {
 	return 0
 }
 
+stage_redefine_probe() {
+	log "=== Stage 22: PROBE -- can libvirt remove an orphaned bitmap on a LIVE domain? ==="
+	local sc=redefine-probe
+	local fo_ok=0
+
+	# A PROBE, not a test of vmsync. vmsync does not implement any of this yet;
+	# the stage asks libvirt and qemu directly whether it CAN be implemented, so
+	# the answer decides a design rather than grading one. Every check therefore
+	# reports what happened even when it is not what was hoped for.
+	#
+	# The question: -reinit cannot clear a vmsync-cpt-* bitmap that libvirt has no
+	# checkpoint for while the source is running, because qemu holds the image and
+	# qemu-img cannot write it. The proposed way out is to ADOPT the orphan --
+	# redefine checkpoint metadata naming the existing bitmap, then delete that
+	# checkpoint normally so qemu removes the bitmap through its own path. Whether
+	# libvirt accepts a redefine whose XML vmsync built by hand, and whether the
+	# delete then actually takes the bitmap away, is unverifiable without hardware.
+
+	if [ "$DRY_RUN" = yes ]; then
+		log "   (would plant an orphan bitmap on $SOURCE_DOMAIN and try to adopt it)"
+		fo_check "$sc" "qemu-img cannot write a live image" 0
+		fo_check "$sc" "a metadata-only delete leaves the bitmap behind" 0
+		fo_check "$sc" "redefine from libvirt's own dumped xml is accepted" 0
+		fo_check "$sc" "redefine from a hand-built xml is accepted" 0
+		fo_check "$sc" "deleting the adopted checkpoint removes the bitmap" 0
+		fo_check "$sc" "the same works while the domain is paused" 0
+		return 0
+	fi
+
+	if [ -z "${SOURCE_HOST:-}" ] || [ -z "${TAMPER_DISK_DEV:-}" ]; then
+		warn "SKIP stage 22: needs SOURCE_HOST and TAMPER_DISK_DEV in $CONF -- it inspects the source's own image file."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP SOURCE_HOST/TAMPER_DISK_DEV unset"
+		return 0
+	fi
+	if [ "$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN")" != "running" ]; then
+		warn "SKIP stage 22: $SOURCE_DOMAIN is not running, and the whole question is what can be done while qemu holds the image. Start it and re-run."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP source not running"
+		return 0
+	fi
+
+	local active
+	active="$(disk_source_path "$SOURCE_URI" "$SOURCE_DOMAIN" "$TAMPER_DISK_DEV")" || true
+	if [ -z "$active" ]; then
+		warn "SKIP stage 22: could not resolve $SOURCE_DOMAIN's active path for dev='$TAMPER_DISK_DEV'."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP source disk path unresolved"
+		return 0
+	fi
+	log "   probing against $SOURCE_DOMAIN dev=$TAMPER_DISK_DEV path=$active on $SOURCE_HOST"
+
+	# A name that satisfies vmsync's own IsManagedCheckpointName prefix test, so
+	# the probe exercises the same classification the engine would -- but far
+	# outside the range a real chain counts into, so it cannot be mistaken for
+	# one and is obvious in any leftover state.
+	local probe=vmsync-cpt-099001
+
+	# bitmap_present -> 0 when the active image carries $1.
+	#
+	# -U on the read, which is the documented way to inspect an image another
+	# process has open. It is NOT used on any write below: whether a write is
+	# refused is the first thing being probed.
+	bitmap_present() {
+		run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" \
+			"qemu-img info -U --output=json -f qcow2 '$active' 2>/dev/null" 2>/dev/null \
+			| tr -d ' \n' | grep -q "\"name\":\"$1\""
+	}
+	cp_listed() {
+		virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>/dev/null | grep -qx "$1"
+	}
+
+	# Refuse to start if something of that name is already there: the stage would
+	# otherwise destroy state it did not create.
+	if bitmap_present "$probe" || cp_listed "$probe"; then
+		warn "SKIP stage 22: $probe already exists on $SOURCE_DOMAIN (bitmap or checkpoint). This stage will not touch state it did not create. Remove it by hand first."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP probe name already present"
+		return 0
+	fi
+
+	probe_cleanup() {
+		virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" >/dev/null 2>&1 \
+			|| virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" --metadata >/dev/null 2>&1 || true
+		if bitmap_present "$probe"; then
+			# Said loudly, because this is the state the whole feature exists to
+			# prevent and the stage has just manufactured one.
+			warn "stage 22 LEFT $probe IN $active on $SOURCE_HOST. Nothing here can remove it while the domain runs -- that is the finding. To clear it: shut $SOURCE_DOMAIN down, then 'qemu-img bitmap --remove -f qcow2 $active $probe'. Until then a -reinit of this pair will refuse, naming this bitmap."
+			results_row "$CSV" "$sc" cleanup 1 "" "" "" "" "" "FAIL left $probe behind"
+		fi
+	}
+
+	# --- P1. can qemu-img write a live image at all? ------------------------
+	#
+	# The constraint the design is built on. If this SUCCEEDS the simplest fix is
+	# available after all and the rest of the probe is moot, so it is worth
+	# knowing either way.
+	local out rc
+	out="$(run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "qemu-img bitmap --add -f qcow2 '$active' vmsync-probe-writelock 2>&1" 2>&1)" && rc=0 || rc=$?
+	if [ "$rc" != 0 ]; then
+		fo_check "$sc" "qemu-img cannot write a live image" 0
+		log "   qemu-img refused as expected: $(printf '%s' "$out" | head -1 | cut -c1-120)"
+	else
+		fo_check "$sc" "qemu-img cannot write a live image" 1 \
+			"qemu-img ADDED a bitmap to an image a running qemu holds open. That contradicts the premise of the whole design -- it means the image lock is not being taken, which is itself worth investigating before relying on either route"
+		run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "qemu-img bitmap --remove -f qcow2 '$active' vmsync-probe-writelock" >/dev/null 2>&1 || \
+			warn "could not remove the probe bitmap vmsync-probe-writelock from $active -- remove it by hand"
+	fi
+
+	# --- P2. manufacture an orphan the way reality does ---------------------
+	#
+	# create, dump the xml, then delete METADATA_ONLY. That is precisely the
+	# sequence vmsync's own DeleteCheckpointIfExists documents as the orphan
+	# factory, so the fixture is the real defect rather than an approximation.
+	local xml="$RUN_DIR/${sc}.checkpoint.xml"
+	cat > "$xml" <<XML
+<domaincheckpoint>
+  <name>$probe</name>
+  <disks>
+    <disk name='$TAMPER_DISK_DEV' checkpoint='bitmap'/>
+  </disks>
+</domaincheckpoint>
+XML
+	if ! virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$xml" >/dev/null 2>&1; then
+		warn "SKIP stage 22: could not create a checkpoint on $SOURCE_DOMAIN, so no orphan can be manufactured. Does this libvirt/qemu support checkpoints (libvirt >= 5.6, qemu >= 4.2)?"
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP checkpoint-create failed"
+		probe_cleanup
+		return 0
+	fi
+	# libvirt's own description of the checkpoint it just made, which is the
+	# easy-case input for P3a.
+	local dumped="$RUN_DIR/${sc}.dumped.xml"
+	virsh_uri "$SOURCE_URI" checkpoint-dumpxml "$SOURCE_DOMAIN" "$probe" > "$dumped" 2>/dev/null || true
+
+	virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" --metadata >/dev/null 2>&1 || true
+	if bitmap_present "$probe" && ! cp_listed "$probe"; then
+		fo_check "$sc" "a metadata-only delete leaves the bitmap behind" 0
+	else
+		fo_check "$sc" "a metadata-only delete leaves the bitmap behind" 1 \
+			"bitmap_present=$(bitmap_present "$probe" && echo yes || echo no) cp_listed=$(cp_listed "$probe" && echo yes || echo no). The orphan fixture was not produced, so nothing below is testing what it claims"
+		probe_cleanup
+		return 0
+	fi
+	log "   orphan manufactured: $probe is in $active with no libvirt checkpoint"
+
+	# --- P3a. redefine from libvirt's own dumped xml ------------------------
+	if [ -s "$dumped" ] && virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$dumped" --redefine >/dev/null 2>&1 && cp_listed "$probe"; then
+		fo_check "$sc" "redefine from libvirt's own dumped xml is accepted" 0
+		# Put it back to orphaned so P3b tests the case that matters.
+		virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" --metadata >/dev/null 2>&1 || true
+	else
+		fo_check "$sc" "redefine from libvirt's own dumped xml is accepted" 1 \
+			"even libvirt's own checkpoint description was refused on redefine, so the adopt route is not available at all on this libvirt"
+	fi
+
+	# --- P3b. redefine from the xml VMSYNC would have to build --------------
+	#
+	# THE check this stage exists for. A real orphan has no dumped xml anywhere --
+	# that is what makes it an orphan -- so vmsync would have to construct the
+	# metadata from the bitmap name and the disk it sits on. If libvirt refuses
+	# this but accepted P3a, the adopt route is only usable where the metadata
+	# was never actually lost, which is not the reported case.
+	local built="$RUN_DIR/${sc}.built.xml"
+	cat > "$built" <<XML
+<domaincheckpoint>
+  <name>$probe</name>
+  <disks>
+    <disk name='$TAMPER_DISK_DEV' checkpoint='bitmap' bitmap='$probe'/>
+  </disks>
+</domaincheckpoint>
+XML
+	out="$(virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$built" --redefine 2>&1)" && rc=0 || rc=$?
+	if [ "$rc" = 0 ] && cp_listed "$probe"; then
+		fo_check "$sc" "redefine from a hand-built xml is accepted" 0
+	else
+		fo_check "$sc" "redefine from a hand-built xml is accepted" 1 \
+			"exit $rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200). vmsync cannot adopt an orphan it has no metadata for, so the live-source case needs a different answer"
+		probe_cleanup
+		return 0
+	fi
+
+	# --- P4. does deleting the adopted checkpoint remove the bitmap? --------
+	out="$(virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" 2>&1)" && rc=0 || rc=$?
+	if [ "$rc" = 0 ] && ! bitmap_present "$probe" && ! cp_listed "$probe"; then
+		fo_check "$sc" "deleting the adopted checkpoint removes the bitmap" 0
+		log "   ADOPT ROUTE WORKS on a running domain: the bitmap is gone from $active"
+	else
+		fo_check "$sc" "deleting the adopted checkpoint removes the bitmap" 1 \
+			"exit $rc, bitmap_present=$(bitmap_present "$probe" && echo yes || echo no): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200). Adoption succeeded but the delete did not take the bitmap away, which is the half that matters"
+		probe_cleanup
+		return 0
+	fi
+
+	# --- P5. and the same while PAUSED -------------------------------------
+	#
+	# -reinit -start brings a shut-off source up PAUSED before the chain drop, so
+	# the paused case is the maintainer's exact failing scenario rather than a
+	# variation on it.
+	if virsh_uri "$SOURCE_URI" suspend "$SOURCE_DOMAIN" >/dev/null 2>&1; then
+		virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$xml" >/dev/null 2>&1 || true
+		virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" --metadata >/dev/null 2>&1 || true
+		if bitmap_present "$probe" &&
+			virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$built" --redefine >/dev/null 2>&1 &&
+			virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" >/dev/null 2>&1 &&
+			! bitmap_present "$probe"; then
+			fo_check "$sc" "the same works while the domain is paused" 0
+		else
+			fo_check "$sc" "the same works while the domain is paused" 1 \
+				"the adopt-then-delete sequence did not clear $probe while $SOURCE_DOMAIN was paused -- which is the state -reinit -start puts a source into"
+		fi
+		virsh_uri "$SOURCE_URI" resume "$SOURCE_DOMAIN" >/dev/null 2>&1 || \
+			warn "could not resume $SOURCE_DOMAIN after the paused probe -- resume it by hand ('virsh -c $SOURCE_URI resume $SOURCE_DOMAIN')"
+	else
+		log "   SKIP: could not suspend $SOURCE_DOMAIN, so the paused case is untested"
+		results_row "$CSV" "$sc" the_same_works_while_the_domain_is_paused SKIP "" "" "" "" "" "SKIP suspend failed"
+	fi
+
+	probe_cleanup
+	unset -f bitmap_present cp_listed probe_cleanup
+	return 0
+}
+
 stage_pattern() {
 	case "$1" in
 	# Anchored to the named sub-tests rather than a bare ^verify- , so a
@@ -8171,6 +8405,9 @@ stage_pattern() {
 	# Stage 21 stands down on several preconditions (no TARGET_HOST, no helper on
 	# the target, a sync it could not stall), and those rows belong to its verdict.
 	lock-lease) printf '^(lock-lease|precondition)$' ;;
+	# Stage 22 is a PROBE rather than a test: it asks libvirt a question whose
+	# answer decides a design. Its precondition rows belong to its own verdict.
+	redefine-probe) printf '^(redefine-probe|precondition|cleanup)$' ;;
 	*) printf '$^' ;; # matches nothing
 	esac
 }
@@ -8570,7 +8807,8 @@ for s in "${stage_list[@]}"; do
         leftovers) stage_leftovers || stage_rc=$? ;;
         reinit-order) stage_reinit_order || stage_rc=$? ;;
         lock-lease) stage_lock_lease || stage_rc=$? ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease)" ;;
+        redefine-probe) stage_redefine_probe || stage_rc=$? ;;
+        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease,redefine-probe)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
                 warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."
