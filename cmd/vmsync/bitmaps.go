@@ -149,12 +149,12 @@ then run this command again. Shutting the domain down and re-running vmsync with
 // identically.
 //
 // Which bitmaps are orphaned decides whether a rebuild can proceed, so it is a
-// pure set difference over values both of which are already in hand: no libvirt
+// pure set difference over values already in hand: no libvirt
 // call, no qemu-img, and therefore testable without either.
-func orphanBitmaps(byDisk map[string][]string, known []libvirtsync.Checkpoint) map[string][]string {
+func orphanBitmaps(byDisk map[string][]string, known []string) map[string][]string {
 	k := make(map[string]bool, len(known))
-	for _, cp := range known {
-		k[cp.Name] = true
+	for _, name := range known {
+		k[name] = true
 	}
 	out := map[string][]string{}
 	for path, names := range byDisk {
@@ -163,6 +163,20 @@ func orphanBitmaps(byDisk map[string][]string, known []libvirtsync.Checkpoint) m
 				out[path] = append(out[path], name)
 			}
 		}
+	}
+	return out
+}
+
+// checkpointNames reduces libvirt's checkpoint records to the names the bitmaps
+// in an image can be compared against.
+//
+// The names are the only part of a checkpoint that appears in a qcow2: a bitmap
+// carries its checkpoint's name and nothing else, so a comparison against
+// anything richer would be comparing fields one side does not have.
+func checkpointNames(cps []libvirtsync.Checkpoint) []string {
+	out := make([]string, 0, len(cps))
+	for _, cp := range cps {
+		out = append(out, cp.Name)
 	}
 	return out
 }

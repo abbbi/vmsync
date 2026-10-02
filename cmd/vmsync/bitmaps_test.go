@@ -107,7 +107,7 @@ func TestMessageIsStableAcrossRuns(t *testing.T) {
 // rebuild, and missing a real orphan lets the run destroy the target and the
 // source's baseline before failing on it.
 func TestOrphanBitmapsIsTheSetWithNoCheckpointBehindIt(t *testing.T) {
-	cps := []libvirtsync.Checkpoint{{Name: "vmsync-cpt-000002"}, {Name: "vmsync-cpt-000003"}}
+	cps := checkpointNames([]libvirtsync.Checkpoint{{Name: "vmsync-cpt-000002"}, {Name: "vmsync-cpt-000003"}})
 
 	got := orphanBitmaps(map[string][]string{
 		"/vm/web01-vda.qcow2": {"vmsync-cpt-000001", "vmsync-cpt-000002"},

@@ -3933,18 +3933,25 @@ func run(cfg syncConfig) (runErr error) {
 		trace.Info("checksum: pre-commit integrity check enabled", "algo", blockdigest.DefaultAlgo, "helper", cfg.BridgeHelperPath)
 	default:
 		st := nbdbridge.ProbeHelper(ctx, targetSSHClient, bridgeCfg, targetSSHConfig.Address)
-		if st.Usable {
-			checksumEnabled = true
-			trace.Info("checksum: pre-commit integrity check enabled", "algo", blockdigest.DefaultAlgo, "helper", cfg.BridgeHelperPath, "helper_version", st.Version)
-		} else {
-			// Not an error: nothing about this run asked for the helper, so a
-			// missing or mismatched one means no check rather than no sync.
-			// Said out loud every time, because a silently absent integrity
-			// check is worse than none -- an operator who believes it ran
-			// would trust a replica it never looked at.
-			trace.Warning("checksum: pre-commit integrity check SKIPPED -- vmsync-bridge-helper "+st.Reason,
-				"remedy", "deploy a matching vmsync-bridge-helper on the target to enable it, or pass -no-checksum to state that intent and silence this")
+		if !st.Usable {
+			// Refused, not degraded. The integrity check is on by default, so a
+			// run that did not pass -no-checksum asked for it, and a missing or
+			// mismatched helper means it cannot happen. Continuing would copy a
+			// replica nobody compared against its source while reporting
+			// success -- and whether that is acceptable is the operator's
+			// decision to state, not vmsync's to make on their behalf. Both
+			// ways of stating it are named below.
+			// Also refused in case any compression/buffering option is required since they require
+			// the helper on the counterpart hypervisor
+			//
+			// Here rather than later because this is the last cheap moment: the
+			// target lock and everything destructive are still ahead, so a
+			// refusal costs an SSH round trip and changes nothing.
+			return fmt.Errorf("refusing to sync %s: vmsync-bridge-helper %s. Deploy a matching helper at %s on %s, or avoid using features that need the helper",
+				cfg.TargetDomain, st.Reason, cfg.BridgeHelperPath, util.HostFromURIOrLocal(cfg.TargetURI))
 		}
+		checksumEnabled = true
+		trace.Info("checksum: pre-commit integrity check enabled", "algo", blockdigest.DefaultAlgo, "helper", cfg.BridgeHelperPath, "helper_version", st.Version)
 	}
 
 	// From here the checksum metric exists whatever happens next --
@@ -4349,7 +4356,7 @@ func run(cfg syncConfig) (runErr error) {
 			case knownErr != nil || activeErr != nil:
 				trace.Warning("could not tell whether the source's vmsync bitmaps are orphaned before starting the rebuild; the audit after the chain drop will catch it instead",
 					"vm", cfg.SourceDomain, "checkpoints_error", knownErr, "state_error", activeErr)
-			case len(orphanBitmaps(preDropBitmaps, known)) == 0:
+			case len(orphanBitmaps(preDropBitmaps, checkpointNames(known))) == 0:
 				// Every bitmap has a checkpoint behind it, so the drop below
 				// removes all of them through qemu.
 			case !srcActive:
@@ -4364,7 +4371,7 @@ func run(cfg syncConfig) (runErr error) {
 				// replica_incomplete, undefined the target under -force-clean,
 				// and discarded the source's baseline. Nothing is touched yet.
 				return fmt.Errorf("refusing to rebuild %s: %w", cfg.SourceDomain,
-					leftoverBitmapRefusal(cfg.SourceDomain, orphanBitmaps(preDropBitmaps, known)))
+					leftoverBitmapRefusal(cfg.SourceDomain, orphanBitmaps(preDropBitmaps, checkpointNames(known))))
 			}
 		}
 
