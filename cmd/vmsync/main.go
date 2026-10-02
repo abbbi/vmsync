@@ -3954,11 +3954,7 @@ func run(cfg syncConfig) (runErr error) {
 		trace.Info("checksum: pre-commit integrity check enabled", "algo", blockdigest.DefaultAlgo, "helper", cfg.BridgeHelperPath, "helper_version", st.Version)
 	}
 
-	// From here the checksum metric exists whatever happens next --
-	// including the case it exists FOR. A skipped check is otherwise
-	// completely silent: the sync reports success and nothing says the
-	// integrity check never ran, which is exactly how a stale helper turns
-	// a default-on safety feature off across an estate unnoticed.
+	// Add a metric that allows us to track whether checksum was performed
 	metricsMu.Lock()
 	checksumDecided = true
 	if !checksumEnabled {
