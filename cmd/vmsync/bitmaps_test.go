@@ -38,7 +38,7 @@ func TestRefusalCarriesEverythingNeededToFixIt(t *testing.T) {
 		{"the domain", testDomain},
 		{"the disk file the bitmap is in", testDiskPath},
 		{"the bitmap's name", testBitmap},
-		{"the removal command", "qemu-img bitmap --remove " + testDiskPath + " " + testBitmap},
+		{"the removal command", "qemu-img bitmap --remove -f qcow2 " + testDiskPath + " " + testBitmap},
 		{"how to stop the domain first", "virsh shutdown " + testDomain},
 		{"how to start it again", "virsh start " + testDomain},
 		{"why vmsync will not do it itself", "qemu holds the image open"},
@@ -63,9 +63,9 @@ func TestEveryBitmapGetsItsOwnCommand(t *testing.T) {
 	}
 	msg := err.Error()
 	for _, want := range []string{
-		"qemu-img bitmap --remove /vm/a.qcow2 vmsync-cpt-000001",
-		"qemu-img bitmap --remove /vm/a.qcow2 vmsync-cpt-000002",
-		"qemu-img bitmap --remove /vm/b.qcow2 vmsync-cpt-000001",
+		"qemu-img bitmap --remove -f qcow2 /vm/a.qcow2 vmsync-cpt-000001",
+		"qemu-img bitmap --remove -f qcow2 /vm/a.qcow2 vmsync-cpt-000002",
+		"qemu-img bitmap --remove -f qcow2 /vm/b.qcow2 vmsync-cpt-000001",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("missing removal command: %q", want)

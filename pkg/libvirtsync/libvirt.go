@@ -3843,6 +3843,18 @@ func ExternalSnapshotCount(dom *libvirt.Domain) (int, error) {
 // worded version of this same message; that failure mode is safe by
 // comparison; it just falls back to failing the run outright, same as any
 // other unrecognized CreateCheckpoint error.
+//
+// That false-negative window is wider than "some future version": it is open
+// NOW on any host whose libvirtd runs in a non-English locale. libvirtd formats
+// its errors server-side and sends the finished string, so the client's own
+// locale does not reach them -- observed on a French deployment (2026-10-02),
+// where a checkpoint error arrived as "erreur interne : Impossible d'executer
+// la commande QEMU 'transaction' : Bitmap already exists: ...". Only qemu's own
+// half came through untranslated, and the unwrap loop above tests just
+// libvirt's innermost message, which is the translated one. So on such a host
+// this returns false and the tolerance never engages -- safe, by the argument
+// above, but it means the tolerance is effectively English-only. Matching on
+// the virError code and domain instead of on prose would close it.
 func IsCheckpointBlockedBySnapshot(err error) bool {
 	if err == nil {
 		return false

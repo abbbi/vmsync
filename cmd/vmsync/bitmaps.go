@@ -53,8 +53,18 @@ import (
 // checkpoint list would work too and would be more code for the same answer.
 //
 // Reads the images the same way the rest of the run does -- remotely when the
-// source is reached over SSH, locally otherwise -- and both paths already pass
-// --force-share, which is what lets this read a disk a running qemu has open.
+// source is reached over SSH, locally otherwise -- and both paths pass
+// --force-share, which is what lets the read open a disk a running qemu holds.
+//
+// --force-share buys the lock, not the truth. What comes back is the qcow2
+// bitmap directory ON DISK, and that can lag what qemu itself holds: a bitmap
+// created during the current qemu process's life need not be in the file yet.
+// So an empty answer from a RUNNING source is not proof of absence, and the
+// caller must not read it as one -- qemu can still refuse the next sync with
+// "Bitmap already exists" for a name this never reported. Proven on hardware
+// (2026-10-02): libvirt made a checkpoint, this read found no bitmap of its
+// name, and a later checkpoint-create of the same name was refused by qemu for
+// already having it. The reliable answer needs qemu, not the file.
 func leftoverCheckpointBitmaps(ctx context.Context, needsSSH bool, ssh *remotessh.Client, disks []disk.QcowDisk) (map[string][]string, error) {
 	out := map[string][]string{}
 	for _, d := range disks {
@@ -120,7 +130,11 @@ func leftoverBitmapRefusal(domain string, byDisk map[string][]string) error {
 	for _, p := range paths {
 		for _, b := range byDisk[p] {
 			found = append(found, fmt.Sprintf("%s in %s", b, p))
-			fix = append(fix, fmt.Sprintf("    qemu-img bitmap --remove %s %s", p, b))
+			// -f qcow2, matching disk.RemoveBitmap: the advice handed to an
+			// operator should not skip the format pin the code applies to
+			// itself, since probing a guest-writable image is how a raw disk
+			// gets treated as something else.
+			fix = append(fix, fmt.Sprintf("    qemu-img bitmap --remove -f qcow2 %s %s", p, b))
 		}
 	}
 
