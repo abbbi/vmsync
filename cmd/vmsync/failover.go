@@ -1131,7 +1131,15 @@ func dropCheckpointsOffline(dom *libvirt.Domain, domainName, uri, verb string) e
 
 	// --- half one: the bitmaps ----------------------------------------------
 	for _, d := range disks {
-		path := d.Path()
+		// Source, the domain's currently ACTIVE file, not Path(): a checkpoint's
+		// dirty bitmap is written into the image qemu has open, and Path()
+		// resolves a backing chain down to its base. On a linked clone or a
+		// source carrying an external snapshot the two are different files, and
+		// reading the base there would scrub bitmaps out of a template other
+		// domains share while leaving this domain's own untouched -- after which
+		// the audit in cmd/vmsync still finds them, because it reads Source.
+		// Path() is for naming files on the TARGET; see its own doc comment.
+		path := d.Source
 		if path == "" {
 			continue
 		}
