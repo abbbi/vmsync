@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"vmsync/pkg/libvirtsync"
 )
 
 const (
@@ -97,5 +99,44 @@ func TestMessageIsStableAcrossRuns(t *testing.T) {
 	z := strings.Index(first, "/vm/z.qcow2")
 	if !(a < m && m < z) {
 		t.Errorf("disks are not in sorted order (a=%d m=%d z=%d)", a, m, z)
+	}
+}
+
+// Which bitmaps are orphaned decides whether a rebuild can proceed at all, so
+// both directions matter: calling a tracked bitmap an orphan refuses a healthy
+// rebuild, and missing a real orphan lets the run destroy the target and the
+// source's baseline before failing on it.
+func TestOrphanBitmapsIsTheSetWithNoCheckpointBehindIt(t *testing.T) {
+	cps := []libvirtsync.Checkpoint{{Name: "vmsync-cpt-000002"}, {Name: "vmsync-cpt-000003"}}
+
+	got := orphanBitmaps(map[string][]string{
+		"/vm/web01-vda.qcow2": {"vmsync-cpt-000001", "vmsync-cpt-000002"},
+		"/vm/web01-vdb.qcow2": {"vmsync-cpt-000002", "vmsync-cpt-000003"},
+	}, cps)
+
+	if len(got) != 1 {
+		t.Fatalf("got %+v, want only vda's untracked bitmap", got)
+	}
+	if n := got["/vm/web01-vda.qcow2"]; len(n) != 1 || n[0] != "vmsync-cpt-000001" {
+		t.Errorf("vda orphans = %v, want just vmsync-cpt-000001", n)
+	}
+	if _, ok := got["/vm/web01-vdb.qcow2"]; ok {
+		t.Error("a disk whose every bitmap has a checkpoint was reported as holding orphans; that refuses a rebuild with nothing wrong with it")
+	}
+
+	// Nothing tracked at all is the state an interrupted run or a
+	// metadata-only delete leaves, and every bitmap is then an orphan.
+	all := orphanBitmaps(map[string][]string{"/vm/web01-vda.qcow2": {"vmsync-cpt-000001"}}, nil)
+	if len(all["/vm/web01-vda.qcow2"]) != 1 {
+		t.Errorf("with no checkpoints known, got %+v, want every bitmap orphaned", all)
+	}
+
+	// And the clean cases produce nothing, so the caller's len()==0 branch is
+	// the one that runs on a healthy source.
+	if n := len(orphanBitmaps(nil, cps)); n != 0 {
+		t.Errorf("no bitmaps gave %d orphans", n)
+	}
+	if n := len(orphanBitmaps(map[string][]string{"/vm/a.qcow2": {"vmsync-cpt-000002"}}, cps)); n != 0 {
+		t.Errorf("a fully tracked disk gave %d orphans", n)
 	}
 }

@@ -138,3 +138,31 @@ then run this command again. Shutting the domain down and re-running vmsync with
 		domain, len(found), strings.Join(found, ", "),
 		domain, strings.Join(fix, "\n"), domain)
 }
+
+// orphanBitmaps reports which vmsync-named bitmaps in the images have no libvirt
+// checkpoint behind them.
+//
+// An orphan is the one state that makes a later sync fail with no explanation in
+// libvirt's view: `virsh checkpoint-list` shows nothing, so the next chain
+// restarts at vmsync-cpt-000001, and qemu refuses because the qcow2 already
+// holds a bitmap of that name. Every subsequent sync for the pair fails
+// identically.
+//
+// Which bitmaps are orphaned decides whether a rebuild can proceed, so it is a
+// pure set difference over values both of which are already in hand: no libvirt
+// call, no qemu-img, and therefore testable without either.
+func orphanBitmaps(byDisk map[string][]string, known []libvirtsync.Checkpoint) map[string][]string {
+	k := make(map[string]bool, len(known))
+	for _, cp := range known {
+		k[cp.Name] = true
+	}
+	out := map[string][]string{}
+	for path, names := range byDisk {
+		for _, name := range names {
+			if !k[name] {
+				out[path] = append(out[path], name)
+			}
+		}
+	}
+	return out
+}
