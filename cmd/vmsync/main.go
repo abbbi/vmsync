@@ -4230,6 +4230,60 @@ func run(cfg syncConfig) (runErr error) {
 		}
 	}
 
+	// A vTPM is announced here because vmsync does not replicate its state,
+	// and the alternative to saying so is the operator finding out at
+	// failover. Same reasoning as the varstore warning above, which exists
+	// because a replica silently missing its boot entries and Secure Boot keys
+	// is discovered at the worst possible moment -- except a vTPM had no
+	// warning at all until now.
+	//
+	// Not fatal. A replica with a fresh TPM boots; what it cannot do is open
+	// anything the guest sealed to the source's TPM. That is the operator's
+	// call to make, and they can only make it if they are told.
+	if tpm, hasTPM := libvirtsync.DetectTPM(srcXML); hasTPM {
+		switch tpm.Backend {
+		case "emulator":
+			// The encrypted case is worse than it looks and is called out
+			// separately: the key is a libvirt secret on the SOURCE host, so
+			// even a hand-copied state directory is unreadable on the target
+			// until the same secret is provisioned there.
+			detail := "the replica's TPM will be a DIFFERENT, empty one, so anything the guest sealed to the source's TPM (BitLocker and other measured-boot secrets) will not open on the replica until it is re-enrolled there"
+			if tpm.EncryptionSecret != "" {
+				// A HARDER failure than the sentence above, and it is worth
+				// saying separately because it is not about replication at
+				// all: the <encryption secret='...'/> element survives into
+				// the replica's own definition verbatim -- the rewrite patches
+				// a parsed tree precisely so unmodelled content is not lost
+				// (see warnIfXMLElementsDropped's comment, which names TPM as
+				// an example) -- and libvirt resolves that uuid at START time,
+				// not at define time. So on a target with no such secret the
+				// replica does not boot with an empty TPM. It does not boot at
+				// all, and the operator finds out at failover.
+				//
+				// The uuid is named because "provision the same secret" is
+				// useless advice without saying which one.
+				detail = "the replica carries its <encryption secret='" + tpm.EncryptionSecret +
+					"'/> verbatim and libvirt resolves that at START time, so unless a secret with that exact uuid (usage type vtpm) already exists on the TARGET host, the replica will FAIL TO START -- not boot with an empty TPM. Provision it there out of band; vmsync does not and will not copy a secret between hosts. Separately, the source's TPM state is not replicated either, so sealed secrets need re-enrolling on the replica once it does start"
+			}
+			if tpm.SourceType == "file" {
+				// Worth saying separately: the file-backed shape is the one
+				// libvirt does NOT repair the ownership of on each start, and
+				// the one virt-aa-helper generates no AppArmor rule for.
+				detail += "; note this domain names its own state path (" + tpm.SourcePath +
+					") rather than using libvirt's uuid-derived default, which is the shape that needs the swtpm user's ownership and its own apparmor rule getting right by hand"
+			}
+			trace.Warning("the source has an emulated vTPM whose state vmsync does NOT replicate -- "+detail+". See docs/design/TODO/vtpm-replication.md",
+				"vm", cfg.SourceDomain, "model", tpm.Model, "version", tpm.Version,
+				"encryption_secret", tpm.EncryptionSecret, "source_type", tpm.SourceType, "profile", tpm.Profile)
+		case "passthrough":
+			trace.Warning("the source passes through a HOST TPM device; a replica cannot inherit it, and the target host needs its own TPM for this domain to start there at all",
+				"vm", cfg.SourceDomain, "model", tpm.Model)
+		default:
+			trace.Warning("the source has a TPM device vmsync does not replicate or understand; check the replica can start without it",
+				"vm", cfg.SourceDomain, "model", tpm.Model, "backend", tpm.Backend)
+		}
+	}
+
 	loader, lerr := libvirtsync.DetectLoader(srcXML)
 	if lerr != nil {
 		return lerr

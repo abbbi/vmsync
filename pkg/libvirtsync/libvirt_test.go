@@ -1545,6 +1545,106 @@ func TestCollidingBitmap(t *testing.T) {
 	}
 }
 
+// A vTPM has to be NOTICED, because nothing replicates its state and the
+// alternative to warning is the operator finding out at failover.
+func TestDetectTPM(t *testing.T) {
+	t.Run("no tpm device at all", func(t *testing.T) {
+		if _, ok := DetectTPM(`<domain type='kvm'><name>a</name><devices></devices></domain>`); ok {
+			t.Error("reported a TPM on a domain that has none")
+		}
+		if _, ok := DetectTPM(`<domain type='kvm'><name>a</name></domain>`); ok {
+			t.Error("reported a TPM on a domain with no <devices> at all")
+		}
+	})
+
+	t.Run("an emulated tpm, which is the case that matters", func(t *testing.T) {
+		got, ok := DetectTPM(`<domain type='kvm'><name>a</name><devices>
+			<tpm model='tpm-tis'><backend type='emulator' version='2.0'/></tpm>
+		</devices></domain>`)
+		if !ok {
+			t.Fatal("did not detect an emulated TPM")
+		}
+		if got.Backend != "emulator" || got.Model != "tpm-tis" || got.Version != "2.0" {
+			t.Errorf("got %+v, want emulator/tpm-tis/2.0", got)
+		}
+		if got.EncryptionSecret != "" {
+			t.Error("reported an encryption secret for a backend with no <encryption>")
+		}
+	})
+
+	t.Run("encrypted state, which no hand-copy can recover either", func(t *testing.T) {
+		got, ok := DetectTPM(`<domain type='kvm'><name>a</name><devices>
+			<tpm model='tpm-crb'><backend type='emulator' version='2.0' persistent_state='yes'>
+				<encryption secret='3a1b0c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d'/>
+			</backend></tpm>
+		</devices></domain>`)
+		if !ok {
+			t.Fatal("did not detect the TPM")
+		}
+		// NAMED, not merely flagged: "provision the same secret on the
+		// target" is useless advice without saying which one.
+		if got.EncryptionSecret != "3a1b0c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d" {
+			t.Errorf("encryption secret = %q, want the uuid from the xml", got.EncryptionSecret)
+		}
+		if got.PersistentState != "yes" {
+			t.Errorf("persistent_state = %q, want \"yes\"", got.PersistentState)
+		}
+	})
+
+	// The shape libvirt does NOT repair the ownership of on every start, and
+	// the one virt-aa-helper generates no AppArmor rule for -- so the warning
+	// has to be able to say which it is and where.
+	t.Run("a state path the domain names itself", func(t *testing.T) {
+		got, ok := DetectTPM(`<domain type='kvm'><name>a</name><devices>
+			<tpm model='tpm-tis'><backend type='emulator' version='2.0'>
+				<source type='file' path='/srv/tpm/a-state'/>
+				<profile name='custom:restricted'/>
+			</backend></tpm>
+		</devices></domain>`)
+		if !ok {
+			t.Fatal("did not detect the TPM")
+		}
+		if got.SourceType != "file" || got.SourcePath != "/srv/tpm/a-state" {
+			t.Errorf("source = %q at %q, want file at /srv/tpm/a-state", got.SourceType, got.SourcePath)
+		}
+		if got.Profile != "custom:restricted" {
+			t.Errorf("profile = %q, want custom:restricted", got.Profile)
+		}
+	})
+
+	// libvirt's own default: no <source> at all, and the path is derived from
+	// the domain uuid. Reported as empty rather than guessed at, because the
+	// default is libvirt's to choose and swtpmStorageDir is its config.
+	t.Run("no source element means libvirt's uuid-derived default", func(t *testing.T) {
+		got, _ := DetectTPM(`<domain type='kvm'><name>a</name><devices>
+			<tpm model='tpm-tis'><backend type='emulator' version='2.0'/></tpm>
+		</devices></domain>`)
+		if got.SourceType != "" || got.SourcePath != "" {
+			t.Errorf("invented a source: %q at %q", got.SourceType, got.SourcePath)
+		}
+	})
+
+	// A different problem entirely: nothing to copy, and the replica needs the
+	// target host to have its own TPM to start at all.
+	t.Run("a passed-through host tpm", func(t *testing.T) {
+		got, ok := DetectTPM(`<domain type='kvm'><name>a</name><devices>
+			<tpm model='tpm-tis'><backend type='passthrough'><device path='/dev/tpm0'/></backend></tpm>
+		</devices></domain>`)
+		if !ok {
+			t.Fatal("did not detect the TPM")
+		}
+		if got.Backend != "passthrough" {
+			t.Errorf("backend = %q, want passthrough", got.Backend)
+		}
+	})
+
+	t.Run("an unparseable document is not a TPM", func(t *testing.T) {
+		if _, ok := DetectTPM(`<domain`); ok {
+			t.Error("reported a TPM from a document that does not parse")
+		}
+	})
+}
+
 // Which path DefineDomain takes decides whether the replica spends a moment
 // with no definition at all, so the decision is tested on its own.
 func TestPlanDefine(t *testing.T) {

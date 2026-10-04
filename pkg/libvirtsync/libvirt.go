@@ -3230,6 +3230,110 @@ func DetectNvram(domainXML string) (string, error) {
 	return "", nil
 }
 
+// TPMInfo describes a domain's TPM device, for the one thing vmsync can
+// honestly do about one: say it is there and that its state is not replicated.
+type TPMInfo struct {
+	// Model is the emulated chip, e.g. tpm-tis or tpm-crb.
+	Model string
+	// Backend is "emulator", "passthrough" or "external". They need entirely
+	// different things of a replica, so the warning has to tell them apart.
+	Backend string
+	// Version is 2.0 or 1.2 for an emulator backend; it also names the state
+	// directory, <swtpmStorageDir>/<uuid>/tpm2 or .../tpm1.2.
+	Version string
+	// EncryptionSecret is the libvirt secret UUID the state is encrypted
+	// with, or "" when it is not encrypted. Named rather than reduced to a
+	// boolean because an operator asked to provision the same secret on the
+	// target needs to know WHICH one, and this is the only place the sync can
+	// tell them.
+	//
+	// Encrypted state cannot be replicated by copying bytes: the secret lives
+	// on the SOURCE host, and every route out of an encrypted swtpm yields
+	// ciphertext that needs it -- even swtpm's own state-blob export re-
+	// encrypts under a migration key libvirt sets from this same secret.
+	EncryptionSecret string
+	// PersistentState is the backend's persistent_state attribute verbatim.
+	// Unset means libvirt treats the state as disposable and deletes it on
+	// undefine unless KEEP_TPM is passed.
+	PersistentState string
+	// SourceType is "file", "dir" or "" for libvirt's own UUID-derived
+	// default, and SourcePath is the path when one is named.
+	//
+	// This is not cosmetic. <source type='file'> changes what libvirt does on
+	// every start: it skips creating the storage, so none of the chown/chmod
+	// repair that covers the directory case runs, and it runs swtpm_setup each
+	// time instead. A state file written by anything other than the swtpm user
+	// therefore stays wrong and the domain fails to start -- where a directory
+	// would have been quietly repaired. Debian and Ubuntu add a second trap:
+	// virt-aa-helper hardcodes the UUID-derived path when generating AppArmor
+	// rules and never reads this one, so a custom path gets no rule at all.
+	SourceType string
+	SourcePath string
+	// Profile is the backend's <profile> name, when set. Two hosts with
+	// different libtpms profiles available are a start-time failure on the
+	// replica that has nothing to do with the state itself.
+	Profile string
+}
+
+// DetectTPM reports the domain's TPM device, if it has one.
+//
+// Detection only. vmsync does not replicate vTPM state, and this exists so
+// that fact is announced at sync time rather than discovered at failover --
+// the same reason DetectNvram exists, and the varstore's own story is what
+// makes the case: a replica that silently lacked its boot entries and Secure
+// Boot keys was "discovered at failover, which is the worst possible moment to
+// discover anything" (cmd/vmsync/nvram.go). A vTPM is the same shape of
+// surprise and currently has no warning at all.
+//
+// Note what a TPM is NOT: it is not the varstore. The varstore is one file
+// named in <os><nvram> and vmsync copies it. Emulated TPM state is a
+// DIRECTORY, <swtpmStorageDir>/<uuid>/{tpm2|tpm1.2} -- different path,
+// different content (endorsement and storage root keys, PCRs, NV indices,
+// sealed blobs), and nothing the varstore copy reaches.
+//
+// Only the first device is reported. libvirt's schema allows several, and a
+// domain with more than one is rare enough that one warning naming the first
+// is a better trade than a loop nobody reads.
+func DetectTPM(domainXML string) (TPMInfo, bool) {
+	domcfg := &libvirtxml.Domain{}
+	if err := domcfg.Unmarshal(domainXML); err != nil {
+		return TPMInfo{}, false
+	}
+	if domcfg.Devices == nil || len(domcfg.Devices.TPMs) == 0 {
+		return TPMInfo{}, false
+	}
+	tpm := domcfg.Devices.TPMs[0]
+	info := TPMInfo{Model: tpm.Model}
+	switch {
+	case tpm.Backend == nil:
+	case tpm.Backend.Emulator != nil:
+		em := tpm.Backend.Emulator
+		info.Backend = "emulator"
+		info.Version = em.Version
+		info.PersistentState = em.PersistentState
+		if em.Encryption != nil {
+			info.EncryptionSecret = em.Encryption.Secret
+		}
+		if em.Profile != nil {
+			info.Profile = em.Profile.Name
+		}
+		switch {
+		case em.Source == nil:
+		case em.Source.File != nil:
+			info.SourceType = "file"
+			info.SourcePath = em.Source.File.Path
+		case em.Source.Dir != nil:
+			info.SourceType = "dir"
+			info.SourcePath = em.Source.Dir.Path
+		}
+	case tpm.Backend.Passthrough != nil:
+		info.Backend = "passthrough"
+	case tpm.Backend.External != nil:
+		info.Backend = "external"
+	}
+	return info, true
+}
+
 // TargetNvramPath is where a replica's UEFI varstore belongs, given the
 // source's.
 //
