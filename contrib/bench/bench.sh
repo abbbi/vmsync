@@ -392,7 +392,13 @@ line, quotes the line from vmsync's own log that decided it, and records an INFO
 verdict ignores. It prints an EVIDENCE block at each step the way stage 22 does. It
 shares stage 22's helpers, and it cleans up by adopting and deleting rather than by
 printing a recipe, because a bitmap left in the chain's name space would break every
-later sync for the pair -- including the rest of the bench run.
+later sync for the pair -- including the rest of the bench run. The sync it runs
+afterwards carries -verify=fast, which reads the replica back and compares it against
+the source: that is the only check in the stage about DATA rather than metadata, and it
+is what would catch an incremental that copied too little because the bitmap surgery had
+disturbed the tracking. Not qemu-img check, which needs the domain down -- shutting it
+down would close the image cleanly and so describe a state the live operation did not
+produce, and it validates structure rather than bitmap contents anyway.
 EOF
 }
 
@@ -8552,6 +8558,7 @@ log_state() {
 	log "     qemu-img bitmaps in $PROBE_ACTIVE: $(raw_bitmaps)"
 }
 
+
 stage_redefine_probe() {
 	log "=== Stage 22: PROBE -- can libvirt remove an orphaned bitmap on a LIVE domain? ==="
 	local sc=redefine-probe
@@ -9171,6 +9178,7 @@ stage_reinit_orphan() {
 		log "   (would plant an orphaned $probe on $SOURCE_DOMAIN and -reinit the pair)"
 		fo_check "$sc" "the planted bitmap is an orphan qemu holds" 0
 		fo_check "$sc" "-reinit completed" 0
+		fo_check "$sc" "the replica still matches the source" 0
 		fo_check "$sc" "the name is a real checkpoint afterwards, not an orphan" 0
 		fo_check "$sc" "the sync after it is incremental" 0
 		return 0
@@ -9339,7 +9347,7 @@ stage_reinit_orphan() {
 		route="unexplained"
 		warn "neither the sweep nor the retry said anything in $RUN_LOG, so how $probe went is unexplained. The checks above still hold -- it is gone and the chain is sound -- but which code path did it is not in evidence."
 	fi
-	[ -n "$evidence" ] && log "     vmsync said: $(printf '%s' "$evidence" | tr -s ' ' | cut -c1-220)"
+	[ -n "$evidence" ] && log "     vmsync said: $(printf '%s' "$evidence" | tr -s ' ' | cut -c1-400)"
 	results_row "$CSV" "$sc" route INFO "" "" "" "" "" "INFO cleared by $route"
 
 	# --- and the pair still works -------------------------------------------
@@ -9347,13 +9355,45 @@ stage_reinit_orphan() {
 	# A rebuild that clears the orphan and leaves an unusable chain has fixed
 	# nothing. The sync after it must be INCREMENTAL, which is only true if
 	# -reinit left a checkpoint the next run can carry on from.
-	run_vmsync "$sc" after
-	if [ "$RUN_RC" = 0 ] && grep -q 'starting incremental pull backup' "$RUN_LOG" 2>/dev/null; then
-		fo_check "$sc" "the sync after it is incremental" 0
-	else
-		fo_check "$sc" "the sync after it is incremental" 1 \
-			"exit $RUN_RC, and the log does not say it started an incremental pull backup -- so -reinit cleared the orphan but did not leave a chain the next run could use. $(log_reason "$RUN_LOG")"
-	fi
+	# -verify=fast on this run rather than a fourth one, and it is the ONLY
+	# check here that speaks about data.
+	#
+	# Everything above establishes that the bitmap went and that the metadata is
+	# consistent. A replication tool can get both right and still have copied
+	# the wrong bytes, and that is the outcome worth testing: if adopting and
+	# deleting had disturbed the tracking that survives it, this incremental
+	# would copy too little and the replica would be silently stale. Reading it
+	# back and comparing against the source is what finds that. fast stops at
+	# the first differing range, which is the whole question -- whether there is
+	# a difference, not a census of them -- and a clean result means it compared
+	# the entire image.
+	#
+	# NOT qemu-img check, which was tried here and removed. It needs the domain
+	# down, so running it means shutting down the very thing whose LIVE
+	# behaviour is under test: the shutdown flushes the bitmaps and closes the
+	# image cleanly, so what comes back describes the state after a clean close
+	# rather than the state the live operation produced. And it would answer the
+	# wrong question anyway -- it validates refcounts and cluster allocation,
+	# and an image whose bitmap has quietly lost dirty bits passes it and then
+	# under-copies. A check that cannot fail for the reason you care about is
+	# worse than no check, because it reads as reassurance.
+	#
+	# What this still does NOT establish: that the tracking is right for every
+	# future interval, only for this one. Over-copying would also pass, which is
+	# the safe direction.
+	run_vmsync "$sc" after -verify=fast
+	# The LOG decides this one and the exit code decides the next, because the
+	# two now share a run: a verify mismatch exits non-zero, and reading the
+	# exit code here as well would report "the sync was not incremental" about a
+	# sync that was perfectly incremental and then found a difference. Two
+	# findings, two checks.
+	if grep -q 'starting incremental pull backup' "$RUN_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the sync after it is incremental" "$fo_ok" \
+		"the log does not say it started an incremental pull backup -- so -reinit cleared the orphan but did not leave a chain the next run could carry on from. $(log_reason "$RUN_LOG")"
+	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
+	fo_check "$sc" "the replica still matches the source" "$fo_ok" \
+		"-verify=fast exited $RUN_RC after the orphan was cleared and the chain rebuilt. The bitmap surgery is between the source's data and this comparison, so a mismatch here is the serious outcome: the replica no longer holds what the source holds. $(log_reason "$RUN_LOG")"
+
 
 	orphan_cleanup
 	unset -f orphan_cleanup

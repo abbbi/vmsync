@@ -108,6 +108,7 @@ vmsync itself to work at all).
 ./bench.sh --stages reinit-order # 20 opt-in: a refused reinit destroyed nothing; STARTS THE TARGET (paused)
 ./bench.sh --stages lock-lease   # 21 opt-in: a dead driver must not keep the target's run lock
 ./bench.sh --stages redefine-probe # 22 PROBE: can libvirt clear an orphaned bitmap on a live domain?
+./bench.sh --stages reinit-orphan  # 23 does -reinit actually clear one?
 ```
 
 Stages 2, 3, 4, 9, 10 and 11 each run their own baseline `-reinit` full
@@ -1466,6 +1467,85 @@ stop and restart the source. Two things need it, and only one of them is optiona
 Every path that stops the domain starts it again, including the failing ones, and
 the stage stands down rather than continuing against a source that did not come
 back — the whole question here is what can be done while qemu holds the image.
+
+### Stage 23 (`reinit-orphan`) — does `-reinit` actually clear one?
+
+Stage 22 asks whether an orphan *can* be cleared on a live domain. This one asks
+whether vmsync does it, which is the only version of the question an operator
+has. It plants an orphaned bitmap on a **running** source and runs a plain
+`-reinit` over it — no special flags, because an operator hitting this passes
+none.
+
+**The planted name is `vmsync-cpt-000001`, deliberately.** That is the name the
+rebuild's own new chain takes, so the orphan is a real collision rather than a
+bitmap sitting harmlessly out of the way. It also means **a clean exit is itself
+the proof the orphan was cleared**: a surviving one is precisely what makes qemu
+refuse that checkpoint, which is the failure every run of this command used to
+hit. Asking "does qemu still hold the name?" afterwards would prove nothing —
+after a successful rebuild it holds it legitimately, as the new chain's first
+checkpoint — and an earlier draft of this stage reported the one as the other
+until the stub harness showed every mode failing the same check.
+
+**vmsync builds the fixture, not the stage.** It seeds with a `-reinit` and then
+drops libvirt's record of the checkpoint that rebuild made. That is the orphan
+factory the engine documents, and it covers something a hand-written fixture
+cannot: vmsync checkpoints **every** qcow2 disk it manages, so a real orphan is
+on all of them.
+
+The seed is a `-reinit` rather than a plain sync because a plain **full** sync
+refuses to overwrite a target disk that already exists — which is every pair this
+stage would run against, since it needs a working replica to start from.
+`-reinit` displaces the existing disks first, according to
+`-replaced-disk-action` (`rename` by default, or `delete`), and is the only thing
+here permitted to. A fixture naming one disk would leave the adopt-then-delete
+route claiming a bitmap the other disks do not carry, the delete would fail
+looking for it, and the stage would report a failure that existed only in its own
+fixture. On a single-disk domain that difference never shows; the pair this was
+written against has two. It also fixes the name by construction, since a full
+sync's chain starts at `vmsync-cpt-000001`.
+
+| check | what the answer decides |
+| --- | --- |
+| the planted bitmap is an orphan qemu holds | that the fixture is real. Confirmed with **qemu**, not with the image: a bitmap made during the current qemu's life need not be in the image at all, and on the host this was written against it is not |
+| **`-reinit` completed** | **the feature.** The name collides, so a surviving orphan makes qemu refuse the rebuild's own checkpoint and this fails |
+| the name is a real checkpoint afterwards, not an orphan | that the end state is consistent. Same name, opposite meaning, and only libvirt can tell them apart |
+| the sync after it is incremental | that the rebuild left a chain the next run can use. Clearing the orphan and leaving nothing to carry on from has fixed nothing. Decided by the **log**, not the exit code, since that run also verifies |
+| **the replica still matches the source** | **the only check here about data.** The run above carries `-verify=fast`, which reads the replica back and compares it against the source. If adopting and deleting had disturbed the tracking that survives it, this incremental would copy too little and the replica would be silently stale — this is what finds that. `fast` stops at the first differing range, so a clean result means the whole image compared |
+
+**Why not `qemu-img check`.** It was tried here and removed. It needs the domain
+**down**, so running it means shutting down the very thing whose *live*
+behaviour is under test — and the shutdown flushes the bitmaps and closes the
+image cleanly, so what comes back describes the state after a clean close rather
+than the state the live operation produced. It also answers the wrong question:
+it validates refcounts and cluster allocation, and an image whose bitmap has
+quietly lost dirty bits passes it and then under-copies. A check that cannot
+fail for the reason you care about is worse than none, because it reads as
+reassurance. `-verify` is content-based and runs against a live source, which is
+why it carries this weight instead.
+
+What `-verify` still does not establish: that the tracking is right for every
+future interval, only for this one. Over-copying would also pass, which is the
+safe direction.
+
+One run covers **both** routes the engine has: the sweep after the chain drop,
+and the self-healing retry inside `CreateCheckpoint` for when the sweep cannot
+see the bitmap. Which one did the work is a finding about the host, not a detail:
+
+- **the retry** means the sweep could not see the bitmap, so a bitmap made
+  during the running qemu's life is not in the image yet;
+- **the sweep** means it was in the image and the audit could see it.
+
+So the stage prints a `ROUTE:` line, quotes the line from vmsync's own log that
+decided it, and writes an `INFO` row to `results.csv` — which the verdict
+ignores, so it costs nothing and survives into the report. It also prints an
+`EVIDENCE` block (`checkpoint-list` plus the image's bitmaps) before seeding,
+after the seed, after the metadata drop and after the rebuild under test, the
+way stage 22 does. Measured on hardware (2026-10-04): the **retry**.
+
+It **cleans up by adopting and deleting**, not by printing a recipe: a bitmap
+left in the chain's own name space would break every later sync for the pair,
+including the rest of the bench run. A *checkpoint* of that name is the healthy
+end state and is left alone.
 
 ## Files
 
