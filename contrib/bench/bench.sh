@@ -618,7 +618,42 @@ preflight() {
         [ -n "$TARGET_DISK_PATH" ] || warn "TARGET_DISK_PATH is empty -- target disk path resolution (used for tampering) is only reliable when the source has no active external snapshot. Recommended: always set TARGET_DISK_PATH in $CONF."
 
         preflight_bridge_helper
+        preflight_target_vmsync
         log "preflight OK"
+}
+
+# preflight_target_vmsync reports what vmsync is on the TARGET host, which is
+# a different binary from the one this harness runs locally.
+#
+# It needs its own check because of which binary runs what. -promote,
+# -update-role and -release-promotion all act on the domain where it lives, so
+# every failover stage invokes TARGET_VMSYNC_BIN over ssh rather than the local
+# $VMSYNC_BIN -- stages 6, 7, 14 and 16 among them. Stage 6 tests only that the
+# variable is non-empty, and until this function nothing compared its version
+# at all: preflight_bridge_helper compares the local vmsync against the
+# target's vmsync-bridge-helper, a different binary again.
+preflight_target_vmsync() {
+	local vmsync_version target_version
+	# Unset is not this function's business -- stage 6 reports that case
+	# itself, with the remedy, and the other stages skip on it.
+	[ -n "${TARGET_VMSYNC_BIN:-}" ] || return 0
+
+	if ! ssh_host_cmd "$TARGET_HOST" "test -x '$TARGET_VMSYNC_BIN'" >/dev/null 2>&1; then
+		warn "vmsync is not present (or not executable) at $TARGET_VMSYNC_BIN on $TARGET_HOST. The failover stages run vmsync THERE, not here, so stages 6, 7, 14 and 16 will skip or fail. Deploy it, or correct TARGET_VMSYNC_BIN in $CONF."
+		return 0
+	fi
+
+	vmsync_version="$("$VMSYNC_BIN" -version 2>/dev/null | tr -d '[:space:]')"
+	target_version="$(ssh_host_cmd "$TARGET_HOST" "'$TARGET_VMSYNC_BIN' -version" 2>/dev/null | tr -d '[:space:]')"
+
+	if [ -z "$target_version" ]; then
+		warn "vmsync at $TARGET_VMSYNC_BIN on $TARGET_HOST exists but would not report a version, so this harness cannot tell whether the failover stages are testing the build you just made. Check it runs there by hand."
+	elif [ -n "$vmsync_version" ] && [ "$target_version" != "$vmsync_version" ]; then
+		warn "version skew: vmsync is $vmsync_version here but $target_version at $TARGET_VMSYNC_BIN on $TARGET_HOST. The failover stages run the TARGET's binary, so stages 6, 7, 14 and 16 are testing $target_version no matter what was rebuilt here -- and when they fail, the report reads as an engine regression. Rebuild and redeploy to $TARGET_HOST before trusting them."
+	else
+		log "preflight: vmsync $target_version at $TARGET_VMSYNC_BIN on $TARGET_HOST matches vmsync -- the failover stages run the current build"
+	fi
+	return 0
 }
 
 # bridge_helper_path -> the ONE vmsync-bridge-helper path this whole harness
@@ -5600,9 +5635,17 @@ stage_verify_failure() {
 	# the RETURN trap's heal behind it, so a restore that fails cannot turn
 	# into another sub-test failing for a reason that is not its own.
 	verify_failure_refuses_promote_subtest
-	# Stood down here, not left armed: the sub-test puts the role back itself,
-	# and an EXIT trap still armed at this point would fire at the end of the
-	# whole run, long after the heal below has rebuilt this replica.
+	# Run the cleanup, THEN stand the trap down -- the order stages 6, 11 and
+	# 16 all use. Disarming first threw the backstop away one line before the
+	# thing that needs it: `return 0` fires the RETURN trap above, whose
+	# heal_target is a -force-clean, and -force-clean deliberately does not
+	# override the served-live gate. So if 14f promoted and could not put the
+	# role back, that heal is refused and die()s, ending the whole run with
+	# the pair still promoted.
+	# Calling it here costs nothing in the ordinary case: the guard returns
+	# at once unless VF_PROMOTED is still yes, i.e. unless 14f's own way back
+	# failed.
+	verify_failure_promotion_cleanup
 	trap - EXIT
 	return 0
 }
