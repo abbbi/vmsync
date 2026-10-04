@@ -3517,6 +3517,85 @@ func buildCheckpointXML(name, parent string, diskTargets []disk.QcowDisk) string
 	return b.String()
 }
 
+// buildAdoptionXML describes a checkpoint for a bitmap that ALREADY EXISTS,
+// which is what libvirt's REDEFINE wants and buildCheckpointXML above does not
+// provide. Three differences, each one load-bearing.
+//
+// <creationTime> is present, because REDEFINE refuses without it -- "missing
+// creationTime from existing checkpoint". Nothing validates the value, against
+// other checkpoints or against the image, so the caller passes the clock.
+//
+// Disks that do NOT carry the bitmap are named with checkpoint="no" rather than
+// left out, which is what libvirt's own checkpoint dumps do. Claiming a bitmap
+// on a disk that has none would make the delete afterwards fail looking for it,
+// and that delete is the entire point of adopting.
+//
+// No <parent>. This adopts into a chain that has just been dropped, and naming
+// a parent that no longer exists is refused.
+func buildAdoptionXML(name string, creationUnix int64, disks []disk.QcowDisk, carrying []string) string {
+	has := make(map[string]bool, len(carrying))
+	for _, dev := range carrying {
+		has[dev] = true
+	}
+	var b strings.Builder
+	b.WriteString("<domaincheckpoint>\n")
+	b.WriteString("  <name>" + name + "</name>\n")
+	b.WriteString("  <creationTime>" + strconv.FormatInt(creationUnix, 10) + "</creationTime>\n")
+	b.WriteString("  <description>vmsync adopting an orphaned bitmap to remove it</description>\n")
+	b.WriteString("  <disks>\n")
+	for _, d := range disks {
+		if has[d.TargetDev] {
+			b.WriteString("    <disk name=\"" + d.TargetDev + "\" checkpoint=\"bitmap\" bitmap=\"" + name + "\"/>\n")
+			continue
+		}
+		b.WriteString("    <disk name=\"" + d.TargetDev + "\" checkpoint=\"no\"/>\n")
+	}
+	b.WriteString("  </disks>\n")
+	b.WriteString("</domaincheckpoint>")
+	return b.String()
+}
+
+// ClearOrphanBitmap removes a dirty bitmap that outlived its checkpoint from a
+// domain whose images nothing else may write.
+//
+// Adopt, then delete: libvirt accepts a REDEFINE of checkpoint metadata naming
+// an existing bitmap, and an ordinary delete of that checkpoint then has qemu
+// remove the bitmap through its own path. It is the only route that works on a
+// RUNNING domain -- qemu holds the image open, so qemu-img cannot write it, and
+// the alternative is a monitor command issued behind libvirt's back. Verified
+// against libvirt on a running domain and on a paused one, which is the state
+// -reinit -start leaves a source in (contrib/bench stage 22, 2026-10-04).
+//
+// Adoption on its own changes nothing on disk -- it restores a record, nothing
+// more -- so a failure there leaves the orphan exactly as it was found.
+//
+// A failed DELETE is rolled back, metadata-only. That flag is poison in general;
+// it is what creates orphans in the first place, and DeleteCheckpointIfExists
+// refuses to go near it. It is right here for one narrow reason: the record
+// being dropped was created by this function moments ago, so dropping it
+// restores precisely the state this was called in -- an orphaned bitmap with no
+// record -- rather than inventing a new one. Leaving the record instead would
+// have libvirt listing a checkpoint whose bitmap may or may not exist, and the
+// next sync would chain from it.
+func ClearOrphanBitmap(dom *libvirt.Domain, bitmap string, creationUnix int64, disks []disk.QcowDisk, carrying []string) error {
+	cp, err := dom.CreateCheckpointXML(
+		buildAdoptionXML(bitmap, creationUnix, disks, carrying),
+		libvirt.DOMAIN_CHECKPOINT_CREATE_REDEFINE)
+	if err != nil {
+		return fmt.Errorf("adopt orphaned bitmap %s as a checkpoint so it can be deleted: %w", bitmap, err)
+	}
+	defer cp.Free()
+
+	if err := cp.Delete(0); err != nil {
+		if rb := cp.Delete(libvirt.DOMAIN_CHECKPOINT_DELETE_METADATA_ONLY); rb != nil {
+			return fmt.Errorf("delete the checkpoint adopted for bitmap %s: %w -- and the record could not be dropped again either (%v), so libvirt now lists a checkpoint %s whose bitmap state is unknown; check `virsh checkpoint-list` and `qemu-img info` before the next sync",
+				bitmap, err, rb, bitmap)
+		}
+		return fmt.Errorf("delete the checkpoint adopted for bitmap %s, leaving it where it was: %w", bitmap, err)
+	}
+	return nil
+}
+
 func NextCheckpointName(existing []Checkpoint) (name string, parent string, err error) {
 	if len(existing) == 0 {
 		return fmt.Sprintf("%s-%06d", CheckpointPrefix, 1), "", nil
@@ -3595,7 +3674,9 @@ func DeleteCheckpointIfExists(dom *libvirt.Domain, checkpointName string) error 
 	// sync starts its chain again at vmsync-cpt-000001 -- at which point qemu
 	// refuses: "Bitmap already exists: vmsync-cpt-000001". Every subsequent
 	// sync for that pair fails the same way, and nothing in libvirt's view
-	// explains why. Recovery is qemu-img bitmap --remove per disk, by hand.
+	// explains why. Recovery is ClearOrphanBitmap, which gives the record back
+	// and then deletes it properly; or qemu-img bitmap --remove per disk with
+	// the domain shut down, which is all there was before that existed.
 	//
 	// The rule is: checkpoint metadata may only be dropped without its bitmap
 	// when the IMAGE ITSELF is about to be deleted or replaced, which is what

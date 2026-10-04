@@ -1350,6 +1350,17 @@ to leave a complete replica.
 
 ### Stage 22 (`redefine-probe`) — a probe, not a test
 
+> **Answered, 2026-10-04.** The adopt route works on a running domain. libvirt
+> accepts a REDEFINE of checkpoint metadata naming an existing bitmap, and a
+> normal delete of that checkpoint then has qemu remove the bitmap — no
+> `qemu-img`, no raw QMP, no downtime. It works while **paused** too, which is the
+> state `-reinit -start` leaves a source in. The metadata libvirt requires is
+> `<name>`, `<creationTime>` and the disk with `bitmap=NAME`; the `<domain>`
+> definition libvirt's own dumps carry is **not** needed, and nothing validates
+> `creationTime`. Shape 1 (name and disk only) is refused with
+> `missing creationTime from existing checkpoint`. The stage stays, because it is
+> what re-answers this on a different libvirt or qemu.
+
 The only stage here that grades **libvirt** rather than vmsync. vmsync implements
 none of what it exercises: the stage asks whether a thing *can* be implemented, so
 its answer decides a design rather than grading one. Needs a **running** source,

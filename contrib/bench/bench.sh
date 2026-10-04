@@ -8226,19 +8226,35 @@ stage_redefine_probe() {
 	# -U on the read, which is the documented way to inspect an image another
 	# process has open. It is NOT used on any write below: whether a write is
 	# refused is the first thing being probed.
-	# bitmap_names prints the bitmap names qemu-img reports, one per line.
-	#
-	# Scoped to the bitmaps array, which matters: qemu-img's json also names the
-	# protocol child ({"name": "file"}), so grepping the whole document for
-	# "name" reports a bitmap called "file" that does not exist -- it did, in the
-	# 2026-10-04 hardware run. The array is isolated first, then names are taken
-	# from inside it.
-	bitmap_names() {
+	# bitmap_json prints the image's info once, whitespace stripped, so every
+	# reader below works off the same text and they cannot disagree about what
+	# qemu-img said.
+	bitmap_json() {
 		run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" \
-			"qemu-img info -U --output=json -f qcow2 '$active' 2>/dev/null" 2>/dev/null \
-			| tr -d ' \n' \
+			"qemu-img info -U --output=json -f qcow2 '$active' 2>&1" 2>&1 | tr -d ' \n'
+	}
+
+	# names_in extracts the bitmap names from the json on stdin.
+	#
+	# Two traps, both of which have bitten this stage on hardware.
+	#
+	# Scoped to the bitmaps array, because qemu-img also names the protocol
+	# child ({"name": "file"}): grepping the whole document reported a bitmap
+	# called "file" that does not exist.
+	#
+	# And "flags":[...] is deleted FIRST, because it lives inside each bitmap
+	# object and the [^]]* below stops at the first closing bracket it meets --
+	# the flags array's, not the bitmaps array's. Every in-use bitmap carries
+	# flags, so this failed on exactly the bitmaps that exist: the 2026-10-04
+	# run read "no bitmap of that name" for two qemu-img had listed, and failed
+	# a check over it.
+	names_in() {
+		sed 's/"flags":\[[^]]*\]//g' \
 			| sed -n 's/.*"bitmaps":\[\([^]]*\)\].*/\1/p' \
 			| grep -oE '"name":"[^"]*"' | sed 's/"name":"//; s/"$//'
+	}
+	bitmap_names() {
+		bitmap_json | names_in
 	}
 	bitmap_present() {
 		bitmap_names | grep -qx "$1"
@@ -8267,17 +8283,21 @@ stage_redefine_probe() {
 	# log. A probe that only says PASS or FAIL cannot be acted on when the answer
 	# is surprising, and the answers here are expected to be surprising.
 	raw_bitmaps() {
-		local j
-		j="$(run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" \
-			"qemu-img info -U --output=json -f qcow2 '$active' 2>&1" 2>&1 | tr -d ' \n')"
+		local j n
+		j="$(bitmap_json)"
 		case "$j" in
 		*'"bitmaps"'*)
-			# From inside the array only -- see bitmap_names. The whole document
-			# also names the protocol child, and reporting "file" among the
-			# bitmaps is how this line read in the 2026-10-04 run.
-			printf '%s' "$j" \
-				| sed -n 's/.*"bitmaps":\[\([^]]*\)\].*/\1/p' \
-				| grep -oE '"name":"[^"]*"' | sed 's/"name":"//; s/"$//' | tr '\n' ' '
+			n="$(printf '%s' "$j" | names_in | tr '\n' ' ')"
+			if [ -n "$n" ]; then
+				printf '%s' "$n"
+			else
+				# An array that parsed to nothing is a parser fault, not an
+				# empty image, and saying so is the difference between noticing
+				# that and not: this line printed EMPTY for two bitmaps that
+				# were there, and an empty evidence line reads like good news.
+				printf 'UNPARSED bitmaps array, which is a fault in this stage rather than an answer: %s' \
+					"$(printf '%s' "$j" | sed -n 's/.*\("bitmaps":.\{0,200\}\).*/\1/p')"
+			fi
 			;;
 		*'qemu-img:'*)
 			# Said apart from "no bitmaps", because they are different answers
@@ -8577,11 +8597,24 @@ XML
 			warn "stage 22 LEFT $probe IN $active on $SOURCE_HOST. Nothing here can remove it while the domain runs -- that is the finding. To clear it: shut $SOURCE_DOMAIN down, then 'qemu-img bitmap --remove -f qcow2 $active $probe'. Until then a -reinit of this pair will refuse, naming this bitmap."
 			results_row "$CSV" "$sc" cleanup 1 "" "" "" "" "" "FAIL left $probe behind"
 		elif [ "${visible_live:-}" = no ]; then
-			# A silent clean exit here would be a lie: on this host a leftover
-			# bitmap looks exactly like no bitmap, so the stage cannot certify
-			# that it took its fixture away again.
-			warn "stage 22 cannot confirm it cleaned up: bitmaps in $active are not readable while $SOURCE_DOMAIN runs on $SOURCE_HOST. Check with the domain shut off ('qemu-img info --output=json -f qcow2 $active') and remove $probe by hand if it is there."
-			results_row "$CSV" "$sc" cleanup SKIP "" "" "" "" "" "SKIP cleanup unverifiable while live"
+			# The image cannot answer for a bitmap made during this qemu's
+			# life, so qemu is asked instead. This used to be a bare "cannot
+			# confirm", which was the honest answer only while the stage had no
+			# way to ask -- and it left the operator to check by hand after
+			# every run, including the ones that cleaned up perfectly.
+			local held
+			qemu_holds_probe && held=0 || held=$?
+			case "$held" in
+			1) ;;
+			0)
+				warn "stage 22 LEFT $probe ON $SOURCE_DOMAIN: qemu still holds that bitmap, though $active does not show it. Nothing can remove it while the domain runs -- that is the finding. To clear it: shut $SOURCE_DOMAIN down (which is also what puts it in the image), then 'qemu-img bitmap --remove -f qcow2 $active $probe'."
+				results_row "$CSV" "$sc" cleanup 1 "" "" "" "" "" "FAIL left $probe behind"
+				;;
+			*)
+				warn "stage 22 could not establish whether it left $probe behind on $SOURCE_DOMAIN: neither $active nor qemu gave a usable answer. Check with the domain shut off ('qemu-img info --output=json -f qcow2 $active')."
+				results_row "$CSV" "$sc" cleanup SKIP "" "" "" "" "" "SKIP cleanup unverifiable"
+				;;
+			esac
 		fi
 	}
 

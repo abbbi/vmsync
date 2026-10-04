@@ -26,6 +26,7 @@ import (
 	"vmsync/pkg/disk"
 	"vmsync/pkg/libvirtsync"
 	"vmsync/pkg/remotessh"
+	"vmsync/pkg/trace"
 )
 
 // An ORPHANED BITMAP is a qcow2 dirty bitmap named like one of vmsync's
@@ -145,7 +146,7 @@ func leftoverBitmapRefusal(domain string, byDisk map[string][]string) error {
 
 	return fmt.Errorf(`reinit discarded %s's checkpoint chain, but its disks still carry %d dirty bitmap(s) that no checkpoint accounts for: %s
 
-These are leftovers from a checkpoint whose bitmap outlived its metadata, and they are why the next step would fail with "Bitmap already exists". libvirt cannot see them (virsh checkpoint-list shows nothing) and reinit cannot remove them while the domain is running: qemu holds the image open, so the only live route is a raw QMP block-dirty-bitmap-remove behind libvirt's back, which vmsync will not do to a running guest.
+These are leftovers from a checkpoint whose bitmap outlived its metadata, and they are why the next step would fail with "Bitmap already exists". libvirt cannot see them (virsh checkpoint-list shows nothing) and reinit does not remove them while the domain is running: qemu holds the image open, so qemu-img cannot write it.
 
 Clear them by hand, with the domain shut down:
 
@@ -153,9 +154,26 @@ Clear them by hand, with the domain shut down:
 %s
     virsh start %s
 
-then run this command again. Shutting the domain down and re-running vmsync with -reinit also works -- reinit removes bitmaps itself when the source is offline -- but costs a full sync's worth of downtime rather than a reboot's`,
+then run this command again. Shutting the domain down and re-running vmsync with -reinit also works -- reinit removes bitmaps itself when the source is offline -- but costs a full sync's worth of downtime rather than a reboot's.
+
+There is also a way to do it with NO downtime, which vmsync does not do for you yet: give libvirt back a checkpoint that names the orphaned bitmap, then delete that checkpoint normally so qemu removes the bitmap through its own path. Per bitmap, with TARGET-DEV the disk's target device (vda, sda...):
+
+    cat > /tmp/adopt.xml <<'XML'
+    <domaincheckpoint>
+      <name>BITMAP-NAME</name>
+      <creationTime>SECONDS-SINCE-EPOCH</creationTime>
+      <disks>
+        <disk name='TARGET-DEV' checkpoint='bitmap' bitmap='BITMAP-NAME'/>
+      </disks>
+    </domaincheckpoint>
+    XML
+    virsh checkpoint-create %s --xmlfile /tmp/adopt.xml --redefine
+    virsh checkpoint-delete %s --checkpointname BITMAP-NAME
+
+creationTime is required and its value is not checked against anything. Verified against libvirt on a running domain, and on a paused one`,
 		domain, len(found), strings.Join(found, ", "),
-		domain, strings.Join(fix, "\n"), domain)
+		domain, strings.Join(fix, "\n"), domain,
+		domain, domain)
 }
 
 // orphanBitmaps reports which vmsync-named bitmaps in the images have no libvirt
@@ -170,6 +188,122 @@ then run this command again. Shutting the domain down and re-running vmsync with
 // Which bitmaps are orphaned decides whether a rebuild can proceed, so it is a
 // pure set difference over values already in hand: no libvirt
 // call, no qemu-img, and therefore testable without either.
+// clearOrphanBitmapsOnline removes every vmsync-named bitmap the source still
+// carries that libvirt has no checkpoint for, on a RUNNING domain, by adopting
+// each one and deleting it.
+//
+// Called after the chain drop, which is what makes the set unambiguous:
+// everything libvirt knew about has just been removed the proper way, so a
+// vmsync-named bitmap still in the images is an orphan by definition and there
+// is nothing left for it to collide with.
+//
+// Every orphan is attempted even when one fails, because they are independent
+// and clearing three of four is better than clearing none -- the error names
+// all the failures and the caller refuses on them. Returns how many it removed,
+// so a run that cleared nothing does not read like a run that had nothing to
+// clear.
+//
+// The removal itself arrives as a function so the decisions here -- what to
+// attempt, what cannot be attempted at all, what to say when some of it fails
+// -- are testable without a libvirt connection, which is the only way they get
+// tested at all.
+func clearOrphanBitmapsOnline(domainName string, orphans map[string][]string, disks []disk.QcowDisk, clear func(bitmap string, devs []string) error) (cleared int, err error) {
+	plan, unmapped := adoptionPlan(orphans, disks)
+
+	var failed []string
+	for _, a := range plan {
+		if cerr := clear(a.Bitmap, a.Devs); cerr != nil {
+			failed = append(failed, fmt.Sprintf("%s on %s: %v", a.Bitmap, strings.Join(a.Devs, ","), cerr))
+			continue
+		}
+		cleared++
+		trace.Info("removed an orphaned checkpoint bitmap from a running source by adopting it and deleting the checkpoint",
+			"vm", domainName, "bitmap", a.Bitmap, "disks", strings.Join(a.Devs, ","))
+	}
+
+	// Named, not swallowed: a bitmap in a file the domain does not list cannot
+	// be adopted -- there is no target device to put in the xml -- and reporting
+	// success over it would be a clean sweep of something still sitting there.
+	for path, names := range unmapped {
+		failed = append(failed, fmt.Sprintf("%s in %s, which %s does not list as one of its disks",
+			strings.Join(names, ", "), path, domainName))
+	}
+
+	if len(failed) > 0 {
+		return cleared, fmt.Errorf("could not clear %d orphaned bitmap(s) on %s: %s",
+			len(failed), domainName, strings.Join(failed, "; "))
+	}
+	return cleared, nil
+}
+
+// countBitmaps totals the bitmaps across every disk, for a log line that says
+// how many there are rather than how many disks have some.
+func countBitmaps(byDisk map[string][]string) int {
+	n := 0
+	for _, names := range byDisk {
+		n += len(names)
+	}
+	return n
+}
+
+// adoption is one orphaned bitmap and the disks that carry it, named the way
+// libvirt wants them.
+type adoption struct {
+	Bitmap string
+	// Devs are TARGET devices (vda, sda), not paths. libvirt's checkpoint xml
+	// addresses disks by target device, and the bitmap read addresses them by
+	// file, so something has to translate -- and it has to be the domain's own
+	// definition doing it rather than a guess from the filename.
+	Devs []string
+}
+
+// adoptionPlan turns orphaned bitmaps keyed by disk FILE into one entry per
+// bitmap NAME, carrying the target devices that hold it.
+//
+// Per name rather than per disk, because one adoption covers all of a name's
+// disks at once: a vmsync checkpoint puts the same bitmap name on every disk it
+// covers, so adopting per disk would ask libvirt to redefine the same checkpoint
+// several times and the second call would be refused for already existing.
+//
+// A bitmap on a file the domain does not list is left out, and the caller is
+// expected to notice the count. Adopting it is impossible -- there is no target
+// device to name -- and quietly dropping it would report a clean sweep over a
+// bitmap still sitting there.
+//
+// Sorted, so a run's log and its error messages list the same thing in the same
+// order twice running.
+func adoptionPlan(byDisk map[string][]string, disks []disk.QcowDisk) (plan []adoption, unmapped map[string][]string) {
+	dev := make(map[string]string, len(disks))
+	for _, d := range disks {
+		if d.Source != "" {
+			dev[d.Source] = d.TargetDev
+		}
+	}
+
+	devsFor := map[string][]string{}
+	unmapped = map[string][]string{}
+	for path, names := range byDisk {
+		target, ok := dev[path]
+		if !ok || target == "" {
+			unmapped[path] = append(unmapped[path], names...)
+			continue
+		}
+		for _, name := range names {
+			devsFor[name] = append(devsFor[name], target)
+		}
+	}
+
+	for name, devs := range devsFor {
+		sort.Strings(devs)
+		plan = append(plan, adoption{Bitmap: name, Devs: devs})
+	}
+	sort.Slice(plan, func(i, j int) bool { return plan[i].Bitmap < plan[j].Bitmap })
+	for path := range unmapped {
+		sort.Strings(unmapped[path])
+	}
+	return plan, unmapped
+}
+
 func orphanBitmaps(byDisk map[string][]string, known []string) map[string][]string {
 	k := make(map[string]bool, len(known))
 	for _, name := range known {

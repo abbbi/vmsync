@@ -1499,6 +1499,54 @@ func TestBuildCheckpointXML(t *testing.T) {
 	})
 }
 
+// The adoption xml is what libvirt accepts for a bitmap that already exists,
+// and every assertion here is something a hardware run proved it needs or
+// refuses (contrib/bench stage 22, 2026-10-04).
+func TestBuildAdoptionXML(t *testing.T) {
+	disks := []disk.QcowDisk{{TargetDev: "vda"}, {TargetDev: "vdb"}}
+
+	t.Run("creationTime is present, because REDEFINE refuses without it", func(t *testing.T) {
+		xmlStr := buildAdoptionXML("vmsync-cpt-000001", 1791119945, disks, []string{"vda"})
+		if !strings.Contains(xmlStr, "<creationTime>1791119945</creationTime>") {
+			t.Errorf("expected the creation time, got: %s", xmlStr)
+		}
+	})
+
+	t.Run("only the disks that carry the bitmap claim it", func(t *testing.T) {
+		xmlStr := buildAdoptionXML("vmsync-cpt-000001", 1, disks, []string{"vda"})
+		if !strings.Contains(xmlStr, `name="vda" checkpoint="bitmap" bitmap="vmsync-cpt-000001"`) {
+			t.Errorf("expected vda to claim the bitmap, got: %s", xmlStr)
+		}
+		// vdb has no such bitmap, so claiming one there would make the delete
+		// that follows fail looking for it -- and that delete is the point.
+		if !strings.Contains(xmlStr, `name="vdb" checkpoint="no"`) {
+			t.Errorf("expected vdb to be named with checkpoint=no, got: %s", xmlStr)
+		}
+		if strings.Contains(xmlStr, `name="vdb" checkpoint="bitmap"`) {
+			t.Errorf("vdb claims a bitmap it does not have: %s", xmlStr)
+		}
+	})
+
+	t.Run("a bitmap on every disk is claimed on every disk", func(t *testing.T) {
+		xmlStr := buildAdoptionXML("vmsync-cpt-000002", 1, disks, []string{"vda", "vdb"})
+		for _, dev := range []string{"vda", "vdb"} {
+			if !strings.Contains(xmlStr, `name="`+dev+`" checkpoint="bitmap" bitmap="vmsync-cpt-000002"`) {
+				t.Errorf("expected %s to claim the bitmap, got: %s", dev, xmlStr)
+			}
+		}
+		if strings.Contains(xmlStr, `checkpoint="no"`) {
+			t.Errorf("a disk was excused when both carry the bitmap: %s", xmlStr)
+		}
+	})
+
+	t.Run("no parent, which a dropped chain cannot supply", func(t *testing.T) {
+		xmlStr := buildAdoptionXML("vmsync-cpt-000001", 1, disks, []string{"vda"})
+		if strings.Contains(xmlStr, "<parent>") {
+			t.Errorf("a parent names a checkpoint that no longer exists: %s", xmlStr)
+		}
+	})
+}
+
 func TestNextCheckpointName(t *testing.T) {
 	t.Run("empty existing produces the first name", func(t *testing.T) {
 		name, parent, err := NextCheckpointName(nil)

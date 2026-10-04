@@ -4370,14 +4370,17 @@ func run(cfg syncConfig) (runErr error) {
 				// images and removes them whether or not libvirt lists them, so
 				// an orphan on a stopped source is cleared a few lines below.
 			default:
-				// Refused HERE, which is the whole point of reading the bitmaps
-				// this early. qemu holds these images open, so neither qemu-img
-				// nor the drop below can take an orphan away, and the audit
-				// after the drop would refuse the same run having already armed
-				// replica_incomplete, undefined the target under -force-clean,
-				// and discarded the source's baseline. Nothing is touched yet.
-				return fmt.Errorf("refusing to rebuild %s: %w", cfg.SourceDomain,
-					leftoverBitmapRefusal(cfg.SourceDomain, orphanBitmaps(preDropBitmaps, checkpointNames(known))))
+				// Said early, not refused. This used to refuse here, because
+				// nothing could clear an orphan from a running source and
+				// stopping before anything was displaced was the kindest
+				// answer available. The adopt-then-delete route after the drop
+				// clears them now, so refusing would be turning away a run that
+				// works -- and the orphans are named up front anyway, while the
+				// replica and the source's baseline are both still intact, so a
+				// run that does go wrong later says what it was dealing with.
+				orphans := orphanBitmaps(preDropBitmaps, checkpointNames(known))
+				trace.Info("the source carries checkpoint bitmaps that libvirt has no checkpoint for; the rebuild will clear them after dropping the chain",
+					"vm", cfg.SourceDomain, "bitmaps", countBitmaps(orphans))
 			}
 		}
 
@@ -4459,24 +4462,81 @@ func run(cfg syncConfig) (runErr error) {
 		// removed everything libvirt knew about.
 		//
 		// Refused rather than worked around. vmsync cannot remove a bitmap from
-		// a running domain's image -- qemu holds it open, and the only live
-		// route is a raw QMP block-dirty-bitmap-remove behind libvirt's back,
-		// which is not a thing this program should be doing to a production
-		// guest's block layer. Choosing a different checkpoint name instead
-		// would let the sync proceed while leaving the orphan to collide again
-		// later, which is how a one-off becomes permanent. An actionable
-		// refusal is the honest answer, and it is a strict improvement on
-		// qemu's message, which names neither the file nor the remedy.
+		// a running domain's image: qemu holds it open, so qemu-img cannot
+		// write it.
+		//
+		// CLEARED, not refused, which is the whole point of a rebuild: -reinit
+		// discards the chain, so it has no business leaving behind the one piece
+		// of it that makes every later sync fail. The orphan is removed by
+		// adopting it -- libvirt takes a REDEFINE of checkpoint metadata naming
+		// an existing bitmap, and an ordinary delete of that checkpoint then has
+		// qemu remove the bitmap through its own path. No qemu-img, no monitor
+		// command behind libvirt's back, and no downtime. Verified against
+		// libvirt on a running domain and on a paused one, which is the state
+		// -reinit -start leaves a source in (contrib/bench stage 22).
+		//
+		// A shut-down source needs none of this: dropCheckpointsOffline removes
+		// the bitmaps itself with qemu-img, orphaned or not, because it can.
+		//
+		// The refusal stays for what cannot be cleared, and it is still a strict
+		// improvement on qemu's own message, which names neither the file nor
+		// the remedy. Letting the sync proceed on an orphan instead -- by
+		// choosing a different checkpoint name, say -- would leave it to collide
+		// again later, which is how a one-off becomes permanent.
 		leftover, err := leftoverCheckpointBitmaps(ctx, sourceNeedsSSH, sourceSSHClient, qcowDisks)
-		if err != nil {
+		switch {
+		case err != nil:
 			// Not fatal on its own: this is a check, and failing to RUN the
 			// check is not evidence that anything is wrong. The sync proceeds
 			// and, if there really is an orphan, fails a moment later with
 			// qemu's own error -- which is where it stood before this existed.
 			trace.Warning("could not check the source's disks for leftover checkpoint bitmaps after discarding the chain; if this sync fails with \"Bitmap already exists\", that is why",
 				"vm", cfg.SourceDomain, "error", err)
-		} else if refusal := leftoverBitmapRefusal(cfg.SourceDomain, leftover); refusal != nil {
-			return refusal
+		case len(leftover) == 0:
+		default:
+			srcActive, activeErr := libvirtsync.DomainActive(srcDom)
+			switch {
+			case activeErr != nil:
+				trace.Warning("could not tell whether the source is running, so its leftover checkpoint bitmaps were left alone",
+					"vm", cfg.SourceDomain, "error", activeErr)
+				if refusal := leftoverBitmapRefusal(cfg.SourceDomain, leftover); refusal != nil {
+					return refusal
+				}
+			case !srcActive:
+				// The offline drop above already removes bitmaps with qemu-img,
+				// so anything still here survived that and is not something
+				// another attempt at the same thing will fix.
+				if refusal := leftoverBitmapRefusal(cfg.SourceDomain, leftover); refusal != nil {
+					return refusal
+				}
+			default:
+				trace.Info("the source still carries checkpoint bitmaps that no checkpoint accounts for; clearing them",
+					"vm", cfg.SourceDomain, "bitmaps", countBitmaps(leftover))
+				// One clock reading for the whole sweep: the value is only
+				// there because REDEFINE demands the element, and nothing
+				// validates it, so every adoption may share it.
+				adoptedAt := time.Now().Unix()
+				cleared, clearErr := clearOrphanBitmapsOnline(cfg.SourceDomain, leftover, qcowDisks,
+					func(bitmap string, devs []string) error {
+						return libvirtsync.ClearOrphanBitmap(srcDom, bitmap, adoptedAt, qcowDisks, devs)
+					})
+				if clearErr != nil {
+					return fmt.Errorf("refusing to rebuild %s: %w", cfg.SourceDomain, clearErr)
+				}
+				trace.Info("cleared the source's orphaned checkpoint bitmaps", "vm", cfg.SourceDomain, "removed", cleared)
+
+				// Re-read rather than trust the removals. Everything after this
+				// assumes the source's bitmap namespace is empty, and the first
+				// thing that finds out otherwise is qemu refusing the sync's own
+				// checkpoint with the error this exists to prevent.
+				after, afterErr := leftoverCheckpointBitmaps(ctx, sourceNeedsSSH, sourceSSHClient, qcowDisks)
+				if afterErr != nil {
+					trace.Warning("could not re-read the source's disks after clearing its orphaned bitmaps; if this sync fails with \"Bitmap already exists\", that is why",
+						"vm", cfg.SourceDomain, "error", afterErr)
+				} else if refusal := leftoverBitmapRefusal(cfg.SourceDomain, after); refusal != nil {
+					return refusal
+				}
+			}
 		}
 
 		// Deliberately NOT undefining the target domain anywhere in this block.
