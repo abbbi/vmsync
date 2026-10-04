@@ -1499,6 +1499,52 @@ func TestBuildCheckpointXML(t *testing.T) {
 	})
 }
 
+// The name has to come out of qemu's own words, because libvirt's wrapper
+// around them is translated server-side on a non-English daemon -- the French
+// form below is verbatim from the host this was found on.
+func TestCollidingBitmap(t *testing.T) {
+	for _, tc := range []struct {
+		what string
+		err  error
+		want string
+		ok   bool
+	}{
+		{
+			what: "the plain qemu refusal",
+			err:  errors.New("internal error: Unable to execute QEMU command 'transaction': Bitmap already exists: vmsync-cpt-000001"),
+			want: "vmsync-cpt-000001", ok: true,
+		},
+		{
+			what: "a daemon that translates its own half",
+			err:  errors.New("erreur interne : Impossible d'executer la commande QEMU 'transaction' : Bitmap already exists: vmsync-cpt-099001"),
+			want: "vmsync-cpt-099001", ok: true,
+		},
+		{
+			what: "a name followed by a full stop",
+			err:  errors.New("Bitmap already exists: vmsync-cpt-000007."),
+			want: "vmsync-cpt-000007", ok: true,
+		},
+		{
+			what: "a name in the middle of a sentence",
+			err:  errors.New("Bitmap already exists: vmsync-cpt-000003 on vda"),
+			want: "vmsync-cpt-000003", ok: true,
+		},
+		{what: "any other failure", err: errors.New("cannot delete checkpoint for inactive domain")},
+		{what: "the marker with nothing after it", err: errors.New("Bitmap already exists:")},
+		{what: "no error at all", err: nil},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			got, ok := collidingBitmap(tc.err)
+			if ok != tc.ok {
+				t.Fatalf("collidingBitmap ok=%v, want %v (got name %q)", ok, tc.ok, got)
+			}
+			if got != tc.want {
+				t.Errorf("collidingBitmap = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // The adoption xml is what libvirt accepts for a bitmap that already exists,
 // and every assertion here is something a hardware run proved it needs or
 // refuses (contrib/bench stage 22, 2026-10-04).

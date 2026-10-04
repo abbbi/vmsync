@@ -3465,12 +3465,104 @@ func parseCheckpointXML(name, desc string) Checkpoint {
 }
 
 func CreateCheckpoint(dom *libvirt.Domain, checkpointName, parent string, diskTargets []disk.QcowDisk) error {
-	xmlBody := buildCheckpointXML(checkpointName, parent, diskTargets)
-	cp, err := dom.CreateCheckpointXML(xmlBody, 0)
+	err := createCheckpointOnce(dom, checkpointName, parent, diskTargets)
+	if err == nil {
+		return nil
+	}
+
+	// SELF-HEALING, for one specific refusal and nothing else.
+	//
+	// "Bitmap already exists" means the images carry a bitmap of the name this
+	// checkpoint wants, left by a run whose metadata was dropped without it.
+	// Before this, every sync for the pair failed here forever and the operator
+	// had to go and remove the bitmap by hand. The bitmap is vmsync's own, the
+	// name is one vmsync chose, and there is now a way to remove it on a
+	// running domain -- so the honest thing is to clear it and carry on rather
+	// than to keep failing at the same place with the same advice.
+	//
+	// It is worth doing HERE as well as in -reinit because -reinit cannot
+	// always see it: the orphan audit reads the qcow2 bitmap directory, which
+	// does not carry a bitmap created during the current qemu's life. qemu
+	// refusing this create is the one moment the collision is certain.
+	//
+	// Once, never in a loop. A second identical refusal means the clearing did
+	// not do what it reported, and retrying that forever is how a sync hangs
+	// instead of failing.
+	stale, ok := collidingBitmap(err)
+	if !ok || stale != checkpointName || !IsManagedCheckpointName(stale) {
+		// Some other collision, or a name vmsync did not choose. Not ours to
+		// delete, whatever qemu thinks of it.
+		return err
+	}
+
+	// Every disk this checkpoint covers, because the error names the bitmap and
+	// not the disks it is on, and the orphan was made by a run checkpointing
+	// this same set. A disk that turns out not to carry it makes the DELETE
+	// fail, not the adoption, and ClearOrphanBitmap rolls that back to exactly
+	// this state -- so the wrong guess costs a failed sync, which is what was
+	// already happening, and not a wedged checkpoint record.
+	devs := make([]string, 0, len(diskTargets))
+	for _, d := range diskTargets {
+		devs = append(devs, d.TargetDev)
+	}
+	trace.Warning("qemu refused this checkpoint because the images already carry a bitmap of the same name, left by a run whose checkpoint metadata was dropped without it; adopting that bitmap so it can be deleted, then trying once more",
+		"checkpoint", checkpointName, "bitmap", stale, "disks", strings.Join(devs, ","))
+	if cerr := ClearOrphanBitmap(dom, stale, time.Now().Unix(), diskTargets, devs); cerr != nil {
+		return fmt.Errorf("%w -- and the orphaned bitmap of that name could not be cleared either: %v", err, cerr)
+	}
+	if again := createCheckpointOnce(dom, checkpointName, parent, diskTargets); again != nil {
+		return fmt.Errorf("%w -- the orphaned bitmap of that name was cleared and the checkpoint was refused again: %v", err, again)
+	}
+	trace.Info("cleared an orphaned bitmap of the same name and created the checkpoint",
+		"checkpoint", checkpointName, "bitmap", stale)
+	return nil
+}
+
+func createCheckpointOnce(dom *libvirt.Domain, checkpointName, parent string, diskTargets []disk.QcowDisk) error {
+	cp, err := dom.CreateCheckpointXML(buildCheckpointXML(checkpointName, parent, diskTargets), 0)
 	if err != nil {
 		return fmt.Errorf("create checkpoint %s: %w", checkpointName, err)
 	}
 	return cp.Free()
+}
+
+// collidingBitmap pulls the bitmap name out of qemu's refusal to create a
+// checkpoint over one that already exists, reporting false for any other error.
+//
+// Matched on QEMU's words, not libvirt's. libvirtd formats its own messages
+// server-side in the daemon's locale, so on a non-English host the wrapper
+// around this arrives translated -- "erreur interne : Impossible d'executer la
+// commande QEMU 'transaction' : Bitmap already exists: vmsync-cpt-000001" was
+// the observed form. The qemu half comes through untranslated because libvirt
+// appends it verbatim, which is why the test is on that half and why it must
+// stay on that half.
+//
+// The LAST occurrence, so a message that quotes an earlier one cannot shift the
+// answer to a name from further back in the text.
+func collidingBitmap(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	const marker = "Bitmap already exists:"
+	msg := err.Error()
+	i := strings.LastIndex(msg, marker)
+	if i < 0 {
+		return "", false
+	}
+	// Leading space first, THEN the cut. qemu writes ": NAME", so cutting at
+	// the first space without trimming one finds the space it just skipped
+	// past and returns nothing at all.
+	name := strings.TrimLeft(msg[i+len(marker):], " \t")
+	// Up to whatever ends it: libvirt has been seen to append nothing, and a
+	// future version wrapping the name in a sentence must not widen it.
+	if cut := strings.IndexAny(name, " \t\r\n\"',;)"); cut >= 0 {
+		name = name[:cut]
+	}
+	name = strings.Trim(name, ".\"'")
+	if name == "" {
+		return "", false
+	}
+	return name, true
 }
 
 // CreateVerifyWindowCheckpoint is GONE, deliberately, and this note stands
