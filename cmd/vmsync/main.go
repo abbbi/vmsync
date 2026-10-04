@@ -725,62 +725,29 @@ func main() {
 	// them has no meaning, and quietly running one of them would be a poor
 	// way to find that out.
 	{
-		var chosen []string
-		for _, m := range []struct {
-			on   bool
-			name string
-		}{
-			{cfg.Promote, "-promote"},
-			{cfg.Invert, "-invert"},
-			{cfg.ShutdownDomain, "-shutdown-domain"},
-			{cfg.FenceDomain, "-fence-domain"},
-			{cfg.ReadFence, "-read-fence"},
-			{cfg.UpdateRole != "", "-update-role"},
-			{cfg.ReleasePromotion, "-" + libvirtsync.FlagReleasePromotion},
-			{cfg.BreakTargetLock, "-break-target-lock"},
-			{cfg.ListRestorePoints, "-list-restore-points"},
-			{cfg.CloneRestorePoint != "", "-clone-restore-point"},
-			{cfg.RestoreRestorePoint != "", "-restore-restore-point"},
-			{cfg.ExplainDomain != "", "-explain-domain"},
-		} {
+		var chosen []cliMode
+		var chosenNames []string
+		for _, m := range cliModes(cfg) {
 			if m.on {
-				chosen = append(chosen, m.name)
+				chosen = append(chosen, m)
+				chosenNames = append(chosenNames, m.name)
 			}
 		}
 		if len(chosen) > 1 {
-			trace.Error("conflicting modes", "error", fmt.Errorf("%s cannot be combined; each is a separate operation", strings.Join(chosen, " and ")))
+			trace.Error("conflicting modes", "error", fmt.Errorf("%s cannot be combined; each is a separate operation", strings.Join(chosenNames, " and ")))
 			os.Exit(2)
 		}
 
-		if len(chosen) == 1 && chosen[0] != "-update-role" {
+		// On the handler, never on the name: a mode with no handler is one
+		// handled by its own block below (modesHandledInline), and one that
+		// reaches here with neither would exit 0 having done nothing. See
+		// cliMode.
+		if len(chosen) == 1 && chosen[0].run != nil {
 			trace.SetDebug(cfg.Debug)
 			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
 
-			var err error
-			switch {
-			case cfg.Promote:
-				err = runPromote(ctx, cfg)
-			case cfg.Invert:
-				err = runInvert(ctx, cfg)
-			case cfg.ShutdownDomain:
-				err = runShutdownDomain(ctx, cfg)
-			case cfg.FenceDomain:
-				err = runFenceDomain(ctx, cfg)
-			case cfg.ReadFence:
-				err = runReadFence(cfg)
-			case cfg.ListRestorePoints:
-				err = runListRestorePoints(ctx, cfg)
-			case cfg.CloneRestorePoint != "":
-				err = runCloneRestorePoint(ctx, cfg, cfg.CloneRestorePoint, cfg.CloneRestorePointTo)
-			case cfg.RestoreRestorePoint != "":
-				err = runRestoreRestorePoint(ctx, cfg, cfg.RestoreRestorePoint)
-			case cfg.ExplainDomain != "":
-				err = runExplainDomain(cfg, cfg.ExplainDomain)
-			case cfg.BreakTargetLock:
-				err = runBreakTargetLock(ctx, cfg)
-			}
-			if err != nil {
+			if err := chosen[0].run(ctx); err != nil {
 				// Nothing was done, so this must not read as a failure. The
 				// caller most likely to care is the agent: a terminal result
 				// burns the operation's id permanently, and "another vmsync
@@ -790,7 +757,7 @@ func main() {
 						"vm", cfg.TargetDomain, "error", err)
 					os.Exit(util.ExitBusy)
 				}
-				trace.Error(strings.TrimPrefix(chosen[0], "-"), "error", err)
+				trace.Error(strings.TrimPrefix(chosen[0].name, "-"), "error", err)
 				os.Exit(1)
 			}
 			os.Exit(0)
