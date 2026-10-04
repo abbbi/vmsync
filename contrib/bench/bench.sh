@@ -375,7 +375,8 @@ the probe name is free is then confirmed with qemu rather than with the image, s
 a bitmap made during the running qemu's life need not be in the image at all.
 
 Stage 23 (reinit-orphan) checks that vmsync does what stage 22 proved it CAN do: it
-seeds a sync, drops libvirt's record of the checkpoint it made -- so the orphan is on
+seeds a -reinit (a plain full sync refuses to overwrite a target disk that is already
+there), drops libvirt's record of the checkpoint it made -- so the orphan is on
 every disk vmsync manages, as a real one is -- and runs a plain -reinit over it. The
 planted name is vmsync-cpt-000001 deliberately -- the name the rebuild's own new chain
 takes -- so the orphan is a real collision rather than a bitmap sitting out of the way,
@@ -9223,9 +9224,16 @@ stage_reinit_orphan() {
 	# single-disk domain that difference never shows; the pair this was written
 	# against has two.
 	#
-	# It also fixes the name by construction: a full sync's chain starts at
+	# It also fixes the name by construction: a rebuilt chain starts at
 	# vmsync-cpt-000001, which is the name the -reinit below will want.
-	run_vmsync "$sc" seed
+	#
+	# -reinit for the SEED too, not a plain sync. A plain full sync refuses to
+	# overwrite a target disk that already exists -- deliberately, since
+	# overwriting one is destructive -- so seeding that way stood down on any
+	# pair that already had a replica, which is every pair this stage would ever
+	# run against. -reinit displaces the existing disks first, according to
+	# -replaced-disk-action, and that is the only thing here that may do so.
+	run_vmsync "$sc" seed -reinit
 	if [ "$RUN_RC" != 0 ]; then
 		warn "SKIP $sc: the seeding sync failed (exit $RUN_RC), so there is no checkpoint to orphan and nothing below would be testing anything. $(log_reason "$RUN_LOG")"
 		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP seeding sync failed"
