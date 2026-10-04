@@ -1069,7 +1069,7 @@ func forceCleanTargetDomain(tgtMgr *libvirtsync.Manager, cfg syncConfig) error {
 // whichever of the two mechanisms that domain's state actually permits.
 //
 // The distinction is not cosmetic. A checkpoint IS a persistent bitmap in the
-// qcow2, and deleting one properly means merging its bitmap into the next --
+// qcow2, and deleting one properly has qemu remove its bitmap --
 // which only a live qemu can do. Against a shut-down domain libvirt simply
 // refuses: "cannot delete checkpoint for inactive domain".
 //
@@ -1083,7 +1083,7 @@ func dropCheckpointChain(dom *libvirt.Domain, domainName, uri, verb string) erro
 		return fmt.Errorf("determine whether %s is running: %w", domainName, err)
 	}
 	if active {
-		// Running: libvirt merges each bitmap into the next as it deletes,
+		// Running: libvirt has qemu remove each bitmap as it deletes,
 		// which is the proper job and needs nothing from us.
 		return libvirtsync.DeleteAllManagedCheckpoints(dom)
 	}

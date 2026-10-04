@@ -3659,7 +3659,34 @@ func buildAdoptionXML(name string, creationUnix int64, disks []disk.QcowDisk, ca
 // -reinit -start leaves a source in (contrib/bench stage 22, 2026-10-04).
 //
 // Adoption on its own changes nothing on disk -- it restores a record, nothing
-// more -- so a failure there leaves the orphan exactly as it was found.
+// more -- so a failure there leaves the orphan exactly as it was found. A
+// REDEFINE issues no QMP command at all; it writes one file under libvirt's
+// checkpointDir. (VIR_DOMAIN_CHECKPOINT_CREATE_REDEFINE_VALIDATE exists
+// precisely to make libvirt go and check the images, and this does not pass it.)
+//
+// WHY DISCARDING THE ORPHAN'S DIRTY BITS LOSES NOTHING, which is the question
+// to ask of this and the one that is not obvious.
+//
+// Every checkpoint's bitmap records independently and continuously. Creating a
+// checkpoint emits one block-dirty-bitmap-add per disk and does NOT disable the
+// parent's bitmap (libvirt v10.10.0, qemuCheckpointAddActions, which passes
+// disabled=false and touches no other bitmap), so the bitmap of the last
+// checkpoint the target accepted still covers everything the guest has written
+// since, including everything an orphan also recorded. The orphan's bits are
+// therefore a subset of bits that survive it, and removing them cannot shorten
+// a later incremental.
+//
+// Had the opposite been true -- had creating a checkpoint frozen its
+// predecessor -- discarding an orphan named tip+1 WOULD have dropped the window
+// it alone recorded, and a later incremental from the tip would have silently
+// copied too little. That is a real failure mode in a tool that gets this
+// wrong, so the premise is named here rather than left implicit.
+//
+// Nor does the delete merge anything into a neighbour: libvirt's checkpoint
+// delete emits only block-dirty-bitmap-remove actions, for every disk, in ONE
+// qemuMonitorTransaction (same file, qemuCheckpointDiscardBitmaps) -- so it is
+// also atomic across disks, and cannot half-remove a multi-disk set. The
+// adopted record is parentless and childless in any case.
 //
 // A failed DELETE is rolled back, metadata-only. That flag is poison in general;
 // it is what creates orphans in the first place, and DeleteCheckpointIfExists
@@ -3756,8 +3783,8 @@ func DeleteCheckpointIfExists(dom *libvirt.Domain, checkpointName string) error 
 
 	// NEVER metadata-only. It was tried here and it corrupts the pair.
 	//
-	// Deleting a checkpoint means merging its dirty bitmap into the next one,
-	// which qemu only does live -- so on an inactive domain libvirt refuses
+	// Deleting a checkpoint has qemu remove its dirty bitmap, which it only
+	// does live -- so on an inactive domain libvirt refuses
 	// with VIR_ERR_OPERATION_UNSUPPORTED, "cannot delete checkpoint for
 	// inactive domain". VIR_DOMAIN_CHECKPOINT_DELETE_METADATA_ONLY gets past
 	// that refusal by dropping libvirt's RECORD of the checkpoint and leaving
@@ -3798,7 +3825,7 @@ func DeleteCheckpointIfExists(dom *libvirt.Domain, checkpointName string) error 
 // showing nothing that would explain it.
 //
 // It is exported only because an offline domain gives no alternative: deleting
-// a checkpoint properly merges its bitmap into the next one, and only a running
+// a checkpoint properly has qemu remove its bitmap, and only a running
 // qemu can do that. The offline equivalent is this plus disk.RemoveBitmap for
 // every bitmap on every disk, and the CALLER MUST DO BOTH.
 //

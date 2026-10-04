@@ -1655,8 +1655,8 @@ func planCheckpointRecovery(pending, lastAccepted string, existing []libvirtsync
 		return "", nil
 	}
 
-	// Only ever the TIP. Deleting the newest checkpoint merges its bitmap
-	// into the active tracking, which is exactly the state before it
+	// Only ever the TIP. Deleting the newest checkpoint removes its bitmap
+	// and leaves the chain exactly as it was before that checkpoint
 	// existed. Deleting a mid-chain one is a different operation that later
 	// checkpoints depend on, and reaching here with something newer means
 	// the chain advanced past a checkpoint the target never accepted --
@@ -4432,7 +4432,7 @@ func run(cfg syncConfig) (runErr error) {
 		}
 		// Via dropCheckpointChain rather than DeleteAllManagedCheckpoints
 		// directly, so this works on a SHUT-DOWN source too. Deleting a
-		// checkpoint merges its bitmap into the next one, which only a running
+		// checkpoint has qemu remove its bitmap, which only a running
 		// qemu can do -- so a reinit of a stopped source would otherwise fail
 		// here with libvirt's "cannot delete checkpoint for inactive domain",
 		// and stopping the source, reinitialising and promoting is a
@@ -4889,13 +4889,13 @@ func run(cfg syncConfig) (runErr error) {
 		//
 		// The realistic failure is a source domain that is not running.
 		// DeleteCheckpointIfExists is deliberately never metadata-only, so
-		// the delete needs qemu to merge the dirty bitmap, and libvirt
+		// the delete needs qemu to remove the dirty bitmap, and libvirt
 		// refuses that on an inactive domain. There is no safe fallback --
 		// dropping the metadata alone is precisely what leaves an orphaned
 		// bitmap and makes every later sync fail with "Bitmap already
 		// exists" -- so name the remedy instead of improvising one.
 		if err := libvirtsync.DeleteCheckpointIfExists(srcDom, orphan); err != nil {
-			return fmt.Errorf("cannot remove checkpoint %s, which the source holds but the target never accepted: %w -- deleting it merges its dirty bitmap, which qemu only does while the domain is RUNNING, so start %s and sync again, or use -force-clean to clear the chain and recopy in full. Do not delete the checkpoint metadata by hand: without its bitmap every later sync fails with \"Bitmap already exists\"",
+			return fmt.Errorf("cannot remove checkpoint %s, which the source holds but the target never accepted: %w -- deleting it removes its dirty bitmap, which qemu only does while the domain is RUNNING, so start %s and sync again, or use -force-clean to clear the chain and recopy in full. Do not delete the checkpoint metadata by hand: without its bitmap every later sync fails with \"Bitmap already exists\"",
 				orphan, err, cfg.SourceDomain)
 		}
 

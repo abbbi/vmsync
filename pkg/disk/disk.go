@@ -245,7 +245,7 @@ func ResolveRootSource(chain []QemuImgInfo, source string) string {
 // image, in the order it reported them.
 //
 // These are what a libvirt checkpoint actually IS on disk. Deleting a
-// checkpoint normally merges its bitmap into the next one, which only qemu can
+// checkpoint normally has qemu remove its bitmap, which only qemu can
 // do and only while the domain runs -- so an offline domain's checkpoints can
 // only be removed by dropping libvirt's metadata and then deleting these by
 // hand. Getting that pair out of step is what leaves an image that refuses

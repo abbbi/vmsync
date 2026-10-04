@@ -759,10 +759,10 @@ func TestPlanCheckpointRecovery(t *testing.T) {
 		}
 	})
 
-	// Only ever the tip. Deleting the newest merges its bitmap into the
-	// active tracking, which is exactly the state before it existed;
-	// deleting a mid-chain one is a different operation that later
-	// checkpoints depend on.
+	// Only ever the tip. Deleting the newest removes its bitmap and leaves
+	// the chain as it was before that checkpoint existed; deleting a
+	// mid-chain one is a different operation that later checkpoints
+	// depend on.
 	t.Run("pending is mid-chain -> refuse rather than improvise", func(t *testing.T) {
 		got, err := planCheckpointRecovery(
 			"vmsync-cpt-000002", "vmsync-cpt-000001",
