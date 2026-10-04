@@ -1545,6 +1545,76 @@ func TestCollidingBitmap(t *testing.T) {
 	}
 }
 
+// Which path DefineDomain takes decides whether the replica spends a moment
+// with no definition at all, so the decision is tested on its own.
+func TestPlanDefine(t *testing.T) {
+	const u1 = "8dc86d0b-bd8c-4c62-a826-21b8aecb8391"
+	const u2 = "11111111-2222-3333-4444-555555555555"
+
+	for _, tc := range []struct {
+		what        string
+		exists      bool
+		targetUUID  string
+		sourceUUID  string
+		checkpoints int
+		want        definePlan
+	}{
+		{
+			what:   "no target yet -- nothing to preserve",
+			exists: false, want: definePlanFresh,
+		},
+		{
+			what:   "same uuid, no checkpoints -- the atomic case, and the common one",
+			exists: true, targetUUID: u1, sourceUUID: u1, want: definePlanInPlace,
+		},
+		{
+			what:   "same uuid in different case -- still the same identity",
+			exists: true, targetUUID: strings.ToUpper(u1), sourceUUID: u1, want: definePlanInPlace,
+		},
+		{
+			// vmsync keeps the source's UUID on purpose, so this is the case
+			// that genuinely needs the destructive path.
+			what:   "uuid mismatch -- libvirt will not overwrite through it",
+			exists: true, targetUUID: u2, sourceUUID: u1, want: definePlanUndefine,
+		},
+		{
+			// An inverted pair's new target still carries the chain from its
+			// time as a source, and only an undefine clears it.
+			what:   "checkpoints present -- only an undefine clears them",
+			exists: true, targetUUID: u1, sourceUUID: u1, checkpoints: 3, want: definePlanUndefine,
+		},
+		{
+			what:   "neither document names a uuid -- equal, but not an identity",
+			exists: true, targetUUID: "", sourceUUID: "", want: definePlanUndefine,
+		},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			got, reason := planDefine(tc.exists, tc.targetUUID, tc.sourceUUID, tc.checkpoints)
+			if got != tc.want {
+				t.Errorf("planDefine = %v, want %v (reason given: %q)", got, tc.want, reason)
+			}
+			if reason == "" {
+				t.Error("no reason given; it is logged and belongs in the run's record")
+			}
+		})
+	}
+}
+
+func TestDomainUUIDFromXML(t *testing.T) {
+	const u = "8dc86d0b-bd8c-4c62-a826-21b8aecb8391"
+	if got := domainUUIDFromXML(`<domain type='kvm'><name>a</name><uuid>` + u + `</uuid></domain>`); got != u {
+		t.Errorf("got %q, want %q", got, u)
+	}
+	// Both of these mean "no identity to match on", which planDefine reads as
+	// a reason to take the destructive path rather than as an error.
+	if got := domainUUIDFromXML(`<domain type='kvm'><name>a</name></domain>`); got != "" {
+		t.Errorf("a document with no uuid gave %q, want empty", got)
+	}
+	if got := domainUUIDFromXML(`<domain`); got != "" {
+		t.Errorf("an unparseable document gave %q, want empty", got)
+	}
+}
+
 // The adoption xml is what libvirt accepts for a bitmap that already exists,
 // and every assertion here is something a hardware run proved it needs or
 // refuses (contrib/bench stage 22, 2026-10-04).

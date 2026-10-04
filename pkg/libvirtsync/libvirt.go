@@ -1050,6 +1050,90 @@ func isUUIDCollisionError(err error, domainXML string) bool {
 	return strings.Contains(strings.ToLower(lvErr.Message), strings.ToLower(domcfg.UUID))
 }
 
+// domainUUIDFromXML reads a domain document's UUID, or "" when it has none or
+// the document will not parse.
+//
+// Empty rather than an error: the one caller treats "no identity to match on"
+// as a reason to take the destructive path, which is also the right answer for
+// a document it cannot read.
+func domainUUIDFromXML(domainXML string) string {
+	domcfg := &libvirtxml.Domain{}
+	if err := domcfg.Unmarshal(domainXML); err != nil {
+		return ""
+	}
+	return domcfg.UUID
+}
+
+// definePlan is how the target's definition has to be replaced.
+type definePlan int
+
+const (
+	// definePlanFresh: nothing is there, so there is nothing to preserve and
+	// nothing to undefine.
+	definePlanFresh definePlan = iota
+	// definePlanInPlace: hand libvirt the new document and let it overwrite
+	// the existing definition. ATOMIC, and the point of all this.
+	definePlanInPlace
+	// definePlanUndefine: the destructive path, for the cases libvirt will not
+	// overwrite through or that need the undefine's own side effects.
+	definePlanUndefine
+)
+
+// planDefine decides which of the three it is, from FACTS rather than from
+// libvirt's error prose.
+//
+// The in-place case is not an optimisation, it is the fix for a real defect:
+// the undefine-then-define path has a window in which the replica has no
+// definition at all, and a crash or a dropped connection inside it leaves it
+// that way with the only copy of the previous definition in this process's
+// memory. libvirt will overwrite a persistent definition in place when the
+// NAME and the UUID both match -- "A previous definition for this domain with
+// the same UUID and name would be overridden if it already exists", and
+// virDomainObjListAddLocked reaches virDomainObjAssignDef in exactly that case
+// -- and that write is itself crash-safe, because libvirt persists it by
+// writing <config>.new, fsyncing and renaming. So the common case needs no
+// window at all, and the earlier claim in this file that persistent
+// definitions "can't be replaced in place" was simply wrong.
+//
+// What keeps the destructive path alive is not libvirt refusing to overwrite.
+// It is two things the undefine does that a define does not:
+//
+//   - a UUID mismatch. Same name with a different UUID is refused outright
+//     ("domain '%s' already exists with uuid %s"), and vmsync keeps the
+//     SOURCE's UUID deliberately, so the replica carries the identity of what
+//     it replicates. Adopting the target's UUID instead would make every case
+//     atomic and is NOT done: it would change the replica's guest-visible
+//     SMBIOS UUID, which licensing and activation can be keyed to.
+//   - checkpoints. There is no checkpoint gate anywhere on the define path, so
+//     an in-place define leaves them -- each one embedding a copy of the old
+//     domain definition and naming bitmaps on disks that have just been
+//     replaced. The undefine drops them, which is what the far end of an
+//     inverted pair needs on its first sync in the new direction.
+//
+// Pure, and takes counts rather than handles, so the decision is testable
+// without a libvirt connection.
+func planDefine(exists bool, targetUUID, sourceUUID string, checkpoints int) (definePlan, string) {
+	if !exists {
+		return definePlanFresh, "the target has no definition yet"
+	}
+	// Compared case-insensitively: libvirt accepts either case in the XML and
+	// normalises what it reports, so a document written by hand can differ
+	// from the one libvirt hands back for the same domain.
+	if !strings.EqualFold(strings.TrimSpace(targetUUID), strings.TrimSpace(sourceUUID)) {
+		return definePlanUndefine, "the target's uuid differs from the source's, which libvirt will not overwrite through"
+	}
+	if targetUUID == "" {
+		// Neither document names one. libvirt would assign a random UUID to
+		// the new definition and then refuse it as a name collision with the
+		// old one, so this is not an in-place case however equal the two are.
+		return definePlanUndefine, "neither definition carries a uuid, so there is no identity to match on"
+	}
+	if checkpoints > 0 {
+		return definePlanUndefine, "the target carries checkpoint metadata, which only an undefine clears"
+	}
+	return definePlanInPlace, "name and uuid match and nothing needs clearing"
+}
+
 // DefineDomain (re)defines targetDomainName on target from sourceDomainXML.
 // rootSourceByLiveSource maps each disk's live source path to its resolved
 // backing-chain root file (see disk.QcowDisk.RootSource) -- passed straight
@@ -1073,11 +1157,13 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 	}
 
 	var originalXML string
+	var existingUUID string
+	var checkpointCount int
+	var d *libvirt.Domain
 	if exists {
-		trace.Info("Undefining domain on target system", "vm", targetDomainName)
-		d, err := target.Conn.LookupDomainByName(targetDomainName)
+		d, err = target.Conn.LookupDomainByName(targetDomainName)
 		if err != nil {
-			return fmt.Errorf("look up existing target domain %s for undefine: %w", targetDomainName, err)
+			return fmt.Errorf("look up existing target domain %s: %w", targetDomainName, err)
 		}
 		defer d.Free()
 		// Captured before undefining -- see rollback below. Failing to even
@@ -1121,35 +1207,71 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 		if active {
 			return fmt.Errorf("target domain %s is running, refusing to undefine/redefine its persistent definition while active -- shut it down before syncing", targetDomainName)
 		}
-		// KEEP_NVRAM: vmsync never copies or manages a domain's NVRAM/
-		// varstore file itself (see DetectNvram -- it only checks the file
-		// already exists on the target and warns if not), so undefining
-		// here must not delete it out from under whatever provisioned it.
-		// Undefine() (no flags) unconditionally refuses to undefine any
-		// domain that has an NVRAM file present at all, which is exactly
-		// why a plain Undefine() fails here -- silently, if the error is
-		// swallowed -- for every UEFI/OVMF target domain.
-		// CHECKPOINTS_METADATA is required, not optional: libvirt refuses to
-		// undefine an inactive domain that carries checkpoint metadata
-		// unless it is passed. A target acquires checkpoints whenever it has
-		// previously been a SOURCE -- which is exactly what the far end of
-		// an inverted pair is -- so without this the first sync in the new
-		// direction fails at its very last step, after having already copied
-		// the entire VM. Dropping the checkpoints is correct here anyway:
-		// this domain is being replaced wholesale by the source's
-		// definition, and a chain describing the disks it used to have is
-		// meaningless against the disks it is about to be given.
-		if err := d.UndefineFlags(libvirt.DOMAIN_UNDEFINE_KEEP_NVRAM | libvirt.DOMAIN_UNDEFINE_CHECKPOINTS_METADATA); err != nil {
-			return fmt.Errorf("undefine existing target domain %s: %w", targetDomainName, err)
+
+		// The two refusals below used to be LIBVIRT's, inherited as side
+		// effects of the undefine. The define path has neither, so replacing
+		// an existing definition in place would silently proceed past both --
+		// and in the managed-save case that is worse than the window being
+		// closed. They are made explicit so the behaviour no longer depends on
+		// which path a run happens to take, and so the message names the
+		// remedy rather than leaving libvirt's own wording to explain it.
+		//
+		// MANAGED SAVE is the dangerous one. A managedsave'd domain reports as
+		// SHUT OFF, so the active check above does not catch it, and libvirt
+		// restores from the save image on the next start -- ignoring the
+		// definition just written. The replica would resume the old guest's
+		// RAM, device state and view of its disks on top of disks this run has
+		// just overwritten wholesale.
+		hasSave, saveErr := d.HasManagedSaveImage(0)
+		if saveErr != nil {
+			return fmt.Errorf("check whether target domain %s has a managed save image: %w", targetDomainName, saveErr)
 		}
+		if hasSave {
+			return fmt.Errorf("target domain %s has a managed save image, refusing to redefine it: libvirt would restore that saved RAM and device state on the next start and ignore the definition written here, on top of disks this sync has replaced. Discard it first ('virsh -c <target-uri> managedsave-remove %s'), or start the replica once with --force-boot", targetDomainName, targetDomainName)
+		}
+
+		// SNAPSHOTS: libvirt refuses to undefine an inactive domain that has
+		// snapshot metadata unless DOMAIN_UNDEFINE_SNAPSHOTS_METADATA is
+		// passed, which vmsync does not pass anywhere. So this is today's
+		// behaviour made explicit rather than a new restriction: each snapshot
+		// embeds the replica's old definition and names state in disks that
+		// are being replaced, so leaving them is not an option either.
+		snapshots, snapErr := d.SnapshotNum(0)
+		if snapErr != nil {
+			return fmt.Errorf("count target domain %s's snapshots: %w", targetDomainName, snapErr)
+		}
+		if snapshots > 0 {
+			return fmt.Errorf("target domain %s has %d snapshot(s), refusing to redefine it: each one describes the replica as it was and names state in disks this sync replaces, and reverting to one afterwards would resurrect a definition that no longer matches them. Remove them first ('virsh -c <target-uri> snapshot-delete %s --snapshotname <name> --metadata' for each)", targetDomainName, snapshots, targetDomainName)
+		}
+
+		// Counted, not listed: any checkpoint metadata at all keeps the
+		// destructive path, because an in-place define leaves every one of
+		// them behind. Not ListManagedCheckpoints, which filters to vmsync's
+		// own names -- the undefine refuses on anything, so the plan has to
+		// see anything.
+		cps, cpErr := d.ListAllCheckpoints(0)
+		if cpErr != nil {
+			return fmt.Errorf("count target domain %s's checkpoints: %w", targetDomainName, cpErr)
+		}
+		checkpointCount = len(cps)
+		for i := range cps {
+			_ = cps[i].Free()
+		}
+		existingUUID = domainUUIDFromXML(originalXML)
 	}
+
+	// Set only once the undefine has actually run, which is what rollback
+	// keys on. Not `exists`: on the in-place path nothing is ever undefined,
+	// so a failed define has left the previous definition exactly where it
+	// was, and re-defining it would log a recovery that did not happen.
+	undefined := false
 
 	// rollback restores the target domain to its pre-undefine definition
 	// (best effort) whenever cause is about to make this function return
-	// without having left a valid replacement defined -- a no-op if the
-	// domain didn't already exist, since there's nothing to roll back to.
+	// without having left a valid replacement defined -- a no-op when nothing
+	// was undefined, since there is nothing to roll back to.
 	rollback := func(cause error) error {
-		if !exists {
+		if !undefined {
 			return cause
 		}
 		restored, rbErr := target.Conn.DomainDefineXML(originalXML)
@@ -1206,10 +1328,77 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 		updatedXML = "<vmsync-test-injected-failure>" + updatedXML
 	}
 
+	// Decided HERE, after every rewrite and before anything destructive: the
+	// rewrites can fail, and failing them before the undefine means failing
+	// them with the replica's definition still in place.
+	plan, planReason := planDefine(exists, existingUUID, domainUUIDFromXML(updatedXML), checkpointCount)
+
+	if plan == definePlanUndefine {
+		trace.Info("Undefining domain on target system before redefining it", "vm", targetDomainName, "reason", planReason)
+		// The definition goes into the RUN LOG before it is destroyed, because
+		// the rollback below holds the only other copy and that one is in this
+		// process's memory. A crash or a dropped connection between the
+		// undefine and the define leaves the replica with no definition at
+		// all, and without this there is nothing anywhere to rebuild it from
+		// -- which is the whole of CI-11. The log is not a good store (it is
+		// one line, it is wherever the run's output went, and an operator has
+		// to find and un-wrap it), and it beats nothing by a wide margin. A
+		// durable copy beside the replica's own disks, where restore points
+		// already live, is the better answer and is not built yet.
+		//
+		// Only on this path: the in-place define never destroys anything, so
+		// there is nothing to recover and no reason to put a domain document
+		// in the log on every run.
+		trace.Warning("about to undefine the replica's definition; the previous one follows so it can be recovered if this run dies before redefining it ('virsh -c <target-uri> define <file>' with the xml below)",
+			"vm", targetDomainName, "previous_definition", originalXML)
+		// KEEP_NVRAM: vmsync never copies or manages a domain's NVRAM/
+		// varstore file itself (see DetectNvram -- it only checks the file
+		// already exists on the target and warns if not), so undefining
+		// here must not delete it out from under whatever provisioned it.
+		// Undefine() (no flags) unconditionally refuses to undefine any
+		// domain that has an NVRAM file present at all, which is exactly
+		// why a plain Undefine() fails here -- silently, if the error is
+		// swallowed -- for every UEFI/OVMF target domain.
+		//
+		// KEEP_TPM for the same reason, and it was missing. Without it
+		// libvirt deletes the domain's swtpm state directory
+		// (<swtpmStorageDir>/<uuid>/) on undefine, because a <tpm> backend
+		// with no persistent_state attribute defaults to not persistent. So
+		// every run that took this path destroyed whatever provisioned the
+		// replica's vTPM -- state vmsync does not copy, does not manage, and
+		// had no business removing, exactly as said of NVRAM above. It does
+		// NOT follow that a sealed guest's volumes then open on the replica:
+		// those keys are sealed to the SOURCE's vTPM, which vmsync copies no
+		// more than it did before. This stops destroying the target's.
+		//
+		// CHECKPOINTS_METADATA is required, not optional: libvirt refuses to
+		// undefine an inactive domain that carries checkpoint metadata
+		// unless it is passed. A target acquires checkpoints whenever it has
+		// previously been a SOURCE -- which is exactly what the far end of
+		// an inverted pair is -- so without this the first sync in the new
+		// direction fails at its very last step, after having already copied
+		// the entire VM. Dropping them is correct here: this domain is being
+		// replaced wholesale by the source's definition, and a chain
+		// describing the disks it used to have is meaningless against the
+		// disks it is about to be given. It is also why carrying checkpoints
+		// is one of the two things that keeps a run on this path at all.
+		if err := d.UndefineFlags(libvirt.DOMAIN_UNDEFINE_KEEP_NVRAM |
+			libvirt.DOMAIN_UNDEFINE_KEEP_TPM |
+			libvirt.DOMAIN_UNDEFINE_CHECKPOINTS_METADATA); err != nil {
+			return fmt.Errorf("undefine existing target domain %s: %w", targetDomainName, err)
+		}
+		undefined = true
+	}
+
 	dom, err := target.Conn.DomainDefineXML(updatedXML)
 	if err != nil {
-		// Fallback for cloning into same target where another domain already uses the UUID.
-		if isUUIDCollisionError(err, updatedXML) {
+		// Fallback for cloning into same target where another domain already
+		// uses the UUID -- and only where the name is free for a re-define
+		// under a new one. On the in-place path the target itself holds the
+		// source's UUID, so no other domain can, and stripping it would make
+		// libvirt refuse the retry as a NAME collision instead: a different
+		// error, reported as this one.
+		if plan != definePlanInPlace && isUUIDCollisionError(err, updatedXML) {
 			// Logged as a Warning, not Info: this isn't a routine step --
 			// it means something ELSE on the target host currently claims
 			// the source's own UUID, and the consequence is significant
