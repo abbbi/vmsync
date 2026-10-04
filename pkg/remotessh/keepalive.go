@@ -102,14 +102,38 @@ func keepaliveLoop(stop <-chan struct{}, tick <-chan time.Time, probe func() boo
 				return false
 			}
 		}
+		// Stop again, because the select above does not settle it: when a stop
+		// and a tick are both ready, select picks between them uniformly at
+		// random, so a deliberate close loses that race about half the time.
+		// Losing it means probing a connection somebody is closing on purpose,
+		// failing, and reporting a dead peer -- which closes the connection a
+		// second time and puts "the peer stopped answering keepalives" in the
+		// log of a run that was shutting down cleanly. A phantom network fault
+		// is worse than a late shutdown, since that warning is the signal an
+		// operator is meant to act on.
+		if stopped(stop) {
+			return false
+		}
 		if probe() {
 			missed = 0
 			continue
 		}
 		missed++
 		if missed >= strikes {
-			return true
+			// And a stop that arrived DURING the probe wins too: the verdict is
+			// reached after it, and it is no more true for having been slow.
+			return !stopped(stop)
 		}
+	}
+}
+
+// stopped reports whether stop has been closed, without waiting for it.
+func stopped(stop <-chan struct{}) bool {
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
 	}
 }
 

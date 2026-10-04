@@ -66,13 +66,54 @@ func TestKeepaliveGivesUpOnlyOnAnUnbrokenRun(t *testing.T) {
 // Stopping must not read as a dead peer: closing a client deliberately would
 // otherwise close it again and log that the peer stopped answering.
 
+// A tick is left ready alongside the stop on purpose. That is the case the
+// implementation got wrong: select picks between two ready cases at random, so
+// this failed about half the time it ran -- which is also why it needs -count
+// to be trusted.
 func TestKeepaliveStopIsNotAFailure(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		stop := make(chan struct{})
+		close(stop)
+		tick := make(chan time.Time, 1)
+		tick <- time.Time{}
+		if keepaliveLoop(stop, tick, func() bool { return false }, 1) {
+			t.Fatalf("a stopped prober reported that the peer should be given up on (attempt %d)", i+1)
+		}
+	}
+}
+
+// A stop must also mean "do not probe at all", which suppressing the verdict
+// alone does not give: stopKeepalive WAITS for this goroutine, so a probe begun
+// after the stop can hold a deliberate Close for the full keepalive timeout --
+// ten seconds, and most likely on exactly the dead peer that is being closed
+// because it is dead. Looped because the race it guards is decided by select.
+func TestKeepaliveStopSkipsThePendingProbe(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		stop := make(chan struct{})
+		close(stop)
+		tick := make(chan time.Time, 1)
+		tick <- time.Time{}
+		probed := 0
+		keepaliveLoop(stop, tick, func() bool { probed++; return true }, 1)
+		if probed != 0 {
+			t.Fatalf("a stopped prober still probed %d time(s) (attempt %d)", probed, i+1)
+		}
+	}
+}
+
+// And a stop that arrives WHILE a probe is in flight, which the tests above
+// cannot reach: the verdict is only reached after the probe returns, so without
+// the second check the loop still reports a peer it was told to stop watching.
+func TestKeepaliveStopDuringAProbeIsNotAFailure(t *testing.T) {
 	stop := make(chan struct{})
-	close(stop)
 	tick := make(chan time.Time, 1)
 	tick <- time.Time{}
-	if keepaliveLoop(stop, tick, func() bool { return false }, 1) {
-		t.Error("a stopped prober reported that the peer should be given up on")
+	probe := func() bool {
+		close(stop)
+		return false
+	}
+	if keepaliveLoop(stop, tick, probe, 1) {
+		t.Error("a peer was given up on by a prober that was stopped mid-probe")
 	}
 }
 
