@@ -2888,6 +2888,42 @@ target_disk_owner() {
 	ssh_host_cmd "$TARGET_HOST" stat -c %U:%G "$path" 2>/dev/null | tr -d '[:space:]' || true
 }
 
+# disks_unreachable_by_qemu QEMU_USER -> the target disks that account cannot
+# READ, one per line. Empty output means every disk is reachable.
+#
+# The only assertion in this harness that does not run as root, and that is the
+# whole reason it exists. Every other target-side check goes through
+# ssh_host_cmd as $SSH_USER -- root -- which traverses a 0700 directory owned
+# by somebody else and reads a disk qemu cannot touch. So a replica whose
+# PARENT DIRECTORY is unreachable looks perfect to `stat -c %U:%G`, and then
+# refuses to boot with an error naming the disk file, whose own ownership is
+# correct. Checking the disks and not the path to them is how that went
+# unnoticed: vmsync owns only the directories it creates itself, by design, so
+# a pre-existing one can be root-owned and 0700 with every disk inside it
+# correctly owned.
+#
+# `test -r` as the qemu account asks the question libvirt actually asks. It
+# fails on an unreadable file AND on any directory above it the account cannot
+# search, which is the second case and the one nothing else here can see.
+#
+# Every disk, not just $TAMPER_DISK_DEV: the ownership checks above resolve one
+# device, and a multi-disk domain can have one disk right and another wrong.
+#
+# runuser first because the qemu account's shell is normally nologin, which
+# defeats a bare `su`; `su -s /bin/sh` is the fallback for a host without
+# util-linux's runuser.
+disks_unreachable_by_qemu() {
+	local u="${1:-}" path
+	[ -n "$u" ] || return 0
+	while IFS= read -r path; do
+		[ -n "$path" ] || continue
+		ssh_host_cmd "$TARGET_HOST" \
+			"runuser -u '$u' -- test -r '$path' || su -s /bin/sh -c \"test -r '$path'\" '$u'" \
+			>/dev/null 2>&1 || printf '%s\n' "$path"
+	done < <(target_disk_paths)
+	return 0
+}
+
 # expected_qemu_owner -> the "user:group" the target host's libvirt would run
 # qemu as, by the same rule vmsync itself uses.
 #
@@ -3000,6 +3036,24 @@ stage_failover_disk_owner() {
 		ssh_host_cmd "$TARGET_HOST" chown "$expected" "$path" \
 			|| warn "could not restore ownership on $path -- fix it before promoting this replica"
 	fi
+
+	# 4. The question all three checks above leave unanswered: can qemu
+	#    actually OPEN these disks? They stat one disk as root, which cannot
+	#    see a parent directory the qemu account may not traverse -- and until
+	#    this check existed, the only thing in the whole harness that noticed
+	#    was stage 7's `-promote -start`, the single place in ~9900 lines that
+	#    boots a promoted replica. A replica reported as synced that cannot be
+	#    opened is the failure this stage is for, so it is asserted here, on
+	#    every disk, as the account that has to do the opening.
+	#
+	#    Last, deliberately: ownership has just been put back to $expected, so
+	#    anything this still finds is about the PATH to the disks rather than
+	#    the disks themselves.
+	local unreachable
+	unreachable="$(disks_unreachable_by_qemu "$expected_user" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+	if [ -n "$unreachable" ]; then fo_ok=1; else fo_ok=0; fi
+	fo_check "$sc" "every replica disk is readable by the qemu account" "$fo_ok" \
+		"$expected_user cannot read: $unreachable -- check the owner AND MODE of the directories above them, not only the disks. vmsync owns just the directories it creates itself, so a pre-existing 0700 root-owned parent leaves correctly-owned disks unopenable and the replica unbootable"
 	return 0
 }
 

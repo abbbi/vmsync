@@ -2218,6 +2218,47 @@ func targetDirOwner(ctx context.Context, client util.CommandRunner, cfg syncConf
 	return detectTargetQemuOwner(ctx, client)
 }
 
+// ensureTargetDiskDirs creates the directories this replica's disks will live
+// in, owned by the account qemu runs as.
+//
+// WHEN this runs is the whole point of it being a step of its own, and the
+// reason is not local to this function. The action journal lives BESIDE the
+// replica's disks -- its root is the same directory -- and it creates that
+// root with a plain `mkdir -p` (see actionlog.AppendCommand), run over SSH as
+// the SSH user, which is root. Under a restrictive umask that leaves the whole
+// chain 0700 and root-owned. MkdirOwnedCommand deliberately never re-owns a
+// directory that already exists, so whichever path creates it FIRST settles
+// for good whether qemu can traverse it. Called before the recorder is built,
+// this function is that first creator and the journal's mkdir is a no-op.
+//
+// The other order costs a replica that cannot boot, silently: the disks inside
+// are chowned correctly, the sync reports success, and the failure surfaces at
+// the next promotion as a permission error naming a disk file whose own
+// ownership is right. MkdirOwnedCommand's doc comment says why that is the
+// wrong place to go looking.
+//
+// Runs for an incremental sync too, where the directories exist already and
+// every mkdir is a no-op. That costs one command per directory and removes the
+// need to know whether this run will be full -- which is not decided until the
+// checkpoint chain has been read, long after the journal has written.
+func ensureTargetDiskDirs(ctx context.Context, client util.CommandRunner, cfg syncConfig, disks []disk.QcowDisk) error {
+	owner := targetDirOwner(ctx, client, cfg)
+	// Several disks sharing one directory is the ordinary layout, so this is
+	// one mkdir per DIRECTORY rather than one per disk.
+	done := make(map[string]bool, len(disks))
+	for _, d := range disks {
+		dir := path.Dir(util.SetTargetPath(cfg.TargetDiskPath, d.RootSource))
+		if done[dir] {
+			continue
+		}
+		done[dir] = true
+		if _, err := client.Run(ctx, util.MkdirOwnedCommand(owner, dir)); err != nil {
+			return fmt.Errorf("create remote target dir %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
 func applyTargetDiskOwner(ctx context.Context, client util.CommandRunner, cfg syncConfig, targetPath string, replaced util.DiskOwner) error {
 	owner, err := util.ParseDiskOwner(cfg.TargetDiskOwner)
 	if err != nil {
@@ -3822,6 +3863,18 @@ func run(cfg syncConfig) (runErr error) {
 	// answer beside the replica rather than in whatever kept the run's stdout.
 	var displaced leftoverSweep
 
+	// BEFORE the recorder, and the ordering is load-bearing: the journal's root
+	// is the directory the disks live in, and it creates that directory unowned.
+	// See ensureTargetDiskDirs for what the other order leaves behind.
+	//
+	// This is also the first thing in a run that writes to the target at all,
+	// which is what makes the guarantee hold for everything after it -- the
+	// target-side run lock and the restore-point store both create their own
+	// directories under this one.
+	if err := ensureTargetDiskDirs(ctx, targetSSHClient, cfg, qcowDisks); err != nil {
+		return err
+	}
+
 	journal := newRecorder(cfg, targetSSHClient, util.SetTargetPath(cfg.TargetDiskPath, qcowDisks[0].RootSource), cfg.TargetDomain)
 	journal.Intent(ctx, journalVerbSync, map[string]string{
 		"mode":          syncJournalMode(cfg),
@@ -4699,17 +4752,11 @@ func run(cfg syncConfig) (runErr error) {
 		for _, d := range qcowDisks {
 			targetPath = util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
 			trace.Info("Using target", "path", targetPath, "disk", d.TargetDev)
-			targetDir := path.Dir(targetPath)
-			// Directories this creates get the same owner the disk inside them
-			// will get. Without it they stay owned by the SSH user -- root --
-			// and under a restrictive umask the chain is 0700, so qemu cannot
-			// traverse to a disk it demonstrably owns. Directories that already
-			// exist are never touched: the target commonly lives under
-			// something the operator set up, and re-owning that because a
-			// replica landed inside it would be the worse bug.
-			if _, err := targetSSHClient.Run(ctx, util.MkdirOwnedCommand(targetDirOwner(ctx, targetSSHClient, cfg), targetDir)); err != nil {
-				return fmt.Errorf("create remote target dir %s: %w", targetDir, err)
-			}
+			// The directories were created, owned, by ensureTargetDiskDirs
+			// before anything in this run wrote to the target. Creating them
+			// here as well would be harmless but misleading: it would read as
+			// though this were the place that settles their ownership, and by
+			// the time control reaches this line it no longer can.
 			exists, err := util.RemotePathExists(ctx, targetSSHClient, targetPath)
 			if err != nil {
 				// Unlike the advisory nvram/loader checks above, this one
@@ -4740,8 +4787,8 @@ func run(cfg syncConfig) (runErr error) {
 	//
 	// AFTER the preflight above, and that ordering is load-bearing in a way
 	// the obvious one is not. Nothing in that preflight writes to the replica
-	// -- it creates the target directory and refuses on a disk that already
-	// exists -- while the first byte of this run reaches the replica at the
+	// -- it only refuses on a disk that already exists -- while the first byte
+	// of this run reaches the replica at the
 	// qemu-img create far below. Arming before it looked safer and was not:
 	// the refusal it walks into leaves nothing to clear the field, and the
 	// only thing that clears it is a SUCCESSFUL sync, so every later run
