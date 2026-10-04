@@ -1365,9 +1365,11 @@ the bitmap through its own path, with no `qemu-img` anywhere.
 | check | what the answer decides |
 | --- | --- |
 | qemu-img cannot write a live image | the premise of the whole design. If this *passes*, the simple fix was available all along and the rest is moot — so it is worth knowing either way |
-| a metadata-only delete leaves the bitmap behind | that the fixture is the real defect rather than an approximation of it. This is the documented orphan factory, and if it does not produce one, nothing below tests what it claims |
+| **qemu-img reports the bitmap of a checkpoint libvirt lists** | the cleanest measurement here, and it needs no fixture: it runs whenever the source already has a vmsync chain. A checkpoint **is** a bitmap, so when libvirt names one and `qemu-img` reports no bitmap of that name, the two disagree about a bitmap nobody has touched. That is not an orphan question — it says the read `leftoverCheckpointBitmaps` is built on does not answer for a running domain at all. Measured on hardware (2026-10-02): a source listing `vmsync-cpt-000001` returned **no bitmaps key** in `qemu-img`'s json, not an empty one |
+| **a checkpoint's bitmap is visible in the live image** | which oracle the rest of the stage can trust, and a finding in its own right. vmsync's orphan audit reads bitmaps exactly this way (`disk.BitmapNames`, via `cmd/vmsync/bitmaps.go`), so a failure here says that audit does not see what qemu will refuse the next sync over. It does **not** establish where the bitmap lives — only that the file and qemu disagree, which is enough to make the audit unreliable on a running source |
+| a metadata-only delete leaves the bitmap behind | that the fixture is the real defect rather than an approximation of it. This is the documented orphan factory, and if it does not produce one, nothing below tests what it claims. Answered by `qemu-img` where it can see the bitmap and by the live oracle where it cannot — and a *failure* here is informative in its own right: it means the metadata-only delete took the bitmap with it on this host, so the orphan vmsync refuses over cannot be made this way |
 | redefine from libvirt's own dumped xml is accepted | the mechanism, in its easiest form. A failure here means the adopt route does not exist on this libvirt at all |
-| **redefine from a hand-built xml is accepted** | **the check the stage exists for.** A real orphan has no dumped xml anywhere — that is what makes it an orphan — so vmsync would have to construct the metadata from the bitmap name and the disk it sits on. If this fails while the one above passes, the route only works where the metadata was never actually lost, which is not the reported case |
+| **redefine from a hand-built xml is accepted** | **the check the stage exists for.** A real orphan has no dumped xml anywhere — that is what makes it an orphan — so vmsync would have to construct the metadata from the bitmap name and the disk it sits on. Four shapes are tried, cheapest first, and the stage reports **which one libvirt took** plus the refusal for each it would not: name+disk, then `+creationTime`, then `+` the dumped domain definition, then `+` a parent in the existing chain. "libvirt refused" and "libvirt refused *this description*" are different answers and only the second is actionable — the first hardware attempt was refused for `missing creationTime from existing checkpoint` and an earlier build of this stage read that as the route being unavailable |
 | deleting the adopted checkpoint removes the bitmap | the other half. Adoption succeeding proves nothing if the delete leaves the bitmap where it was |
 | the same works while the domain is paused | `-reinit -start` brings a shut-off source up **paused** before the chain drop, so this is the reported failing case rather than a variation on it |
 
@@ -1377,6 +1379,51 @@ cannot clear that again it says so at **WARNING** with the exact `qemu-img` comm
 and the fact that `-reinit` will refuse until somebody runs it. It refuses to start
 at all if a bitmap or checkpoint of that name already exists, rather than destroying
 state it did not create.
+
+**Evidence before verdicts.** Every step logs what `virsh` and `qemu-img` actually
+said — `checkpoint-list`, `checkpoint-dumpxml`, the raw bitmap names, and the raw
+`qemu-img` output when it reports no bitmap array at all — before any check is
+derived from it, and a check whose evidence is unreadable is recorded **SKIP**
+rather than passed. That is not caution for its own sake: where `qemu-img` reports
+no bitmap of a name, "the bitmap is gone" and "the bitmap was never visible here"
+produce the identical reading, and an earlier build of this stage reported the
+adopt route working on exactly that footing. The stage now carries *which* oracle
+proved the orphan exists and confirms its removal through that same oracle.
+
+**Three oracles, and they answer different questions.** Keeping them apart is the
+whole design, because asking one and believing another is what produces a vacuous
+pass.
+
+| oracle | what it actually knows | when it is wrong to use |
+| --- | --- | --- |
+| `qemu-img info --force-share` | the bitmap directory **in the file**. `--force-share` buys the lock, not the truth: a bitmap created during this qemu process's life need not be in the file yet | as proof of absence on a running domain. It cannot see what qemu will refuse the next sync over |
+| a `checkpoint-create` that qemu **refuses** with `Bitmap already exists` | that **qemu holds** a bitmap of that name, right now, with the domain running. The live oracle, and the one this stage prefers | as proof the bitmap is *persistent* — qemu's lookup does not filter by persistence, so this says nothing about the file |
+| a `qemu-img` read with the domain **shut off** | what is in the file **now** | as proof of what was in the file *while the domain ran*. A clean shutdown is itself when qemu writes a persistent bitmap out, so a positive reading can be the shutdown's own doing |
+
+The third one's limit is why the stage no longer needs `PROBE_MAY_STOP_SOURCE` to
+reach a verdict: the live oracle answers the same question without stopping
+anything, and without `qemu-monitor-command` (which would taint the domain).
+
+**An orphan left by an earlier run is adopted, not a reason to stand down.** The
+first hardware run of this stage manufactured `vmsync-cpt-099001` and could not
+clear it — that is the finding, not a bug — so the next run met it again. Its
+`qemu-img` precondition could not see the leftover and passed, and
+`checkpoint-create` then failed with `Bitmap already exists: vmsync-cpt-099001`.
+That error is worth more than the fixture it blocked: QEMU asserts a bitmap that
+`qemu-img --force-share` does not report and libvirt has no checkpoint for, which
+settles the visibility question from the error text alone, with the domain still
+running. The stage now reads it that way — it adopts the existing orphan and goes
+straight to the hand-built redefine, so **clearing the leftover and proving the
+adopt route are the same experiment**. P3a is skipped in that case, since a real
+orphan has no dumped xml to redefine from, which is the whole point.
+
+**`PROBE_MAY_STOP_SOURCE=yes`** (environment, not a flag) is now a **fallback**,
+reached only when neither `qemu-img` nor qemu itself gave a usable answer. With the
+domain shut off the image is readable, which says what is in the file — bearing in
+mind the third row of the table above, that the shutdown may be what put it there.
+It stops the source and starts it again, so it is never done on a bare
+`--stages redefine-probe`; without it that one check comes out SKIP and the stage
+says which knob would settle it. The ordinary run needs none of this.
 
 ## Files
 

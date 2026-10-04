@@ -8182,6 +8182,7 @@ stage_redefine_probe() {
 	if [ "$DRY_RUN" = yes ]; then
 		log "   (would plant an orphan bitmap on $SOURCE_DOMAIN and try to adopt it)"
 		fo_check "$sc" "qemu-img cannot write a live image" 0
+		fo_check "$sc" "qemu-img reports the bitmap of a checkpoint libvirt lists" 0
 		fo_check "$sc" "a checkpoint's bitmap is visible in the live image" 0
 		fo_check "$sc" "a metadata-only delete leaves the bitmap behind" 0
 		fo_check "$sc" "redefine from libvirt's own dumped xml is accepted" 0
@@ -8231,6 +8232,21 @@ stage_redefine_probe() {
 		virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>/dev/null | grep -qx "$1"
 	}
 
+	# cp_covers_disk NAME -> 0 when checkpoint NAME declares a bitmap for
+	# $TAMPER_DISK_DEV.
+	#
+	# Checked rather than assumed, because a checkpoint covering other disks and
+	# not this one has no bitmap here to find -- and reading that as "libvirt and
+	# qemu-img disagree" would invent a finding out of a disk the checkpoint
+	# never claimed. Elements are split onto their own lines so both attributes
+	# must appear on the SAME disk, not merely somewhere in the document.
+	cp_covers_disk() {
+		virsh_uri "$SOURCE_URI" checkpoint-dumpxml "$SOURCE_DOMAIN" "$1" 2>/dev/null \
+			| tr -d '\n' | tr '<' '\n' | grep '^disk ' \
+			| grep -E "name=['\"]$TAMPER_DISK_DEV['\"]" \
+			| grep -qE "checkpoint=['\"]bitmap['\"]"
+	}
+
 	# raw_bitmaps prints every bitmap name qemu-img reports, or says plainly that
 	# it reported none, so every verdict below has its evidence beside it in the
 	# log. A probe that only says PASS or FAIL cannot be acted on when the answer
@@ -8243,12 +8259,23 @@ stage_redefine_probe() {
 		*'"bitmaps"'*)
 			printf '%s' "$j" | grep -oE '"name":"[^"]*"' | sed 's/"name":"//; s/"$//' | tr '\n' ' '
 			;;
+		*'qemu-img:'*)
+			# Said apart from "no bitmaps", because they are different answers
+			# and bitmap_present cannot tell them apart -- it discards stderr
+			# and the exit status, so a read that never ran looks exactly like a
+			# clean read of an image with nothing in it.
+			printf 'READ FAILED: %s' "$(printf '%s' "$j" | cut -c1-200)"
+			;;
 		*)
-			# What qemu-img actually said, not a summary of it. "no bitmaps" and
-			# "the read never ran" are different answers that bitmap_present
-			# cannot tell apart -- it discards stderr and the exit status -- so
-			# the only place the difference can still be seen is here.
-			printf 'NO bitmaps array; qemu-img said: %s' "$(printf '%s' "$j" | cut -c1-220)"
+			# Summarised rather than truncated. A modern qemu-img nests the
+			# protocol child first, so the first few hundred characters are all
+			# file-layer noise -- the hardware run printed exactly that and said
+			# nothing about the qcow2 layer. What matters is which format layers
+			# it reported and that no bitmaps key appears in any of them.
+			printf 'NO bitmaps key in %d bytes of json; format-specific layers: %s' \
+				"${#j}" \
+				"$(printf '%s' "$j" | grep -oE '"format-specific":\{"type":"[a-z0-9]+"' \
+					| sed 's/.*"type":"//; s/"$//' | sort -u | tr '\n' ' ')"
 			;;
 		esac
 	}
@@ -8347,9 +8374,40 @@ XML
 	# claimed is printed first so a wrong answer is visible rather than silent,
 	# and the create below treats that specific error as the fixture rather than
 	# as a failure.
+	local pre_list
+	pre_list="$(virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>/dev/null | grep -v '^$' | tr '\n' ' ' || true)"
 	log "   EVIDENCE before planting anything:"
-	log "     virsh checkpoint-list --name: $(virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>&1 | tr '\n' ' ' | cut -c1-200)"
+	log "     virsh checkpoint-list --name: ${pre_list:-(none)}"
 	log "     qemu-img bitmaps in the LIVE image: $(raw_bitmaps)"
+
+	# The cleanest measurement in the stage, and it needs no fixture at all.
+	#
+	# A checkpoint libvirt lists HAS a bitmap -- that is what a checkpoint is on
+	# disk. So when libvirt names one and qemu-img reports no bitmap of that
+	# name, the two disagree about a bitmap nobody has tampered with, and the
+	# read vmsync's audit depends on is answering about a live, legitimate
+	# checkpoint the wrong way. Found by accident on hardware (2026-10-02): the
+	# source carried vmsync-cpt-000001 and qemu-img returned no bitmaps array at
+	# all, not an empty one.
+	if [ -n "$pre_list" ]; then
+		log "   note: $SOURCE_DOMAIN already carries a vmsync checkpoint chain (${pre_list}), so this stage is probing alongside live replication state"
+		local listed missing= covered=
+		for listed in $pre_list; do
+			cp_covers_disk "$listed" || continue
+			covered="${covered}${listed} "
+			bitmap_present "$listed" || missing="${missing}${listed} "
+		done
+		if [ -z "$covered" ]; then
+			log "   no listed checkpoint declares a bitmap for $TAMPER_DISK_DEV, so there is nothing to cross-check on this disk"
+			results_row "$CSV" "$sc" "qemu-img_reports_the_bitmap_of_a_checkpoint_libvirt_lists" SKIP "" "" "" "" "" "SKIP no listed checkpoint covers this disk"
+		elif [ -z "$missing" ]; then
+			fo_check "$sc" "qemu-img reports the bitmap of a checkpoint libvirt lists" 0
+		else
+			fo_check "$sc" "qemu-img reports the bitmap of a checkpoint libvirt lists" 1 \
+				"libvirt lists checkpoint(s) ${missing}covering $TAMPER_DISK_DEV on $SOURCE_DOMAIN and qemu-img reports no bitmap of those names in $active. A checkpoint IS a bitmap, so these are not orphans and nothing has tampered with them -- the read is simply not answering for a running domain. That is the read vmsync's orphan audit is built on (disk.BitmapNames over qemu-img info --force-share, cmd/vmsync/bitmaps.go), so on a running source the audit reports clean whatever is there"
+		fi
+	fi
+
 	if bitmap_present "$probe" || cp_listed "$probe"; then
 		warn "SKIP stage 22: $probe already exists on $SOURCE_DOMAIN (bitmap or checkpoint). This stage will not touch state it did not create. Remove it by hand first."
 		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP probe name already present"
@@ -8575,8 +8633,20 @@ XML
 	# metadata from the bitmap name and the disk it sits on. If libvirt refuses
 	# this but accepted P3a, the adopt route is only usable where the metadata
 	# was never actually lost, which is not the reported case.
-	local built="$RUN_DIR/${sc}.built.xml"
-	cat > "$built" <<XML
+	# Four candidate shapes, cheapest first, because "libvirt refused" and
+	# "libvirt refused THIS description" are different answers and only the
+	# second one is useful. The first hardware run was refused for
+	# "missing creationTime from existing checkpoint" and the stage reported
+	# that the adopt route needed a different answer -- a conclusion the error
+	# did not support. What vmsync has to construct is whichever shape libvirt
+	# takes, so the stage reports exactly that, and the error for each shape it
+	# would not take.
+	local built="$RUN_DIR/${sc}.built"
+	local now shape accepted= adopted_xml=
+	now="$(date +%s)"
+
+	# 1. name and the disk. What a caller would try first.
+	cat > "$built.1.xml" <<XML
 <domaincheckpoint>
   <name>$probe</name>
   <disks>
@@ -8584,12 +8654,63 @@ XML
   </disks>
 </domaincheckpoint>
 XML
-	out="$(virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$built" --redefine 2>&1)" && rc=0 || rc=$?
-	if [ "$rc" = 0 ] && cp_listed "$probe"; then
+	# 2. plus creationTime, which REDEFINE demands of an existing checkpoint.
+	cat > "$built.2.xml" <<XML
+<domaincheckpoint>
+  <name>$probe</name>
+  <creationTime>$now</creationTime>
+  <disks>
+    <disk name='$TAMPER_DISK_DEV' checkpoint='bitmap' bitmap='$probe'/>
+  </disks>
+</domaincheckpoint>
+XML
+	# 3. plus the domain definition, which libvirt's own checkpoint dumps carry
+	# and may require back. --inactive for the persistent config: the live one
+	# carries a runtime id that is not part of the definition.
+	local domxml="$RUN_DIR/${sc}.domain.xml"
+	virsh_uri "$SOURCE_URI" dumpxml --inactive "$SOURCE_DOMAIN" 2>/dev/null \
+		| grep -v '^<?xml' > "$domxml" || true
+	{
+		printf '<domaincheckpoint>\n  <name>%s</name>\n  <creationTime>%s</creationTime>\n' "$probe" "$now"
+		printf '  <disks>\n    <disk name=%s checkpoint=%s bitmap=%s/>\n  </disks>\n' \
+			"'$TAMPER_DISK_DEV'" "'bitmap'" "'$probe'"
+		cat "$domxml"
+		printf '</domaincheckpoint>\n'
+	} > "$built.3.xml"
+	# 4. plus a parent, for a libvirt that wants the orphan placed in the chain
+	# it already has. Only built when there IS a leaf to parent it to.
+	local leaf
+	leaf="$(virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>/dev/null | grep -v '^$' | tail -1 || true)"
+	if [ -n "$leaf" ] && [ "$leaf" != "$probe" ]; then
+		{
+			printf '<domaincheckpoint>\n  <name>%s</name>\n  <creationTime>%s</creationTime>\n' "$probe" "$now"
+			printf '  <parent>\n    <name>%s</name>\n  </parent>\n' "$leaf"
+			printf '  <disks>\n    <disk name=%s checkpoint=%s bitmap=%s/>\n  </disks>\n' \
+				"'$TAMPER_DISK_DEV'" "'bitmap'" "'$probe'"
+			cat "$domxml"
+			printf '</domaincheckpoint>\n'
+		} > "$built.4.xml"
+	fi
+
+	for shape in "1:name and disk only" "2:plus creationTime" "3:plus creationTime and the domain definition" "4:plus creationTime, parent $leaf and the domain definition"; do
+		local n="${shape%%:*}" what="${shape#*:}"
+		[ -s "$built.$n.xml" ] || continue
+		out="$(virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$built.$n.xml" --redefine 2>&1)" && rc=0 || rc=$?
+		if [ "$rc" = 0 ] && cp_listed "$probe"; then
+			accepted="$what"
+			adopted_xml="$built.$n.xml"
+			log "   libvirt ACCEPTED the redefine from shape $n ($what)"
+			break
+		fi
+		log "   libvirt refused shape $n ($what): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+	done
+
+	if [ -n "$accepted" ]; then
 		fo_check "$sc" "redefine from a hand-built xml is accepted" 0
+		log "   WHAT VMSYNC MUST BUILD: $accepted. The xml is in $built.*.xml."
 	else
 		fo_check "$sc" "redefine from a hand-built xml is accepted" 1 \
-			"exit $rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200). vmsync cannot adopt an orphan it has no metadata for, so the live-source case needs a different answer"
+			"libvirt refused every shape tried, the richest being a full dumped domain definition with creationTime and a parent -- so on this libvirt there is no description vmsync could construct for an orphan it has no metadata for, and the live-source case needs a different answer. The attempted xml and each refusal are above and in $built.*.xml"
 		probe_cleanup
 		return 0
 	fi
@@ -8680,7 +8801,7 @@ XML
 		local p_adopt=1 p_del=1
 		virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$xml" >/dev/null 2>&1 || true
 		virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" --metadata >/dev/null 2>&1 || true
-		if virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$built" --redefine >/dev/null 2>&1; then
+		if virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$adopted_xml" --redefine >/dev/null 2>&1; then
 			p_adopt=0
 			if virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" >/dev/null 2>&1; then
 				p_del=0
@@ -8721,7 +8842,7 @@ XML
 	fi
 
 	probe_cleanup
-	unset -f bitmap_present cp_listed raw_bitmaps qemu_holds_probe settle_stopped probe_cleanup
+	unset -f bitmap_present cp_listed cp_covers_disk raw_bitmaps qemu_holds_probe settle_stopped probe_cleanup
 	return 0
 }
 
