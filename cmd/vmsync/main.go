@@ -4340,18 +4340,17 @@ func run(cfg syncConfig) (runErr error) {
 		// intact. Failing to RUN the check is not evidence of anything, so it
 		// warns and the run continues to the post-drop audit below.
 		//
-		// KNOWN LIMIT, and it is the case this was written for: on a RUNNING
-		// source this read comes back empty whatever the images hold, so the
-		// refusal below does not fire. See leftoverCheckpointBitmaps -- the
-		// read answers out of the qcow2 bitmap directory, which does not carry
-		// what qemu has not written there yet. Measured on hardware
-		// (2026-10-02): a running source listing checkpoint vmsync-cpt-000001
-		// in libvirt had NO bitmaps key at all in qemu-img's json, so even an
-		// untampered checkpoint's own bitmap was invisible to it. What still
-		// works is the !srcActive case below, where the source is stopped and
-		// the read is answerable. Making the running case work needs qemu's own
-		// view of its bitmap list, which qemu-img cannot provide; until then an
-		// orphan on a running source is caught by the sync failing, not here.
+		// KNOWN LIMIT: on a RUNNING source this read sees the qcow2 bitmap
+		// directory as it stood when qemu opened the image, so an orphan
+		// created since -- which is exactly the one a failed run just made --
+		// can be missing from it and the refusal below will not fire. It starts
+		// being seen once the domain has been restarted. See
+		// leftoverCheckpointBitmaps for the two hardware measurements that
+		// bracket this. The !srcActive case below is unaffected, since a
+		// stopped source has nothing unwritten. Closing the gap for a running
+		// source needs qemu's own view of its bitmap list rather than the
+		// file's; until then an orphan made during this qemu's life is caught
+		// by the sync failing, not here.
 		preDropBitmaps, preDropErr := leftoverCheckpointBitmaps(ctx, sourceNeedsSSH, sourceSSHClient, qcowDisks)
 		if preDropErr != nil {
 			trace.Warning("could not read the source's disks for vmsync checkpoint bitmaps before starting the rebuild; an orphaned bitmap would be caught after the chain drop instead, which is later than it needs to be",

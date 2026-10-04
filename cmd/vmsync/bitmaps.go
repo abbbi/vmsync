@@ -57,14 +57,19 @@ import (
 // --force-share, which is what lets the read open a disk a running qemu holds.
 //
 // --force-share buys the lock, not the truth. What comes back is the qcow2
-// bitmap directory ON DISK, and that can lag what qemu itself holds: a bitmap
+// bitmap directory ON DISK, which is not always what qemu holds: a bitmap
 // created during the current qemu process's life need not be in the file yet.
 // So an empty answer from a RUNNING source is not proof of absence, and the
 // caller must not read it as one -- qemu can still refuse the next sync with
-// "Bitmap already exists" for a name this never reported. Proven on hardware
-// (2026-10-02): libvirt made a checkpoint, this read found no bitmap of its
-// name, and a later checkpoint-create of the same name was refused by qemu for
-// already having it. The reliable answer needs qemu, not the file.
+// "Bitmap already exists" for a name this never reported.
+//
+// Both halves measured on the same host. On 2026-10-02 a checkpoint libvirt had
+// made at 16:46 was still not in the directory at 18:10 while the domain ran,
+// and qemu refused to re-create that bitmap for already having it. On
+// 2026-10-04, after that domain had been restarted, the same read reported both
+// bitmaps, flagged in-use. So this read is not blind on a running domain -- it
+// reports what was in the file when qemu opened it -- but it cannot be trusted
+// to show a bitmap created since. A restart is what moves one into the file.
 func leftoverCheckpointBitmaps(ctx context.Context, needsSSH bool, ssh *remotessh.Client, disks []disk.QcowDisk) (map[string][]string, error) {
 	out := map[string][]string{}
 	for _, d := range disks {
