@@ -385,10 +385,14 @@ what makes qemu refuse that checkpoint. It then checks the name is a real CHECKP
 afterwards rather than an orphan again, and that the sync after it is incremental, since
 a rebuild that clears the orphan and leaves no usable chain has fixed nothing. Both
 routes are covered by one run: the sweep after the chain drop, and the self-healing
-retry inside CreateCheckpoint for when the sweep cannot see the bitmap. It shares stage
-22's helpers, and it cleans up by adopting and deleting rather than by printing a
-recipe, because a bitmap left in the chain's name space would break every later sync for
-the pair -- including the rest of the bench run.
+retry inside CreateCheckpoint for when the sweep cannot see the bitmap. WHICH one did
+the work is a finding about the host rather than a detail -- the retry means a fresh
+bitmap is not in the image yet, the sweep means it was -- so the stage prints a ROUTE
+line, quotes the line from vmsync's own log that decided it, and records an INFO row the
+verdict ignores. It prints an EVIDENCE block at each step the way stage 22 does. It
+shares stage 22's helpers, and it cleans up by adopting and deleting rather than by
+printing a recipe, because a bitmap left in the chain's name space would break every
+later sync for the pair -- including the rest of the bench run.
 EOF
 }
 
@@ -8532,6 +8536,22 @@ XML
 }
 
 
+# log_state LABEL prints what libvirt and qemu-img each say right now.
+#
+# Two read-only facts, side by side, at every point a stage changes something:
+# the checkpoint list and the bitmaps in the image. Deliberately NOT the live
+# oracle, which creates and deletes a checkpoint to answer -- evidence lines
+# must not alter what they are describing.
+#
+# Stage 22 prints these inline at each of its own steps and predates this
+# helper; stage 23 had almost none of it, which left its one interesting result
+# buried among the vmsync command lines.
+log_state() {
+	log "   EVIDENCE $1:"
+	log "     virsh checkpoint-list --name: $(virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>&1 | grep -v '^$' | tr '\n' ' ' || true)"
+	log "     qemu-img bitmaps in $PROBE_ACTIVE: $(raw_bitmaps)"
+}
+
 stage_redefine_probe() {
 	log "=== Stage 22: PROBE -- can libvirt remove an orphaned bitmap on a LIVE domain? ==="
 	local sc=redefine-probe
@@ -9233,20 +9253,23 @@ stage_reinit_orphan() {
 	# pair that already had a replica, which is every pair this stage would ever
 	# run against. -reinit displaces the existing disks first, according to
 	# -replaced-disk-action, and that is the only thing here that may do so.
+	log_state "before seeding"
 	run_vmsync "$sc" seed -reinit
 	if [ "$RUN_RC" != 0 ]; then
 		warn "SKIP $sc: the seeding sync failed (exit $RUN_RC), so there is no checkpoint to orphan and nothing below would be testing anything. $(log_reason "$RUN_LOG")"
 		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP seeding sync failed"
 		return 0
 	fi
+	log_state "after the seeding rebuild"
 	if ! cp_listed "$probe"; then
-		warn "SKIP $sc: the seeding sync left no checkpoint called $probe (checkpoint-list: $(virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>&1 | tr '\n' ' ')), so an orphan of that name would not be the one the next chain collides with."
+		warn "SKIP $sc: the seeding sync left no checkpoint called $probe, so an orphan of that name would not be the one the next chain collides with."
 		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP seeding sync left no checkpoint"
 		return 0
 	fi
 
 	# And now the defect: libvirt's record goes, the bitmaps stay.
 	virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" --metadata >/dev/null 2>&1 || true
+	log_state "after dropping its metadata, which is the defect being planted"
 	if cp_listed "$probe"; then
 		warn "SKIP $sc: the metadata-only delete of $probe did not take, so there is no orphan to test with."
 		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP could not orphan the checkpoint"
@@ -9258,7 +9281,7 @@ stage_reinit_orphan() {
 		return 0
 	fi
 	fo_check "$sc" "the planted bitmap is an orphan qemu holds" 0
-	log "   fixture: vmsync made $probe across its own disks, libvirt now lists no checkpoint for it, qemu still holds it, and qemu-img reports $(raw_bitmaps)"
+	log "   fixture: vmsync made $probe across its own disks, libvirt now lists no checkpoint for it, and qemu still holds it -- an orphan, exactly as a bad rebuild leaves one"
 
 	# --- the test -----------------------------------------------------------
 	#
@@ -9294,15 +9317,30 @@ stage_reinit_orphan() {
 	fo_check "$sc" "the name is a real checkpoint afterwards, not an orphan" "$fo_ok" \
 		"-reinit exited 0 but libvirt lists no checkpoint called $probe, so whatever qemu holds under that name has nothing behind it -- an orphan again, and the next sync will refuse"
 
-	# One line of evidence either way, because "it worked" and "it worked via
-	# the retry" are different stories and the log distinguishes them.
-	if grep -q 'adopting that bitmap so it can be deleted' "$RUN_LOG" 2>/dev/null; then
-		log "   cleared by the self-healing retry in CreateCheckpoint: the sweep could not see the bitmap, qemu refused the name, and vmsync adopted it and tried again"
-	elif grep -q 'cleared the source' "$RUN_LOG" 2>/dev/null; then
-		log "   cleared by the sweep after the chain drop, before any checkpoint was attempted"
+	log_state "after the rebuild under test"
+
+	# WHICH ROUTE, said loudly and recorded, not left in the console.
+	#
+	# "It worked" and "it worked via the retry" are different findings about the
+	# host: the retry means the sweep could not see the bitmap, which says a
+	# fresh orphan is not in the image yet, while the sweep means it was. This
+	# used to be one log line among the full vmsync command echoes, where the
+	# owner had to go looking for it -- so it is quoted from vmsync's own output
+	# rather than paraphrased, and written to the results so a later run can be
+	# compared without re-reading a transcript.
+	local route="" evidence=""
+	if evidence="$(grep -m1 'adopting that bitmap so it can be deleted' "$RUN_LOG" 2>/dev/null)"; then
+		route="the self-healing retry in CreateCheckpoint"
+		log "   ROUTE: $route. The sweep after the chain drop could not see the bitmap, qemu refused the name, and vmsync adopted it and tried again -- so on this host a bitmap made during the running qemu's life is not in the image."
+	elif evidence="$(grep -m1 'cleared the source' "$RUN_LOG" 2>/dev/null)"; then
+		route="the sweep after the chain drop"
+		log "   ROUTE: $route, before any checkpoint was attempted -- so on this host the orphan WAS in the image and the audit could see it."
 	else
-		log "   NOTE: neither the sweep nor the retry said anything in the run log, so how the bitmap went is unexplained -- worth reading $RUN_LOG"
+		route="unexplained"
+		warn "neither the sweep nor the retry said anything in $RUN_LOG, so how $probe went is unexplained. The checks above still hold -- it is gone and the chain is sound -- but which code path did it is not in evidence."
 	fi
+	[ -n "$evidence" ] && log "     vmsync said: $(printf '%s' "$evidence" | tr -s ' ' | cut -c1-220)"
+	results_row "$CSV" "$sc" route INFO "" "" "" "" "" "INFO cleared by $route"
 
 	# --- and the pair still works -------------------------------------------
 	#
