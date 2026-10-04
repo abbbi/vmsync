@@ -375,7 +375,8 @@ the probe name is free is then confirmed with qemu rather than with the image, s
 a bitmap made during the running qemu's life need not be in the image at all.
 
 Stage 23 (reinit-orphan) checks that vmsync does what stage 22 proved it CAN do: it
-plants an orphaned bitmap on a RUNNING source and runs a plain -reinit over it. The
+seeds a sync, drops libvirt's record of the checkpoint it made -- so the orphan is on
+every disk vmsync manages, as a real one is -- and runs a plain -reinit over it. The
 planted name is vmsync-cpt-000001 deliberately -- the name the rebuild's own new chain
 takes -- so the orphan is a real collision rather than a bitmap sitting out of the way,
 and a clean exit is itself the proof it was cleared, since a surviving orphan is exactly
@@ -8184,6 +8185,16 @@ stage_lock_lease() {
 #
 # Globals rather than arguments because every one of these would otherwise take
 # the same three, and the stages run one at a time in one shell.
+#
+# WRITE THE FIXTURE BEFORE CALLING ANY OF THESE. probe_reset asks qemu whether
+# the name is free by sending PROBE_XML, so a stage that sets the globals and
+# leaves the file for later gets "Failed to open file ... No such file" and
+# stands down before it starts -- which is how stage 23's first hardware run
+# went.
+#
+# Messages here name the stage with $sc, which every stage sets as its scenario.
+# They said "stage 22" until stage 23 started using them and reported its own
+# stand-down under stage 22's name.
 
 # bitmap_json prints the image's info once, whitespace stripped, so every
 # reader below works off the same text and they cannot disagree about what
@@ -8379,12 +8390,12 @@ settle_stopped() {
 sweep_offline() {
 	local names="$1" b out rc i left
 	if [ "${PROBE_MAY_STOP_SOURCE:-no}" != yes ]; then
-		warn "SKIP stage 22: ${names}must come out of $PROBE_ACTIVE and qemu holds the image, so nothing can remove them while $SOURCE_DOMAIN runs. Re-run with PROBE_MAY_STOP_SOURCE=yes to have this stage stop the domain and sweep them, or do it by hand: 'virsh -c $SOURCE_URI shutdown $SOURCE_DOMAIN', then 'qemu-img bitmap --remove -f qcow2 $PROBE_ACTIVE <name>' for each of ${names}then start it again."
+		warn "SKIP $sc: ${names}must come out of $PROBE_ACTIVE and qemu holds the image, so nothing can remove them while $SOURCE_DOMAIN runs. Re-run with PROBE_MAY_STOP_SOURCE=yes to have this stage stop the domain and sweep them, or do it by hand: 'virsh -c $SOURCE_URI shutdown $SOURCE_DOMAIN', then 'qemu-img bitmap --remove -f qcow2 $PROBE_ACTIVE <name>' for each of ${names}then start it again."
 		return 1
 	fi
 	log "   PROBE_MAY_STOP_SOURCE=yes: stopping $SOURCE_DOMAIN to sweep $names"
 	if ! graceful_shutdown "$SOURCE_URI" "$SOURCE_DOMAIN" 180 "source $SOURCE_DOMAIN"; then
-		warn "SKIP stage 22: $SOURCE_DOMAIN did not shut down within 180s, so ${names}could not be removed"
+		warn "SKIP $sc: $SOURCE_DOMAIN did not shut down within 180s, so ${names}could not be removed"
 		virsh_uri "$SOURCE_URI" start "$SOURCE_DOMAIN" >/dev/null 2>&1 || true
 		return 1
 	fi
@@ -8403,11 +8414,11 @@ sweep_offline() {
 		i=$((i + 1))
 	done
 	if [ "$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN" 2>/dev/null || true)" != running ]; then
-		warn "SKIP stage 22: $SOURCE_DOMAIN did not come back up after the sweep -- start it by hand ('virsh -c $SOURCE_URI start $SOURCE_DOMAIN'). The whole question this stage asks is what can be done while qemu holds the image, so there is nothing to ask of a stopped domain."
+		warn "SKIP $sc: $SOURCE_DOMAIN did not come back up after the sweep -- start it by hand ('virsh -c $SOURCE_URI start $SOURCE_DOMAIN'). The whole question this stage asks is what can be done while qemu holds the image, so there is nothing to ask of a stopped domain."
 		return 1
 	fi
 	if [ -n "$left" ]; then
-		warn "SKIP stage 22: the sweep did not clear ${left}from $PROBE_ACTIVE, read with $SOURCE_DOMAIN shut off. Remove them by hand ('qemu-img bitmap --remove -f qcow2 $PROBE_ACTIVE <name>') before re-running."
+		warn "SKIP $sc: the sweep did not clear ${left}from $PROBE_ACTIVE, read with $SOURCE_DOMAIN shut off. Remove them by hand ('qemu-img bitmap --remove -f qcow2 $PROBE_ACTIVE <name>') before re-running."
 		return 1
 	fi
 	return 0
@@ -8417,7 +8428,7 @@ probe_reset() {
 	local cps c left
 	cps="$(virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>/dev/null | grep -v '^$' | tr '\n' ' ' || true)"
 	if [ -n "$cps" ]; then
-		warn "stage 22 is clearing $SOURCE_DOMAIN's checkpoints to start from a known state: ${cps}-- the next sync for this pair will be a FULL one"
+		warn "$sc is clearing $SOURCE_DOMAIN's checkpoints to start from a known state: ${cps}-- the next sync for this pair will be a FULL one"
 		for c in $cps; do
 			case "$c" in
 			vmsync-cpt*) ;;
@@ -8455,7 +8466,7 @@ probe_reset() {
 		1) break ;;
 		0)
 			if [ "$attempt" != 0 ]; then
-				warn "SKIP stage 22: qemu still holds a bitmap named $PROBE_NAME after the sweep, so this run has no clean starting point"
+				warn "SKIP $sc: qemu still holds a bitmap named $PROBE_NAME after the sweep, so this run has no clean starting point"
 				return 1
 			fi
 			attempt=1
@@ -8463,7 +8474,7 @@ probe_reset() {
 			sweep_offline "$PROBE_NAME " || return 1
 			;;
 		*)
-			warn "SKIP stage 22: could not establish whether qemu holds a bitmap named $PROBE_NAME, so this run has no known starting point"
+			warn "SKIP $sc: could not establish whether qemu holds a bitmap named $PROBE_NAME, so this run has no known starting point"
 			return 1
 			;;
 		esac
@@ -8485,7 +8496,7 @@ probe_reset() {
 		left="$(bitmap_names | grep '^vmsync-cpt' | tr '\n' ' ' || true)"
 	fi
 	if [ -n "$cps" ] || [ -n "$left" ]; then
-		warn "SKIP stage 22: could not reach a clean starting point on $SOURCE_DOMAIN -- checkpoints: ${cps:-none}, vmsync bitmaps: ${left:-none}"
+		warn "SKIP $sc: could not reach a clean starting point on $SOURCE_DOMAIN -- checkpoints: ${cps:-none}, vmsync bitmaps: ${left:-none}"
 		return 1
 	fi
 	log "   clean starting point: no checkpoints on $SOURCE_DOMAIN, no vmsync bitmaps in $PROBE_ACTIVE, and qemu accepts the name $PROBE_NAME"
@@ -8519,24 +8530,6 @@ XML
 	return 0
 }
 
-# plant_orphan -> 0 once qemu holds a bitmap named PROBE_NAME that libvirt has
-# no checkpoint for.
-#
-# The documented orphan factory, and the real defect rather than an imitation
-# of it: create a checkpoint, then delete only libvirt's record of it. Confirmed
-# with qemu rather than with the image, because a bitmap made during the current
-# qemu's life need not be in the image at all -- on the host this was written
-# against it is not, which is exactly the case that matters.
-plant_orphan() {
-	write_probe_fixture
-	virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$PROBE_XML" >/dev/null 2>&1 || return 1
-	cp_listed "$PROBE_NAME" || return 1
-	virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$PROBE_NAME" --metadata >/dev/null 2>&1 || true
-	if cp_listed "$PROBE_NAME"; then
-		return 1
-	fi
-	qemu_holds_probe
-}
 
 stage_redefine_probe() {
 	log "=== Stage 22: PROBE -- can libvirt remove an orphaned bitmap on a LIVE domain? ==="
@@ -9185,6 +9178,9 @@ stage_reinit_orphan() {
 	PROBE_ACTIVE="$active"
 	PROBE_NAME="$probe"
 	PROBE_XML="$RUN_DIR/${sc}.checkpoint.xml"
+	# Written HERE, not left to plant_orphan below: probe_reset asks qemu
+	# whether the name is free by sending this file, and it runs first.
+	write_probe_fixture
 
 	orphan_cleanup() {
 		# Adopt and delete, not a warning with instructions: this stage plants a
@@ -9215,15 +9211,46 @@ stage_reinit_orphan() {
 		return 0
 	fi
 
-	# --- the fixture --------------------------------------------------------
-	if ! plant_orphan; then
-		warn "SKIP stage 23: could not plant an orphaned $probe on $SOURCE_DOMAIN -- see the evidence above. Nothing below would be testing anything."
-		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP could not plant the orphan"
-		orphan_cleanup
+	# --- the fixture, built BY VMSYNC ---------------------------------------
+	#
+	# A sync first, then drop libvirt's record of the checkpoint it made. That
+	# is the orphan factory the engine documents, and having vmsync make it
+	# covers something a hand-written fixture cannot: vmsync checkpoints EVERY
+	# qcow2 disk it manages, so a real orphan is on all of them. A fixture
+	# naming one disk would leave the adopt-then-delete route claiming a bitmap
+	# the other disks do not carry, the delete would fail looking for it, and
+	# the stage would report a failure that exists only in its own fixture. On a
+	# single-disk domain that difference never shows; the pair this was written
+	# against has two.
+	#
+	# It also fixes the name by construction: a full sync's chain starts at
+	# vmsync-cpt-000001, which is the name the -reinit below will want.
+	run_vmsync "$sc" seed
+	if [ "$RUN_RC" != 0 ]; then
+		warn "SKIP $sc: the seeding sync failed (exit $RUN_RC), so there is no checkpoint to orphan and nothing below would be testing anything. $(log_reason "$RUN_LOG")"
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP seeding sync failed"
+		return 0
+	fi
+	if ! cp_listed "$probe"; then
+		warn "SKIP $sc: the seeding sync left no checkpoint called $probe (checkpoint-list: $(virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>&1 | tr '\n' ' ')), so an orphan of that name would not be the one the next chain collides with."
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP seeding sync left no checkpoint"
+		return 0
+	fi
+
+	# And now the defect: libvirt's record goes, the bitmaps stay.
+	virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" --metadata >/dev/null 2>&1 || true
+	if cp_listed "$probe"; then
+		warn "SKIP $sc: the metadata-only delete of $probe did not take, so there is no orphan to test with."
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP could not orphan the checkpoint"
+		return 0
+	fi
+	if ! qemu_holds_probe; then
+		warn "SKIP $sc: after dropping its metadata, qemu no longer holds $probe either -- so this host does not produce the orphan this stage needs, and the sync below would have nothing to clear. Stage 22's own fixture check reports the same thing in more detail."
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP no orphan was produced"
 		return 0
 	fi
 	fo_check "$sc" "the planted bitmap is an orphan qemu holds" 0
-	log "   fixture: qemu holds $probe, libvirt lists no checkpoint for it, and qemu-img reports $(raw_bitmaps)"
+	log "   fixture: vmsync made $probe across its own disks, libvirt now lists no checkpoint for it, qemu still holds it, and qemu-img reports $(raw_bitmaps)"
 
 	# --- the test -----------------------------------------------------------
 	#
