@@ -8675,9 +8675,26 @@ stage_lock_lease() {
 		fo_check "$sc" "an unleased lock is still held long after the lease" "$fo_ok" \
 			"the lock was released without a helper holding a lease, which means something other than this stage's mechanism freed it and the leased half above proves less than it appears to"
 
-		# And the escape refuses, because the shell lock records no holder. The
-		# refusal is the designed answer, not a gap: breaking a lock that cannot
-		# be attributed is how two writers end up on one replica.
+		# And the escape refuses. The refusal is the designed answer, not a
+		# gap: breaking a lock whose live holder cannot be accounted for is how
+		# two writers end up on one replica.
+		#
+		# Either refusal counts, which is why this matches the refusal LINE
+		# rather than one reason's wording. There are two legitimate ones and
+		# the engine picks whichever applies:
+		#
+		#   - "records no holder" -- the lock file is empty, so nothing can be
+		#     proven either way. What this check was originally written for.
+		#   - "something still holds the lock" -- the file carries a record
+		#     whose pid is genuinely gone, but the flock is still held, so the
+		#     record describes a PREVIOUS holder. That is the common case here:
+		#     the file is never unlinked, and the shell hold writes no stamp of
+		#     its own, so it inherits the leased half's record.
+		#
+		# Matching only the first wording failed the check on 2026-10-06 for a
+		# refusal that was not merely correct but better evidenced than the one
+		# expected -- the engine had just been taught to verify the lock rather
+		# than trust the record.
 		local out="" rc=0
 		if [ -z "${TARGET_VMSYNC_BIN:-}" ]; then
 			log "   SKIP: TARGET_VMSYNC_BIN is not set, so -break-target-lock cannot be run on $TARGET_HOST"
@@ -8700,11 +8717,11 @@ stage_lock_lease() {
 		fi
 		if [ "$rc" = -1 ]; then
 			: # already recorded as a skip above
-		elif [ "$rc" != 0 ] && printf '%s' "$out" | grep -q "records no holder"; then
+		elif [ "$rc" != 0 ] && printf "%s" "$out" | grep -q "REFUSING to break the target-side run lock"; then
 			fo_check "$sc" "-break-target-lock refuses a lock it cannot attribute" 0
 		else
 			fo_check "$sc" "-break-target-lock refuses a lock it cannot attribute" 1 \
-				"it exited $rc saying: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200) -- full output in $RUN_DIR/logs/${sc}.break-lock.log. An unleased lock records no holder, so nothing can prove its holder is gone and breaking itmust be refused"
+				"it exited $rc saying: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300) -- full output in $RUN_DIR/logs/${sc}.break-lock.log. A live unleased lock must be refused: it records no holder of its own, and the record it does carry belongs to a previous one, so nothing here can prove the process actually holding the lock is gone. Breaking it leaves two writers on one replica"
 		fi
 		cleanup_stalled
 	fi
