@@ -2702,6 +2702,54 @@ vmsync_meta_field() {
 		| xmllint --xpath "string(//*[local-name()='${field}']/@id)" - 2>/dev/null || true
 }
 
+# vmsync_meta_set_field URI DOMAIN FIELD VALUE -- add or replace ONE field in a
+# domain's vmsync metadata, leaving every other field as it was. Prints the
+# element as it was BEFORE the change, for vmsync_meta_restore. Returns 1 and
+# changes nothing if it is not sure what it is looking at.
+#
+# Read-splice-write, because `virsh metadata --set` replaces the whole element:
+# setting one field the obvious way would take replication_role,
+# last_checkpoint and the promotion record with it. The engine then REFUSES to
+# merge into metadata it cannot parse (metadataFieldsFromFragment), so a
+# malformed write does not degrade -- it wedges the pair until somebody removes
+# the element by hand. Hence the shape check before splicing and the xmllint
+# check after: on anything unexpected this declines rather than guessing.
+#
+# Only for fixtures that need a marker the engine would otherwise only write
+# by failing. Nothing here should use it to fake a result.
+vmsync_meta_set_field() {
+	local uri="$1" domain="$2" field="$3" value="$4" cur spliced
+	cur="$(virsh_uri "$uri" metadata "$domain" --uri "$VMSYNC_METADATA_URI" --config 2>/dev/null)" || cur=""
+	# Must look like vmsync's own element, opening and closing. An empty read
+	# is also a decline: an element built from nothing would be the only thing
+	# on the domain and would drop whatever failed to be read.
+	case "$cur" in
+		*"<vmsync"*"</vmsync>"*) ;;
+		*) return 1 ;;
+	esac
+	# Any existing copy of the field goes first, so this is idempotent.
+	spliced="$(printf '%s\n' "$cur" \
+		| sed "s|<${field}[^>]*/>||g" \
+		| sed "s|</vmsync>|<${field} id=\"${value}\"/></vmsync>|")"
+	printf '%s\n' "$spliced" | xmllint --noout - 2>/dev/null || return 1
+	virsh_uri "$uri" metadata "$domain" --uri "$VMSYNC_METADATA_URI" \
+		--key vmsync --set "$spliced" --config >/dev/null 2>&1 || return 1
+	printf '%s\n' "$cur"
+}
+
+# vmsync_meta_restore URI DOMAIN ELEMENT -- put an element back verbatim.
+#
+# Verbatim, rather than splicing the fixture field back out: undoing an edit
+# with a second edit doubles the chance of leaving something malformed, and the
+# original string is already in hand.
+vmsync_meta_restore() {
+	local uri="$1" domain="$2" xml="$3"
+	[ -n "$xml" ] || return 0
+	virsh_uri "$uri" metadata "$domain" --uri "$VMSYNC_METADATA_URI" \
+		--key vmsync --set "$xml" --config >/dev/null 2>&1 \
+		|| warn "could not restore $domain's vmsync metadata after a fixture; check it with: virsh -c '$uri' metadata '$domain' --uri '$VMSYNC_METADATA_URI' --config"
+}
+
 # replica_incomplete URI DOMAIN -> the raw replica_incomplete value, or empty.
 #
 # vmsync writes this on the TARGET before a full copy starts destroying the
@@ -8090,10 +8138,48 @@ stage_leftovers() {
 		log "   SKIP: the interrupted rebuild left no aside set, so there is nothing for the refusal to protect"
 		results_row "$CSV" "$sc" nothing_is_reclaimed_while_the_replica_is_marked_incomplete SKIP "" "" "" "" "" "SKIP no aside set after the injected failure"
 	else
-		restamp_asides "$old_stamp"
-		# The sync is EXPECTED to run here -- re-running it is the documented
-		# repair for replica_incomplete -- so what is being tested is that the
-		# sweep inside it stood down, not that the run was refused.
+		# The sync below is EXPECTED to run: what is tested is that the sweep
+		# inside it stood down, not that the run was refused.
+		#
+		# Which is why the fixture is rebuilt here instead of inherited from
+		# the killed fault above. That fault proved what it can -- it armed
+		# replica_incomplete and left an aside set, the shape stage 16 asserts
+		# in detail -- but it also left the replica unusable for this check,
+		# and no combination of flags fixes that. A plain sync after a
+		# fault-injected -reinit meets two gates, both of them gates a -reinit
+		# itself skips, which is why nothing else in this stage meets either:
+		#
+		#   1. the out-of-band-write guard. The fault wrote into the base and
+		#      recorded no stamp, so the replica's mtime leads the last sync
+		#      time -- seen as "an mtime 2s newer than the last sync
+		#      timestamp" (2026-10-06). -timestamp-tolerance-sec gets past it,
+		#      at the price of suppressing a finding that is TRUE.
+		#   2. the checkpoint-chain check, which nothing gets past: the fault
+		#      dies AFTER creating its checkpoint, so the source's chain was
+		#      dropped and restarted while the target still records the
+		#      previous one, and checkpointChainConsistent refuses. Its
+		#      documented remedy is a -reinit -- which this check cannot use,
+		#      because a -reinit arms replica_incomplete itself and would pass
+		#      even if the marker were ignored entirely.
+		#
+		# Both assertions below were therefore passing on nothing: the run was
+		# refused before the sweep ran, so "nothing was reclaimed" held because
+		# nothing could have been, and the refusal line was missing because the
+		# code that prints it was never reached.
+		#
+		# Healing first and arming the marker BY HAND is faithful rather than a
+		# shortcut: leftoversToReclaim keys on nothing more than a non-empty
+		# replica_incomplete, so a hand-written value drives exactly the
+		# decision the engine's own value would.
+		bench_sync "$sc" refusal-fixture -reinit
+		local saved_meta=""
+		if bench_sync_ok; then
+			n="$(aside_count)"
+			restamp_asides "$old_stamp"
+			saved_meta="$(vmsync_meta_set_field "$TARGET_URI" "$TARGET_DOMAIN" replica_incomplete bench-leftovers-fixture)" || saved_meta=""
+		fi
+	fi
+	if [ -n "${saved_meta:-}" ] && [ "${n:-0}" -ge 1 ]; then
 		bench_sync "$sc" refused "-reclaim-leftovers-after=24h"
 		local rc_refused="${RUN_RC:-0}" log_refused="$RUN_LOG"
 		if [ "$(aside_count)" = "$n" ]; then
@@ -8108,6 +8194,17 @@ stage_leftovers() {
 		else
 			fo_check "$sc" "the refusal does not fail the sync" 1 "no refusal line in $log_refused, so it cannot be told from a sweep that simply found nothing"
 		fi
+		# Put the metadata back verbatim before anything else reads it: the
+		# marker is a fixture, and a replica left marked incomplete refuses
+		# every promotion for the rest of the run.
+		vmsync_meta_restore "$TARGET_URI" "$TARGET_DOMAIN" "$saved_meta"
+	elif [ "${n:-0}" -ge 1 ]; then
+		# The aside set exists but the marker could not be armed, so the sweep
+		# would have nothing to stand down for and both assertions would be
+		# measuring an ordinary reclaim. Skipped rather than reported.
+		log "   SKIP: could not arm replica_incomplete by hand, so there is no refusal to observe"
+		results_row "$CSV" "$sc" nothing_is_reclaimed_while_the_replica_is_marked_incomplete SKIP "" "" "" "" "" "SKIP could not arm replica_incomplete"
+		results_row "$CSV" "$sc" the_refusal_does_not_fail_the_sync SKIP "" "" "" "" "" "SKIP could not arm replica_incomplete"
 	fi
 
 	# Leave the replica complete and clean, whatever happened above: the next
