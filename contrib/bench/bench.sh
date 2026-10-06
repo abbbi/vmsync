@@ -8380,8 +8380,28 @@ stage_lock_lease() {
 	# flock -n on the same path the engine uses. A read of the file would not do:
 	# the lock lives on the open file description, so the only way to ask whether
 	# it is held is to try to take it.
+	# lock_free -> 0 when nothing holds the target's run lock.
+	#
+	# `flock -n FILE -c true`, the documented file form, and NOT the fd form
+	# this used to attempt:
+	#
+	#     flock -n 9 9>'$lock_path' -c true
+	#
+	# flock(1) treats its remaining argument as a file descriptor only when
+	# that argument is a number AND no command was given. `-c true` supplies a
+	# command, so flock took the file form and read `9` as a FILENAME --
+	# locking a file literally called `9` in the remote login directory, which
+	# nothing else ever touches and which is therefore always free. The `9>`
+	# redirection did open the real lock file, but flock never looked at that
+	# descriptor. So this answered "free" on every call, whoever held the lock,
+	# and every assertion in this stage that waits for the lock to be taken
+	# waited out its whole poll budget and skipped (2026-10-06).
+	#
+	# The file form locks the path itself, which is the question being asked.
+	# It creates the file if absent, exactly as the engine's own lock does, and
+	# only ever runs `true` while holding it.
 	lock_free() {
-		ssh_host_cmd "$TARGET_HOST" "flock -n 9 9>'$lock_path' -c true" >/dev/null 2>&1
+		ssh_host_cmd "$TARGET_HOST" "flock -n '$lock_path' -c true" >/dev/null 2>&1
 	}
 
 	# start_stalled_sync PATH_TO_HELPER LABEL -> sets STALLED_PID and
@@ -8565,6 +8585,14 @@ stage_lock_lease() {
 	bench_sync "$sc" repaired -reinit \
 		|| warn "stage 21 could not leave $TARGET_DOMAIN with a complete replica; the next stage starts from a replica a killed sync was part way through"
 
+	# Disarmed BEFORE the unset, and in that order for a reason: the RETURN
+	# trap runs after this function's last statement, so unsetting
+	# cleanup_stalled first left the trap calling a function that no longer
+	# existed -- "bench.sh: line NNNN: cleanup_stalled: command not found" at
+	# the end of the stage. Harmless to the results and alarming to read.
+	# Called explicitly here so the trap's job is still done on this path.
+	cleanup_stalled
+	trap - RETURN
 	unset -f lock_free start_stalled_sync cleanup_stalled
 	return 0
 }
