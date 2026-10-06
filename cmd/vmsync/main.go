@@ -2252,8 +2252,16 @@ func ensureTargetDiskDirs(ctx context.Context, client util.CommandRunner, cfg sy
 			continue
 		}
 		done[dir] = true
-		if _, err := client.Run(ctx, util.MkdirOwnedCommand(owner, dir)); err != nil {
-			return fmt.Errorf("create remote target dir %s: %w", dir, err)
+		// The output, not just the error. MkdirOwnedCommand silences its
+		// per-component mkdirs on purpose -- "already exists" is the ordinary
+		// case there -- and deliberately leaves the FINAL `mkdir -p`
+		// un-silenced so that one reports a genuine problem in its own words.
+		// Discarding it threw away the only description of why the directory
+		// could not be made: a read-only filesystem, a parent that is a file,
+		// an NFS mount that squashed the chown. The caller would be told the
+		// path and nothing else.
+		if out, err := client.Run(ctx, util.MkdirOwnedCommand(owner, dir)); err != nil {
+			return fmt.Errorf("create remote target dir %s: %w: %s", dir, err, strings.TrimSpace(out))
 		}
 	}
 	return nil
@@ -4927,6 +4935,41 @@ func run(cfg syncConfig) (runErr error) {
 					// writing the stamp would swallow it.
 					out, err := targetSSHClient.Run(ctx, "stat -c '%Y' "+util.ShQuote(targetPath))
 					if err != nil {
+						// Tell "the replica's disk is gone" apart from "stat
+						// could not run", by EXIT CODE and never by message.
+						// coreutils translates its prose, so on a non-English
+						// host the raw failure reads "impossible d'executer
+						// statx ... Aucun fichier ou dossier de ce nom" and
+						// reaches the operator as the entire explanation of a
+						// failed sync -- no diagnosis, no remedy, and in a
+						// language the rest of the log is not in. Observed on
+						// a French host, 2026-10-06.
+						//
+						// RemotePathExists is a `test -e`, so it answers the
+						// same question in any locale. A missing disk stays a
+						// hard error -- see the comment above about why the
+						// tolerant batch form is not used here -- this only
+						// says what the error MEANS.
+						//
+						// The DIRECTORY is checked before the disk is declared
+						// missing, and that order matters. `test -e` on the
+						// disk also fails when a parent directory cannot be
+						// SEARCHED, which is a different fault with a
+						// different remedy -- and not a hypothetical one: on
+						// NFS with root_squash, or any export where the SSH
+						// user is not really root, a 0700 directory owned by
+						// somebody else reads exactly like a deleted disk.
+						// Prescribing -reinit for that would have the operator
+						// rebuild a 9 GB replica to fix a chmod.
+						if exists, exErr := util.RemotePathExists(ctx, targetSSHClient, targetPath); exErr == nil && !exists {
+							targetDir := path.Dir(targetPath)
+							if dirOK, dirErr := util.RemotePathExists(ctx, targetSSHClient, targetDir); dirErr == nil && !dirOK {
+								return fmt.Errorf("incremental sync of %s: the directory holding this replica's disks (%s) cannot be reached as the SSH user this ran as, so %s could not be examined either. Nothing has been written. Check that directory's owner and mode on the target -- vmsync owns only the directories it creates itself, so one an operator or an earlier tool made is left exactly as it was found",
+									cfg.TargetDomain, targetDir, targetPath)
+							}
+							return fmt.Errorf("incremental sync of %s: this replica's disk for %s is missing from the target (%s), yet the domain still records last_checkpoint=%q -- so this run was asked to extend a chain whose base image is gone. Nothing has been written. Rebuild with -reinit, or -force-clean if the target's definition is wedged too; an incremental sync cannot recreate a base image",
+								cfg.TargetDomain, d.TargetDev, targetPath, metadataEntryCheckpoint)
+						}
 						return fmt.Errorf("%w: %s", err, out)
 					}
 					stamp, haveStamp := writtenAt[d.TargetDev]
