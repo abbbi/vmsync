@@ -976,7 +976,14 @@ func main() {
 	}
 	if cfg.TestFault != "" {
 		libvirtsync.TestFault = cfg.TestFault
-		trace.Warning("FAULT INJECTION ACTIVE: this run will deliberately fail, and is not a replication anybody should rely on", "test", cfg.TestFault)
+		// The stall fault does not fail the run, it never ends it at all, so
+		// the usual wording would be wrong about the one thing an operator
+		// reading this needs to know. See TestFaultStallAfterLock.
+		what := "this run will deliberately fail, and is not a replication anybody should rely on"
+		if cfg.TestFault == libvirtsync.TestFaultStallAfterLock {
+			what = "this run will take the target-side run lock and then hang for ever on purpose; it has to be killed, and it is not a replication anybody should rely on"
+		}
+		trace.Warning("FAULT INJECTION ACTIVE: "+what, "test", cfg.TestFault)
 	}
 
 	// Validated whether or not -reinit was passed, so a typo is caught at
@@ -4088,6 +4095,33 @@ func run(cfg syncConfig) (runErr error) {
 			"vm", cfg.TargetDomain, "host", util.HostFromURIOrLocal(cfg.TargetURI),
 			"reason", reason,
 			"remedy", "deploy a matching vmsync-bridge-helper at "+cfg.BridgeHelperPath+" on the target; until then vmsync -break-target-lock is the way past a stale lock")
+	}
+
+	// HERE, and the position is the whole fault. The lock is held, whichever
+	// kind it turned out to be, and the line above has already said which --
+	// so a harness can read that, and then stop this process, with no race to
+	// lose. Earlier and there would be no lock to hold; later and the run
+	// would have started touching the replica, which this fault must not do.
+	//
+	// Blocks until signalled, with no timeout: see TestFaultStallAfterLock for
+	// why a silent holder cannot be produced any other way, and why ending it
+	// is the caller's job. Logged at WARNING so it is visible without -debug,
+	// because a run that never returns needs to say why in its own log.
+	if cfg.TestFault == libvirtsync.TestFaultStallAfterLock {
+		trace.Warning("FAULT INJECTION: holding the target-side run lock and going silent, deliberately. This run will not return; the caller ends it with a signal",
+			"vm", cfg.TargetDomain, "host", util.HostFromURIOrLocal(cfg.TargetURI),
+			"leased", targetLock.Leased(), "test", cfg.TestFault)
+		// A sleep loop, not `select {}` or a receive on a channel nothing
+		// sends to. Both of those are blocks on Go synchronization primitives,
+		// and if every other goroutine is parked on one too the runtime
+		// declares a deadlock and panics -- which would end the process and
+		// release the lock, the exact opposite of this fault. Sleeping always
+		// has a timer pending, so the detector never fires, and the process
+		// stays alive holding the lock until a signal ends it. The duration is
+		// arbitrary and tunes nothing: the loop never exits on its own.
+		for {
+			time.Sleep(time.Hour)
+		}
 	}
 
 	// Check the two clocks agree before anything depends on them.

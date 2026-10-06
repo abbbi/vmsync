@@ -196,11 +196,36 @@ const (
 	// target must kill it. contrib/bench/bench.sh does, immediately after the
 	// run and again from its cleanup trap.
 	TestFaultDieWritingBase = "die-writing-base"
+
+	// TestFaultStallAfterLock takes the target-side run lock and then blocks
+	// for ever, holding every socket open and sending nothing.
+	//
+	// The one fault that is not a failure. It exists because the state it
+	// produces cannot be reached any other way: a driver that has the lock and
+	// has gone SILENT, which is what a partitioned or powered-off host looks
+	// like from the target. A killed process is no use -- closing its sockets
+	// sends a FIN and the target releases the lock promptly, which is the case
+	// that always worked.
+	//
+	// SIGSTOP on an ordinary run is the obvious alternative and is a race the
+	// caller loses: the lock is taken late in the preflight and held only until
+	// the run ends, so on a replica whose delta is small the whole sync is over
+	// in about two seconds and there is nothing to stop. contrib/bench/bench.sh
+	// lost that race on every attempt (2026-10-06) and skipped both halves of
+	// its lock-lease stage for want of a window. This makes the window
+	// unbounded instead, and the harness decides when it ends.
+	//
+	// Blocks rather than sleeps, so there is no duration to tune and no run
+	// that outlives its own fault. The caller ends it with a signal: SIGKILL
+	// for "the driver died", or SIGCONT after a SIGSTOP to prove the resumed
+	// driver notices it no longer holds the lock. Nothing here unwinds, which
+	// is the point -- an orderly release is the behaviour under test.
+	TestFaultStallAfterLock = "stall-after-lock"
 )
 
 // TestFaults is every accepted -test value, for validation and for the flag's
 // own help text.
-var TestFaults = []string{TestFaultFailureDefine, TestFaultCorruptBeforeChecksum, TestFaultCorruptAfterCommit, TestFaultFailLastDisk, TestFaultDieWritingBase}
+var TestFaults = []string{TestFaultFailureDefine, TestFaultCorruptBeforeChecksum, TestFaultCorruptAfterCommit, TestFaultFailLastDisk, TestFaultDieWritingBase, TestFaultStallAfterLock}
 
 // ValidateTestFault reports whether name is an injectable fault. "" is valid
 // and means no injection.
