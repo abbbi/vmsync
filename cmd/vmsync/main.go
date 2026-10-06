@@ -2302,6 +2302,25 @@ func applyTargetDiskOwner(ctx context.Context, client util.CommandRunner, cfg sy
 	return nil
 }
 
+// checkpointLibvirtError unwraps err down to the libvirt.Error underneath it,
+// if there is one.
+//
+// errors.As rather than a type assertion: CreateCheckpoint wraps with %w, and
+// re-wraps again on its self-heal retries, so the libvirt.Error is never the
+// outermost value. A type assertion on the wrapper reports "not a libvirt
+// error" for every one of them.
+//
+// Exists so a failure can be reported by its NUMERIC code and domain. libvirtd
+// formats its message server-side in the daemon's locale, so the prose is the
+// one part of a libvirt.Error that cannot be relied on.
+func checkpointLibvirtError(err error) (libvirt.Error, bool) {
+	var lvErr libvirt.Error
+	if errors.As(err, &lvErr) {
+		return lvErr, true
+	}
+	return libvirt.Error{}, false
+}
+
 func run(cfg syncConfig) (runErr error) {
 	runStart := time.Now()
 	defer func() {
@@ -5106,6 +5125,30 @@ func run(cfg syncConfig) (runErr error) {
 		// baseline for future incremental syncs, so that case still fails
 		// outright, same as any other CreateCheckpoint error.
 		if parent == "" || !libvirtsync.IsCheckpointBlockedBySnapshot(err) {
+			// Say what libvirt actually reported before giving up, because the
+			// discriminator above cannot be trusted on every host.
+			// IsCheckpointBlockedBySnapshot matches libvirt's ENGLISH prose,
+			// and libvirtd formats its errors server-side in the DAEMON's
+			// locale -- so on a non-English host it returns false for a
+			// genuinely snapshot-blocked checkpoint and this run fails where
+			// the same source would sync incrementally elsewhere. Its own doc
+			// comment records that window; this is what makes it diagnosable.
+			//
+			// The virError code and domain are numeric, and the external
+			// snapshot count comes from dom.SnapshotNum rather than from a
+			// message, so both survive translation. Together they are enough
+			// to replace the prose test with a structured one -- which cannot
+			// be written until one failure on such a host says which code
+			// libvirt uses here. Logged on a path that is already failing, so
+			// it costs a line in a run that was going to end anyway.
+			if parent != "" {
+				snaps, snapErr := libvirtsync.ExternalSnapshotCount(srcDom)
+				if lvErr, ok := checkpointLibvirtError(err); ok {
+					trace.Warning("checkpoint creation failed and was not recognised as snapshot-blocked; if this source carries an external snapshot, the recogniser's English-only text match is why -- report these numbers so it can key on them instead",
+						"vm", cfg.SourceDomain, "virterror_code", int(lvErr.Code), "virterror_domain", int(lvErr.Domain),
+						"external_snapshots", snaps, "snapshot_count_error", snapErr, "message", lvErr.Message)
+				}
+			}
 			thawSource("checkpoint creation failed")
 			return err
 		}
