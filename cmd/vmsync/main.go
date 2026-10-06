@@ -4111,16 +4111,42 @@ func run(cfg syncConfig) (runErr error) {
 		trace.Warning("FAULT INJECTION: holding the target-side run lock and going silent, deliberately. This run will not return; the caller ends it with a signal",
 			"vm", cfg.TargetDomain, "host", util.HostFromURIOrLocal(cfg.TargetURI),
 			"leased", targetLock.Leased(), "test", cfg.TestFault)
-		// A sleep loop, not `select {}` or a receive on a channel nothing
-		// sends to. Both of those are blocks on Go synchronization primitives,
-		// and if every other goroutine is parked on one too the runtime
-		// declares a deadlock and panics -- which would end the process and
-		// release the lock, the exact opposite of this fault. Sleeping always
-		// has a timer pending, so the detector never fires, and the process
-		// stays alive holding the lock until a signal ends it. The duration is
-		// arbitrary and tunes nothing: the loop never exits on its own.
+		// Sleeps in short slices and watches the clock, rather than blocking
+		// on a channel or waiting for a signal of its own.
+		//
+		// Two reasons, and the second is what the stage needs. A block on a Go
+		// synchronization primitive risks the runtime's deadlock detector:
+		// with every other goroutine parked on one too it panics, which would
+		// end the process and release the lock -- the exact opposite of this
+		// fault. A pending timer rules that out.
+		//
+		// And resuming has to be detectable. SIGSTOP freezes the process, so
+		// the sleep in flight does not return until SIGCONT; an elapsed time
+		// far longer than the slice asked for therefore means "something
+		// stopped and restarted us", which is the only thing SIGCONT can
+		// communicate -- the signal itself is not deliverable to a handler.
+		// Waiting for a SIGUSR1 instead would read more plainly and does not
+		// compile everywhere: syscall.SIGUSR1 is absent on Windows, where this
+		// tree is developed and type-checked.
+		//
+		// On resume the run CONTINUES, deliberately. The whole second half of
+		// the lock-lease stage is about what a driver does after it discovers
+		// the lock went away while it was silent, and it cannot discover
+		// anything if the fault keeps it parked. Never stopped, this loops for
+		// ever, which is what holding the lock indefinitely means.
+		const stallSlice = 500 * time.Millisecond
+		// 20x the slice. Scheduling jitter does not reach ten seconds; a
+		// SIGSTOP held while a lease expires does, by design -- the harness
+		// waits out the whole lease before resuming.
+		const stallResumed = 20 * stallSlice
 		for {
-			time.Sleep(time.Hour)
+			start := time.Now()
+			time.Sleep(stallSlice)
+			if time.Since(start) >= stallResumed {
+				trace.Warning("FAULT INJECTION: resumed after being stopped for longer than the run lock's lease could survive; continuing, so this run now has to discover for itself whether it still holds the lock",
+					"vm", cfg.TargetDomain, "stopped_for", time.Since(start).Round(time.Second).String())
+				break
+			}
 		}
 	}
 
