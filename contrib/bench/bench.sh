@@ -35,8 +35,8 @@ set -euo pipefail
 # which is exactly the case this guards against.
 #
 # virsh is the obvious one -- it translates its own labels and values through
-# gettext, so `domstate` answers in French and `dominfo` prints a translated
-# "Persistant" label instead of "Persistent", and every exact-string comparison here
+# gettext, so `domstate` answers in French and `dominfo` prints a localized
+# "Persistent" label (in our case "Persist-a-nt"), and every exact-string comparison here
 # assumes the English vocabulary. virsh_uri has always forced this for itself;
 # this covers everything else: qemu-img, stat, ls, date and df are parsed too,
 # and under a French locale `ls` prints "4,0K" and "6 oct." while a decimal
