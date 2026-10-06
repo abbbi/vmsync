@@ -903,6 +903,24 @@ bench_sync() {
 	fi
 }
 
+# bench_sync_ok -> 0 when the vmsync run bench_sync just made succeeded.
+#
+# bench_sync cannot answer this itself, and that is why this exists: run_vmsync
+# ends on results_row, so its exit status is results_row's, not vmsync's. Every
+# `bench_sync ... || { ... }` in this file was therefore DEAD -- a stage whose
+# baseline sync failed carried straight on and measured the damage, and a
+# `|| fo_ok=1` guard reported a failed sync as a passing check. Observed on
+# 2026-10-06: stage 19's baseline exited 1 and the stage proceeded to its
+# rebuild as though nothing had happened.
+#
+# Deliberately NOT fixed by giving run_vmsync `return $RUN_RC`. Over a hundred
+# call sites invoke bench_sync bare, many of them for runs that are EXPECTED to
+# fail (a reinit over a running target, an under-floor duration), and under
+# `set -euo pipefail` a non-zero return there would abort the whole stage. This
+# keeps the terse `||` shape the call sites already read well as, and leaves
+# every bare call behaving exactly as before.
+bench_sync_ok() { [ "${RUN_RC:-0}" = 0 ]; }
+
 # bench_sync_hint names the likely cause when one of those syncs fails, since
 # the flags it adds are also the one extra thing that has to be installed on
 # the target.
@@ -7913,8 +7931,8 @@ stage_leftovers() {
 	}
 
 	# --- 19a. a rebuild leaves an aside set -----------------------------------
-	bench_sync "$sc" baseline || { bench_sync_hint; fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "the baseline sync itself failed, see $RUN_LOG"; return 0; }
-	bench_sync "$sc" rebuild -reinit || { fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "the rebuild failed, see $RUN_LOG"; return 0; }
+	bench_sync "$sc" baseline; bench_sync_ok || { bench_sync_hint; fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "the baseline sync itself failed, see $RUN_LOG"; return 0; }
+	bench_sync "$sc" rebuild -reinit; bench_sync_ok || { fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "the rebuild failed, see $RUN_LOG"; return 0; }
 
 	local n
 	n="$(aside_count)"
@@ -7930,7 +7948,7 @@ stage_leftovers() {
 	# The reporting half is the one that matters on an estate that has been
 	# running for a year: the files are already there, and until a run said so
 	# nothing named them at all.
-	bench_sync "$sc" report || fo_ok=1
+	bench_sync "$sc" report; bench_sync_ok || fo_ok=1
 	if [ "$(aside_count)" = "$n" ] && grep -q "displaced sets beside the replica" "$RUN_LOG" 2>/dev/null; then
 		fo_check "$sc" "a run with no duration reports the sets and removes none" 0
 	else
@@ -7942,7 +7960,7 @@ stage_leftovers() {
 	# Refused BEFORE anything is touched, and that is the point: "0h" is what
 	# somebody writes meaning "off", and a sweep that obeyed it would delete an
 	# aside made minutes earlier.
-	bench_sync "$sc" under-floor "-reclaim-leftovers-after=1h" || true
+	bench_sync "$sc" under-floor "-reclaim-leftovers-after=1h"; bench_sync_ok || true
 	if [ "${RUN_RC:-0}" != 0 ] && [ "$(aside_count)" = "$n" ]; then
 		fo_check "$sc" "a duration under the floor is refused at startup" 0
 	else
@@ -7953,7 +7971,7 @@ stage_leftovers() {
 	#
 	# A year's duration against a set made a minute ago, so the age test is the
 	# only thing that can keep it.
-	bench_sync "$sc" too-new "-reclaim-leftovers-after=8760h" || fo_ok=1
+	bench_sync "$sc" too-new "-reclaim-leftovers-after=8760h"; bench_sync_ok || fo_ok=1
 	if [ "$(aside_count)" = "$n" ]; then
 		fo_check "$sc" "a fresh aside is not reclaimed" 0
 	else
@@ -7973,7 +7991,7 @@ stage_leftovers() {
 	local theirs="${TARGET_DISK_PATH%/}/not-${TARGET_DOMAIN}.qcow2.vmsync-replaced-${old_stamp}"
 	ssh_host_cmd "$TARGET_HOST" "dd if=/dev/zero of='$theirs' bs=1k count=8 2>/dev/null" >/dev/null 2>&1 || true
 
-	bench_sync "$sc" reclaim "-reclaim-leftovers-after=24h" || fo_ok=1
+	bench_sync "$sc" reclaim "-reclaim-leftovers-after=24h"; bench_sync_ok || fo_ok=1
 	if [ "$(aside_count)" = 0 ]; then
 		fo_check "$sc" "an aside older than the duration is reclaimed" 0
 	else
@@ -7992,14 +8010,14 @@ stage_leftovers() {
 	# per-domain stores, so -list-restore-points cannot see them and the points
 	# inside them are outside every store.
 	local rp_parent="${TARGET_DISK_PATH%/}/.vmsync-rp"
-	bench_sync "$sc" store-baseline "-retention=2,0" || fo_ok=1
-	bench_sync "$sc" store-rebuild -reinit "-retention=2,0" || fo_ok=1
+	bench_sync "$sc" store-baseline "-retention=2,0"; bench_sync_ok || fo_ok=1
+	bench_sync "$sc" store-rebuild -reinit "-retention=2,0"; bench_sync_ok || fo_ok=1
 	local asides
 	asides="$(ssh_host_cmd "$TARGET_HOST" "ls -1d '$rp_parent'/.replaced-vm-${TARGET_DOMAIN}-* 2>/dev/null | wc -l" 2>/dev/null | tr -d '[:space:]' || true)"
 	if [ "${asides:-0}" -ge 1 ]; then
 		# Age it the same way, then sweep.
 		ssh_host_cmd "$TARGET_HOST" "for d in '$rp_parent'/.replaced-vm-${TARGET_DOMAIN}-*; do [ -d \"\$d\" ] || continue; mv -n \"\$d\" \"${rp_parent}/.replaced-vm-${TARGET_DOMAIN}-${old_stamp}\"; done" >/dev/null 2>&1 || true
-		bench_sync "$sc" store-reclaim "-reclaim-leftovers-after=24h" || fo_ok=1
+		bench_sync "$sc" store-reclaim "-reclaim-leftovers-after=24h"; bench_sync_ok || fo_ok=1
 		local left
 		left="$(ssh_host_cmd "$TARGET_HOST" "ls -1d '$rp_parent'/.replaced-vm-${TARGET_DOMAIN}-* 2>/dev/null | wc -l" 2>/dev/null | tr -d '[:space:]' || true)"
 		if [ "${left:-1}" = 0 ]; then
@@ -8053,7 +8071,7 @@ stage_leftovers() {
 
 	# Leave the replica complete and clean, whatever happened above: the next
 	# stage inherits this target.
-	bench_sync "$sc" repaired -reinit || warn "stage 19 could not leave $TARGET_DOMAIN with a complete replica -- the next stage starts from a replica marked incomplete"
+	bench_sync "$sc" repaired -reinit; bench_sync_ok || warn "stage 19 could not leave $TARGET_DOMAIN with a complete replica -- the next stage starts from a replica marked incomplete"
 	# Every disk's asides, not just one: this stage creates a set per disk, so
 	# a single-path cleanup would leave a full-size copy of every other disk
 	# behind for the rest of the run to fill the target's filesystem with.
@@ -8107,18 +8125,61 @@ stage_reinit_order() {
 	# shellcheck disable=SC2064
 	trap "REPLACED_DISK_ACTION='$saved_action'" RETURN
 
-	# target_is_persistent -> 0 when the target domain still has a definition.
+	# target_persistence -> prints "yes", "no" or "unknown".
 	#
 	# Not domain_exists: dominfo succeeds for a TRANSIENT domain too, which is
 	# exactly the state a -force-clean that undefined a running domain leaves
 	# behind, and telling those apart is the point of sub-test 20f.
-	target_is_persistent() {
-		virsh_uri "$TARGET_URI" dominfo "$TARGET_DOMAIN" 2>/dev/null \
-			| grep -qE '^Persistent:[[:space:]]+yes'
+	#
+	# Three-valued, because the question is. The previous two-valued form
+	#
+	#     virsh_uri ... dominfo ... 2>/dev/null | grep -qE '^Persistent:[[:space:]]+yes'
+	#
+	# folded "the domain is transient" together with "the query did not answer",
+	# and `2>/dev/null` threw away the only evidence of which it was. Worse, it
+	# put a fallible command on the LEFT of a pipeline under `set -o pipefail`
+	# (bench.sh:30): the pipeline's status is the rightmost non-zero one, so a
+	# virsh that printed a complete, matching `Persistent:  yes` and only THEN
+	# exited non-zero reported "transient" anyway. virsh dominfo is not one RPC
+	# -- virDomainIsPersistent, virNodeGetSecurityModel and
+	# virDomainGetSecurityLabel are three independently fallible calls -- and
+	# 20f reaches this check with the domain deliberately PAUSED, where the
+	# security-label read goes to the live qemu process. On 2026-10-06 this
+	# reported a domain that `LC_ALL=C virsh dominfo` plainly called
+	# `Persistent: yes` as transient, failed 20f, and printed a warning telling
+	# the operator the engine had undefined their replica. It had not.
+	#
+	# `virsh list --persistent` would avoid the label entirely, but dominfo is
+	# kept: it answers for one named domain instead of filtering a list, and the
+	# fix is to stop making a pipeline's exit status carry the answer. Capture
+	# first, then decide on the status and the text separately.
+	target_persistence() {
+		local out rc
+		out="$(virsh_uri "$TARGET_URI" dominfo "$TARGET_DOMAIN" 2>&1)" && rc=0 || rc=$?
+		if [ "$rc" != 0 ]; then
+			VIRSH_ERR="$out"
+			printf 'unknown\n'
+			return 0
+		fi
+		# The Persistent LINE, not a substring of the whole table: dominfo
+		# prints a dozen other fields, and a bare *"Persistent:"*"yes"* glob
+		# would take a "yes" belonging to any of them. grep runs against a
+		# captured string here, so no fallible command is on the left of a
+		# pipeline and pipefail has nothing to misreport.
+		local line
+		line="$(printf '%s\n' "$out" | grep -E '^Persistent:[[:space:]]+' || true)"
+		case "$line" in
+			"")
+				# dominfo exited 0 without the field at all: not a transient
+				# domain, an output shape this check does not understand.
+				VIRSH_ERR="$out"; printf 'unknown\n' ;;
+			*yes*) printf 'yes\n' ;;
+			*)     printf 'no\n' ;;
+		esac
 	}
 
 	# A baseline so there IS a checkpoint chain to protect and a replica to boot.
-	bench_sync "$sc" baseline -reinit || {
+	bench_sync "$sc" baseline -reinit; bench_sync_ok || {
 		bench_sync_hint
 		fo_check "$sc" "-reinit over a running target is refused" 1 "the baseline sync itself failed, see $RUN_LOG"
 		return 0
@@ -8155,7 +8216,16 @@ stage_reinit_order() {
 	ro_cleanup() {
 		[ "$started_paused" = yes ] || return 0
 		started_paused=no
-		if ! target_is_persistent; then
+		# Only the definite "no" gets the alarming message. An "unknown" used to
+		# land here too and tell the operator their replica had been undefined
+		# when it had not, which is a worse outcome than saying nothing: it
+		# blames the engine for a question the harness failed to ask.
+		local persist
+		persist="$(target_persistence)"
+		if [ "$persist" = unknown ]; then
+			warn "could not tell whether $TARGET_DOMAIN is still persistent, so nothing is claimed about it${VIRSH_ERR:+: $VIRSH_ERR}"
+		fi
+		if [ "$persist" = no ]; then
 			# Only reachable when a sub-test below already failed: destroying a
 			# transient domain removes it outright. Said out loud, with the way
 			# back, because a silent vanishing target is how a bench run gets
@@ -8189,7 +8259,20 @@ stage_reinit_order() {
 
 		# Only -force-clean can undefine, so only it is asked.
 		if [ "$verb" = "-force-clean" ]; then
-			if target_is_persistent; then fo_ok=0; else fo_ok=1; fi
+			local persist
+			persist="$(target_persistence)"
+			if [ "$persist" = unknown ]; then
+				# Asserted on nothing rather than guessed. A failed query is
+				# not evidence that the engine undefined anything, and
+				# recording it as a FAIL is how a harness bug gets reported as
+				# an engine regression -- which is exactly what happened on
+				# 2026-10-06.
+				warn "SKIP 20f: could not determine whether $TARGET_DOMAIN is still persistent${VIRSH_ERR:+: $VIRSH_ERR}"
+				results_row "$CSV" "$sc" the_refused_force_clean_left_the_target_domain_defined SKIP "" "" "" "" "" "SKIP persistence query did not answer"
+				[ -n "$phase" ] || true
+				return 0
+			fi
+			if [ "$persist" = yes ]; then fo_ok=0; else fo_ok=1; fi
 			fo_check "$sc" "the refused $verb left the target domain defined" "$fo_ok" \
 				"$TARGET_DOMAIN is no longer persistent: -force-clean undefined it and only then noticed it was running. DomainExists uses LookupDomainByName, which still finds a RUNNING domain after its definition is gone, so the guard fired one step too late and left the replica as a transient domain with no definition at all"
 		fi
@@ -8197,7 +8280,7 @@ stage_reinit_order() {
 	}
 
 	# --- 20a-c. a plain -reinit ----------------------------------------------
-	bench_sync "$sc" running-reinit -reinit || true
+	bench_sync "$sc" running-reinit -reinit; bench_sync_ok || true
 	ro_assert_nothing_destroyed "-reinit" running-reinit
 
 	# --- 20d-f. and -force-clean, which has one more way to be wrong ---------
@@ -8205,7 +8288,7 @@ stage_reinit_order() {
 	# Separate from the above rather than folded into it: -force-clean reaches
 	# the same guard through forceCleanTargetDomain, which runs before it and would
 	# undefine the target on the way there if the guard sat any later.
-	bench_sync "$sc" running-force-clean -force-clean || true
+	bench_sync "$sc" running-force-clean -force-clean; bench_sync_ok || true
 	ro_assert_nothing_destroyed "-force-clean" running-force-clean
 
 	ro_cleanup
@@ -8216,7 +8299,7 @@ stage_reinit_order() {
 	bench_sync "$sc" repaired -reinit \
 		|| warn "stage 20 could not leave $TARGET_DOMAIN with a freshly written replica; the next stage starts from a replica whose qcow2 headers were touched by a paused boot"
 
-	unset -f target_is_persistent ro_cleanup ro_assert_nothing_destroyed
+	unset -f target_persistence ro_cleanup ro_assert_nothing_destroyed
 	return 0
 }
 
@@ -8260,7 +8343,15 @@ stage_lock_lease() {
 		ssh_host_cmd "$TARGET_HOST" "flock -n 9 9>'$lock_path' -c true" >/dev/null 2>&1
 	}
 
-	# start_stalled_sync PATH_TO_HELPER -> sets STALLED_PID, or returns 1.
+	# start_stalled_sync PATH_TO_HELPER LABEL -> sets STALLED_PID and
+	# STALLED_LOG, or returns 1.
+	#
+	# LABEL keeps the two halves' logs apart. They shared one path, so the
+	# unleased attempt overwrote the leased one and the leased half's failure
+	# became undiagnosable the moment the stage moved on -- the assertions below
+	# still read the right content, because they run before the second attempt
+	# starts, but the only surviving artifact was the wrong run's. That cost a
+	# whole round trip to the operator to discover.
 	#
 	# SIGSTOP, not SIGKILL, and that is the whole point of this stage. Killing a
 	# process closes its sockets, so the target gets a FIN and releases the lock
@@ -8269,7 +8360,8 @@ stage_lock_lease() {
 	# powered-off driver looks like from the target: no heartbeat, and no FIN
 	# either. It needs no firewall rule and it is fully reversible.
 	start_stalled_sync() {
-		local helper="$1"
+		local helper="$1" label="${2:-run}"
+		STALLED_LOG="$RUN_DIR/logs/${sc}.stalled-${label}.log"
 		vmsync_common_args "${IO_DEPTH:-8}"
 		# -no-checksum, and without it the unleased half can never set up.
 		#
@@ -8290,7 +8382,7 @@ stage_lock_lease() {
 		# would never have run anyway. Do not remove the flag to "restore
 		# checksum coverage" -- it would re-break 21d and 21e.
 		local -a args=("${VMSYNC_ARGS[@]}" -bridge-helper-path "$helper" -no-checksum -remote-lock-lease "${lease}s")
-		"$VMSYNC_BIN" "${args[@]}" >"$RUN_DIR/logs/${sc}.stalled.log" 2>&1 &
+		"$VMSYNC_BIN" "${args[@]}" >"$STALLED_LOG" 2>&1 &
 		STALLED_PID=$!
 
 		# Wait for it to actually hold the lock before stopping it; stopping it
@@ -8317,7 +8409,7 @@ stage_lock_lease() {
 		STALLED_PID=""
 	}
 
-	bench_sync "$sc" baseline -reinit || {
+	bench_sync "$sc" baseline -reinit; bench_sync_ok || {
 		bench_sync_hint
 		fo_check "$sc" "a leased lock is taken when the helper is there" 1 "the baseline sync failed, see $RUN_LOG"
 		return 0
@@ -8329,14 +8421,14 @@ stage_lock_lease() {
 	if ! ssh_host_cmd "$TARGET_HOST" "test -x '$helper'" >/dev/null 2>&1; then
 		warn "SKIP stage 21's leased half: no executable $helper on $TARGET_HOST, so there is nothing to hold a lease. This is exactly the configuration the unleased half below tests."
 		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP no bridge helper on target"
-	elif ! start_stalled_sync "$helper"; then
-		warn "SKIP stage 21's leased half: could not get a sync to hold the lock and then stall it. See $RUN_DIR/logs/${sc}.stalled.log"
+	elif ! start_stalled_sync "$helper" leased; then
+		warn "SKIP stage 21's leased half: could not get a sync to hold the lock and then stall it. See $STALLED_LOG"
 		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP could not stall a lock-holding sync"
 		cleanup_stalled
 	else
-		if grep -q "holding the target-side run lock under a lease" "$RUN_DIR/logs/${sc}.stalled.log" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+		if grep -q "holding the target-side run lock under a lease" "$STALLED_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
 		fo_check "$sc" "a leased lock is taken when the helper is there" "$fo_ok" \
-			"the run did not report a leased lock, so it fell back to the shell and this half tests nothing -- see $RUN_DIR/logs/${sc}.stalled.log"
+			"the run did not report a leased lock, so it fell back to the shell and this half tests nothing -- see $STALLED_LOG"
 
 		# Before the lease is up the lock must still be held: a lock that goes
 		# early can be handed to a promotion while its driver is still writing.
@@ -8357,9 +8449,9 @@ stage_lock_lease() {
 		kill -CONT "$STALLED_PID" 2>/dev/null || true
 		local i=0
 		while kill -0 "$STALLED_PID" 2>/dev/null && [ $i -lt 120 ]; do sleep 0.5; i=$((i + 1)); done
-		if grep -qE "can no longer prove it holds the target-side run lock" "$RUN_DIR/logs/${sc}.stalled.log" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
+		if grep -qE "can no longer prove it holds the target-side run lock" "$STALLED_LOG" 2>/dev/null; then fo_ok=0; else fo_ok=1; fi
 		fo_check "$sc" "the resumed driver refuses to commit after losing its lock" "$fo_ok" \
-			"the run resumed and said nothing about having lost its lock; if a promotion took that lock, committing into those disks corrupts what the promoted guest has written -- see $RUN_DIR/logs/${sc}.stalled.log"
+			"the run resumed and said nothing about having lost its lock; if a promotion took that lock, committing into those disks corrupts what the promoted guest has written -- see $STALLED_LOG"
 		cleanup_stalled
 	fi
 
@@ -8367,7 +8459,7 @@ stage_lock_lease() {
 	#
 	# Asserted rather than assumed, because the WARNING every such run prints is
 	# only worth trusting if the consequence it names is real.
-	if ! start_stalled_sync "/nonexistent/vmsync-bridge-helper"; then
+	if ! start_stalled_sync "/nonexistent/vmsync-bridge-helper" unleased; then
 		warn "SKIP stage 21's unleased half: could not get a sync to hold the lock and then stall it."
 		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP could not stall an unleased sync"
 		cleanup_stalled
