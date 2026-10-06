@@ -91,11 +91,71 @@ func BreakRunLockDecision(dir, key, expectBinary string) BreakLockDecision {
 			Holder: id, HasHolder: true,
 		}
 	}
+
+	// The record says its holder is gone. Now ask the LOCK, because the record
+	// describes whoever last WROTE this file and the lock belongs to whoever
+	// currently holds the flock, and those are not the same process.
+	//
+	// Nothing clears the stamp: the file is never unlinked on any release path,
+	// and three acquirers of the target lock write no stamp of their own -- the
+	// unleased shell hold (remotelock.go's `exec 9>>`, append-only by design),
+	// -promote, and a local -restore, the last two launched by the agent. So a
+	// LIVE holder routinely inherits a dead predecessor's record, every link of
+	// that confirmed by test on 2026-10-06. Without this check the decision
+	// read "its holder is gone" and unlinked the lock from under a running
+	// restore, after which the next sync created a fresh file, won it, and
+	// wrote the same qcow2 images the restore was rolling back.
+	//
+	// Stamping every acquirer would make the record truthful, and should still
+	// happen, but it cannot be the guarantee: WriteRunLockIdentity is
+	// best-effort by contract, so one failed stamp would bring the hazard
+	// straight back. This asks the kernel instead, which no acquirer can forget
+	// to do.
+	//
+	// FAILS CLOSED like the rest of this function: a lock that cannot be tested
+	// is a lock that must not be broken.
+	if free, whyNot := runLockFree(RunLockPath(dir, key)); !free {
+		return BreakLockDecision{
+			Reason: fmt.Sprintf("the lock for %q names pid %d and %s -- but %s, so that record describes a previous holder rather than the live one. Breaking it would leave two writers on this replica", key, id.PID, why, whyNot),
+			Holder: id, HasHolder: true,
+		}
+	}
 	return BreakLockDecision{
 		Break:  true,
-		Reason: fmt.Sprintf("the lock for %q names pid %d, and %s", key, id.PID, why),
+		Reason: fmt.Sprintf("the lock for %q names pid %d, %s, and nothing is holding the lock", key, id.PID, why),
 		Holder: id, HasHolder: true,
 	}
+}
+
+// runLockFree reports whether the advisory lock on path could be taken, and
+// when it could not, one clause saying why for the refusal to quote.
+//
+// Taking the lock and letting it go again is the only way to ask: flock exposes
+// no "who holds this" query. The probe is non-blocking and the descriptor is
+// closed immediately, and because the lock lives on the open file description,
+// closing is what releases it -- so a probe leaves nothing behind.
+//
+// "Held" and "could not be tested" are deliberately NOT told apart. Both have
+// to refuse, so distinguishing them would add an errno dependency that cannot
+// change the decision -- and EWOULDBLOCK is not even the error every platform
+// reports for a contended non-blocking flock.
+//
+// A missing file is free: there is nothing to hold, and treating that as held
+// would make a lock nobody has created unbreakable.
+func runLockFree(path string) (bool, string) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, ""
+		}
+		return false, fmt.Sprintf("the lock file could not be opened to test whether anything holds it (%v)", err)
+	}
+	defer f.Close()
+
+	if err := FlockExclusiveNB(f); err != nil {
+		return false, fmt.Sprintf("something still holds the lock, or it could not be tested (%v)", err)
+	}
+	return true, ""
 }
 
 // holderProvablyGone reports whether id's process is CERTAINLY not running, and
