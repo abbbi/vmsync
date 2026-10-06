@@ -8691,6 +8691,12 @@ stage_lock_lease() {
 			raw="$(ssh_host_cmd "$TARGET_HOST" "'$TARGET_VMSYNC_BIN' -break-target-lock -target-uri qemu:///system -target-domain '$TARGET_DOMAIN'" 2>&1)" && rc=0 || rc=$?
 			out="$(vmsync_said "$raw")"
 			[ -n "$out" ] || out="$raw"
+			# Kept on disk like every other vmsync invocation in this harness.
+			# This one lived only in a shell variable, and the assertion below
+			# quotes 200 characters of it on failure -- so when it failed on
+			# 2026-10-06 the reason was unrecoverable afterwards, and a grep
+			# over logs/ for it found nothing because nothing was ever written.
+			printf 'exit=%s\n%s\n' "$rc" "$raw" >"$RUN_DIR/logs/${sc}.break-lock.log" 2>/dev/null || true
 		fi
 		if [ "$rc" = -1 ]; then
 			: # already recorded as a skip above
@@ -8698,7 +8704,7 @@ stage_lock_lease() {
 			fo_check "$sc" "-break-target-lock refuses a lock it cannot attribute" 0
 		else
 			fo_check "$sc" "-break-target-lock refuses a lock it cannot attribute" 1 \
-				"it exited $rc saying: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200). An unleased lock records no holder, so nothing can prove its holder is gone and breaking it must be refused"
+				"it exited $rc saying: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200) -- full output in $RUN_DIR/logs/${sc}.break-lock.log. An unleased lock records no holder, so nothing can prove its holder is gone and breaking itmust be refused"
 		fi
 		cleanup_stalled
 	fi
