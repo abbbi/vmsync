@@ -29,6 +29,25 @@
 
 set -euo pipefail
 
+# Every verdict in this harness is read out of a tool's output, so the tools
+# must speak one language. LC_ALL, not LANG: LANG is only the fallback and
+# loses to an LC_MESSAGES or LC_ALL already in the operator's environment,
+# which is exactly the case this guards against.
+#
+# virsh is the obvious one -- it translates its own labels and values through
+# gettext, so `domstate` answers in French and `dominfo` prints a translated
+# "Persistant" label instead of "Persistent", and every exact-string comparison here
+# assumes the English vocabulary. virsh_uri has always forced this for itself;
+# this covers everything else: qemu-img, stat, ls, date and df are parsed too,
+# and under a French locale `ls` prints "4,0K" and "6 oct." while a decimal
+# comma turns a size comparison into a string nobody can parse. It also pins
+# sort collation, so an ordering assertion means the same thing on every host.
+#
+# Exported, so it reaches every local child process. The remote side is a fresh
+# login shell that reads the TARGET host's own profile, so ssh_host_cmd exports
+# it again at the far end -- see lib/common.sh.
+export LC_ALL=C LANG=C
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
@@ -643,8 +662,8 @@ preflight_target_vmsync() {
 		return 0
 	fi
 
-	vmsync_version="$("$VMSYNC_BIN" -version 2>/dev/null | tr -d '[:space:]')"
-	target_version="$(ssh_host_cmd "$TARGET_HOST" "'$TARGET_VMSYNC_BIN' -version" 2>/dev/null | tr -d '[:space:]')"
+	vmsync_version="$(version_from "$("$VMSYNC_BIN" -version 2>&1)")"
+	target_version="$(version_from "$(ssh_host_cmd "$TARGET_HOST" "'$TARGET_VMSYNC_BIN' -version" 2>&1)")"
 
 	if [ -z "$target_version" ]; then
 		warn "vmsync at $TARGET_VMSYNC_BIN on $TARGET_HOST exists but would not report a version, so this harness cannot tell whether the failover stages are testing the build you just made. Check it runs there by hand."
@@ -673,6 +692,32 @@ bridge_helper_path() {
 	printf '%s\n' "${BRIDGE_HELPER_PATH:-/usr/bin/vmsync-bridge-helper}"
 }
 
+# version_from OUTPUT -> the bare version string in a `-version` line, or empty.
+#
+# Not a plain `$(binary -version)`, because vmsync does not print its version on
+# stdout. `cfg.ShowVersion` goes through `trace.Info` (cmd/vmsync/main.go), and
+# pkg/trace is Go's `log` package with `log.LstdFlags` -- so the value arrives on
+# STDERR, wrapped in a log line:
+#
+#     2026/10/06 09:21:04 INFO vmsync Version: 0.50-2026100401-beta
+#
+# A `$(... 2>/dev/null)` therefore captures the empty string. That is not a
+# hypothetical: preflight_bridge_helper compared `$vmsync_version` against the
+# helper's, found it empty, skipped the comparison and logged "matches vmsync"
+# having compared nothing -- for every run this harness has ever made.
+# vmsync-bridge-helper prints plainly on stdout, which is exactly why it went
+# unnoticed: the half that worked produced a version, and the half that did not
+# produced "" and was silently treated as "nothing to compare".
+#
+# Callers pass BOTH streams in (`2>&1`). This takes the last whitespace-separated
+# field of the first line that starts with a digit, which handles the log-wrapped
+# form, a bare version, and a `<name> <version>` form alike -- and discards the
+# SSH login banner the target hosts print on stderr, whose lines end in `|`,
+# `-` or a word.
+version_from() {
+	printf '%s\n' "$1" | tr -d '\r' | awk '{ print $NF }' | grep -m1 -E '^[0-9]' || true
+}
+
 # preflight_bridge_helper reports what vmsync-bridge-helper is on the target
 # and whether its version matches the vmsync under test.
 #
@@ -696,8 +741,8 @@ preflight_bridge_helper() {
 		return 0
 	fi
 
-	vmsync_version="$("$VMSYNC_BIN" -version 2>/dev/null | tr -d '[:space:]')"
-	helper_version="$(ssh_host_cmd "$TARGET_HOST" "'$helper' -version" 2>/dev/null | tr -d '[:space:]')"
+	vmsync_version="$(version_from "$("$VMSYNC_BIN" -version 2>&1)")"
+	helper_version="$(version_from "$(ssh_host_cmd "$TARGET_HOST" "'$helper' -version" 2>&1)")"
 
 	if [ -z "$helper_version" ]; then
 		warn "vmsync-bridge-helper at $helper on $TARGET_HOST exists but would not report a version, so the integrity check may be skipped on every sync. Check it runs there by hand."
@@ -4486,8 +4531,20 @@ rp_list() {
 # would destroy a co-located replica's entire recovery history -- the same
 # mistake stage 18 guards the engine against. Use rp_store_dir and clear one
 # store.
+# Resolves the same way journal_file does (bench.sh:6833), and for a sharper
+# reason: an unset or empty TARGET_DISK_PATH made this print "/.vmsync-rp", so
+# rp_clear_store ran `rm -rf '/.vmsync-rp/vm-<domain>'` as root on the target --
+# an unguarded recursive remove one component below /. TARGET_DISK_PATH is not
+# in the required-variable block and an empty value is only warned about, so
+# that was reachable from a stock bench.conf with one line left blank.
+#
+# Returns nothing rather than a bare "/" prefix when the directory cannot be
+# resolved at all, and every caller treats empty as "do not touch the target".
 rp_root() {
-	printf '%s/.vmsync-rp' "${TARGET_DISK_PATH%/}"
+	local dir="${TARGET_DISK_PATH:-}"
+	[ -n "$dir" ] || dir="$(domain_disk_dir "$TARGET_URI" "$TARGET_DOMAIN")"
+	[ -n "$dir" ] || return 0
+	printf '%s/.vmsync-rp' "${dir%/}"
 }
 
 # rp_store_dir [DOMAIN] -> one target domain's own restore point directory.
@@ -4520,6 +4577,18 @@ rp_plant_point() {
 rp_clear_store() {
 	local dir
 	dir="$(rp_store_dir "${1:-$TARGET_DOMAIN}")"
+	# Refuses rather than guesses. This is a root `rm -rf` on the target, so an
+	# unresolvable store directory must stop it, not shorten it: rp_root
+	# returning nothing used to leave this removing a path rooted at /.
+	# Three conditions, and the third is the one that matters: the path must
+	# contain a /.vmsync-rp/ component AND have a real directory above it.
+	# Requiring only the component still accepts "/.vmsync-rp/vm-<domain>",
+	# which is precisely the path an empty TARGET_DISK_PATH produced.
+	local above="${dir%%/.vmsync-rp/*}"
+	if [ -z "$dir" ] || [ "${dir#*/.vmsync-rp/}" = "$dir" ] || [ -z "$above" ] || [ "$above" = "/" ]; then
+		warn "refusing to clear a restore-point store at '$dir': it is not a .vmsync-rp store directory under a real target disk path. Set TARGET_DISK_PATH in $CONF."
+		return 0
+	fi
 	ssh_host_cmd "$TARGET_HOST" "rm -rf '$dir'" >/dev/null 2>&1 || true
 }
 
@@ -7801,11 +7870,46 @@ stage_leftovers() {
 	# shellcheck disable=SC2064
 	trap "REPLACED_DISK_ACTION='$saved_action'" RETURN
 
-	local replica="${TARGET_DISK_PATH%/}/${TARGET_DOMAIN}.qcow2"
-	# aside_count -> how many aside files sit beside the replica right now.
+	# Resolved from the target's own definition, never built from the domain
+	# name. vmsync names a replica's disks after the SOURCE disk's basename, so
+	# a two-disk domain has <domain>-disk0.qcow2 and <domain>-disk1.qcow2 and a
+	# "${TARGET_DOMAIN}.qcow2" guess matches no file that has ever existed --
+	# which is how this stage reported "no aside files" immediately after a
+	# -reinit that had just created two of them, and then skipped its whole
+	# remaining body for having nothing to act on. Stage 10 resolves it the
+	# same way (disk_source_path); target_disk_paths walks every qcow2 disk.
+	local -a replicas=()
+	mapfile -t replicas < <(target_disk_paths)
+	if [ "${#replicas[@]}" -eq 0 ]; then
+		warn "SKIP stage 19: could not resolve $TARGET_DOMAIN's disk paths from $TARGET_URI, so there is nothing to count aside files beside."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP no target disk paths"
+		return 0
+	fi
+
+	# aside_count -> how many aside files sit beside the replica's disks right
+	# now, summed over ALL of them.
+	#
+	# Every assertion below compares against a count taken this same way rather
+	# than against 1, so counting all disks needs nothing else changed -- and
+	# it is what makes "one aside file per disk" mean what it says. A
+	# single-disk count would pass a two-disk domain that displaced only one.
 	aside_count() {
-		ssh_host_cmd "$TARGET_HOST" "ls -1d '${replica}'.vmsync-replaced-* 2>/dev/null | wc -l" \
-			2>/dev/null | tr -d '[:space:]' || true
+		local p total=0 c
+		for p in "${replicas[@]}"; do
+			c="$(ssh_host_cmd "$TARGET_HOST" "ls -1d '${p}'.vmsync-replaced-* 2>/dev/null | wc -l" 2>/dev/null | tr -d '[:space:]')"
+			total=$((total + ${c:-0}))
+		done
+		printf '%s\n' "$total"
+	}
+
+	# restamp_asides STAMP -- give every aside beside every disk the same
+	# stamp, so the reaper sees one set old enough (or young enough) to act on.
+	# Per disk, for the same reason aside_count is.
+	restamp_asides() {
+		local stamp="$1" p
+		for p in "${replicas[@]}"; do
+			ssh_host_cmd "$TARGET_HOST" "for f in '${p}'.vmsync-replaced-*; do [ -e \"\$f\" ] || continue; mv -n \"\$f\" \"\${f%.vmsync-replaced-*}.vmsync-replaced-${stamp}\"; done" >/dev/null 2>&1 || true
+		done
 	}
 
 	# --- 19a. a rebuild leaves an aside set -----------------------------------
@@ -7817,7 +7921,7 @@ stage_leftovers() {
 	if [ "${n:-0}" -ge 1 ]; then
 		fo_check "$sc" "a rebuild leaves one aside file per disk" 0
 	else
-		fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "no ${replica}.vmsync-replaced-* on $TARGET_HOST after a -reinit with -replaced-disk-action=rename; the rest of this stage has nothing to act on"
+		fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "no <disk>.vmsync-replaced-* beside any of ${#replicas[@]} disk(s) of $TARGET_DOMAIN on $TARGET_HOST (${replicas[*]}) after a -reinit with -replaced-disk-action=rename; the rest of this stage has nothing to act on"
 		return 0
 	fi
 
@@ -7860,7 +7964,7 @@ stage_leftovers() {
 	# clock: the stamp is what vmsync reads, and moving the host's time would
 	# invalidate every other timestamp this replica carries.
 	local old_stamp=1000000000
-	ssh_host_cmd "$TARGET_HOST" "for f in '${replica}'.vmsync-replaced-*; do [ -e \"\$f\" ] || continue; mv -n \"\$f\" \"\${f%.vmsync-replaced-*}.vmsync-replaced-${old_stamp}\"; done" >/dev/null 2>&1 || true
+	restamp_asides "$old_stamp"
 
 	# A co-located domain's aside, planted beside ours in the same directory.
 	# This is the check that a sweep reading the DIRECTORY rather than this
@@ -7927,7 +8031,7 @@ stage_leftovers() {
 		log "   SKIP: the interrupted rebuild left no aside set, so there is nothing for the refusal to protect"
 		results_row "$CSV" "$sc" nothing_is_reclaimed_while_the_replica_is_marked_incomplete SKIP "" "" "" "" "" "SKIP no aside set after the injected failure"
 	else
-		ssh_host_cmd "$TARGET_HOST" "for f in '${replica}'.vmsync-replaced-*; do [ -e \"\$f\" ] || continue; mv -n \"\$f\" \"\${f%.vmsync-replaced-*}.vmsync-replaced-${old_stamp}\"; done" >/dev/null 2>&1 || true
+		restamp_asides "$old_stamp"
 		# The sync is EXPECTED to run here -- re-running it is the documented
 		# repair for replica_incomplete -- so what is being tested is that the
 		# sweep inside it stood down, not that the run was refused.
@@ -7950,9 +8054,16 @@ stage_leftovers() {
 	# Leave the replica complete and clean, whatever happened above: the next
 	# stage inherits this target.
 	bench_sync "$sc" repaired -reinit || warn "stage 19 could not leave $TARGET_DOMAIN with a complete replica -- the next stage starts from a replica marked incomplete"
-	ssh_host_cmd "$TARGET_HOST" "rm -f '${replica}'.vmsync-replaced-* ; rm -rf '$rp_parent'/.replaced-vm-${TARGET_DOMAIN}-*" >/dev/null 2>&1 || true
+	# Every disk's asides, not just one: this stage creates a set per disk, so
+	# a single-path cleanup would leave a full-size copy of every other disk
+	# behind for the rest of the run to fill the target's filesystem with.
+	local rp
+	for rp in "${replicas[@]}"; do
+		ssh_host_cmd "$TARGET_HOST" "rm -f '${rp}'.vmsync-replaced-*" >/dev/null 2>&1 || true
+	done
+	ssh_host_cmd "$TARGET_HOST" "rm -rf '$rp_parent'/.replaced-vm-${TARGET_DOMAIN}-*" >/dev/null 2>&1 || true
 
-	unset -f aside_count
+	unset -f aside_count restamp_asides
 	return 0
 }
 
@@ -8160,7 +8271,25 @@ stage_lock_lease() {
 	start_stalled_sync() {
 		local helper="$1"
 		vmsync_common_args "${IO_DEPTH:-8}"
-		local -a args=("${VMSYNC_ARGS[@]}" -bridge-helper-path "$helper" -remote-lock-lease "${lease}s")
+		# -no-checksum, and without it the unleased half can never set up.
+		#
+		# This function invokes $VMSYNC_BIN directly rather than through
+		# bench_sync, so it does NOT inherit BENCH_SYNC_EXTRA's -compress.
+		# bridgeCfg.Enabled() is therefore false, and with neither -compress
+		# nor -no-checksum the engine reaches the default: arm of its checksum
+		# switch (cmd/vmsync/main.go:3942) and probes the helper with `test -x`.
+		# The unleased half passes a deliberately nonexistent helper path --
+		# that is the whole point of it -- so the probe fails and the run is
+		# REFUSED before it ever reaches the target-side run lock. It exits
+		# immediately, never takes the lock, and the poll below reports
+		# "could not get a sync to hold the lock and then stall it" as a
+		# precondition SKIP: structural, not environmental.
+		#
+		# Safe for what this stage measures: these runs are SIGSTOPped and then
+		# killed, never committed, so the pre-commit integrity check they skip
+		# would never have run anyway. Do not remove the flag to "restore
+		# checksum coverage" -- it would re-break 21d and 21e.
+		local -a args=("${VMSYNC_ARGS[@]}" -bridge-helper-path "$helper" -no-checksum -remote-lock-lease "${lease}s")
 		"$VMSYNC_BIN" "${args[@]}" >"$RUN_DIR/logs/${sc}.stalled.log" 2>&1 &
 		STALLED_PID=$!
 

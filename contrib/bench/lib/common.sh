@@ -44,7 +44,20 @@ ssh_host_cmd() {
 	[ -n "${SSH_KEY:-}" ] && opts+=(-i "$SSH_KEY")
 	[ -n "${SSH_PORT:-}" ] && opts+=(-p "$SSH_PORT")
 	[ -n "${SSH_KNOWN_HOSTS:-}" ] && opts+=(-o "UserKnownHostsFile=$SSH_KNOWN_HOSTS")
-	ssh "${opts[@]}" "${SSH_USER}@${host}" "$@"
+	# `export LC_ALL=C LANG=C;` rather than a bare `LC_ALL=C` prefix, and that
+	# distinction matters: a variable assignment prefix applies to ONE command,
+	# so `LC_ALL=C ls -1 … | tail -1` would leave everything after the pipe on
+	# the host's own locale. Exporting it covers the whole command string.
+	#
+	# Needed even though bench.sh exports it locally: ssh starts a fresh login
+	# shell on the far side, which reads the TARGET host's profile, and the
+	# harness parses remote `stat`, `ls`, `qemu-img info` and `date` output.
+	# bench.sh's own comment has why that matters.
+	#
+	# "$*" rather than "$@": ssh already flattens its argv into a single string
+	# for the remote shell to re-parse, so joining here changes nothing about
+	# how a call behaves -- it only puts the export in front of it.
+	ssh "${opts[@]}" "${SSH_USER}@${host}" "export LC_ALL=C LANG=C; $*"
 }
 
 # maybe_ssh_cmd IS_LOCAL HOST CMD... - runs CMD directly on this machine
