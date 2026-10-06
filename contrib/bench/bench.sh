@@ -1800,6 +1800,14 @@ VMSYNC_TEST_FAILURE_DEFINE="failure-define"
 # fault looks like.
 VMSYNC_TEST_DIE_WRITING_BASE="die-writing-base"
 
+# The one injectable fault that is not a failure: the run takes the
+# target-side run lock and then goes silent for ever, which is what a
+# partitioned or powered-off driver looks like from the target. Stage 21 needs
+# that state and cannot produce it from an ordinary sync -- see the comment at
+# its own use, and libvirtsync.TestFaultStallAfterLock for why killing a run
+# instead proves nothing.
+VMSYNC_TEST_STALL_AFTER_LOCK="stall-after-lock"
+
 stage_reinit_after_failures() {
         log "=== Stage 3: -reinit-after-failures ==="
         local n="${REINIT_AFTER_FAILURES_N:-3}"
@@ -8414,7 +8422,22 @@ stage_lock_lease() {
 		# killed, never committed, so the pre-commit integrity check they skip
 		# would never have run anyway. Do not remove the flag to "restore
 		# checksum coverage" -- it would re-break 21d and 21e.
-		local -a args=("${VMSYNC_ARGS[@]}" -bridge-helper-path "$helper" -no-checksum -remote-lock-lease "${lease}s")
+		# -test=stall-after-lock is what makes this stage possible at all.
+		# Without it the run is an ordinary sync: the lock is taken late in the
+		# preflight and held only until the run ends, so against a replica
+		# whose delta is small the whole thing is over in about two seconds and
+		# there is nothing left to SIGSTOP. Each lock_free probe is its own SSH
+		# round trip on top of the sleep below, so the poller got roughly two
+		# looks -- one before the lock existed, one after the process was gone
+		# -- and this stage skipped both halves on every run (2026-10-06). The
+		# fault holds the lock and goes silent indefinitely instead, so the
+		# window is unbounded and the harness decides when it closes.
+		#
+		# -debug because 21a greps this log for "holding the target-side run
+		# lock under a lease", which vmsync emits at DEBUG level. Without it
+		# that assertion can never pass however well the lock behaves.
+		local -a args=("${VMSYNC_ARGS[@]}" -bridge-helper-path "$helper" -no-checksum -debug
+			-test="$VMSYNC_TEST_STALL_AFTER_LOCK" -remote-lock-lease "${lease}s")
 		"$VMSYNC_BIN" "${args[@]}" >"$STALLED_LOG" 2>&1 &
 		STALLED_PID=$!
 
@@ -8441,6 +8464,20 @@ stage_lock_lease() {
 		wait "$STALLED_PID" 2>/dev/null || true
 		STALLED_PID=""
 	}
+	# Armed as well as called on each of the four paths below, because the
+	# stalled run now holds the lock FOR EVER rather than finishing on its own
+	# in a couple of seconds -- that is the point of -test=stall-after-lock.
+	# Left behind, it blocks every later sync of this target and both -promote
+	# and -restore, for as long as the process lives. The explicit calls handle
+	# the ordinary paths; this catches an assertion that aborts the stage under
+	# `set -e`, or an early return added here later. Idempotent: cleanup_stalled
+	# returns at once once STALLED_PID is empty.
+	#
+	# A RETURN trap does not fire on `exit`, so a Ctrl+C taken mid-stall still
+	# leaves the process: `vmsync -break-target-lock` on the target is the way
+	# past the lock it holds, and the stage prints that remedy below.
+	# shellcheck disable=SC2064
+	trap 'cleanup_stalled' RETURN
 
 	bench_sync "$sc" baseline -reinit; bench_sync_ok || {
 		bench_sync_hint
