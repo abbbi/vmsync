@@ -718,6 +718,25 @@ version_from() {
 	printf '%s\n' "$1" | tr -d '\r' | awk '{ print $NF }' | grep -m1 -E '^[0-9]' || true
 }
 
+# vmsync_said OUTPUT -> only the lines vmsync itself printed.
+#
+# A remote invocation captured with 2>&1 brings back the target host's SSH
+# login banner as well, and vmsync's own output is on that same stream
+# (pkg/trace is Go's log package, which writes to stderr). So a diagnostic
+# built from the raw capture quotes the banner and buries the reason -- which
+# is precisely what stage 21's break-lock failure reported on 2026-10-06: two
+# hundred characters of "UNAUTHORIZED ACCESS TO THIS DEVICE" and not one word
+# from vmsync, leaving the actual refusal unreadable.
+#
+# Every line vmsync prints is prefixed by log.LstdFlags' "YYYY/MM/DD HH:MM:SS "
+# and no banner line is, so the timestamp is the discriminator. Keep 2>&1 at
+# the call sites -- the message wanted is genuinely on stderr -- and filter
+# here instead.
+vmsync_said() {
+	printf '%s\n' "$1" | tr -d '\r' \
+		| grep -E '^[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} ' || true
+}
+
 # preflight_bridge_helper reports what vmsync-bridge-helper is on the target
 # and whether its version matches the vmsync under test.
 #
@@ -8665,7 +8684,13 @@ stage_lock_lease() {
 			results_row "$CSV" "$sc" break_target_lock_refuses_a_lock_it_cannot_attribute SKIP "" "" "" "" "" "SKIP TARGET_VMSYNC_BIN unset"
 			rc=-1
 		else
-			out="$(ssh_host_cmd "$TARGET_HOST" "'$TARGET_VMSYNC_BIN' -break-target-lock -target-uri qemu:///system -target-domain '$TARGET_DOMAIN'" 2>&1)" && rc=0 || rc=$?
+			# rc from ssh, message from vmsync. Captured separately because
+			# the raw capture carries the host's login banner: filtering in
+			# the same expression would take the exit status with it.
+			local raw=""
+			raw="$(ssh_host_cmd "$TARGET_HOST" "'$TARGET_VMSYNC_BIN' -break-target-lock -target-uri qemu:///system -target-domain '$TARGET_DOMAIN'" 2>&1)" && rc=0 || rc=$?
+			out="$(vmsync_said "$raw")"
+			[ -n "$out" ] || out="$raw"
 		fi
 		if [ "$rc" = -1 ]; then
 			: # already recorded as a skip above
