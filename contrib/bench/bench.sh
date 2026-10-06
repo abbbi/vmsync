@@ -7898,6 +7898,21 @@ stage_leftovers() {
 	# same way (disk_source_path); target_disk_paths walks every qcow2 disk.
 	local -a replicas=()
 	mapfile -t replicas < <(target_disk_paths)
+
+	# Start from a known aside state, because every assertion below counts
+	# aside files and an earlier run's sets are indistinguishable from this
+	# one's. They are also NEWER than the stamp restamp_asides writes, so they
+	# are correctly left alone by the reclaim and then counted as "left
+	# behind": on 2026-10-06 this stage removed the 2 files it had aged and
+	# reported FAIL over the 4 it had inherited from the previous run.
+	#
+	# restamp_asides cannot paper over it either -- it renames every aside to
+	# ONE stamp with `mv -n`, so with several sets per disk the first wins and
+	# the rest keep their own, which is how 2 of 6 ended up aged.
+	#
+	# sweep_replaced_disks is the helper written for exactly this; stages 16
+	# and 17 already use it for the same reason.
+	sweep_replaced_disks
 	if [ "${#replicas[@]}" -eq 0 ]; then
 		warn "SKIP stage 19: could not resolve $TARGET_DOMAIN's disk paths from $TARGET_URI, so there is nothing to count aside files beside."
 		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP no target disk paths"
@@ -8041,9 +8056,27 @@ stage_leftovers() {
 	# complete replica the rebuild replaced -- putting it back is the documented
 	# recovery. A sweep that took it would leave a half-written image whose
 	# metadata still reads healthy.
-	if bench_sync "$sc" incomplete -reinit "-test=$VMSYNC_TEST_DIE_WRITING_BASE"; then
+	bench_sync "$sc" incomplete -reinit "-test=$VMSYNC_TEST_DIE_WRITING_BASE"
+	# bench_sync_ok, not `if bench_sync ...`: bench_sync always returns 0 (see
+	# its own doc comment), so `if bench_sync ...; then warn` fired on EVERY
+	# run and reported "exited 0" whatever the run actually did -- it said so
+	# for an exit of 137.
+	if bench_sync_ok; then
 		warn "the injected failure did not take effect: -test=$VMSYNC_TEST_DIE_WRITING_BASE exited 0. Is $VMSYNC_BIN older than the flag?"
 	fi
+
+	# The fault exits without unwinding, so vmsync never runs its own
+	# abortBackup and the SOURCE keeps an active libvirt pull-backup job.
+	# libvirt allows one per domain and vmsync refuses at preflight while one
+	# exists, so the `refused` sub-test below would fail for that reason
+	# instead of the one it tests -- which is what happened on 2026-10-06:
+	# "active block job detected on disk vda" where a reclaim refusal was
+	# expected. Stage 16 already clears this after its own fault injections;
+	# this stage injects the same kind of fault and did not.
+	#
+	# Before aside_count, so a stranded job cannot outlive an early return.
+	abort_orphaned_source_backup
+
 	n="$(aside_count)"
 	if [ "${n:-0}" -lt 1 ]; then
 		log "   SKIP: the interrupted rebuild left no aside set, so there is nothing for the refusal to protect"
