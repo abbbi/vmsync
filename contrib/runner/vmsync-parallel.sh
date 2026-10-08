@@ -4,7 +4,7 @@
 # Written in 2026 by Orsiris de Jong <ozy@netpower.fr> for vmsync by Michael Ablassmeier <abi@grinser.de>
 
 
-#SCRIPT_BUILD=2026082401
+#SCRIPT_BUILD=2026100801
 LOG_FILE=/var/log/vmsync_parallel
 TARGET_VM_PATH=/vm_data
 VMSYNC=/usr/local/bin/vmsync
@@ -14,13 +14,22 @@ IGNORE_VM_LIST=("someVMname" "othervm.local")
 
 # Port accounting, so parallel replication (REPLICATION_CONCURRENCY > 1) never hands two
 # VMs overlapping port ranges:
-#   - Target: vmsync uses one real qemu-nbd port per disk (TargetNBDPort + i). With
-#     -compress/-netbuffer, it *also* uses one bridge port per disk, placed right after all
-#     the real ones (targetBridgePort := targetPort + len(qcowDisks), see
-#     cmd/vmsync/main.go) -- so an N-disk VM needs 2*N ports when bridging is on, not N+1.
+#   - Target: one qemu-nbd export per disk, plus one bridge port per disk when
+#     -compress/-netbuffer is on, plus -- on a --verify run -- a read-only verify export
+#     per disk and that export's own bridge. So 1, 2 or 4 ports per disk; a 2-disk VM with
+#     compression needs 4 to sync and 8 to sync-and-verify. vmsync's targetPortsNeeded
+#     (cmd/vmsync/main.go) is the authority, and it logs the result as target_ports_wanted.
 #   - Source: there is only ONE shared libvirt backup NBD export per VM (not per disk), plus
 #     one more fixed bridge port when bridging is on (SourceNBDPort + 1) -- 1 or 2 ports
-#     total, regardless of disk count.
+#     total, regardless of disk count and regardless of --verify, which reads the source
+#     back through that same export.
+#
+# The base port handed to each VM is a STARTING POINT, not a reservation: each export binds
+# its own port, walking upwards past anything busy (up to 64 candidates) and logging the one
+# it got. So a window that is too narrow does not fail -- it quietly spills into the next
+# VM's, where it collides with a live export, retries, and costs ~20s per collision while
+# warning about a "stale process". Which is why the count above has to be right rather than
+# roughly right.
 
 SOURCE_BASE_PORT=10809
 DESTINATION_HOST=hv02.replica.local
@@ -188,7 +197,6 @@ replicate() {
         fi
         if [ "${VERIFY}" == true ]; then
                 opts="${opts} -verify=fast"
-                ports_increse=2
         fi
 
         # Each vmsync runs in its own session, so a hangup on the terminal
@@ -255,15 +263,44 @@ replicate() {
                 fi
 
 
-                # Target: one real qemu-nbd port per disk; with bridging, one additional
-                # bridge port per disk too (2*disk_count total). Source: one shared NBD
-                # export for the whole VM, plus one more if bridging (1 or 2 total,
-                # independent of disk_count). See the port-accounting comment up top.
+                # Target ports per disk, in the same four steps and the same
+                # order as vmsync's own targetPortsNeeded (cmd/vmsync/main.go),
+                # so the two can be read side by side and a divergence is
+                # visible rather than inferred. vmsync logs the figure it
+                # arrived at as target_ports_wanted, which is what to compare
+                # against if this is ever in doubt.
+                #
+                # A verify run needs TWICE the ports of a plain one, and that is
+                # what this got wrong: the count stayed at the sync figure while
+                # a VERIFY=true branch set a misspelled "ports_increse" that
+                # nothing ever read. A 2-disk VM with compression was handed a
+                # window of 4 and wanted 8, so on every verify run each VM's
+                # exports walked straight into its neighbours' windows. Not a
+                # data-safety problem -- a bridge pidfile is keyed by domain AND
+                # port, so a collision fails loudly and the allocator moves on
+                # -- but it cost each collision ~20s of retries and produced a
+                # warning about a "stale process" that reads like something much
+                # worse than a range too small.
+                target_ports_per_disk=1 # the qemu-nbd write export
                 if [ "${bridging_enabled}" == true ]; then
-                        destination_ports_needed=$((disk_count*2))
+                        target_ports_per_disk=$((target_ports_per_disk+1)) # its bridge helper
+                fi
+                if [ "${VERIFY}" == true ]; then
+                        target_ports_per_disk=$((target_ports_per_disk+1)) # the read-only verify export
+                        if [ "${bridging_enabled}" == true ]; then
+                                target_ports_per_disk=$((target_ports_per_disk+1)) # and the verify export's own bridge
+                        fi
+                fi
+                destination_ports_needed=$((disk_count*target_ports_per_disk))
+
+                # Source: one shared libvirt NBD export for the whole VM, plus
+                # one more if bridging. 1 or 2, independent of disk_count AND of
+                # -verify -- the verify reads the source through the very same
+                # export the copy did, which is why vmsync has no counterpart to
+                # targetPortsNeeded for this side.
+                if [ "${bridging_enabled}" == true ]; then
                         source_ports_needed=2
                 else
-                        destination_ports_needed=$disk_count
                         source_ports_needed=1
                 fi
                 source_base_port_end=$((source_base_port_start+source_ports_needed-1))
