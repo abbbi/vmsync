@@ -235,6 +235,9 @@ func main() {
 			NBDAddr: *checksumNBD,
 			Export:  *checksumExport,
 			Timeout: *checksumTimeout,
+			// stderr, never stdout: stdout is the digest response, and a
+			// progress line mixed into it would fail the far side's parse.
+			Progress: os.Stderr,
 		}
 		if err := runChecksum(context.Background(), cfg, os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: %v\n", err)
