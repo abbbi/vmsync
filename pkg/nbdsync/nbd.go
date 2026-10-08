@@ -333,6 +333,30 @@ func allocationExtents(ctx context.Context, h *nbd.Libnbd, role string) []Extent
 	return out
 }
 
+// warnIfNoAllocationMap says so when a side will not report base:allocation,
+// and says nothing when it will.
+//
+// Silence-when-healthy is deliberate: a line per side per disk per run, on a
+// 46-VM estate, is noise that teaches an operator to skim. The only
+// interesting state is the expensive one, and it is expensive in a way that
+// otherwise shows up as "the verify is taking hours" with no reason attached.
+//
+// A failed query is reported too, rather than being taken as "no map": the
+// consequence is identical (everything gets hashed) but the cause is not, and
+// a handle that cannot answer a question about itself is a different problem
+// from a server that simply does not offer the context.
+func warnIfNoAllocationMap(h *nbd.Libnbd, role string) {
+	ok, err := h.CanMetaContext("base:allocation")
+	switch {
+	case err != nil:
+		trace.Warning("could not ask this side whether it reports an allocation map, so every range will be hashed",
+			"side", role, "error", err)
+	case !ok:
+		trace.Warning("this side does not report base:allocation, so ranges that read as zeros on BOTH sides cannot be skipped and the whole disk will be hashed",
+			"side", role)
+	}
+}
+
 // zeroRanges reduces a base:allocation scan to just the ranges that READ AS
 // ZEROS, coalescing anything adjacent so the caller's overlap test stays
 // cheap. Ranges are returned in offset order, which is the order the scan
@@ -1134,6 +1158,27 @@ func CompareChunkPlanTCP(ctx context.Context, aHost string, aPort int, aExport s
 	}
 	defer b.Close()
 
+	// base:allocation, on BOTH handles, BEFORE connecting -- because NBD
+	// settles meta contexts during the handshake. A context not asked for here
+	// can never be queried afterwards, so allocationExtents below gets nothing
+	// back and planCompareChunks skips nothing.
+	//
+	// That is exactly what this function did for a release, and it cost 32x the
+	// work on a sparse disk: a 1 TB replica planned 32000 blocks -- its entire
+	// virtual size -- and both sides hashed every one of them, the target at
+	// 356 MiB/s, so a verify that should have taken minutes took the better
+	// part of an hour and looked for all the world like a hang. compareTCP,
+	// the slower byte-for-byte path, had these two lines all along; the digest
+	// path, the FAST one that runs whenever the helper is deployed, did not.
+	//
+	// Errors discarded, in the same form compareTCP uses, because this is a
+	// request and not a requirement: a server that does not grant the context
+	// leaves planCompareChunks comparing everything, which is correct, just
+	// expensive. What must not happen is that being INVISIBLE -- see the
+	// availability check after the handshake below.
+	_ = a.AddMetaContext("base:allocation")
+	_ = b.AddMetaContext("base:allocation")
+
 	if aExport != "" {
 		if err := a.SetExportName(aExport); err != nil {
 			return nil, fmt.Errorf("set source export name %s: %w", aExport, err)
@@ -1165,6 +1210,14 @@ func CompareChunkPlanTCP(ctx context.Context, aHost string, aPort int, aExport s
 	size := sizeA
 
 	bufferSize := negotiateBufferSize(a, b, "source", "target")
+	// Whether the server GRANTED base:allocation is only knowable after the
+	// handshake, and it is the difference between hashing a disk's allocated
+	// part and hashing all of it. Said out loud for that reason: the whole cost
+	// of this going wrong hid for a release behind allocationExtents' Debug
+	// line, which nobody runs with. Silence here means both sides answered, and
+	// the "skipping ranges" line below says how much it bought.
+	warnIfNoAllocationMap(a, "source")
+	warnIfNoAllocationMap(b, "target")
 	aZero := zeroRanges(allocationExtents(ctx, a, "source"))
 	bZero := zeroRanges(allocationExtents(ctx, b, "target"))
 	chunks, skippedBytes := planCompareChunks(size, bufferSize, minSkipBytes, aZero, bZero)
