@@ -58,6 +58,19 @@ DRY_RUN=no
 ONLY_PATTERN=""
 STAGES="matrix,verify,reinit,snapshot,journal,retention"
 
+# ALL_STAGES -- every stage, in stage-number order, which is also the order a
+# full run executes them in.
+#
+# Defined once and used by three things that were drifting apart: the `all` and
+# `all-but-matrix` keywords below, the "want ..." list the unknown-stage
+# refusal prints, and --help. A stage added to the dispatcher but not to one of
+# those is invisible in exactly the way that costs an afternoon.
+# Genuinely 1..23, verified against stage_number rather than taken on trust.
+# The "want ..." list this was first copied from had checksum third, for
+# historical reasons, which made `--stages all` run stage 13 before stage 3
+# while --help promised stage-number order.
+ALL_STAGES="matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,checksum,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease,redefine-probe,reinit-orphan"
+
 # INTERRUPTED: vmsync catches SIGINT/SIGTERM itself (cleanup, then a plain
 # os.Exit(1) -- see cmd/vmsync/main.go's own signal handling), so a Ctrl+C
 # that lands while a vmsync child is running exits *normally* as far as
@@ -81,17 +94,25 @@ Options:
   --only PATTERN          only run Stage 1 scenarios whose name matches
                            PATTERN (a bash glob, e.g. "compress-zstd-*")
   --stages LIST           comma-separated subset of, in stage-number order:
-                             1  matrix        8  verify-long
-                             2  verify        9  retention
-                             3  reinit       10  restore
-                             4  snapshot     11  invert
-                             5  define       12  wedge
-                             6  failover     13  checksum
-                             7  fence-agent  14  verify-failure
-                                            15  commit-barrier
-                                            16  interrupted-reinit
-                                            17  journal
-                                            18  colocated
+                             1  matrix       13  checksum
+                             2  verify       14  verify-failure
+                             3  reinit       15  commit-barrier
+                             4  snapshot     16  interrupted-reinit
+                             5  define       17  journal
+                             6  failover     18  colocated
+                             7  fence-agent  19  leftovers
+                             8  verify-long  20  reinit-order
+                             9  retention    21  lock-lease
+                            10  restore      22  redefine-probe
+                            11  invert       23  reinit-orphan
+                            12  wedge
+                           Or one of two shorthands, used on their own rather
+                           than inside a list:
+                             all             every stage above, in that order
+                             all-but-matrix  the same without stage 1, which
+                                             is 532 runs and most of an hour
+                                             and measures throughput rather
+                                             than asserting correctness
                            Runs in whichever order LIST gives them, not a
                            fixed canonical one.
                            (default: matrix,verify,reinit,snapshot,journal,
@@ -1287,6 +1308,10 @@ stage_verify_tamper() {
         bench_sync verify-baseline full -reinit
         if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
                 warn "baseline full sync for verify testing failed (see $RUN_LOG) -- aborting stage 2$(bench_sync_hint)"
+                # Recorded on the way out: a stage that returns non-zero
+                # without a row leaves its report section with nothing to
+                # show while the summary table above it says FAIL.
+                results_row "$CSV" verify-precondition stood-down 1 "" "" "" "" "" "FAIL the baseline full sync failed"
                 return 1
         fi
 
@@ -2131,7 +2156,7 @@ stage_external_snapshot() {
 
                 if [ "$RUN_RC" != 0 ]; then
                         warn "FAIL: sync+verify while an external snapshot existed did not succeed (exit=$RUN_RC) -- see $RUN_LOG"
-                        results_row "$CSV" ext-snapshot during-result 1 "" "" "" "" "" "FAIL sync did not succeed with snapshot present"
+                        results_row "$CSV" ext-snapshot during-snapshot-result 1 "" "" "" "" "" "FAIL sync did not succeed with snapshot present"
                 elif [ "$snap_count" -lt 1 ]; then
                         # vmsync counts the source domain's external snapshots
                         # itself and reports them as
@@ -2142,13 +2167,13 @@ stage_external_snapshot() {
                         # snapshot take effect?" check, which the old version
                         # only ever asked rhetorically in a warning message.
                         warn "FAIL: vmsync reported vmsync_external_snapshot_count=$snap_count during the sync, but this stage created an external snapshot on $TAMPER_DISK_DEV -- the snapshot did not take effect, or the metric is broken; see $RUN_LOG"
-                        results_row "$CSV" ext-snapshot during-result 1 "" "" "" "" "" "FAIL snapshot not visible to vmsync (count=$snap_count)"
+                        results_row "$CSV" ext-snapshot during-snapshot-result 1 "" "" "" "" "" "FAIL snapshot not visible to vmsync (count=$snap_count)"
                 elif [ -n "$target_path_before" ] && [ "$target_path_during" != "$target_path_before" ]; then
                         warn "FAIL: target disk path changed while the snapshot existed (before='$target_path_before' during='$target_path_during') -- RootSource-based naming should have kept this stable"
-                        results_row "$CSV" ext-snapshot during-result 1 "" "" "" "" "" "FAIL target path drifted during snapshot"
+                        results_row "$CSV" ext-snapshot during-snapshot-result 1 "" "" "" "" "" "FAIL target path drifted during snapshot"
                 elif grep -q 'checkpoint creation blocked by an existing external snapshot' "$RUN_LOG" 2>/dev/null; then
                         log "   PASS: synced and verified with the external snapshot present; libvirt blocked the new checkpoint and vmsync's tolerance path handled it (vmsync_external_snapshot_count=$snap_count, target path unchanged)"
-                        results_row "$CSV" ext-snapshot during-result 0 "" "" "" "" "" "PASS synced+verified via tolerance path, count=$snap_count"
+                        results_row "$CSV" ext-snapshot during-snapshot-result 0 "" "" "" "" "" "PASS synced+verified via tolerance path, count=$snap_count"
                 else
                         # Not a failure. Whether libvirt refuses to create a
                         # checkpoint while an external snapshot exists is
@@ -2166,7 +2191,7 @@ stage_external_snapshot() {
                         # grep, which would skip them entirely whenever it
                         # didn't match.
                         log "   PASS: synced and verified with the external snapshot present; this libvirt permitted the checkpoint, so the tolerance path was not exercised (vmsync_external_snapshot_count=$snap_count, target path unchanged)"
-                        results_row "$CSV" ext-snapshot during-result 0 "" "" "" "" "" "PASS synced+verified, checkpoint not blocked by this libvirt, count=$snap_count"
+                        results_row "$CSV" ext-snapshot during-snapshot-result 0 "" "" "" "" "" "PASS synced+verified, checkpoint not blocked by this libvirt, count=$snap_count"
                 fi
         fi
 
@@ -2217,13 +2242,13 @@ stage_external_snapshot() {
         if [ "$DRY_RUN" != yes ]; then
                 if [ "$RUN_RC" != 0 ]; then
                         warn "FAIL: sync+verify after removing the external snapshot did not succeed (exit=$RUN_RC) -- see $RUN_LOG"
-                        results_row "$CSV" ext-snapshot after-result 1 "" "" "" "" "" "FAIL sync did not succeed after snapshot removal"
+                        results_row "$CSV" ext-snapshot after-snapshot-result 1 "" "" "" "" "" "FAIL sync did not succeed after snapshot removal"
                 elif grep -q 'checkpoint chain did not advance this run' "$RUN_LOG" 2>/dev/null; then
                         warn "FAIL: checkpoint chain still not advancing after the external snapshot was removed -- see $RUN_LOG"
-                        results_row "$CSV" ext-snapshot after-result 1 "" "" "" "" "" "FAIL checkpoint chain still not advancing"
+                        results_row "$CSV" ext-snapshot after-snapshot-result 1 "" "" "" "" "" "FAIL checkpoint chain still not advancing"
                 else
                         log "   PASS: synced and verified correctly after the external snapshot was removed, checkpoint chain resumed advancing"
-                        results_row "$CSV" ext-snapshot after-result 0 "" "" "" "" "" "PASS synced+verified after snapshot removed"
+                        results_row "$CSV" ext-snapshot after-snapshot-result 0 "" "" "" "" "" "PASS synced+verified after snapshot removed"
                 fi
         fi
         return 0
@@ -3241,6 +3266,10 @@ stage_failover() {
 	bench_sync "$sc" baseline -reinit
 	if [ "$RUN_RC" != 0 ] && [ "$DRY_RUN" != yes ]; then
 		warn "baseline full sync failed (see $RUN_LOG) -- aborting stage 6 before anything is promoted$(bench_sync_hint)"
+		# Recorded on the way out: a stage that returns non-zero without a
+		# row leaves its report section with nothing to show while the
+		# summary table above it says FAIL.
+		results_row "$CSV" "$sc" stood-down 1 "" "" "" "" "" "FAIL the baseline full sync failed"
 		return 1
 	fi
 
@@ -3738,8 +3767,12 @@ stage_fence_agent() {
 	# A fence only ever acts on a RUNNING domain. Skipping rather than
 	# starting the source ourselves, the same way Stage 4 does.
 	local src_state
-	src_state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN")" \
-		|| { warn "cannot query the source domain's state${VIRSH_ERR:+: $VIRSH_ERR}"; return 1; }
+	src_state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN")" || {
+		warn "cannot query the source domain's state${VIRSH_ERR:+: $VIRSH_ERR}"
+		# Recorded for the same reason as the baseline abort below.
+		results_row "$CSV" "$sc" stood-down 1 "" "" "" "" "" "FAIL could not query the source domain state"
+		return 1
+	}
 	if [ "$src_state" != running ]; then
 		warn "source domain '$SOURCE_DOMAIN' is '$src_state', not running -- skipping stage 7. A fence only acts on a running domain, and this harness does not start the source itself."
 		results_row "$CSV" "$sc" skipped 0 "" "" "" "" "" "SKIPPED source not running"
@@ -3819,6 +3852,10 @@ stage_fence_agent() {
 	bench_sync "$sc" baseline -reinit
 	if [ "$RUN_RC" != 0 ]; then
 		warn "baseline full sync failed (see $RUN_LOG) -- aborting stage 7 before anything is promoted$(bench_sync_hint)"
+		# Recorded on the way out: a stage that returns non-zero without a
+		# row leaves its report section with nothing to show while the
+		# summary table above it says FAIL.
+		results_row "$CSV" "$sc" stood-down 1 "" "" "" "" "" "FAIL the baseline full sync failed"
 		return 1
 	fi
 
@@ -4115,7 +4152,17 @@ stage_fence_agent() {
 # run passing --stages matrix,commit-barrier or matrix,interrupted-reinit
 # would report Stage 1 as FAILED on the strength of a deliberate kill in
 # another stage. commit-barrier was missing when this line was last touched.
-NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$|colocated$)'
+#
+# leftovers, reinit-order, lock-lease, redefine-probe and reinit-orphan were
+# missing for the same reason, and three of them fail a run on purpose too:
+# stage 19 arms replica_incomplete and requires the next sweep to refuse,
+# stage 20 requires a reinit to be refused for a running target, and stage 21
+# requires a second driver to be refused the target's lock. Every one of those
+# refusals is a non-zero vmsync exit in a row whose scenario Stage 1 was
+# counting as one of its own transport runs -- so a full --stages all run
+# reported Stage 1 as FAILED, with a count of "N of M vmsync runs exited
+# non-zero" that no transport combination in the matrix table accounts for.
+NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$|colocated$|leftovers$|reinit-order$|lock-lease$|redefine-probe$|reinit-orphan$)'
 
 # stage_pattern STAGE -> the regex matching that stage's scenario column.
 # --- Stage 8: verify after a long incremental chain --------------------------
@@ -4267,14 +4314,14 @@ verify_long_round() {
 					# vmsync's mtime guard instead of running over the damage
 					# the way a real incremental sync would.
 					if ! tamper_target "$path" yes; then
-						results_row "$CSV" verify-long "${mode}-result" "" "" "" "" "" "" "SKIP the tamper could not be applied"
+						results_row "$CSV" verify-long "${mode}-verify-result" "" "" "" "" "" "" "SKIP the tamper could not be applied"
 						heal_target verify-long "${mode}-tamper-heal" "$path"
 						return 0
 					fi
 					tampered=yes
 				else
 					warn "SKIP verify-long/$mode: the configured tamper band does not fit inside a ${vsize}-byte disk"
-					results_row "$CSV" verify-long "${mode}-result" "" "" "" "" "" "" "SKIP tamper band does not fit the disk"
+					results_row "$CSV" verify-long "${mode}-verify-result" "" "" "" "" "" "" "SKIP tamper band does not fit the disk"
 				fi
 			fi
 		fi
@@ -4285,7 +4332,7 @@ verify_long_round() {
 		# Still run the verify sync, so --dry-run prints every command line
 		# this round would issue -- which is the whole point of --dry-run.
 		bench_sync verify-long "${mode}-verify" "-verify=$mode"
-		results_row "$CSV" verify-long "${mode}-result" DRYRUN "" "" "" "" "" "SKIP dry run"
+		results_row "$CSV" verify-long "${mode}-verify-result" DRYRUN "" "" "" "" "" "SKIP dry run"
 		return 0
 	fi
 
@@ -4313,7 +4360,7 @@ verify_long_round() {
 	if ! ssh_host_cmd "$TARGET_HOST" qemu-io -r -f qcow2 \
 		-c "'read -P ${TAMPER_PATTERN} ${TAMPER_OFF} ${TAMPER_LEN}'" "'${path}'" >/dev/null 2>&1; then
 		log "   SKIP: a later incremental copy overwrote the corrupted region, so there is nothing left for -verify=$mode to find"
-		results_row "$CSV" verify-long "${mode}-result" "" "" "" "" "" "" "SKIP corruption healed by a later copy"
+		results_row "$CSV" verify-long "${mode}-verify-result" "" "" "" "" "" "" "SKIP corruption healed by a later copy"
 		return 0
 	fi
 
@@ -4322,15 +4369,15 @@ verify_long_round() {
 	case "$outcome" in
 	RAN_MISMATCH)
 		log "   PASS: -verify=$mode found the corruption after $((copies - tamper_at)) further incremental copies"
-		results_row "$CSV" verify-long "${mode}-result" 0 "" "" "" "" "" "PASS mismatch detected after a deep chain"
+		results_row "$CSV" verify-long "${mode}-verify-result" 0 "" "" "" "" "" "PASS mismatch detected after a deep chain"
 		;;
 	RAN_CLEAN)
 		warn "FAIL: -verify=$mode ran and found NOTHING, though the corruption at offset $TAMPER_OFF length $TAMPER_LEN was still present on disk immediately before the compare (reproduce with TAMPER_SEED=$TAMPER_SEED). See $RUN_LOG"
-		results_row "$CSV" verify-long "${mode}-result" 1 "" "" "" "" "" "FAIL mismatch NOT detected"
+		results_row "$CSV" verify-long "${mode}-verify-result" 1 "" "" "" "" "" "FAIL mismatch NOT detected"
 		;;
 	*)
 		warn "FAIL: -verify=$mode never reached its compare -- the run ended before verification ran, so nothing was verified (exit=$RUN_RC). See $RUN_LOG"
-		results_row "$CSV" verify-long "${mode}-result" 1 "" "" "" "" "" "FAIL verification never ran"
+		results_row "$CSV" verify-long "${mode}-verify-result" 1 "" "" "" "" "" "FAIL verification never ran"
 		;;
 	esac
 	return 0
@@ -7819,7 +7866,7 @@ stage_colocated() {
 			return 0
 		fi
 		warn "FAIL: the baseline sync this stage is built on did not succeed (see $RUN_LOG)$(bench_sync_hint)"
-		results_row "$CSV" "$sc" sync-result 1 "" "" "" "" "" "FAIL the baseline sync failed"
+		results_row "$CSV" "$sc" baseline-result 1 "" "" "" "" "" "FAIL the baseline sync failed"
 		return 1
 	fi
 
@@ -9969,7 +10016,7 @@ stage_pattern() {
 	# down records its reason under that name, and a reason nothing matches
 	# is a reason nobody reads: the verdict would say "nothing recorded"
 	# rather than why the stage skipped.
-	verify) printf '^verify-(guard|fast|full|qemu-img|fast-bytes|full-bytes|cross|oracle|precondition)$' ;;
+	verify) printf '^verify-(guard|baseline|fast|full|qemu-img|fast-bytes|full-bytes|cross|oracle|precondition)$' ;;
 	checksum) printf '^checksum$' ;;
 	reinit) printf '^reinit-after-failures$' ;;
 	snapshot) printf '^ext-snapshot$' ;;
@@ -10226,41 +10273,124 @@ final_verdict() {
 # file at all, and the evidence was in checksum.mismatch.log. A row that never
 # ran a vmsync (no wall time, no -result suffix) gets nothing rather than a
 # guess at a filename that does not exist.
+#
+# A name runlog() computes is a GUESS until it is checked against the logs that
+# actually exist, and four different things made that guess wrong: stage 4
+# recorded during-result/after-result for runs named during-snapshot and
+# after-snapshot, stage 8 recorded <mode>-result while it verifies in
+# <mode>-verify, stage 18 recorded sync-result for a run whose phase is
+# baseline, and a --dry-run writes no log at all while recording a wall time of
+# 0, which is not empty. All four named a file that was never written. The three
+# phase names are fixed at their source; BENCH_LOG_INDEX, written by
+# generate_report, is what keeps the next one from reaching the reader: it lists
+# the logs present, and a computed name absent from it is dropped rather than
+# printed. Which also means a stage may rename a run phase without the report
+# starting to lie about it.
 REPORT_AWK='
+function load_logs(    f, rc, l) {
+        if (LOGS_TRIED) return
+        LOGS_TRIED = 1
+        f = ENVIRON["BENCH_LOG_INDEX"]
+        if (f == "") return
+        rc = (getline l < f)
+        if (rc < 0) return
+        LOGS_INDEXED = 1
+        while (rc > 0) { LOGS[l] = 1; rc = (getline l < f) }
+        close(f)
+}
 function verdict(n) {
         if (n ~ /^PASS/) return "**PASS**"
         if (n ~ /^FAIL/) return "**FAIL**"
         if (n ~ /^SKIP/) return "_skipped_"
+        if (n ~ /^INFO/) return "_info_"
         return ""
 }
 function detail(n) {
-        sub(/^(PASS|FAIL|SKIP)[ ]?/, "", n)
+        sub(/^(PASS|FAIL|SKIPPED|SKIP|INFO)[ ]?/, "", n)
         return n
 }
-function runlog(sc, ph, wall,    base, isres) {
+function runlog(sc, ph, wall,    base, isres, name) {
         base = ph
         isres = sub(/-result$/, "", base)
         if (sc == "" || base == "") return ""
         if (!isres && wall == "") return ""
-        return sc "." base ".log"
+        name = sc "." base ".log"
+        load_logs()
+        if (LOGS_INDEXED && !(name in LOGS)) return ""
+        return name
 }
 '
 
+# section_no_rows_note STAGE_KEY OPT_IN -- the line a report section prints when
+# it found no rows of its own in results.csv.
+#
+# Two very different situations look identical from the CSV: a stage nobody
+# asked for, and a stage that WAS asked for and then wrote no row at all.
+# Printing "not run" for the second is a lie, and it hides the more interesting
+# of the two -- a stage that returned before its first assertion, which is
+# exactly the case a reader would want to chase. RAN_STAGES is what the summary
+# table above is built from, so it is the authority on what was selected.
+#
+# STAGE_KEY is the --stages key (matrix, verify, reinit, snapshot, ...), NOT the
+# CSV scenario key: four sections cover scenarios whose names differ from the
+# stage that writes them (verify -> verify-*, reinit -> reinit-after-failures,
+# snapshot -> ext-snapshot, define -> define-*).
+section_no_rows_note() {
+	local key="$1" optin="$2" s
+	for s in ${RAN_STAGES[@]+"${RAN_STAGES[@]}"}; do
+		[ "$s" = "$key" ] || continue
+		echo "_**ran but recorded nothing**: stage $(stage_number "$key") was selected and left no row in \`results.csv\`, so it returned before its first assertion. Its own output is in the bench log, not under \`logs/\`._"
+		return 0
+	done
+	echo "_not run ($optin)_"
+}
+
 generate_report() {
         local report="$RUN_DIR/report.md" i
+        # The list of logs that actually exist, for runlog(). The log column
+        # tells the reader which file to open, so a name it cannot back with a
+        # file is worse than an empty cell: it sends them looking for something
+        # that was never written. Built here rather than in awk because only
+        # the shell can list a directory, and read once per awk program.
+        local log_index="$RUN_DIR/.log-index"
+        ( cd "$RUN_DIR/logs" 2>/dev/null && ls -1 ) >"$log_index" 2>/dev/null || : >"$log_index"
+        export BENCH_LOG_INDEX="$log_index"
         {
-                echo "# vmsync benchmark report"
+                # The verdict is ON the first line, not under a heading below
+                # it, so `head -1 report.md` answers the only question most
+                # readings ask. It was three lines down, which is three lines
+                # too many when the report is 500 long.
+                echo "# vmsync benchmark report: **$(overall_verdict)**"
                 echo
-                echo "## Result: $(overall_verdict)"
-                echo
-                # Numbered, because a verdict here has to be findable below:
-                # the sections are headed "## Stage N" and the keys are not in
-                # that order (checksum is 13, wedge 12, invert 11).
-                echo "| # | stage | result | |"
+                # Numbered AND sorted by that number, so a row here can be
+                # found in the sections below. Neither came free: the keys are
+                # not in stage-number order (checksum is 13, wedge 12, invert
+                # 11), and the rows arrive in EXECUTION order, which for a
+                # partial run is whatever order --stages happened to name.
+                echo "| result | # | stage | detail |"
                 echo "|---|---|---|---|"
                 for i in "${!RAN_STAGES[@]}"; do
-                        echo "| $(stage_number "${RAN_STAGES[$i]}") | ${RAN_STAGES[$i]} | ${RAN_VERDICTS[$i]} | ${RAN_DETAILS[$i]} |"
-                done
+                        # A numeric sort key, stripped again below. An unknown
+                        # stage sorts last rather than breaking the %d.
+                        local num
+                        num="$(stage_number "${RAN_STAGES[$i]}")"
+                        case "$num" in
+                        ''|*[!0-9]*) num=999 ;;
+                        esac
+                        # Rendered like the verdicts in the per-stage tables
+                        # below, so a failure is as visible here as it is there.
+                        # The raw value stays in results.csv.
+                        local vd
+                        case "${RAN_VERDICTS[$i]}" in
+                        PASS*) vd='**PASS**' ;;
+                        FAIL*) vd='**FAIL**' ;;
+                        SKIP*) vd='_skipped_' ;;
+                        *) vd="${RAN_VERDICTS[$i]}" ;;
+                        esac
+                        printf '%03d\t| %s | %s | %s | %s |\n' \
+                                "$num" "$vd" "$(stage_number "${RAN_STAGES[$i]}")" \
+                                "${RAN_STAGES[$i]}" "${RAN_DETAILS[$i]}"
+                done | sort -n | cut -f2-
                 echo
                 echo "- Run: $RUN_ID"
                 echo "- Source: $SOURCE_DOMAIN @ $SOURCE_URI"
@@ -10274,39 +10404,215 @@ generate_report() {
                 # transport combination completed", so exit 0 is a pass and
                 # anything else is not. The summary said "7 of 532 runs exited
                 # non-zero" and the table gave no way to find which seven.
-                echo "| scenario | phase | result | exit | wall (s) | transferred (MiB) | throughput (MiB/s) | log |"
-                echo "|---|---|---|---|---|---|---|---|"
+                # Captured first so the header is printed only when there is
+                # something under it: a table of nothing but column names
+                # reads as "this ran and found nothing", which is not the
+                # same as "this did not run". Capturing also keeps the row
+                # filter in ONE place -- a guard with its own copy drifts.
                 # Excludes Stage 2/3's own scenario names explicitly -- phase names
                 # ("full", "incremental") are only unique WITHIN Stage 1; Stage 2's
                 # baseline run also uses phase "full" and would otherwise leak into
                 # this table too.
-                awk -F, "$REPORT_AWK"'NR>1 && ($2=="full" || $2=="incremental") && $1 !~ /^verify-/ && $1 != "reinit-after-failures" {
+                local matrix_rows
+                matrix_rows="$(awk -F, "$REPORT_AWK"'NR>1 && ($2=="full" || $2=="incremental") && $1 !~ /^verify-/ && $1 != "reinit-after-failures" {
                         mib = ($5+0) / 1048576
                         secs = $4+0
                         thr = (secs>0) ? mib/secs : 0
                         printf "| %s | %s | %s | %s | %s | %.1f | %.2f | %s |\n", \
-                                $1, $2, ($3=="0" ? "**PASS**" : "**FAIL**"), $3, $4, mib, thr, runlog($1, $2, $4)
-                }' "$CSV"
+                                ($3=="0" ? "**PASS**" : "**FAIL**"), $1, $2, $3, $4, mib, thr, runlog($1, $2, $4)
+                }' "$CSV")"
+                if [ -n "$matrix_rows" ]; then
+                        echo "| result | scenario | phase | exit | wall (s) | transferred (MiB) | throughput (MiB/s) | log |"
+                        echo "|---|---|---|---|---|---|---|---|"
+                        printf '%s\n' "$matrix_rows"
+                else
+                        section_no_rows_note matrix "it is a default stage, so this means \`--stages\` named something else"
+                fi
                 echo
                 echo "## Stage 2: verify + tamper detection"
                 echo
-                echo "| mode | phase | result | exit | wall (s) | detail | log |"
-                echo "|---|---|---|---|---|---|---|"
+                # Captured first so the header is printed only when there is
+                # something under it: a table of nothing but column names
+                # reads as "this ran and found nothing", which is not the
+                # same as "this did not run". Capturing also keeps the row
+                # filter in ONE place -- a guard with its own copy drifts.
                 # Kept in step with stage_pattern's "verify" entry by hand:
                 # a sub-test missing here is not an error anywhere, it just
                 # silently drops out of the report while still counting
                 # toward the stage verdict -- which is how the cross-check
                 # and clean-oracle rows went unlisted when they were added.
-                awk -F, "$REPORT_AWK"'NR>1 && $1 ~ /^verify-(guard|baseline|fast|full|qemu-img|fast-bytes|full-bytes|cross|oracle|precondition)/ { printf "| %s | %s | %s | %s | %s | %s | %s |\n", $1, $2, verdict($9), $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                local verify_rows
+                verify_rows="$(awk -F, "$REPORT_AWK"'NR>1 && $1 ~ /^verify-(guard|baseline|fast|full|qemu-img|fast-bytes|full-bytes|cross|oracle|precondition)/ { printf "| %s | %s | %s | %s | %s | %s | %s |\n", verdict($9), $1, $2, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV")"
+                if [ -n "$verify_rows" ]; then
+                        echo "| result | mode | phase | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|---|"
+                        printf '%s\n' "$verify_rows"
+                else
+                        section_no_rows_note verify "it is a default stage, so this means \`--stages\` named something else"
+                fi
+                echo
+                echo "## Stage 3: reinit-after-failures"
+                echo
+                if awk -F, 'NR>1 && $1=="reinit-after-failures" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="reinit-after-failures" { printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), $2, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                else
+                        section_no_rows_note reinit "opt in with \`--stages reinit\`; it fails $REINIT_AFTER_FAILURES_N syncs in a row and then checks that a -reinit forces a full resync and clears the incomplete marker"
+                fi
+                echo
+                echo "## Stage 4: external snapshot lifecycle"
+                echo
+                # Captured first so the header is printed only when there is
+                # something under it: a table of nothing but column names
+                # reads as "this ran and found nothing", which is not the
+                # same as "this did not run". Capturing also keeps the row
+                # filter in ONE place -- a guard with its own copy drifts.
+                local snapshot_rows
+                snapshot_rows="$(awk -F, "$REPORT_AWK"'NR>1 && $1=="ext-snapshot" { printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), $2, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV")"
+                if [ -n "$snapshot_rows" ]; then
+                        echo "| result | phase | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        printf '%s\n' "$snapshot_rows"
+                else
+                        section_no_rows_note snapshot "it is a default stage, so this means \`--stages\` named something else"
+                fi
+                echo
+                echo "## Stage 5: DefineDomain redefine/rollback coverage"
+                echo
+                # Captured first so the header is printed only when there is
+                # something under it: a table of nothing but column names
+                # reads as "this ran and found nothing", which is not the
+                # same as "this did not run". Capturing also keeps the row
+                # filter in ONE place -- a guard with its own copy drifts.
+                local define_rows
+                define_rows="$(awk -F, "$REPORT_AWK"'NR>1 && ($1=="define-uuid-collision" || $1=="define-rollback" || $1=="define-metadata" || $1=="define-precondition") { printf "| %s | %s | %s | %s | %s | %s | %s |\n", verdict($9), $1, $2, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV")"
+                if [ -n "$define_rows" ]; then
+                        echo "| result | test | phase | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|---|"
+                        printf '%s\n' "$define_rows"
+                else
+                        section_no_rows_note define "opt in with \`--stages define\`; it exercises DefineDomain directly -- uuid collisions, rollback on a bad redefine, and metadata round-tripping"
+                fi
+                echo
+                echo "## Stage 6: failover, fencing, and the way back"
+                echo
+                # One row per assertion, in the same table as every other stage.
+                # This was a bullet list, which had no room for the exit code or
+                # the log name: a failure named a check and nothing else.
+                #
+                # Unlike the list, the table does NOT drop the ordinary run rows
+                # (baseline, resync, ...) that run_vmsync writes. Those rows are
+                # the only place failover.<phase>.log is named, and they are the
+                # files to open when an assertion here fails. The list had to
+                # exclude them because a row with no PASS/FAIL in its notes
+                # printed as "- **PASS** -- baseline", reporting a run as a
+                # passing test; in a table the same row shows an empty result
+                # cell beside its wall time and its log, which is what it is.
+                # The counter below still counts assertions only.
+                if awk -F, 'NR>1 && $1=="failover" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="failover" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                        echo
+                        awk -F, 'NR>1 && $1=="failover" && $9 ~ /^(PASS|FAIL|SKIP)/ {
+                                        if ($9 ~ /^FAIL/) f++; else if ($9 ~ /^SKIP/) s++; else p++
+                                }
+                                END {
+                                        if (f)      printf "**%d failover assertion(s) failed.**\n", f
+                                        else if (p) printf "All %d failover assertion(s) passed.\n", p
+                                        else        printf "_No assertion was recorded (%d skipped)._\n", s
+                                }' "$CSV"
+                else
+                        section_no_rows_note failover "opt in with \`--stages failover\`"
+                fi
+                echo
+                echo "## Stage 7: fencing end to end, with real agents"
+                echo
+                # A table, for the reasons given under stage 6: the run rows
+                # carry the fence-agent.<phase>.log names, and an assertion that
+                # fails here is read together with the run it came from.
+                if awk -F, 'NR>1 && $1=="fence-agent" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="fence-agent" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                        echo
+                        awk -F, 'NR>1 && $1=="fence-agent" && $9 ~ /^(PASS|FAIL|SKIP)/ {
+                                        if ($9 ~ /^FAIL/) f++; else if ($9 ~ /^SKIP/) s++; else p++
+                                }
+                                END {
+                                        if (f)      printf "**%d fencing assertion(s) failed.**\n", f
+                                        else if (p) printf "All %d fencing assertion(s) passed.\n", p
+                                        else        printf "_No assertion was recorded (%d skipped)._\n", s
+                                }' "$CSV"
+                else
+                        section_no_rows_note fence-agent "opt in with \`--stages fence-agent\`; it stops the source VM"
+                fi
+                echo
+                echo "## Stage 8: verify after a long incremental chain"
+                echo
+                if awk -F, 'NR>1 && $1=="verify-long" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "Tamper placement: $TAMPER_MODE${TAMPER_MODE:+, seed \`$TAMPER_SEED\`}"
+                        echo
+                        echo "| result | phase | exit | wall (s) | transferred (MiB) | detail | log |"
+                        echo "|---|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="verify-long" {
+                                mib = ($5+0) / 1048576
+                                printf "| %s | %s | %s | %s | %.1f | %s | %s |\n", \
+                                        verdict($9), $2, $3, $4, mib, detail($9), runlog($1,$2,$4)
+                        }' "$CSV"
+                else
+                        section_no_rows_note verify-long "opt in with \`--stages verify-long\`; it builds a $VERIFY_LONG_COPIES-deep chain per mode"
+                fi
+                echo
+                echo "## Stage 9: retention (restore points on the target)"
+                echo
+                if awk -F, 'NR>1 && $1=="retention" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | detail | log |"
+                        echo "|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="retention" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, detail($9), runlog($1,$2,$4) }' "$CSV"
+                else
+                        section_no_rows_note retention "opt in with \`--stages retention\`; needs a reflink-capable target filesystem"
+                fi
+                echo
+                echo "## Stage 10: -restore-restore-point"
+                echo
+                if awk -F, 'NR>1 && $1=="restore" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="restore" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                else
+                        section_no_rows_note restore "opt in with \`--stages restore\`; it rolls the replica back to a restore point, so it needs a reflink-capable target filesystem and a resolvable target disk path"
+                fi
+                echo
+                echo "## Stage 11: -invert direction reversal"
+                echo
+                if awk -F, 'NR>1 && $1=="invert" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="invert" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                else
+                        section_no_rows_note invert "opt in with \`--stages invert\`; it reverses the pair's direction and checks both ends swapped roles, and needs TARGET_VMSYNC_BIN set and a shut-off target"
+                fi
+                echo
+                echo "## Stage 12: a failed run must not wedge the next one"
+                echo
+                if awk -F, 'NR>1 && $1=="wedge" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="wedge" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                else
+                        section_no_rows_note wedge "opt in with \`--stages wedge\`; it fails a sync deliberately and then checks the next one still works, and needs a running source with guest exec so the failing run has real writes to copy"
+                fi
                 echo
                 echo "## Stage 13: pre-commit integrity check"
                 echo
                 if awk -F, 'NR>1 && $1=="checksum" { found=1 } END { exit !found }' "$CSV"; then
-                        echo "| check | result | exit | wall (s) | detail | log |"
+                        echo "| result | check | exit | wall (s) | detail | log |"
                         echo "|---|---|---|---|---|---|"
-                        awk -F, "$REPORT_AWK"'NR>1 && $1=="checksum" { printf "| %s | %s | %s | %s | %s | %s |\n", $2, verdict($9), $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="checksum" { printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), $2, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
                 else
-                        echo "_not run (opt in with \`--stages checksum\`; sub-test 13b deliberately fails a sync, and all four temporarily install helper shims on the target)_"
+                        section_no_rows_note checksum "opt in with \`--stages checksum\`; sub-test 13b deliberately fails a sync, and all four temporarily install helper shims on the target"
                 fi
                 echo
                 echo "## Stage 14: a verification failure outliving its run"
@@ -10316,11 +10622,11 @@ generate_report() {
                 # cannot pick up these, since "failure" matches none of its
                 # named sub-tests.
                 if awk -F, 'NR>1 && $1=="verify-failure" { found=1 } END { exit !found }' "$CSV"; then
-                        echo "| check | result | exit | wall (s) | detail | log |"
+                        echo "| result | check | exit | wall (s) | detail | log |"
                         echo "|---|---|---|---|---|---|"
-                        awk -F, "$REPORT_AWK"'NR>1 && $1=="verify-failure" { printf "| %s | %s | %s | %s | %s | %s |\n", $2, verdict($9), $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="verify-failure" { printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), $2, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
                 else
-                        echo "_not run (opt in with \`--stages verify-failure\`; it corrupts the replica, four of its six sub-tests deliberately fail a sync, and one promotes the replica and puts the role straight back)_"
+                        section_no_rows_note verify-failure "opt in with \`--stages verify-failure\`; it corrupts the replica, four of its six sub-tests deliberately fail a sync, and one promotes the replica and puts the role straight back"
                 fi
                 echo
                 echo "## Stage 15: the commit barrier"
@@ -10331,11 +10637,11 @@ generate_report() {
                 # silently vanished from the report would read as a stage
                 # that passed.
                 if awk -F, 'NR>1 && $1=="commit-barrier" { found=1 } END { exit !found }' "$CSV"; then
-                        echo "| check | result | exit | wall (s) | detail | log |"
+                        echo "| result | check | exit | wall (s) | detail | log |"
                         echo "|---|---|---|---|---|---|"
-                        awk -F, "$REPORT_AWK"'NR>1 && $1=="commit-barrier" { printf "| %s | %s | %s | %s | %s | %s |\n", $2, verdict($9), $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="commit-barrier" { printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), $2, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
                 else
-                        echo "_not run (opt in with \`--stages commit-barrier\`; one sub-test deliberately fails a sync, and it needs a source domain with two or more qcow2 disks)_"
+                        section_no_rows_note commit-barrier "opt in with \`--stages commit-barrier\`; one sub-test deliberately fails a sync, and it needs a source domain with two or more qcow2 disks"
                 fi
                 echo
                 echo "## Stage 16: an interrupted rebuild"
@@ -10346,129 +10652,93 @@ generate_report() {
                 # and either one vanishing from the report would read as a
                 # promotion refusal that had been proven when it had not.
                 if awk -F, 'NR>1 && $1=="interrupted-reinit" { found=1 } END { exit !found }' "$CSV"; then
-                        echo "| check | result | exit | wall (s) | detail | log |"
+                        echo "| result | check | exit | wall (s) | detail | log |"
                         echo "|---|---|---|---|---|---|"
-                        awk -F, "$REPORT_AWK"'NR>1 && $1=="interrupted-reinit" { printf "| %s | %s | %s | %s | %s | %s |\n", $2, verdict($9), $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="interrupted-reinit" { printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), $2, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
                 else
-                        echo "_not run (opt in with \`--stages interrupted-reinit\`; it kills a rebuild on purpose, leaves the target half-written, promotes it three times and rebuilds it, and needs TARGET_VMSYNC_BIN)_"
+                        section_no_rows_note interrupted-reinit "opt in with \`--stages interrupted-reinit\`; it kills a rebuild on purpose, leaves the target half-written, promotes it three times and rebuilds it, and needs TARGET_VMSYNC_BIN"
                 fi
                 echo
                 echo "## Stage 17: the action journal"
                 echo
                 if awk -F, 'NR>1 && $1=="journal" { found=1 } END { exit !found }' "$CSV"; then
-                        echo "| check | result | exit | wall (s) | detail | log |"
+                        echo "| result | check | exit | wall (s) | detail | log |"
                         echo "|---|---|---|---|---|---|"
-                        awk -F, "$REPORT_AWK"'NR>1 && $1=="journal" { printf "| %s | %s | %s | %s | %s | %s |\n", $2, verdict($9), $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="journal" { printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), $2, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
                 else
-                        echo "_not run (it is a default stage, so this means --stages named something else)_"
+                        section_no_rows_note journal "it is a default stage, so this means --stages named something else"
                 fi
                 echo
                 echo "## Stage 18: two target domains in one directory"
                 echo
                 if awk -F, 'NR>1 && $1=="colocated" { found=1 } END { exit !found }' "$CSV"; then
-                        echo "| check | result | exit | wall (s) | detail | log |"
+                        echo "| result | check | exit | wall (s) | detail | log |"
                         echo "|---|---|---|---|---|---|"
-                        awk -F, "$REPORT_AWK"'NR>1 && $1=="colocated" { printf "| %s | %s | %s | %s | %s | %s |\n", $2, verdict($9), $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="colocated" { printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), $2, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
                 else
-                        echo "_not run (opt in with \`--stages colocated\`; it plants a second target domain's restore points beside this one's and checks that no sync, prune, staging sweep or reinit of this domain touches them, and needs TARGET_DISK_PATH set)_"
+                        section_no_rows_note colocated "opt in with \`--stages colocated\`; it plants a second target domain's restore points beside this one's and checks that no sync, prune, staging sweep or reinit of this domain touches them, and needs TARGET_DISK_PATH set"
                 fi
                 echo
-                echo "## Stage 8: verify after a long incremental chain"
+                echo "## Stage 19: displaced sets are reported, and reclaimed only when asked"
                 echo
-                if awk -F, 'NR>1 && $1=="verify-long" { found=1 } END { exit !found }' "$CSV"; then
-                        echo "Tamper placement: $TAMPER_MODE${TAMPER_MODE:+, seed \`$TAMPER_SEED\`}"
+                if awk -F, 'NR>1 && $1=="leftovers" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="leftovers" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                else
+                        section_no_rows_note leftovers "opt in with \`--stages leftovers\`; it moves a replica set aside and checks the report names it and that only \`-force-clean\` reclaims it, and needs TARGET_DISK_PATH set"
+                fi
+                echo
+                echo "## Stage 20: a reinit refused for a running target must have destroyed nothing"
+                echo
+                if awk -F, 'NR>1 && $1=="reinit-order" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="reinit-order" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                else
+                        section_no_rows_note reinit-order "opt in with \`--stages reinit-order\`; it starts the target and then asks for a reinit, so the refusal has to come before anything is removed, and needs the target domain to exist"
+                fi
+                echo
+                echo "## Stage 21: a dead driver must not hold the target's lock"
+                echo
+                if awk -F, 'NR>1 && $1=="lock-lease" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="lock-lease" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                else
+                        section_no_rows_note lock-lease "opt in with \`--stages lock-lease\`; it stops a run inside the lock with \`-test=stall-after-lock\` and checks who may break it, and needs TARGET_HOST set"
+                fi
+                echo
+                echo "## Stage 22: PROBE -- can libvirt remove an orphaned bitmap on a LIVE domain?"
+                echo
+                if awk -F, 'NR>1 && $1=="redefine-probe" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="redefine-probe" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
                         echo
-                        echo "| phase | result | exit | wall (s) | transferred (MiB) | detail | log |"
-                        echo "|---|---|---|---|---|---|---|"
-                        awk -F, "$REPORT_AWK"'NR>1 && $1=="verify-long" {
-                                mib = ($5+0) / 1048576
-                                printf "| %s | %s | %s | %s | %.1f | %s | %s |\n", \
-                                        $2, verdict($9), $3, $4, mib, detail($9), runlog($1,$2,$4)
-                        }' "$CSV"
+                        echo "This stage asks libvirt a question rather than testing vmsync, so read its"
+                        echo "rows as the platform's answer on this host and build: a FAIL here is a"
+                        echo "libvirt limitation stage 23 then has to work around, not a vmsync defect."
                 else
-                        echo "_not run (opt in with \`--stages verify-long\`; it builds a $VERIFY_LONG_COPIES-deep chain per mode)_"
+                        section_no_rows_note redefine-probe "opt in with \`--stages redefine-probe\`; it needs SOURCE_HOST and TAMPER_DISK_DEV set and a running source, since it asks what libvirt will do to a live domain"
                 fi
                 echo
-                echo "## Stage 9: retention (restore points on the target)"
+                echo "## Stage 23: -reinit must clear an orphaned bitmap on a RUNNING source"
                 echo
-                if awk -F, 'NR>1 && $1=="retention" { found=1 } END { exit !found }' "$CSV"; then
-                        echo "| check | result | exit | detail | log |"
-                        echo "|---|---|---|---|---|"
-                        awk -F, "$REPORT_AWK"'NR>1 && $1=="retention" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s |\n", ph, verdict($9), $3, detail($9), runlog($1,$2,$4) }' "$CSV"
+                if awk -F, 'NR>1 && $1=="reinit-orphan" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="reinit-orphan" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
                 else
-                        echo "_not run (opt in with \`--stages retention\`; needs a reflink-capable target filesystem)_"
-                fi
-                echo
-                echo "## Stage 3: reinit-after-failures"
-                echo
-                awk -F, 'NR>1 && $1=="reinit-after-failures" { printf "- %s/%s: exit=%s wall=%ss %s\n", $1, $2, $3, $4, $9 }' "$CSV"
-                echo
-                echo "## Stage 4: external snapshot lifecycle"
-                echo
-                echo "| phase | result | exit | wall (s) | detail | log |"
-                echo "|---|---|---|---|---|---|"
-                awk -F, "$REPORT_AWK"'NR>1 && $1=="ext-snapshot" { printf "| %s | %s | %s | %s | %s | %s |\n", $2, verdict($9), $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
-                echo
-                echo "## Stage 5: DefineDomain redefine/rollback coverage"
-                echo
-                echo "| test | phase | result | exit | wall (s) | detail | log |"
-                echo "|---|---|---|---|---|---|---|"
-                awk -F, "$REPORT_AWK"'NR>1 && ($1=="define-uuid-collision" || $1=="define-rollback" || $1=="define-metadata") { printf "| %s | %s | %s | %s | %s | %s | %s |\n", $1, $2, verdict($9), $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
-                echo
-                echo "## Stage 6: failover, fencing, and the way back"
-                echo
-                # Every row is one assertion, so the useful rendering is a
-                # pass/fail list rather than timings -- nothing here is a
-                # benchmark, and a wall-clock column would just be noise.
-                # Only the ASSERTION rows, which are the ones whose notes start
-                # with PASS/FAIL/SKIP. The stage also emits ordinary run rows
-                # (baseline, resync, ...) through run_vmsync, and listing those
-                # as though they were assertions would report a phase name as
-                # a passing test.
-                if awk -F, 'NR>1 && $1=="failover" && $9 ~ /^(PASS|FAIL|SKIP)/ { found=1 } END { exit !found }' "$CSV"; then
-                        awk -F, 'NR>1 && $1=="failover" && $9 ~ /^(PASS|FAIL|SKIP)/ {
-                                gsub(/_/, " ", $2)
-                                if ($9 ~ /^FAIL/)      printf "- **FAIL** — %s (%s)\n", $2, substr($9, 6)
-                                else if ($9 ~ /^SKIP/) printf "- _skipped_ — %s\n", $2
-                                else                   printf "- **PASS** — %s\n", $2
-                        }' "$CSV"
-                        echo
-                        awk -F, 'NR>1 && $1=="failover" && $9 ~ /^(PASS|FAIL|SKIP)/ {
-                                        if ($9 ~ /^FAIL/) f++; else if ($9 ~ /^SKIP/) s++; else p++
-                                }
-                                END {
-                                        if (f)      printf "**%d failover assertion(s) failed.**\n", f
-                                        else if (p) printf "All %d failover assertion(s) passed.\n", p
-                                        else        printf "_Nothing was executed (%d skipped)._\n", s
-                                }' "$CSV"
-                else
-                        echo "_not run (opt in with \`--stages failover\`)_"
-                fi
-                echo
-                echo "## Stage 7: fencing end to end, with real agents"
-                echo
-                if awk -F, 'NR>1 && $1=="fence-agent" && $9 ~ /^(PASS|FAIL|SKIP)/ { found=1 } END { exit !found }' "$CSV"; then
-                        awk -F, 'NR>1 && $1=="fence-agent" && $9 ~ /^(PASS|FAIL|SKIP)/ {
-                                gsub(/_/, " ", $2)
-                                if ($9 ~ /^FAIL/)      printf "- **FAIL** — %s (%s)\n", $2, substr($9, 6)
-                                else if ($9 ~ /^SKIP/) printf "- _skipped_ — %s\n", $2
-                                else                   printf "- **PASS** — %s\n", $2
-                        }' "$CSV"
-                        echo
-                        awk -F, 'NR>1 && $1=="fence-agent" && $9 ~ /^(PASS|FAIL|SKIP)/ {
-                                        if ($9 ~ /^FAIL/) f++; else if ($9 ~ /^SKIP/) s++; else p++
-                                }
-                                END {
-                                        if (f)      printf "**%d fencing assertion(s) failed.**\n", f
-                                        else if (p) printf "All %d fencing assertion(s) passed.\n", p
-                                        else        printf "_Nothing was executed (%d skipped)._\n", s
-                                }' "$CSV"
-                else
-                        echo "_not run (opt in with \`--stages fence-agent\`; it stops the source VM)_"
+                        section_no_rows_note reinit-orphan "opt in with \`--stages reinit-orphan\`; it leaves a bitmap behind with no checkpoint and checks a reinit clears it without stopping the source, and needs SOURCE_HOST and TAMPER_DISK_DEV set"
                 fi
                 echo
                 echo "Full machine-readable data: \`results.csv\`. Per-run logs: \`logs/\`. Raw prometheus textfiles: \`prom/\`."
         } >"$report"
+        # Only the report reads it, and a stale one left in the run directory
+        # would be read by the next regeneration.
+        rm -f "$log_index"
+        unset BENCH_LOG_INDEX
         log "report written to $report"
         cat "$report"
         return 0
@@ -10477,6 +10747,27 @@ generate_report() {
 # --- main --------------------------------------------------------------------
 
 preflight
+
+# The two keywords expand HERE, once, so everything downstream -- the dispatch
+# below, the report, the verdict, stage_number -- only ever sees a plain list
+# of stage names and needs no special case for them.
+#
+# all-but-matrix earns its own name because the transport matrix is not like
+# the others: 532 runs and the better part of an hour, and what it produces is
+# a performance table rather than a correctness verdict. "Everything that can
+# actually fail" is the common thing to want, and spelling out twenty-two
+# names to get it invites a typo that silently drops a stage -- `--stages trol`
+# at least refuses, but a list missing one entry runs happily and proves less
+# than it looks like it did.
+#
+# Matched against the WHOLE value rather than per element: these are shorthands
+# for a list, not stages, so `all,verify` is not meaningful. It falls through
+# to the dispatcher's refusal, which names them.
+case "$STAGES" in
+all) STAGES="$ALL_STAGES" ;;
+# matrix is first in ALL_STAGES, so the prefix strip is the whole edit.
+all-but-matrix) STAGES="${ALL_STAGES#matrix,}" ;;
+esac
 
 IFS=',' read -ra stage_list <<<"$STAGES"
 # Each stage's exit status is captured rather than left to `set -e`.
@@ -10517,7 +10808,7 @@ for s in "${stage_list[@]}"; do
         lock-lease) stage_lock_lease || stage_rc=$? ;;
         redefine-probe) stage_redefine_probe || stage_rc=$? ;;
         reinit-orphan) stage_reinit_orphan || stage_rc=$? ;;
-        *) die "unknown stage '$s' in --stages (want matrix,verify,checksum,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease,redefine-probe,reinit-orphan)" ;;
+        *) die "unknown stage '$s' in --stages (want one of: $ALL_STAGES -- or the shorthands 'all' and 'all-but-matrix', which stand alone rather than inside a list)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
                 warn "stage $s returned exit status $stage_rc -- it did not finish cleanly. Whatever it recorded before that point is in the report below; the run continues so the remaining stages and the report still happen."
