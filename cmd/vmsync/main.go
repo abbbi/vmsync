@@ -7295,6 +7295,44 @@ func run(cfg syncConfig) (runErr error) {
 		commitErr = commitErrFromLock
 	}
 
+	// Stamped HERE, the moment the replica disks stop changing, and stamped
+	// again after phase two below.
+	//
+	// The later one is not enough on its own, and a real incident proved it.
+	// The commit is what moves a base image's mtime; the next run's preflight
+	// refuses a replica whose mtime is ahead of everything on record, and this
+	// stamp is the record. Phase two sits between the two events -- and phase
+	// two contains -verify, which on a terabyte disk is the longest step in a
+	// run by a wide margin, tens of minutes against the seconds the commit
+	// takes. A run interrupted anywhere in that window committed its data,
+	// recorded nothing about having done so, and left every subsequent sync of
+	// that domain refusing with "something wrote to the replica between syncs"
+	// -- which was true, and the something was that run. The replica itself
+	// was fine; only the bookkeeping was missing, and clearing it by hand
+	// needed either a metadata edit or a tolerance wide enough to hide a real
+	// finding.
+	//
+	// It is not a signal-handling problem, which is why catching more signals
+	// does not close it: a SIGKILL, an OOM, a lost hypervisor or a power cut
+	// during those tens of minutes all produce the same wedge, and no handler
+	// runs for any of them. Stamping at the moment the mtime changes is the
+	// only placement that covers them.
+	//
+	// WITHOUT cleanupTargetNBD, deliberately, unlike the stamp below. That
+	// teardown is Once-guarded and the verify's own exports register into the
+	// same list, so running it here would leave THEM unstopped on every error
+	// path. It is not needed here either: on an incremental the target export
+	// holds the overlay and only qemu-img commit touches the base, which has
+	// exited by now; on a full sync the export holds the base but copyAndStage
+	// stopped it inline before this point. The one case that escapes both --
+	// a copy that failed before that inline stop -- is what the later stamp
+	// still covers, cleanup and all.
+	//
+	// Unconditional, like the one below: a commit that failed partway, or one
+	// refused because this run lost the target lock, is exactly when the next
+	// run most needs to know a disk was touched.
+	recordReplicaWrittenAt("post-commit", measureReplicaWrittenAt("post-commit"))
+
 	// Phase two: everything that needs the delta to be in the base --
 	// restore points and -verify. Skipped when a disk failed to copy or a
 	// commit failed, because the base then holds something other than what
