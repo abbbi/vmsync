@@ -105,16 +105,13 @@ func stalled(lastProgress, now time.Time, timeout time.Duration) bool {
 // is reading it. A minute is frequent enough to tell "moving" from "wedged"
 // (and the 120s noProgressTimeout above is what actually catches wedged),
 // and rare enough that an hour-long sync leaves sixty lines.
-const progressLogInterval = time.Minute
+// Defined in pkg/trace so vmsync-bridge-helper can report the target side of
+// a digest exchange on the same cadence -- see trace.ProgressInterval.
+const progressLogInterval = trace.ProgressInterval
 
 // dueForProgressLog reports whether a progress line should be emitted now.
-//
-// done forces one regardless of the interval, so every operation logs its
-// own completion state rather than potentially stopping at the last tick --
-// a copy that finishes 3 seconds after a log would otherwise never report
-// 100%.
 func dueForProgressLog(lastLog, now time.Time, done bool) bool {
-	return done || now.Sub(lastLog) >= progressLogInterval
+	return trace.DueForProgress(lastLog, now, done)
 }
 
 type Extent struct {
@@ -1258,6 +1255,34 @@ func HashRangesTCP(ctx context.Context, host string, port int, export string, pl
 	reading := 0
 	var hashedBytes uint64
 
+	// The same per-minute line the copy pipeline emits, for the same reason,
+	// and it was missing here for longer than it should have been: a verify
+	// of a terabyte hashes for sixteen minutes and used to log NOTHING from
+	// "hashing both sides in parallel" until it was done. An operator
+	// watching that cannot tell a slow pass from a wedged one, and a run
+	// that then died mid-pass left no record of how far it had got. The
+	// noProgressTimeout below catches an actually-stuck connection; this is
+	// what makes a merely slow one legible while it happens.
+	totalBytes := blockdigest.TotalBytes(plan)
+	lastLog := start
+	logProgress := func() {
+		now := time.Now()
+		if !dueForProgressLog(lastLog, now, hashedBytes == totalBytes) {
+			return
+		}
+		elapsed := now.Sub(start).Seconds()
+		if elapsed <= 0 {
+			elapsed = 0.001
+		}
+		percent := 100.0
+		if totalBytes > 0 {
+			percent = (float64(hashedBytes) / float64(totalBytes)) * 100.0
+		}
+		mibPerSec := (float64(hashedBytes) / (1024.0 * 1024.0)) / elapsed
+		trace.Info(fmt.Sprintf("nbd: digest progress (%s)  %.2f%% (%d/%d bytes) %.2f MiB/s", export, percent, hashedBytes, totalBytes, mibPerSec))
+		lastLog = now
+	}
+
 	// Same reason compareTCP and CopyExtentsTCP carry their abort reason out
 	// in a variable instead of returning from inside the loop: every exit
 	// path has to reach the drain below, because libnbd requires a buffer
@@ -1352,6 +1377,7 @@ digestLoop:
 			hashedBytes += slots[i].length
 			slots[i].buf.Free()
 			slots[i].state = slotFree
+			logProgress()
 		}
 	}
 

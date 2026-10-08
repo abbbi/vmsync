@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -345,7 +346,79 @@ func (c *Client) DialTCP(addr string) (net.Conn, error) {
 //
 // stderr is returned rather than logged here so the caller can fold it into
 // its own error message, which is where the operator will actually look.
+// lineWriter calls onLine once per complete line written to it, and is how a
+// remote command's stderr reaches the log WHILE it runs rather than after.
+//
+// A buffered-until-the-end stderr is fine for a message explaining a failure,
+// which is all it was ever used for. It is useless for anything the remote
+// side says about work in progress: the pass that most needs to be audible --
+// the target's digest of a terabyte -- says it over tens of minutes, and the
+// one run that mattered died before the session closed, taking every word of
+// it with the buffer.
+//
+// Partial trailing output is deliberately dropped rather than logged: a
+// progress line is worth nothing once it is the only thing left of a dead
+// session, and the full text is still in the buffer the caller gets back.
+type lineWriter struct {
+	onLine func(string)
+	buf    []byte
+	// discard is set while an over-long line is being thrown away, and
+	// cleared by the newline that ends it.
+	//
+	// Not an optimisation -- a correctness requirement. Dropping the
+	// oversized buffer and carrying on would leave whatever arrived after it
+	// in the same line, so the next real line would be logged with a
+	// kilobyte of someone else's garbage glued to its front. Resyncing on
+	// the newline is what makes the line after an overflow intact.
+	discard bool
+}
+
+// maxLineBytes bounds one line. The far side is a process on another host, so
+// a bug or a binary stream over there must not be able to grow this buffer
+// until vmsync runs out of memory.
+const maxLineBytes = 64 * 1024
+
+func (w *lineWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		if i < 0 {
+			if !w.discard {
+				w.buf = append(w.buf, p...)
+				if len(w.buf) > maxLineBytes {
+					w.buf = w.buf[:0]
+					w.discard = true
+				}
+			}
+			break
+		}
+		if w.discard {
+			w.discard = false
+		} else {
+			w.buf = append(w.buf, p[:i]...)
+			line := strings.TrimRight(string(w.buf), "\r")
+			w.buf = w.buf[:0]
+			if line != "" {
+				w.onLine(line)
+			}
+		}
+		p = p[i+1:]
+	}
+	return n, nil
+}
+
 func (c *Client) RunWithInput(ctx context.Context, command string, input []byte) (stdout string, stderr string, err error) {
+	return c.RunWithInputProgress(ctx, command, input, nil)
+}
+
+// RunWithInputProgress is RunWithInput plus onStderrLine, called once per
+// line the command writes to stderr, as it is written. stderr is still
+// returned in full.
+//
+// onStderrLine is called from the goroutine copying the session's stderr, so
+// it must be safe to call concurrently with the caller's own work and must
+// not block for long.
+func (c *Client) RunWithInputProgress(ctx context.Context, command string, input []byte, onStderrLine func(string)) (stdout string, stderr string, err error) {
 	if c == nil || c.client == nil {
 		return "", "", errors.New("ssh client is not connected")
 	}
@@ -379,7 +452,11 @@ func (c *Client) RunWithInput(ctx context.Context, command string, input []byte)
 
 	var outBuf, errBuf bytes.Buffer
 	session.Stdout = &outBuf
-	session.Stderr = &errBuf
+	if onStderrLine != nil {
+		session.Stderr = io.MultiWriter(&errBuf, &lineWriter{onLine: onStderrLine})
+	} else {
+		session.Stderr = &errBuf
+	}
 	// A plain bytes.Reader rather than an explicit StdinPipe: x/crypto/ssh
 	// copies from session.Stdin and closes the remote's stdin when it is
 	// exhausted, which is exactly the EOF a one-shot command needs to stop

@@ -467,3 +467,74 @@ func TestRunChecksumAgreesWithVmsyncForEveryRequestShape(t *testing.T) {
 		}
 	}
 }
+
+// TestRunChecksumReportsProgressSeparatelyFromTheResponse pins the two
+// properties the progress writer has to have, because getting either wrong is
+// worse than having no progress at all.
+//
+// First, it must not touch out. stdout carries the digest response, and
+// vmsync parses it strictly: one progress line mixed in would turn a verify
+// that found nothing wrong into a format error, which is reported as a
+// BROKEN CHECK rather than a clean pass.
+//
+// Second, the final line must be emitted even for a plan that finishes inside
+// one interval. The interval is a minute and most plans are far shorter than
+// that, so without the done-forces-one rule the overwhelmingly common case
+// would report nothing and the field would look broken.
+func TestRunChecksumReportsProgressSeparatelyFromTheResponse(t *testing.T) {
+	const bs = 4096
+	data := diskPattern(32 * bs)
+	s := startExport(t, data, "vm-vda")
+	written := chunked(0, 8*bs, bs)
+
+	cfg := checksumCfg(s, "vm-vda")
+	var progress bytes.Buffer
+	cfg.Progress = &progress
+
+	var out bytes.Buffer
+	if err := runChecksum(context.Background(), cfg, request(t, bs, written...), &out); err != nil {
+		t.Fatalf("runChecksum: %v", err)
+	}
+
+	// The response still parses, and still says what it said without progress.
+	got := readResponse(t, &out, bs)
+	want := expected(written, data)
+	if len(got) != len(want) {
+		t.Fatalf("got %d digests, want %d -- progress leaked into the response", len(got), len(want))
+	}
+
+	line := progress.String()
+	if line == "" {
+		t.Fatal("no progress line for a completed pass; a pass shorter than one interval must still report its completion")
+	}
+	if !strings.Contains(line, "100.00%") {
+		t.Errorf("progress does not report completion: %q", line)
+	}
+	if !strings.Contains(line, "vm-vda") {
+		t.Errorf("progress does not name the export, so two disks' lines cannot be told apart: %q", line)
+	}
+	if strings.Contains(line, "checksum:") {
+		t.Errorf("progress carries its own prefix; vmsync adds one, and two read as a stutter: %q", line)
+	}
+}
+
+// TestRunChecksumWithoutProgressWriterIsSilent keeps the writer optional: the
+// pre-commit check and every test above pass no writer, and a nil one must not
+// panic.
+func TestRunChecksumWithoutProgressWriterIsSilent(t *testing.T) {
+	const bs = 4096
+	data := diskPattern(8 * bs)
+	s := startExport(t, data, "vm-vda")
+
+	cfg := checksumCfg(s, "vm-vda")
+	if cfg.Progress != nil {
+		t.Fatal("checksumCfg should leave Progress nil, so the default is silence")
+	}
+	var out bytes.Buffer
+	if err := runChecksum(context.Background(), cfg, request(t, bs, chunked(0, 4*bs, bs)...), &out); err != nil {
+		t.Fatalf("runChecksum with no progress writer: %v", err)
+	}
+	if len(readResponse(t, &out, bs)) != 4 {
+		t.Error("the response changed when progress was disabled")
+	}
+}

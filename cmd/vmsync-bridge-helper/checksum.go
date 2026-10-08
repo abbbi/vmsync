@@ -25,6 +25,7 @@ import (
 
 	"vmsync/pkg/blockdigest"
 	"vmsync/pkg/nbdclient"
+	"vmsync/pkg/trace"
 )
 
 // The helper's second mode: hash the target's own disk content, locally.
@@ -73,6 +74,17 @@ type checksumConfig struct {
 	// Timeout bounds each individual socket operation, not the pass as a
 	// whole -- a large disk legitimately takes many round trips.
 	Timeout time.Duration
+	// Progress is where per-minute progress lines go, or nil for none.
+	//
+	// Separate from out, which carries the digest response and must contain
+	// nothing else. In production this is stderr, which vmsync reads line by
+	// line while the pass runs -- the only way the side that WAITS can say
+	// anything about how the side that WORKS is getting on. A verify of a
+	// terabyte hashes here for the better part of an hour, and with nothing
+	// on this writer the whole of it was invisible: vmsync logged that it
+	// had asked, and then either the answer or, if the run died first,
+	// nothing at all.
+	Progress io.Writer
 }
 
 // runChecksum reads a digest request from in, hashes the named ranges off the
@@ -135,6 +147,43 @@ func runChecksum(ctx context.Context, cfg checksumConfig, in io.Reader, out io.W
 	}
 	buf := make([]byte, maxLen)
 
+	// Reported on the same cadence as vmsync's own side of the pass (see
+	// trace.ProgressInterval), because the two are read against each other:
+	// "nbd: digest progress" is the source, this is the target, and which of
+	// them is the slow one is the first question anybody asks of a verify
+	// that is taking too long.
+	//
+	// Bare lines, with no timestamp and no level: vmsync stamps them as it
+	// reads them, so a line carries the time it was SEEN by the side doing
+	// the waiting rather than two clocks that may disagree.
+	totalBytes := blockdigest.TotalBytes(blocks)
+	start := time.Now()
+	lastLog := start
+	var hashedBytes uint64
+	logProgress := func() {
+		if cfg.Progress == nil {
+			return
+		}
+		now := time.Now()
+		if !trace.DueForProgress(lastLog, now, hashedBytes == totalBytes) {
+			return
+		}
+		elapsed := now.Sub(start).Seconds()
+		if elapsed <= 0 {
+			elapsed = 0.001
+		}
+		percent := 100.0
+		if totalBytes > 0 {
+			percent = (float64(hashedBytes) / float64(totalBytes)) * 100.0
+		}
+		mibPerSec := (float64(hashedBytes) / (1024.0 * 1024.0)) / elapsed
+		// No "checksum:" prefix: vmsync adds its own ("checksum: target: ")
+		// as it logs the line, and two of them read as a stutter.
+		fmt.Fprintf(cfg.Progress, "digest progress (%s)  %.2f%% (%d/%d bytes) %.2f MiB/s\n",
+			cfg.Export, percent, hashedBytes, totalBytes, mibPerSec)
+		lastLog = now
+	}
+
 	for i := range blocks {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -145,6 +194,8 @@ func runChecksum(ctx context.Context, cfg checksumConfig, in io.Reader, out io.W
 			return fmt.Errorf("read %d+%d from export %q: %w", b.Offset, b.Length, cfg.Export, err)
 		}
 		blocks[i].Digest = blockdigest.Sum(p)
+		hashedBytes += b.Length
+		logProgress()
 	}
 
 	return blockdigest.WriteResponse(out, header, blocks)

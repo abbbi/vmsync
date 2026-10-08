@@ -23,7 +23,36 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 )
+
+// ProgressInterval is how often a long-running phase reports how far along it
+// is. Every phase that can run for minutes uses it, so an operator watching a
+// run never has to learn that one phase reports every second and the next
+// says nothing for half an hour.
+//
+// It lives here, in the smallest package both sides can import, because the
+// two sides of a digest exchange report in turn: vmsync hashes the source and
+// vmsync-bridge-helper hashes the target, and a reader comparing the two
+// needs them on the same cadence. A local copy in each would be two chances
+// to drift.
+//
+// A minute rather than a second: these phases are measured in tens of minutes
+// against multi-gigabyte disks, so per-second lines are not progress -- they
+// are thousands of entries that push everything else out of a journal and
+// make the log unreadable exactly when something has gone wrong and somebody
+// is reading it. A minute is frequent enough to tell "moving" from "wedged",
+// and rare enough that an hour-long phase leaves sixty lines.
+const ProgressInterval = time.Minute
+
+// DueForProgress reports whether a progress line should be emitted now.
+//
+// done forces one regardless of the interval, so every phase logs its own
+// completion state rather than potentially stopping at the last tick -- a
+// pass that finishes 3 seconds after a log would otherwise never report 100%.
+func DueForProgress(lastLog, now time.Time, done bool) bool {
+	return done || now.Sub(lastLog) >= ProgressInterval
+}
 
 var (
 	debugEnabled atomic.Bool
