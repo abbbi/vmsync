@@ -3633,7 +3633,23 @@ func run(cfg syncConfig) (runErr error) {
 
 	sigCh := make(chan os.Signal, 1)
 	doneCh := make(chan struct{})
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	// SIGHUP is in the list because Go's default disposition for it is to
+	// terminate the process -- immediately, with no traceback, no deferred
+	// "vmsync run finished", and none of the cleanup below. A hangup is
+	// therefore the ONE signal that could take a run down leaving no trace
+	// whatsoever of why, which is exactly as mysterious as it sounds when
+	// what it leaves behind is a libvirt backup job that blocks every
+	// subsequent sync of that domain.
+	//
+	// It reaches a run through the controlling terminal: a replication pass
+	// started by hand over SSH, and the session dropping (or the window
+	// closing) hours later while the long disks are still verifying. Every
+	// vmsync in that process group gets it at once, which is why it takes
+	// out "all the big VMs" and none of the small ones -- those had already
+	// finished. Treated exactly like SIGTERM rather than ignored: the run
+	// should still stop, it should just stop the way an interrupted run is
+	// supposed to, saying so and putting the domain back.
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigCh)
 	defer close(doneCh)
 	go func() {
@@ -5561,7 +5577,51 @@ func run(cfg syncConfig) (runErr error) {
 			" -export " + util.ShQuote(exportName)
 
 		start := time.Now()
-		stdout, stderr, err := targetSSHClient.RunWithInput(ctx, helperCmd, request.Bytes())
+
+		// Two separate things make this wait audible, because a silent one
+		// cost a real diagnosis: a verify of a terabyte hashes on the target
+		// for the better part of an hour, and all this used to log was the
+		// question and -- if the run survived -- the answer.
+		//
+		// First, the helper's own per-minute progress, logged as each line
+		// arrives (pkg/remotessh's lineWriter) rather than with the response.
+		// Second, a heartbeat for when it says nothing at all: a helper that
+		// is wedged, or one too old to report progress, otherwise leaves the
+		// same silence as a dead one. It only speaks when the helper has
+		// not, so the two together cost one line a minute, never two.
+		var heardMu sync.Mutex
+		lastHeard := start
+		onLine := func(line string) {
+			heardMu.Lock()
+			lastHeard = time.Now()
+			heardMu.Unlock()
+			trace.Info("checksum: target: "+line, "disk", dev)
+		}
+		waitDone := make(chan struct{})
+		go func() {
+			t := time.NewTicker(trace.ProgressInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-waitDone:
+					return
+				case <-ctx.Done():
+					return
+				case now := <-t.C:
+					heardMu.Lock()
+					quiet := now.Sub(lastHeard)
+					heardMu.Unlock()
+					if quiet < trace.ProgressInterval {
+						continue
+					}
+					trace.Info("checksum: still waiting for the target's digest", "disk", dev,
+						"elapsed", time.Since(start).Round(time.Second).String(),
+						"silent_for", quiet.Round(time.Second).String())
+				}
+			}
+		}()
+		stdout, stderr, err := targetSSHClient.RunWithInputProgress(ctx, helperCmd, request.Bytes(), onLine)
+		close(waitDone)
 		if err != nil {
 			return nil, fmt.Errorf("checksum: run %s on the target for %s: %w%s -- pass -no-checksum to run without digest checks if the helper is not deployed there yet",
 				cfg.BridgeHelperPath, dev, err, formatRemoteStderr(stderr))
