@@ -619,7 +619,53 @@ func printFlagLine(out io.Writer, f *flag.Flag) {
 	fmt.Fprintf(out, "%-32s %s\n", left, f.Usage)
 }
 
+// stopSignals mean "stop this run". Both of this binary's signal registrations
+// use this one list, which is the point: they drifted, and the drift was the
+// bug. SIGHUP was added to the sync path's handler alone, leaving the mode
+// dispatch -- and with it -promote, -fence-domain, -invert, -shutdown-domain,
+// -break-target-lock, -clone-restore-point and -restore-restore-point -- still
+// dying silently on a hangup. Two lists are two chances to forget one, and the
+// one that was forgotten covered the verbs that change a replica's role.
+//
+// SIGHUP is in the list because Go's default disposition for it TERMINATES the
+// process with no output whatsoever: no error, no traceback, nothing deferred.
+// A pass started by hand over SSH, with the session dropping hours later while
+// the big disks were still verifying, took four runs down without a line
+// between them and left four libvirt backup jobs open -- each of which then
+// blocked every subsequent sync of that domain until an operator aborted it by
+// hand. Caught, the same event stops the run, says so, and puts the domain
+// back. See the sync path's own registration for the rest of that story.
+//
+// NOT in the list, deliberately: SIGPIPE, which main() ignores instead -- see
+// there for why catching it would defeat the cleanup it exists to protect.
+var stopSignals = []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP}
+
 func main() {
+	// Ignored, not caught, and first of all -- before anything in this process
+	// can write a log line.
+	//
+	// Go's rule for SIGPIPE is specific: a write to a broken pipe on file
+	// descriptor 1 or 2 raises it with the DEFAULT disposition, which kills the
+	// process silently; on any other descriptor the write simply returns
+	// EPIPE. Under contrib/runner those two descriptors are a regular file, so
+	// it cannot fire. Under the agent they are a PIPE: opexec.go and fence.go
+	// hand exec.Cmd a *bytes.Buffer rather than an *os.File, so os/exec gives
+	// the child a pipe, and cmd.WaitDelay closes the read end sixty seconds
+	// after a cancellation. A cleanup that runs past that budget -- aborting a
+	// backup job, thawing a filesystem, putting a role back -- would be killed
+	// by its own next log line, which is the same silent death as the hangup
+	// above and in the same place: halfway through putting things back.
+	//
+	// Ignore rather than Notify because the handler would have to log, and
+	// logging is what raises it: a caught SIGPIPE re-arms itself on the first
+	// line the cleanup writes. Ignored, the write returns EPIPE, log discards
+	// it (nobody is reading that pipe anyway), and the run finishes its unwind.
+	//
+	// The cost is that `vmsync ... | head` no longer dies when head exits. For
+	// a tool whose verbs promote replicas and fence hosts, a closed pager
+	// aborting the work mid-way is the worse of the two behaviours.
+	signal.Ignore(syscall.SIGPIPE)
+
 	if os.Getenv("PROFILE") == "development" {
 		host := "localhost:6060"
 		trace.Info("Enabling pprof for profiling", "address", host)
@@ -744,7 +790,10 @@ func main() {
 		// cliMode.
 		if len(chosen) == 1 && chosen[0].run != nil {
 			trace.SetDebug(cfg.Debug)
-			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+			// stopSignals, not a list of its own: this site is the one that
+			// was missed when SIGHUP was added to the sync path, and these
+			// are the verbs that change a replica's role.
+			ctx, stop := signal.NotifyContext(context.Background(), stopSignals...)
 			defer stop()
 
 			if err := chosen[0].run(ctx); err != nil {
@@ -3649,7 +3698,7 @@ func run(cfg syncConfig) (runErr error) {
 	// finished. Treated exactly like SIGTERM rather than ignored: the run
 	// should still stop, it should just stop the way an interrupted run is
 	// supposed to, saying so and putting the domain back.
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(sigCh, stopSignals...)
 	defer signal.Stop(sigCh)
 	defer close(doneCh)
 	go func() {
