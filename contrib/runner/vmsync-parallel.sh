@@ -191,6 +191,32 @@ replicate() {
                 ports_increse=2
         fi
 
+        # Each vmsync runs in its own session, so a hangup on the terminal
+        # this script was started from cannot reach it.
+        #
+        # Why it matters: a pass started by hand over SSH puts every vmsync in
+        # this script's process group, and a session that drops hours later --
+        # while the big disks are still verifying -- SIGHUPs that whole group
+        # at once. vmsync handles SIGHUP now (it stops, says so, and releases
+        # the libvirt backup job it holds), but not being signalled at all is
+        # better than unwinding cleanly: the verify finishes instead of being
+        # abandoned a third of the way through, and a 1 TB replica is not left
+        # needing another hour of somebody's evening.
+        #
+        # --wait, and only if --wait works: it keeps setsid in place as the
+        # process this script waits on, so the pid in pidsArray stays valid
+        # and vmsync's exit status still propagates. Plain setsid may fork and
+        # exit immediately when it is already a process group leader, which
+        # would make every task look like it finished the instant it started
+        # -- a far worse failure than the one being fixed. No setsid, or one
+        # too old for --wait, replicates exactly as before.
+        if setsid --wait true >/dev/null 2>&1; then
+                setsid_prefix="setsid --wait "
+        else
+                setsid_prefix=""
+                log "$(date): setsid --wait is unavailable; vmsync children will share this script's process group, so a hangup on its terminal will reach them" "WARN"
+        fi
+
         # Generating list of vmsync commands to execute
 
         vm_count=0
@@ -248,7 +274,7 @@ replicate() {
                         tgt_path=""
                 fi
                 log "$(date): Preparing replication ${vm} to ${target_disk_path} from ports ${source_base_port_start}-${source_base_port_end} to ports ${destination_base_port_start}-${destination_base_port_end}"
-                vmsync_cmd="\"${VMSYNC}\" -source-domain \"${vm}\" -source-uri qemu:///system -target-uri \"qemu+ssh://${DESTINATION_HOST}/system\" -ssh-key \"${DESTINATION_SSH_KEY}\" ${tgt_path} -source-nbd-port ${source_base_port_start} -target-nbd-port ${destination_base_port_start} -start ${opts} ${prom} >> \"${LOG_FILE}_${vm}.log\" 2>&1"
+                vmsync_cmd="${setsid_prefix}\"${VMSYNC}\" -source-domain \"${vm}\" -source-uri qemu:///system -target-uri \"qemu+ssh://${DESTINATION_HOST}/system\" -ssh-key \"${DESTINATION_SSH_KEY}\" ${tgt_path} -source-nbd-port ${source_base_port_start} -target-nbd-port ${destination_base_port_start} -start ${opts} ${prom} >> \"${LOG_FILE}_${vm}.log\" 2>&1"
                 if [ -z "${cmd_list}" ]; then
                         vm_list="${vm_list}"
                         cmd_list="${vmsync_cmd}"
