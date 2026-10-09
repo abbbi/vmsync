@@ -145,6 +145,42 @@ type agentConfig struct {
 // changed by restarting it is one an operator hesitates to touch during an
 // incident -- which is when they most need to.
 func main() {
+	// Ignored, not caught, and before flag.Parse -- which prints usage to
+	// stderr on a bad flag and is therefore the first thing here that can
+	// write to fd 2 at all.
+	//
+	// Go raises SIGPIPE with its DEFAULT disposition -- terminate, no output,
+	// nothing deferred -- for a write to a broken pipe on file descriptor 1
+	// or 2 specifically; on any other descriptor the write merely returns
+	// EPIPE. cmd/vmsync ignores it for the same reason and its comment has
+	// the mechanics.
+	//
+	// THE DECISION THIS ENCODES, since "a daemon that cannot log should stop"
+	// is a defensible position and this takes the other one.
+	//
+	// The agent is a supervisor. It starts vmsync through
+	// exec.CommandContext and stops it by cancelling that context, so an
+	// agent that dies does NOT take its children with it: every in-flight
+	// sync is orphaned, still holding a libvirt backup job on its source and
+	// the run lock on its target, with nobody left to cancel it, record its
+	// outcome, or notice that a guest was left frozen. Losing the log stream
+	// costs log lines. Dying costs a replica's bookkeeping and leaves a
+	// domain that refuses every later sync until an operator clears the job
+	// by hand -- which is precisely the incident this whole signal review
+	// came out of.
+	//
+	// And stopping would not even buy an auditable stop: the exit cannot be
+	// logged either, because logging is what raised the signal. It buys an
+	// unexplained disappearance. The supervisor that CAN record this is
+	// systemd, which has no trouble seeing an agent still running while
+	// journald is not.
+	//
+	// The realistic trigger is not a journald crash, either -- journald
+	// re-adopts its units' stdout streams across a restart. It is an
+	// operator running the agent in the foreground through a pager or a head
+	// while a sync is in flight, and quitting the pager.
+	signal.Ignore(syscall.SIGPIPE)
+
 	var (
 		configPath     = flag.String("config", "/etc/vmsync/agent.json", "Path to this agent's configuration. Everything except the flags listed here lives in that file; see the agent README")
 		once           = flag.Bool("once", false, "Report once and exit, instead of running as a daemon. For verifying a new install")
