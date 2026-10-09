@@ -1594,6 +1594,81 @@ verify_guard_subtest() {
         heal_target verify-guard tamper-heal "$path"
 }
 
+# verify_skip_checks SCENARIO PHASE MODE -- grades the allocation-aware plan
+# from the verify this subtest just ran.
+#
+# WHY TWO CHECKS RATHER THAN ONE. The obvious assertion is "skipped_bytes > 0",
+# and it is wrong: a replica whose disks are fully allocated has nothing that
+# reads as zeros on both sides, so a CORRECT vmsync skips nothing and the stage
+# would go permanently red on that pair. Stage 22 already carries the lesson --
+# "a stage whose verdict is always red is one nobody reads" -- so the property
+# that must hold on every run is separated from the one that only holds when
+# the disks happen to be sparse.
+#
+# CHECK ONE grades whether the allocation map was AVAILABLE, which is
+# indifferent to how sparse anything is. It is also the exact regression guard
+# for the bug this exists for: when the meta context is never requested the
+# server never grants it, so vmsync's own availability check fires and says so.
+# Every pre-fix verify would have tripped this.
+#
+# CHECK TWO grades whether the map was USED, and only when this VM gives it
+# something to grade. Sparse disks -> PASS with the figures; nothing skippable
+# -> SKIP, measured rather than failed, the same way stage 22 reports a
+# platform fact it cannot grade.
+#
+# Read from the prometheus textfile rather than the log, so this exercises the
+# vmsync_verify_*_bytes series as well as the behaviour behind it -- a gauge
+# nobody reads is a gauge that can silently stop being emitted.
+#
+# NOT asserted here, deliberately: that skipped+hashed equals
+# vmsync_disk_size_bytes. Those two are different measurements -- the gauges
+# count the NBD export, the disk-size series comes from qemu-img, and a real
+# run has shown them differing by a gibibyte on the same disk. An invariant
+# that fires on a healthy pair is worse than no invariant; the exact arithmetic
+# is pinned in pkg/nbdsync's own tests, where the numbers come from one source.
+verify_skip_checks() {
+        local scenario="$1" phase="$2" mode="$3"
+        local label="the verify had an allocation map to work from"
+        local used="the zero-skip pruned the comparison plan"
+        local skipped hashed total
+
+        # qemu-img has no plan to prune: it shells out to a separate
+        # implementation that reads every byte on both sides, so neither gauge
+        # describes anything there. Nothing to grade, and nothing missing.
+        if [ "$mode" = qemu-img ]; then
+                return 0
+        fi
+
+        if grep -qE 'does not report base:allocation|could not ask this side whether it reports an allocation map' "$RUN_LOG" 2>/dev/null; then
+                fo_check "$scenario" "$label" 1 "vmsync said a side would not report base:allocation, so the whole disk was hashed -- see $RUN_LOG"
+                return 0
+        fi
+        fo_check "$scenario" "$label" 0
+
+        skipped="$(prom_sum "$RUN_PROM" vmsync_verify_skipped_bytes)"
+        hashed="$(prom_sum "$RUN_PROM" vmsync_verify_hashed_bytes)"
+        total=$((skipped + hashed))
+        if [ "$total" -eq 0 ]; then
+                # The series are emitted for any run that verified, so both being
+                # absent or zero here means no plan was ever built -- the compare
+                # failed ahead of it, which the outcome check above already graded.
+                results_row "$CSV" "$scenario" "${used// /_}" SKIP "" "" "" "" "" "SKIP no comparison plan was recorded for this run"
+                return 0
+        fi
+
+        log "   plan: hashed ${hashed} of ${total} bytes, skipped ${skipped} as zeros on both sides"
+        if [ "$skipped" -gt 0 ]; then
+                fo_check "$scenario" "$used" 0
+        else
+                # MEASURED, not graded: whether a replica holds anything that reads
+                # as zeros on both sides is a property of the guest's free space and
+                # whether it discards, not of vmsync. Check one above already proved
+                # the map was consulted.
+                log "   nothing on this pair reads as zeros on both sides, so there was nothing to prune -- not a finding"
+                results_row "$CSV" "$scenario" "${used// /_}" SKIP "" "" "" "" "" "SKIP nothing reads as zeros on both sides (hashed ${hashed} bytes)"
+        fi
+}
+
 # verify_mode_subtest PATH VSIZE MODE SCENARIO PHASE [EXTRA_ARGS...] --
 # asserts -verify=MODE detects a corruption the mtime guard cannot see.
 #
@@ -1653,6 +1728,22 @@ verify_mode_subtest() {
                 *)
                         warn "FAIL: -verify=$mode never reached its compare -- the run ended before verification ran, so nothing was verified (exit=$RUN_RC). vmsync emits no vmsync_verification_state for such a run. See $RUN_LOG"
                         results_row "$CSV" "$scenario" "${phase}-result" 1 "" "" "" "" "" "FAIL verification never ran"
+                        ;;
+                esac
+        fi
+
+        # One subtest per comparator, not all four. fast and full converge on
+        # the same digest code whenever the helper is deployed (which bench_sync
+        # makes sure of), and the two -bytes subtests likewise share compareTCP,
+        # so grading all four would add rows without adding coverage. These two
+        # cover both of the places the meta context has to be negotiated.
+        #
+        # Before heal_target, which runs a sync of its own and would move
+        # RUN_LOG and RUN_PROM off this subtest's run.
+        if [ "$DRY_RUN" != yes ]; then
+                case "$scenario" in
+                verify-fast | verify-fast-bytes)
+                        verify_skip_checks "$scenario" "$phase" "$mode"
                         ;;
                 esac
         fi
@@ -10442,7 +10533,7 @@ generate_report() {
                 # toward the stage verdict -- which is how the cross-check
                 # and clean-oracle rows went unlisted when they were added.
                 local verify_rows
-                verify_rows="$(awk -F, "$REPORT_AWK"'NR>1 && $1 ~ /^verify-(guard|baseline|fast|full|qemu-img|fast-bytes|full-bytes|cross|oracle|precondition)/ { printf "| %s | %s | %s | %s | %s | %s | %s |\n", verdict($9), $1, $2, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV")"
+                verify_rows="$(awk -F, "$REPORT_AWK"'NR>1 && $1 ~ /^verify-(guard|baseline|fast|full|qemu-img|fast-bytes|full-bytes|cross|oracle|precondition)/ { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s | %s |\n", verdict($9), $1, ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV")"
                 if [ -n "$verify_rows" ]; then
                         echo "| result | mode | phase | exit | wall (s) | detail | log |"
                         echo "|---|---|---|---|---|---|---|"
