@@ -34,6 +34,7 @@ import (
 	"vmsync/pkg/metrics"
 	"vmsync/pkg/nbdsync"
 	"vmsync/pkg/portalloc"
+	"vmsync/pkg/trace"
 )
 
 // TestOptionalValueFlag verifies the bare/"=value"/"=false" tri-state
@@ -1230,4 +1231,39 @@ func TestThawTrackerReportsWhenItResolvesATimeout(t *testing.T) {
 			t.Errorf("%d writers were told they resolved the timeout, want exactly 1", n)
 		}
 	})
+}
+
+// TestTargetDigestQuietGraceOutlastsOneReportingInterval pins the one property
+// that makes the heartbeat worth logging at all.
+//
+// The target digest has two voices: the helper's own per-minute progress,
+// relayed as it arrives, and a heartbeat for when the helper says nothing. If
+// the heartbeat's patience equals the helper's reporting period they fire
+// together -- the helper's first line is emitted after one interval of
+// hashing, and a heartbeat on the same period is due at that same instant. A
+// real run logged both in the same second, once per disk: "still waiting for
+// the target's digest ... silent_for=1m0s" immediately followed by that
+// helper's "44.74%".
+//
+// That pairing is worse than either line alone. A reader who sees the wait
+// declared silent and then immediately hears from it concludes the heartbeat
+// is noise, and stops reading the one line that would have told them a verify
+// was genuinely wedged.
+//
+// Equality is therefore the regression, not inequality, which is why this
+// asserts a strict ordering rather than a value: whoever retunes the reporting
+// cadence may move both, but must not make them equal.
+func TestTargetDigestQuietGraceOutlastsOneReportingInterval(t *testing.T) {
+	if targetDigestQuietGrace <= trace.ProgressInterval {
+		t.Errorf("targetDigestQuietGrace is %s and the reporting interval is %s: the heartbeat will fire in the same instant as the helper's first progress line, and a reader who sees them together learns to ignore both",
+			targetDigestQuietGrace, trace.ProgressInterval)
+	}
+	// And not so patient that a wedged pass goes unremarked for long. Two
+	// intervals is the ceiling because the heartbeat is checked on an
+	// interval tick: a grace above 2x would skip a whole tick and report
+	// silence three intervals late.
+	if targetDigestQuietGrace > 2*trace.ProgressInterval {
+		t.Errorf("targetDigestQuietGrace is %s, more than twice the %s reporting interval: a wedged target digest would go unremarked for three intervals",
+			targetDigestQuietGrace, trace.ProgressInterval)
+	}
 }

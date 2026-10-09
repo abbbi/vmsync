@@ -640,6 +640,28 @@ func printFlagLine(out io.Writer, f *flag.Flag) {
 // there for why catching it would defeat the cleanup it exists to protect.
 var stopSignals = []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP}
 
+// targetDigestQuietGrace is how long the target may say nothing before the
+// side waiting on it remarks that it has.
+//
+// Longer than trace.ProgressInterval ON PURPOSE, and that is the entire reason
+// this constant exists rather than the interval being used directly. The
+// helper reports once per interval, so its FIRST line lands at about the same
+// instant as a heartbeat timed on the same period -- and it did: a real run
+// logged "still waiting for the target's digest ... silent_for=1m0s" and the
+// helper's own "44.74%" in the same second, once per disk. Two lines
+// contradicting each other about the same moment are worse than either alone,
+// because they teach a reader that the heartbeat means nothing.
+//
+// Half an interval of slack loses that race without blunting the signal. A
+// helper that is reporting never goes quiet this long, so the heartbeat stays
+// silent for the whole of a healthy pass; one that is NOT reporting gets
+// remarked on at the second tick instead of the first, which is a minute later
+// in a wait measured in tens of them.
+//
+// Derived from the interval rather than written as 90s so the two cannot drift:
+// whoever changes the reporting cadence changes this with it.
+const targetDigestQuietGrace = trace.ProgressInterval * 3 / 2
+
 func main() {
 	// Ignored, not caught, and first of all -- before anything in this process
 	// can write a log line.
@@ -5657,8 +5679,10 @@ func run(cfg syncConfig) (runErr error) {
 		// arrives (pkg/remotessh's lineWriter) rather than with the response.
 		// Second, a heartbeat for when it says nothing at all: a helper that
 		// is wedged, or one too old to report progress, otherwise leaves the
-		// same silence as a dead one. It only speaks when the helper has
-		// not, so the two together cost one line a minute, never two.
+		// same silence as a dead one. It speaks only when the helper has gone
+		// quiet for longer than the helper's own reporting period, so the two
+		// together cost one line a minute rather than two -- see
+		// targetDigestQuietGrace for why that slack is not optional.
 		var heardMu sync.Mutex
 		lastHeard := start
 		onLine := func(line string) {
@@ -5681,7 +5705,7 @@ func run(cfg syncConfig) (runErr error) {
 					heardMu.Lock()
 					quiet := now.Sub(lastHeard)
 					heardMu.Unlock()
-					if quiet < trace.ProgressInterval {
+					if quiet < targetDigestQuietGrace {
 						continue
 					}
 					trace.Info("checksum: still waiting for the target's digest", "disk", dev,
