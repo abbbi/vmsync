@@ -2607,6 +2607,17 @@ func run(cfg syncConfig) (runErr error) {
 	var started bool = false
 	var metricsMu sync.Mutex
 	diskMetrics := make([]metrics.DiskMetric, 0)
+	// What the zero-skip did to each disk's verify plan, keyed by device.
+	//
+	// A map merged in at write time rather than a field set on the DiskMetric
+	// directly, because the two are recorded in different PHASES: a disk's
+	// metric is appended by its copy worker, and the verify that produces
+	// these numbers runs afterwards. Reaching back to mutate an entry already
+	// in the slice would work and would also mean two writers for one struct;
+	// a map the writer folds in keeps each phase owning what it measures.
+	// Guarded by metricsMu like everything else here, because the signal
+	// handler can write the textfile while a disk is still verifying.
+	verifyPlanStats := make(map[string]nbdsync.PlanStats)
 	var nbdHost, targetNBDHost string
 	// Declared up here with the rest of the metricsMu-guarded state, not
 	// down where the source bridge is actually started: writeMetricsTextfile
@@ -2705,6 +2716,16 @@ func run(cfg syncConfig) (runErr error) {
 		}
 		metricsMu.Lock()
 		disksSnapshot := append([]metrics.DiskMetric(nil), diskMetrics...)
+		// Folded in here, under the same lock, so the two phases that measure
+		// a disk each write only their own state. A disk that has not reached
+		// its verify yet keeps the zero values, which is why the renderer
+		// gates these series on the run having verified at all.
+		for i := range disksSnapshot {
+			if st, ok := verifyPlanStats[disksSnapshot[i].Disk]; ok {
+				disksSnapshot[i].VerifySkippedBytes = st.SkippedBytes
+				disksSnapshot[i].VerifyHashedBytes = st.HashingBytes
+			}
+		}
 		sourceHost, targetHost := nbdHost, targetNBDHost
 		snapshotCount := externalSnapshotCount
 		attempted := verificationAttempted
@@ -6856,6 +6877,12 @@ func run(cfg syncConfig) (runErr error) {
 		trace.Info("verify: comparing source and target images", "disk", d.TargetDev,
 			"source", sourceNBDURL, "target", targetPath, "mode", cfg.Verify)
 		var compareErr error
+		// Hoisted above the switch so the verdict below can report what the
+		// pass cost. Only the digest comparator fills it in: the byte
+		// comparators do their own planning internally and have no reason to
+		// hand it back, so TotalBytes stays zero there and the verdict line
+		// simply does not claim figures it does not have.
+		var planStats nbdsync.PlanStats
 		switch {
 		case checksumEnabled && (verifyFull || verifyFast):
 			// The digest path. vmsync hashes the source; the helper hashes
@@ -6884,7 +6911,14 @@ func run(cfg syncConfig) (runErr error) {
 			// TIME: a digest verify then costs max(source, target) instead
 			// of their sum, which is what the byte comparator it replaces
 			// always did by reading both sides in one pipeline.
-			plan, perr := nbdsync.CompareChunkPlanTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, verifyExportName)
+			plan, st, perr := nbdsync.CompareChunkPlanTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, verifyExportName)
+			planStats = st
+			// Recorded even when the plan failed, so a verify that could not
+			// be planned reports zeros rather than silently inheriting the
+			// previous run's numbers through a stale textfile.
+			metricsMu.Lock()
+			verifyPlanStats[d.TargetDev] = planStats
+			metricsMu.Unlock()
 			switch {
 			case perr != nil:
 				compareErr = fmt.Errorf("planning the comparison failed: %w", perr)
@@ -7017,7 +7051,20 @@ func run(cfg syncConfig) (runErr error) {
 		if compareErr != nil {
 			return fmt.Errorf("verify: disk %s does not match: %w", d.TargetDev, compareErr)
 		}
-		trace.Info("verify: images match", "disk", d.TargetDev)
+		// The verdict carries what the pass cost, because this is the line
+		// somebody greps when comparing two runs of the same VM: "bytes" on
+		// the hashing line above says how much was read, but only alongside
+		// skipped_bytes does it distinguish a sparse disk from an allocation
+		// map that was never consulted. Those two have the same symptom -- a
+		// verify that takes an hour -- and opposite fixes.
+		matched := []any{"disk", d.TargetDev}
+		if planStats.TotalBytes > 0 {
+			matched = append(matched,
+				"hashed_bytes", planStats.HashingBytes,
+				"skipped_bytes", planStats.SkippedBytes,
+				"skipped_pct", nbdsync.SkipPct(planStats.SkippedBytes, planStats.TotalBytes))
+		}
+		trace.Info("verify: images match", matched...)
 		return nil
 	}
 

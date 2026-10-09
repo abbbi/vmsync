@@ -1143,18 +1143,55 @@ func CompareTCPCollect(ctx context.Context, aHost string, aPort int, aExport str
 // factoring it out. The two diverge immediately afterwards, and the shared
 // part is a dozen straight-line calls, against a refactor of a cgo AIO
 // function whose buffer-lifetime discipline is the subtlest code here.
-func CompareChunkPlanTCP(ctx context.Context, aHost string, aPort int, aExport string, bHost string, bPort int, bExport string) (plan []blockdigest.Block, err error) {
+// PlanStats is what the zero-skip did to one disk's comparison plan.
+//
+// Returned rather than only logged because the caller has two uses for it the
+// log line cannot serve: a verdict line that says what the pass actually cost,
+// and a Prometheus series. The share that reads as zeros on both sides is a
+// property of the REPLICA, not of this run -- it is the free space the guest
+// has discarded back to the image -- so a run that stops reporting it hides a
+// guest that has stopped trimming, which shows up as a verify getting slowly
+// more expensive and nothing saying why.
+type PlanStats struct {
+	// TotalBytes is the export's whole size, which is the denominator.
+	TotalBytes uint64
+	// SkippedBytes reads as zeros on BOTH sides, so it cannot differ and is
+	// not hashed. Zero when neither side reported an allocation map, which is
+	// correct-but-expensive and the thing warnIfNoAllocationMap exists to say
+	// out loud.
+	SkippedBytes uint64
+	// HashingBytes is what the plan actually covers: TotalBytes - SkippedBytes.
+	HashingBytes uint64
+}
+
+// SkipPct is SkippedBytes as a percentage of TotalBytes, to two decimals.
+//
+// A string, formatted here, for the same reason mib_per_sec is: these go into
+// log lines, and a reader comparing two runs wants "9.43" rather than
+// 101261639680 against 1073741824000. Shared by both comparators so the two
+// cannot drift into reporting the same ratio differently.
+//
+// Prometheus gets the two raw byte figures instead and divides them itself --
+// a pre-divided percentage cannot be re-aggregated across disks or hosts.
+func SkipPct(skipped, total uint64) string {
+	if total == 0 {
+		return "0.00"
+	}
+	return fmt.Sprintf("%.2f", (float64(skipped)/float64(total))*100.0)
+}
+
+func CompareChunkPlanTCP(ctx context.Context, aHost string, aPort int, aExport string, bHost string, bPort int, bExport string) (plan []blockdigest.Block, stats PlanStats, err error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, stats, err
 	}
 	a, err := nbd.Create()
 	if err != nil {
-		return nil, fmt.Errorf("create source nbd handle: %w", err)
+		return nil, stats, fmt.Errorf("create source nbd handle: %w", err)
 	}
 	defer a.Close()
 	b, err := nbd.Create()
 	if err != nil {
-		return nil, fmt.Errorf("create target nbd handle: %w", err)
+		return nil, stats, fmt.Errorf("create target nbd handle: %w", err)
 	}
 	defer b.Close()
 
@@ -1181,31 +1218,31 @@ func CompareChunkPlanTCP(ctx context.Context, aHost string, aPort int, aExport s
 
 	if aExport != "" {
 		if err := a.SetExportName(aExport); err != nil {
-			return nil, fmt.Errorf("set source export name %s: %w", aExport, err)
+			return nil, stats, fmt.Errorf("set source export name %s: %w", aExport, err)
 		}
 	}
 	if err := a.ConnectTcp(aHost, strconv.Itoa(aPort)); err != nil {
-		return nil, fmt.Errorf("connect source nbd tcp %s:%d: %w", aHost, aPort, err)
+		return nil, stats, fmt.Errorf("connect source nbd tcp %s:%d: %w", aHost, aPort, err)
 	}
 	if bExport != "" {
 		if err := b.SetExportName(bExport); err != nil {
-			return nil, fmt.Errorf("set target export name %s: %w", bExport, err)
+			return nil, stats, fmt.Errorf("set target export name %s: %w", bExport, err)
 		}
 	}
 	if err := b.ConnectTcp(bHost, strconv.Itoa(bPort)); err != nil {
-		return nil, fmt.Errorf("connect target nbd tcp %s:%d (export %q): %w", bHost, bPort, bExport, err)
+		return nil, stats, fmt.Errorf("connect target nbd tcp %s:%d (export %q): %w", bHost, bPort, bExport, err)
 	}
 
 	sizeA, err := a.GetSize()
 	if err != nil {
-		return nil, fmt.Errorf("nbd get source size: %w", err)
+		return nil, stats, fmt.Errorf("nbd get source size: %w", err)
 	}
 	sizeB, err := b.GetSize()
 	if err != nil {
-		return nil, fmt.Errorf("nbd get target size: %w", err)
+		return nil, stats, fmt.Errorf("nbd get target size: %w", err)
 	}
 	if sizeA != sizeB {
-		return nil, fmt.Errorf("image size mismatch: source=%d target=%d", sizeA, sizeB)
+		return nil, stats, fmt.Errorf("image size mismatch: source=%d target=%d", sizeA, sizeB)
 	}
 	size := sizeA
 
@@ -1221,16 +1258,17 @@ func CompareChunkPlanTCP(ctx context.Context, aHost string, aPort int, aExport s
 	aZero := zeroRanges(allocationExtents(ctx, a, "source"))
 	bZero := zeroRanges(allocationExtents(ctx, b, "target"))
 	chunks, skippedBytes := planCompareChunks(size, bufferSize, minSkipBytes, aZero, bZero)
+	stats = PlanStats{TotalBytes: size, SkippedBytes: skippedBytes, HashingBytes: size - skippedBytes}
 	if skippedBytes > 0 {
 		trace.Info("nbd digest: skipping ranges that read as zeros on both sides",
 			"export", aExport, "skipped_bytes", skippedBytes, "total_bytes", size,
-			"hashing_bytes", size-skippedBytes)
+			"hashing_bytes", size-skippedBytes, "skipped_pct", SkipPct(skippedBytes, size))
 	}
 	plan = make([]blockdigest.Block, 0, len(chunks))
 	for _, c := range chunks {
 		plan = append(plan, blockdigest.Block{Offset: c.offset, Length: c.length})
 	}
-	return plan, nil
+	return plan, stats, nil
 }
 
 // HashRangesTCP reads exactly the ranges in plan off ONE export and returns
@@ -1573,7 +1611,7 @@ func compareTCP(ctx context.Context, aHost string, aPort int, aExport string, bH
 	if skippedBytes > 0 {
 		trace.Info("nbd compare: skipping ranges that read as zeros on both sides",
 			"export", aExport, "skipped_bytes", skippedBytes, "total_bytes", size,
-			"comparing_bytes", size-skippedBytes)
+			"comparing_bytes", size-skippedBytes, "skipped_pct", SkipPct(skippedBytes, size))
 	}
 
 	pipelineDepth := ioDepth

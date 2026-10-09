@@ -368,7 +368,7 @@ func TestCompareChunkPlanAndHashRangesAgreeEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	plan, err := CompareChunkPlanTCP(ctx, "127.0.0.1", aPort, "", "127.0.0.1", bPort, "")
+	plan, _, err := CompareChunkPlanTCP(ctx, "127.0.0.1", aPort, "", "127.0.0.1", bPort, "")
 	if err != nil {
 		t.Fatalf("CompareChunkPlanTCP: %v", err)
 	}
@@ -1475,4 +1475,141 @@ func TestPlanCompareChunksOnARealSparseDisk(t *testing.T) {
 	}
 	t.Logf("10 GiB disk, ~3 MiB of data: comparing %d bytes in %d chunks (skipping %d)",
 		compared, len(chunks), skipped)
+}
+
+// writeSparseRawFile writes content at the head of a file of total size
+// `size`, leaving the rest a HOLE rather than written zeros.
+//
+// The hole is the point. A file padded with zero BYTES is fully allocated, so
+// qemu-nbd reports it as data and the plan covers it -- which is exactly the
+// state a broken zero-skip produces, and would make the test below pass for
+// the wrong reason. Truncate leaves the tail unallocated, so qemu-nbd reports
+// NBD_STATE_ZERO|NBD_STATE_HOLE for it and there is something real to skip.
+func writeSparseRawFile(t *testing.T, dir, name string, head []byte, size int64) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("create sparse test file %s: %v", path, err)
+	}
+	defer f.Close()
+	if _, err := f.Write(head); err != nil {
+		t.Fatalf("write head of %s: %v", path, err)
+	}
+	if err := f.Truncate(size); err != nil {
+		t.Fatalf("truncate %s to %d: %v", path, size, err)
+	}
+	return path
+}
+
+// TestCompareChunkPlanSkipsRangesThatReadAsZerosOnBothSides is the end-to-end
+// guard for the allocation-aware plan, against two real qemu-nbd servers.
+//
+// WHAT IT CATCHES, and why the cheaper tests do not. planCompareChunks is
+// already unit-tested on synthetic extent lists, and a source-reading test
+// asserts that both handles negotiate base:allocation before connecting. What
+// neither can see is the step between them: whether the negotiated context
+// actually yields an allocation map from a real server, and whether the holes
+// it reports survive into the plan. That is precisely where this broke -- the
+// request was never made, every query came back empty, the plan silently
+// covered the whole disk, and the only outward sign was a verify that took
+// 32x longer than it needed to on a sparse terabyte.
+//
+// A FAILURE HERE IS NOT A STYLE COMPLAINT: it means every -verify is reading
+// and hashing deleted data on both sides of the link.
+func TestCompareChunkPlanSkipsRangesThatReadAsZerosOnBothSides(t *testing.T) {
+	requireQemuNBD(t)
+
+	// A small head of real data, then a hole that dwarfs it. The hole is far
+	// larger than minSkipBytes so planCompareChunks cannot dismiss it as too
+	// small to be worth a boundary.
+	const (
+		headSize  = 1 << 20  // 1 MiB of data
+		totalSize = 64 << 20 // 63 MiB of hole after it
+	)
+	dir := t.TempDir()
+	head := patternBytes(headSize)
+	aPort := qemuNBDExport(t, writeSparseRawFile(t, dir, "sparse-a.raw", head, totalSize))
+	bPort := qemuNBDExport(t, writeSparseRawFile(t, dir, "sparse-b.raw", head, totalSize))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	plan, stats, err := CompareChunkPlanTCP(ctx, "127.0.0.1", aPort, "", "127.0.0.1", bPort, "")
+	if err != nil {
+		t.Fatalf("CompareChunkPlanTCP: %v", err)
+	}
+
+	if stats.TotalBytes != totalSize {
+		t.Errorf("stats.TotalBytes = %d, want the export size %d", stats.TotalBytes, totalSize)
+	}
+	if stats.SkippedBytes == 0 {
+		t.Fatalf("nothing was skipped on a %d-byte export holding %d bytes of data: either base:allocation was not negotiated before the handshake, or neither server reported the hole. Every verify of a sparse disk is now hashing all of it",
+			totalSize, headSize)
+	}
+	if stats.SkippedBytes+stats.HashingBytes != stats.TotalBytes {
+		t.Errorf("stats do not add up: skipped %d + hashing %d != total %d",
+			stats.SkippedBytes, stats.HashingBytes, stats.TotalBytes)
+	}
+
+	// The hole is most of the file, so most of it must be gone from the plan.
+	// Deliberately not an exact figure: qemu is entitled to round a hole to
+	// its own granularity, and planCompareChunks keeps whole buffer-sized
+	// chunks, so the last chunk of real data may legitimately carry some
+	// zeros along with it.
+	if stats.SkippedBytes < totalSize/2 {
+		t.Errorf("skipped only %d of %d bytes; the file is %d bytes of data in a %d-byte hole, so well over half should have been skipped",
+			stats.SkippedBytes, totalSize, headSize, totalSize-headSize)
+	}
+
+	// And the plan must agree with the stats rather than merely coexisting
+	// with them: every byte the plan covers is a byte that will be read twice,
+	// once on each side.
+	var planned uint64
+	for _, b := range plan {
+		planned += b.Length
+	}
+	if planned != stats.HashingBytes {
+		t.Errorf("plan covers %d bytes but stats claim %d would be hashed", planned, stats.HashingBytes)
+	}
+
+	// The digests still have to agree, because a plan that skips the wrong
+	// ranges is worse than one that skips nothing: it would pass a verify over
+	// data it never looked at.
+	aDigests, err := HashRangesTCP(ctx, "127.0.0.1", aPort, "", plan, 4)
+	if err != nil {
+		t.Fatalf("HashRangesTCP(a): %v", err)
+	}
+	bDigests, err := HashRangesTCP(ctx, "127.0.0.1", bPort, "", plan, 4)
+	if err != nil {
+		t.Fatalf("HashRangesTCP(b): %v", err)
+	}
+	mismatches, err := blockdigest.Compare(aDigests, bDigests)
+	if err != nil {
+		t.Fatalf("blockdigest.Compare: %v", err)
+	}
+	if len(mismatches) != 0 {
+		t.Errorf("two identical sparse images compared as different in %d block(s)", len(mismatches))
+	}
+}
+
+// TestSkipPct covers the formatting and the one input that would otherwise
+// divide by zero -- an export whose size vmsync could not determine.
+func TestSkipPct(t *testing.T) {
+	cases := []struct {
+		skipped, total uint64
+		want           string
+	}{
+		{101261639680, 1073741824000, "9.43"}, // the figure from the incident
+		{0, 1000, "0.00"},
+		{1000, 1000, "100.00"},
+		{1, 3, "33.33"},
+		{0, 0, "0.00"}, // no size: must not panic or print NaN
+		{5, 0, "0.00"},
+	}
+	for _, c := range cases {
+		if got := SkipPct(c.skipped, c.total); got != c.want {
+			t.Errorf("SkipPct(%d, %d) = %q, want %q", c.skipped, c.total, got, c.want)
+		}
+	}
 }

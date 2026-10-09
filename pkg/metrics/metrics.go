@@ -137,6 +137,25 @@ type DiskMetric struct {
 	// safe to sum across disks, which is the whole reason for the split.
 	CompressedTransferredBytes uint64
 	DurationSeconds            float64
+	// VerifySkippedBytes and VerifyHashedBytes are how -verify's comparison
+	// plan divided this disk: the part that reads as zeros on BOTH sides and
+	// therefore cannot differ, and the part actually hashed. Both zero on a
+	// run that did not verify, which is why they are rendered only when
+	// RunMetric.VerificationRan -- see VerificationState for the same
+	// reasoning about a bare 0 being indistinguishable from a real answer.
+	//
+	// Two raw figures rather than the ratio, deliberately. A percentage
+	// cannot be re-aggregated: summing it across a VM's disks or across an
+	// estate is meaningless, while summing bytes is not. The ratio is one
+	// division away in PromQL and the log line carries it for humans.
+	//
+	// WHAT THEY ARE FOR, beyond curiosity. The skipped share is a property of
+	// the REPLICA, not of the run: it is the free space the guest has
+	// discarded back to the image. A series that drifts toward zero is a
+	// guest that has stopped trimming, and the only symptom otherwise is a
+	// verify that gets gradually more expensive with nothing saying why.
+	VerifySkippedBytes uint64
+	VerifyHashedBytes  uint64
 }
 
 // RunMetric holds the overall result of one vmsync invocation -- unlike
@@ -374,6 +393,25 @@ func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 	for _, m := range disks {
 		fmt.Fprintf(&b, "vmsync_sync_duration_seconds{source_host=%q,target_host=%q,vm=%q,disk=%q} %.3f\n",
 			m.SourceHost, m.TargetHost, m.VM, m.Disk, m.DurationSeconds)
+	}
+
+	// Gated on VerificationRan for the same reason vmsync_verification_state
+	// is: a run that never verified would otherwise emit skipped=0 hashed=0,
+	// which reads exactly like a verify that found nothing skippable.
+	if run.VerificationRan {
+		fmt.Fprintln(&b, "# HELP vmsync_verify_skipped_bytes Bytes of this disk that -verify did not hash because they read as zeros on BOTH sides and therefore cannot differ. This is the free space the guest has discarded back to the image: divide by (skipped+hashed) for the share, and alert on it falling toward zero, which means the guest has stopped trimming and every verify is paying to hash deleted data.")
+		fmt.Fprintln(&b, "# TYPE vmsync_verify_skipped_bytes gauge")
+		for _, m := range disks {
+			fmt.Fprintf(&b, "vmsync_verify_skipped_bytes{source_host=%q,target_host=%q,vm=%q,disk=%q} %d\n",
+				m.SourceHost, m.TargetHost, m.VM, m.Disk, m.VerifySkippedBytes)
+		}
+
+		fmt.Fprintln(&b, "# HELP vmsync_verify_hashed_bytes Bytes of this disk that -verify actually hashed on each side. Their sum with vmsync_verify_skipped_bytes is the disk's virtual size; a run where skipped is 0 and hashed is the whole disk either has nothing skippable or lost its allocation map (vmsync warns when it is the latter).")
+		fmt.Fprintln(&b, "# TYPE vmsync_verify_hashed_bytes gauge")
+		for _, m := range disks {
+			fmt.Fprintf(&b, "vmsync_verify_hashed_bytes{source_host=%q,target_host=%q,vm=%q,disk=%q} %d\n",
+				m.SourceHost, m.TargetHost, m.VM, m.Disk, m.VerifyHashedBytes)
+		}
 	}
 
 	fmt.Fprintln(&b, "# HELP vmsync_sync_state Result of the last vmsync run as a whole (0=success, 1=failure, 2=succeeded but guest filesystem freeze failed -- checkpoint is only crash-consistent, not application-consistent).")

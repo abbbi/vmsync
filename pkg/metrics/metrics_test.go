@@ -326,3 +326,87 @@ func TestChecksumNotReachedEmitsNoSeries(t *testing.T) {
 		}
 	}
 }
+
+// writeAndReadDisks is writeAndRead for the per-disk series.
+func writeAndReadDisks(t *testing.T, disks []DiskMetric, run RunMetric) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "vmsync.prom")
+	if err := WriteTextfile(p, disks, run); err != nil {
+		t.Fatalf("WriteTextfile: %v", err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	return string(b)
+}
+
+// TestVerifyPlanBytesRenderPerDisk pins the pair that makes a verify's cost
+// readable after the fact: how much of each disk could not differ (and so was
+// not hashed), and how much was.
+//
+// Raw bytes rather than a ratio, because that is the only form that
+// re-aggregates: sum them across a VM's disks or across an estate and the
+// division still means something, which a pre-divided percentage would not.
+func TestVerifyPlanBytesRenderPerDisk(t *testing.T) {
+	disks := []DiskMetric{
+		{VM: "mail01", Disk: "vda", VerifySkippedBytes: 1835008, VerifyHashedBytes: 53685256192},
+		{VM: "mail01", Disk: "vdb", VerifySkippedBytes: 101261639680, VerifyHashedBytes: 972480184320},
+	}
+	text := writeAndReadDisks(t, disks, RunMetric{
+		VM: "mail01", State: StateSuccess,
+		VerificationRan: true, VerificationState: CheckStatePassed,
+	})
+
+	for _, want := range []string{
+		`vmsync_verify_skipped_bytes{source_host="",target_host="",vm="mail01",disk="vda"} 1835008`,
+		`vmsync_verify_hashed_bytes{source_host="",target_host="",vm="mail01",disk="vda"} 53685256192`,
+		`vmsync_verify_skipped_bytes{source_host="",target_host="",vm="mail01",disk="vdb"} 101261639680`,
+		`vmsync_verify_hashed_bytes{source_host="",target_host="",vm="mail01",disk="vdb"} 972480184320`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing series %q in:\n%s", want, text)
+		}
+	}
+}
+
+// TestVerifyPlanBytesAreAbsentWithoutAVerify is the one that matters, and it
+// is the same trap vmsync_verification_state exists to avoid: a run that never
+// verified would otherwise emit skipped=0 hashed=0, which is indistinguishable
+// from a verify that found nothing skippable. An alert on "skipped is falling
+// toward zero" -- the signal that a guest has stopped trimming -- would then
+// fire on every ordinary sync.
+func TestVerifyPlanBytesAreAbsentWithoutAVerify(t *testing.T) {
+	disks := []DiskMetric{{VM: "web01", Disk: "vda", TransferredBytes: 4096}}
+	text := writeAndReadDisks(t, disks, RunMetric{VM: "web01", State: StateSuccess})
+
+	if _, ok := sampleFor(text, "vmsync_verify_skipped_bytes"); ok {
+		t.Errorf("a run that did not verify emitted vmsync_verify_skipped_bytes:\n%s", text)
+	}
+	if _, ok := sampleFor(text, "vmsync_verify_hashed_bytes"); ok {
+		t.Errorf("a run that did not verify emitted vmsync_verify_hashed_bytes:\n%s", text)
+	}
+	// And the ordinary per-disk series must still be there, so this is a
+	// gate on two series rather than on the whole disk block.
+	if _, ok := sampleFor(text, "vmsync_transferred_bytes"); !ok {
+		t.Errorf("gating the verify series suppressed the ordinary per-disk ones:\n%s", text)
+	}
+}
+
+// TestVerifyPlanBytesRenderZeroWhenNothingWasSkipped separates the two
+// readings of a zero: a verify that ran and found nothing skippable is a real
+// answer and must be reported, because its absence is what would hide a
+// fully-allocated replica whose verify costs the whole disk every time.
+func TestVerifyPlanBytesRenderZeroWhenNothingWasSkipped(t *testing.T) {
+	disks := []DiskMetric{{VM: "db01", Disk: "vda", VerifySkippedBytes: 0, VerifyHashedBytes: 53687091200}}
+	text := writeAndReadDisks(t, disks, RunMetric{
+		VM: "db01", State: StateSuccess,
+		VerificationRan: true, VerificationState: CheckStatePassed,
+	})
+	if v, ok := sampleFor(text, "vmsync_verify_skipped_bytes"); !ok || v != "0" {
+		t.Errorf("a verify that skipped nothing must still say so, got %q ok=%v:\n%s", v, ok, text)
+	}
+	if v, ok := sampleFor(text, "vmsync_verify_hashed_bytes"); !ok || v != "53687091200" {
+		t.Errorf("hashed bytes = %q ok=%v, want the whole disk:\n%s", v, ok, text)
+	}
+}
