@@ -54,6 +54,65 @@ func DueForProgress(lastLog, now time.Time, done bool) bool {
 	return done || now.Sub(lastLog) >= ProgressInterval
 }
 
+// QuietWatch is the give-up half of a reported phase. DueForProgress decides
+// when the WORKING side speaks; this decides how long the WAITING side keeps
+// listening to nothing. Both halves live here so that the cadence and the
+// patience cannot be changed independently: a bound is only meaningful as a
+// multiple of the interval the other side reports on, and a reader who
+// changes one must see the other.
+//
+// Returns true ONLY when it gives up, so what giving up means stays with the
+// caller. remark fires on every tick past grace but short of bound, which is
+// what makes a long wait audible before it becomes a failure.
+//
+// quiet >= bound, not >. A silence sitting exactly on the bound has to trip:
+// with a strict comparison, a tick that lands precisely there remarks instead
+// and the wait continues to the next one, which is the off-by-one that turns
+// a bound into a bound-plus-an-interval.
+//
+// Pure with respect to the clock and to the peer -- both arrive as arguments
+// -- so the boundary is provable with no peer to wedge and no sleeping, the
+// way pkg/remotessh proves its keepalive strike logic.
+func QuietWatch(stop <-chan struct{}, tick <-chan time.Time, quietFor func(now time.Time) time.Duration, grace, bound time.Duration, remark func(quiet time.Duration)) bool {
+	for {
+		select {
+		case <-stop:
+			return false
+		case now, open := <-tick:
+			if !open {
+				return false
+			}
+			// Stop again, for the reason pkg/remotessh's keepaliveLoop gives
+			// for its own second check: when a stop and a tick are both
+			// ready, select picks between them uniformly at random, so a
+			// wait that has just FINISHED loses that race about half the
+			// time. Losing it means declaring a stall on an exchange that
+			// already answered -- a healthy run failed at the last instant,
+			// which is worse than noticing a real stall one tick later.
+			if stopped(stop) {
+				return false
+			}
+			quiet := quietFor(now)
+			if quiet >= bound {
+				return true
+			}
+			if quiet >= grace && remark != nil {
+				remark(quiet)
+			}
+		}
+	}
+}
+
+// stopped reports whether stop has been closed, without waiting for it.
+func stopped(stop <-chan struct{}) bool {
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
+	}
+}
+
 var (
 	debugEnabled atomic.Bool
 	warningCount atomic.Uint64

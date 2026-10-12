@@ -73,8 +73,9 @@ type Server struct {
 	data   []byte
 	export string
 
-	mu    sync.Mutex
-	reads int
+	mu         sync.Mutex
+	reads      int
+	beforeRead func(off, length uint64)
 }
 
 // NewServer starts a read-only NBD server exporting data under the name
@@ -214,6 +215,9 @@ func (s *Server) serve(conn net.Conn) error {
 			}
 			continue
 		}
+		if hook := s.readHook(); hook != nil {
+			hook(off, length)
+		}
 		s.mu.Lock()
 		s.reads++
 		s.mu.Unlock()
@@ -242,4 +246,29 @@ func writeSimpleReply(conn net.Conn, errCode uint32, cookie uint64, payload []by
 	rep = append(rep, payload...)
 	_, err := conn.Write(rep)
 	return err
+}
+
+// SetBeforeRead installs a hook called just before each NBD_CMD_READ is
+// served, with that request's offset and length.
+//
+// It exists so a test can hold a read open -- the one state a digest pass
+// cannot otherwise be caught in, and the only one in which "is the helper
+// alive?" and "is the helper making progress?" have different answers. A
+// hook that blocks makes the client block in exactly the place a wedged
+// target would.
+//
+// Guarded by the same mutex as the read counter rather than set directly on
+// the struct, because the server reads it from its own goroutine and a test
+// that installed it with a plain assignment would be a data race the race
+// detector is entitled to report.
+func (s *Server) SetBeforeRead(f func(off, length uint64)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.beforeRead = f
+}
+
+func (s *Server) readHook() func(off, length uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.beforeRead
 }

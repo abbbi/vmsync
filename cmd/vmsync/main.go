@@ -662,6 +662,46 @@ var stopSignals = []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP}
 // whoever changes the reporting cadence changes this with it.
 const targetDigestQuietGrace = trace.ProgressInterval * 3 / 2
 
+// targetDigestStallBound is how long the target may say NOTHING before the
+// side waiting on its digest stops waiting.
+//
+// SILENCE, never elapsed time. A verify of a terabyte legitimately hashes on
+// the target for the better part of an hour, so no cap on how LONG a pass may
+// take can be both safe for a healthy one and short enough to bound a held
+// lock. What can be bounded is how long the far side may be unheard from,
+// because the helper beats on a fixed clock -- one line per
+// trace.ProgressInterval whatever it is doing, progress when a block
+// completed and a liveness line when none did.
+//
+// That beat is what makes three intervals defensible. Before it the helper
+// only spoke when a BLOCK finished, and a block is up to 32 MiB read in 4 MiB
+// requests of three deadlined socket operations each: a helper doing exactly
+// what it should could be silent for tens of minutes, so any bound safe
+// against that was far too long to bound anything. The beat separates "is it
+// alive" from "is it fast", and only the first is decided here. A
+// legitimately slow pass runs to completion however long it takes -- that
+// judgement belongs to whoever reads the liveness lines piling up against the
+// same offset, not to this constant.
+//
+// THREE, matching pkg/remotessh's keepaliveStrikes, and for its reason: one
+// missed beat is a loaded host, an unbroken run of them is a peer that is
+// gone. Detection costs one tick on top, so a trip lands in [3, 4) intervals.
+//
+// Derived from the interval, like targetDigestQuietGrace above, so the ladder
+// ProgressInterval < targetDigestQuietGrace < targetDigestStallBound moves as
+// one. The helper is always this binary's own version -- nbdbridge.ProbeHelper
+// refuses the run otherwise, before anything destructive -- so a bound that
+// assumes the beat can never meet a helper that does not send it.
+//
+// THE INCIDENT THIS CLOSES: this wait had no bound at all. A target whose
+// helper started and never answered parked the run forever, holding the
+// target's run lock (renewed every 30s by a heartbeat that never consulted
+// this wait) and an open libvirt backup job on the source that blocks every
+// later checkpoint of that domain -- and, on a -verify=qemu-img run, where
+// the pre-commit check still runs, a SUSPENDED production guest. Nothing
+// ended it but a signal.
+const targetDigestStallBound = 3 * trace.ProgressInterval
+
 func main() {
 	// Ignored, not caught, and first of all -- before anything in this process
 	// can write a log line.
@@ -5654,7 +5694,7 @@ func run(cfg syncConfig) (runErr error) {
 	// check, which needs no port at all) or 127.0.0.1:<target port> (the
 	// verify export, which is on TCP because vmsync reads it too). The
 	// helper reaching it locally is the whole reason this is cheap.
-	askTargetDigests := func(dev string, nbdAddr string, exportName string, plan []blockdigest.Block) ([]blockdigest.Block, error) {
+	askTargetDigests := func(ctx context.Context, dev string, nbdAddr string, exportName string, plan []blockdigest.Block) ([]blockdigest.Block, error) {
 		header := blockdigest.DefaultHeader(blockdigest.MaxRangeLength(plan))
 		var request bytes.Buffer
 		if err := blockdigest.WriteRequest(&request, header, blockdigest.RangesFromBlocks(plan)); err != nil {
@@ -5685,38 +5725,74 @@ func run(cfg syncConfig) (runErr error) {
 		// targetDigestQuietGrace for why that slack is not optional.
 		var heardMu sync.Mutex
 		lastHeard := start
+		lastLine := ""
+		heardAny := false
+		gaveUp := false
 		onLine := func(line string) {
 			heardMu.Lock()
 			lastHeard = time.Now()
+			lastLine = line
+			heardAny = true
 			heardMu.Unlock()
 			trace.Info("checksum: target: "+line, "disk", dev)
 		}
+		// Derived and scoped to this one call, and NEVER the run's own
+		// cancel: abandoning the digest has to leave everything else working,
+		// because the first thing that happens afterwards is the target-side
+		// export being torn down over this same SSH connection. Cancelling
+		// the run ctx would make that teardown a no-op and trade a bounded
+		// wait for a live export with an abandoned helper still attached.
+		digestCtx, abandonDigest := context.WithCancel(ctx)
+		defer abandonDigest()
 		waitDone := make(chan struct{})
 		go func() {
 			t := time.NewTicker(trace.ProgressInterval)
 			defer t.Stop()
-			for {
-				select {
-				case <-waitDone:
-					return
-				case <-ctx.Done():
-					return
-				case now := <-t.C:
-					heardMu.Lock()
-					quiet := now.Sub(lastHeard)
-					heardMu.Unlock()
-					if quiet < targetDigestQuietGrace {
-						continue
-					}
-					trace.Info("checksum: still waiting for the target's digest", "disk", dev,
-						"elapsed", time.Since(start).Round(time.Second).String(),
-						"silent_for", quiet.Round(time.Second).String())
-				}
+			quietFor := func(now time.Time) time.Duration {
+				heardMu.Lock()
+				defer heardMu.Unlock()
+				return now.Sub(lastHeard)
+			}
+			remark := func(quiet time.Duration) {
+				trace.Info("checksum: still waiting for the target's digest", "disk", dev,
+					"elapsed", time.Since(start).Round(time.Second).String(),
+					"silent_for", quiet.Round(time.Second).String())
+			}
+			if trace.QuietWatch(waitDone, t.C, quietFor, targetDigestQuietGrace, targetDigestStallBound, remark) {
+				heardMu.Lock()
+				gaveUp = true
+				heardMu.Unlock()
+				abandonDigest()
 			}
 		}()
-		stdout, stderr, err := targetSSHClient.RunWithInputProgress(ctx, helperCmd, request.Bytes(), onLine)
+		stdout, stderr, err := targetSSHClient.RunWithInputProgress(digestCtx, helperCmd, request.Bytes(), onLine)
 		close(waitDone)
 		if err != nil {
+			// Read inside the error branch, never beside it: a response that
+			// lands in the same instant as the cancellation returns no error,
+			// and must be used rather than discarded as a stall.
+			heardMu.Lock()
+			stalled, last, heard, quiet := gaveUp, lastLine, heardAny, time.Since(lastHeard)
+			heardMu.Unlock()
+			if stalled {
+				// vmsync's own witness, because there is no other: the
+				// cancellation path in RunWithInputProgress returns neither
+				// the stdout nor the stderr collected so far, so the helper's
+				// last words exist only here.
+				trace.Error("checksum: giving up on the target's digest", "disk", dev,
+					"via", nbdAddr, "helper", cfg.BridgeHelperPath,
+					"elapsed", time.Since(start).Round(time.Second).String(),
+					"silent_for", quiet.Round(time.Second).String(),
+					"bound", targetDigestStallBound.String(),
+					"heard_anything", heard, "last_line", last)
+				// No -no-checksum remedy here, deliberately: that one is for
+				// a helper which was never deployed, and this helper answered
+				// the version probe minutes ago. Recommending it would turn
+				// an estate's default-on integrity check off to work around
+				// one broken target.
+				return nil, fmt.Errorf("checksum: the target stopped reporting on %s: nothing from %s for %s (bound %s, %s elapsed) -- the helper beats once per %s while it works, so silence this long means it or its output channel is gone; check the target host and that export",
+					dev, cfg.BridgeHelperPath, quiet.Round(time.Second), targetDigestStallBound, time.Since(start).Round(time.Second), trace.ProgressInterval)
+			}
 			return nil, fmt.Errorf("checksum: run %s on the target for %s: %w%s -- pass -no-checksum to run without digest checks if the helper is not deployed there yet",
 				cfg.BridgeHelperPath, dev, err, formatRemoteStderr(stderr))
 		}
@@ -5992,7 +6068,7 @@ func run(cfg syncConfig) (runErr error) {
 			"disk", d.TargetDev, "image", imagePath, "socket", sockPath,
 			"blocks", len(sourceDigests),
 			"bytes", blockdigest.TotalBytes(sourceDigests), "algo", blockdigest.DefaultAlgo)
-		targetBlocks, err := askTargetDigests(d.TargetDev, sockPath, exportName, sourceDigests)
+		targetBlocks, err := askTargetDigests(ctx, d.TargetDev, sockPath, exportName, sourceDigests)
 		if err != nil {
 			return err
 		}
@@ -6969,10 +7045,19 @@ func run(cfg syncConfig) (runErr error) {
 					sourceErr     error
 					targetErr     error
 				)
+				// One cancellation domain for the two legs, because they
+				// exist only to feed one comparison: when either side can no
+				// longer produce its half, the other is working for nothing
+				// and wg.Wait() below is holding the run until it finishes
+				// anyway. Without this, a target that stalls costs the bound
+				// PLUS whatever a healthy source pass still had left, which
+				// on a terabyte is most of an hour.
+				hashCtx, abandonHash := context.WithCancel(ctx)
+				defer abandonHash()
 				wg.Add(2)
 				go func() {
 					defer wg.Done()
-					sourceDigests, sourceErr = nbdsync.HashRangesTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, plan, cfg.IODepth)
+					sourceDigests, sourceErr = nbdsync.HashRangesTCP(hashCtx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, plan, cfg.IODepth)
 				}()
 				go func() {
 					defer wg.Done()
@@ -6982,7 +7067,16 @@ func run(cfg syncConfig) (runErr error) {
 					// TCP anyway (it read base:allocation through it above,
 					// possibly bridged from another host), and the helper
 					// reaches the same export over loopback.
-					targetBlocks, targetErr = askTargetDigests(d.TargetDev, fmt.Sprintf("127.0.0.1:%d", verifyPort), verifyExportName, plan)
+					targetBlocks, targetErr = askTargetDigests(hashCtx, d.TargetDev, fmt.Sprintf("127.0.0.1:%d", verifyPort), verifyExportName, plan)
+					if targetErr != nil {
+						// Safe to cut the source leg short: HashRangesTCP's
+						// ctx case breaks to its drain rather than returning
+						// from inside the loop, so buffers handed to
+						// AioPread stay valid until libnbd is done with
+						// them (pkg/nbdsync/nbd.go, "every exit path has to
+						// reach the drain below").
+						abandonHash()
+					}
 				}()
 				wg.Wait()
 
@@ -6990,17 +7084,25 @@ func run(cfg syncConfig) (runErr error) {
 				// failed there is nothing to compare against, and reporting
 				// the target's error instead would point at the replica for
 				// a problem on the other side.
-				if sourceErr != nil {
+				//
+				// Unless the source error IS the cancellation above: then it
+				// is a consequence of the target's failure and naming it
+				// first would send an operator to the healthy side.
+				switch {
+				case sourceErr != nil && !errors.Is(sourceErr, context.Canceled):
 					compareErr = fmt.Errorf("hashing the source failed: %w", sourceErr)
-					break
-				}
-				if targetErr != nil {
-					// A format or plan problem, or a helper that would not
-					// run. NOT wrapped in ErrImagesDiffer: the comparison
-					// could not be performed, which is a broken sync rather
-					// than a finding about the data, and isVerifyMismatch
-					// must not exempt it from failure_count.
+				case targetErr != nil:
+					// A format or plan problem, a stalled target, or a
+					// helper that would not run. NOT wrapped in
+					// ErrImagesDiffer: the comparison could not be
+					// performed, which is a broken sync rather than a
+					// finding about the data, and isVerifyMismatch must not
+					// exempt it from failure_count.
 					compareErr = targetErr
+				case sourceErr != nil:
+					compareErr = fmt.Errorf("hashing the source failed: %w", sourceErr)
+				}
+				if compareErr != nil {
 					break
 				}
 				mismatches, cerr := blockdigest.Compare(sourceDigests, targetBlocks)
@@ -7073,7 +7175,20 @@ func run(cfg syncConfig) (runErr error) {
 		}
 
 		if compareErr != nil {
-			return fmt.Errorf("verify: disk %s does not match: %w", d.TargetDev, compareErr)
+			// Keyed on the classifier that already drives the metric, so the
+			// sentence and the number cannot disagree. Every failure here
+			// used to be announced as "does not match", including the ones
+			// where no comparison happened at all -- a target that stalled,
+			// a plan that could not be built, a source read that failed --
+			// while verification_state correctly recorded 2, "could not
+			// check". An operator reading "disk vda does not match" reinits
+			// a replica; one reading "could not be compared" looks at the
+			// target host, which is where the fault actually is.
+			verdict := "could not be compared"
+			if isVerifyMismatch(compareErr) {
+				verdict = "does not match"
+			}
+			return fmt.Errorf("verify: disk %s %s: %w", d.TargetDev, verdict, compareErr)
 		}
 		// The verdict carries what the pass cost, because this is the line
 		// somebody greps when comparing two runs of the same VM: "bytes" on

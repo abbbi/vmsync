@@ -22,7 +22,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -536,5 +538,213 @@ func TestRunChecksumWithoutProgressWriterIsSilent(t *testing.T) {
 	}
 	if len(readResponse(t, &out, bs)) != 4 {
 		t.Error("the response changed when progress was disabled")
+	}
+}
+
+// safeProgress is an io.Writer a test can read while the beat is still
+// writing to it. bytes.Buffer is not one: the beat runs on its own goroutine
+// for the whole pass, so every assertion made DURING a pass -- which is the
+// only time a liveness line exists to assert on -- would be a data race.
+type safeProgress struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (w *safeProgress) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *safeProgress) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+// TestRunChecksumReportsLivenessWhileBlockedOnARead is the whole point of the
+// beat, end to end: a helper stuck inside one read still says so.
+//
+// Before it, a line was only produced when a BLOCK completed, so a helper
+// wedged mid-read was indistinguishable from a helper doing honest work on a
+// large block -- and the side waiting had to allow for the slowest legitimate
+// block, which is tens of minutes. This test holds a read open and asserts
+// that the pass keeps speaking anyway, which is what lets vmsync bound the
+// wait on silence alone.
+//
+// MUTATION CAUGHT: emitting only when bytes have moved (the old behaviour)
+// produces no line at all here, because no block completes while the read is
+// held.
+func TestRunChecksumReportsLivenessWhileBlockedOnARead(t *testing.T) {
+	const bs = 4096
+	data := diskPattern(32 * bs)
+	s := startExport(t, data, "vm-vda")
+
+	release := make(chan struct{})
+	var once sync.Once
+	releaseOnce := func() { once.Do(func() { close(release) }) }
+	defer releaseOnce()
+	blocked := make(chan struct{})
+	var blockedOnce sync.Once
+	s.SetBeforeRead(func(off, length uint64) {
+		blockedOnce.Do(func() { close(blocked) })
+		<-release
+	})
+
+	cfg := checksumCfg(s, "vm-vda")
+	var progress safeProgress
+	cfg.Progress = &progress
+	cfg.Interval = 5 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() {
+		var out bytes.Buffer
+		done <- runChecksum(context.Background(), cfg, request(t, bs, chunked(0, 8*bs, bs)...), &out)
+	}()
+
+	<-blocked
+	deadline := time.After(10 * time.Second)
+	for !strings.Contains(progress.String(), "digest alive (vm-vda)") {
+		select {
+		case err := <-done:
+			t.Fatalf("the pass finished (%v) without ever reporting liveness; a helper held inside a read must still speak: %q", err, progress.String())
+		case <-deadline:
+			t.Fatalf("no liveness line while a read was held open: %q", progress.String())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	if line := progress.String(); !strings.Contains(line, "still reading the block at 0+") {
+		t.Errorf("liveness line does not name the block being read: %q", line)
+	}
+
+	releaseOnce()
+	if err := <-done; err != nil {
+		t.Fatalf("runChecksum: %v", err)
+	}
+	if line := progress.String(); !strings.Contains(line, "100.00%") {
+		t.Errorf("a pass that finished did not report completion: %q", line)
+	}
+}
+
+// TestDigestBeatSaysProgressOnlyWhenBytesMoved pins the emit rule itself,
+// away from any export: progress when the count advanced, liveness when it
+// did not, and exactly one line per tick either way.
+//
+// MUTATIONS CAUGHT: inverting the comparison, which makes every line of a
+// healthy pass a liveness line and so stops reporting throughput at all --
+// the number the two sides of a verify are read against each other by; and
+// emitting both forms on one tick, which doubles the log budget the cadence
+// was chosen to fit.
+func TestDigestBeatSaysProgressOnlyWhenBytesMoved(t *testing.T) {
+	hashed := uint64(0)
+	snapshot := func() digestState {
+		return digestState{HashedBytes: hashed, TotalBytes: 100, Offset: 4096, Length: 4096}
+	}
+	tick := make(chan time.Time)
+	stop := make(chan struct{})
+	var got []digestState
+	emitted := make(chan struct{})
+	go digestBeat(stop, tick, snapshot, func(s digestState) {
+		got = append(got, s)
+		emitted <- struct{}{}
+	})
+
+	beat := func(to uint64) {
+		t.Helper()
+		hashed = to
+		tick <- time.Now()
+		select {
+		case <-emitted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the beat did not emit for a tick")
+		}
+	}
+	beat(10) // the first line always has something to say
+	beat(20) // advanced
+	beat(20) // stalled: nothing completed this tick
+	beat(50) // advanced again
+	close(stop)
+
+	want := []bool{true, true, false, true}
+	if len(got) != len(want) {
+		t.Fatalf("got %d lines for %d ticks, want one each: %+v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i].Moved != w {
+			t.Errorf("line %d: Moved = %v, want %v (%+v)", i, got[i].Moved, w, got[i])
+		}
+	}
+}
+
+// TestDigestBeatPrefersAStopOverAPendingTick covers the race that only shows
+// up under load: a pass whose last block completes just as a tick fires.
+//
+// select picks uniformly at random when both are ready, so without the second
+// check the beat emits "still reading the block at X" for a block it has
+// already finished, in the log of a pass that succeeded, immediately before
+// the 100% line. Looped, because a race that happens half the time passes a
+// single run half the time.
+func TestDigestBeatPrefersAStopOverAPendingTick(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		tick := make(chan time.Time, 1)
+		stop := make(chan struct{})
+		tick <- time.Now()
+		close(stop)
+		emitted := 0
+		digestBeat(stop, tick, func() digestState { return digestState{} }, func(digestState) { emitted++ })
+		if emitted != 0 {
+			t.Fatalf("round %d: the beat emitted after it was stopped", i)
+		}
+	}
+}
+
+// TestFormatDigestLineKeepsTheProgressFormVerbatim guards the half of the
+// output that is not new. Operators grep "digest progress", vmsync carries
+// the line into its own log unchanged, and the bench greps it too: the
+// liveness line had to be a new shape BESIDE it, never a reshaping of it.
+func TestFormatDigestLineKeepsTheProgressFormVerbatim(t *testing.T) {
+	moved := formatDigestLine("vm-vdb", digestState{HashedBytes: 50, TotalBytes: 100, Offset: 1, Length: 2, Moved: true}, time.Second)
+	if !strings.HasPrefix(moved, "digest progress (vm-vdb)  50.00% (50/100 bytes) ") {
+		t.Errorf("progress line changed shape: %q", moved)
+	}
+	if strings.Contains(moved, "still reading") {
+		t.Errorf("progress line leaked the liveness wording: %q", moved)
+	}
+
+	still := formatDigestLine("vm-vdb", digestState{HashedBytes: 50, TotalBytes: 100, Offset: 4096, Length: 8192}, 90*time.Second)
+	if !strings.Contains(still, "digest alive (vm-vdb)") {
+		t.Errorf("liveness line is not recognisable as one: %q", still)
+	}
+	if !strings.Contains(still, "still reading the block at 4096+8192 after 1m30s") {
+		t.Errorf("liveness line does not say which block, or for how long: %q", still)
+	}
+	// No MiB/s on a liveness line: the rate since the start of the pass is
+	// not the rate now, and printing one beside "nothing moved this tick"
+	// invites exactly the wrong reading.
+	if strings.Contains(still, "MiB/s") {
+		t.Errorf("liveness line quotes a throughput it cannot know: %q", still)
+	}
+}
+
+// TestChecksumIntervalDefaultsToTheSharedCadence keeps the test-only knob
+// from becoming a deployment one. vmsync's stall bound is a multiple of
+// trace.ProgressInterval and assumes the helper beats on it; a default that
+// drifted from it would silently change what that bound means.
+func TestChecksumIntervalDefaultsToTheSharedCadence(t *testing.T) {
+	const bs = 4096
+	data := diskPattern(8 * bs)
+	s := startExport(t, data, "vm-vda")
+	cfg := checksumCfg(s, "vm-vda")
+	if cfg.Interval != 0 {
+		t.Fatalf("checksumCfg sets Interval = %v; production must leave it zero so the default applies", cfg.Interval)
+	}
+
+	src, err := os.ReadFile("checksum.go")
+	if err != nil {
+		t.Fatalf("read checksum.go: %v", err)
+	}
+	if !strings.Contains(string(src), "interval = trace.ProgressInterval") {
+		t.Error("runChecksum no longer falls back to trace.ProgressInterval, so the helper's cadence and vmsync's stall bound can drift apart")
 	}
 }
