@@ -20,6 +20,9 @@ package main
 import (
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"testing"
 	"time"
 
@@ -556,7 +559,7 @@ func TestFailedRunGivesBackTheVerifyWindow(t *testing.T) {
 		}
 		// Without the release, this second sync would not verify and the
 		// month's occurrence would be spent on a run that failed.
-		s.releaseVerifyOccurrence(e, verifying)
+		s.releaseVerifyOccurrence(e, verifying, false)
 		if !s.verifyDue(e, schedTime(t, "2026-03-01 02:15")) {
 			t.Error("the next sync in the window did not verify after the first failed")
 		}
@@ -568,7 +571,7 @@ func TestFailedRunGivesBackTheVerifyWindow(t *testing.T) {
 		s := newSched()
 		e := calVM("web01")
 		s.verifyDue(e, schedTime(t, "2026-03-01 11:59"))
-		s.releaseVerifyOccurrence(e, verifying)
+		s.releaseVerifyOccurrence(e, verifying, false)
 		for _, at := range []string{"2026-03-01 12:00", "2026-03-02 09:00", "2026-03-20 03:00"} {
 			if s.verifyDue(e, schedTime(t, at)) {
 				t.Errorf("verified at %s, outside the window", at)
@@ -585,7 +588,7 @@ func TestFailedRunGivesBackTheVerifyWindow(t *testing.T) {
 		if !s.verifyDue(e, schedTime(t, "2026-03-01 02:00")) {
 			t.Fatal("the first sync did not verify")
 		}
-		s.releaseVerifyOccurrence(e, syncPlan{}) // Profile.Verify == ""
+		s.releaseVerifyOccurrence(e, syncPlan{}, false) // Profile.Verify == ""
 		if s.verifyDue(e, schedTime(t, "2026-03-01 03:00")) {
 			t.Error("a non-verifying run gave back another run's claim")
 		}
@@ -602,7 +605,7 @@ func TestFailedRunGivesBackTheVerifyWindow(t *testing.T) {
 		if !s.verifyDue(e, now.Add(2*time.Hour)) {
 			t.Fatal("the interval path did not come due")
 		}
-		s.releaseVerifyOccurrence(e, verifying)
+		s.releaseVerifyOccurrence(e, verifying, false)
 		if s.verifyDue(e, now.Add(2*time.Hour+time.Minute)) {
 			t.Error("releasing reset an interval cadence it has no business touching")
 		}
@@ -729,7 +732,7 @@ func TestFailedRunReArmsEveryCalendarShape(t *testing.T) {
 			if !s.verifyDue(e, schedTime(t, tc.inWindow[0])) {
 				t.Fatalf("the first sync in the occurrence did not verify")
 			}
-			s.releaseVerifyOccurrence(e, verifying)
+			s.releaseVerifyOccurrence(e, verifying, false)
 			if !s.verifyDue(e, schedTime(t, tc.inWindow[1])) {
 				t.Error("the next sync did not verify after the first failed; the occurrence was lost")
 			}
@@ -858,4 +861,130 @@ func TestEffectiveScheduleReportsWhatTheAgentWillActuallyDo(t *testing.T) {
 			t.Error("reported a next window for a calendar that does not parse")
 		}
 	})
+}
+
+// TestAVerifyThatRanSpendsTheWindow is the other half of
+// TestFailedRunGivesBackTheVerifyWindow above, and the two have to be read
+// together: that one says a failure re-arms, this one says a failure which
+// VERIFIED does not.
+//
+// THE LOOP THIS CLOSES. The agent claims a calendar verify window at launch
+// and gave it back after every failure, because it had no way to tell a run
+// that died before the compare from one that reached it. So a replica with a
+// real finding -- or a target whose helper had stopped answering -- failed,
+// re-armed, and verified again on the next sync. Sync intervals are minutes
+// and a verify window is hours: one bad replica meant dozens of runs inside
+// one window, each re-copying the delta, each leaving an unpublished staging
+// set, and failure_count climbing the whole time towards a -reinit of a
+// replica whose only problem might have been a wedged target.
+//
+// The window is a promise that a read-back is ATTEMPTED in it, not that one
+// succeeds. A run that attempted it kept the promise, whatever it found.
+func TestAVerifyThatRanSpendsTheWindow(t *testing.T) {
+	verifying := syncPlan{SyncRequest: SyncRequest{Profile: SyncProfile{Verify: "fast"}}}
+
+	t.Run("a failed run that verified does not re-arm", func(t *testing.T) {
+		s := newSched()
+		e := calVM("web01")
+		if !s.verifyDue(e, schedTime(t, "2026-03-01 02:00")) {
+			t.Fatal("the first sync in the window did not verify")
+		}
+		s.releaseVerifyOccurrence(e, verifying, true)
+		if s.verifyDue(e, schedTime(t, "2026-03-01 02:05")) {
+			t.Error("a run that failed its verification re-armed the window, so the next sync verifies again five minutes later -- that is the loop this exists to stop")
+		}
+	})
+
+	t.Run("every later sync in the window stays quiet", func(t *testing.T) {
+		// One probe would pass against an off-by-one that re-arms on the
+		// second attempt instead of the first.
+		s := newSched()
+		e := calVM("web01")
+		s.verifyDue(e, schedTime(t, "2026-03-01 02:00"))
+		s.releaseVerifyOccurrence(e, verifying, true)
+		for _, at := range []string{"2026-03-01 02:05", "2026-03-01 02:10", "2026-03-01 09:00", "2026-03-01 11:59"} {
+			if s.verifyDue(e, schedTime(t, at)) {
+				t.Errorf("verified again at %s inside a window already spent by a verification that ran", at)
+			}
+		}
+	})
+
+	t.Run("the next window is unaffected", func(t *testing.T) {
+		// Spending a window must not look like disabling the cadence: the
+		// failure is reported through the run's own result, and the next
+		// occurrence has to verify on its own merits.
+		s := newSched()
+		e := calVM("web01")
+		s.verifyDue(e, schedTime(t, "2026-03-01 02:00"))
+		s.releaseVerifyOccurrence(e, verifying, true)
+		if !s.verifyDue(e, schedTime(t, "2026-04-05 02:00")) { // the first Sunday of April 2026; the 1st is a Wednesday
+			t.Error("the following month's window did not verify; spending one occurrence must not silence the cadence")
+		}
+	})
+}
+
+// TestRunOnePassesTheRunsOwnVerdictToTheWindowAccounting guards the wiring
+// between the two halves, which no unit test can exercise: runOne starts a
+// real vmsync and waits for it.
+//
+// THE MUTATION IT CATCHES is the one that makes the whole change a no-op
+// while every other test still passes: passing a literal false (or the
+// result of something that is never true) at the call sites. The scheduler
+// tests above drive releaseVerifyOccurrence directly, so they would go on
+// passing with runOne wired to a constant.
+func TestRunOnePassesTheRunsOwnVerdictToTheWindowAccounting(t *testing.T) {
+	const file = "scheduler.go"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+
+	calls := 0
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "releaseVerifyOccurrence" {
+			return true
+		}
+		calls++
+		if len(call.Args) != 3 {
+			t.Errorf("%s: releaseVerifyOccurrence called with %d arguments, want 3", fset.Position(call.Pos()), len(call.Args))
+			return true
+		}
+		arg, ok := call.Args[2].(*ast.Ident)
+		if !ok || arg.Name != "verificationRan" {
+			t.Errorf("%s: the verify window is released on something other than what the run reported, so a verification that ran would re-arm the window and the sync would verify again minutes later", fset.Position(call.Pos()))
+		}
+		return true
+	})
+	if calls != 2 {
+		t.Errorf("found %d releaseVerifyOccurrence call sites in %s, want 2 (busy and failure); a third would need the same fact and this test would not notice it missing", calls, file)
+	}
+}
+
+// TestTheVerdictComesFromAResultFileThisRunWrote pins where the fact may come
+// from. An unreadable or stale file must leave it false: re-arming when we
+// should not costs one extra verify, while NOT re-arming when we should costs
+// the window -- and a missed window is never made up.
+func TestTheVerdictComesFromAResultFileThisRunWrote(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rr   runresult.Result
+		err  error
+		want string
+	}{
+		{"this run's clean file", runresult.Result{RunID: "r1", VerificationRan: true}, nil, resultClean},
+		{"another run's file", runresult.Result{RunID: "other", VerificationRan: true}, nil, resultStale},
+		{"a file that will not parse", runresult.Result{}, errors.New("broken"), resultUnreadable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyRunResult(tc.rr, tc.err, "r1").kind; got != tc.want {
+				t.Fatalf("classifyRunResult = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }

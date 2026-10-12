@@ -497,7 +497,27 @@ func (s *Scheduler) verifyDueByCalendar(entry ScheduleEntry, now time.Time) bool
 //
 // Giving it back simply re-arms the window: any later sync inside it verifies,
 // and once the window closes Due goes quiet on its own.
-func (s *Scheduler) releaseVerifyOccurrence(entry ScheduleEntry, plan syncPlan) {
+//
+// verificationRan is what the run itself reported (runresult.Result), and it
+// is the difference between re-arming and hammering. "Failed" and "did not
+// verify" are not the same thing: a verification that RAN and found a
+// difference, and one that ran and could not be completed, both fail the run
+// -- and both spent the window. Re-arming after those turned a replica with
+// a real finding, or a target whose helper had stopped answering, into a loop
+// of verify-fail-rearm every few minutes for the length of a window measured
+// in hours, each iteration re-copying the delta and leaving another
+// unpublished staging set behind. The window is a promise that a read-back is
+// ATTEMPTED in it, not that one succeeds; a run that attempted it has kept
+// the promise, whatever it found.
+//
+// False when the result file was missing, stale or unreadable, which is the
+// safe direction: the cost of re-arming when we should not is one extra
+// verify, and the cost of not re-arming when we should is a window silently
+// skipped -- and a missed window is never made up.
+func (s *Scheduler) releaseVerifyOccurrence(entry ScheduleEntry, plan syncPlan, verificationRan bool) {
+	if verificationRan {
+		return
+	}
 	// plan.Profile, not entry's: the plan is what became the command line, so
 	// it is the authoritative record of whether this run carried -verify.
 	if plan.Profile.Verify == "" {
@@ -866,6 +886,10 @@ func (s *Scheduler) runOne(ctx context.Context, cfg *agentConfig, entry Schedule
 	// Removed either way. These accumulate one per run, and a directory
 	// filling with them on a busy host is a second failure caused by the
 	// mechanism for reporting the first.
+	// Hoisted out of the block below because the verify-window
+	// accounting at the end of this function needs it. False unless the
+	// run said otherwise in a file this run actually wrote.
+	verificationRan := false
 	if plan.ResultJSON != "" {
 		rr, rerr := runresult.Read(plan.ResultJSON)
 		_ = os.Remove(plan.ResultJSON)
@@ -893,6 +917,13 @@ func (s *Scheduler) runOne(ctx context.Context, cfg *agentConfig, entry Schedule
 				"vm", entry.VM, "target", plan.targetHost, "run_id", runID,
 				"fsfreeze_failed", rr.FSFreezeFailed, "fsthaw_failed", rr.FSThawFailed, "fsthaw_timed_out", rr.FSThawTimedOut,
 				"action", v.reason)
+			verificationRan = rr.VerificationRan
+		default:
+			// resultClean. The file is this run's and parsed, so what it
+			// says about the verification is usable -- which is the only
+			// reason this case exists rather than being absorbed into the
+			// switch's absence.
+			verificationRan = rr.VerificationRan
 		}
 	}
 
@@ -941,13 +972,13 @@ func (s *Scheduler) runOne(ctx context.Context, cfg *agentConfig, entry Schedule
 		trace.Info("a scheduled sync stood down: another vmsync is already working on this domain, and nothing was changed",
 			"vm", entry.VM, "target", plan.targetHost)
 		s.metrics.runBusy()
-		s.releaseVerifyOccurrence(entry, plan)
+		s.releaseVerifyOccurrence(entry, plan, verificationRan)
 		return
 	}
 
 	if err != nil {
 		res.Error = err.Error()
-		s.releaseVerifyOccurrence(entry, plan)
+		s.releaseVerifyOccurrence(entry, plan, verificationRan)
 		trace.Error("scheduled sync failed", "vm", entry.VM, "target", plan.targetHost,
 			"exit_code", code, "duration_s", res.DurationSecs, "error", err)
 		// vmsync's own output goes to the host's log too, not only into the
