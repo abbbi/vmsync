@@ -2907,12 +2907,23 @@ func run(cfg syncConfig) (runErr error) {
 		if cfg.ResultJSON == "" {
 			return
 		}
+		// Under metricsMu for the reason writeMetricsTextfile reads it under
+		// the same lock: the signal handler calls this too, concurrently
+		// with the disk workers that set it.
+		metricsMu.Lock()
+		attempted := verificationAttempted
+		metricsMu.Unlock()
 		res := runresult.Result{
 			VM:             cfg.SourceDomain,
 			RunID:          cfg.RunID,
 			FSFreezeFailed: freezeDidFail(),
 			FSThawFailed:   thawDidFail(),
 			FSThawTimedOut: thawDidTimeOut(),
+			// The same predicate the metric uses, not a second reading of
+			// the same two variables: "was a verify asked for" and "did one
+			// happen" differ, and the scheduler's window accounting now
+			// turns on the difference.
+			VerificationRan: verificationRan(cfg.Verify, attempted),
 		}
 		if err := runresult.Write(cfg.ResultJSON, res); err != nil {
 			// Warning, not Error: this file is how the agent LEARNS about a

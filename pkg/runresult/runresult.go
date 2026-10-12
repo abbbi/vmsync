@@ -98,6 +98,40 @@ type Result struct {
 	// that turned out fine is how the loudest alarm in this program becomes
 	// one people scroll past.
 	FSThawTimedOut bool `json:"fsthaw_timed_out,omitempty"`
+
+	// VerificationRan says this run entered its verification step -- the
+	// compare block, for at least one disk -- as opposed to merely having
+	// been asked for one with -verify.
+	//
+	// NOT a degradation, and deliberately absent from Degraded(): on a
+	// healthy run it is simply true, and nobody needs waking for it.
+	//
+	// It is here rather than left to the exit code because the exit code
+	// cannot carry it: a run that verified and then failed, a run that
+	// verified and found a difference, and a run that died before ever
+	// reaching the compare all exit non-zero, and the scheduler has to tell
+	// the third from the first two. It is not a duplicate of
+	// vmsync_verification_state either, despite that metric being derived
+	// from the same fact: the textfile is optional (-prometheus-textfile is
+	// frequently unset), estate-wide rather than per-run, and carries no run
+	// id, so a parent cannot attribute a line in it to the child it just
+	// waited for. This file can be, and is, attributed by RunID.
+	//
+	// WHAT IT IS FOR. vmsync-agent claims a calendar verify window at launch
+	// and gives it back when the run "did not verify". It had no way to know
+	// whether a failing run had verified, so it gave the window back after
+	// EVERY failure -- and since sync intervals are minutes and a verify
+	// window is hours, a replica that fails its verification turned into a
+	// loop: verify, fail, re-arm, verify again, every few minutes until the
+	// window closed, each iteration re-copying the delta and leaving another
+	// unpublished staging set behind. With this, a window spent is a window
+	// spent.
+	//
+	// An older vmsync omits the field, which reads as false and restores
+	// exactly the previous behaviour. That is the right way round: the
+	// fallback is the one that re-verifies too often, not the one that
+	// silently stops verifying.
+	VerificationRan bool `json:"verification_ran,omitempty"`
 }
 
 // Degraded reports whether anything here needs a person.

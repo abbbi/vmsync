@@ -141,3 +141,54 @@ func TestBothFailuresLeadWithTheFrozenGuest(t *testing.T) {
 		t.Errorf("reason leads with the copy rather than the blocked guest: %q", reason)
 	}
 }
+
+// TestVerificationRanIsNotADegradation keeps the new field out of the alarm.
+//
+// Degraded() is what wakes somebody: it means a guest may still be frozen.
+// "This run verified" is true of every healthy verifying run, so folding it
+// in would make the loudest signal in this program fire on success -- the
+// exact way an alarm becomes one people scroll past.
+func TestVerificationRanIsNotADegradation(t *testing.T) {
+	r := Result{VerificationRan: true}
+	if r.Degraded() {
+		t.Error("a run that merely verified is reported as needing a person")
+	}
+	if reason := r.Reason(); reason != "" {
+		t.Errorf("a clean verifying run has a degradation reason: %q", reason)
+	}
+}
+
+// TestVerificationRanSurvivesTheRoundTrip is the whole point of the field:
+// the scheduler on the other side of this file decides whether a verify
+// window was spent by reading it back.
+func TestVerificationRanSurvivesTheRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "run.json")
+	if err := Write(path, Result{VM: "web01", RunID: "r1", VerificationRan: true}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := Read(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !got.VerificationRan {
+		t.Error("the verification verdict did not survive the file; the agent would re-arm the verify window after every failure, as it did before this field existed")
+	}
+}
+
+// TestAnOlderEngineReadsAsNotVerified pins the compatibility direction. An
+// agent newer than the vmsync it runs sees no field at all, and the safe
+// reading of silence is "did not verify": that re-arms the window, which
+// costs one extra verify. The other way round would silently skip windows.
+func TestAnOlderEngineReadsAsNotVerified(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"vm":"web01","run_id":"r1"}`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := Read(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got.VerificationRan {
+		t.Error("a result file with no verification field read as verified")
+	}
+}
