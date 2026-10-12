@@ -4,7 +4,7 @@
 # Written in 2026 by Orsiris de Jong <ozy@netpower.fr> for vmsync by Michael Ablassmeier <abi@grinser.de>
 
 
-#SCRIPT_BUILD=2026100801
+#SCRIPT_BUILD=2026101201
 LOG_FILE=/var/log/vmsync_parallel
 TARGET_VM_PATH=/vm_data
 VMSYNC=/usr/local/bin/vmsync
@@ -61,8 +61,13 @@ PROMETHEUS_TEXTFILE_PATH=/var/lib/node_exporter/textfile_collector
 ## Parallel task execution settings
 PROGRAM=vmsync_parallel
 REPLICATION_CONCURRENCY=4
+# Timeout per VM in seconds
+# soft timeout will complain, hard timeout will terminate the current VM sync
 SOFT_TIMEOUT_PER_VM=1800
-HARD_TIMEOUT=86400 # Keep 0 for initial replica
+HARD_TIMEOUT_PER_VM=86400 # Keep 0 for initial replica
+# Total script timeout
+SOFT_TIMEOUT=14400
+HARD_TIMEOUT=0 # Total script hard timeout in seconds
 SLEEP_TIME=.5
 KEEP_LOGGING=1800
 DEBUG=false
@@ -335,7 +340,8 @@ replicate() {
         # the top of the file) exists to make that overlap benign, so it must
         # not be treated as an error -- without this, every legitimate overlap
         # is logged as a failure and can reach SendAlert.
-        exectasks "${cmd_list}" "${PROGRAM}" false "${SOFT_TIMEOUT_PER_VM}" 0 0 0 false .5 "${KEEP_LOGGING}" true "" "" "${REPLICATION_CONCURRENCY}" "" "" "" "0;75"
+
+        exectasks "${cmd_list}" "${PROGRAM}" false "${SOFT_TIMEOUT_PER_VM}" "${HARD_TIMEOUT_PER_VM}" "${SOFT_TIMEOUT}" "${HARD_TIMEOUT}" false .5 "${KEEP_LOGGING}" true "" "" "${REPLICATION_CONCURRENCY}" "" "" "" "0;75"
         result=$?
         if [ $result -ne 0 ]; then
                 log "$(date): Global replication state failed" "ERROR"
