@@ -685,18 +685,43 @@ func runListRestorePoints(ctx context.Context, cfg syncConfig) error {
 	points := append([]restorepoint.Tag(nil), listing.Points...)
 	sort.Slice(points, func(i, j int) bool { return points[i].At.Before(points[j].At) })
 
+	// What the loop below could not read, reported once after the table.
+	unreadable := 0
+	firstTag, firstReason := "", ""
+
 	fmt.Printf("%-20s  %-20s  %-10s  %s\n", "TAKEN", "CHECKPOINT", "VERIFY", "TAG")
 	for _, tag := range points {
 		verify, checkpoint := "unknown", tag.Checkpoint
-		if cmd, cerr := restorepoint.ReadStatusCommand(store.Point(tag)); cerr == nil {
-			out, rerr := client.Run(ctx, cmd)
-			if rerr == nil {
-				if s, derr := restorepoint.DecodeStatus([]byte(out)); derr == nil {
-					verify = s.Verify
-					if s.Checkpoint != "" {
-						checkpoint = s.Checkpoint
-					}
-				}
+		// Each of the three stages can fail, and each used to fail silently
+		// into the same "unknown" the next line defends. The value is right;
+		// the silence was not. A root-written 0600 sidecar read as another
+		// user yields "Permission denied" on EVERY row, and the table was
+		// then indistinguishable from one where nothing had ever been
+		// verified -- a difference that decides which copy gets restored.
+		//
+		// The reason is remembered rather than printed here: this loop is
+		// writing a table to stdout, and a diagnostic in the middle of it
+		// would corrupt the thing being read. One line goes to stderr after
+		// the table instead.
+		if cmd, cerr := restorepoint.ReadStatusCommand(store.Point(tag)); cerr != nil {
+			unreadable++
+			if firstReason == "" {
+				firstTag, firstReason = tag.String(), "build the read command: "+cerr.Error()
+			}
+		} else if out, rerr := client.Run(ctx, cmd); rerr != nil {
+			unreadable++
+			if firstReason == "" {
+				firstTag, firstReason = tag.String(), "read it on the target: "+rerr.Error()+": "+strings.TrimSpace(out)
+			}
+		} else if s, derr := restorepoint.DecodeStatus([]byte(out)); derr != nil {
+			unreadable++
+			if firstReason == "" {
+				firstTag, firstReason = tag.String(), "decode it: "+derr.Error()
+			}
+		} else {
+			verify = s.Verify
+			if s.Checkpoint != "" {
+				checkpoint = s.Checkpoint
 			}
 		}
 		// "unknown" rather than a guess when the sidecar is missing or
@@ -705,6 +730,20 @@ func runListRestorePoints(ctx context.Context, cfg syncConfig) error {
 		// defeat it.
 		fmt.Printf("%-20s  %-20s  %-10s  %s\n",
 			tag.At.UTC().Format("2006-01-02 15:04:05"), checkpoint, verify, tag.String())
+	}
+
+	// One line for however many rows were affected, naming the first and its
+	// reason. Per row would print the same sentence fifty times on a store
+	// whose sidecars are all unreadable for one reason, which is the case
+	// this exists for.
+	//
+	// "No such file or directory" here means the restore point predates the
+	// sidecar or was never finished; "Permission denied" means the answer
+	// exists and this user cannot see it. Only the reason tells them apart,
+	// and VERIFY=unknown looks identical either way.
+	if unreadable > 0 {
+		trace.Warning("could not read the status sidecar of some restore points, so their VERIFY column says unknown because the answer could not be read -- not because they were never verified",
+			"restore_points", unreadable, "of", len(points), "first", firstTag, "reason", firstReason)
 	}
 
 	for _, name := range listing.Staging {
