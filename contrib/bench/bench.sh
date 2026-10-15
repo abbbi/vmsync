@@ -69,7 +69,7 @@ STAGES="matrix,verify,reinit,snapshot,journal,retention"
 # The "want ..." list this was first copied from had checksum third, for
 # historical reasons, which made `--stages all` run stage 13 before stage 3
 # while --help promised stage-number order.
-ALL_STAGES="matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,checksum,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease,redefine-probe,reinit-orphan"
+ALL_STAGES="matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,checksum,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease,redefine-probe,reinit-orphan,supervise"
 
 # INTERRUPTED: vmsync catches SIGINT/SIGTERM itself (cleanup, then a plain
 # os.Exit(1) -- see cmd/vmsync/main.go's own signal handling), so a Ctrl+C
@@ -105,7 +105,7 @@ Options:
                              9  retention    21  lock-lease
                             10  restore      22  redefine-probe
                             11  invert       23  reinit-orphan
-                            12  wedge
+                            12  wedge       24  supervise
                            Or one of two shorthands, used on their own rather
                            than inside a list:
                              all             every stage above, in that order
@@ -121,8 +121,10 @@ Options:
                            where the target filesystem cannot reflink. define,
                            failover, fence-agent, verify-long, restore,
                            invert, wedge, checksum, verify-failure,
-                           commit-barrier, interrupted-reinit and colocated
-                           are opt-in, see below. commit-barrier additionally
+                           commit-barrier, interrupted-reinit, colocated,
+                           leftovers, reinit-order, lock-lease,
+                           redefine-probe, reinit-orphan and supervise are
+                           opt-in, see below. commit-barrier additionally
                            needs a source domain with two or more qcow2 disks,
                            and skips cleanly without one. colocated needs
                            TARGET_DISK_PATH set and a target filesystem that
@@ -439,6 +441,33 @@ is what would catch an incremental that copied too little because the bitmap sur
 disturbed the tracking. Not qemu-img check, which needs the domain down -- shutting it
 down would close the image cleanly and so describe a state the live operation did not
 produce, and it validates structure rather than bitmap contents anyway.
+
+Stage 24 (supervise) checks that the commands vmsync runs ON THE TARGET are supervised
+by vmsync-bridge-helper, bounded where abandoning them is safe, and audible always. The
+fault it covers is a target whose storage has wedged: such a command never returns, and
+because sshd keeps answering keepalives without ever touching the disk, nothing on
+vmsync's side notices -- the run parks indefinitely holding the target's run lock and an
+open libvirt backup job on the source. Only a process on the target can signal it, which
+is what the helper does. Four sub-tests. An ordinary sync must carry the helper's verdict
+for its target commands into vmsync's log, which proves the whole path end to end with
+nothing tampered with and without which the other three would be testing a wrapper nobody
+invoked. A run pointed at no helper must still take the old unbounded path and WARN that
+it has, since that sentence is how an operator reading a parked run's log afterwards knows
+why nothing bounded it. Then two sub-tests install a wrapper at -bridge-helper-path that
+hijacks exactly one target command -- the runtime-directory mkdir, the first and cheapest
+supervised command of a run, matched on vmsync's own -label text rather than on all of
+them, since every supervised command would otherwise inherit the probe's delay: one
+replaces it with a command that cannot finish under a three-second limit, and the run
+FAILING is the pass condition, because before this existed that situation was a sync that
+never returned at all; the other lets the real command finish and then lingers past one
+reporting interval with no limit at all -- the setting a qemu-img commit runs under -- so
+what is tested is only whether the wait was visible, and whether the liveness line names
+the child's /proc state, which is the field that turns "the target is slow" into a
+diagnosis. The killed sub-test also checks the target is left with no surviving process,
+since a signal that reached the shell alone and not its process group is the exact leak
+supervision exists to prevent. Opt-in: one sub-test fails a sync on purpose, one spends a
+reporting interval waiting on purpose (BENCH_SUPERVISE_BEAT_WAIT, default 75s), and both
+temporarily point vmsync at a wrapper instead of the real helper.
 EOF
 }
 
@@ -4253,7 +4282,7 @@ stage_fence_agent() {
 # counting as one of its own transport runs -- so a full --stages all run
 # reported Stage 1 as FAILED, with a count of "N of M vmsync runs exited
 # non-zero" that no transport combination in the matrix table accounts for.
-NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$|colocated$|leftovers$|reinit-order$|lock-lease$|redefine-probe$|reinit-orphan$)'
+NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$|colocated$|leftovers$|reinit-order$|lock-lease$|redefine-probe$|reinit-orphan$|supervise$)'
 
 # stage_pattern STAGE -> the regex matching that stage's scenario column.
 # --- Stage 8: verify after a long incremental chain --------------------------
@@ -10099,6 +10128,272 @@ stage_reinit_orphan() {
 	return 0
 }
 
+# Stage 24: the commands vmsync runs ON THE TARGET must be supervised --
+# bounded where that is safe, and audible always.
+#
+# WHAT IS BEING TESTED, and why it cannot be a unit test. vmsync drives the
+# target by running shell commands over SSH, and every one of them touches the
+# replica's storage. If that storage wedges, the command never returns: sshd
+# keeps answering keepalives because sshd does not touch the disk, so nothing
+# on vmsync's side notices, and the run parks forever holding the target's run
+# lock and an open libvirt backup job on the source. Only a process on the
+# target can signal such a command, which is what vmsync-bridge-helper's
+# supervision does -- own process group, a liveness line a minute carrying the
+# child's /proc state, SIGTERM then SIGKILL after a grace, and one verdict
+# line back.
+#
+# The Go tests prove the state machine and, on Linux, the group kill against a
+# real child. What they cannot prove is that the two binaries agree over SSH:
+# that vmsync builds the invocation the helper expects, that the helper's
+# stderr reaches vmsync's log line by line while the command is still running,
+# and that a killed command actually fails the run. That is this stage.
+#
+# Four sub-tests:
+#
+#   24a supervise/supervised  -- an ordinary sync's log carries the helper's
+#                                verdict for its target commands, which is the
+#                                whole path end to end and needs no fault.
+#   24b supervise/timeout     -- a command that outlives its -max-runtime is
+#                                signalled, and the run FAILS rather than
+#                                waiting. The verdict must say so.
+#   24c supervise/liveness    -- a command that outruns one reporting interval
+#                                produces a liveness line naming its /proc
+#                                state, which is the field that turns "the
+#                                target is slow" into a diagnosis.
+#   24d supervise/unsupervised-- with no usable helper the old unbounded path
+#                                is still taken, and the run says so loudly.
+#
+# Not in the default stage list: 24b deliberately fails a sync, 24c spends a
+# reporting interval waiting on purpose, and both temporarily point vmsync at
+# a wrapper instead of the real helper.
+
+# SUPERVISE_SHIM_DIR holds the wrapper scripts on the TARGET host, under /tmp
+# for CHECKSUM_SHIM_DIR's reason: this must never risk overwriting the
+# operator's deployed binary, and vmsync is pointed at the wrapper by flag.
+SUPERVISE_SHIM_DIR="/tmp/vmsync-bench-supervise-shim"
+
+# The label of the one target command these probes hijack: the runtime
+# directory creation, which is the FIRST supervised command of a run and the
+# cheapest. Matched on a fragment of vmsync's own -label text.
+#
+# One command rather than all of them, and that is not tidiness: every
+# supervised command would otherwise inherit the probe's delay, which for 24c
+# is a reporting interval each and turns a sync into half an hour.
+SUPERVISE_PROBE_LABEL="runtime directory"
+
+# How long 24c's probe lingers, which has to OUTLAST the helper's reporting
+# interval or there is no liveness line to find. The helper beats once per
+# trace.ProgressInterval (one minute); 75s leaves fifteen seconds of slack for
+# a loaded target without making the stage much slower. Overridable because
+# somebody changing that interval will want to change this with it, and a
+# hardcoded 75 would then fail for a reason nothing explains.
+BENCH_SUPERVISE_BEAT_WAIT="${BENCH_SUPERVISE_BEAT_WAIT:-75}"
+
+# supervise_install_shim NAME LIMIT COMMAND_TEMPLATE -- writes a wrapper at
+# $SUPERVISE_SHIM_DIR/NAME and prints its path.
+#
+# The wrapper passes everything through to the real helper untouched EXCEPT
+# the one supervision whose -label matches $SUPERVISE_PROBE_LABEL. For that
+# one it drains the command vmsync sent, and runs the real helper again with
+# a command of its own and -max-runtime LIMIT.
+#
+# COMMAND_TEMPLATE is shell text evaluated on the target, where $orig holds
+# the command vmsync wanted run -- so a template can replace that command
+# ("sleep 300") or extend it ("$orig; sleep 75").
+#
+# Three things below are deliberate and two of them are the checksum shim's
+# lessons, which apply unchanged:
+#
+# The other MODES exec straight through. The same binary serves the relay,
+# the digest pass and the run lock; mangling any of those would break the
+# transfer or the lock rather than exercising supervision.
+#
+# NOT "exec real | ..." for the hijacked case. exec applies to the left
+# subshell of a pipeline, not to the shim, so control would return and the
+# trailing exec would run the helper a second time against a stdin the first
+# invocation had already drained.
+#
+# The pipeline's status IS the real helper's, because it is the last element.
+# That matters here more than for the digest shim: the whole point of 24b is
+# that the helper exits 124 and vmsync treats the command as failed, so a
+# status swallowed by the shim would make the probe prove nothing.
+supervise_install_shim() {
+	local name="$1" limit="$2" template="$3" real
+	real="$(bridge_helper_path)"
+
+	run_shell_on "$TARGET_HOST" no "mkdir -p '$SUPERVISE_SHIM_DIR' && cat > '$SUPERVISE_SHIM_DIR/$name' <<'VMSYNC_SUPERVISE_SHIM_EOF'
+#!/bin/sh
+mine=no
+for a in \"\$@\"; do
+	case \"\$a\" in
+		-checksum|-hold-run-lock|-listen|-connect) exec $real \"\$@\" ;;
+		*\"$SUPERVISE_PROBE_LABEL\"*) mine=yes ;;
+	esac
+done
+if [ \"\$mine\" != yes ]; then
+	exec $real \"\$@\"
+fi
+orig=\$(cat)
+printf '%s\n' \"$template\" | $real -max-runtime '$limit' -kill-grace 2s -label 'bench supervision probe'
+exit \$?
+VMSYNC_SUPERVISE_SHIM_EOF
+chmod +x '$SUPERVISE_SHIM_DIR/$name'" >/dev/null || return 1
+
+	printf '%s\n' "$SUPERVISE_SHIM_DIR/$name"
+}
+
+supervise_remove_shims() {
+	[ "$DRY_RUN" = yes ] && return 0
+	run_shell_on "$TARGET_HOST" no "rm -rf '$SUPERVISE_SHIM_DIR'" >/dev/null 2>&1 || true
+}
+
+# supervise_log_has PATTERN -- grep the run just made, quietly.
+supervise_log_has() {
+	grep -q "$1" "$RUN_LOG" 2>/dev/null
+}
+
+stage_supervise() {
+	log "=== Stage 24: target commands must be supervised, bounded and audible ==="
+	local sc=supervise ok
+
+	if [ "$DRY_RUN" != yes ]; then
+		stage_needs_target_shutoff "$CSV" "$sc" "stage supervise" || return 0
+		# The helper has to be deployed for there to be anything to test.
+		# A SKIP row rather than a FAIL: an estate without the helper is a
+		# supported configuration -- 24d is the sub-test that covers it --
+		# and reporting its absence as a failure would make this stage
+		# unusable on exactly those hosts.
+		if ! ssh_host_cmd "$TARGET_HOST" "test -x '$(bridge_helper_path)'" >/dev/null 2>&1; then
+			warn "SKIP stage 24: no vmsync-bridge-helper at $(bridge_helper_path) on $TARGET_HOST"
+			results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP no helper on the target"
+			return 0
+		fi
+	fi
+
+	# 24a -- the whole path, with nothing tampered with. vmsync logs every
+	# line the helper writes to stderr as it arrives, so an ordinary run's
+	# log must carry the verdict for its target commands. If this fails the
+	# three below prove nothing: they would be testing a wrapper nobody
+	# invoked.
+	bench_sync "$sc" supervised -reinit
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" "$sc" supervised-result DRYRUN "" "" "" "" "" "SKIP dry run"
+	else
+		if bench_sync_ok; then ok=0; else ok=1; fi
+		fo_check "$sc" "an ordinary sync succeeds with its target commands supervised" "$ok" "exit=$RUN_RC -- see $RUN_LOG"
+		if supervise_log_has 'target: supervise: outcome=completed'; then ok=0; else ok=1; fi
+		fo_check "$sc" "the helper's verdict for a target command reaches vmsync's log" "$ok" \
+			"no \"target: supervise: outcome=completed\" line in $RUN_LOG -- the commands ran unsupervised, or the verdict never came back"
+	fi
+
+	# 24d -- the documented fallback, before anything installs a wrapper:
+	# with no usable helper the old unbounded path is taken, and the run has
+	# to say so. An operator reading a parked run's log afterwards needs
+	# that sentence to know why nothing bounded it.
+	bench_sync "$sc" unsupervised -reinit -bridge-helper-path /nonexistent/vmsync-bridge-helper
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" "$sc" unsupervised-result DRYRUN "" "" "" "" "" "SKIP dry run"
+	else
+		if supervise_log_has 'run UNSUPERVISED'; then ok=0; else ok=1; fi
+		fo_check "$sc" "a run with no usable helper warns that target commands are unsupervised" "$ok" \
+			"no UNSUPERVISED warning in $RUN_LOG"
+	fi
+
+	[ "$DRY_RUN" = yes ] && return 0
+
+	# Everything below points vmsync at a wrapper on the target; make sure
+	# the wrappers go away whichever way this stage ends.
+	trap 'supervise_remove_shims' RETURN
+
+	supervise_timeout_subtest
+	supervise_liveness_subtest
+	return 0
+}
+
+# 24b -- a target command that outlives its limit must be killed, and the run
+# must FAIL rather than wait.
+#
+# This is the fault the whole mechanism exists for, and the only way to stage
+# it on healthy hardware is to make a command that cannot finish: the probe
+# replaces the runtime-directory mkdir with `sleep 300` under a 3-second
+# limit. Everything after that is the real machinery -- the helper's own
+# process group, SIGTERM, the grace, SIGKILL, the verdict, exit 124, and
+# vmsync turning that into a failed run.
+#
+# The run FAILING is the pass condition, not a side effect: before this
+# existed, the same situation was a sync that never returned at all.
+supervise_timeout_subtest() {
+	local sc=supervise shim ok
+	shim="$(supervise_install_shim timeout 3s 'sleep 300')" || {
+		warn "could not install the timeout shim on $TARGET_HOST"
+		results_row "$CSV" "$sc" timeout-shim "" "" "" "" "" "" "SKIP shim install failed"
+		return 0
+	}
+
+	bench_sync "$sc" timeout -reinit -bridge-helper-path "$shim"
+
+	# Non-zero is the pass. A zero here means the command was never bounded
+	# and the sync somehow carried on regardless, which is the old behaviour.
+	if [ "$RUN_RC" != 0 ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "a target command that outlives its limit fails the run" "$ok" \
+		"the run exited 0 with a command that could not finish -- nothing bounded it"
+
+	if supervise_log_has 'outcome=timeout'; then ok=0; else ok=1; fi
+	fo_check "$sc" "the verdict reports a timeout" "$ok" "no \"outcome=timeout\" in $RUN_LOG"
+
+	# SIGTERM first is not politeness: qemu-nbd removes its own pidfile on
+	# TERM, and a SIGKILL leaves it behind for a later teardown to kill -9
+	# whatever process has since inherited the number.
+	if supervise_log_has 'signalled=TERM'; then ok=0; else ok=1; fi
+	fo_check "$sc" "the command was sent SIGTERM before anything harsher" "$ok" \
+		"no \"signalled=TERM\" in $RUN_LOG"
+
+	# Nothing of the probe may outlive it. A surviving sleep is the exact
+	# leak supervision exists to prevent, so finding one here is a finding.
+	if [ "$(ssh_host_cmd "$TARGET_HOST" "pgrep -c -f 'sleep 300' 2>/dev/null || echo 0" 2>/dev/null | tr -dc '0-9')" = 0 ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "the killed command left no process behind on the target" "$ok" \
+		"a 'sleep 300' is still running on $TARGET_HOST -- the signal reached the shell alone and not its process group"
+}
+
+# 24c -- a command that outruns one reporting interval must be audible while
+# it runs, and must say what its child is DOING.
+#
+# Unbounded on purpose (-max-runtime 0, the setting a qemu-img commit runs
+# under), so this proves the half that has no bound to rely on: the liveness
+# line. The probe lets the real command finish and then lingers past one
+# interval, so the sync still succeeds and what is being tested is only
+# whether the wait was visible.
+#
+# It costs a reporting interval of wall clock, which is why the whole stage is
+# opt-in.
+supervise_liveness_subtest() {
+	local sc=supervise shim ok beat
+	beat=$((BENCH_SUPERVISE_BEAT_WAIT))
+	shim="$(supervise_install_shim liveness 0 "\$orig; sleep $beat")" || {
+		warn "could not install the liveness shim on $TARGET_HOST"
+		results_row "$CSV" "$sc" liveness-shim "" "" "" "" "" "" "SKIP shim install failed"
+		return 0
+	}
+
+	log "   (this sub-test waits ${beat}s on purpose, for the helper's reporting interval to come round)"
+	bench_sync "$sc" liveness -reinit -bridge-helper-path "$shim"
+
+	if bench_sync_ok; then ok=0; else ok=1; fi
+	fo_check "$sc" "an unbounded target command is left alone to finish" "$ok" \
+		"exit=$RUN_RC -- a command with no runtime limit was not supposed to be signalled; see $RUN_LOG"
+
+	if supervise_log_has 'supervise alive'; then ok=0; else ok=1; fi
+	fo_check "$sc" "a command that outruns one interval reports that it is still alive" "$ok" \
+		"no \"supervise alive\" line in $RUN_LOG after ${beat}s of waiting"
+
+	# The /proc state is the field that makes the line a diagnosis rather
+	# than a pulse: D means uninterruptible I/O, which on a command that only
+	# touches the replica's storage means that storage has stopped answering.
+	if supervise_log_has 'in state'; then ok=0; else ok=1; fi
+	fo_check "$sc" "the liveness line names the child's process state" "$ok" \
+		"no \"in state\" in $RUN_LOG -- the line proves this process is alive and nothing about the command"
+}
+
 stage_pattern() {
 	case "$1" in
 	# Anchored to the named sub-tests rather than a bare ^verify- , so a
@@ -10147,6 +10442,7 @@ stage_pattern() {
 	# Stage 23 plants a bitmap in the chain's own name space on purpose, so its
 	# cleanup row is a failure of the stage and belongs to its verdict.
 	reinit-orphan) printf '^(reinit-orphan|precondition|stood-down|cleanup)$' ;;
+	supervise) printf '^(supervise|precondition)$' ;;
 	*) printf '$^' ;; # matches nothing
 	esac
 }
@@ -10188,6 +10484,7 @@ stage_number() {
 	lock-lease) printf '21' ;;
 	redefine-probe) printf '22' ;;
 	reinit-orphan) printf '23' ;;
+	supervise) printf '24' ;;
 	*) printf '?' ;;
 	esac
 }
@@ -10824,6 +11121,16 @@ generate_report() {
                         section_no_rows_note reinit-orphan "opt in with \`--stages reinit-orphan\`; it leaves a bitmap behind with no checkpoint and checks a reinit clears it without stopping the source, and needs SOURCE_HOST and TAMPER_DISK_DEV set"
                 fi
                 echo
+                echo "## Stage 24: target commands must be supervised, bounded and audible"
+                echo
+                if awk -F, 'NR>1 && $1=="supervise" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="supervise" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                else
+                        section_no_rows_note supervise "opt in with \`--stages supervise\`; it replaces one target command with one that cannot finish, so a sync fails on purpose, and it waits a full reporting interval to catch a liveness line"
+                fi
+                echo
                 echo "Full machine-readable data: \`results.csv\`. Per-run logs: \`logs/\`. Raw prometheus textfiles: \`prom/\`."
         } >"$report"
         # Only the report reads it, and a stale one left in the run directory
@@ -10899,6 +11206,7 @@ for s in "${stage_list[@]}"; do
         lock-lease) stage_lock_lease || stage_rc=$? ;;
         redefine-probe) stage_redefine_probe || stage_rc=$? ;;
         reinit-orphan) stage_reinit_orphan || stage_rc=$? ;;
+        supervise) stage_supervise || stage_rc=$? ;;
         *) die "unknown stage '$s' in --stages (want one of: $ALL_STAGES -- or the shorthands 'all' and 'all-but-matrix', which stand alone rather than inside a list)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
