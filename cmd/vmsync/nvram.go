@@ -315,7 +315,7 @@ func (w *remoteFileWriter) write(ctx context.Context, dst string, data []byte, w
 		// temp file next to a live varstore is a trap for the next person to
 		// look at that directory, and it has nothing to tell us that the
 		// hashes have not already said.
-		_, _ = w.runner.Run(ctx, "rm -f "+util.ShQuote(tmp))
+		w.removeTemp(ctx, tmp)
 		return fmt.Errorf("the varstore arrived on the target corrupted: sent sha256 %s, target holds %s", wantSum, got)
 	}
 
@@ -323,22 +323,46 @@ func (w *remoteFileWriter) write(ctx context.Context, dst string, data []byte, w
 	// wrong owner -- qemu runs as an unprivileged user and a varstore it
 	// cannot open stops the domain from starting at all. Same reasoning, and
 	// the same owner, as the replica's disks.
+	// The output of all three, not just their errors, and this is the place
+	// it costs the most to drop: none of these failures stops the sync. The
+	// varstore copy is best-effort, so the run reports success and the cost
+	// is a replica that may not boot -- found at a failover, by somebody who
+	// has only this log to work from. "invalid user" from chown (an owner
+	// that does not exist on the target) and "Operation not permitted" (a
+	// filesystem that will not take one) are the same bare exit status and
+	// completely different problems.
 	if w.owner != "" {
-		if _, err := w.runner.Run(ctx, "chown "+util.ShQuote(w.owner)+" "+util.ShQuote(tmp)); err != nil {
-			_, _ = w.runner.Run(ctx, "rm -f "+util.ShQuote(tmp))
-			return fmt.Errorf("set owner %s on the target varstore: %w", w.owner, err)
+		if out, err := w.runner.Run(ctx, "chown "+util.ShQuote(w.owner)+" "+util.ShQuote(tmp)); err != nil {
+			w.removeTemp(ctx, tmp)
+			return fmt.Errorf("set owner %s on the target varstore: %w: %s", w.owner, err, strings.TrimSpace(out))
 		}
 	}
 	// 0600: it holds Secure Boot keys and boot configuration, and libvirt
 	// creates it this way itself.
-	if _, err := w.runner.Run(ctx, "chmod 0600 "+util.ShQuote(tmp)); err != nil {
-		_, _ = w.runner.Run(ctx, "rm -f "+util.ShQuote(tmp))
-		return fmt.Errorf("set mode on the target varstore: %w", err)
+	if out, err := w.runner.Run(ctx, "chmod 0600 "+util.ShQuote(tmp)); err != nil {
+		w.removeTemp(ctx, tmp)
+		return fmt.Errorf("set mode on the target varstore: %w: %s", err, strings.TrimSpace(out))
 	}
 
-	if _, err := w.runner.Run(ctx, "mv -f "+util.ShQuote(tmp)+" "+util.ShQuote(dst)); err != nil {
-		_, _ = w.runner.Run(ctx, "rm -f "+util.ShQuote(tmp))
-		return fmt.Errorf("install the varstore at %s: %w", dst, err)
+	if out, err := w.runner.Run(ctx, "mv -f "+util.ShQuote(tmp)+" "+util.ShQuote(dst)); err != nil {
+		w.removeTemp(ctx, tmp)
+		return fmt.Errorf("install the varstore at %s: %w: %s", dst, err, strings.TrimSpace(out))
 	}
 	return nil
+}
+
+// removeTemp drops the temporary varstore a failed install leaves behind, and
+// says so when it cannot.
+//
+// Best-effort with respect to the CALLER's error, which is the one that
+// matters: replacing it with a cleanup failure would hide the cause. But not
+// silent, which is what it was. A .vmsync-tmp sitting beside a live varstore
+// is exactly the trap the corrupt-hash branch above removes it to avoid, and
+// the next person in that directory has no way to tell which of the two
+// libvirt will open.
+func (w *remoteFileWriter) removeTemp(ctx context.Context, tmp string) {
+	if out, err := w.runner.Run(ctx, "rm -f "+util.ShQuote(tmp)); err != nil {
+		trace.Warning("could not remove the temporary varstore a failed install left behind; it stays beside the live one until somebody removes it",
+			"path", tmp, "error", err, "output", strings.TrimSpace(out))
+	}
 }
