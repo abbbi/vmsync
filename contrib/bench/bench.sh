@@ -2371,7 +2371,196 @@ stage_external_snapshot() {
                         results_row "$CSV" ext-snapshot after-snapshot-result 0 "" "" "" "" "" "PASS synced+verified after snapshot removed"
                 fi
         fi
+
+        # 4e, last and on its own domain: the sub-tests above proved the
+        # tolerated case (a snapshot present, chain intact, sync carries on).
+        # This asks what happens when the bitmap's layer is gone, which is
+        # the case none of them can reach. Opt-in within the stage, because
+        # it defines and destroys a domain on the source hypervisor.
+        if [ "${BENCH_BITMAP_CHAIN_PROBE:-no}" = yes ]; then
+                log "--- 4e: PROBE -- an incremental whose bitmap left the backing chain ---"
+                bitmap_chain_probe "$(disk_source_path "$SOURCE_URI" "$SOURCE_DOMAIN" "$TAMPER_DISK_DEV")"
+        else
+                log "--- 4e: skipped (set BENCH_BITMAP_CHAIN_PROBE=yes to run it; it defines a throwaway domain on $SOURCE_HOST) ---"
+                results_row "$CSV" ext-snapshot bitmap-chain "" "" "" "" "" "" "SKIP opt in with BENCH_BITMAP_CHAIN_PROBE=yes"
+        fi
         return 0
+}
+
+# --- 4e: PROBE -- what libvirt does when a snapshot takes the bitmap away ----
+#
+# THE HAZARD, which is not the one vmsync's code was written to expect. A
+# checkpoint's dirty bitmap lives inside whichever qcow2 was live when the
+# checkpoint was taken. An external snapshot makes a NEW overlay live and
+# pushes that file down into the backing chain, so the bitmap is still
+# REACHABLE -- which is why the sub-tests above sync happily with a snapshot
+# present, and why nothing here has ever failed. The bitmap only becomes
+# unreachable when its layer leaves the chain altogether, and then the next
+# incremental has no record of what changed.
+#
+# libvirt names that case precisely, and on the pull-mode path vmsync uses:
+#
+#   VIR_ERR_CHECKPOINT_INCONSISTENT, "missing or broken bitmap '%s' for
+#   disk '%s'" -- src/qemu/qemu_backup.c, qemuBackupDiskPrepareOneBitmaps
+#
+# vmsync recognises nothing of the sort today, so the symptom is a sync that
+# fails with a raw libvirt error and no statement that the remedy is -reinit.
+#
+# ON A THROWAWAY DOMAIN, not the bench source, and that is the whole design
+# of this sub-test. The only reliable way to drop a layer out of a live
+# chain is blockpull, which leaves the domain running on the overlay for
+# good -- precisely the state the cleanup above calls damage and refuses to
+# carry into later stages. So this builds its own domain, breaks that, and
+# destroys it.
+#
+# A PROBE in stage 22's sense: it asks libvirt a question rather than
+# grading vmsync. The assertion is behavioural -- the incremental backup must
+# FAIL -- because the message arrives in libvirtd's own locale and this
+# harness cannot depend on its wording. What libvirt actually said is printed
+# as evidence either way, which is what the code-side guard will be written
+# from.
+BMPROBE_DOMAIN="vmsync-bench-bmprobe"
+BMPROBE_PREFIX="vmsync-bench-bmprobe"
+# Outside the bench's own 10809-10908/20809-21008 spans, so a probe backup
+# server cannot collide with a sync that is running beside it.
+BMPROBE_PORT="${BMPROBE_PORT:-10999}"
+
+# bmprobe_cleanup DIR -- removes the throwaway domain and its files.
+#
+# Unconditional and idempotent: every exit from the probe runs it, including
+# the ones that failed half way, because a leftover paused domain on a
+# hypervisor is somebody's confusing morning.
+bmprobe_cleanup() {
+	local dir="$1"
+	[ "$DRY_RUN" = yes ] && return 0
+	virsh_uri "$SOURCE_URI" destroy "$BMPROBE_DOMAIN" >/dev/null 2>&1 || true
+	virsh_uri "$SOURCE_URI" undefine "$BMPROBE_DOMAIN" --snapshots-metadata --checkpoints-metadata >/dev/null 2>&1 || true
+	run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "rm -f '${dir}/${BMPROBE_PREFIX}'*" >/dev/null 2>&1 || true
+}
+
+bitmap_chain_probe() {
+	local sc=ext-snapshot ok dir disk xml out rc state
+	dir="$(dirname "$1")"
+
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" "$sc" bitmap-chain DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+
+	# Anything left from an interrupted previous run, before anything else:
+	# a stale definition makes `define` fail and the whole probe read as a
+	# libvirt problem rather than as leftovers.
+	bmprobe_cleanup "$dir"
+	trap 'bmprobe_cleanup "$dir"' RETURN
+
+	disk="${dir}/${BMPROBE_PREFIX}.qcow2"
+	if ! run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "qemu-img create -f qcow2 '$disk' 64M" >/dev/null 2>&1; then
+		warn "SKIP 4e: could not create the probe disk at $disk on $SOURCE_HOST"
+		results_row "$CSV" "$sc" bitmap-chain "" "" "" "" "" "" "SKIP probe disk not creatable"
+		return 0
+	fi
+
+	# type='kvm' to match what this host actually runs; the guest never
+	# executes anything, so the accelerator is irrelevant to the result.
+	# Started PAUSED on purpose: a checkpoint needs an ACTIVE domain, and a
+	# domain with no bootable disk that is allowed to run will reset or exit
+	# and take the probe with it.
+	xml="${dir}/${BMPROBE_PREFIX}.xml"
+	run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "cat > '$xml' <<'BMPROBE_XML_EOF'
+<domain type='kvm'>
+  <name>${BMPROBE_DOMAIN}</name>
+  <memory unit='MiB'>128</memory>
+  <vcpu>1</vcpu>
+  <os><type arch='x86_64'>hvm</type></os>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='${disk}'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+  </devices>
+</domain>
+BMPROBE_XML_EOF" >/dev/null 2>&1 || true
+
+	if ! out="$(virsh_uri "$SOURCE_URI" define "$xml" 2>&1)"; then
+		warn "SKIP 4e: could not define the probe domain: $out"
+		results_row "$CSV" "$sc" bitmap-chain "" "" "" "" "" "" "SKIP probe domain not definable"
+		return 0
+	fi
+	if ! out="$(virsh_uri "$SOURCE_URI" start --paused "$BMPROBE_DOMAIN" 2>&1)"; then
+		warn "SKIP 4e: could not start the probe domain paused: $out"
+		results_row "$CSV" "$sc" bitmap-chain "" "" "" "" "" "" "SKIP probe domain not startable"
+		return 0
+	fi
+	state="$(dom_state "$SOURCE_URI" "$BMPROBE_DOMAIN")"
+	log "   EVIDENCE: probe domain $BMPROBE_DOMAIN is '$state' on a throwaway 64M disk"
+
+	# 1. a checkpoint, whose bitmap goes into the file that is live now.
+	run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "cat > '${dir}/${BMPROBE_PREFIX}-cpt.xml' <<'BMPROBE_CPT_EOF'
+<domaincheckpoint><name>${BMPROBE_PREFIX}-cpt1</name><disks><disk name='vda' checkpoint='bitmap'/></disks></domaincheckpoint>
+BMPROBE_CPT_EOF" >/dev/null 2>&1 || true
+	if ! out="$(virsh_uri "$SOURCE_URI" checkpoint-create "$BMPROBE_DOMAIN" --xmlfile "${dir}/${BMPROBE_PREFIX}-cpt.xml" 2>&1)"; then
+		warn "SKIP 4e: this libvirt would not create a checkpoint on the probe domain: $out"
+		results_row "$CSV" "$sc" bitmap-chain "" "" "" "" "" "" "SKIP checkpoint not creatable on probe"
+		return 0
+	fi
+	log "   EVIDENCE: checkpoint ${BMPROBE_PREFIX}-cpt1 created; its bitmap is in $disk"
+
+	# 2. an external snapshot, which makes an overlay live and pushes the
+	#    bitmap's file down into the backing chain -- still reachable.
+	if ! out="$(virsh_uri "$SOURCE_URI" snapshot-create-as --domain "$BMPROBE_DOMAIN" --name "${BMPROBE_PREFIX}-snap" --disk-only --atomic 2>&1)"; then
+		warn "SKIP 4e: could not take an external snapshot of the probe domain: $out"
+		results_row "$CSV" "$sc" bitmap-chain "" "" "" "" "" "" "SKIP snapshot not creatable on probe"
+		return 0
+	fi
+	log "   EVIDENCE: live disk is now $(disk_source_path "$SOURCE_URI" "$BMPROBE_DOMAIN" vda), backed by $disk"
+
+	# 3. blockpull, which flattens the backing file INTO the overlay and
+	#    drops it from the chain. This is the step that loses the bitmap, and
+	#    the reason this runs on a domain nobody needs afterwards.
+	if ! out="$(virsh_uri "$SOURCE_URI" blockpull "$BMPROBE_DOMAIN" vda --wait --verbose 2>&1)"; then
+		warn "SKIP 4e: blockpull did not complete on the probe domain, so the bitmap's layer is still in the chain and the probe would prove nothing: $out"
+		results_row "$CSV" "$sc" bitmap-chain "" "" "" "" "" "" "SKIP blockpull did not complete"
+		return 0
+	fi
+	log "   EVIDENCE: after blockpull the chain is $(disk_source_path "$SOURCE_URI" "$BMPROBE_DOMAIN" vda) with no backing file -- the bitmap's layer is gone"
+
+	# 4. the question: an incremental PULL backup against that checkpoint,
+	#    which is exactly the call vmsync makes every incremental sync.
+	run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "cat > '${dir}/${BMPROBE_PREFIX}-backup.xml' <<'BMPROBE_BK_EOF'
+<domainbackup mode='pull' incremental='${BMPROBE_PREFIX}-cpt1'>
+  <server transport='tcp' name='127.0.0.1' port='${BMPROBE_PORT}'/>
+  <disks>
+    <disk name='vda' backup='yes' type='file'>
+      <scratch file='${dir}/${BMPROBE_PREFIX}-scratch.qcow2'/>
+    </disk>
+  </disks>
+</domainbackup>
+BMPROBE_BK_EOF" >/dev/null 2>&1 || true
+	out="$(virsh_uri "$SOURCE_URI" backup-begin "$BMPROBE_DOMAIN" --backupxml "${dir}/${BMPROBE_PREFIX}-backup.xml" 2>&1)"
+	rc=$?
+	log "   EVIDENCE: backup-begin rc=$rc, libvirt said: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
+
+	# Behavioural, not textual: the message arrives in libvirtd's locale.
+	# A SUCCESS here is the finding worth having -- it would mean this
+	# libvirt reconstructs or tolerates a bitmap whose layer has gone, and
+	# that the hazard does not exist on this host.
+	if [ "$rc" != 0 ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "an incremental backup refuses a checkpoint whose bitmap left the chain" "$ok" \
+		"backup-begin SUCCEEDED with the bitmap's layer flattened away -- this libvirt does not treat that as inconsistent, so the hazard is not reachable here"
+	if [ "$rc" = 0 ]; then
+		# It started a job. Leave nothing running on the hypervisor.
+		virsh_uri "$SOURCE_URI" domjobabort "$BMPROBE_DOMAIN" >/dev/null 2>&1 || true
+	fi
+
+	# Reported, never asserted: "bitmap" survives untranslated in libvirt's
+	# French catalogue, so matching it would pass on one host and fail on
+	# another for no reason that concerns vmsync.
+	case "$out" in
+	*bitmap*|*Bitmap*) log "   EVIDENCE: the message names a bitmap, so a code-side guard can key on VIR_ERR_CHECKPOINT_INCONSISTENT with confidence" ;;
+	*) log "   EVIDENCE: the message does NOT mention a bitmap; record it before writing any guard against it" ;;
+	esac
+	return 0
 }
 
 # --- Stage 5: DefineDomain redefine/rollback coverage -----------------------
@@ -10918,7 +11107,7 @@ generate_report() {
                 # same as "this did not run". Capturing also keeps the row
                 # filter in ONE place -- a guard with its own copy drifts.
                 local snapshot_rows
-                snapshot_rows="$(awk -F, "$REPORT_AWK"'NR>1 && $1=="ext-snapshot" { printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), $2, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV")"
+                snapshot_rows="$(awk -F, "$REPORT_AWK"'NR>1 && $1=="ext-snapshot" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV")"
                 if [ -n "$snapshot_rows" ]; then
                         echo "| result | phase | exit | wall (s) | detail | log |"
                         echo "|---|---|---|---|---|---|"
