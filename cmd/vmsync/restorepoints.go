@@ -795,8 +795,14 @@ func runCloneRestorePoint(ctx context.Context, cfg syncConfig, tagName, dest str
 	// produces disks somebody may well go on to boot, and a chain of
 	// root-owned directories above them is the same trap. Directories that
 	// already exist are left exactly as they are.
-	if _, err := client.Run(ctx, util.MkdirOwnedCommand(targetDirOwner(ctx, client, cfg), dest)); err != nil {
-		return fmt.Errorf("create %s on the target: %w", dest, err)
+	// The output, not just the error, for the reason the identical call in
+	// main.go gives: MkdirOwnedCommand silences its per-component mkdirs on
+	// purpose and leaves the final one un-silenced so it can report a real
+	// problem in its own words. Discarded, the caller is told the path and
+	// nothing else -- not that the filesystem is read-only, that a parent is
+	// a file, or that an NFS mount squashed the chown.
+	if out, err := client.Run(ctx, util.MkdirOwnedCommand(targetDirOwner(ctx, client, cfg), dest)); err != nil {
+		return fmt.Errorf("create %s on the target: %w: %s", dest, err, strings.TrimSpace(out))
 	}
 	for _, name := range status.Disks {
 		// A bare name, checked before it is joined onto either end. These come
@@ -813,8 +819,17 @@ func runCloneRestorePoint(ctx context.Context, cfg syncConfig, tagName, dest str
 		if err != nil {
 			return err
 		}
-		if _, err := client.Run(ctx, clone); err != nil {
-			return fmt.Errorf("clone %s from restore point %s: %w", name, tag, err)
+		// The output, not just the error, and this is the site where it costs
+		// the most. CloneCommand uses cp --reflink=auto precisely because
+		// -clone-to may be on another filesystem, where it falls back to a
+		// full byte copy -- so running out of space is the designed-for
+		// failure here, and `cp: error writing '...': No space left on
+		// device` is the whole diagnosis. Discarded, an operator cloning a
+		// restore point mid-incident is told only that a copy exited
+		// non-zero, and finishAction persists that reasonless string into
+		// the journal for -explain-domain to repeat afterwards.
+		if out, err := client.Run(ctx, clone); err != nil {
+			return fmt.Errorf("clone %s from restore point %s: %w: %s", name, tag, err, strings.TrimSpace(out))
 		}
 		trace.Info("cloned a restore point disk", "disk", name, "to", to)
 	}
