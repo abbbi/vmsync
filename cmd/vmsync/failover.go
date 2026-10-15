@@ -171,6 +171,29 @@ func runPromote(ctx context.Context, cfg syncConfig) (runErr error) {
 	}
 	defer lock.Close()
 
+	// Stamp who holds it, for the reason this function has just demonstrated
+	// twelve lines up: the refusal above answers "who has this lock?" with
+	// DescribeLockHolder, and that answer comes from this stamp. Taking the
+	// lock without writing one left a promote attributable to nobody -- so a
+	// sync or a restore blocked by a promote in progress was told the holder
+	// was unattributable, and a -break-target-lock run was left to hunt the
+	// sshd session by hand.
+	//
+	// Worse than nothing, in fact: acquisition never truncates the file, so a
+	// previous holder's stamp survives underneath this one. The blocked
+	// caller is then shown a DEAD process's identity and told the lock is
+	// stale, while a live promotion holds it.
+	//
+	// Best-effort, as everywhere else this is written: provenance, not
+	// correctness, and refusing to promote during a disaster because a
+	// diagnostic could not be written would be the wrong trade.
+	if err := util.WriteRunLockIdentity(lock, util.NewRunLockIdentity("promote", cfg.SourceDomain,
+		util.ReplicaHost(cfg.TargetURI, cfg.LocalHostName)+":"+cfg.TargetDomain,
+		cfg.ActionID, time.Now().Unix())); err != nil {
+		trace.Warning("could not record this promotion's identity in the target run lock; anything blocked by it will be told the holder is unattributable",
+			"vm", cfg.TargetDomain, "error", err)
+	}
+
 	mgr, err := libvirtsync.Connect(cfg.TargetURI)
 	if err != nil {
 		return fmt.Errorf("connect to libvirt at %s: %w", cfg.TargetURI, err)

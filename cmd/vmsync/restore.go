@@ -252,16 +252,40 @@ func restoreRootFor(cfg syncConfig, plan restorePlan) (replicaDir string, store 
 // being excluded is a sync writing the very disks about to be replaced.
 func acquireTargetRunLock(ctx context.Context, cfg syncConfig, runner remoteRunner) (io.Closer, error) {
 	key := targetLockKey(cfg.TargetDomain)
+	identity := util.NewRunLockIdentity("restore", cfg.SourceDomain,
+		util.ReplicaHost(cfg.TargetURI, cfg.LocalHostName)+":"+cfg.TargetDomain,
+		cfg.ActionID, time.Now().Unix())
 	if holder, ok := runner.(util.CommandHolder); ok {
 		return util.AcquireRemoteRunLock(ctx, holder, runLockDir, key, util.RemoteLockOptions{
 			HelperPath: cfg.BridgeHelperPath,
-			Identity: util.NewRunLockIdentity("restore", cfg.SourceDomain,
-				util.ReplicaHost(cfg.TargetURI, cfg.LocalHostName)+":"+cfg.TargetDomain,
-				cfg.ActionID, time.Now().Unix()),
+			Identity:   identity,
 		})
 	}
-	// Local: the same flock the source-side lock in main() uses.
-	return util.AcquireRunLock(runLockDir, key)
+	// Local: the same flock the source-side lock in main() uses, and the same
+	// stamp -- hoisted above the branch because both sides need it and only
+	// one was writing it.
+	//
+	// Unstamped, this lock is attributable to nobody, and the file is not
+	// empty either: acquisition never truncates, so a predecessor's stamp
+	// survives underneath a new holder. What -break-target-lock and
+	// DescribeLockHolder then read is a DEAD process's identity while a live
+	// restore holds the lock -- so an operator blocked by this restore is
+	// told the lock is stale and pointed at the verb that breaks it, which
+	// would unlink the lock from under the restore and let a sync overwrite
+	// the disks it is rolling back.
+	//
+	// Best-effort for the reason main()'s copy gives: this is provenance,
+	// not correctness, and refusing a restore because a diagnostic could not
+	// be written would be the wrong trade.
+	f, err := util.AcquireRunLock(runLockDir, key)
+	if err != nil {
+		return nil, err
+	}
+	if err := util.WriteRunLockIdentity(f, identity); err != nil {
+		trace.Warning("could not record this restore's identity in the target run lock; anything blocked by it will be told the holder is unattributable",
+			"vm", cfg.TargetDomain, "error", err)
+	}
+	return f, nil
 }
 
 // checkRestoreTargetState answers the two questions that refuse a restore
