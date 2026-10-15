@@ -4133,19 +4133,33 @@ func run(cfg syncConfig) (runErr error) {
 	// fast local link, purely because bridging is where that binary was
 	// historically needed. Asking the target directly costs two cheap SSH
 	// commands per run and answers the actual question.
+	// targetHelper is the one answer to "does this target have a usable
+	// helper", and it is deliberately wider than the integrity check that
+	// used to own the question. Two things turn on it now: the digests, and
+	// whether the commands this run issues on the target are SUPERVISED --
+	// which has nothing to do with checksums, and must not quietly switch
+	// off with -no-checksum. So the probe runs on every path and the
+	// checksum decision is derived from it rather than the reverse.
+	//
+	// The cost is two cheap SSH commands on a -no-checksum run, which asked
+	// the target nothing at all before.
+	var targetHelper nbdbridge.HelperStatus
 	checksumEnabled := false
 	switch {
 	case cfg.NoChecksum:
+		targetHelper = nbdbridge.ProbeHelper(ctx, targetSSHClient, bridgeCfg, targetSSHConfig.Address)
 		trace.Info("checksum: pre-commit integrity check disabled by -no-checksum")
 	case bridgeCfg.Enabled():
 		// nbdbridge.CheckRemote below hard-fails on a helper that is missing
 		// or version-mismatched, so on a bridged run there is nothing to
 		// probe for: either the helper is good or the run does not proceed.
 		// Skipping the probe here avoids asking the same two questions twice.
+		targetHelper = nbdbridge.HelperStatus{Present: true, Usable: true}
 		checksumEnabled = true
 		trace.Info("checksum: pre-commit integrity check enabled", "algo", blockdigest.DefaultAlgo, "helper", cfg.BridgeHelperPath)
 	default:
-		st := nbdbridge.ProbeHelper(ctx, targetSSHClient, bridgeCfg, targetSSHConfig.Address)
+		targetHelper = nbdbridge.ProbeHelper(ctx, targetSSHClient, bridgeCfg, targetSSHConfig.Address)
+		st := targetHelper
 		if !st.Usable {
 			// Refused, not degraded. The integrity check is on by default, so a
 			// run that did not pass -no-checksum asked for it, and a missing or
@@ -4165,6 +4179,28 @@ func run(cfg syncConfig) (runErr error) {
 		}
 		checksumEnabled = true
 		trace.Info("checksum: pre-commit integrity check enabled", "algo", blockdigest.DefaultAlgo, "helper", cfg.BridgeHelperPath, "helper_version", st.Version)
+	}
+
+	// Whether the commands this run issues on the target are supervised,
+	// said once, every run, because its absence is otherwise invisible
+	// precisely when it matters.
+	//
+	// Supervised, the helper runs each command in its own process group,
+	// reports every minute while it runs, and can signal it. Unsupervised,
+	// a command that never returns parks this run for as long as it takes:
+	// sshd goes on answering keepalives because sshd does not touch the
+	// disk, so nothing here notices, while the target's run lock stays held
+	// and the source's libvirt backup job stays open. A log that did not
+	// say which of the two this run was leaves nobody able to tell that
+	// afterwards.
+	superviseTargetCommands := targetHelper.Usable
+	if superviseTargetCommands {
+		trace.Debug("target commands are supervised by the helper", "host", util.HostFromURIOrLocal(cfg.TargetURI), "helper", cfg.BridgeHelperPath)
+	} else {
+		trace.Warning("target commands run UNSUPERVISED: no usable vmsync-bridge-helper on the target, so a command that wedges on the target's storage cannot be bounded or signalled from here and will park this run indefinitely, holding the target's run lock and the source's backup job",
+			"host", util.HostFromURIOrLocal(cfg.TargetURI), "helper", cfg.BridgeHelperPath,
+			"reason", targetHelper.Reason,
+			"remedy", "deploy a matching vmsync-bridge-helper at "+cfg.BridgeHelperPath+" on the target")
 	}
 
 	// Add a metric that allows us to track whether checksum was performed
@@ -5606,13 +5642,46 @@ func run(cfg syncConfig) (runErr error) {
 	// runTargetCommand only ever touches ctx/targetSSHClient, both already
 	// fixed for the rest of run() by this point -- shared as-is by
 	// copyAndStage and runVerify instead of being redefined in each.
-	runTargetCommand := func(command, action string) error {
+	// runTargetCommandWithin runs one command on the target.
+	//
+	// maxRuntime is how long it may take before the helper signals it, and ZERO
+	// MEANS UNBOUNDED -- which is what most of these get, deliberately. See
+	// targetCommandMaxRuntime for which commands are safe to abandon and why so
+	// few of them are.
+	//
+	// Supervised when the target has a usable helper, which is decided once
+	// per run (see superviseTargetCommands). The helper runs the command in
+	// its own process group, reports every minute while it runs, and can
+	// signal it -- none of which is possible from this side, because a
+	// cancelled context here only stops this process LISTENING: the command
+	// would keep running, and a qemu-nbd that unwedged an hour later would
+	// bind a port this run has long since released.
+	//
+	// Unsupervised, the old path: no bound, no progress, and a wedged
+	// target's storage parks the run. The capability line above says which
+	// of the two happened, every run.
+	runTargetCommandWithin := func(maxRuntime time.Duration, command, action string) error {
 		trace.Debug(command)
-		out, err := targetSSHClient.Run(ctx, command)
+		if !superviseTargetCommands {
+			out, err := targetSSHClient.Run(ctx, command)
+			if err != nil {
+				return fmt.Errorf("%s: %w: %s", action, err, out)
+			}
+			return nil
+		}
+		out, err := runSupervisedTargetCommand(ctx, targetSSHClient, cfg.BridgeHelperPath, maxRuntime, command, action)
 		if err != nil {
 			return fmt.Errorf("%s: %w: %s", action, err, out)
 		}
 		return nil
+	}
+
+	// runTargetCommand is the default: supervised when it can be, and never
+	// signalled. Everything that cannot prove it is safe to abandon uses
+	// this, so the gain is the per-minute liveness line and the diagnosis it
+	// carries, with no new way to leave a half-finished command behind.
+	runTargetCommand := func(command, action string) error {
+		return runTargetCommandWithin(0, command, action)
 	}
 
 	// Created once, here, because every export below puts its socket or its
@@ -5627,7 +5696,11 @@ func run(cfg syncConfig) (runErr error) {
 	// mkdir -p, so a second concurrent run against another domain on the same
 	// target host does not race this one -- and so the directory surviving
 	// from an earlier run costs nothing.
-	if err := runTargetCommand("mkdir -p -m 0700 "+util.ShQuote(cfg.TargetRuntimeDir),
+	// Budgeted: creating a directory under the runtime dir touches no
+	// replica storage and either returns at once or is stuck on a target
+	// whose filesystem has stopped answering -- and nothing is left behind
+	// to clean up if it is abandoned.
+	if err := runTargetCommandWithin(targetCommandMaxRuntime, "mkdir -p -m 0700 "+util.ShQuote(cfg.TargetRuntimeDir),
 		fmt.Sprintf("create the target runtime directory %s", cfg.TargetRuntimeDir)); err != nil {
 		return err
 	}
@@ -5647,7 +5720,8 @@ func run(cfg syncConfig) (runErr error) {
 	// guest offset. Nor is dd -- see injectTestCorruption for why a
 	// file-offset write into a qcow2 tests something else entirely.
 	if cfg.TestFault == libvirtsync.TestFaultCorruptBeforeChecksum || cfg.TestFault == libvirtsync.TestFaultCorruptAfterCommit {
-		if err := runTargetCommand("command -v qemu-io >/dev/null 2>&1", "checking for qemu-io on the target"); err != nil {
+		// Budgeted: a pure probe, writing nothing.
+		if err := runTargetCommandWithin(targetCommandMaxRuntime, "command -v qemu-io >/dev/null 2>&1", "checking for qemu-io on the target"); err != nil {
 			return fmt.Errorf("-test=%s needs qemu-io on the target host to inject its fault, and it is not there: %w -- install it (qemu-utils on Debian/Ubuntu, qemu-kvm-tools or the qemu-img package on RHEL). Refused before the copy rather than after it",
 				cfg.TestFault, err)
 		}
@@ -5734,57 +5808,25 @@ func run(cfg syncConfig) (runErr error) {
 		// quiet for longer than the helper's own reporting period, so the two
 		// together cost one line a minute rather than two -- see
 		// targetDigestQuietGrace for why that slack is not optional.
-		var heardMu sync.Mutex
-		lastHeard := start
-		lastLine := ""
-		heardAny := false
-		gaveUp := false
+		// The silence bound, shared with every other wait on this helper --
+		// see helperWatch, which owns the rule and the derived context it
+		// cancels.
+		watch := watchHelperSilence(ctx, func(quiet, elapsed time.Duration) {
+			trace.Info("checksum: still waiting for the target's digest", "disk", dev,
+				"elapsed", elapsed.Round(time.Second).String(),
+				"silent_for", quiet.Round(time.Second).String())
+		})
+		defer watch.stop()
 		onLine := func(line string) {
-			heardMu.Lock()
-			lastHeard = time.Now()
-			lastLine = line
-			heardAny = true
-			heardMu.Unlock()
+			watch.heard(line)
 			trace.Info("checksum: target: "+line, "disk", dev)
 		}
-		// Derived and scoped to this one call, and NEVER the run's own
-		// cancel: abandoning the digest has to leave everything else working,
-		// because the first thing that happens afterwards is the target-side
-		// export being torn down over this same SSH connection. Cancelling
-		// the run ctx would make that teardown a no-op and trade a bounded
-		// wait for a live export with an abandoned helper still attached.
-		digestCtx, abandonDigest := context.WithCancel(ctx)
-		defer abandonDigest()
-		waitDone := make(chan struct{})
-		go func() {
-			t := time.NewTicker(trace.ProgressInterval)
-			defer t.Stop()
-			quietFor := func(now time.Time) time.Duration {
-				heardMu.Lock()
-				defer heardMu.Unlock()
-				return now.Sub(lastHeard)
-			}
-			remark := func(quiet time.Duration) {
-				trace.Info("checksum: still waiting for the target's digest", "disk", dev,
-					"elapsed", time.Since(start).Round(time.Second).String(),
-					"silent_for", quiet.Round(time.Second).String())
-			}
-			if trace.QuietWatch(waitDone, t.C, quietFor, targetDigestQuietGrace, targetDigestStallBound, remark) {
-				heardMu.Lock()
-				gaveUp = true
-				heardMu.Unlock()
-				abandonDigest()
-			}
-		}()
-		stdout, stderr, err := targetSSHClient.RunWithInputProgress(digestCtx, helperCmd, request.Bytes(), onLine)
-		close(waitDone)
+		stdout, stderr, err := targetSSHClient.RunWithInputProgress(watch.ctx, helperCmd, request.Bytes(), onLine)
 		if err != nil {
 			// Read inside the error branch, never beside it: a response that
 			// lands in the same instant as the cancellation returns no error,
 			// and must be used rather than discarded as a stall.
-			heardMu.Lock()
-			stalled, last, heard, quiet := gaveUp, lastLine, heardAny, time.Since(lastHeard)
-			heardMu.Unlock()
+			stalled, last, heard, quiet, elapsed := watch.verdict()
 			if stalled {
 				// vmsync's own witness, because there is no other: the
 				// cancellation path in RunWithInputProgress returns neither
@@ -5792,7 +5834,7 @@ func run(cfg syncConfig) (runErr error) {
 				// last words exist only here.
 				trace.Error("checksum: giving up on the target's digest", "disk", dev,
 					"via", nbdAddr, "helper", cfg.BridgeHelperPath,
-					"elapsed", time.Since(start).Round(time.Second).String(),
+					"elapsed", elapsed.Round(time.Second).String(),
 					"silent_for", quiet.Round(time.Second).String(),
 					"bound", targetDigestStallBound.String(),
 					"heard_anything", heard, "last_line", last)
@@ -5802,7 +5844,7 @@ func run(cfg syncConfig) (runErr error) {
 				// an estate's default-on integrity check off to work around
 				// one broken target.
 				return nil, fmt.Errorf("checksum: the target stopped reporting on %s: nothing from %s for %s (bound %s, %s elapsed) -- the helper beats once per %s while it works, so silence this long means it or its output channel is gone; check the target host and that export",
-					dev, cfg.BridgeHelperPath, quiet.Round(time.Second), targetDigestStallBound, time.Since(start).Round(time.Second), trace.ProgressInterval)
+					dev, cfg.BridgeHelperPath, quiet.Round(time.Second), targetDigestStallBound, elapsed.Round(time.Second), trace.ProgressInterval)
 			}
 			return nil, fmt.Errorf("checksum: run %s on the target for %s: %w%s -- pass -no-checksum to run without digest checks if the helper is not deployed there yet",
 				cfg.BridgeHelperPath, dev, err, formatRemoteStderr(stderr))
@@ -6065,7 +6107,12 @@ func run(cfg syncConfig) (runErr error) {
 			util.ShQuote(pidFile) +
 			" " +
 			util.ShQuote(imagePath)
-		if err := runTargetCommand(startCmd, fmt.Sprintf("start read-only checksum export for %s", imagePath)); err != nil {
+		// Budgeted, and alone among the export starts in being so: this
+		// one is preceded by the argv-matched /proc reclaim just above and
+		// backed by a stop command that matches on argv rather than on a
+		// pidfile, so an abandoned start is found and killed by the next
+		// attempt. The write and verify exports have neither yet.
+		if err := runTargetCommandWithin(targetCommandMaxRuntime, startCmd, fmt.Sprintf("start read-only checksum export for %s", imagePath)); err != nil {
 			return err
 		}
 

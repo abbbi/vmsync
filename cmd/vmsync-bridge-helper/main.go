@@ -47,9 +47,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -165,6 +167,15 @@ func main() {
 	holdRunLockPath := flag.String("hold-run-lock", "", "Hold vmsync's target-side run lock on this path until stdin goes quiet, instead of running the bridge relay. Prints "+util.RemoteLockReady+" once held, then releases the lock if no heartbeat line arrives within -lock-lease. -listen/-connect are not used")
 	lockLease := flag.Duration("lock-lease", 90*time.Second, "With -hold-run-lock: how long the lock survives silence from the driver. vmsync beats at a third of this, so two lost beats do not release a lock whose driver is healthy")
 	lockStamp := flag.String("lock-stamp", "", "With -hold-run-lock: provenance to record in the lock file, as the JSON of a run lock identity. Read by whoever has to decide whether breaking the lock is safe; the pid and boot id in it are filled in by this process, which is the only one that knows them")
+	// Supervision is what this binary does when nothing else is asked for:
+	// read one shell command from stdin, run it under a runtime limit, and report
+	// what became of it. There is no -supervise flag because every caller
+	// would pass it -- see chooseHelperMode in mode.go, and supervise.go for
+	// why running a command through a process on this host is worth doing at
+	// all.
+	superviseMaxRuntime := flag.Duration("max-runtime", 0, "How long a supervised command may run before it is sent SIGTERM, then SIGKILL after -kill-grace. ZERO MEANS UNBOUNDED, which is a deliberate setting and not an oversight: a command that must never be abandoned part-way (qemu-img commit, whose base image would be left in an undescribable state) still gets the per-minute liveness line, so a hang is audible even where it must not be interrupted")
+	superviseGrace := flag.Duration("kill-grace", defaultSuperviseGrace, "How long a signalled command has to honour SIGTERM before SIGKILL, and then how long to wait for a killed command to be reaped before reporting that it was not. A process wedged in uninterruptible I/O is never reaped, and saying so is more useful than waiting for it")
+	superviseLabel := flag.String("label", "", "What to call a supervised command in the liveness line. The command itself is never logged here -- it is already in the caller's log, and repeating it every minute would bury the fields that change")
 	showVersion := flag.Bool("v", false, "Show version and exit")
 	showVersionLong := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
@@ -186,15 +197,34 @@ func main() {
 		os.Exit(2)
 	}
 
-	if *holdRunLockPath != "" {
+	// Decided once, here, and then only tested below -- see chooseHelperMode
+	// for the precedence and for why supervising is what happens when
+	// nothing else was asked for.
+	mode := chooseHelperMode(helperModeRequest{
+		HoldRunLock:     *holdRunLockPath != "",
+		Checksum:        *checksumMode,
+		Relay:           relayFlagsGiven(),
+		StdinIsTerminal: stdinIsTerminal(),
+	})
+
+	if mode == modeUsage {
+		// A person who typed the name of this binary and nothing else. Not a
+		// supervision: reading their keyboard for a command they do not know
+		// they owe us is indistinguishable from a hang.
+		fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: nothing to do. With no mode flag this binary supervises one shell command read from stdin, and stdin is a terminal here -- pipe the command in, or pass -listen/-connect to relay, -checksum to hash an export, or -hold-run-lock to hold the target lock.")
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	if mode == modeLock {
 		// Refused rather than ignored, for the same reason -checksum refuses
 		// the relay flags below: a caller that passed both has a wrong idea of
 		// what this process will do, and doing the other thing silently is how
 		// that stays undiscovered. Here it matters more than usual -- a caller
 		// that thinks it holds a lock and does not would run concurrently with
 		// whoever really does.
-		if *listenAddr != "" || *connectAddr != "" || *checksumMode {
-			fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -hold-run-lock holds a lock and does nothing else, so -listen/-connect/-checksum must not be given with it")
+		if *listenAddr != "" || *connectAddr != "" || *checksumMode || supervisionFlagsGiven() {
+			fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -hold-run-lock holds a lock and does nothing else, so -listen/-connect/-checksum and the supervision flags (-max-runtime/-kill-grace/-label) must not be given with it")
 			os.Exit(2)
 		}
 		err := holdRunLock(runLockConfig{
@@ -214,13 +244,13 @@ func main() {
 		os.Exit(code)
 	}
 
-	if *checksumMode {
+	if mode == modeChecksum {
 		// Refuse the mixed invocation rather than quietly ignoring the
 		// relay flags. A caller that passed -listen alongside -checksum has
 		// a wrong idea of what this process will do, and silently doing the
 		// other thing is how that stays undiscovered.
-		if *listenAddr != "" || *connectAddr != "" {
-			fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -checksum runs one checksum pass and never relays, so -listen/-connect must not be given with it")
+		if *listenAddr != "" || *connectAddr != "" || supervisionFlagsGiven() {
+			fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -checksum runs one checksum pass and never relays, so -listen/-connect and the supervision flags (-max-runtime/-kill-grace/-label) must not be given with it")
 			os.Exit(2)
 		}
 		if *checksumNBD == "" {
@@ -244,6 +274,41 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	}
+
+	if mode == modeSupervise {
+		// No refusal of the other modes' flags here, unlike the three blocks
+		// above: this mode is reached only when none of them was named, so
+		// there is nothing left to refuse. chooseHelperMode is where that is
+		// decided, and its table test is what keeps it true.
+		//
+		// The command arrives on stdin, never in argv. Over SSH an argv
+		// would be quoted twice -- once by the caller for the remote shell,
+		// once again here -- and every one of these commands contains paths
+		// and shell operators. One stream, no quoting.
+		raw, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: could not read the command from stdin: %v\n", err)
+			os.Exit(util.ExitSuperviseFailed)
+		}
+		command := strings.TrimSpace(string(raw))
+		if command == "" {
+			fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: read an empty command from stdin, so there is nothing to supervise. Pipe a shell command in, or name a mode: -listen/-connect to relay, -checksum to hash an export, -hold-run-lock to hold the target lock.")
+			os.Exit(2)
+		}
+		label := *superviseLabel
+		if label == "" {
+			label = "an unnamed command"
+		}
+		res := runSupervise(superviseConfig{
+			MaxRuntime: *superviseMaxRuntime,
+			Grace:      *superviseGrace,
+			Label:      label,
+			// stderr, never stdout: stdout carries the command's own output
+			// verbatim, and the caller puts that in the error it reports.
+			Progress: os.Stderr,
+		}, command, os.Stdout)
+		os.Exit(res.ExitCode)
 	}
 
 	if *listenAddr == "" {

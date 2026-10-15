@@ -89,47 +89,39 @@ func TestTargetDigestLadderHoldsTogether(t *testing.T) {
 // MUTATION CAUGHT: passing ctx to RunWithInputProgress, which is exactly the
 // simplification the extra variable invites once its purpose is forgotten.
 func TestTargetDigestWaitRunsOnADerivedContext(t *testing.T) {
-	const file = "main.go"
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, file, nil, 0)
-	if err != nil {
-		t.Fatalf("parse %s: %v", file, err)
-	}
-
 	calls := 0
-	ast.Inspect(f, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
+	for _, file := range []string{"main.go", "supervisedcmd.go"} {
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "RunWithInputProgress" {
+				return true
+			}
+			calls++
+			if len(call.Args) == 0 {
+				t.Errorf("%s: RunWithInputProgress called with no context at all", fset.Position(call.Pos()))
+				return true
+			}
+			// Anything derived is acceptable; the run's own ctx is not. Both
+			// waits take it from a helperWatch, which is what cancels it.
+			if id, ok := call.Args[0].(*ast.Ident); ok && id.Name == "ctx" {
+				t.Errorf("%s: this wait on the helper runs on the run's own context; the bound cancels what it is given, and cancelling the run's context takes the target-side teardown and the lock release down with the wait",
+					fset.Position(call.Pos()))
+			}
 			return true
-		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != "RunWithInputProgress" {
-			return true
-		}
-		calls++
-		if len(call.Args) == 0 {
-			t.Errorf("%s: RunWithInputProgress called with no context at all", fset.Position(call.Pos()))
-			return true
-		}
-		arg, ok := call.Args[0].(*ast.Ident)
-		if !ok || arg.Name != "digestCtx" {
-			t.Errorf("%s: the target digest runs on %s rather than the context askTargetDigests derived for it; cancelling the run's own context takes the export teardown and the lock release down with the wait",
-				fset.Position(call.Pos()), exprName(call.Args[0]))
-		}
-		return true
-	})
-	if calls != 1 {
-		t.Errorf("found %d RunWithInputProgress call sites, want 1 -- a second would need a bound of its own, and this test would not notice it missing", calls)
+		})
 	}
-}
-
-// exprName renders an expression for an error message, falling back to a
-// description when it is not a plain identifier.
-func exprName(e ast.Expr) string {
-	if id, ok := e.(*ast.Ident); ok {
-		return id.Name
+	if calls != 2 {
+		t.Errorf("found %d RunWithInputProgress call sites, want 2 (the digest pass and the supervised target command) -- a third would need a bound of its own, and nothing else would notice it missing", calls)
 	}
-	return "a non-identifier expression"
 }
 
 // TestVerifyVerdictDoesNotCallAFailedCompareAMismatch guards the sentence an

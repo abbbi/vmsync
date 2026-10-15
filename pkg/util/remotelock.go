@@ -59,14 +59,10 @@ const (
 	RemoteLockNoCreate = "VMSYNC-LOCK-NO-CREATE"
 )
 
-// Exit codes the remote side uses per failure, shared for the same reason the
-// markers are: the shell script and the helper have to be interchangeable.
-const (
-	RemoteLockExitNoFlock  = 3
-	RemoteLockExitNoDir    = 4
-	RemoteLockExitNoCreate = 5
-	RemoteLockExitBusy     = 6
-)
+// Each marker above pairs with an exit status, and those live with every
+// other status these binaries use, in exitcodes.go:
+// RemoteLockExitNoFlock, RemoteLockExitNoDir, RemoteLockExitNoCreate,
+// RemoteLockExitBusy.
 
 // AcquireRemoteRunLock takes the same advisory lock AcquireRunLock takes, but on
 // a remote host over SSH.
