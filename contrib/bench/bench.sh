@@ -10181,6 +10181,32 @@ SUPERVISE_SHIM_DIR="/tmp/vmsync-bench-supervise-shim"
 # is a reporting interval each and turns a sync into half an hour.
 SUPERVISE_PROBE_LABEL="runtime directory"
 
+# What 24b's probe replaces the hijacked command with: a loop that cannot
+# finish and that announces it is alive by touching a file every second.
+#
+# A STAMP FILE RATHER THAN A PROCESS NAME, and that is not a style choice. The
+# obvious check -- pgrep -f 'sleep 300' -- matches the shell that is running
+# the pgrep, because that shell's own command line contains the string being
+# searched for. It returns a match with nothing running at all, so it can
+# neither confirm nor deny a survivor, and a pkill built the same way kills
+# the harness's own ssh session. Observing a side effect the probe itself
+# produces has no such hazard: the stamp advances only while the loop lives.
+#
+# THE LOOP IS BACKGROUNDED AND THE SHELL WAITS, which is what gives the check
+# its discriminating power. Run in the foreground, the loop is a construct of
+# the supervised shell itself, so killing that shell alone stops it -- and the
+# stamp then freezes whether the signal reached the process GROUP or only its
+# leader, which is precisely the distinction this sub-test exists to make.
+# Backgrounded, the loop is a process of its own in the same group: a group
+# kill takes it, a leader-only kill leaves it stamping. Verified both ways
+# against a deliberately broken helper.
+#
+# The pid goes in a file too, so cleaning up afterwards needs no matching
+# either -- the group is signalled by number.
+SUPERVISE_PROBE_STAMP="/tmp/vmsync-bench-supervise-wedge.stamp"
+SUPERVISE_PROBE_PIDFILE="/tmp/vmsync-bench-supervise-wedge.pid"
+SUPERVISE_PROBE_WEDGE="echo \\$\\$ > $SUPERVISE_PROBE_PIDFILE; sh -c 'while :; do date +%s > $SUPERVISE_PROBE_STAMP; sleep 1; done' & wait"
+
 # How long 24c's probe lingers, which has to OUTLAST the helper's reporting
 # interval or there is no liveness line to find. The helper beats once per
 # trace.ProgressInterval (one minute); 75s leaves fifteen seconds of slack for
@@ -10290,13 +10316,36 @@ stage_supervise() {
 	# with no usable helper the old unbounded path is taken, and the run has
 	# to say so. An operator reading a parked run's log afterwards needs
 	# that sentence to know why nothing bounded it.
-	bench_sync "$sc" unsupervised -reinit -bridge-helper-path /nonexistent/vmsync-bridge-helper
+	#
+	# run_vmsync rather than bench_sync, and -no-checksum, because BOTH of
+	# the other routes to a missing helper are refusals rather than
+	# fallbacks -- which is the point, and is what the first attempt at this
+	# sub-test got wrong:
+	#
+	#   - bench_sync appends BENCH_SYNC_ARGS, which defaults to -compress.
+	#     That turns bridging on, and nbdbridge.CheckRemote hard-fails a
+	#     bridged run whose helper is missing. The run dies in preflight,
+	#     long before the capability line.
+	#   - without -no-checksum, the probe that decides the pre-commit check
+	#     refuses the run outright for the same missing helper.
+	#
+	# So the unsupervised path is reachable only by a run that asked for
+	# neither bridging nor the integrity check. That is exactly the
+	# configuration the fallback exists for, and the only one in which it
+	# can be observed.
+	run_vmsync "$sc" unsupervised -reinit -no-checksum -bridge-helper-path /nonexistent/vmsync-bridge-helper
 	if [ "$DRY_RUN" = yes ]; then
 		results_row "$CSV" "$sc" unsupervised-result DRYRUN "" "" "" "" "" "SKIP dry run"
 	else
 		if supervise_log_has 'run UNSUPERVISED'; then ok=0; else ok=1; fi
 		fo_check "$sc" "a run with no usable helper warns that target commands are unsupervised" "$ok" \
 			"no UNSUPERVISED warning in $RUN_LOG"
+		# The run itself must still work: an estate with no helper is a
+		# supported configuration, and a fallback that cannot complete a
+		# sync would not be one.
+		if bench_sync_ok; then ok=0; else ok=1; fi
+		fo_check "$sc" "a sync with no helper still completes, unsupervised" "$ok" \
+			"exit=$RUN_RC -- see $RUN_LOG"
 	fi
 
 	[ "$DRY_RUN" = yes ] && return 0
@@ -10315,25 +10364,26 @@ stage_supervise() {
 #
 # This is the fault the whole mechanism exists for, and the only way to stage
 # it on healthy hardware is to make a command that cannot finish: the probe
-# replaces the runtime-directory mkdir with `sleep 300` under a 3-second
-# limit. Everything after that is the real machinery -- the helper's own
-# process group, SIGTERM, the grace, SIGKILL, the verdict, exit 124, and
-# vmsync turning that into a failed run.
+# replaces the runtime-directory mkdir with a loop that cannot finish, under a
+# three-second limit. Everything after that is the real machinery -- the
+# helper's own process group, SIGTERM, the grace, SIGKILL, the verdict, exit
+# 124, and vmsync turning that into a failed run.
 #
 # The run FAILING is the pass condition, not a side effect: before this
 # existed, the same situation was a sync that never returned at all.
 supervise_timeout_subtest() {
-	local sc=supervise shim ok
-	shim="$(supervise_install_shim timeout 3s 'sleep 300')" || {
+	local sc=supervise shim ok before after survivor
+	shim="$(supervise_install_shim timeout 3s "$SUPERVISE_PROBE_WEDGE")" || {
 		warn "could not install the timeout shim on $TARGET_HOST"
 		results_row "$CSV" "$sc" timeout-shim "" "" "" "" "" "" "SKIP shim install failed"
 		return 0
 	}
+	ssh_host_cmd "$TARGET_HOST" "rm -f '$SUPERVISE_PROBE_STAMP' '$SUPERVISE_PROBE_PIDFILE'" >/dev/null 2>&1 || true
 
 	bench_sync "$sc" timeout -reinit -bridge-helper-path "$shim"
 
 	# Non-zero is the pass. A zero here means the command was never bounded
-	# and the sync somehow carried on regardless, which is the old behaviour.
+	# and the sync carried on regardless, which is the old behaviour.
 	if [ "$RUN_RC" != 0 ]; then ok=0; else ok=1; fi
 	fo_check "$sc" "a target command that outlives its limit fails the run" "$ok" \
 		"the run exited 0 with a command that could not finish -- nothing bounded it"
@@ -10348,11 +10398,22 @@ supervise_timeout_subtest() {
 	fo_check "$sc" "the command was sent SIGTERM before anything harsher" "$ok" \
 		"no \"signalled=TERM\" in $RUN_LOG"
 
-	# Nothing of the probe may outlive it. A surviving sleep is the exact
-	# leak supervision exists to prevent, so finding one here is a finding.
-	if [ "$(ssh_host_cmd "$TARGET_HOST" "pgrep -c -f 'sleep 300' 2>/dev/null || echo 0" 2>/dev/null | tr -dc '0-9')" = 0 ]; then ok=0; else ok=1; fi
-	fo_check "$sc" "the killed command left no process behind on the target" "$ok" \
-		"a 'sleep 300' is still running on $TARGET_HOST -- the signal reached the shell alone and not its process group"
+	# Did anything survive? The probe stamps a file every second while it
+	# lives, so two readings three seconds apart answer it without matching
+	# any process: if the stamp moved, the group kill missed something.
+	before="$(ssh_host_cmd "$TARGET_HOST" "cat '$SUPERVISE_PROBE_STAMP' 2>/dev/null || echo none" 2>/dev/null | tr -dc '0-9a-z')"
+	sleep 3
+	after="$(ssh_host_cmd "$TARGET_HOST" "cat '$SUPERVISE_PROBE_STAMP' 2>/dev/null || echo none" 2>/dev/null | tr -dc '0-9a-z')"
+	if [ "$before" = "$after" ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "the killed command left nothing running on the target" "$ok" \
+		"the probe is still stamping $SUPERVISE_PROBE_STAMP on $TARGET_HOST ($before then $after) -- the signal reached the shell alone and not its process group"
+
+	# Clean up by pid, never by pattern: the probe recorded its own, and a
+	# pattern match here would hit the harness's own shell.
+	survivor="$(ssh_host_cmd "$TARGET_HOST" "cat '$SUPERVISE_PROBE_PIDFILE' 2>/dev/null || true" 2>/dev/null | tr -dc '0-9')"
+	if [ -n "$survivor" ]; then
+		ssh_host_cmd "$TARGET_HOST" "kill -9 -$survivor 2>/dev/null; kill -9 $survivor 2>/dev/null; rm -f '$SUPERVISE_PROBE_STAMP' '$SUPERVISE_PROBE_PIDFILE'" >/dev/null 2>&1 || true
+	fi
 }
 
 # 24c -- a command that outruns one reporting interval must be audible while
