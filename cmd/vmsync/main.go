@@ -4194,13 +4194,28 @@ func run(cfg syncConfig) (runErr error) {
 	// say which of the two this run was leaves nobody able to tell that
 	// afterwards.
 	superviseTargetCommands := targetHelper.Usable
-	if superviseTargetCommands {
-		trace.Debug("target commands are supervised by the helper", "host", util.HostFromURIOrLocal(cfg.TargetURI), "helper", cfg.BridgeHelperPath)
-	} else {
+	logSupervisionDecision := func() {
+		if superviseTargetCommands {
+			trace.Debug("target commands are supervised by the helper", "host", util.HostFromURIOrLocal(cfg.TargetURI), "helper", cfg.BridgeHelperPath)
+			return
+		}
 		trace.Warning("target commands run UNSUPERVISED: no usable vmsync-bridge-helper on the target, so a command that wedges on the target's storage cannot be bounded or signalled from here and will park this run indefinitely, holding the target's run lock and the source's backup job",
 			"host", util.HostFromURIOrLocal(cfg.TargetURI), "helper", cfg.BridgeHelperPath,
 			"reason", targetHelper.Reason,
 			"remedy", "deploy a matching vmsync-bridge-helper at "+cfg.BridgeHelperPath+" on the target")
+	}
+	// WHEN this is said depends on how it was decided.
+	//
+	// On every other path the probe above asked the target directly, so the
+	// answer is already a fact and the line can be written now. A BRIDGED
+	// run has not asked anything: it takes the helper on trust because
+	// nbdbridge.CheckRemote refuses the run if that trust is misplaced --
+	// and CheckRemote has not run yet. Saying "supervised" here would claim
+	// something not yet established, which a bridged run against a missing
+	// helper would print immediately before failing for that exact reason.
+	// So that case waits for the check that settles it.
+	if !bridgeCfg.Enabled() {
+		logSupervisionDecision()
 	}
 
 	// Add a metric that allows us to track whether checksum was performed
@@ -4509,6 +4524,11 @@ func run(cfg syncConfig) (runErr error) {
 	}
 	if err := nbdbridge.CheckRemote(ctx, targetSSHClient, bridgeCfg, targetSSHConfig.Address); err != nil {
 		return err
+	}
+	// The bridged run's half of the supervision decision, now that the check
+	// it rests on has passed. See logSupervisionDecision.
+	if bridgeCfg.Enabled() {
+		logSupervisionDecision()
 	}
 
 	// Moved here (was previously checked before targetSSHClient even
