@@ -295,8 +295,17 @@ func (r *restorePoints) take(ctx context.Context, diskPath string) error {
 	if err != nil {
 		return fmt.Errorf("-retention: %w", err)
 	}
-	if _, err := r.runner.Run(ctx, cmd); err != nil {
-		return fmt.Errorf("-retention: copy %s into restore point %s: %w", diskPath, r.point.Tag(), err)
+	// The output, not just the error, at every call in this chain.
+	//
+	// This one and the two that publish the restore point are FATAL to a run
+	// whose replica data has already been committed, so what they report is
+	// the only account of why an otherwise finished sync failed. And because
+	// those failures count toward -reinit-after-failures, a restore-point
+	// filesystem that has filled up eventually forces a full recopy onto the
+	// filesystem that was already out of space -- a sequence that reads as
+	// inexplicable unless the first failure said "No space left on device".
+	if out, err := r.runner.Run(ctx, cmd); err != nil {
+		return fmt.Errorf("-retention: copy %s into restore point %s: %w: %s", diskPath, r.point.Tag(), err, strings.TrimSpace(out))
 	}
 	r.mu.Lock()
 	r.disks = append(r.disks, path.Base(diskPath))
@@ -341,15 +350,15 @@ func (r *restorePoints) commit(ctx context.Context, verifyState, source string, 
 	if err != nil {
 		return fmt.Errorf("-retention: %w", err)
 	}
-	if _, err := r.runner.Run(ctx, cmd); err != nil {
-		return fmt.Errorf("-retention: write the status sidecar for restore point %s: %w", r.point.Tag(), err)
+	if out, err := r.runner.Run(ctx, cmd); err != nil {
+		return fmt.Errorf("-retention: write the status sidecar for restore point %s: %w: %s", r.point.Tag(), err, strings.TrimSpace(out))
 	}
 	commit, err := restorepoint.CommitCommand(r.point)
 	if err != nil {
 		return fmt.Errorf("-retention: %w", err)
 	}
-	if _, err := r.runner.Run(ctx, commit); err != nil {
-		return fmt.Errorf("-retention: publish restore point %s: %w", r.point.Tag(), err)
+	if out, err := r.runner.Run(ctx, commit); err != nil {
+		return fmt.Errorf("-retention: publish restore point %s: %w: %s", r.point.Tag(), err, strings.TrimSpace(out))
 	}
 	dir, _ := r.point.Dir()
 	trace.Info("restore point taken", "tag", r.point.Tag().String(), "disks", len(disks), "verify", verifyState, "path", dir)
@@ -398,8 +407,8 @@ func (r *restorePoints) prune(ctx context.Context) {
 			trace.Warning("leaving an unrecognised staging directory in place", "entry", name, "error", err)
 			continue
 		}
-		if _, err := r.runner.Run(ctx, cmd); err != nil {
-			trace.Warning("could not remove an abandoned staging directory", "entry", name, "error", err)
+		if out, err := r.runner.Run(ctx, cmd); err != nil {
+			trace.Warning("could not remove an abandoned staging directory", "entry", name, "error", err, "output", strings.TrimSpace(out))
 			continue
 		}
 		trace.Info("removed an abandoned restore point staging directory left by an interrupted run", "entry", name)
@@ -415,8 +424,8 @@ func (r *restorePoints) prune(ctx context.Context) {
 			trace.Warning("leaving a restore point in place", "tag", tag.String(), "error", err)
 			continue
 		}
-		if _, err := r.runner.Run(ctx, cmd); err != nil {
-			trace.Warning("could not remove an expired restore point; restore points will accumulate until this succeeds", "tag", tag.String(), "error", err)
+		if out, err := r.runner.Run(ctx, cmd); err != nil {
+			trace.Warning("could not remove an expired restore point; restore points will accumulate until this succeeds", "tag", tag.String(), "error", err, "output", strings.TrimSpace(out))
 			continue
 		}
 		trace.Info("removed an expired restore point", "tag", tag.String())
