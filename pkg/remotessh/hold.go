@@ -29,6 +29,72 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+// maxHoldStderrTail bounds what is kept of a refused command's stderr.
+//
+// 4 KiB because the useful part is the FIRST thing said: a missing binary, a
+// permission denial or a shell syntax error names itself immediately and then
+// usually says nothing else. A command that fails by printing without end
+// must not be able to grow this, and truncating the front to keep the tail
+// would throw away exactly the sentence worth having.
+const maxHoldStderrTail = 4 << 10
+
+// holdStderr collects what a held command said on stderr, so a refusal can
+// report the reason instead of reporting that there was none.
+//
+// Mutex-guarded, because x/crypto/ssh copies the channel's stderr into this
+// writer from a goroutine of its own and the branches that read it do so
+// while that goroutine may still be running. A bare bytes.Buffer here is a
+// data race, and one on a path taken only when something has already gone
+// wrong -- the worst place to put a rare crash.
+type holdStderr struct {
+	mu   sync.Mutex
+	buf  []byte
+	full bool
+}
+
+func (s *holdStderr) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Always reports the whole write as accepted: this is a diagnostic sink,
+	// and a short write would make x/crypto/ssh treat a full buffer as a
+	// broken stream and tear down a session that is working.
+	if s.full {
+		return len(p), nil
+	}
+	room := maxHoldStderrTail - len(s.buf)
+	if room <= 0 {
+		s.full = true
+		return len(p), nil
+	}
+	if len(p) > room {
+		s.buf = append(s.buf, p[:room]...)
+		s.full = true
+		return len(p), nil
+	}
+	s.buf = append(s.buf, p...)
+	return len(p), nil
+}
+
+// String is what the remote command said, trimmed, or "" when it said
+// nothing.
+func (s *holdStderr) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.TrimSpace(string(s.buf))
+}
+
+// holdStderrSuffix renders what the command said for appending to an error,
+// or "" when it said nothing.
+//
+// A suffix rather than a wrapped error: this is the remote command's words,
+// not a Go error, and errors.Is on anything above must keep working.
+func holdStderrSuffix(said string) string {
+	if said == "" {
+		return ""
+	}
+	return ": " + said
+}
+
 // heldCommand is a remote command kept running for as long as the handle is
 // open, rather than run to completion like Run does.
 //
@@ -104,6 +170,15 @@ func (c *Client) HoldCommand(ctx context.Context, command, readyLine string) (io
 		session.Close()
 		return nil, fmt.Errorf("open stdout from remote command: %w", err)
 	}
+	// Attached BEFORE Start, which is the only time it can be: this is the
+	// channel the remote shell uses to explain itself, and without a writer
+	// here x/crypto/ssh discards it. A refusal then has to report that the
+	// command said nothing, while the command in fact said exactly what was
+	// wrong -- "No such file or directory" for a mis-pathed helper being the
+	// one an operator meets first.
+	var stderr holdStderr
+	session.Stderr = &stderr
+
 	if err := session.Start(command); err != nil {
 		session.Close()
 		return nil, fmt.Errorf("start remote command: %w", err)
@@ -144,15 +219,27 @@ func (c *Client) HoldCommand(ctx context.Context, command, readyLine string) (io
 		switch {
 		case r.err != nil:
 			_ = h.Close()
-			return nil, fmt.Errorf("remote command produced no output: %w", r.err)
+			return nil, fmt.Errorf("remote command produced no output: %w%s", r.err, holdStderrSuffix(stderr.String()))
 		case r.line == readyLine:
 			return h, nil
 		case r.line == "":
 			_ = h.Close()
-			return nil, fmt.Errorf("%w: it exited without saying why", ErrHoldRefused)
+			// The reason, when there is one, INSTEAD of saying there was
+			// none. "it exited without saying why" is only true when stderr
+			// is empty too, and it was being printed over the top of a
+			// perfectly good explanation.
+			if said := stderr.String(); said != "" {
+				return nil, fmt.Errorf("%w: %s", ErrHoldRefused, said)
+			}
+			return nil, fmt.Errorf("%w: it exited without saying why, on stdout or on stderr", ErrHoldRefused)
 		default:
 			_ = h.Close()
-			return nil, fmt.Errorf("%w: %s", ErrHoldRefused, r.line)
+			// stderr appended rather than substituted here: this branch
+			// already has the command's own first line, and one of the
+			// VMSYNC-LOCK-* markers arriving where the ready line was
+			// expected is the whole diagnosis. Where it is something else,
+			// stderr is usually what explains it.
+			return nil, fmt.Errorf("%w: %s%s", ErrHoldRefused, r.line, holdStderrSuffix(stderr.String()))
 		}
 	}
 }
