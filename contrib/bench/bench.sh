@@ -2374,15 +2374,22 @@ stage_external_snapshot() {
 
         # 4e, last and on its own domain: the sub-tests above proved the
         # tolerated case (a snapshot present, chain intact, sync carries on).
-        # This asks what happens when the bitmap's layer is gone, which is
-        # the case none of them can reach. Opt-in within the stage, because
-        # it defines and destroys a domain on the source hypervisor.
-        if [ "${BENCH_BITMAP_CHAIN_PROBE:-no}" = yes ]; then
-                log "--- 4e: PROBE -- an incremental whose bitmap left the backing chain ---"
+        # This one checks that a chain COLLAPSE keeps every fragment of the
+        # checkpoint's bitmap, which is the property those sub-tests rely on
+        # without ever testing, and which nothing else here can reach.
+        #
+        # On by default. It was opt-in while it defined a domain on the
+        # source hypervisor to ask a question nobody had answered; now that
+        # the answer is known, it is a regression test for the mechanism
+        # every incremental sync depends on, and one that only ever touches
+        # its own throwaway domain. BENCH_BITMAP_CHAIN_PROBE=no still turns
+        # it off for a host where defining a domain is unwelcome.
+        if [ "${BENCH_BITMAP_CHAIN_PROBE:-yes}" = yes ]; then
+                log "--- 4e: a flattened backing chain must keep the whole checkpoint bitmap ---"
                 bitmap_chain_probe "$(disk_source_path "$SOURCE_URI" "$SOURCE_DOMAIN" "$TAMPER_DISK_DEV")"
         else
-                log "--- 4e: skipped (set BENCH_BITMAP_CHAIN_PROBE=yes to run it; it defines a throwaway domain on $SOURCE_HOST) ---"
-                results_row "$CSV" ext-snapshot bitmap-chain "" "" "" "" "" "" "SKIP opt in with BENCH_BITMAP_CHAIN_PROBE=yes"
+                log "--- 4e: skipped (BENCH_BITMAP_CHAIN_PROBE=no; it defines a throwaway domain on $SOURCE_HOST) ---"
+                results_row "$CSV" ext-snapshot bitmap-chain "" "" "" "" "" "" "SKIP opted out with BENCH_BITMAP_CHAIN_PROBE=no"
         fi
         return 0
 }
@@ -2398,7 +2405,25 @@ stage_external_snapshot() {
 # unreachable when its layer leaves the chain altogether, and then the next
 # incremental has no record of what changed.
 #
-# libvirt names that case precisely, and on the pull-mode path vmsync uses:
+# WHAT THIS ACTUALLY TESTS, after a first version got it backwards. libvirt
+# does not refuse a checkpoint whose layer left the chain: it MERGES. On
+# block-pull completion qemuBlockJobProcessEventCompletedPullBitmaps()
+# unions every removed layer's fragment into the surviving image, before the
+# chain is torn down. qemu contributes nothing -- block/stream.c has no
+# bitmap code at all. So asserting that backup-begin must FAIL asserted the
+# opposite of the documented behaviour, and the run that "passed" had in
+# fact been handed a schema rejection.
+#
+# The merge is therefore the only thing standing between a flattened chain
+# and an incremental that silently misses data, which is what this now
+# checks: write before the snapshot, write after it, flatten, and require
+# the surviving bitmap to still account for both.
+#
+# Measured end to end on libvirt 12.0.0 / qemu 10.2.2 before this was
+# written: the merge happens, and a real pull backup's NBD export reports
+# both the pre-snapshot and the post-snapshot extents.
+#
+# The loud variant, when there is no bitmap left to merge at all:
 #
 #   VIR_ERR_CHECKPOINT_INCONSISTENT, "missing or broken bitmap '%s' for
 #   disk '%s'" -- src/qemu/qemu_backup.c, qemuBackupDiskPrepareOneBitmaps
@@ -2414,11 +2439,16 @@ stage_external_snapshot() {
 # destroys it.
 #
 # A PROBE in stage 22's sense: it asks libvirt a question rather than
-# grading vmsync. The assertion is behavioural -- the incremental backup must
-# FAIL -- because the message arrives in libvirtd's own locale and this
-# harness cannot depend on its wording. What libvirt actually said is printed
-# as evidence either way, which is what the code-side guard will be written
-# from.
+# grading vmsync. The assertion is numeric -- how many bytes the bitmap
+# still calls dirty -- rather than textual, because libvirt's messages
+# arrive in libvirtd's own locale and this harness cannot depend on their
+# wording. Everything libvirt said is printed as evidence either way.
+#
+# It writes to the probe domain through `qemu-monitor-command --hmp qemu-io`,
+# which taints the domain as far as libvirt is concerned. That is confined
+# to the throwaway domain and never touches the bench source, and without it
+# the bitmap stays empty and the sub-test cannot distinguish a working merge
+# from a broken one.
 BMPROBE_DOMAIN="vmsync-bench-bmprobe"
 BMPROBE_PREFIX="vmsync-bench-bmprobe"
 # Outside the bench's own 10809-10908/20809-21008 spans, so a probe backup
@@ -2430,6 +2460,10 @@ BMPROBE_PORT2="$((BMPROBE_PORT + 1))"
 # Set by bitmap_chain_probe before anything can need cleaning. A global on
 # purpose: cleanup must not depend on a caller's local under `set -u`.
 BMPROBE_DIR=""
+# Resolved once the probe domain is running: the qdev path of its disk
+# backend, and whichever JSON reader this host turned out to have.
+BMPROBE_QDEV=""
+BMPROBE_PY=""
 
 # bmprobe_cleanup -- removes the throwaway domain and its files.
 #
@@ -2488,11 +2522,62 @@ bitmap_chain_probe() {
 	return 0
 }
 
+# bmprobe_cpt1_bytes -- total bytes the checkpoint's bitmap calls dirty,
+# summed over every layer of the chain that still has a copy of it.
+#
+# This, not the exit status of backup-begin, is the observable that decides
+# whether a chain collapse lost anything: libvirt merges the removed layers'
+# fragments into the survivor, and a merge that did not happen shows up here
+# as a total that shrank.
+bmprobe_cpt1_bytes() {
+	local js
+	js="$(virsh_uri "$SOURCE_URI" qemu-monitor-command "$BMPROBE_DOMAIN" \
+		'{"execute":"query-named-block-nodes"}' 2>/dev/null)" || return 1
+	[ -n "$js" ] || return 1
+	if [ -n "$BMPROBE_PY" ]; then
+		printf '%s' "$js" | "$BMPROBE_PY" -c 'import json,sys
+d = json.load(sys.stdin).get("return") or []
+print(sum(b["count"] for n in d for b in (n.get("dirty-bitmaps") or [])
+          if b["name"] == sys.argv[1]))' "${BMPROBE_PREFIX}-cpt1" 2>/dev/null
+	else
+		printf '%s' "$js" | jq --arg n "${BMPROBE_PREFIX}-cpt1" \
+			'[.return[]?."dirty-bitmaps"[]? | select(.name==$n) | .count] | add // 0' 2>/dev/null
+	fi
+}
+
+# bmprobe_write OFFSET -- dirty 4 MiB through the guest's own block backend.
+#
+# The probe domain is paused and has no OS, so it can never write for itself,
+# and a bitmap with nothing in it cannot demonstrate anything being lost --
+# that is precisely why the first version of this sub-test could not tell a
+# working merge from a broken one. HMP qemu-io addressed by qdev PATH reuses
+# the device's existing BlockBackend; a plain node name makes qemu open a
+# second writer and virtio-blk refuses to share it ("Permission conflict"),
+# and qcow2 cannot be marked <shareable/> to work around that.
+bmprobe_write() {
+	virsh_uri "$SOURCE_URI" qemu-monitor-command "$BMPROBE_DOMAIN" --hmp \
+		"qemu-io -d ${BMPROBE_QDEV} \"write $1 4M\"" >/dev/null 2>&1 || true
+}
+
 bitmap_chain_probe_body() {
-	local sc=ext-snapshot ok dir disk xml out rc state i
+	local sc=ext-snapshot ok dir disk xml out rc state i req live alias
+	local before after
 
 	dir="$BMPROBE_DIR"
 	disk="${dir}/${BMPROBE_PREFIX}.qcow2"
+
+	# Reading the bitmap needs a JSON parser. Without one the probe can
+	# only observe exit statuses again, which is what made it useless.
+	BMPROBE_PY=""
+	for i in python3 python; do
+		if command -v "$i" >/dev/null 2>&1; then BMPROBE_PY="$i"; break; fi
+	done
+	if [ -z "$BMPROBE_PY" ] && ! command -v jq >/dev/null 2>&1; then
+		warn "SKIP 4e: neither python3 nor jq is available to read the bitmap, and this sub-test is only meaningful if it can"
+		results_row "$CSV" "$sc" bitmap-chain "" "" "" "" "" "" "SKIP no JSON parser for the bitmap"
+		return 0
+	fi
+
 	if ! run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "qemu-img create -f qcow2 '$disk' 64M" >/dev/null 2>&1; then
 		warn "SKIP 4e: could not create the probe disk at $disk on $SOURCE_HOST"
 		results_row "$CSV" "$sc" bitmap-chain "" "" "" "" "" "" "SKIP probe disk not creatable"
@@ -2534,6 +2619,18 @@ BMPROBE_XML_EOF" >/dev/null 2>&1 || true
 	state="$(dom_state "$SOURCE_URI" "$BMPROBE_DOMAIN")"
 	log "   EVIDENCE: probe domain $BMPROBE_DOMAIN is '$state' on a throwaway 64M disk"
 
+	# The qdev path of the disk's backend, which is what HMP qemu-io needs.
+	# The alias is libvirt's own, so it is read back rather than guessed.
+	alias="$(virsh_uri "$SOURCE_URI" dumpxml "$BMPROBE_DOMAIN" 2>/dev/null |
+		sed -n "/<target dev='vda'/,/<\/disk>/p" |
+		sed -n "s/.*<alias name='\([^']*\)'.*/\1/p" | head -1)"
+	if [ -z "$alias" ]; then
+		warn "SKIP 4e: could not read the disk's device alias, so writes cannot be injected"
+		results_row "$CSV" "$sc" bitmap-chain "" "" "" "" "" "" "SKIP no disk alias"
+		return 0
+	fi
+	BMPROBE_QDEV="/machine/peripheral/${alias}/virtio-backend"
+
 	# 1. a checkpoint, whose bitmap goes into the file that is live now.
 	run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "cat > '${dir}/${BMPROBE_PREFIX}-cpt.xml' <<'BMPROBE_CPT_EOF'
 <domaincheckpoint><name>${BMPROBE_PREFIX}-cpt1</name><disks><disk name='vda' checkpoint='bitmap'/></disks></domaincheckpoint>
@@ -2545,7 +2642,18 @@ BMPROBE_CPT_EOF" >/dev/null 2>&1 || true
 	fi
 	log "   EVIDENCE: checkpoint ${BMPROBE_PREFIX}-cpt1 created; its bitmap is in $disk"
 
-	# 2. an external snapshot, which makes an overlay live and pushes the
+	# 2. WRITE A, into the file the checkpoint's bitmap lives in -- the one
+	#    the blockpull in step 5 will remove from the chain. This is the
+	#    data whose survival the whole sub-test is about.
+	bmprobe_write 0
+	if [ "$(bmprobe_cpt1_bytes)" != "4194304" ]; then
+		warn "SKIP 4e: could not dirty the probe disk through the monitor (bitmap reads $(bmprobe_cpt1_bytes) bytes, wanted 4194304); with no writes recorded there is nothing for a lost bitmap to lose and this sub-test would assert nothing"
+		results_row "$CSV" "$sc" bitmap-chain "" "" "" "" "" "" "SKIP writes not injectable"
+		return 0
+	fi
+	log "   EVIDENCE: WRITE A dirtied [0,4M) while $disk was live; bitmap holds 4M"
+
+	# 3. an external snapshot, which makes an overlay live and pushes the
 	#    bitmap's file down into the backing chain -- still reachable.
 	if ! out="$(virsh_uri "$SOURCE_URI" snapshot-create-as --domain "$BMPROBE_DOMAIN" --name "${BMPROBE_PREFIX}-snap" --disk-only --atomic 2>&1)"; then
 		warn "SKIP 4e: could not take an external snapshot of the probe domain: $out"
@@ -2554,31 +2662,34 @@ BMPROBE_CPT_EOF" >/dev/null 2>&1 || true
 	fi
 	log "   EVIDENCE: live disk is now $(disk_source_path "$SOURCE_URI" "$BMPROBE_DOMAIN" vda), backed by $disk"
 
-	# 3. THE CONTROL, and the only reason the result in step 5 can be
-	#    believed. The very same request is made now, while the bitmap's
-	#    file is still in the chain, and it must SUCCEED.
-	#
-	#    Without it the probe asserts nothing stronger than "backup-begin
-	#    failed", which every malformed request also satisfies -- and that
-	#    is not hypothetical: the first version of this probe put
-	#    `incremental` in the wrong place, libvirt rejected it against
-	#    domainbackup.rng, and the probe recorded a PASS for a schema error.
-	#    A control that must pass before a test that must fail is what
-	#    separates "the bitmap is gone" from "this libvirt would not accept
-	#    the question".
+	# 4. WRITE B, which lands on the overlay instead. The chain now holds
+	#    two fragments of the same bitmap, 4M in each.
+	bmprobe_write 33554432
+	before="$(bmprobe_cpt1_bytes)"
+	if [ "$before" != "8388608" ]; then
+		warn "SKIP 4e: the chain holds $before dirty bytes after the second write, wanted 8388608, so the two fragments this sub-test compares were never set up"
+		results_row "$CSV" "$sc" bitmap-chain "" "" "" "" "" "" "SKIP two-fragment setup failed"
+		return 0
+	fi
+	log "   EVIDENCE: WRITE B dirtied [32M,36M) on the overlay; the chain now holds 8M across two fragments"
+
+	# 5. THE CONTROL. The same request made here, while both fragments are
+	#    reachable, must be ACCEPTED -- otherwise a later refusal says
+	#    nothing about bitmaps and everything about the request. The first
+	#    version of this sub-test had no control, put `incremental` in the
+	#    wrong place, and recorded a schema rejection as a PASS.
 	bmprobe_backup_xml "${dir}/${BMPROBE_PREFIX}-ctl.xml" "${dir}/${BMPROBE_PREFIX}-scratch1.qcow2" "$BMPROBE_PORT"
 	if ! out="$(virsh_uri "$SOURCE_URI" backup-begin "$BMPROBE_DOMAIN" --backupxml "${dir}/${BMPROBE_PREFIX}-ctl.xml" 2>&1)"; then
-		warn "SKIP 4e: the CONTROL incremental was refused while the bitmap was still reachable, so this probe cannot tell a lost bitmap from a request this libvirt will not accept: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
+		warn "SKIP 4e: the CONTROL incremental was refused while both bitmap fragments were reachable, so this probe cannot tell a lost bitmap from a request this libvirt will not accept: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
 		results_row "$CSV" "$sc" bitmap-chain "" "" "" "" "" "" "SKIP control incremental refused"
 		return 0
 	fi
-	log "   EVIDENCE: CONTROL -- the same incremental request is ACCEPTED while the bitmap's file is still in the chain"
+	log "   EVIDENCE: CONTROL -- an incremental against cpt1 is accepted while the chain is intact"
 	virsh_uri "$SOURCE_URI" domjobabort "$BMPROBE_DOMAIN" >/dev/null 2>&1 || true
 	run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "rm -f '${dir}/${BMPROBE_PREFIX}-scratch1.qcow2'" >/dev/null 2>&1 || true
 
-	# 4. blockpull, which flattens the backing file INTO the overlay and
-	#    drops it from the chain. This is the step that loses the bitmap, and
-	#    the reason this runs on a domain nobody needs afterwards.
+	# 6. blockpull, which flattens the backing file INTO the overlay and
+	#    drops it from the chain, taking its copy of the bitmap with it.
 	#
 	#    Retried: the control's backup job was aborted rather than waited
 	#    out, and libvirt refuses a block job while another is winding down.
@@ -2592,38 +2703,53 @@ BMPROBE_CPT_EOF" >/dev/null 2>&1 || true
 		sleep 2
 	done
 	if [ "$rc" != 0 ]; then
-		warn "SKIP 4e: blockpull did not complete on the probe domain, so the bitmap's layer is still in the chain and the probe would prove nothing: $out"
+		warn "SKIP 4e: blockpull did not complete on the probe domain, so the chain was never collapsed and the probe would prove nothing: $out"
 		results_row "$CSV" "$sc" bitmap-chain "" "" "" "" "" "" "SKIP blockpull did not complete"
 		return 0
 	fi
-	log "   EVIDENCE: after blockpull the chain is $(disk_source_path "$SOURCE_URI" "$BMPROBE_DOMAIN" vda) with no backing file -- the bitmap's layer is gone"
+	log "   EVIDENCE: after blockpull the chain is $(disk_source_path "$SOURCE_URI" "$BMPROBE_DOMAIN" vda) with no backing file -- WRITE A's layer is gone"
 
-	# 5. the question, asked now that the control has established that the
-	#    only thing to have changed since it passed is the backing chain.
+	# 7. THE QUESTION, and it is not "did libvirt refuse".
+	#
+	#    libvirt is SPECIFIED to merge, not to refuse: on block-pull
+	#    completion qemuBlockJobProcessEventCompletedPullBitmaps() merges
+	#    every removed layer's fragment into the survivor, and it does so
+	#    BEFORE the chain is torn down. qemu contributes nothing here --
+	#    block/stream.c has no bitmap code at all -- so the merge is the
+	#    only thing standing between a flattened chain and an incremental
+	#    that silently misses WRITE A.
+	#
+	#    Hence the assertion: the surviving bitmap must still account for
+	#    BOTH writes. A total that shrank to 4M would mean the next
+	#    incremental copies [32M,36M) and quietly skips [0,4M) -- success
+	#    reported, data lost, nothing for vmsync to catch.
+	after="$(bmprobe_cpt1_bytes)"
+	log "   EVIDENCE: bitmap held $before bytes across the chain before the pull, $after after it"
+	req="$(run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "cat '${dir}/${BMPROBE_PREFIX}-backup.xml'" 2>/dev/null || true)"
+	if [ "$after" = "8388608" ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "a flattened backing chain keeps every fragment of the checkpoint bitmap" "$ok" \
+		"the bitmap lost ${before}->${after} bytes when blockpull removed WRITE A's layer. libvirt did not merge the removed fragment, so the next incremental backup SUCCEEDS while silently omitting data written before the snapshot. There is no error for vmsync to key on"
+
+	# 8. The same question asked the way a backup client experiences it,
+	#    when the host has nbdinfo to ask it with. Reported, not asserted:
+	#    step 7 already decided the verdict from the bitmap itself, and
+	#    nbdinfo is not installed everywhere.
 	bmprobe_backup_xml "${dir}/${BMPROBE_PREFIX}-backup.xml" "${dir}/${BMPROBE_PREFIX}-scratch2.qcow2" "$BMPROBE_PORT2"
+	log "   EVIDENCE: request XML: $(printf '%s' "$req" | tr -s '\n\t ' ' ')"
 	rc=0
 	out="$(virsh_uri "$SOURCE_URI" backup-begin "$BMPROBE_DOMAIN" --backupxml "${dir}/${BMPROBE_PREFIX}-backup.xml" 2>&1)" || rc=$?
-	log "   EVIDENCE: backup-begin rc=$rc, libvirt said: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
-
-	# Behavioural, not textual: the message arrives in libvirtd's locale.
-	# A SUCCESS here is the finding worth having -- it would mean this
-	# libvirt reconstructs or tolerates a bitmap whose layer has gone, and
-	# that the hazard does not exist on this host.
-	if [ "$rc" != 0 ]; then ok=0; else ok=1; fi
-	fo_check "$sc" "an incremental backup refuses a checkpoint whose bitmap left the chain" "$ok" \
-		"backup-begin SUCCEEDED with the bitmap's layer flattened away -- this libvirt does not treat that as inconsistent, so the hazard is not reachable here"
+	log "   EVIDENCE: post-pull backup-begin rc=$rc$([ "$rc" != 0 ] && printf ', libvirt said: %s' "$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)")"
 	if [ "$rc" = 0 ]; then
-		# It started a job. Leave nothing running on the hypervisor.
+		live="$(virsh_uri "$SOURCE_URI" backup-dumpxml "$BMPROBE_DOMAIN" 2>&1 || true)"
+		log "   EVIDENCE: libvirt's own view of the job: $(printf '%s' "$live" | tr -s '\n\t ' ' ' | cut -c1-300)"
+		if command -v nbdinfo >/dev/null 2>&1; then
+			log "   EVIDENCE: extents a backup client would copy:$(nbdinfo \
+				--map=qemu:dirty-bitmap:backup-vda \
+				"nbd://127.0.0.1:${BMPROBE_PORT2}/vda" 2>/dev/null |
+				awk '$3=="1"{printf " [%d,%d)", $1, $1+$2}')"
+		fi
 		virsh_uri "$SOURCE_URI" domjobabort "$BMPROBE_DOMAIN" >/dev/null 2>&1 || true
 	fi
-
-	# Reported, never asserted: "bitmap" survives untranslated in libvirt's
-	# French catalogue, so matching it would pass on one host and fail on
-	# another for no reason that concerns vmsync.
-	case "$out" in
-	*bitmap*|*Bitmap*) log "   EVIDENCE: the message names a bitmap, so a code-side guard can key on VIR_ERR_CHECKPOINT_INCONSISTENT with confidence" ;;
-	*) log "   EVIDENCE: the message does NOT mention a bitmap; record it before writing any guard against it" ;;
-	esac
 	return 0
 }
 

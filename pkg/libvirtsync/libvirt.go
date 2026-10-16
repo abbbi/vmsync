@@ -4308,6 +4308,23 @@ func StartPullBackupTCP(
 ) error {
 	backupXML := buildPullBackupXML(incrementalCheckpoint, exportBitmap, bindAddr, port, diskTargets)
 	if err := dom.BackupBegin(backupXML, "", 0); err != nil {
+		// Named rather than passed through raw, because the raw form is a
+		// bitmap name and a disk name with no statement of what to do, and
+		// the answer is always the same: the incremental history is gone,
+		// so the next run has to start a new one.
+		//
+		// libvirt's own message is kept verbatim in both the log line and
+		// the returned error. It carries which bitmap and which disk, which
+		// is the part that identifies the damage, and this wrapper has no
+		// business paraphrasing a string libvirt wrote in its own locale.
+		if incrementalCheckpoint != "" && IsCheckpointInconsistent(err) {
+			trace.Error("libvirt refused the incremental backup: the checkpoint's dirty bitmap is missing or broken",
+				"checkpoint", incrementalCheckpoint,
+				"libvirt_error", err.Error(),
+				"remedy", "re-run with -reinit to take a fresh full copy and start a new checkpoint chain")
+			return fmt.Errorf("start pull backup (tcp %s:%d): %w -- the incremental checkpoint %q no longer has a usable dirty bitmap on the source, so there is no record of what changed and this sync cannot continue incrementally. Re-run with -reinit to take a fresh full copy and begin a new checkpoint chain (xml=%s)",
+				bindAddr, port, err, incrementalCheckpoint, backupXML)
+		}
 		return fmt.Errorf("start pull backup (tcp %s:%d): %w (xml=%s)", bindAddr, port, err, backupXML)
 	}
 	return nil
@@ -4328,14 +4345,61 @@ func ExternalSnapshotCount(dom *libvirt.Domain) (int, error) {
 	return n, nil
 }
 
-// IsCheckpointBlockedBySnapshot reports whether err is libvirt's specific,
-// documented rejection of checkpoint creation while an external snapshot
-// exists on the domain: "the creation of checkpoints when external
-// snapshots exist is currently forbidden" (see
-// https://libvirt.org/formatcheckpoint.html). Matched on the error text
-// rather than a dedicated error code, since libvirt reports this as a
-// generic invalid-operation error with no code of its own specific to this
-// case -- unlike StopBackup just below, which has a structured alternative
+// IsCheckpointBlockedBySnapshot reports whether err is a rejection of
+// checkpoint creation because a snapshot exists on the domain.
+//
+// IT RETURNS FALSE ON EVERY LIBVIRT THIS PROJECT SUPPORTS, AND THAT IS NOT A
+// BUG IN THE MATCH. No QEMU-driver libvirt refuses this. Measured, rather
+// than reasoned about:
+//
+//   - libvirt 8.0.0 / QEMU 6.2.0 (Rocky 8.10, the oldest RHEL family vmsync
+//     is expected to meet): a checkpoint created over a live external
+//     snapshot succeeds. The snapshot was real -- the domain's live disk had
+//     moved to the overlay -- and the checkpoint was created anyway.
+//   - libvirt 12.0.0 / QEMU 10.2.2 (Fedora 44): the same, for an external
+//     snapshot AND for an internal one. Snapshots taken while checkpoints
+//     already existed also succeed, so neither direction is enforced.
+//   - libvirt 10.x, which is what this project targets, sits between those
+//     two and was not tested directly. The source explains why it does not
+//     need to be: in libvirt 8.0.0, src/qemu/qemu_checkpoint.c never
+//     consults the domain's snapshot list at all -- the word appears there
+//     only in an #include and a comment -- and the sole emitter of "cannot
+//     create checkpoint while snapshot exists" in the entire tree is
+//     src/test/test_driver.c, libvirt's MOCK hypervisor, which raises it
+//     with VIR_ERR_OPERATION_UNSUPPORTED when virDomainSnapshotObjListNum()
+//     is non-zero. The qemu driver has no equivalent.
+//
+// So the condition this recognises is reachable only through test:///default.
+// https://libvirt.org/formatcheckpoint.html describes the restriction as a
+// documented limitation; the enforcement with that wording lives in the mock
+// driver, and the phrase this function matches ("external snapshot") is the
+// documentation page's, not any error's.
+//
+// KEPT ANYWAY, deliberately. It costs one string comparison on a path that
+// is already failing, and it is the only thing standing between a future
+// libvirt that does start refusing and a fleet of runs that fail outright
+// instead of syncing incrementally. Returning false is the safe direction
+// (see the caller): the run fails rather than proceeding against a
+// checkpoint whose validity was not re-established.
+//
+// DO NOT "fix" it by matching the mock driver's wording. That would make the
+// tolerance reachable only under test:///default, where there is no replica
+// to protect, while leaving every real hypervisor exactly as it is now.
+//
+// The real snapshot hazard is elsewhere and this function is not it: an
+// external snapshot adds an overlay, so a bitmap recorded in the previous
+// layer is no longer in the chain the next incremental reads, and qemu
+// reports "bitmap '%s' not found in backing chain of '%s'"
+// (VIR_ERR_INTERNAL_ERROR, qemu_checkpoint.c). Tolerating THAT by syncing
+// against the existing checkpoint would be precisely wrong, because the
+// bitmap being relied on is the missing one.
+//
+// Matched on the error text rather than a dedicated error code, since
+// libvirt reports this as a generic unsupported-operation error with no code
+// of its own specific to this case -- VIR_ERR_OPERATION_UNSUPPORTED (84)
+// from VIR_FROM_QEMU (10), which is the same pair "cannot create checkpoint
+// for inactive domain" carries, so a code-only test could not tell them
+// apart. Unlike StopBackup just below, which has a structured alternative
 // available and uses that instead.
 //
 // Unwraps err fully before checking it: err is CreateCheckpoint's own
@@ -4371,8 +4435,25 @@ func ExternalSnapshotCount(dom *libvirt.Domain) (int, error) {
 // half came through untranslated, and the unwrap loop above tests just
 // libvirt's innermost message, which is the translated one. So on such a host
 // this returns false and the tolerance never engages -- safe, by the argument
-// above, but it means the tolerance is effectively English-only. Matching on
-// the virError code and domain instead of on prose would close it.
+// above, but it means the tolerance would be effectively English-only if it
+// were reachable at all, which per the block at the top of this comment it is
+// not.
+//
+// The locale mechanism is worth keeping on record even so, because it applies
+// to every prose match in this package: the language is a property of
+// LIBVIRTD's environment, not the client's. systemd gives a system libvirtd
+// the LANG from /etc/locale.conf, so a French host's daemon emits French --
+// exactly the 2026-10-02 observation -- while a daemon whose unit has
+// LC_ALL=C emits English regardless of who is asking. Confirmed both ways on
+// a French host. Setting LC_ALL=C inside vmsync therefore cannot help, since
+// vmsync is the client.
+//
+// Matching the virError code and domain instead of the prose would NOT close
+// it either: this refusal carries VIR_ERR_OPERATION_UNSUPPORTED (84) from
+// VIR_FROM_QEMU (10), measured from its adjacent sibling "cannot create
+// checkpoint for inactive domain", which carries the identical pair. A
+// code-only test cannot tell a snapshot-blocked checkpoint from one refused
+// for a shut-off domain.
 func IsCheckpointBlockedBySnapshot(err error) bool {
 	if err == nil {
 		return false
@@ -4386,6 +4467,43 @@ func IsCheckpointBlockedBySnapshot(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "checkpoint") && strings.Contains(msg, "external snapshot")
+}
+
+// IsCheckpointInconsistent reports whether err is libvirt refusing to base an
+// incremental backup on a checkpoint whose dirty bitmap it will not trust --
+// VIR_ERR_CHECKPOINT_INCONSISTENT (109), "missing or broken bitmap '%s' for
+// disk '%s'", raised by qemuBackupDiskPrepareOneBitmaps.
+//
+// Keyed on the NUMERIC code, unlike IsCheckpointBlockedBySnapshot directly
+// above, and that difference is the whole point. libvirtd formats its
+// messages server-side in its own locale, so prose matching is a coin toss on
+// a French host; this code is unambiguous and needs no wording at all. The
+// sibling above has to match prose only because its refusal shares
+// VIR_ERR_OPERATION_UNSUPPORTED with unrelated failures. This one does not.
+//
+// WHEN IT FIRES. libvirt validates the bitmap chain against the CURRENT
+// backing chain: the bitmap must be present in the top layer, present in
+// consecutive layers below it with no gap, and in every layer where present
+// be persistent, recording and not inconsistent. Routine snapshot work does
+// not break that -- measured on libvirt 12.0.0/qemu 10.2.2, a checkpoint
+// survives an external snapshot, a `blockcommit --active --pivot`, an
+// offline `snapshot-delete` and even a manual `qemu-img commit`, because
+// libvirt merges the removed layer's fragment into the survivor and
+// qemu-img's own writes re-dirty what it copies. What does reach here is a
+// chain with no usable bitmap left at all: a blockcommit onto a RAW base,
+// where libvirt's merge is skipped outright, is the documented case.
+//
+// SCOPED TO THE BACKUP PATH ON PURPOSE. The same code has a second raise
+// site, qemuCheckpointRedefineValidateBitmaps, which vmsync reaches through
+// ClearOrphanBitmap's redefine. A bad bitmap found while ADOPTING an orphan
+// is not a reason to tell anyone to -reinit -- that path is doing the
+// repair. So this is consulted where a backup is started and nowhere else;
+// do not promote it to a general classifier without splitting the two.
+func IsCheckpointInconsistent(err error) bool {
+	// errors.As, not a type assertion: callers wrap with %w, so the
+	// libvirt.Error is rarely the outermost value.
+	var lvErr libvirt.Error
+	return errors.As(err, &lvErr) && lvErr.Code == libvirt.ERR_CHECKPOINT_INCONSISTENT
 }
 
 // domainJobOperationNames maps the subset of libvirt's job-operation
