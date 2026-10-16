@@ -1690,7 +1690,7 @@ verify_guard_subtest() {
 # that fires on a healthy pair is worse than no invariant; the exact arithmetic
 # is pinned in pkg/nbdsync's own tests, where the numbers come from one source.
 verify_skip_checks() {
-        local scenario="$1" phase="$2" mode="$3"
+        local scenario="$1" phase="$2" mode="$3" planned="${4:-yes}"
         local label="the verify had an allocation map to work from"
         local used="the zero-skip pruned the comparison plan"
         local skipped hashed total
@@ -1707,6 +1707,28 @@ verify_skip_checks() {
                 return 0
         fi
         fo_check "$scenario" "$label" 0
+
+        # AFTER the check above, never before it, and that ordering is the
+        # whole point of this early-out.
+        #
+        # The check above is log-based and applies to BOTH comparators -- it
+        # asks whether vmsync got an allocation map at all -- and covering
+        # the byte comparator's own negotiation of base:allocation is exactly
+        # why this function is called for verify-fast-bytes as well as
+        # verify-fast. Returning before it, which is the obvious way to write
+        # this, would silently delete that coverage and leave the suite
+        # looking tidier for it.
+        #
+        # What follows is gauge-based and the byte comparator emits no
+        # gauges, so grading it there reported "no comparison plan was
+        # recorded for this run" on a verify that ran perfectly well and
+        # found its corruption. The message blamed a compare that had failed
+        # ahead of the plan; nothing had failed. A SKIP whose stated cause
+        # did not happen is worse than no row, because somebody reads it.
+        if [ "$planned" != yes ]; then
+                log "   (no plan to grade: -no-checksum puts -verify on the byte comparator, which plans internally and reports no figures)"
+                return 0
+        fi
 
         skipped="$(prom_sum "$RUN_PROM" vmsync_verify_skipped_bytes)"
         hashed="$(prom_sum "$RUN_PROM" vmsync_verify_hashed_bytes)"
@@ -1806,7 +1828,20 @@ verify_mode_subtest() {
         if [ "$DRY_RUN" != yes ]; then
                 case "$scenario" in
                 verify-fast | verify-fast-bytes)
-                        verify_skip_checks "$scenario" "$phase" "$mode"
+                        # Whether a PLAN is reportable, which is not the same
+                        # question as the mode. -verify uses the digest
+                        # comparator only when the checksum helper is enabled
+                        # (main.go: `case checksumEnabled && (verifyFull ||
+                        # verifyFast)`), and only that comparator fills in the
+                        # plan gauges -- the byte comparator plans internally
+                        # and hands nothing back. The -bytes subtests pass
+                        # -no-checksum precisely to take that other path, so
+                        # here `fast` arrives meaning two different things.
+                        local planned=yes a
+                        for a in "${extra[@]}"; do
+                                [ "$a" = -no-checksum ] && planned=no
+                        done
+                        verify_skip_checks "$scenario" "$phase" "$mode" "$planned"
                         ;;
                 esac
         fi
