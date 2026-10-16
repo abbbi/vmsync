@@ -448,9 +448,9 @@ fault it covers is a target whose storage has wedged: such a command never retur
 because sshd keeps answering keepalives without ever touching the disk, nothing on
 vmsync's side notices -- the run parks indefinitely holding the target's run lock and an
 open libvirt backup job on the source. Only a process on the target can signal it, which
-is what the helper does. Four sub-tests. An ordinary sync must carry the helper's verdict
+is what the helper does. Seven sub-tests. An ordinary sync must carry the helper's verdict
 for its target commands into vmsync's log, which proves the whole path end to end with
-nothing tampered with and without which the other three would be testing a wrapper nobody
+nothing tampered with and without which the other six would be testing a wrapper nobody
 invoked. A run pointed at no helper must still take the old unbounded path and WARN that
 it has, since that sentence is how an operator reading a parked run's log afterwards knows
 why nothing bounded it. Then two sub-tests install a wrapper at -bridge-helper-path that
@@ -465,9 +465,18 @@ what is tested is only whether the wait was visible, and whether the liveness li
 the child's /proc state, which is the field that turns "the target is slow" into a
 diagnosis. The killed sub-test also checks the target is left with no surviving process,
 since a signal that reached the shell alone and not its process group is the exact leak
-supervision exists to prevent. Opt-in: one sub-test fails a sync on purpose, one spends a
-reporting interval waiting on purpose (BENCH_SUPERVISE_BEAT_WAIT, default 75s), and both
-temporarily point vmsync at a wrapper instead of the real helper.
+supervision exists to prevent. Three further sub-tests cover the PROGRESS bound, which
+asks whether a command is doing anything rather than how long it has taken: one that a
+command doing nothing is signalled while one still working is not, which is the only
+evidence the bound discriminates; one that a command under -stall-warn (what qemu-img
+commit runs under, since a commit interrupted part-way leaves the base image in a state
+no later run can describe) is reported and never signalled; and one that a child which
+setsid()s out of the process group -- a real qemu-nbd --fork -- is still found through
+/proc and still killed, with the same probe minus the flag as a control to prove it is
+the flag doing the killing. Opt-in: one sub-test fails a sync on purpose, one spends a
+reporting interval waiting on purpose (BENCH_SUPERVISE_BEAT_WAIT, default 75s), the
+progress ones spend two intervals each and can be skipped with BENCH_SUPERVISE_STALL=no,
+and all of them temporarily point vmsync at a wrapper instead of the real helper.
 EOF
 }
 
@@ -10527,7 +10536,7 @@ stage_reinit_orphan() {
 # stderr reaches vmsync's log line by line while the command is still running,
 # and that a killed command actually fails the run. That is this stage.
 #
-# Four sub-tests:
+# Seven sub-tests:
 #
 #   24a supervise/supervised  -- an ordinary sync's log carries the helper's
 #                                verdict for its target commands, which is the
@@ -10541,10 +10550,22 @@ stage_reinit_orphan() {
 #                                target is slow" into a diagnosis.
 #   24d supervise/unsupervised-- with no usable helper the old unbounded path
 #                                is still taken, and the run says so loudly.
+#   24e supervise/stall       -- a command making NO progress is signalled;
+#                                one still advancing is NOT, however long it
+#                                runs. The second half is what proves the
+#                                bound discriminates rather than merely
+#                                fires.
+#   24f supervise/stallwarn   -- a command under -stall-warn, the setting
+#                                qemu-img commit runs under, is reported and
+#                                never signalled.
+#   24g supervise/watchargv   -- a child that setsid()s out of the process
+#                                group (qemu-nbd --fork) is still found via
+#                                /proc and still killed; without the flag it
+#                                survives, which is the control.
 #
 # Not in the default stage list: 24b deliberately fails a sync, 24c spends a
-# reporting interval waiting on purpose, and both temporarily point vmsync at
-# a wrapper instead of the real helper.
+# reporting interval waiting on purpose, 24e-g spend two each, and all of
+# them temporarily point vmsync at a wrapper instead of the real helper.
 
 # SUPERVISE_SHIM_DIR holds the wrapper scripts on the TARGET host, under /tmp
 # for CHECKSUM_SHIM_DIR's reason: this must never risk overwriting the
@@ -10594,13 +10615,19 @@ SUPERVISE_PROBE_WEDGE="echo \\$\\$ > $SUPERVISE_PROBE_PIDFILE; sh -c 'while :; d
 # hardcoded 75 would then fail for a reason nothing explains.
 BENCH_SUPERVISE_BEAT_WAIT="${BENCH_SUPERVISE_BEAT_WAIT:-75}"
 
-# supervise_install_shim NAME LIMIT COMMAND_TEMPLATE -- writes a wrapper at
-# $SUPERVISE_SHIM_DIR/NAME and prints its path.
+# supervise_install_shim NAME BOUNDFLAGS COMMAND_TEMPLATE -- writes a wrapper
+# at $SUPERVISE_SHIM_DIR/NAME and prints its path.
 #
 # The wrapper passes everything through to the real helper untouched EXCEPT
 # the one supervision whose -label matches $SUPERVISE_PROBE_LABEL. For that
 # one it drains the command vmsync sent, and runs the real helper again with
-# a command of its own and -max-runtime LIMIT.
+# a command of its own and whatever BOUNDFLAGS say.
+#
+# BOUNDFLAGS is the whole bound, not a number -- "-max-runtime 3s",
+# "-stall-after 1s", "-stall-warn 1s -watch-argv /tmp/x.sock". Deliberately
+# unquoted where it is used, so it splits into separate arguments; the
+# alternative is one flag per parameter and a new parameter every time the
+# helper grows a bound.
 #
 # COMMAND_TEMPLATE is shell text evaluated on the target, where $orig holds
 # the command vmsync wanted run -- so a template can replace that command
@@ -10623,7 +10650,7 @@ BENCH_SUPERVISE_BEAT_WAIT="${BENCH_SUPERVISE_BEAT_WAIT:-75}"
 # that the helper exits 124 and vmsync treats the command as failed, so a
 # status swallowed by the shim would make the probe prove nothing.
 supervise_install_shim() {
-	local name="$1" limit="$2" template="$3" real
+	local name="$1" bounds="$2" template="$3" real
 	real="$(bridge_helper_path)"
 
 	run_shell_on "$TARGET_HOST" no "mkdir -p '$SUPERVISE_SHIM_DIR' && cat > '$SUPERVISE_SHIM_DIR/$name' <<'VMSYNC_SUPERVISE_SHIM_EOF'
@@ -10639,7 +10666,7 @@ if [ \"\$mine\" != yes ]; then
 	exec $real \"\$@\"
 fi
 orig=\$(cat)
-printf '%s\n' \"$template\" | $real -max-runtime '$limit' -kill-grace 2s -label 'bench supervision probe'
+printf '%s\n' \"$template\" | $real $bounds -kill-grace 2s -label 'bench supervision probe'
 exit \$?
 VMSYNC_SUPERVISE_SHIM_EOF
 chmod +x '$SUPERVISE_SHIM_DIR/$name'" >/dev/null || return 1
@@ -10650,6 +10677,13 @@ chmod +x '$SUPERVISE_SHIM_DIR/$name'" >/dev/null || return 1
 supervise_remove_shims() {
 	[ "$DRY_RUN" = yes ] && return 0
 	run_shell_on "$TARGET_HOST" no "rm -rf '$SUPERVISE_SHIM_DIR'" >/dev/null 2>&1 || true
+	# 24g's daemon too, and on EXIT as well as RETURN. A RETURN trap does
+	# not fire for `exit`, and run_vmsync exits the harness outright on an
+	# interrupt -- so a Ctrl+C during either of 24g's two-minute waits
+	# would otherwise strand a --persistent qemu-nbd that deliberately
+	# setsid()'d out of every process group involved, holding its image
+	# open with nothing on the host that will ever reap it.
+	supervise_nbd_cleanup
 }
 
 # supervise_log_has PATTERN -- grep the run just made, quietly.
@@ -10729,12 +10763,55 @@ stage_supervise() {
 
 	[ "$DRY_RUN" = yes ] && return 0
 
-	# Everything below points vmsync at a wrapper on the target; make sure
-	# the wrappers go away whichever way this stage ends.
-	trap 'supervise_remove_shims' RETURN
+	# Everything below points vmsync at a wrapper on the target, and 24g
+	# starts a daemon there; make sure both go away whichever way this
+	# stage ends.
+	#
+	# EXIT as well as RETURN, because a RETURN trap does not fire for
+	# `exit` and run_vmsync exits the harness outright on an interrupt --
+	# the one path on which 24g's --persistent, setsid()'d qemu-nbd would
+	# otherwise be left on the target with nothing to reap it. Cleared
+	# before returning, as every other stage here clears its own, so the
+	# harness is not left carrying this one's trap into later stages.
+	trap 'supervise_remove_shims' RETURN EXIT
 
 	supervise_timeout_subtest
 	supervise_liveness_subtest
+
+	# The progress-bound sub-tests, each costing two of the helper's
+	# reporting intervals because the bound is counted in beats and the
+	# earliest a stall can be declared is the second one. Skippable on
+	# their own, for a run that wants the four above without the wait.
+	#
+	# ORDER MATTERS, for 24c's reason: two of these deliberately fail a
+	# sync, and the stage must not END on one. Every sub-test runs with
+	# -reinit so a failed run is recovered by the next, but the LAST run of
+	# the stage is the state the next stage inherits. 24f succeeds, so it
+	# goes last -- stall (fails, then succeeds), watch-argv (fails twice),
+	# stall-warn (succeeds).
+	if [ "$BENCH_SUPERVISE_STALL" = yes ]; then
+		supervise_stall_subtest
+		supervise_watch_argv_subtest
+		supervise_stall_warn_subtest
+		# Belt and braces on the ordering above. Putting the succeeding
+		# sub-test last only holds while it actually RUNS: every one of
+		# these returns early, before its sync, if its shim cannot be
+		# installed -- and the stage would then end on 24g's deliberate
+		# failure and hand the next stage a replica left mid-reinit.
+		# Costs a sync only on the path where that happened.
+		if [ "$RUN_RC" != 0 ]; then
+			log "   (the last sub-test left a deliberately failed run; syncing once more so the next stage does not inherit it)"
+			bench_sync "$sc" restore -reinit
+			if bench_sync_ok; then ok=0; else ok=1; fi
+			fo_check "$sc" "the stage leaves a replica the next stage can use" "$ok" \
+				"exit=$RUN_RC -- the restoring sync failed too; see $RUN_LOG"
+		fi
+	else
+		log "--- 24e-g: skipped (BENCH_SUPERVISE_STALL=no; they wait several reporting intervals) ---"
+		results_row "$CSV" supervise stall "" "" "" "" "" "" "SKIP opted out with BENCH_SUPERVISE_STALL=no"
+	fi
+	# Cleared here; the RETURN trap just below still does the cleanup.
+	trap - EXIT
 	return 0
 }
 
@@ -10752,7 +10829,7 @@ stage_supervise() {
 # existed, the same situation was a sync that never returned at all.
 supervise_timeout_subtest() {
 	local sc=supervise shim ok before after survivor
-	shim="$(supervise_install_shim timeout 3s "$SUPERVISE_PROBE_WEDGE")" || {
+	shim="$(supervise_install_shim timeout "-max-runtime 3s" "$SUPERVISE_PROBE_WEDGE")" || {
 		warn "could not install the timeout shim on $TARGET_HOST"
 		results_row "$CSV" "$sc" timeout-shim "" "" "" "" "" "" "SKIP shim install failed"
 		return 0
@@ -10809,7 +10886,7 @@ supervise_timeout_subtest() {
 supervise_liveness_subtest() {
 	local sc=supervise shim ok beat
 	beat=$((BENCH_SUPERVISE_BEAT_WAIT))
-	shim="$(supervise_install_shim liveness 0 "\$orig; sleep $beat")" || {
+	shim="$(supervise_install_shim liveness "-max-runtime 0" "\$orig; sleep $beat")" || {
 		warn "could not install the liveness shim on $TARGET_HOST"
 		results_row "$CSV" "$sc" liveness-shim "" "" "" "" "" "" "SKIP shim install failed"
 		return 0
@@ -10832,6 +10909,343 @@ supervise_liveness_subtest() {
 	if supervise_log_has 'in state'; then ok=0; else ok=1; fi
 	fo_check "$sc" "the liveness line names the child's process state" "$ok" \
 		"no \"in state\" in $RUN_LOG -- the line proves this process is alive and nothing about the command"
+}
+
+# --- 24e/24f/24g: the PROGRESS bound ----------------------------------------
+#
+# A clock asks "how long should this take", which cannot be answered for a
+# command whose runtime scales with the storage. The progress bound asks "is
+# it doing anything", which has the same answer everywhere. The Go tests
+# prove the counting against a fake clock and the /proc sampling against real
+# processes; what they cannot prove is that vmsync emits the flags, that the
+# helper acts on them over SSH, and -- the part resting until now on an
+# isolated experiment -- that a daemon which setsid()s out of the helper's
+# process group is still found and still killed.
+#
+# EACH OF THESE COSTS TWO BEATS OF WALL CLOCK, and that is not tunable from
+# here. The helper beats once per trace.ProgressInterval and the bound is
+# counted in beats, so the earliest a stall can be declared is the second
+# beat: one to establish a baseline, one to see nothing has moved. The beat
+# interval is deliberately a test-only knob in Go (checksumCfg leaves it
+# zero and a unit test enforces that), so the bench pays the real minute.
+BENCH_SUPERVISE_STALL="${BENCH_SUPERVISE_STALL:-yes}"
+
+# How long the probes that must OUTLIVE the bound keep going. Must exceed two
+# beats or they prove nothing: a command that exits before the second beat was
+# never offered the chance to be wrongly killed.
+BENCH_SUPERVISE_STALL_WAIT="${BENCH_SUPERVISE_STALL_WAIT:-150}"
+
+# The stall bound the shims hand the helper. Any value under one beat rounds
+# up to one beat, so this is "the soonest the mechanism can act" rather than a
+# duration anybody waits.
+SUPERVISE_STALL_BOUND="1s"
+
+# 24g's throwaway NBD export on the TARGET. A unix SOCKET rather than a port,
+# which is not a detail: every port on that host belongs to the bench's own
+# allocator or to a real run, and a probe that guessed one could collide with
+# a sync running beside it. A socket path collides with nothing and doubles as
+# the -watch-argv marker, because it appears verbatim in the daemon's argv and
+# in nothing else on the host.
+SUPERVISE_NBD_SOCK="/tmp/vmsync-bench-supervise-nbd.sock"
+SUPERVISE_NBD_PID="/tmp/vmsync-bench-supervise-nbd.pid"
+SUPERVISE_NBD_IMG="/tmp/vmsync-bench-supervise-nbd.qcow2"
+
+# The witness, and 24g is worthless without it.
+#
+# "the daemon was killed" and "the daemon never started" are the SAME
+# observation if the only thing looked at is whether it is running now: no
+# qemu-img, an old qemu that rejects the flag combination, a full /tmp, and
+# the probe silently has no daemon -- while the stall still fires, because
+# the trailing sleep produces it on its own. The verdict would then be green
+# with nothing on the host at all, which is the shape this stage has shipped
+# twice already.
+#
+# So the probe records the daemon's pid AND its pgid at the moment it exists,
+# and the sub-test refuses to judge the kill until it has read them back. The
+# pgid is the better half: it proves the daemon LEFT the process group, which
+# is the premise -watch-argv exists for.
+SUPERVISE_NBD_WITNESS="/tmp/vmsync-bench-supervise-nbd.witness"
+
+# 24e's own stamp, deliberately not 24b's. Sharing one would couple two
+# sub-tests whose probes mean opposite things -- 24b's stamp advancing is a
+# FAILURE (something survived a kill), 24e's advancing is the whole point --
+# and a leftover from either would be read by the other.
+SUPERVISE_ADVANCING_STAMP="/tmp/vmsync-bench-supervise-advancing.stamp"
+
+# supervise_nbd_alive -- "yes" if the probe's qemu-nbd daemon is still there.
+#
+# By PIDFILE AND ARGV, never by pgrep: pgrep -f would match the shell running
+# it (bench.sh learned that one the hard way, see SUPERVISE_PROBE_STAMP), and
+# the pidfile alone cannot survive pid reuse across a two-minute window. The
+# pid must still exist AND still be the process that owns this socket.
+supervise_nbd_alive() {
+	# Prints exactly "yes" or "no" on success, and nothing if the host could
+	# not be reached -- which the callers must treat as "could not tell",
+	# never as an answer. An unreachable target reported as "the daemon is
+	# gone" would be a PASS for a probe that never ran.
+	ssh_host_cmd "$TARGET_HOST" "p=\$(cat '$SUPERVISE_NBD_PID' 2>/dev/null || true); \
+if [ -n \"\$p\" ] && tr '\\0' ' ' < \"/proc/\$p/cmdline\" 2>/dev/null | grep -qF '$SUPERVISE_NBD_SOCK'; then echo yes; else echo no; fi" 2>/dev/null |
+		tr -dc 'a-z' || true
+}
+
+# supervise_nbd_verdict LABEL WANT DETAIL -- assert the daemon's state,
+# standing down rather than guessing when the target could not be asked.
+supervise_nbd_verdict() {
+	local label="$1" want="$2" detail="$3" alive ok
+	alive="$(supervise_nbd_alive)"
+	case "$alive" in
+	yes | no) ;;
+	*)
+		warn "could not read the probe daemon's state on $TARGET_HOST, so \"$label\" was not decided"
+		results_row "$CSV" supervise "${label// /_}" "" "" "" "" "" "" "SKIP daemon state unreadable"
+		return 0
+		;;
+	esac
+	if [ "$alive" = "$want" ]; then ok=0; else ok=1; fi
+	fo_check supervise "$label" "$ok" "$detail"
+}
+
+supervise_nbd_cleanup() {
+	# The SAME pid+argv confirmation supervise_nbd_alive insists on, and for
+	# the reason written there: a daemon SIGKILLed by the helper never
+	# unlinks its own pidfile, so the number on disk may by now belong to
+	# somebody else's process. Killing it by number alone is the pidfile
+	# half of the pgrep hazard. The numeric guard matters as much -- a
+	# pidfile holding "-1" would otherwise signal every process this user
+	# can reach.
+	ssh_host_cmd "$TARGET_HOST" "p=\$(cat '$SUPERVISE_NBD_PID' 2>/dev/null || true); \
+case \"\$p\" in ''|*[!0-9]*) ;; *) \
+if tr '\\0' ' ' < \"/proc/\$p/cmdline\" 2>/dev/null | grep -qF '$SUPERVISE_NBD_SOCK'; then kill -9 \"\$p\" 2>/dev/null || true; fi ;; esac; \
+rm -f '$SUPERVISE_NBD_SOCK' '$SUPERVISE_NBD_PID' '$SUPERVISE_NBD_IMG' '$SUPERVISE_NBD_WITNESS'" >/dev/null 2>&1 || true
+}
+
+# 24e -- a command making no progress is signalled; one making progress is
+# NOT, however long it runs.
+#
+# TWO RUNS, AND THE SECOND IS THE POINT. A bound that kills everything would
+# pass the first assertion perfectly, which is the trap sub-test 4e fell into
+# before it grew a control: "it was killed" is satisfied by a mechanism with
+# no judgement at all. The advancing probe runs well past the bound and must
+# come through untouched, which is the only evidence that the bound
+# discriminates rather than merely fires.
+supervise_stall_subtest() {
+	local sc=supervise shim ok wait
+
+	wait=$((BENCH_SUPERVISE_STALL_WAIT))
+
+	# -- the stalling half: nothing moves, so it must be signalled ---------
+	shim="$(supervise_install_shim stall "-stall-after $SUPERVISE_STALL_BOUND" "\$orig; sleep 300")" || {
+		warn "could not install the stall shim on $TARGET_HOST"
+		results_row "$CSV" "$sc" stall-shim "" "" "" "" "" "" "SKIP shim install failed"
+		return 0
+	}
+	log "   (24e waits for two of the helper's reporting intervals on purpose, for the stall bound to come round)"
+	bench_sync "$sc" stall -reinit -bridge-helper-path "$shim"
+
+	if [ "$RUN_RC" != 0 ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "a target command making no progress fails the run" "$ok" \
+		"the run exited 0 with a command that did nothing for two reporting intervals -- the stall bound never fired"
+
+	# outcome=stalled, not outcome=timeout: the two are different findings
+	# and only one of them is evidence about the storage.
+	if supervise_log_has 'outcome=stalled'; then ok=0; else ok=1; fi
+	fo_check "$sc" "the verdict reports a stall rather than a timeout" "$ok" \
+		"no \"outcome=stalled\" in $RUN_LOG -- a wall-clock timeout would say outcome=timeout, and this command had no clock"
+
+	if supervise_log_has 'stalled_beats='; then ok=0; else ok=1; fi
+	fo_check "$sc" "the verdict says how many beats showed no progress" "$ok" \
+		"no \"stalled_beats=\" in $RUN_LOG -- \"stalled\" without a count invites the question the count answers"
+
+	if supervise_log_has 'NO PROGRESS'; then ok=0; else ok=1; fi
+	fo_check "$sc" "the liveness line announced the stall before acting on it" "$ok" \
+		"no \"NO PROGRESS\" line in $RUN_LOG -- the first an operator heard of it was the failure"
+
+	# -- the discriminating half: it advances, so it must be left alone ----
+	ssh_host_cmd "$TARGET_HOST" "rm -f '$SUPERVISE_ADVANCING_STAMP'" >/dev/null 2>&1 || true
+	# NO '$' ANYWHERE IN THE TEMPLATE except the ones bench.sh must expand
+	# itself. A template is expanded TWICE -- once by the shim's own printf
+	# on the target, then by the shell the helper runs it in -- which is the
+	# hazard SUPERVISE_PROBE_WEDGE escapes '\$\$' for. `$(seq 1 N)` written
+	# plainly would be evaluated by the shim instead of the command, and a
+	# counter variable would expand to nothing at all. `timeout` needs
+	# neither, and `|| true` keeps its 124 from failing a run that is
+	# supposed to succeed.
+	#
+	# --foreground IS LOAD-BEARING, not tidiness. GNU timeout calls
+	# setpgid(0,0) by default, so it and the worker underneath it leave the
+	# supervised process group entirely -- measured on this project's test
+	# host: leader pgid 2186736, timeout and its child both 2186738. The
+	# group sum would then contain nothing but a shell asleep in wait(),
+	# the probe meant to PROVE a working command is spared would read as
+	# making no progress, and the bound would kill it. The control would
+	# fail for the exact reason it exists to disprove. --foreground
+	# suppresses the setpgid; verified the same way.
+	shim="$(supervise_install_shim advancing "-stall-after $SUPERVISE_STALL_BOUND" \
+		"\$orig; timeout --foreground $wait sh -c 'while :; do date +%s > $SUPERVISE_ADVANCING_STAMP; sleep 1; done' || true")" || {
+		warn "could not install the advancing shim on $TARGET_HOST"
+		results_row "$CSV" "$sc" advancing-shim "" "" "" "" "" "" "SKIP shim install failed"
+		return 0
+	}
+	log "   (24e now runs a probe that keeps working for ${wait}s under the same bound, which must NOT kill it)"
+	bench_sync "$sc" advancing -reinit -bridge-helper-path "$shim"
+
+	# THE PREMISE FIRST, because without it this half is green for a probe
+	# that never ran. "the run succeeded" and "nothing stalled" are both
+	# trivially true of a command that finished inside the first beat --
+	# which is exactly what happens if `timeout` is missing on the target
+	# (127, swallowed by the `|| true`), or if the template were malformed.
+	# The beat line carries the probe's own label, so matching it proves
+	# THIS command outlived a reporting interval rather than some other.
+	if supervise_log_has 'supervise alive (bench supervision probe)'; then ok=0; else ok=1; fi
+	fo_check "$sc" "the advancing probe outlived a reporting interval" "$ok" \
+		"no beat for the probe in $RUN_LOG -- it finished inside the first interval, so it was never offered the chance to be wrongly killed and the two checks below prove nothing"
+
+	if bench_sync_ok; then ok=0; else ok=1; fi
+	fo_check "$sc" "a slow target command that is still advancing is never signalled" "$ok" \
+		"exit=$RUN_RC -- a command that did work every second for ${wait}s was killed anyway, so the bound is a clock in disguise and every slow-but-healthy command on a loaded array will fail the same way; see $RUN_LOG"
+
+	if supervise_log_has 'outcome=stalled'; then ok=1; else ok=0; fi
+	fo_check "$sc" "the advancing command is not reported as stalled" "$ok" \
+		"\"outcome=stalled\" in $RUN_LOG for a command that was working throughout"
+}
+
+# 24f -- a command that must never be abandoned is still watched.
+#
+# qemu-img commit runs under -stall-warn: measured exactly like the others,
+# signalled never, because a commit interrupted part-way leaves the base image
+# in a state no later run can describe. Being unkillable was never a reason
+# not to look, and this is the sub-test that says the looking actually
+# happens -- delete the watch and every "it was not killed" assertion stays
+# green while the one command that can hang for an hour goes silent again.
+supervise_stall_warn_subtest() {
+	local sc=supervise shim ok wait
+	wait=$((BENCH_SUPERVISE_STALL_WAIT))
+
+	shim="$(supervise_install_shim stallwarn "-stall-warn $SUPERVISE_STALL_BOUND" "\$orig; sleep $wait")" || {
+		warn "could not install the stall-warn shim on $TARGET_HOST"
+		results_row "$CSV" "$sc" stallwarn-shim "" "" "" "" "" "" "SKIP shim install failed"
+		return 0
+	}
+	log "   (24f waits ${wait}s on purpose: a command doing nothing, which must be reported and NOT killed)"
+	bench_sync "$sc" stallwarn -reinit -bridge-helper-path "$shim"
+
+	if bench_sync_ok; then ok=0; else ok=1; fi
+	fo_check "$sc" "a warn-only command is never signalled however long it does nothing" "$ok" \
+		"exit=$RUN_RC -- this is the setting qemu-img commit runs under, and signalling it corrupts the base image; see $RUN_LOG"
+
+	if supervise_log_has 'NO PROGRESS'; then ok=0; else ok=1; fi
+	fo_check "$sc" "a warn-only command still reports that it is making no progress" "$ok" \
+		"no \"NO PROGRESS\" in $RUN_LOG -- watching in silence is the same as not watching"
+
+	# The line must also say that nothing is about to happen, or an operator
+	# reads "NO PROGRESS" and assumes the tool is handling it.
+	if supervise_log_has 'NOT signalled'; then ok=0; else ok=1; fi
+	fo_check "$sc" "the warning says plainly that the command will not be signalled" "$ok" \
+		"no \"NOT signalled\" in $RUN_LOG -- the operator cannot tell whether to intervene"
+
+	# Deliberately NOT asserting 'outcome=completed': every other supervised
+	# command in the run emits that line too, so the grep would pass with
+	# this probe killed stone dead. "the run succeeded" above already says
+	# the only thing a verdict line could add here, and says it about the
+	# right command.
+	if supervise_log_has 'stalled_beats='; then ok=0; else ok=1; fi
+	fo_check "$sc" "the stall reaches the verdict even though nothing was signalled" "$ok" \
+		"no \"stalled_beats=\" in $RUN_LOG -- a command that froze and then finished reported a clean completion, which is the state nobody can act on afterwards"
+}
+
+# 24g -- a child that daemonises out of the process group is still found.
+#
+# THE ONE CLAIM HERE THAT NOTHING ELSE TESTS. qemu-nbd --fork calls setsid():
+# measured on this project's test host, the daemon's pgid and sid both equal
+# its own pid, and it SURVIVED a kill(-pgid) aimed at the group it was started
+# in. So the group-wide measurement cannot see it and the group-wide signal
+# cannot stop it -- the one process whose health matters would be the one
+# process neither watched nor stopped. -watch-argv finds it in /proc by a
+# substring of its command line.
+#
+# TWO RUNS AGAIN, and the second is the control in reverse: the SAME probe
+# without -watch-argv must leave the daemon running. If it died anyway the
+# flag is proving nothing and something else is doing the killing.
+supervise_watch_argv_subtest() {
+	local sc=supervise shim ok start witness
+
+	if ! ssh_host_cmd "$TARGET_HOST" "command -v qemu-nbd >/dev/null 2>&1 && command -v qemu-img >/dev/null 2>&1" >/dev/null 2>&1; then
+		warn "SKIP 24g: no qemu-nbd/qemu-img on $TARGET_HOST to stage a daemonising child with"
+		results_row "$CSV" "$sc" watch-argv "" "" "" "" "" "" "SKIP no qemu-nbd on the target"
+		return 0
+	fi
+
+	# The probe: create a tiny image, start a REAL qemu-nbd --fork on it so a
+	# real setsid() happens, then do nothing so the group stalls. The daemon
+	# is idle too, so it makes no progress either and the bound fires on the
+	# pair of them -- which is the situation being tested.
+	# The witness is written with `cat FILE > FILE` and `ps -o pgid=`, never
+	# with a command substitution: a $(...) in a template is evaluated by
+	# the SHIM, one layer too early, when the daemon does not exist yet.
+	start="\$orig; rm -f '$SUPERVISE_NBD_SOCK' '$SUPERVISE_NBD_PID' '$SUPERVISE_NBD_WITNESS'; \
+qemu-img create -f qcow2 '$SUPERVISE_NBD_IMG' 1M >/dev/null 2>&1; \
+qemu-nbd --fork --persistent --read-only --format=qcow2 --socket='$SUPERVISE_NBD_SOCK' --pid-file='$SUPERVISE_NBD_PID' '$SUPERVISE_NBD_IMG'; \
+cat '$SUPERVISE_NBD_PID' > '$SUPERVISE_NBD_WITNESS' 2>/dev/null; \
+ps -o pid=,pgid=,sid= -C qemu-nbd >> '$SUPERVISE_NBD_WITNESS' 2>/dev/null; \
+sleep 300"
+
+	# -- with the flag: the daemon must die with the group ----------------
+	supervise_nbd_cleanup
+	shim="$(supervise_install_shim watchargv \
+		"-stall-after $SUPERVISE_STALL_BOUND -watch-argv $SUPERVISE_NBD_SOCK" "$start")" || {
+		warn "could not install the watch-argv shim on $TARGET_HOST"
+		results_row "$CSV" "$sc" watchargv-shim "" "" "" "" "" "" "SKIP shim install failed"
+		return 0
+	}
+	log "   (24g starts a real qemu-nbd --fork on $TARGET_HOST and waits two reporting intervals for the bound)"
+	bench_sync "$sc" watchargv -reinit -bridge-helper-path "$shim"
+
+	# TWO premises, and neither is optional.
+	#
+	# That the bound fired at all -- otherwise nothing was killed and the
+	# daemon's survival says nothing about -watch-argv.
+	if supervise_log_has 'outcome=stalled'; then ok=0; else ok=1; fi
+	fo_check "$sc" "the watch-argv probe reached its stall bound" "$ok" \
+		"no \"outcome=stalled\" in $RUN_LOG -- the probe never stalled, so whether the daemon died says nothing"
+
+	# And that there WAS a daemon. Without this, "qemu-nbd is gone" is also
+	# what a host with no qemu-nbd at all looks like, and the sub-test
+	# passes having tested nothing. The witness is written by the probe at
+	# the moment the daemon exists.
+	witness="$(ssh_host_cmd "$TARGET_HOST" "cat '$SUPERVISE_NBD_WITNESS' 2>/dev/null || true" 2>/dev/null | tr -s ' \n' ' ' || true)"
+	if [ -n "$(printf '%s' "$witness" | tr -dc '0-9')" ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "the watch-argv probe really did start a daemon to kill" "$ok" \
+		"nothing in $SUPERVISE_NBD_WITNESS on $TARGET_HOST -- qemu-nbd never came up, so \"it is gone now\" is not evidence of anything"
+	log "   EVIDENCE: the probe's daemon, as pid/pgid/sid while it lived: ${witness:-<none>}"
+
+	supervise_nbd_verdict "a daemon that left the process group is still killed" no \
+		"qemu-nbd is still serving $SUPERVISE_NBD_SOCK on $TARGET_HOST after the helper gave up. It called setsid(), so the group kill could not reach it and -watch-argv was supposed to"
+	supervise_nbd_cleanup
+
+	# -- without the flag: the daemon must SURVIVE ------------------------
+	#
+	# Not belt and braces. If it dies here too, something other than
+	# -watch-argv is killing it and the assertion above is measuring that
+	# something instead -- the probe would be green whether the flag worked
+	# or not, which is the failure mode this whole stage keeps running into.
+	shim="$(supervise_install_shim nowatchargv "-stall-after $SUPERVISE_STALL_BOUND" "$start")" || {
+		warn "could not install the no-watch-argv control shim on $TARGET_HOST"
+		results_row "$CSV" "$sc" nowatchargv-shim "" "" "" "" "" "" "SKIP shim install failed"
+		return 0
+	}
+	log "   (24g now runs the same probe WITHOUT -watch-argv, where the daemon is expected to survive)"
+	bench_sync "$sc" nowatchargv -reinit -bridge-helper-path "$shim"
+
+	# The control needs its own premise for the same reason: a control run
+	# where nothing was ever signalled leaves the daemon up trivially, and
+	# would stay green even if the group kill had started reaching strays.
+	if supervise_log_has 'outcome=stalled'; then ok=0; else ok=1; fi
+	fo_check "$sc" "the control run also reached its stall bound" "$ok" \
+		"no \"outcome=stalled\" in $RUN_LOG for the control -- nothing was killed, so the daemon surviving proves nothing"
+
+	supervise_nbd_verdict "without -watch-argv the escaped daemon is left running, as the control" yes \
+		"qemu-nbd is gone from $TARGET_HOST even though nothing was watching its argv -- so the previous check was not measuring -watch-argv, and something else is reaping it"
+	supervise_nbd_cleanup
 }
 
 stage_pattern() {
