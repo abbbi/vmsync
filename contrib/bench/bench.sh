@@ -69,7 +69,7 @@ STAGES="matrix,verify,reinit,snapshot,journal,retention"
 # The "want ..." list this was first copied from had checksum third, for
 # historical reasons, which made `--stages all` run stage 13 before stage 3
 # while --help promised stage-number order.
-ALL_STAGES="matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,checksum,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease,redefine-probe,reinit-orphan,supervise"
+ALL_STAGES="matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,checksum,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease,redefine-probe,reinit-orphan,supervise,exclude"
 
 # INTERRUPTED: vmsync catches SIGINT/SIGTERM itself (cleanup, then a plain
 # os.Exit(1) -- see cmd/vmsync/main.go's own signal handling), so a Ctrl+C
@@ -106,6 +106,7 @@ Options:
                             10  restore      22  redefine-probe
                             11  invert       23  reinit-orphan
                             12  wedge       24  supervise
+                                                     25  exclude
                            Or one of two shorthands, used on their own rather
                            than inside a list:
                              all             every stage above, in that order
@@ -123,7 +124,7 @@ Options:
                            invert, wedge, checksum, verify-failure,
                            commit-barrier, interrupted-reinit, colocated,
                            leftovers, reinit-order, lock-lease,
-                           redefine-probe, reinit-orphan and supervise are
+                           redefine-probe, reinit-orphan, supervise and exclude are
                            opt-in, see below. commit-barrier additionally
                            needs a source domain with two or more qcow2 disks,
                            and skips cleanly without one. colocated needs
@@ -477,6 +478,30 @@ the flag doing the killing. Opt-in: one sub-test fails a sync on purpose, one sp
 reporting interval waiting on purpose (BENCH_SUPERVISE_BEAT_WAIT, default 75s), the
 progress ones spend two intervals each and can be skipped with BENCH_SUPERVISE_STALL=no,
 and all of them temporarily point vmsync at a wrapper instead of the real helper.
+
+Stage 25 (exclude) checks the `exclude` metadata field: the one field in vmsync's
+namespace an operator writes and vmsync only reads. `exclude=report-only` leaves a
+domain inventoried and reported but never synced, scheduled, fenced or operated on;
+`exclude=fully-ignored` removes it from the agent's view as well. The Go tests cover
+the decision, the assessment and the gates. What they cannot cover is whether the
+field an OPERATOR writes is the field vmsync READS, and that is what this stage is
+for: the engine writes its metadata children unprefixed, `virsh metadata --set`
+writes them prefixed because virsh applies the --key prefix itself, and the first
+version of the documentation told operators to pass a payload virsh stored as
+<vmsync:vmsync:vmsync> -- double-prefixed, accepted with "Metadata modified", and
+read by nothing. Every unit test passed throughout, because every unit test built
+the XML the way vmsync writes it. Seven sub-tests, all engine-side: the pair syncs
+before anything is excluded, so a later refusal means the exclusion rather than a
+broken fixture; the documented virsh command produces metadata vmsync reads back and
+an element that is not double-prefixed; a sync is refused, names the field and leaves
+the replica's last_checkpoint untouched; the refusal is NOT counted toward
+failure_count, since an administrative decision is not a broken sync and counting it
+would make an excluded replica slowly unpromotable; -explain-domain still runs on the
+excluded domain and says why, which is the whole point of exempting it; an
+unrecognised value still refuses, fail-closed; and removing the field makes the pair
+sync again, which is the property that makes the feature usable at all. It writes to
+the bench SOURCE domain, so it restores the element verbatim on EXIT as well as
+RETURN -- an exclusion left behind would refuse every sync in every later stage.
 EOF
 }
 
@@ -4670,7 +4695,7 @@ stage_fence_agent() {
 # counting as one of its own transport runs -- so a full --stages all run
 # reported Stage 1 as FAILED, with a count of "N of M vmsync runs exited
 # non-zero" that no transport combination in the matrix table accounts for.
-NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$|colocated$|leftovers$|reinit-order$|lock-lease$|redefine-probe$|reinit-orphan$|supervise$)'
+NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$|colocated$|leftovers$|reinit-order$|lock-lease$|redefine-probe$|reinit-orphan$|supervise$|exclude$)'
 
 # stage_pattern STAGE -> the regex matching that stage's scenario column.
 # --- Stage 8: verify after a long incremental chain --------------------------
@@ -11248,6 +11273,255 @@ sleep 300"
 	supervise_nbd_cleanup
 }
 
+# --- Stage 25: the exclude metadata field -----------------------------------
+#
+# WHAT IS BEING TESTED. `exclude` is the one field in vmsync's metadata
+# namespace an operator writes and vmsync only ever reads: exclude=report-only
+# leaves a domain inventoried and reported but never synced, scheduled, fenced
+# or operated on, and exclude=fully-ignored additionally removes it from the
+# agent's view entirely. The Go tests cover the decision (libvirtsync.Excluded),
+# the assessment (inventory.Assess) and the gates themselves.
+#
+# WHAT THEY CANNOT COVER is the part that was broken when this shipped: whether
+# the field an OPERATOR writes is the field vmsync reads. The engine writes its
+# own metadata children unprefixed; `virsh metadata --set` writes them
+# prefixed, because virsh applies the --key prefix itself. The first version of
+# the documentation told operators to pass a payload that virsh stored as
+# <vmsync:vmsync:vmsync> -- double-prefixed, accepted with "Metadata modified",
+# and read by nothing. Every unit test passed throughout, because every unit
+# test built the XML the way vmsync writes it. Only a real virsh against a real
+# libvirt catches that, which is this stage.
+#
+# Seven sub-tests, all engine-side -- no agent needed:
+#
+#   25a baseline     -- the pair syncs before anything is excluded, so a later
+#                       refusal means the exclusion and not a broken fixture.
+#   25b set          -- the DOCUMENTED virsh command stores metadata vmsync can
+#                       read back, and the element is not double-prefixed.
+#   25c refused      -- a sync is refused, names the field, and leaves the
+#                       replica's last_checkpoint untouched.
+#   25d no-failure   -- the refusal does NOT count toward failure_count: an
+#                       administrative decision is not a broken sync, and
+#                       counting it would make an excluded replica slowly
+#                       unpromotable.
+#   25e explain      -- -explain-domain still RUNS on an excluded domain and
+#                       says why. It is exempt from the gate precisely so an
+#                       operator can discover the exclusion; exempt and silent
+#                       would buy nothing.
+#   25f typo         -- an unrecognised value still refuses. Fail-closed: a
+#                       misspelling that resumed replication would do the one
+#                       thing the operator was preventing.
+#   25g lifted       -- removing the field makes the pair sync again. The
+#                       property that makes the whole feature safe to use.
+#
+# Not in the default stage list, for one reason: it writes metadata to the
+# bench SOURCE domain. That is the one thing here that could outlive a crashed
+# run and then silently stop every later stage -- and every later RUN --
+# syncing, with the cause buried in metadata nobody thinks to read.
+#
+# Three things make that safe enough to ship. The teardown is on EXIT as well
+# as RETURN, so an interrupt does not strand it. It restores the element
+# VERBATIM rather than removing it, so a source carrying replica_targets keeps
+# them -- `virsh metadata --set` replaces the whole element, and dropping
+# replica_targets would unpair the VM permanently. And 25g re-reads the field
+# afterwards to prove it is gone rather than trusting the write.
+
+# The element as it stood before this stage touched it, restored verbatim on
+# the way out. Empty when the stage never got as far as writing.
+EXCLUDE_SAVED_META=""
+EXCLUDE_TOUCHED=no
+
+# exclude_restore -- put the source's metadata back exactly as it was.
+#
+# ON EXIT, not only on RETURN, and that is the whole safety argument for this
+# stage. A RETURN trap does not fire for `exit`, and run_vmsync exits the
+# harness outright on an interrupt -- so a Ctrl+C in the middle of 25c would
+# otherwise leave exclude=report-only on the bench source, where it would
+# refuse every sync in every later stage and in every later RUN, with the
+# reason buried in metadata nobody thinks to read.
+exclude_restore() {
+	[ "$DRY_RUN" = yes ] && return 0
+	[ "$EXCLUDE_TOUCHED" = yes ] || return 0
+	if [ -n "$EXCLUDE_SAVED_META" ]; then
+		vmsync_meta_restore "$SOURCE_URI" "$SOURCE_DOMAIN" "$EXCLUDE_SAVED_META"
+	else
+		# There was no vmsync element before, so the exclusion is the whole
+		# of it and removing the element restores the original state.
+		virsh_uri "$SOURCE_URI" metadata "$SOURCE_DOMAIN" --uri "$VMSYNC_METADATA_URI" \
+			--key vmsync --remove --config >/dev/null 2>&1 || true
+	fi
+	EXCLUDE_TOUCHED=no
+	# Said out loud, every time: an operator reading this log after an
+	# interrupted run needs to know the source was left clean.
+	log "   (the source's vmsync metadata has been restored)"
+}
+
+# exclude_set VALUE -- write exclude=VALUE on the source, preserving every
+# other field, and report whether vmsync can read it back.
+exclude_set() {
+	local value="$1" saved
+	saved="$(vmsync_meta_set_field "$SOURCE_URI" "$SOURCE_DOMAIN" exclude "$value")" || return 1
+	EXCLUDE_TOUCHED=yes
+	# Only the FIRST save is kept: 25f overwrites the value, and saving
+	# again would record the excluded state as the thing to restore.
+	if [ -z "$EXCLUDE_SAVED_META" ]; then
+		EXCLUDE_SAVED_META="$saved"
+	fi
+	return 0
+}
+
+stage_exclude() {
+	log "=== Stage 25: the exclude metadata field ==="
+	local sc=exclude ok before after fc_before fc_after stored readback out
+
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" "$sc" dryrun DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+
+	stage_needs_target_shutoff "$CSV" "$sc" "stage exclude" || return 0
+
+	# vmsync_meta_set_field declines on a domain whose metadata it cannot
+	# recognise, and a source that has never synced has no vmsync element at
+	# all. Both are SKIPs rather than failures: this stage tests the field,
+	# not whether the fixture has been synced yet.
+	if ! virsh_uri "$SOURCE_URI" metadata "$SOURCE_DOMAIN" --uri "$VMSYNC_METADATA_URI" --config >/dev/null 2>&1; then
+		warn "SKIP stage 25: $SOURCE_DOMAIN carries no vmsync metadata to splice into -- run one sync first"
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP no vmsync metadata on the source"
+		return 0
+	fi
+
+	trap 'exclude_restore' RETURN EXIT
+
+	# --- 25a: the control ---------------------------------------------------
+	#
+	# Before anything is excluded, so a refusal below is the exclusion and
+	# not a pair that was already broken. Every later sub-test rests on this.
+	bench_sync "$sc" baseline -reinit
+	if bench_sync_ok; then ok=0; else ok=1; fi
+	fo_check "$sc" "the pair syncs before anything is excluded" "$ok" \
+		"exit=$RUN_RC -- the fixture is broken, so nothing below would mean anything; see $RUN_LOG"
+	if [ "$ok" != 0 ]; then
+		trap - EXIT
+		return 0
+	fi
+	before="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_checkpoint)"
+	fc_before="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" failure_count)"
+	[ -n "$fc_before" ] || fc_before=0
+
+	# --- 25b: the operator's own command ------------------------------------
+	#
+	# THE SUB-TEST THIS STAGE EXISTS FOR. vmsync writes its metadata children
+	# unprefixed; virsh writes them prefixed. Reading back through vmsync's
+	# own parser is the only way to know the two agree.
+	if ! exclude_set report-only; then
+		warn "SKIP stage 25: could not write the exclude field to $SOURCE_DOMAIN"
+		results_row "$CSV" "$sc" set "" "" "" "" "" "" "SKIP metadata not writable"
+		trap - EXIT
+		return 0
+	fi
+	readback="$(vmsync_meta_field "$SOURCE_URI" "$SOURCE_DOMAIN" exclude)"
+	if [ "$readback" = report-only ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "vmsync reads back the exclude field virsh wrote" "$ok" \
+		"wrote exclude=report-only with virsh and vmsync's own reader returned '${readback}' -- the field an operator sets is not the field vmsync reads"
+
+	# The double-prefix trap, checked directly rather than inferred: virsh
+	# accepts a prefixed payload, prints "Metadata modified", and stores
+	# <vmsync:vmsync:vmsync>, which nothing reads. The read above would
+	# already have failed, but this names the cause instead of leaving
+	# somebody to find it.
+	stored="$(virsh_uri "$SOURCE_URI" dumpxml --inactive "$SOURCE_DOMAIN" 2>/dev/null | tr -d ' \t')"
+	case "$stored" in
+	*"<vmsync:vmsync:vmsync"*) ok=1 ;;
+	*) ok=0 ;;
+	esac
+	fo_check "$sc" "the metadata element is not double-prefixed" "$ok" \
+		"$SOURCE_DOMAIN's metadata contains <vmsync:vmsync:vmsync>, which virsh accepts and no reader recognises"
+
+	# --- 25c: the refusal ---------------------------------------------------
+	bench_sync "$sc" refused
+	if [ "$RUN_RC" != 0 ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "a sync is refused while the source is excluded" "$ok" \
+		"the run exited 0 with exclude=report-only on $SOURCE_DOMAIN -- the exclusion did nothing"
+
+	if grep -q 'exclude' "$RUN_LOG" 2>/dev/null; then ok=0; else ok=1; fi
+	fo_check "$sc" "the refusal names the field" "$ok" \
+		"no mention of 'exclude' in $RUN_LOG -- an operator reading this later cannot tell why the sync stopped"
+
+	# The replica must be untouched, not merely unsynced: a refusal that got
+	# far enough to move the checkpoint would leave the next incremental
+	# working from a baseline no copy corresponds to.
+	after="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" last_checkpoint)"
+	if [ "$before" = "$after" ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "the refused sync left the replica untouched" "$ok" \
+		"last_checkpoint moved from '$before' to '$after' during a refused run"
+
+	# --- 25d: not counted as a failure --------------------------------------
+	#
+	# An administrative decision is not a broken sync. Counting it would make
+	# a deliberately excluded replica slowly unpromotable, since a non-zero
+	# failure_count blocks promotion -- the same reasoning the role gate's
+	# own exemption rests on.
+	fc_after="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" failure_count)"
+	[ -n "$fc_after" ] || fc_after=0
+	if [ "$fc_before" = "$fc_after" ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "the refusal is not counted as a sync failure" "$ok" \
+		"failure_count went from '$fc_before' to '$fc_after' -- an excluded replica would slowly become unpromotable"
+
+	# --- 25e: the verb that explains ----------------------------------------
+	#
+	# -explain-domain is exempt from the exclusion gate so that an operator
+	# can find out WHY a VM is idle. Exempt and silent about the exclusion
+	# would buy nothing, which is what it did until this was noticed.
+	# requireLocalURI: the verb reads the domain's own journal beside its
+	# disks, so it refuses a remote -target-uri. Only runnable here when the
+	# harness is on the source host, which is the ordinary configuration.
+	if [ "$SOURCE_LOCAL" != yes ]; then
+		results_row "$CSV" "$sc" explain "" "" "" "" "" "" "SKIP -explain-domain needs a local source"
+	else
+		out="$("$VMSYNC_BIN" -explain-domain "$SOURCE_DOMAIN" -target-uri "$SOURCE_URI" 2>&1)" || true
+		case "$out" in
+		*exclude*) ok=0 ;;
+		*) ok=1 ;;
+		esac
+		fo_check "$sc" "-explain-domain runs on an excluded domain and says so" "$ok" \
+			"-explain-domain produced no mention of the exclusion: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+	fi
+
+	# --- 25f: a typo still excludes -----------------------------------------
+	if exclude_set ful; then
+		bench_sync "$sc" typo
+		if [ "$RUN_RC" != 0 ]; then ok=0; else ok=1; fi
+		fo_check "$sc" "an unrecognised exclude value still refuses" "$ok" \
+			"the run exited 0 with exclude=ful -- a misspelling resumed replication, which is the one thing the operator was preventing"
+	else
+		results_row "$CSV" "$sc" typo "" "" "" "" "" "" "SKIP could not write the typo value"
+	fi
+
+	# --- 25g: lifting it ----------------------------------------------------
+	#
+	# The property that makes the feature safe to use at all. Done through
+	# the same restore path the teardown uses, so this also proves the
+	# teardown works -- a stage that left the source excluded would be worse
+	# than no stage.
+	exclude_restore
+	readback="$(vmsync_meta_field "$SOURCE_URI" "$SOURCE_DOMAIN" exclude)"
+	if [ -z "$readback" ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "removing the field clears the exclusion" "$ok" \
+		"the source still reads exclude='${readback}' after the restore -- every later stage would be refused"
+
+	bench_sync "$sc" lifted
+	if bench_sync_ok; then ok=0; else ok=1; fi
+	fo_check "$sc" "the pair syncs again once the exclusion is lifted" "$ok" \
+		"exit=$RUN_RC -- the exclusion is not reversible, which makes it unusable; see $RUN_LOG"
+
+	# Cleared because exclude_restore above already ran and the RETURN trap
+	# will run it again harmlessly; what must not persist is the EXIT trap,
+	# which other stages would then inherit.
+	trap - EXIT
+	return 0
+}
+
 stage_pattern() {
 	case "$1" in
 	# Anchored to the named sub-tests rather than a bare ^verify- , so a
@@ -11297,6 +11571,7 @@ stage_pattern() {
 	# cleanup row is a failure of the stage and belongs to its verdict.
 	reinit-orphan) printf '^(reinit-orphan|precondition|stood-down|cleanup)$' ;;
 	supervise) printf '^(supervise|precondition)$' ;;
+	exclude) printf '^(exclude|precondition)$' ;;
 	*) printf '$^' ;; # matches nothing
 	esac
 }
@@ -11339,6 +11614,7 @@ stage_number() {
 	redefine-probe) printf '22' ;;
 	reinit-orphan) printf '23' ;;
 	supervise) printf '24' ;;
+	exclude) printf '25' ;;
 	*) printf '?' ;;
 	esac
 }
@@ -12061,6 +12337,7 @@ for s in "${stage_list[@]}"; do
         redefine-probe) stage_redefine_probe || stage_rc=$? ;;
         reinit-orphan) stage_reinit_orphan || stage_rc=$? ;;
         supervise) stage_supervise || stage_rc=$? ;;
+        exclude) stage_exclude || stage_rc=$? ;;
         *) die "unknown stage '$s' in --stages (want one of: $ALL_STAGES -- or the shorthands 'all' and 'all-but-matrix', which stand alone rather than inside a list)" ;;
         esac
         if [ "$stage_rc" != 0 ]; then
