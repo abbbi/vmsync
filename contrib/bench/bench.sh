@@ -2422,37 +2422,76 @@ stage_external_snapshot() {
 BMPROBE_DOMAIN="vmsync-bench-bmprobe"
 BMPROBE_PREFIX="vmsync-bench-bmprobe"
 # Outside the bench's own 10809-10908/20809-21008 spans, so a probe backup
-# server cannot collide with a sync that is running beside it.
+# server cannot collide with a sync that is running beside it. The control
+# and the test each get their own, because the control's job is aborted
+# rather than waited out and its port may not be free the instant after.
 BMPROBE_PORT="${BMPROBE_PORT:-10999}"
+BMPROBE_PORT2="$((BMPROBE_PORT + 1))"
+# Set by bitmap_chain_probe before anything can need cleaning. A global on
+# purpose: cleanup must not depend on a caller's local under `set -u`.
+BMPROBE_DIR=""
 
-# bmprobe_cleanup DIR -- removes the throwaway domain and its files.
+# bmprobe_cleanup -- removes the throwaway domain and its files.
 #
 # Unconditional and idempotent: every exit from the probe runs it, including
 # the ones that failed half way, because a leftover paused domain on a
 # hypervisor is somebody's confusing morning.
 bmprobe_cleanup() {
-	local dir="$1"
 	[ "$DRY_RUN" = yes ] && return 0
+	[ -n "$BMPROBE_DIR" ] || return 0
 	virsh_uri "$SOURCE_URI" destroy "$BMPROBE_DOMAIN" >/dev/null 2>&1 || true
 	virsh_uri "$SOURCE_URI" undefine "$BMPROBE_DOMAIN" --snapshots-metadata --checkpoints-metadata >/dev/null 2>&1 || true
-	run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "rm -f '${dir}/${BMPROBE_PREFIX}'*" >/dev/null 2>&1 || true
+	run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "rm -f '${BMPROBE_DIR}/${BMPROBE_PREFIX}'*" >/dev/null 2>&1 || true
 }
 
+# bmprobe_backup_xml PATH SCRATCH PORT -- an incremental pull backup request
+# against cpt1, which is the call vmsync makes on every incremental sync.
+#
+# `incremental` is a child ELEMENT of <domainbackup>, not an attribute of it.
+# Written as an attribute, libvirt rejects the request against
+# domainbackup.rng before it ever looks at a bitmap -- see the control in
+# step 3 for what that distinction cost this probe's first result.
+bmprobe_backup_xml() {
+	run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "cat > '$1' <<'BMPROBE_BK_EOF'
+<domainbackup mode='pull'>
+  <incremental>${BMPROBE_PREFIX}-cpt1</incremental>
+  <server transport='tcp' name='127.0.0.1' port='$3'/>
+  <disks>
+    <disk name='vda' backup='yes' type='file'>
+      <scratch file='$2'/>
+    </disk>
+  </disks>
+</domainbackup>
+BMPROBE_BK_EOF" >/dev/null 2>&1 || true
+}
+
+# A wrapper rather than a `trap ... RETURN`, which is what the first version
+# used and which failed twice over: the trap body expanded a local of this
+# function, so it died with `dir: unbound variable` under `set -u`, and a
+# RETURN trap set inside a function is not scoped to that function, so it
+# fired again when the STAGE returned. Cleanup here runs exactly once, after
+# a body that is allowed to fail.
 bitmap_chain_probe() {
-	local sc=ext-snapshot ok dir disk xml out rc state
-	dir="$(dirname "$1")"
+	BMPROBE_DIR="$(dirname "$1")"
 
 	if [ "$DRY_RUN" = yes ]; then
-		results_row "$CSV" "$sc" bitmap-chain DRYRUN "" "" "" "" "" "SKIP dry run"
+		results_row "$CSV" ext-snapshot bitmap-chain DRYRUN "" "" "" "" "" "SKIP dry run"
 		return 0
 	fi
 
 	# Anything left from an interrupted previous run, before anything else:
 	# a stale definition makes `define` fail and the whole probe read as a
 	# libvirt problem rather than as leftovers.
-	bmprobe_cleanup "$dir"
-	trap 'bmprobe_cleanup "$dir"' RETURN
+	bmprobe_cleanup
+	bitmap_chain_probe_body || true
+	bmprobe_cleanup
+	return 0
+}
 
+bitmap_chain_probe_body() {
+	local sc=ext-snapshot ok dir disk xml out rc state i
+
+	dir="$BMPROBE_DIR"
 	disk="${dir}/${BMPROBE_PREFIX}.qcow2"
 	if ! run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "qemu-img create -f qcow2 '$disk' 64M" >/dev/null 2>&1; then
 		warn "SKIP 4e: could not create the probe disk at $disk on $SOURCE_HOST"
@@ -2515,30 +2554,55 @@ BMPROBE_CPT_EOF" >/dev/null 2>&1 || true
 	fi
 	log "   EVIDENCE: live disk is now $(disk_source_path "$SOURCE_URI" "$BMPROBE_DOMAIN" vda), backed by $disk"
 
-	# 3. blockpull, which flattens the backing file INTO the overlay and
+	# 3. THE CONTROL, and the only reason the result in step 5 can be
+	#    believed. The very same request is made now, while the bitmap's
+	#    file is still in the chain, and it must SUCCEED.
+	#
+	#    Without it the probe asserts nothing stronger than "backup-begin
+	#    failed", which every malformed request also satisfies -- and that
+	#    is not hypothetical: the first version of this probe put
+	#    `incremental` in the wrong place, libvirt rejected it against
+	#    domainbackup.rng, and the probe recorded a PASS for a schema error.
+	#    A control that must pass before a test that must fail is what
+	#    separates "the bitmap is gone" from "this libvirt would not accept
+	#    the question".
+	bmprobe_backup_xml "${dir}/${BMPROBE_PREFIX}-ctl.xml" "${dir}/${BMPROBE_PREFIX}-scratch1.qcow2" "$BMPROBE_PORT"
+	if ! out="$(virsh_uri "$SOURCE_URI" backup-begin "$BMPROBE_DOMAIN" --backupxml "${dir}/${BMPROBE_PREFIX}-ctl.xml" 2>&1)"; then
+		warn "SKIP 4e: the CONTROL incremental was refused while the bitmap was still reachable, so this probe cannot tell a lost bitmap from a request this libvirt will not accept: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
+		results_row "$CSV" "$sc" bitmap-chain "" "" "" "" "" "" "SKIP control incremental refused"
+		return 0
+	fi
+	log "   EVIDENCE: CONTROL -- the same incremental request is ACCEPTED while the bitmap's file is still in the chain"
+	virsh_uri "$SOURCE_URI" domjobabort "$BMPROBE_DOMAIN" >/dev/null 2>&1 || true
+	run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "rm -f '${dir}/${BMPROBE_PREFIX}-scratch1.qcow2'" >/dev/null 2>&1 || true
+
+	# 4. blockpull, which flattens the backing file INTO the overlay and
 	#    drops it from the chain. This is the step that loses the bitmap, and
 	#    the reason this runs on a domain nobody needs afterwards.
-	if ! out="$(virsh_uri "$SOURCE_URI" blockpull "$BMPROBE_DOMAIN" vda --wait --verbose 2>&1)"; then
+	#
+	#    Retried: the control's backup job was aborted rather than waited
+	#    out, and libvirt refuses a block job while another is winding down.
+	#    Retrying is locale-safe where reading `domjobinfo` would not be.
+	rc=1
+	for i in 1 2 3 4 5; do
+		if out="$(virsh_uri "$SOURCE_URI" blockpull "$BMPROBE_DOMAIN" vda --wait --verbose 2>&1)"; then
+			rc=0
+			break
+		fi
+		sleep 2
+	done
+	if [ "$rc" != 0 ]; then
 		warn "SKIP 4e: blockpull did not complete on the probe domain, so the bitmap's layer is still in the chain and the probe would prove nothing: $out"
 		results_row "$CSV" "$sc" bitmap-chain "" "" "" "" "" "" "SKIP blockpull did not complete"
 		return 0
 	fi
 	log "   EVIDENCE: after blockpull the chain is $(disk_source_path "$SOURCE_URI" "$BMPROBE_DOMAIN" vda) with no backing file -- the bitmap's layer is gone"
 
-	# 4. the question: an incremental PULL backup against that checkpoint,
-	#    which is exactly the call vmsync makes every incremental sync.
-	run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "cat > '${dir}/${BMPROBE_PREFIX}-backup.xml' <<'BMPROBE_BK_EOF'
-<domainbackup mode='pull' incremental='${BMPROBE_PREFIX}-cpt1'>
-  <server transport='tcp' name='127.0.0.1' port='${BMPROBE_PORT}'/>
-  <disks>
-    <disk name='vda' backup='yes' type='file'>
-      <scratch file='${dir}/${BMPROBE_PREFIX}-scratch.qcow2'/>
-    </disk>
-  </disks>
-</domainbackup>
-BMPROBE_BK_EOF" >/dev/null 2>&1 || true
-	out="$(virsh_uri "$SOURCE_URI" backup-begin "$BMPROBE_DOMAIN" --backupxml "${dir}/${BMPROBE_PREFIX}-backup.xml" 2>&1)"
-	rc=$?
+	# 5. the question, asked now that the control has established that the
+	#    only thing to have changed since it passed is the backing chain.
+	bmprobe_backup_xml "${dir}/${BMPROBE_PREFIX}-backup.xml" "${dir}/${BMPROBE_PREFIX}-scratch2.qcow2" "$BMPROBE_PORT2"
+	rc=0
+	out="$(virsh_uri "$SOURCE_URI" backup-begin "$BMPROBE_DOMAIN" --backupxml "${dir}/${BMPROBE_PREFIX}-backup.xml" 2>&1)" || rc=$?
 	log "   EVIDENCE: backup-begin rc=$rc, libvirt said: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
 
 	# Behavioural, not textual: the message arrives in libvirtd's locale.
