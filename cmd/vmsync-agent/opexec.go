@@ -91,6 +91,22 @@ func runOperation(ctx context.Context, cfg agentConfig, schedule []ScheduleEntry
 	}
 	now := time.Now()
 
+	// The operator's own veto, ahead of every other validation, and it
+	// covers EVERY operation kind rather than the data-moving ones alone.
+	// A control-plane instruction names a VM and nothing else, so this is
+	// the only place that can tell whether that VM is one somebody set
+	// aside -- the scan the other paths read from is bypassed entirely.
+	//
+	// Refused, never silently dropped, for the reason the Validate
+	// refusal below gives: an operator watching a failover sit pending
+	// against a healthy agent with nothing saying why is the worst
+	// outcome available. The refusal names the field and the remedy.
+	if excluded, why := excludedFromAction(cfg, op.VM); excluded {
+		trace.Error("refusing an operation on an excluded domain", "id", op.ID, "kind", op.Kind, "vm", op.VM, "error", why)
+		finishOperation(ledger, op, OperationResult{State: OpStateRefused, Error: why}, now)
+		return
+	}
+
 	localPeers, err := localPeersFor(cfg, op.VM)
 	if err != nil {
 		finishOperation(ledger, op, OperationResult{State: OpStateRefused, Error: err.Error()}, now)

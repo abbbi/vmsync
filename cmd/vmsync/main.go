@@ -858,6 +858,15 @@ func main() {
 			ctx, stop := signal.NotifyContext(context.Background(), stopSignals...)
 			defer stop()
 
+			// The operator's veto, ahead of every verb that does
+			// something. One gate here rather than one inside each
+			// handler: cliModes is the whole list, so a mode added later
+			// is covered the day it is added, and the read-only verbs are
+			// named in an allowlist where their exemption is visible.
+			if err := refuseExcludedMode(cfg, chosen[0].name); err != nil {
+				trace.Error(strings.TrimPrefix(chosen[0].name, "-"), "error", err)
+				os.Exit(1)
+			}
 			if err := chosen[0].run(ctx); err != nil {
 				// Nothing was done, so this must not read as a failure. The
 				// caller most likely to care is the agent: a terminal result
@@ -883,6 +892,13 @@ func main() {
 		if cfg.TargetURI == "" || relDomain == "" {
 			trace.Error("invalid release-promotion configuration", "error", fmt.Errorf("-%s needs -target-uri and -target-domain (or -source-domain) naming the copy whose promotion record to release", libvirtsync.FlagReleasePromotion))
 			os.Exit(2)
+		}
+		// Gated here rather than at the dispatch above: this mode is one of
+		// the two cliModes leaves without a handler (modesHandledInline),
+		// because it needs an exit code the shared dispatch cannot give.
+		if err := refuseExcludedMode(cfg, "-"+libvirtsync.FlagReleasePromotion); err != nil {
+			trace.Error(libvirtsync.FlagReleasePromotion, "error", err)
+			os.Exit(1)
 		}
 		mgr, err := libvirtsync.Connect(cfg.TargetURI)
 		if err != nil {
@@ -942,6 +958,18 @@ func main() {
 		if cfg.TargetURI == "" || roleDomain == "" {
 			trace.Error("invalid update-role configuration", "error", fmt.Errorf("-update-role needs -target-uri and -target-domain (or -source-domain) naming the domain whose role to set"))
 			os.Exit(2)
+		}
+		// The other inline mode, gated here for the same reason.
+		//
+		// Yes, this means an excluded domain's role cannot be changed
+		// until the exclusion is lifted, and that is the intent rather
+		// than an oversight: "vmsync will not act on it" has to include
+		// vmsync's own metadata, or the field means less than it says.
+		// There is no deadlock -- the remedy is `virsh metadata`, which
+		// needs nothing from vmsync.
+		if err := refuseExcludedMode(cfg, "-update-role"); err != nil {
+			trace.Error("update-role", "error", err)
+			os.Exit(1)
 		}
 		mgr, err := libvirtsync.Connect(cfg.TargetURI)
 		if err != nil {
@@ -1429,6 +1457,7 @@ func main() {
 		// longer nobody noticed. See ErrServedLive.
 		if cfg.ReinitAfterFailures > 0 && !isVerifyMismatch(err) &&
 			!errors.Is(err, libvirtsync.ErrRoleRefusesSync) &&
+			!errors.Is(err, libvirtsync.ErrExcludeRefusesSync) &&
 			!errors.Is(err, libvirtsync.ErrVerifyStateRefusesSync) &&
 			!errors.Is(err, libvirtsync.ErrServedLive) &&
 			!errors.Is(err, nbdsync.ErrExportUnreachable) {
@@ -3083,7 +3112,7 @@ func run(cfg syncConfig) (runErr error) {
 			continue
 		}
 		if ex := libvirtsync.Excluded(raw); ex.ReportOnly || ex.Hidden {
-			return fmt.Errorf("%w: %s", libvirtsync.ErrRoleRefusesSync, libvirtsync.ExcludeRefusal(side.domain, ex))
+			return fmt.Errorf("%w: %s", libvirtsync.ErrExcludeRefusesSync, libvirtsync.ExcludeRefusal(side.domain, ex))
 		}
 	}
 

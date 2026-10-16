@@ -20,6 +20,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"os"
@@ -147,10 +148,13 @@ type Scheduler struct {
 	// the time it was taken. See syncableVMs.
 	syncable   []string
 	syncableAt time.Time
-	inFlight   map[string]bool // by VM
-	hostLoad   map[string]int  // concurrent syncs INTO each target host
-	metrics    *agentMetrics   // nil is safe: every call is nil-guarded
-	results    []SyncResult
+	// excluded is filled by the same scan syncable comes from, so the two
+	// cannot disagree and the second answer costs no extra libvirt work.
+	excluded map[string]bool
+	inFlight map[string]bool // by VM
+	hostLoad map[string]int  // concurrent syncs INTO each target host
+	metrics  *agentMetrics   // nil is safe: every call is nil-guarded
+	results  []SyncResult
 }
 
 func NewScheduler(lv *live, state *sharedState) *Scheduler {
@@ -283,6 +287,19 @@ func (s *Scheduler) launchDue(ctx context.Context, wg *sync.WaitGroup) {
 
 		req, err := s.buildRequest(cfg, entry)
 		if err != nil {
+			// An exclusion is a decision, not a failure to prepare. Info
+			// and its own skip reason, so neither the agent's ERROR lines
+			// nor the no_target counter -- both of which people alert on
+			// -- fire every interval because somebody deliberately set a
+			// VM aside. Still deferred like any other skip, so it is
+			// reconsidered on its normal cadence and resumes by itself
+			// the moment the metadata is removed.
+			if errors.Is(err, libvirtsync.ErrExcludeRefusesSync) {
+				trace.Info("scheduled sync skipped: domain excluded by vmsync metadata", "vm", entry.VM, "reason", err)
+				s.metrics.skip(skipExcluded)
+				s.deferEntry(entry, now)
+				continue
+			}
 			trace.Error("could not prepare a scheduled sync", "vm", entry.VM, "error", err)
 			s.metrics.skip(skipNoTarget)
 			s.deferEntry(entry, now)
@@ -751,8 +768,12 @@ func buildSyncRequest(cfg agentConfig, entry ScheduleEntry) (syncPlan, error) {
 	// effect within one interval of an operator setting the field, with no
 	// agent restart and no extra libvirt traffic on the ticks where
 	// nothing is due.
+	// Wrapped in the sentinel, not a bare error, so launchDue can tell this
+	// apart from a fault. Returned plain it was logged at ERROR and counted
+	// as no_target once per interval -- which is exactly the fault-shaped
+	// output the paragraph above says it must not produce.
 	if ex := libvirtsync.Excluded(dom.Exclude); ex.ReportOnly {
-		return syncPlan{}, fmt.Errorf("%s", libvirtsync.ExcludeRefusal(entry.VM, ex))
+		return syncPlan{}, fmt.Errorf("%w: %s", libvirtsync.ErrExcludeRefusesSync, libvirtsync.ExcludeRefusal(entry.VM, ex))
 	}
 	if len(dom.ReplicaTargets) == 0 {
 		return syncPlan{}, fmt.Errorf("domain %q records no replica_targets, so there is nothing to sync it to -- run one sync by hand first, or check that this host is really its source", entry.VM)
@@ -1143,8 +1164,22 @@ func (s *Scheduler) EffectiveSchedule(cfg *agentConfig, cached UIConfig, now tim
 	}
 
 	resolved := ResolveSchedule(cached.Schedule, cached.Templates, s.syncableVMs(cfg, now))
+	// EXPLICIT ENTRIES TOO, which syncableVMs cannot cover: it filters only
+	// the half a default template synthesises, so a VM the control plane
+	// names outright went into this list however excluded it was. This is
+	// the field the console renders as "what will run", and an excluded VM
+	// in it is a promise refused every interval -- which reads as a fault
+	// rather than as somebody's decision.
+	//
+	// Dropped rather than shown disabled: the same report already carries
+	// the domain with status=excluded and the field itself, so the VM is
+	// visible and explained. What it must not be is scheduled.
+	excluded := s.excludedVMs(cfg, now)
 	out := make([]EffectiveScheduleEntry, 0, len(resolved))
 	for _, e := range resolved {
+		if excluded[e.VM] {
+			continue
+		}
 		row := EffectiveScheduleEntry{
 			VM:                    e.VM,
 			Template:              templateNameOf(e),

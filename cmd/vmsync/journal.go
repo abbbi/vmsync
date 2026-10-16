@@ -546,6 +546,14 @@ func runExplainDomain(cfg syncConfig, domain string) error {
 		exp.ReplicaIncomplete = st.ReplicaIncomplete
 		exp.ReplicaIncompleteNote = explainReplicaIncomplete(st.ReplicaIncomplete)
 		exp.ServedLiveNote = explainServedLive(st.LastPromotedAt, st.Role, st.ReplicaSource)
+		// Read separately rather than through ReadFailoverState, which is
+		// about the failover record and has no business growing a field
+		// for this. A failure to read it is not a failure to explain: say
+		// nothing about the exclusion rather than refusing the whole
+		// report, which is the one report somebody in trouble is reading.
+		if raw, rerr := libvirtsync.ReadDomainMetadataField(mgr, domain, libvirtsync.MetadataFieldExclude); rerr == nil {
+			exp.ExcludeNote = explainExclude(domain, raw)
+		}
 	} else if cfg.TargetDiskPath == "" {
 		// Nothing to read the disks off, so there is nothing to find. The
 		// remedy is named rather than left implicit, because the case below is
@@ -738,6 +746,28 @@ func explainReplicaIncomplete(raw string) string {
 // typed at a promoted copy: the first clears it, the second leaves it, and only
 // the first has resolved anything. Same rule as the agent's
 // servedLiveUnresolved and inventory.Assess's.
+// explainExclude turns the raw exclude metadata into the sentence
+// -explain-domain prints, or "" when the domain is not excluded.
+//
+// Rendered here rather than in pkg/actionlog for the reason the two notes
+// beside it give: that package must not depend on the decision logic.
+func explainExclude(domain, raw string) string {
+	d := libvirtsync.Excluded(raw)
+	if !d.ReportOnly && !d.Hidden {
+		return ""
+	}
+	// The refusal text every other path prints, so an operator who met it
+	// once meets the same sentence here, plus what it means for THIS
+	// report: a domain that is excluded has no fault to look for, and the
+	// action list below is history rather than diagnosis.
+	note := libvirtsync.ExcludeRefusal(domain, d)
+	if d.Hidden {
+		return note + ". With exclude=" + libvirtsync.ExcludeFullyIgnored +
+			" the agent does not report this domain at all, so it is absent from the console and the metrics as well as from replication"
+	}
+	return note + ". Nothing below is a fault: this domain is not being synced because somebody decided it should not be"
+}
+
 func explainServedLive(lastPromotedAt, role, replicaSource string) string {
 	if lastPromotedAt == "" {
 		return ""

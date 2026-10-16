@@ -345,6 +345,10 @@ func sweepFences(ctx context.Context, cfg agentConfig, state *sharedState, ledge
 		if !d.Active {
 			continue
 		}
+		// An excluded domain is not fenced, and fencing is the sharpest
+		// case for the rule: it STOPS A RUNNING GUEST. An operator who
+		// wrote "leave this alone" must not find vmsync shutting it down
+		// because a peer looked promoted -- least of all a domain that is
 		// role=fenced AND running: a fence suspended this domain's replication
 		// and did not stop the domain. Either the shutdown never took -- the
 		// realistic case, a guest that ignores ACPI -- or somebody started it
@@ -487,6 +491,25 @@ func checkOneFence(ctx context.Context, cfg agentConfig, cached UIConfig, ledger
 		// somebody resolves it. That repetition is the feature.
 		trace.Warning("SPLIT BRAIN: this host is still running a VM that has been failed over, and -no-autofence is set, so nothing will be done about it automatically",
 			"vm", d.Name, "peer", peerRef, "reason", verdict.Reason)
+		return true
+	}
+
+	// REPORTED, NOT ACTED ON -- the same shape as -no-autofence above, and
+	// for a sharper reason.
+	//
+	// An exclusion says vmsync must not act, and fencing is the most
+	// consequential act there is: it stops a running guest. But
+	// report-only also says the domain stays reported, and a split brain
+	// is the one finding where silence is dangerous: two hosts are serving
+	// the same VM and both are taking writes. Skipping the domain earlier
+	// in the sweep -- which is what this did at first -- suppressed the
+	// finding AND cleared its gauge, so an excluded VM in a split brain
+	// read as healthy for ever.
+	//
+	// Returning true is what keeps it in the split-brain gauge.
+	if excluded := libvirtsync.Excluded(d.Exclude); excluded.ReportOnly || excluded.Hidden {
+		trace.Warning("SPLIT BRAIN: this host is still running a VM that has been failed over, and the domain carries vmsync metadata exclude, so nothing will be done about it automatically -- stop it by hand, or remove the metadata field `exclude` to let autofencing act",
+			"vm", d.Name, "peer", peerRef, "exclude", d.Exclude, "reason", verdict.Reason)
 		return true
 	}
 

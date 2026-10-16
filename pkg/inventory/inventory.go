@@ -262,6 +262,16 @@ const (
 	StatusUnreplicated Status = iota
 	// StatusOK: replicating, recent, no failures.
 	StatusOK
+	// StatusExcluded: an operator set exclude=report-only on this domain,
+	// so vmsync will not act on it. The least alarming of the
+	// administrative states and ranked first among them, but still above
+	// OK for their shared reason: a domain nothing will ever happen to
+	// must not blend into a list of domains that are being replicated
+	// successfully.
+	//
+	// Only report-only reaches here. A fully-ignored domain is dropped by
+	// Scan and never assessed at all.
+	StatusExcluded
 	// StatusPaused/StatusPromoted are administrative states, not faults.
 	// They are ranked above OK only so they stay visible rather than
 	// blending into a long healthy list.
@@ -279,6 +289,8 @@ func (s Status) String() string {
 		return "unreplicated"
 	case StatusOK:
 		return "ok"
+	case StatusExcluded:
+		return "excluded"
 	case StatusPaused:
 		return "paused"
 	case StatusPromoted:
@@ -449,6 +461,45 @@ func Assess(d Domain, now time.Time, cadence time.Duration) Assessment {
 func assessReplication(d Domain, now time.Time, cadence time.Duration) Assessment {
 	a := Assessment{Status: StatusOK, AgeSeconds: -1}
 
+	// BEFORE the participation check, and before every freshness check
+	// below, because an excluded domain's whole point is that nothing is
+	// going to happen to it. Without this it falls through to the
+	// staleness logic and reports `warning` the moment it passes its
+	// cadence, then `critical` -- which is the paging this field exists to
+	// prevent, raised against a domain somebody deliberately set aside.
+	//
+	// Before Participates() as well, so a domain with no replication
+	// relationship at all still reads as excluded rather than as
+	// unreplicated. Both are "nothing happening here", but only one of
+	// them says a person decided it.
+	// FENCED AND STILL RUNNING OUTRANKS THE EXCLUSION, on the rule the
+	// verify overlay already states further down: administrative calm must
+	// not outrank evidence that something is wrong right now. That state
+	// is a live split brain -- this domain is serving beside the peer that
+	// displaced it and both are taking writes -- and it is the one finding
+	// where every other gauge reads clear, so an exclusion that buried it
+	// would leave nothing at all saying so.
+	//
+	// The excluded fact is not lost: it is appended as a reason below, so
+	// the line still says nobody is going to act on this automatically.
+	fencedAndLive := d.Role == libvirtsync.RoleFenced && d.Active
+
+	if ex := libvirtsync.Excluded(d.Exclude); ex.ReportOnly && !fencedAndLive {
+		a.Status = StatusExcluded
+		if ex.Unrecognised {
+			// The operator's clue, and the only place they will see it:
+			// the value stopped replication, so they need to know it was
+			// not the value they meant to write.
+			a.Reasons = append(a.Reasons, fmt.Sprintf(
+				"excluded by vmsync metadata exclude=%q, which is not a recognised value -- treated as %s; expected %s or %s",
+				d.Exclude, libvirtsync.ExcludeReportOnly, libvirtsync.ExcludeReportOnly, libvirtsync.ExcludeFullyIgnored))
+		} else {
+			a.Reasons = append(a.Reasons, fmt.Sprintf(
+				"excluded by vmsync metadata (exclude=%s): reported, never acted on", d.Exclude))
+		}
+		return a
+	}
+
 	if !d.Participates() {
 		a.Status = StatusUnreplicated
 		return a
@@ -478,6 +529,14 @@ func assessReplication(d Domain, now time.Time, cadence time.Duration) Assessmen
 		if d.Active {
 			a.Status = StatusCritical
 			a.Reasons = append(a.Reasons, "FENCED BUT STILL RUNNING: a fence suspended this domain's replication and did not stop the domain (replication_role=fenced, and it is running), so it is live beside the peer that was promoted over it and both are taking writes. A fence is never retried: stop this domain by hand, then run -invert if the failover stands, or -update-role=source if the fence was wrong")
+			// Said second, after the finding, because an excluded domain
+			// reaches here only by outranking its own exclusion: the
+			// split brain is what must be read first, and this is the
+			// sentence that explains why nothing is going to act on it.
+			if ex := libvirtsync.Excluded(d.Exclude); ex.ReportOnly || ex.Hidden {
+				a.Reasons = append(a.Reasons, fmt.Sprintf(
+					"this domain also carries vmsync metadata exclude=%s, so nothing will be done about it automatically -- stop it by hand, or remove the metadata field `exclude`", d.Exclude))
+			}
 			return a
 		}
 		// Stopped, as a fence intends. Reported as paused because the

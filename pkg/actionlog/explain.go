@@ -69,6 +69,19 @@ type Explanation struct {
 	// and three separate commands say no.
 	ServedLiveNote string
 
+	// ExcludeNote is what the caller makes of the domain's `exclude`
+	// metadata, rendered rather than decided here -- same split as the two
+	// notes above.
+	//
+	// THIS VERB IS EXEMPT FROM THE EXCLUSION GATE SO THAT IT CAN SAY THIS.
+	// Every other verb refuses an excluded domain; -explain-domain is
+	// deliberately allowed to run on one, because it is what somebody
+	// reaches for when a VM is quietly doing nothing. Allowed to run and
+	// then silent about the exclusion, the exemption would buy nothing and
+	// the operator would be left reading a healthy-looking domain that
+	// three other commands refuse.
+	ExcludeNote string
+
 	Reading Reading
 
 	// Limit caps how many actions are listed, newest kept. Zero lists them
@@ -125,6 +138,22 @@ func (e Explanation) Render(w io.Writer) {
 	if e.ServedLiveNote != "" {
 		fmt.Fprintf(w, "\nlast_promoted_at\n")
 		for _, line := range wrapNote(e.ServedLiveNote) {
+			fmt.Fprintf(w, "  %s\n", line)
+		}
+	}
+
+	// --- has somebody told vmsync to leave this alone? ----------------------
+	//
+	// FIRST AMONG THE "why is nothing happening" ANSWERS, and printed
+	// before the action list for that reason: where the two findings above
+	// refuse one command each, this one refuses every command there is,
+	// and it is the only one of the three a person wrote deliberately. An
+	// operator reading a domain that has not synced for a week needs this
+	// line before they start reading run history looking for a fault that
+	// is not there. Printed only when set, like the note above.
+	if e.ExcludeNote != "" {
+		fmt.Fprintf(w, "\nexclude\n")
+		for _, line := range wrapNote(e.ExcludeNote) {
 			fmt.Fprintf(w, "  %s\n", line)
 		}
 	}

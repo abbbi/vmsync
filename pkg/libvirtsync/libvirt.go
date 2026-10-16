@@ -736,13 +736,19 @@ const (
 	// Two values, ExcludeReportOnly and ExcludeFullyIgnored. See their
 	// comments for what each suppresses.
 	//
-	// SET IT ON THE SOURCE; THE TARGET INHERITS IT. This field is
-	// deliberately absent from syncRedefineStrips, so UpdateSyncMetadata --
-	// which rebuilds the target's definition from the SOURCE's XML --
-	// carries it across like any other source-side field. An operator
-	// excludes a pair by excluding its source, and the replica ends up
-	// carrying the same marker rather than having to be found and edited
-	// separately.
+	// SET IT ON THE SOURCE: ONE EDIT COVERS THE PAIR, because the engine
+	// refuses when EITHER end carries the field and the source is one end.
+	//
+	// Not because the target inherits it, which is the obvious reading and
+	// is wrong in practice. The field is deliberately absent from
+	// syncRedefineStrips, so UpdateSyncMetadata -- which rebuilds the
+	// target's definition from the SOURCE's XML -- would carry it across
+	// like any other source-side field; but the refusal happens before any
+	// redefine, so once the source is excluded no sync runs to propagate
+	// anything. The absence from the strip list still matters for the case
+	// where a sync DOES run -- a field written while one is already in
+	// flight, or an engine too old to know it -- and there it propagates
+	// in the safe direction.
 	//
 	// AND A TARGET THAT CARRIES IT IS NEVER TOUCHED, whether it inherited
 	// the field or an operator wrote it there directly. The engine checks
@@ -824,10 +830,10 @@ func Excluded(value string) ExcludeDecision {
 // meets the same wording wherever they hit it.
 func ExcludeRefusal(domain string, d ExcludeDecision) string {
 	if d.Unrecognised {
-		return fmt.Sprintf("domain %q carries vmsync metadata exclude=%q, which is not a value this version understands (expected %q or %q). Treating it as %s and doing nothing, because an exclusion nobody can read is still somebody asking vmsync to keep away. Fix or remove the field with `virsh metadata`",
+		return fmt.Sprintf("domain %q carries vmsync metadata exclude=%q, which is not a value this version understands (expected %q or %q). Treating it as %s and doing nothing, because an exclusion nobody can read is still somebody asking vmsync to keep away. Correct it, or remove the metadata field `exclude` with `virsh metadata`",
 			domain, d.Raw, ExcludeReportOnly, ExcludeFullyIgnored, ExcludeReportOnly)
 	}
-	return fmt.Sprintf("domain %q carries vmsync metadata exclude=%s, so vmsync will not act on it. Remove the field with `virsh metadata` to bring it back",
+	return fmt.Sprintf("domain %q carries vmsync metadata exclude=%s, so vmsync will not act on it. Remove the metadata field `exclude` with `virsh metadata` to bring it back",
 		domain, d.Raw)
 }
 
@@ -2472,6 +2478,30 @@ func TargetRoleAllowsSync(role string) error {
 // main() already exempts run-lock contention from the same counter on the same
 // reasoning: another vmsync holding the lock is not a broken sync either.
 var ErrRoleRefusesSync = errors.New("replication role does not permit syncing into this domain")
+
+// ErrExcludeRefusesSync reports that an operator excluded this domain.
+//
+// ITS OWN SENTINEL, not ErrRoleRefusesSync, and the reason is the sentence
+// an operator reads. Wrapping the role error produced "replication role
+// does not permit syncing into this domain: ... carries vmsync metadata
+// exclude=report-only", which is wrong twice over: no role refused
+// anything, and "INTO this domain" points at the target when the field is
+// just as often on the source.
+//
+// It earns the same exemption from the failure counter for the same
+// reason: an administrative decision is not a broken sync, and counting it
+// would make a deliberately excluded replica slowly unpromotable.
+var ErrExcludeRefusesSync = errors.New("vmsync metadata does not permit syncing this domain")
+
+// ErrExcludeRefusesAction is the same refusal for the verbs that are not a
+// sync -- promote, invert, restore, fence, shutdown, role changes.
+//
+// Its own wording rather than reusing the one above, because "does not
+// permit SYNCING this domain" is simply untrue of a refused -promote, and
+// a message that misdescribes what was refused sends an operator looking
+// in the wrong place. The remedy sentence is shared, since it is the same
+// remedy.
+var ErrExcludeRefusesAction = errors.New("vmsync metadata does not permit acting on this domain")
 
 // VerifyStateFailed is the only value MetadataFieldVerifyState ever takes.
 // See that field for why presence is the state.

@@ -47,31 +47,54 @@ import (
 // so a VM that has genuinely gone away fails there, named, rather than
 // vanishing from the schedule unremarked.
 func (s *Scheduler) syncableVMs(cfg *agentConfig, now time.Time) []string {
+	vms, _ := s.scanCache(cfg, now)
+	return vms
+}
+
+// excludedVMs is the set of domains on this host an operator has told
+// vmsync to leave alone, from the same cached scan syncableVMs reads.
+//
+// One scan for both answers: a second pass over every domain to ask a
+// question the first already answered is work a loop whose virtue is
+// being cheap when nothing is due should not do.
+func (s *Scheduler) excludedVMs(cfg *agentConfig, now time.Time) map[string]bool {
+	_, excluded := s.scanCache(cfg, now)
+	return excluded
+}
+
+func (s *Scheduler) scanCache(cfg *agentConfig, now time.Time) ([]string, map[string]bool) {
 	s.mu.Lock()
 	if !s.syncableAt.IsZero() && now.Sub(s.syncableAt) < syncableTTL {
-		vms := s.syncable
+		vms, ex := s.syncable, s.excluded
 		s.mu.Unlock()
-		return vms
+		return vms, ex
 	}
-	last := s.syncable
+	last, lastEx := s.syncable, s.excluded
 	s.mu.Unlock()
 
 	mgr, err := libvirtsync.Connect(cfg.LibvirtURI)
 	if err != nil {
 		trace.Debug("could not connect to libvirt to list template-covered VMs; keeping the previous list",
 			"uri", cfg.LibvirtURI, "error", err)
-		return last
+		return last, lastEx
 	}
 	defer mgr.Close()
 
 	domains, err := inventory.Scan(mgr)
 	if err != nil {
 		trace.Debug("could not scan domains to list template-covered VMs; keeping the previous list", "error", err)
-		return last
+		return last, lastEx
 	}
 
 	vms := make([]string, 0, len(domains))
+	excluded := make(map[string]bool)
 	for _, d := range domains {
+		// Recorded for every domain, not only the syncable ones: the
+		// effective schedule is built from the control plane's list, which
+		// can name a VM that records no replica_targets at all.
+		if libvirtsync.Excluded(d.Exclude).ReportOnly {
+			excluded[d.Name] = true
+		}
 		if len(d.ReplicaTargets) == 0 {
 			continue
 		}
@@ -81,14 +104,14 @@ func (s *Scheduler) syncableVMs(cfg *agentConfig, now time.Time) []string {
 		// effective schedule the console shows -- so the estate view
 		// would promise a sync that is refused every interval, which
 		// reads as a fault rather than as the operator's own decision.
-		if libvirtsync.Excluded(d.Exclude).ReportOnly {
+		if excluded[d.Name] {
 			continue
 		}
 		vms = append(vms, d.Name)
 	}
 
 	s.mu.Lock()
-	s.syncable, s.syncableAt = vms, now
+	s.syncable, s.excluded, s.syncableAt = vms, excluded, now
 	s.mu.Unlock()
-	return vms
+	return vms, excluded
 }

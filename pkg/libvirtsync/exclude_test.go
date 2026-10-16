@@ -181,3 +181,55 @@ func TestDocumentedExcludeXMLParses(t *testing.T) {
 		t.Errorf("Excluded(%q) = %+v, want Hidden", got2, d)
 	}
 }
+
+// THE XML VIRSH ACTUALLY PRODUCES, captured from a real domain on a real
+// libvirt rather than written by hand.
+//
+// vmsync writes its own children unprefixed; `virsh metadata --set` writes
+// them PREFIXED, because virsh applies the --key prefix itself. Both must
+// read, and only one of them had ever been tested -- the hand-written
+// unprefixed form. An operator following the documentation produces the
+// other one.
+func TestVirshWrittenExcludeParses(t *testing.T) {
+	// Verbatim from `virsh dumpxml --inactive` after the documented
+	// `--set '<vmsync><exclude id="report-only"/></vmsync>'`.
+	const fromVirsh = `<domain type='qemu'>
+  <name>web01</name>
+  <metadata>
+    <vmsync:vmsync xmlns:vmsync="http://vmsync.org/xmlns/libvirt/domain/1.0">
+      <vmsync:exclude id="report-only"/>
+    </vmsync:vmsync>
+  </metadata>
+</domain>`
+	got, err := ParseMetadata(fromVirsh, MetadataFieldExclude)
+	if err != nil {
+		t.Fatalf("the XML virsh writes does not parse: %v", err)
+	}
+	if got != ExcludeReportOnly {
+		t.Errorf("ParseMetadata = %q, want %q -- an operator following the documented virsh command would get an exclusion that silently does nothing", got, ExcludeReportOnly)
+	}
+}
+
+// ...and the shape the WRONG virsh payload produces must not read as an
+// exclusion, because it is not one.
+//
+// `--set '<vmsync:vmsync>…'` (prefixed, no xmlns) makes virsh print
+// "Metadata modified" and store a double-prefixed container. Nothing can
+// act on that, and the risk is the opposite of the usual one: a reader
+// lenient enough to accept it would be accepting malformed metadata as an
+// instruction. This pins that it does not parse, so the documentation's
+// warning stays true.
+func TestDoublePrefixedContainerIsNotAnExclusion(t *testing.T) {
+	const malformed = `<domain type='qemu'>
+  <name>web01</name>
+  <metadata>
+    <vmsync:vmsync:vmsync xmlns:vmsync="http://vmsync.org/xmlns/libvirt/domain/1.0">
+      <vmsync:exclude id="report-only"/>
+    </vmsync:vmsync:vmsync>
+  </metadata>
+</domain>`
+	got, _ := ParseMetadata(malformed, MetadataFieldExclude)
+	if Excluded(got).ReportOnly || Excluded(got).Hidden {
+		t.Errorf("a double-prefixed container read as exclude=%q; malformed metadata must not be actionable", got)
+	}
+}

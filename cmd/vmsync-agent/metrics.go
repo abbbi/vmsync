@@ -67,6 +67,14 @@ const (
 	// running across a restart. Distinct from already_running, which is this
 	// process's own bookkeeping: this one is what that bookkeeping cannot see.
 	skipForeignRun = "foreign_run"
+	// skipExcluded is a due VM an operator took out of vmsync's hands with
+	// the exclude metadata field. Its own reason, and deliberately not an
+	// error anywhere, because it is the only skip here that is somebody's
+	// DECISION rather than a condition. Counted under no_target -- which is
+	// where it landed at first -- it fires every no-target alert in the
+	// estate once per interval for as long as the exclusion stands, which
+	// is the opposite of what excluding a VM is for.
+	skipExcluded = "excluded"
 )
 
 var skipReasons = []string{
@@ -77,6 +85,7 @@ var skipReasons = []string{
 	skipNoTarget,
 	skipRunLogUnwritable,
 	skipForeignRun,
+	skipExcluded,
 }
 
 // agentMetrics is what the agent knows about itself.
