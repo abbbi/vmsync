@@ -163,6 +163,53 @@ func TestProcPgidParsesAnAwkwardCommName(t *testing.T) {
 	}
 }
 
+// THE SELF-MATCH, which is how -watch-argv was broken when it shipped.
+//
+// The pattern arrives on this program's own command line, so this program's
+// argv contains it by construction. Including itself makes the group sum
+// move every beat -- beating is work -- so the stall bound never fires, and
+// if it ever did the signal would go to the supervisor. Measured before the
+// guard: 300s with no verdict, against 120s for the same command without
+// the flag.
+func TestProcPidsNeverMatchesTheSupervisorItself(t *testing.T) {
+	skipWithoutProc(t)
+
+	// os.Args[0] is in this process's own command line by definition, which
+	// is exactly the shape -watch-argv has in production.
+	marker := os.Args[0]
+	if !matchesArgv(os.Getpid(), marker) {
+		t.Skipf("this process's argv does not contain %q, so the test cannot pose the question", marker)
+	}
+
+	// A pgid no process has, so anything returned came from the argv match
+	// rather than from the supervised group.
+	const impossiblePgid = -424242
+	for _, pid := range procPids(impossiblePgid, marker) {
+		if pid == os.Getpid() {
+			t.Fatal("procPids matched the supervisor's own pid. Its counters move every beat, so the group sum never looks still and the stall bound can never fire; and if it did fire, the supervisor would signal itself.")
+		}
+	}
+}
+
+// The same exclusion has to cover the shell above it: sshd runs the helper
+// from a command line that also contains the pattern, and signalling that
+// kills the connection the verdict travels on.
+func TestProcPidsNeverMatchesItsOwnProcessGroup(t *testing.T) {
+	skipWithoutProc(t)
+
+	marker := os.Args[0]
+	ownPgid := procPgid(os.Getpid())
+	if ownPgid <= 0 {
+		t.Skip("cannot read this process's own pgid")
+	}
+	const impossiblePgid = -424242
+	for _, pid := range procPids(impossiblePgid, marker) {
+		if procPgid(pid) == ownPgid {
+			t.Fatalf("procPids matched pid %d, which shares the supervisor's process group %d -- signalling it would take down the supervision and the ssh session carrying its output", pid, ownPgid)
+		}
+	}
+}
+
 // matchesArgv is how a daemon that left the process group is found again,
 // so it must match on a distinctive argument and must never match on an
 // empty pattern -- which would adopt every process on the host.

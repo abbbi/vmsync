@@ -78,18 +78,51 @@ func (p progressSample) add(q progressSample) progressSample {
 // group-wide measurement and immune to a group-wide signal, so the one
 // process whose health actually matters would be the one process neither
 // watched nor stopped. Matching its argv is how it is found again.
+// THE MATCH MUST EXCLUDE THIS PROCESS AND ITS OWN GROUP, and leaving that
+// out was a real bug, not a theoretical one. -watch-argv's pattern is passed
+// on this program's OWN command line, so this program's argv contains it, and
+// so does the argv of the shell sshd started to run it. Matching them has two
+// effects, both silent:
+//
+//   - the measurement includes this process, whose counters move every beat
+//     because beating is work. The group sum therefore always "moves" and the
+//     stall bound NEVER FIRES. Measured end to end before this guard existed:
+//     a wedged command under -watch-argv ran to the outer timeout at 300s with
+//     no verdict at all, where the same command without the flag was signalled
+//     at 120s.
+//   - had it fired, the signal loop would have sent SIGTERM then SIGKILL to
+//     this process and to the sshd shell above it -- killing the supervision
+//     and the connection carrying its verdict.
+//
+// It is the `pgrep -f` self-match the bench harness learned about one layer
+// down: a pattern search that finds the searcher. The group being supervised
+// is exempt from the exclusion because the child was deliberately placed in
+// its own group, so it can never share this process's.
 func procPids(pgid int, watchArgv string) []int {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return nil
 	}
+	self := os.Getpid()
+	ownPgid := procPgid(self)
 	var pids []int
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil {
 			continue
 		}
-		if procPgid(pid) == pgid || matchesArgv(pid, watchArgv) {
+		// The supervised group, always and without question.
+		if procPgid(pid) == pgid {
+			pids = append(pids, pid)
+			continue
+		}
+		// An argv-matched stray, but never this process, and never
+		// anything sharing this process's group -- that group holds the
+		// shell that was handed the same pattern on its command line.
+		if pid == self || (ownPgid > 0 && procPgid(pid) == ownPgid) {
+			continue
+		}
+		if matchesArgv(pid, watchArgv) {
 			pids = append(pids, pid)
 		}
 	}
