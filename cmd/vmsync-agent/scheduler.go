@@ -741,6 +741,19 @@ func buildSyncRequest(cfg agentConfig, entry ScheduleEntry) (syncPlan, error) {
 	if !found {
 		return syncPlan{}, fmt.Errorf("no domain named %q on this host", entry.VM)
 	}
+	// Before anything else about the domain is judged: an excluded VM is
+	// not a misconfigured one, and must not be reported as missing targets
+	// or anything else that reads as a fault.
+	//
+	// exclude=full never reaches here -- inventory.Scan drops it, so the
+	// lookup above fails with "no domain named ..." instead. This is the
+	// report-only gate, and the per-launch read is what makes it take
+	// effect within one interval of an operator setting the field, with no
+	// agent restart and no extra libvirt traffic on the ticks where
+	// nothing is due.
+	if ex := libvirtsync.Excluded(dom.Exclude); ex.ReportOnly {
+		return syncPlan{}, fmt.Errorf("%s", libvirtsync.ExcludeRefusal(entry.VM, ex))
+	}
 	if len(dom.ReplicaTargets) == 0 {
 		return syncPlan{}, fmt.Errorf("domain %q records no replica_targets, so there is nothing to sync it to -- run one sync by hand first, or check that this host is really its source", entry.VM)
 	}

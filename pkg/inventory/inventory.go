@@ -39,6 +39,7 @@ import (
 
 	"vmsync/pkg/disk"
 	"vmsync/pkg/libvirtsync"
+	"vmsync/pkg/trace"
 
 	"libvirt.org/go/libvirt"
 )
@@ -55,6 +56,16 @@ type Domain struct {
 	UUID       string `json:"uuid"`
 	Active     bool   `json:"active"`
 	Persistent bool   `json:"persistent"`
+
+	// Exclude is the operator-set exclude metadata field, verbatim and
+	// unvalidated -- "" on every domain nobody has excluded, which is
+	// almost all of them. Interpret it with libvirtsync.Excluded rather
+	// than comparing strings: an unrecognised value still excludes.
+	//
+	// A domain with exclude=full never reaches a caller of Scan at all, so
+	// anything this field holds here is either empty, report-only, or
+	// something misspelt.
+	Exclude string `json:"exclude,omitempty"`
 
 	// Role is the replication_role metadata field, "" when none is
 	// recorded (which is every domain predating that feature).
@@ -580,6 +591,29 @@ func scan(mgr *libvirtsync.Manager, verboseSkips bool) ([]Domain, error) {
 		if err != nil {
 			return nil, err
 		}
+		// exclude=full is enforced HERE and nowhere else, and that is the
+		// design rather than a convenience. Every view the agent has of
+		// this host -- the inventory dump, the report sent to the console,
+		// the metrics, the template-covered VM list, the per-launch domain
+		// lookup -- is built from this one function. Dropping the domain
+		// at the scan means none of them can disagree about whether it
+		// exists, and a view added later inherits the exclusion without
+		// anybody remembering to gate it.
+		if ex := libvirtsync.Excluded(d.Exclude); ex.Hidden {
+			// Debug, not info: on a host where somebody has excluded a
+			// dozen VMs this would otherwise repeat on every scan, and the
+			// operator who set the field is not the audience for being
+			// told it worked. ScanVerbose raises it, for the SIGUSR1 dump
+			// where "what is on this host" is exactly the question.
+			if verboseSkips {
+				trace.Info("inventory: domain hidden by vmsync metadata", "vm", d.Name,
+					"exclude", d.Exclude)
+			} else {
+				trace.Debug("inventory: domain hidden by vmsync metadata", "vm", d.Name,
+					"exclude", d.Exclude)
+			}
+			continue
+		}
 		out = append(out, d)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -667,6 +701,7 @@ func describe(dom *libvirt.Domain, verboseSkips bool) (Domain, error) {
 // so it must not turn an otherwise good scan into an error. The value fails
 // closed, never the whole read.
 func applyDomainMetadata(xml string, d *Domain) {
+	d.Exclude, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldExclude)
 	d.Role, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldReplicationRole)
 	d.LastCheckpoint, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldLastCheckpoint)
 	d.ReplicaSource, _ = libvirtsync.ParseMetadata(xml, libvirtsync.MetadataFieldReplicaSource)

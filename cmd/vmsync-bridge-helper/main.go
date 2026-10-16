@@ -316,8 +316,8 @@ func main() {
 			StallAfter:    stallAfter,
 			StallWarnOnly: stallWarnOnly,
 			WatchArgv:     *superviseWatchArgv,
-			Grace:      *superviseGrace,
-			Label:      label,
+			Grace:         *superviseGrace,
+			Label:         label,
 			// stderr, never stdout: stdout carries the command's own output
 			// verbatim, and the caller puts that in the error it reports.
 			Progress: os.Stderr,

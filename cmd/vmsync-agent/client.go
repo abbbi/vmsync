@@ -213,9 +213,19 @@ type Report struct {
 // format shared with a separately-versioned program, so it changes only
 // when the protocol changes, not when an internal struct is refactored.
 type ReportDomain struct {
-	Name           string   `json:"name"`
-	UUID           string   `json:"uuid,omitempty"`
-	Active         bool     `json:"active"`
+	Name   string `json:"name"`
+	UUID   string `json:"uuid,omitempty"`
+	Active bool   `json:"active"`
+	// Exclude is the operator's exclude metadata, verbatim, and empty on
+	// almost every domain. Reported because a VM that is deliberately not
+	// being synced and a VM that is failing to sync look identical in
+	// every other field here -- without this the console would show a
+	// replica going stale with no visible cause, which is the state an
+	// operator pages somebody about.
+	//
+	// Only report-only ever appears: exclude=full domains are dropped by
+	// inventory.Scan and never reach a report at all.
+	Exclude        string   `json:"exclude,omitempty"`
 	Role           string   `json:"role,omitempty"`
 	LastCheckpoint string   `json:"last_checkpoint,omitempty"`
 	LastSyncUnix   int64    `json:"last_sync_unix,omitempty"`

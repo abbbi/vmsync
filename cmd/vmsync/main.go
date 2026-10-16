@@ -3051,6 +3051,42 @@ func run(cfg syncConfig) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("read target domain replication role: %w", err)
 	}
+	// The operator's own veto, checked on BOTH ends and before the role
+	// gate, because it outranks it: a role says what vmsync has made of
+	// this domain, exclude says what a person decided about it.
+	//
+	// BOTH ENDS, and not because they are expected to agree. The ordinary
+	// case is an operator excluding the SOURCE, and the target inheriting
+	// the field through the sync redefine. The case this exists for is the
+	// other one: a replica excluded on its own, whose source knows nothing
+	// about it. Checking only the source would sync straight into it.
+	//
+	// Unlike the role gate there is no -force-clean override and
+	// deliberately no flag to bypass it: the remedy is to remove the
+	// metadata, which is the same deliberate act that put it there.
+	for _, side := range []struct{ what, domain string }{
+		{"source", cfg.SourceDomain},
+		{"target", cfg.TargetDomain},
+	} {
+		mgr := srcMgr
+		if side.what == "target" {
+			mgr = tgtMgr
+		}
+		raw, rerr := libvirtsync.ReadDomainMetadataField(mgr, side.domain, libvirtsync.MetadataFieldExclude)
+		if rerr != nil {
+			// Unreadable metadata is not an exclusion. Every other reader
+			// here treats an absent field as the ordinary case, and a
+			// domain whose XML could not be read will fail for that reason
+			// a few lines further on, with a better message than this
+			// could give.
+			trace.Debug("could not read the exclude metadata field", "side", side.what, "vm", side.domain, "error", rerr)
+			continue
+		}
+		if ex := libvirtsync.Excluded(raw); ex.ReportOnly || ex.Hidden {
+			return fmt.Errorf("%w: %s", libvirtsync.ErrRoleRefusesSync, libvirtsync.ExcludeRefusal(side.domain, ex))
+		}
+	}
+
 	if err := libvirtsync.TargetRoleAllowsSync(targetRole); err != nil {
 		// -force-clean overrides three of the five refusals, and only those.
 		//
@@ -5727,7 +5763,6 @@ func run(cfg syncConfig) (runErr error) {
 			StallWarnOnly: true,
 		}, command, action)
 	}
-
 
 	// runTargetCommand is the default: supervised when it can be, and never
 	// signalled. Everything that cannot prove it is safe to abandon uses

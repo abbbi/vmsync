@@ -722,7 +722,114 @@ const (
 	// source's real flag on every sync, so the merged-through value is
 	// overwritten before it can ever be written to a target.
 	MetadataFieldAutostartIntent = "autostart_intent"
+
+	// MetadataFieldExclude is how an operator tells vmsync to leave a
+	// domain alone.
+	//
+	// THE ONLY FIELD HERE VMSYNC NEVER WRITES, and that is the whole point
+	// of it. Every other field above is vmsync's own bookkeeping, written
+	// by a run and read by the next one; this one is written by a person,
+	// by hand, and vmsync only ever reads it. Nothing in this codebase may
+	// set or clear it -- an exclusion the tool could remove on its own is
+	// not an exclusion.
+	//
+	// Two values, ExcludeReportOnly and ExcludeFullyIgnored. See their
+	// comments for what each suppresses.
+	//
+	// SET IT ON THE SOURCE; THE TARGET INHERITS IT. This field is
+	// deliberately absent from syncRedefineStrips, so UpdateSyncMetadata --
+	// which rebuilds the target's definition from the SOURCE's XML --
+	// carries it across like any other source-side field. An operator
+	// excludes a pair by excluding its source, and the replica ends up
+	// carrying the same marker rather than having to be found and edited
+	// separately.
+	//
+	// AND A TARGET THAT CARRIES IT IS NEVER TOUCHED, whether it inherited
+	// the field or an operator wrote it there directly. The engine checks
+	// both ends and refuses if either one carries it, so the protection
+	// does not depend on which end was edited, nor on the two ends
+	// agreeing. That matters most in the case the inheritance cannot
+	// cover: a replica excluded on its own, whose source knows nothing
+	// about it.
+	//
+	// There is no inference ACROSS HOSTS beyond that copy. An agent
+	// honours the field on the domains it scans and asks no other host
+	// anything, so what an operator sees in a domain's own XML is the
+	// whole answer for that domain.
+	MetadataFieldExclude = "exclude"
 )
+
+// The values MetadataFieldExclude can hold.
+const (
+	// ExcludeReportOnly keeps the domain in the agent's inventory and
+	// metrics, and stops everything else: no scheduled sync, no sync on
+	// demand, no action taken on it at all.
+	//
+	// The value for a domain somebody still wants to SEE -- one being
+	// decommissioned, or mid-migration, or simply not ready -- where
+	// vanishing from the estate view would read as a monitoring failure
+	// rather than as a decision.
+	ExcludeReportOnly = "report-only"
+	// ExcludeFullyIgnored removes the domain from vmsync's world entirely:
+	// it is not inventoried, not reported, not counted in metrics, not
+	// scheduled, not synced. As far as the agent is concerned it is not
+	// there.
+	//
+	// The value for a domain that is somebody else's problem -- a VM on a
+	// shared hypervisor that this replication estate has no business
+	// knowing about.
+	//
+	// Spelled out rather than "full", which read as a degree of exclusion
+	// next to report-only rather than as what it is: the domain is gone
+	// from the tool's view entirely.
+	ExcludeFullyIgnored = "fully-ignored"
+)
+
+// ExcludeDecision is what a domain's exclude value means in practice.
+type ExcludeDecision struct {
+	// ReportOnly: inventory it, act on nothing.
+	ReportOnly bool
+	// Hidden: do not inventory it at all.
+	Hidden bool
+	// Raw is the value as written, for messages. Empty when unset.
+	Raw string
+	// Unrecognised is set when Raw holds something that is neither
+	// documented value. The caller should say so once, loudly.
+	Unrecognised bool
+}
+
+// Excluded reports what an exclude value means.
+//
+// AN UNRECOGNISED VALUE EXCLUDES, and fails toward report-only rather than
+// toward full. Someone wrote "exclude" on this domain meaning to stop
+// vmsync touching it; a typo that resumed replication would do the thing
+// they were trying to prevent, so a value nobody recognises still stops the
+// syncing. Report-only rather than full because the domain then stays
+// visible, carrying the warning that says why it stopped -- whereas full
+// would make it disappear with the explanation attached to nothing.
+func Excluded(value string) ExcludeDecision {
+	switch strings.TrimSpace(strings.ToLower(value)) {
+	case "":
+		return ExcludeDecision{}
+	case ExcludeFullyIgnored:
+		return ExcludeDecision{Hidden: true, Raw: value}
+	case ExcludeReportOnly:
+		return ExcludeDecision{ReportOnly: true, Raw: value}
+	default:
+		return ExcludeDecision{ReportOnly: true, Raw: value, Unrecognised: true}
+	}
+}
+
+// ExcludeRefusal is the one sentence every refusal uses, so an operator
+// meets the same wording wherever they hit it.
+func ExcludeRefusal(domain string, d ExcludeDecision) string {
+	if d.Unrecognised {
+		return fmt.Sprintf("domain %q carries vmsync metadata exclude=%q, which is not a value this version understands (expected %q or %q). Treating it as %s and doing nothing, because an exclusion nobody can read is still somebody asking vmsync to keep away. Fix or remove the field with `virsh metadata`",
+			domain, d.Raw, ExcludeReportOnly, ExcludeFullyIgnored, ExcludeReportOnly)
+	}
+	return fmt.Sprintf("domain %q carries vmsync metadata exclude=%s, so vmsync will not act on it. Remove the field with `virsh metadata` to bring it back",
+		domain, d.Raw)
+}
 
 // The values MetadataFieldAutostartIntent can hold. Strings rather than a
 // bool-plus-presence, so "we asked and could not tell" is a thing the record

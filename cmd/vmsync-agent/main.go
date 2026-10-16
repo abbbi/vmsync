@@ -888,6 +888,7 @@ func reportDomainFrom(d inventory.Domain, fenced *ReportFenced, a inventory.Asse
 		Name:                 d.Name,
 		UUID:                 d.UUID,
 		Active:               d.Active,
+		Exclude:              d.Exclude,
 		Role:                 d.Role,
 		LastCheckpoint:       d.LastCheckpoint,
 		LastSyncUnix:         d.LastSyncUnix,

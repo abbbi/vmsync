@@ -72,17 +72,25 @@ func formatDomainSummary(d ReportDomain, cadenceSeconds int) []any {
 	if cadenceSeconds > 0 {
 		cadence = fmt.Sprintf("%ds", cadenceSeconds)
 	}
-	return []any{
+	kv := []any{
 		"vm", d.Name,
 		"active", d.Active,
+	}
+	// Only when set, and first after the name, because it changes how
+	// every field after it should be read: a stale last_sync on an
+	// excluded VM is the exclusion working, not a problem.
+	if d.Exclude != "" {
+		kv = append(kv, "exclude", d.Exclude)
+	}
+	return append(kv,
 		"role", d.Role,
 		"status", d.Status,
 		"cadence", cadence,
-		"disks", "[" + strings.Join(disks, ",") + "]",
+		"disks", "["+strings.Join(disks, ",")+"]",
 		"source", d.ReplicaSource,
-		"targets", "[" + strings.Join(d.ReplicaTargets, ",") + "]",
+		"targets", "["+strings.Join(d.ReplicaTargets, ",")+"]",
 		"reasons", strings.Join(d.Reasons, "; "),
-	}
+	)
 }
 
 // watchStatusSignals logs a fresh inventory dump on every SIGUSR1 and exits

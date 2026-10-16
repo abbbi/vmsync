@@ -45,10 +45,13 @@ import (
 // happy. Distinct values are what make a cross-wire fail rather than pass.
 func fullyRecordedDomain() inventory.Domain {
 	return inventory.Domain{
-		Name:                 "web01",
-		UUID:                 "3f1a0f3e-0000-4000-8000-000000000001",
-		Active:               true,
-		Persistent:           true,
+		Name:       "web01",
+		UUID:       "3f1a0f3e-0000-4000-8000-000000000001",
+		Active:     true,
+		Persistent: true,
+		// report-only, because fully-ignored never reaches a report: the
+		// scan drops it, so no ReportDomain can ever carry that value.
+		Exclude:              libvirtsync.ExcludeReportOnly,
 		Role:                 libvirtsync.RoleTarget,
 		LastCheckpoint:       "vmsync-cpt-000042",
 		LastSyncUnix:         1799999700,

@@ -577,6 +577,10 @@ func TestApplyDomainMetadataMapsEveryField(t *testing.T) {
 		// and the parsed one for rendering. A target carrying it is the real
 		// state of a copy that served and was then re-targeted.
 		libvirtsync.MetadataFieldLastPromotedAt: "1799999000",
+		// report-only rather than fully-ignored: a fully-ignored domain
+		// never reaches a caller at all (scan drops it), so report-only is
+		// the only value this struct can legitimately be carrying.
+		libvirtsync.MetadataFieldExclude: libvirtsync.ExcludeReportOnly,
 	}
 
 	var d Domain

@@ -75,6 +75,15 @@ func (s *Scheduler) syncableVMs(cfg *agentConfig, now time.Time) []string {
 		if len(d.ReplicaTargets) == 0 {
 			continue
 		}
+		// An excluded VM must not be picked up by a DEFAULT template.
+		// buildSyncRequest would refuse it per launch anyway, but a
+		// default template that silently covered it would put it in the
+		// effective schedule the console shows -- so the estate view
+		// would promise a sync that is refused every interval, which
+		// reads as a fault rather than as the operator's own decision.
+		if libvirtsync.Excluded(d.Exclude).ReportOnly {
+			continue
+		}
 		vms = append(vms, d.Name)
 	}
 

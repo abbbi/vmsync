@@ -265,8 +265,8 @@ func runSupervise(cfg superviseConfig, command string, out io.Writer) superviseR
 
 	ticker := time.NewTicker(interval)
 	res := superviseLoop(superviseClock{
-		tick:       ticker.C,
-		stop:       ticker.Stop,
+		tick:          ticker.C,
+		stop:          ticker.Stop,
 		maxRuntime:    cfg.MaxRuntime,
 		grace:         grace,
 		stallBeats:    stallBeats,
