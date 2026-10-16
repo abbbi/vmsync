@@ -113,15 +113,138 @@ func TestTheCommitNeverGetsARuntimeLimit(t *testing.T) {
 			return true
 		}
 		fn, ok := call.Fun.(*ast.Ident)
-		if !ok || fn.Name != "runTargetCommandWithin" {
+		if !ok || (fn.Name != "runTargetCommandWithin" && fn.Name != "runTargetCommandUntilStalled") {
 			return true
 		}
 		if src := renderCall(fset, call); strings.Contains(src, "commit") {
-			t.Errorf("%s: the commit has a runtime limit. A qemu-img commit signalled part-way leaves the base image in a state no later run can describe, and the replica is then neither its old self nor its new one.\n  %s",
+			t.Errorf("%s: the commit has a bound, so the helper will signal it. A qemu-img commit signalled part-way leaves the base image in a state no later run can describe, and the replica is then neither its old self nor its new one. This holds for the stall bound exactly as for the clock: a commit grinding through a large delta on slow storage can legitimately show no progress for minutes.\n  %s",
 				fset.Position(call.Pos()), src)
 		}
 		return true
 	})
+}
+
+// The other half of the commit rule, and the half a "never bounded" test
+// cannot state: the commit must still be WATCHED. Deleting the watch leaves
+// every no-bound test green while the one command that can hang for an hour
+// goes back to reporting nothing but that it is still there.
+func TestTheCommitIsWatchedEvenThoughItIsNeverSignalled(t *testing.T) {
+	const file = "main.go"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+	watched := false
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		fn, ok := call.Fun.(*ast.Ident)
+		if !ok || fn.Name != "runTargetCommandWarnOnStall" {
+			return true
+		}
+		if strings.Contains(renderCall(fset, call), "committing changes") {
+			watched = true
+		}
+		return true
+	})
+	if !watched {
+		t.Error("the commit is not watched for stalls. It must never be SIGNALLED -- a qemu-img commit interrupted part-way leaves the base image in a state no later run can describe -- but being unkillable is not a reason to stop measuring it: without this the liveness line repeats \"still alive\" for as long as the storage is wedged, which is the question nobody asked.")
+	}
+}
+
+// The stall-bounded sites get the same treatment as the clock-bounded ones:
+// enumerated here, so adding one is a deliberate act with a note attached
+// rather than a line that slipped in.
+//
+// The bar is identical and it is not about the bound being gentler. A
+// progress bound still ends in SIGKILL, so whatever the command leaves
+// half-done must still be something the next run can clean up.
+func TestEveryStallBoundedTargetCommandIsSafeToAbandon(t *testing.T) {
+	const file = "main.go"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+
+	// Each site, by a fragment of its action text, with what makes
+	// abandoning it survivable:
+	//
+	//   create remote qcow2 -- its removal is armed before the create runs
+	//   target qemu-nbd     -- pidfile-matched -watch-argv, plus a reclaim
+	//   verify export       -- the same
+	allowed := []string{"create remote qcow2", "target qemu-nbd for", "verify export for"}
+	bounded := 0
+
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		fn, ok := call.Fun.(*ast.Ident)
+		if !ok || fn.Name != "runTargetCommandUntilStalled" {
+			return true
+		}
+		bounded++
+		src := renderCall(fset, call)
+		matched := false
+		for _, want := range allowed {
+			if strings.Contains(src, want) {
+				matched = true
+			}
+		}
+		if !matched {
+			t.Errorf("%s: this target command was given a stall bound, so the helper will SIGTERM then SIGKILL it after %s with no progress. Abandoning it must leave nothing the next run cannot clean up. If it does, add it to the list in this test; if it does not, drop the bound and let it run under the liveness line alone.\n  %s",
+				fset.Position(call.Pos()), targetCommandStallAfter, src)
+		}
+		return true
+	})
+
+	if bounded != len(allowed) {
+		t.Errorf("found %d target commands with a stall bound, want %d -- the list in this test and the call sites have drifted apart", bounded, len(allowed))
+	}
+}
+
+// A command that daemonises out of the helper's process group is invisible
+// to the progress sum and immune to the group kill, so a stall bound on one
+// without -watch-argv is a bound that cannot see or stop the only process
+// that matters. Both export starts must pass a watch pattern.
+func TestExportStartsPassAWatchPattern(t *testing.T) {
+	const file = "main.go"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+	seen := 0
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		fn, ok := call.Fun.(*ast.Ident)
+		if !ok || fn.Name != "runTargetCommandUntilStalled" || len(call.Args) == 0 {
+			return true
+		}
+		src := renderCall(fset, call)
+		if !strings.Contains(src, "qemu-nbd") && !strings.Contains(src, "verify export") {
+			return true
+		}
+		seen++
+		// First argument is watchArgv; an empty string literal there means
+		// the daemon is neither measured nor signalled.
+		if lit, ok := call.Args[0].(*ast.BasicLit); ok && lit.Value == `""` {
+			t.Errorf("%s: an export start has a stall bound but no -watch-argv. qemu-nbd --fork calls setsid(), so the daemon leaves the helper's process group: its progress would not be counted and the kill would miss it.\n  %s",
+				fset.Position(call.Pos()), src)
+		}
+		return true
+	})
+	if seen != 2 {
+		t.Errorf("found %d stall-bounded export starts, want 2 (the write export and the verify export)", seen)
+	}
 }
 
 // isZeroLiteral reports whether e is the literal 0, which is how a call site

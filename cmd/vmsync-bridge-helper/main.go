@@ -175,6 +175,9 @@ func main() {
 	// all.
 	superviseMaxRuntime := flag.Duration("max-runtime", 0, "How long a supervised command may run before it is sent SIGTERM, then SIGKILL after -kill-grace. ZERO MEANS UNBOUNDED, which is a deliberate setting and not an oversight: a command that must never be abandoned part-way (qemu-img commit, whose base image would be left in an undescribable state) still gets the per-minute liveness line, so a hang is audible even where it must not be interrupted")
 	superviseGrace := flag.Duration("kill-grace", defaultSuperviseGrace, "How long a signalled command has to honour SIGTERM before SIGKILL, and then how long to wait for a killed command to be reaped before reporting that it was not. A process wedged in uninterruptible I/O is never reaped, and saying so is more useful than waiting for it")
+	superviseStallAfter := flag.Duration("stall-after", 0, "How long a supervised command may make NO progress at all -- no CPU time, no read/write syscalls, no block I/O, summed across its whole process group -- before it is sent SIGTERM, then SIGKILL after -kill-grace. ZERO MEANS NEVER. Prefer this to -max-runtime for any command whose runtime legitimately scales with the storage, because it cannot be wrong about how slow the array is allowed to be today: it fires only on a command that is doing nothing whatsoever")
+	superviseStallWarn := flag.Duration("stall-warn", 0, "Like -stall-after, but REPORTS and never signals. For a command that must not be abandoned part-way -- qemu-img commit, whose base image would be left in a state no later run can describe -- where being unkillable was never a reason not to watch: the liveness line then says how long it has been doing nothing instead of merely that it is still there. Mutually exclusive with -stall-after")
+	superviseWatchArgv := flag.String("watch-argv", "", "A substring of the command line of a process to measure and signal alongside the process group. For a child that daemonises out of the group: qemu-nbd --fork calls setsid(), so it survives a kill aimed at the group it started in and its progress is invisible to a group-wide measurement. Empty matches nothing")
 	superviseLabel := flag.String("label", "", "What to call a supervised command in the liveness line. The command itself is never logged here -- it is already in the caller's log, and repeating it every minute would bury the fields that change")
 	showVersion := flag.Bool("v", false, "Show version and exit")
 	showVersionLong := flag.Bool("version", false, "Show version and exit")
@@ -224,7 +227,7 @@ func main() {
 		// that thinks it holds a lock and does not would run concurrently with
 		// whoever really does.
 		if *listenAddr != "" || *connectAddr != "" || *checksumMode || supervisionFlagsGiven() {
-			fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -hold-run-lock holds a lock and does nothing else, so -listen/-connect/-checksum and the supervision flags (-max-runtime/-kill-grace/-label) must not be given with it")
+			fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -hold-run-lock holds a lock and does nothing else, so -listen/-connect/-checksum and the supervision flags (-max-runtime/-stall-after/-stall-warn/-watch-argv/-kill-grace/-label) must not be given with it")
 			os.Exit(2)
 		}
 		err := holdRunLock(runLockConfig{
@@ -250,7 +253,7 @@ func main() {
 		// a wrong idea of what this process will do, and silently doing the
 		// other thing is how that stays undiscovered.
 		if *listenAddr != "" || *connectAddr != "" || supervisionFlagsGiven() {
-			fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -checksum runs one checksum pass and never relays, so -listen/-connect and the supervision flags (-max-runtime/-kill-grace/-label) must not be given with it")
+			fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -checksum runs one checksum pass and never relays, so -listen/-connect and the supervision flags (-max-runtime/-stall-after/-stall-warn/-watch-argv/-kill-grace/-label) must not be given with it")
 			os.Exit(2)
 		}
 		if *checksumNBD == "" {
@@ -300,8 +303,19 @@ func main() {
 		if label == "" {
 			label = "an unnamed command"
 		}
+		if *superviseStallAfter > 0 && *superviseStallWarn > 0 {
+			fmt.Fprintln(os.Stderr, "vmsync-bridge-helper: -stall-after signals and -stall-warn does not, so giving both says two different things about the same command. Pick one.")
+			os.Exit(2)
+		}
+		stallAfter, stallWarnOnly := *superviseStallAfter, false
+		if *superviseStallWarn > 0 {
+			stallAfter, stallWarnOnly = *superviseStallWarn, true
+		}
 		res := runSupervise(superviseConfig{
-			MaxRuntime: *superviseMaxRuntime,
+			MaxRuntime:    *superviseMaxRuntime,
+			StallAfter:    stallAfter,
+			StallWarnOnly: stallWarnOnly,
+			WatchArgv:     *superviseWatchArgv,
 			Grace:      *superviseGrace,
 			Label:      label,
 			// stderr, never stdout: stdout carries the command's own output

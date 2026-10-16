@@ -28,7 +28,7 @@ import (
 // ignored by a mode that did not expect it.
 var (
 	relayOnlyFlags     = []string{"listen", "connect", "compress", "compress-level", "netbuffer"}
-	superviseOnlyFlags = []string{"max-runtime", "kill-grace", "label"}
+	superviseOnlyFlags = []string{"max-runtime", "stall-after", "stall-warn", "watch-argv", "kill-grace", "label"}
 )
 
 // flagsGiven reports whether any of names appeared on the command line.

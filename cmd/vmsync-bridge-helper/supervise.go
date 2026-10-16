@@ -73,6 +73,15 @@ const (
 	// superviseTimeout: the runtime limit ran out and this process signalled. The
 	// child may or may not have died; reaped= says which.
 	superviseTimeout = "timeout"
+	// superviseStalled: the command went -stall-after without any of its
+	// processes computing or moving a byte, and this process signalled.
+	//
+	// Distinct from a timeout in the verdict line although both share
+	// ExitSupervisedTimeout, because the two say different things to whoever
+	// reads the log: a timeout means "took longer than this command ever
+	// should", a stall means "was still there and doing nothing at all".
+	// Only the second is evidence about the storage.
+	superviseStalled = "stalled"
 	// superviseStartFailed: the child never started. Distinct from a child
 	// that started and failed, because the remedies are different ones.
 	superviseStartFailed = "startfailed"
@@ -87,6 +96,30 @@ type superviseConfig struct {
 	// gets the beat, so a hang is audible even where it must not be
 	// interrupted.
 	MaxRuntime time.Duration
+	// StallAfter is how long the command may make NO progress before it is
+	// signalled. Zero means never, and the two bounds are independent: a
+	// command may have both, either, or neither.
+	//
+	// This is the bound to prefer for anything whose runtime legitimately
+	// scales with the storage -- creating an overlay, opening a large image
+	// -- because it cannot be wrong about how slow the array is allowed to
+	// be today. It only ever fires on a command doing nothing whatsoever.
+	// See progress.go for what counts as doing something.
+	StallAfter time.Duration
+	// StallWarnOnly measures exactly as StallAfter does and never signals.
+	//
+	// SEPARATING THE MEASUREMENT FROM THE KILL is the point. A qemu-img
+	// commit must never be abandoned -- the base image would be left in a
+	// state no later run can describe -- but "must not be killed" was never
+	// a reason not to LOOK. Supervising it for a bare "still alive" line
+	// answered the question nobody asked; counting its progress turns the
+	// same line into the diagnosis the supervision was added for, at no
+	// risk at all, because nothing is signalled either way.
+	StallWarnOnly bool
+	// WatchArgv is a substring of the command line of a process that must be
+	// measured and signalled along with the process group, for the case of a
+	// child that daemonises out of it. Empty matches nothing at all.
+	WatchArgv string
 	// Grace is how long the child has to honour SIGTERM before SIGKILL, and
 	// then how long this process waits for a killed child to be reaped
 	// before reporting that it was not. One knob for both because they are
@@ -121,8 +154,13 @@ type superviseResult struct {
 	// State is the child's /proc state letter at the end, when it could be
 	// read. "D" is uninterruptible I/O: the one that explains an unreaped
 	// child to anybody who does not already know.
-	State    string
-	Duration time.Duration
+	State string
+	// StalledBeats is how many consecutive beats showed no progress at the
+	// moment the command was given up on, and is set only for a stall. It
+	// goes in the line because "stalled" without a count invites the
+	// question the count answers: for how long.
+	StalledBeats int
+	Duration     time.Duration
 }
 
 // Line renders the verdict.
@@ -136,6 +174,9 @@ func (r superviseResult) Line() string {
 	fmt.Fprintf(&b, "outcome=%s exit=%d duration=%s", r.Outcome, r.ExitCode, r.Duration.Round(time.Millisecond))
 	if len(r.Signals) > 0 {
 		fmt.Fprintf(&b, " signalled=%s reaped=%t", strings.Join(r.Signals, ","), r.Reaped)
+	}
+	if r.StalledBeats > 0 {
+		fmt.Fprintf(&b, " stalled_beats=%d", r.StalledBeats)
 	}
 	if r.State != "" {
 		fmt.Fprintf(&b, " child_state=%s", r.State)
@@ -211,21 +252,47 @@ func runSupervise(cfg superviseConfig, command string, out io.Writer) superviseR
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
 
+	// Beats, not seconds: the loop's only clock is the tick, and rounding up
+	// means a bound shorter than one beat still takes one beat rather than
+	// firing on the first one with nothing to compare against.
+	stallBeats := 0
+	if cfg.StallAfter > 0 {
+		stallBeats = int((cfg.StallAfter + interval - 1) / interval)
+		if stallBeats < 1 {
+			stallBeats = 1
+		}
+	}
+
 	ticker := time.NewTicker(interval)
 	res := superviseLoop(superviseClock{
 		tick:       ticker.C,
 		stop:       ticker.Stop,
-		maxRuntime: cfg.MaxRuntime,
-		grace:      grace,
+		maxRuntime:    cfg.MaxRuntime,
+		grace:         grace,
+		stallBeats:    stallBeats,
+		stallWarnOnly: cfg.StallWarnOnly,
 	}, waitCh, superviseActions{
-		beat: func(phase string, elapsed time.Duration) {
+		beat: func(phase string, elapsed time.Duration, p progressSample, stalledBeats int) {
 			if cfg.Progress == nil {
 				return
 			}
-			fmt.Fprint(cfg.Progress, formatSuperviseBeat(cfg, pid, phase, elapsed, procState(pid)))
+			fmt.Fprint(cfg.Progress, formatSuperviseBeat(cfg, pid, phase, elapsed, procState(pid), p, stalledBeats))
 		},
-		signal: func(sig string) error { return signalProcessGroup(pid, sig) },
-		state:  func() string { return procState(pid) },
+		// The group AND the stray, for the reason procPids documents: a
+		// daemon that called setsid() is outside the group and survives a
+		// kill aimed at it, so signalling only the group would leave the
+		// one process worth stopping running.
+		signal: func(sig string) error {
+			err := signalProcessGroup(pid, sig)
+			for _, stray := range procPids(pid, cfg.WatchArgv) {
+				if procPgid(stray) != pid {
+					_ = signalPid(stray, sig)
+				}
+			}
+			return err
+		},
+		state:    func() string { return procState(pid) },
+		progress: func() (progressSample, bool) { return groupProgress(pid, cfg.WatchArgv) },
 	})
 	// Drain what the child wrote, then stop reading whatever happens.
 	//
@@ -290,6 +357,14 @@ type superviseClock struct {
 	stop       func()
 	maxRuntime time.Duration
 	grace      time.Duration
+	// stallBeats is how many consecutive beats with no progress at all end
+	// the command, or zero to never end it that way. Counted in BEATS, not
+	// in time, because the beat is the only clock the loop has and a bound
+	// expressed in anything else could not be checked without a second one.
+	stallBeats int
+	// stallWarnOnly counts and reports the same way but never signals, for
+	// a command that must not be abandoned and still deserves watching.
+	stallWarnOnly bool
 	// after is how the deadlines are armed, or nil for time.After. Only a
 	// test sets it.
 	after func(time.Duration) <-chan time.Time
@@ -304,9 +379,13 @@ func (c superviseClock) arm(d time.Duration) <-chan time.Time {
 
 // superviseActions is what the state machine does to the world.
 type superviseActions struct {
-	beat   func(phase string, elapsed time.Duration)
+	beat   func(phase string, elapsed time.Duration, p progressSample, stalledBeats int)
 	signal func(sig string) error
 	state  func() string
+	// progress samples every process being supervised. ok false means the
+	// counters could not be read at all, which the loop treats as movement:
+	// nothing is ever killed on the strength of a measurement that failed.
+	progress func() (progressSample, bool)
 }
 
 // The phases, which are also what the beat line calls them.
@@ -348,6 +427,13 @@ func superviseLoop(clock superviseClock, waitCh <-chan error, act superviseActio
 		runtimeCh = clock.arm(clock.maxRuntime)
 	}
 
+	// Progress state. haveSample guards the first beat: with no previous
+	// sample to compare against there has been no observed stillness yet,
+	// so the first beat can never be the first strike.
+	var lastSample progressSample
+	haveSample := false
+	stalledBeats := 0
+
 	for {
 		select {
 		case <-waitCh:
@@ -359,7 +445,46 @@ func superviseLoop(clock superviseClock, waitCh <-chan error, act superviseActio
 			return res
 
 		case <-clock.tick:
-			act.beat(phase, time.Since(started))
+			sample, readable := progressNow(act)
+			switch {
+			case !readable || !haveSample:
+				// Cannot tell, or nothing to compare with yet. Either way
+				// this beat is not evidence of stillness.
+				stalledBeats = 0
+			case sample.moved(lastSample):
+				stalledBeats = 0
+			default:
+				stalledBeats++
+			}
+			lastSample, haveSample = sample, readable
+			act.beat(phase, time.Since(started), sample, stalledBeats)
+
+			// Recorded whenever the bound is crossed, signalled or not, so
+			// a command that froze for five minutes and then finished says
+			// so in its verdict instead of reporting a clean completion.
+			if clock.stallBeats > 0 && stalledBeats >= clock.stallBeats {
+				res.StalledBeats = stalledBeats
+			}
+
+			// Only while the command is still running: once SIGTERM is out,
+			// a process making no progress is a process doing as it was
+			// told, and the grace deadline already governs what follows.
+			if phase == superviseRunning && clock.stallBeats > 0 && !clock.stallWarnOnly && stalledBeats >= clock.stallBeats {
+				// The same second look the deadlines take: a command that
+				// finished in the instant this beat fired must not be
+				// reported as stalled.
+				if reaped(waitCh) {
+					return res
+				}
+				runtimeCh = nil
+				res.Outcome = superviseStalled
+				res.ExitCode = util.ExitSupervisedTimeout
+				// StalledBeats is already set by the recorder above.
+				res.Signals = append(res.Signals, "TERM")
+				_ = act.signal("TERM")
+				phase = superviseTerminating
+				deadlineCh = clock.arm(clock.grace)
+			}
 
 		case <-runtimeCh:
 			// A deadline and the child's exit can both be ready, and select
@@ -410,6 +535,16 @@ func superviseLoop(clock superviseClock, waitCh <-chan error, act superviseActio
 	}
 }
 
+// progressNow samples, tolerating a loop driven by a test that supplied no
+// sampler at all. No sampler means no measurement, which means no stall --
+// the same answer an unreadable /proc gives.
+func progressNow(act superviseActions) (progressSample, bool) {
+	if act.progress == nil {
+		return progressSample{}, false
+	}
+	return act.progress()
+}
+
 // reaped reports whether the child has already exited, without waiting for
 // it. Beside the loop that uses it, like stopped() in pkg/remotessh and
 // beatStopped() above.
@@ -441,7 +576,7 @@ const defaultSuperviseGrace = 5 * time.Second
 // Bare, with no timestamp and no level, for the reason the digest beat gives:
 // vmsync stamps each line as it reads it, so the time on the line is when the
 // WAITING side saw it rather than two clocks that may disagree.
-func formatSuperviseBeat(cfg superviseConfig, pid int, phase string, elapsed time.Duration, state string) string {
+func formatSuperviseBeat(cfg superviseConfig, pid int, phase string, elapsed time.Duration, state string, p progressSample, stalledBeats int) string {
 	limit := "no runtime limit"
 	if cfg.MaxRuntime > 0 {
 		limit = "max runtime " + cfg.MaxRuntime.String()
@@ -450,8 +585,27 @@ func formatSuperviseBeat(cfg superviseConfig, pid int, phase string, elapsed tim
 	if state != "" {
 		where = ", child " + strconv.Itoa(pid) + " in state " + state + " (" + procStateMeaning(state) + ")"
 	}
-	return fmt.Sprintf("supervise alive (%s) %s %s elapsed%s, %s\n",
-		cfg.Label, phase, elapsed.Round(time.Second), where, limit)
+	// The counters go in every beat, not just a stalling one. A reader
+	// comparing two consecutive beats can then see for themselves whether a
+	// slow command is advancing, which is the question a bare "alive" line
+	// left them guessing at -- and it is the same question this process
+	// answers mechanically a few beats later.
+	progress := ""
+	if cfg.StallAfter > 0 {
+		progress = fmt.Sprintf(", cpu=%d rw=%dB blk=%dB", p.cpu, p.rw, p.blk)
+		if stalledBeats > 0 {
+			ends := "giving up after " + cfg.StallAfter.String()
+			if cfg.StallWarnOnly {
+				// Said plainly, because an operator seeing "NO PROGRESS"
+				// on a commit needs to know nothing is about to be killed
+				// -- and that the decision to intervene is theirs.
+				ends = "NOT signalled, this command is never abandoned"
+			}
+			progress += fmt.Sprintf(" (NO PROGRESS for %d beat(s), %s)", stalledBeats, ends)
+		}
+	}
+	return fmt.Sprintf("supervise alive (%s) %s %s elapsed%s%s, %s\n",
+		cfg.Label, phase, elapsed.Round(time.Second), where, progress, limit)
 }
 
 // procState is the child's state letter from /proc, or "" when it cannot be
@@ -533,4 +687,14 @@ func signalProcessGroup(pid int, sig string) error {
 		s = syscall.SIGKILL
 	}
 	return syscall.Kill(-pid, s)
+}
+
+// signalPid signals ONE process, for the daemon that left the group and so
+// cannot be reached by the negative pid above.
+func signalPid(pid int, sig string) error {
+	s := syscall.SIGTERM
+	if sig == "KILL" {
+		s = syscall.SIGKILL
+	}
+	return syscall.Kill(pid, s)
 }

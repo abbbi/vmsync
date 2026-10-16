@@ -73,7 +73,7 @@ func (r *superviseRig) clock(maxRuntime, grace time.Duration) superviseClock {
 
 func (r *superviseRig) actions() superviseActions {
 	return superviseActions{
-		beat: func(phase string, _ time.Duration) {
+		beat: func(phase string, _ time.Duration, _ progressSample, _ int) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
 			r.beats = append(r.beats, phase)
@@ -363,7 +363,7 @@ func TestSuperviseVerdictIsParseableAndComplete(t *testing.T) {
 // was asking about.
 func TestSuperviseBeatNamesWhatAnOperatorNeeds(t *testing.T) {
 	cfg := superviseConfig{Label: "start target qemu-nbd for vda", MaxRuntime: 30 * time.Second}
-	line := formatSuperviseBeat(cfg, 4242, superviseRunning, 2*time.Minute, "D")
+	line := formatSuperviseBeat(cfg, 4242, superviseRunning, 2*time.Minute, "D", progressSample{}, 0)
 	for _, want := range []string{
 		"start target qemu-nbd for vda", "2m0s", "child 4242",
 		"state D", "uninterruptible I/O", "max runtime 30s",
@@ -375,7 +375,7 @@ func TestSuperviseBeatNamesWhatAnOperatorNeeds(t *testing.T) {
 
 	// A command with no limit says so, because "no runtime limit" is the fact that
 	// explains why a line has been repeating for twenty minutes.
-	commit := formatSuperviseBeat(superviseConfig{Label: "committing changes for vda"}, 7, superviseRunning, time.Hour, "")
+	commit := formatSuperviseBeat(superviseConfig{Label: "committing changes for vda"}, 7, superviseRunning, time.Hour, "", progressSample{}, 0)
 	if !strings.Contains(commit, "no runtime limit") {
 		t.Errorf("a command with no runtime limit does not say so: %q", commit)
 	}

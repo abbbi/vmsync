@@ -5680,7 +5680,7 @@ func run(cfg syncConfig) (runErr error) {
 	// Unsupervised, the old path: no bound, no progress, and a wedged
 	// target's storage parks the run. The capability line above says which
 	// of the two happened, every run.
-	runTargetCommandWithin := func(maxRuntime time.Duration, command, action string) error {
+	runTargetCommandBounded := func(b targetCommandBounds, command, action string) error {
 		trace.Debug(command)
 		if !superviseTargetCommands {
 			out, err := targetSSHClient.Run(ctx, command)
@@ -5689,12 +5689,45 @@ func run(cfg syncConfig) (runErr error) {
 			}
 			return nil
 		}
-		out, err := runSupervisedTargetCommand(ctx, targetSSHClient, cfg.BridgeHelperPath, maxRuntime, command, action)
+		out, err := runSupervisedTargetCommand(ctx, targetSSHClient, cfg.BridgeHelperPath, b, command, action)
 		if err != nil {
 			return fmt.Errorf("%s: %w: %s", action, err, out)
 		}
 		return nil
 	}
+
+	// runTargetCommandWithin keeps the wall-clock form for the commands that
+	// cannot legitimately be slow: making a directory, probing for a binary.
+	// A clock is the right bound there and the simplest one.
+	runTargetCommandWithin := func(maxRuntime time.Duration, command, action string) error {
+		return runTargetCommandBounded(targetCommandBounds{MaxRuntime: maxRuntime}, command, action)
+	}
+
+	// runTargetCommandUntilStalled is the bound for everything whose runtime
+	// legitimately scales with the storage. It never asks how long the
+	// command should take -- only whether it is still doing anything at all.
+	//
+	// watchArgv names a process that daemonises out of the helper's process
+	// group and must be measured and signalled anyway; "" when none does.
+	runTargetCommandUntilStalled := func(watchArgv, command, action string) error {
+		return runTargetCommandBounded(targetCommandBounds{
+			StallAfter: targetCommandStallAfter,
+			WatchArgv:  watchArgv,
+		}, command, action)
+	}
+
+	// runTargetCommandWarnOnStall measures a command exactly as the bound
+	// above does and never signals it, for the ones that must run to
+	// completion whatever happens. Being unkillable is not a reason to
+	// watch a command less closely -- it is a reason to watch it and say
+	// so, because the only remedy left is a person's.
+	runTargetCommandWarnOnStall := func(command, action string) error {
+		return runTargetCommandBounded(targetCommandBounds{
+			StallAfter:    targetCommandStallAfter,
+			StallWarnOnly: true,
+		}, command, action)
+	}
+
 
 	// runTargetCommand is the default: supervised when it can be, and never
 	// signalled. Everything that cannot prove it is safe to abandon uses
@@ -6421,10 +6454,6 @@ func run(cfg syncConfig) (runErr error) {
 			trace.Info("Create temporary image", "disk", targetPathInc)
 			createCmd = "qemu-img create -f qcow2 -F qcow2  -o cluster_size=" + fmt.Sprintf("%d", d.ClusterSize) + " " + util.ShQuote(targetPathInc) + " -b " + util.ShQuote(targetPath) + " " + fmt.Sprintf("%d", d.VirtualSize)
 		}
-		if err := runTargetCommand(createCmd, fmt.Sprintf("create remote qcow2 %s", targetPathInc)); err != nil {
-			return res, err
-		}
-
 		// The incremental overlay is this run's scratch space, and until it is
 		// committed it is worth exactly nothing: every byte in it is also
 		// still readable from the source. So remove it on any path out of
@@ -6442,8 +6471,16 @@ func run(cfg syncConfig) (runErr error) {
 		// that succeeds hands its overlay to the barrier instead, and the
 		// barrier owns the deletion from then on.
 		//
-		// Registered immediately after creation, not before -- there would be
-		// nothing to remove.
+		// Registered BEFORE the create, not after, and that was the other
+		// way round until the create was given a stall bound. The old
+		// reasoning -- arm it after, because before the create there is
+		// nothing to remove -- only held while the create could not be
+		// interrupted. A create the helper signals part-way leaves a
+		// partial qcow2 that nothing else will ever name, so the window
+		// between starting the create and arming the cleanup is exactly
+		// the window in which the file this defer exists to remove comes
+		// into being. `rm -f` on a file that was never created is a no-op,
+		// so arming early costs nothing.
 		//
 		// Before this existed, every failing incremental left a delta-sized
 		// qcow2 behind on the target. Whether it was ever reclaimed came
@@ -6476,6 +6513,16 @@ func run(cfg syncConfig) (runErr error) {
 						"image", targetPathInc, "disk", d.TargetDev, "error", rmErr, "output", out)
 				}
 			}()
+		}
+
+		// Bounded by PROGRESS, not by a clock. Creating an overlay is
+		// normally instant, but it is a write to the replica's storage and
+		// so takes as long as that storage takes today -- a number this
+		// side cannot know. The stall bound signals it only if it stops
+		// doing anything at all, and the cleanup armed just above removes
+		// whatever partial file that leaves.
+		if err := runTargetCommandUntilStalled("", createCmd, fmt.Sprintf("create remote qcow2 %s", targetPathInc)); err != nil {
+			return res, err
 		}
 
 		// Give the base image an owner qemu can actually open.
@@ -6532,11 +6579,34 @@ func run(cfg syncConfig) (runErr error) {
 		// too so a failed attempt cannot leave a qemu-nbd holding the image
 		// open -- which would block the commit and, on a -reinit, the rm.
 		killExportCmd := "kill -9 $(cat " + util.ShQuote(pidFile) + ") || true; rm -f " + util.ShQuote(pidFile)
+
+		// Before the first attempt, never between them: an abandoned export
+		// from an EARLIER run still holds this disk's image open and will
+		// write this pidfile when its storage recovers. Run on its own so
+		// its output can be read -- runTargetCommand discards stdout on
+		// success, and on success is when this has something to say.
+		if reclaimed, rerr := targetSSHClient.Run(ctx, reclaimAbandonedExportCmd(pidFile)); rerr != nil {
+			trace.Warning("could not check the target for abandoned exports before starting a new one",
+				"disk", d.TargetDev, "error", rerr)
+		} else if found := strings.TrimSpace(reclaimed); found != "" {
+			trace.Warning("killed an ABANDONED target export left behind by an earlier run and took its place. This run is unaffected, but an export outliving its run means one was never stopped -- and while it lived it held this disk's image open",
+				"disk", d.TargetDev, "reclaimed", strings.ReplaceAll(found, "\n", "; "))
+		}
 		targetPort, err := bindOnFreePort(
 			fmt.Sprintf("target qemu-nbd export for %s", targetPath),
 			targetPortAlloc,
 			func(port int) error {
-				return runTargetCommand(buildStartExport(port), fmt.Sprintf("start target qemu-nbd for %s on port %d", targetPath, port))
+				// Bounded by progress, and -watch-argv keyed on the
+				// pidfile path rather than the export name: the verify
+				// export later uses the SAME export name for the same
+				// disk, and a pattern that matched both could signal an
+				// export this call never started. The two pidfiles differ.
+				//
+				// qemu-nbd --fork calls setsid(), so the daemon is outside
+				// the helper's process group and neither measured nor
+				// signalled without this.
+				return runTargetCommandUntilStalled(pidFile, buildStartExport(port),
+					fmt.Sprintf("start target qemu-nbd for %s on port %d", targetPath, port))
 			},
 			func(port int) {
 				// context.Background(), never ctx: a retry may be happening
@@ -6877,6 +6947,17 @@ func run(cfg syncConfig) (runErr error) {
 		// Built before the start rather than after, so the bind retry below
 		// can clean up a failed attempt with the same string.
 		stopVerifyCmd := "kill -9 $(cat " + util.ShQuote(verifyPidFile) + ") || true; rm -f " + util.ShQuote(verifyPidFile)
+
+		// Same reclaim as the write export's, for the same reason: a verify
+		// export abandoned by an earlier run holds the replica open and
+		// will claim this pidfile the moment its storage recovers.
+		if reclaimed, rerr := targetSSHClient.Run(ctx, reclaimAbandonedExportCmd(verifyPidFile)); rerr != nil {
+			trace.Warning("could not check the target for abandoned verify exports before starting a new one",
+				"disk", d.TargetDev, "error", rerr)
+		} else if found := strings.TrimSpace(reclaimed); found != "" {
+			trace.Warning("killed an ABANDONED verify export left behind by an earlier run and took its place",
+				"disk", d.TargetDev, "reclaimed", strings.ReplaceAll(found, "\n", "; "))
+		}
 		// --cache=none (O_DIRECT) for the same reason the pre-commit checksum
 		// export sets it: without it this read is served from the host page
 		// cache, which still holds the pages the sync just wrote. That would
@@ -6907,7 +6988,11 @@ func run(cfg syncConfig) (runErr error) {
 			fmt.Sprintf("read-only verify export for %s", targetPath),
 			targetPortAlloc,
 			func(port int) error {
-				return runTargetCommand(buildStartVerify(port), fmt.Sprintf("start read-only verify export for %s on port %d", targetPath, port))
+				// As for the write export: progress-bounded, and watched
+				// by its own pidfile path because the daemon setsid()s out
+				// of the helper's process group.
+				return runTargetCommandUntilStalled(verifyPidFile, buildStartVerify(port),
+					fmt.Sprintf("start read-only verify export for %s on port %d", targetPath, port))
 			},
 			func(port int) {
 				if out, cerr := targetSSHClient.Run(context.Background(), stopVerifyCmd); cerr != nil {
@@ -7471,7 +7556,16 @@ func run(cfg syncConfig) (runErr error) {
 		for i, s := range staged {
 			trace.Info("Committing changes to base", "image", s.base, "disk", s.dev)
 			commitCmd := "qemu-img commit -b " + util.ShQuote(s.base) + " " + util.ShQuote(s.overlay)
-			if err := runTargetCommand(commitCmd, fmt.Sprintf("committing changes for %s", s.overlay)); err != nil {
+			// WATCHED, NEVER SIGNALLED. The commit is the one command that
+			// must not be abandoned -- interrupted part-way, the base is
+			// neither its old self nor its new one and no later run can
+			// tell which parts were written. That has always ruled out a
+			// bound; it never ruled out looking. With this, a commit
+			// wedged on the replica's storage says "NO PROGRESS for 3
+			// beats" instead of repeating "still alive" for an hour, and
+			// the decision to intervene is a person's, made with the fact
+			// in hand.
+			if err := runTargetCommandWarnOnStall(commitCmd, fmt.Sprintf("committing changes for %s", s.overlay)); err != nil {
 				// THIS disk's base is no longer known-untouched, so its
 				// overlay stops being disposable scratch and becomes the only
 				// record of the delta. Kept.
