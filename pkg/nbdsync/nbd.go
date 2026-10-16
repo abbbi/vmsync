@@ -78,11 +78,33 @@ func clampBufferSize(size, limit uint64) uint64 {
 // in either pipeline would otherwise ever notice. Left unbounded, this
 // spins the calling goroutine forever while holding the source's
 // block-copy backup job open, blocking any future checkpoint or reinit
-// against that domain until the process is killed by hand. 120s is
-// generous enough to tolerate one genuinely slow chunk (even a full
-// negotiated buffer over a heavily-compressed, high-latency link) without
-// tripping on legitimate slowness.
-const noProgressTimeout = 120 * time.Second
+// against that domain until the process is killed by hand.
+//
+// THREE MINUTES, which is the same bound vmsync-bridge-helper applies to a
+// target command that stops making progress (cmd/vmsync:
+// targetCommandStallAfter, three beats of trace.ProgressInterval). They
+// guard different phases of the same run -- the helper watches a command
+// while it starts an export, this watches the data path once that export
+// is serving -- and they ask the identical question: is anything still
+// happening. Two different answers to one question is a number somebody
+// has to look up before they can read a log; one answer is a thing they
+// learn once.
+//
+// It was 120s, chosen on its own as "generous enough to tolerate one
+// genuinely slow chunk, even a full negotiated buffer over a
+// heavily-compressed high-latency link". Three minutes is more generous
+// still, and the cost of the extra minute is one minute later before a
+// half-open connection is reported -- against a bound that now matches the
+// only other progress bound in the tool.
+//
+// WRITTEN AS THE SAME EXPRESSION, not as the same number, and that is the
+// point of doing it this way. `3 * trace.ProgressInterval` is exactly what
+// targetCommandStallAfter says, so the two cannot drift apart by somebody
+// tuning one of them: changing the interval moves both, and changing this
+// multiplier is a visible disagreement with the other rather than a
+// silent one. Equal literals would have been equal only until the next
+// time somebody had a reason to touch one.
+const noProgressTimeout = 3 * trace.ProgressInterval
 
 // stalled reports whether more than timeout has elapsed since lastProgress.
 // Extracted so the exact boundary (>= timeout, not >) is directly testable
@@ -103,7 +125,7 @@ func stalled(lastProgress, now time.Time, timeout time.Duration) bool {
 // are thousands of entries that push everything else out of a journal and
 // make the log unreadable exactly when something has gone wrong and somebody
 // is reading it. A minute is frequent enough to tell "moving" from "wedged"
-// (and the 120s noProgressTimeout above is what actually catches wedged),
+// (and noProgressTimeout above is what actually catches wedged),
 // and rare enough that an hour-long sync leaves sixty lines.
 // Defined in pkg/trace so vmsync-bridge-helper can report the target side of
 // a digest exchange on the same cadence -- see trace.ProgressInterval.

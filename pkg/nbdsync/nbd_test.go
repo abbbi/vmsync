@@ -81,6 +81,7 @@ import (
 	"time"
 
 	"vmsync/pkg/blockdigest"
+	"vmsync/pkg/trace"
 
 	nbd "libguestfs.org/libnbd"
 )
@@ -1611,5 +1612,31 @@ func TestSkipPct(t *testing.T) {
 		if got := SkipPct(c.skipped, c.total); got != c.want {
 			t.Errorf("SkipPct(%d, %d) = %q, want %q", c.skipped, c.total, got, c.want)
 		}
+	}
+}
+
+// ONE ANSWER TO ONE QUESTION. noProgressTimeout bounds the data path once
+// an export is serving; cmd/vmsync's targetCommandStallAfter bounds a
+// target command while it starts one. Both ask "is anything still
+// happening", and two different numbers for that is a value somebody has
+// to look up before they can read a log.
+//
+// Pinned as the expression rather than the number: cmd/vmsync is a main
+// package and cannot be imported here, so this asserts the shared shape --
+// three beats of the interval both sides already use. A reader who changes
+// one has to come here and disagree on purpose.
+func TestNoProgressTimeoutMatchesTheHelpersStallBound(t *testing.T) {
+	if noProgressTimeout != 3*trace.ProgressInterval {
+		t.Errorf("noProgressTimeout = %s, want 3 * trace.ProgressInterval (%s). "+
+			"cmd/vmsync's targetCommandStallAfter is defined as that same expression, and the two bound the "+
+			"same judgement on either side of one run -- a command starting an export, and the data path once "+
+			"it serves. If this genuinely needs to differ, say why here rather than leaving two numbers for "+
+			"one question.", noProgressTimeout, 3*trace.ProgressInterval)
+	}
+	// And it must stay comfortably above the progress-reporting cadence,
+	// or a healthy-but-slow pipeline trips the bound before it has had a
+	// chance to report anything at all.
+	if noProgressTimeout <= progressLogInterval {
+		t.Errorf("noProgressTimeout (%s) must exceed progressLogInterval (%s)", noProgressTimeout, progressLogInterval)
 	}
 }
