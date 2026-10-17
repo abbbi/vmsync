@@ -58,8 +58,36 @@ func (s *Scheduler) Reconcile(ctx context.Context) {
 	cfg := s.lv.get()
 	cached := s.state.get()
 
+	// RESOLVED, exactly as the scheduler's own tick resolves it.
+	//
+	// Reading the published schedule raw cost this function two different
+	// things, and only the first is obvious.
+	//
+	// A VM covered ONLY by a default template has no entry here at all, so
+	// a run of it started by the previous instance was never adopted --
+	// which is precisely the state this whole function exists to repair.
+	// Its concurrency slot stays free, so the host over-admits into a
+	// target another host may already be saturating, and
+	// vmsync_agent_syncs_running reads 0 while a sync is demonstrably in
+	// progress. An operator looking at that dashboard sees an idle host.
+	//
+	// And an entry that DOES exist but inherits its cadence arrives with
+	// IntervalSeconds 0, so adopt below sets nextRun to the moment the run
+	// started -- making the VM due again the instant the adopted run ends,
+	// rather than one interval later.
+	//
+	// syncableVMs is consulted only when a default template exists, the
+	// same guard the tick uses, so an estate not using templates pays no
+	// libvirt round trip here either. Its result is cached, so the first
+	// tick after this reuses it rather than scanning again.
+	var syncable []string
+	if _, hasDefault := cached.Config.Templates[DefaultTemplateName]; hasDefault {
+		syncable = s.syncableVMs(cfg, time.Now())
+	}
+	schedule := ResolveSchedule(cached.Config.Schedule, cached.Config.Templates, syncable)
+
 	adopted := 0
-	for _, entry := range cached.Config.Schedule {
+	for _, entry := range schedule {
 		if entry.VM == "" {
 			continue
 		}
