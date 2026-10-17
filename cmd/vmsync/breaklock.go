@@ -70,7 +70,12 @@ func runBreakTargetLock(ctx context.Context, cfg syncConfig) error {
 	// beside the replica is what says a lock was broken and on whose evidence,
 	// which is the first thing anybody investigating a two-writer incident will
 	// look for.
-	journal := newRecorder(cfg, nil, cfg.TargetDiskPath, cfg.TargetDomain)
+	//
+	// Beside the replica, which is the part this got wrong twice: see
+	// newBreakLockRecorder. The directory comes from the domain's own
+	// definition rather than from -target-disk-path, which the documented
+	// invocation of this verb does not pass.
+	journal := newBreakLockRecorder(cfg)
 	journal.Intent(ctx, journalVerbBreakTargetLock, map[string]string{
 		"holder_pid": fmt.Sprintf("%d", d.Holder.PID),
 		"holder_run": d.Holder.RunID,

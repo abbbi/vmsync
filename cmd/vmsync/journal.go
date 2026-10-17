@@ -408,6 +408,42 @@ func newRecorderInDir(cfg syncConfig, runner remoteRunner, dir, domain string) *
 	return newRecorder(cfg, runner, path.Join(dir, journalDirSentinel), domain)
 }
 
+// newBreakLockRecorder is the journal for -break-target-lock.
+//
+// It derives the directory from the DOMAIN, like every other local-URI verb,
+// rather than from -target-disk-path. Two reasons, and the second is why
+// this function exists at all:
+//
+//   - The documented invocation passes no -target-disk-path (see
+//     docs/RUNBOOK.md), so reading the flag meant the verb whose own comment
+//     calls its record "the first thing anybody investigating a two-writer
+//     incident will look for" wrote no record at all in the ordinary case.
+//   - When the flag WAS given it was handed to newRecorder, which takes a
+//     disk path and strips the last element -- so the journal landed one
+//     directory above the replica, which is neither where any other verb
+//     writes nor where -explain-domain reads. actionlog.RootOfDir's doc
+//     comment names that exact mistake.
+//
+// The libvirt connection is best-effort and deliberately so. This verb's
+// virtue is that it decides from the host's own /proc and the lock file, so
+// it keeps working when other things do not; a lock that cannot be broken
+// because libvirt is unwell would be a worse failure than a lock broken
+// without a record of it. So an unreachable hypervisor costs the journal
+// and nothing else.
+func newBreakLockRecorder(cfg syncConfig) *actionlog.Recorder {
+	if cfg.Journal == journalLevelOff {
+		return nil
+	}
+	mgr, err := libvirtsync.Connect(cfg.TargetURI)
+	if err != nil {
+		trace.Warning("no action journal will be written for this lock break: the hypervisor could not be reached in order to find the replica's disks, and the journal lives beside them. The lock break itself is unaffected and continues",
+			"vm", cfg.TargetDomain, "uri", cfg.TargetURI, "error", err)
+		return nil
+	}
+	defer mgr.Close()
+	return newLocalDomainRecorder(cfg, mgr, cfg.TargetURI, cfg.TargetDomain)
+}
+
 // journalDirSentinel stands in for a disk file when only the directory is
 // known. It names nothing and is never created; actionlog.Root strips it.
 const journalDirSentinel = "disk"
