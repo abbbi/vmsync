@@ -823,6 +823,26 @@ func AssessInvert(st PairState) (InvertPlan, error) {
 			// for ever.
 			FieldLastPromotedAt,
 			FieldFenceID, FieldFenceSource, FieldFenceArmedAt, FieldFenceArmedBy,
+			// DELIBERATELY NOT last_replicated_at / last_replicated_to, and
+			// the omission is a decision rather than the oversight it
+			// resembles -- it will look like one next to last_promoted_at
+			// just above, which is released here for an argument that at
+			// first reads identically.
+			//
+			// The difference is who else clears them. Nothing but this
+			// release ever drops last_promoted_at, so leaving it would wedge
+			// a flip-flopped pair's restores for ever; that is why it is
+			// here. last_replicated_at is now stripped by every sync into a
+			// replica (libvirtsync.syncRedefineStrips), so the first sync
+			// after this inversion clears it on its own.
+			//
+			// What is left is therefore a choice between deleting a true
+			// record now and letting it expire by itself one sync later --
+			// and this domain really did replicate outward, right up to the
+			// moment of the inversion. "When did this VM last replicate, and
+			// where to" is the question these fields exist to answer at the
+			// host you can still reach, so erasing a true answer to shorten
+			// a window is the wrong direction.
 		},
 
 		// The promoted domain becomes the source.

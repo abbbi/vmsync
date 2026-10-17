@@ -179,8 +179,27 @@ func TestCheckRestoreIdentityRefusesADomainThatServedAsASourceSince(t *testing.T
 	if err == nil {
 		t.Fatal("a restore was allowed on a domain that replicated OUT after the restore point was taken -- its disks hold writes no replica of it contains")
 	}
-	if !strings.Contains(err.Error(), "-update-role") {
-		t.Errorf("refusal %q does not tell the operator the way out", err.Error())
+	msg := err.Error()
+	// What the operator needs in order to act: the raw stored value, so it
+	// can be found in the metadata, and both remedies.
+	//
+	// NOT a bare Contains("-update-role"). That assertion used to pass
+	// because the message NAMED -update-role as the way out; when the
+	// message was corrected to say the opposite -- it does not clear this
+	// stamp, and never did -- the same substring kept it green. An
+	// assertion that survives the inversion of the sentence it is checking
+	// is testing the vocabulary, not the advice.
+	for _, want := range []string{
+		plan.lastReplicatedAt,
+		"-update-role does NOT clear it",
+		"next successful sync",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("refusal %q does not mention %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "run -update-role") {
+		t.Errorf("the refusal still offers -update-role as the remedy, which does not clear last_replicated_at: %s", msg)
 	}
 }
 

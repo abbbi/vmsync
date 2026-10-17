@@ -438,11 +438,19 @@ const (
 	// the same reason it is: in domain metadata rather than only in a control
 	// plane's audit log, so the answer survives losing the control plane.
 	//
-	// Cleared by the next successful sync, without being named in
-	// UpdateSyncMetadata's removal list: that function rebuilds the target's
-	// metadata from the SOURCE's XML, so a target-only field it does not set
-	// simply does not survive -- and a replica that has just been fully
-	// recopied is, correctly, no longer a restored one.
+	// Cleared by the next successful sync -- a replica that has just been
+	// fully recopied is, correctly, no longer a restored one -- and cleared
+	// because syncRedefineStrips NAMES them.
+	//
+	// It used to say they were cleared without being named, on the reasoning
+	// that UpdateSyncMetadata rebuilds the target's metadata from the
+	// SOURCE's XML so a target-only field it does not set cannot survive.
+	// The first half is right and the conclusion does not follow: merging
+	// into the source's XML means a field the SOURCE carries survives unless
+	// something removes it. A source that was itself once a restored replica
+	// -- which is what an inverted pair leaves behind -- therefore stamped
+	// its own restore record onto every replica of it. The field is
+	// target-only in meaning, never in mechanism.
 	MetadataFieldRestoredFrom = "restored_from"
 	MetadataFieldRestoredAt   = "restored_at"
 	MetadataFieldRestoredBy   = "restored_by"
@@ -2084,6 +2092,47 @@ var syncRedefineStrips = []string{
 	MetadataFieldFenceSource,
 	MetadataFieldFenceArmedAt,
 	MetadataFieldFenceArmedBy,
+	// SOURCE-ONLY, by their own doc comment: "Written on the SOURCE: when
+	// it last replicated successfully, and to where." A replica has no
+	// such life, and every sync was stamping the source's onto it.
+	//
+	// Three things went wrong with that, in increasing order of damage.
+	// The console reported a replica as having last replicated to ITSELF.
+	// AssessPromote raised a data-loss warning about a rollback that had
+	// not happened to this copy. And checkRestoreIdentity's third check
+	// reads last_replicated_at off the TARGET to ask "has this domain
+	// served as a source since the point was taken" -- so the forged value
+	// answered yes, and refused the restore.
+	//
+	// That last one is why these belong in this list and not in a tidy-up.
+	// The inherited stamp tracks the SOURCE's most recent outward sync, so
+	// it is always about one sync old and advances on every run: every
+	// restore point older than the previous sync became permanently
+	// unrestorable, which is to say nearly all of them. The refusal even
+	// named a remedy -- -update-role=target -- that cannot work, because
+	// strippedPromotionFields covers the promotion record and the fence
+	// token and neither list has ever held these.
+	MetadataFieldLastReplicatedAt,
+	MetadataFieldLastReplicatedTo,
+	// TARGET-ONLY, and already INTENDED to be cleared here -- see their doc
+	// comment, which says "cleared by the next successful sync, without
+	// being named in UpdateSyncMetadata's removal list".
+	//
+	// That mechanism does not exist. This function does not build a fresh
+	// definition out of `updates`; it merges them into the SOURCE's XML, so
+	// "a target-only field it does not set" survives whenever the source
+	// happens to carry one. For a source that was never itself restored the
+	// field is absent and the comment's conclusion held by luck. For a
+	// source that WAS once a restored replica -- an inverted pair, the
+	// ordinary way a DR site becomes primary -- every replica of it
+	// inherited a restore record describing an event in another domain's
+	// history, and -promote then warned about a rollback that never
+	// happened to the copy being promoted.
+	//
+	// Naming them makes the intent true in both cases rather than one.
+	MetadataFieldRestoredFrom,
+	MetadataFieldRestoredAt,
+	MetadataFieldRestoredBy,
 }
 
 func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetRole string, checkpointAtUnix int64, sourceStopped bool, replicaWrittenAt, autostartIntent string) (string, error) {

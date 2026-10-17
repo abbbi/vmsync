@@ -476,12 +476,12 @@ func checkRestoreIdentity(cfg syncConfig, plan restorePlan) error {
 	// captured -- and the point therefore cannot contain what its disks hold.
 	if plan.lastReplicatedAt != "" && plan.status.TakenAt > 0 {
 		if at, perr := strconv.ParseInt(plan.lastReplicatedAt, 10, 64); perr == nil && at > plan.status.TakenAt {
-			return fmt.Errorf("%s last replicated OUT to another host at %s, which is after restore point %s was taken (%s) -- this domain has served as a source since, so its disks hold writes no replica of it contains and this restore point would discard them. If it is genuinely a replica again, run -update-role=%s first",
+			return fmt.Errorf("%s records last_replicated_at=%s (%s), which is after restore point %s was taken (%s). If this domain has genuinely served as a source since, its disks hold writes no replica of it contains and this restore point would discard them. If it has NOT -- it is an ordinary replica that never replicated outward -- then the stamp was inherited from its own source by a vmsync before this one, which copied the field instead of stripping it; it is cleared by the next successful sync into this domain, or by removing last_replicated_at and last_replicated_to from its vmsync metadata. Note that -update-role does NOT clear it",
 				cfg.TargetDomain,
+				plan.lastReplicatedAt,
 				time.Unix(at, 0).UTC().Format("2006-01-02 15:04:05 UTC"),
 				plan.tag,
-				time.Unix(plan.status.TakenAt, 0).UTC().Format("2006-01-02 15:04:05 UTC"),
-				libvirtsync.RoleTarget)
+				time.Unix(plan.status.TakenAt, 0).UTC().Format("2006-01-02 15:04:05 UTC"))
 		}
 	}
 	return nil

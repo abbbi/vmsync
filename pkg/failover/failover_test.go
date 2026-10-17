@@ -980,3 +980,54 @@ func TestAssessInvertKeepsTheTraceOnTheNewSourceAndReleasesItOnTheNewTarget(t *t
 		t.Error("the old source keeps its record of having served live while becoming a replica; every restore and force-clean against it would then refuse for ever")
 	}
 }
+
+// The counterpart of the last_promoted_at test above, and the reason it
+// exists is that this one looks like a bug: an inversion strips fourteen
+// fields off the demoted end and leaves these two behind.
+//
+// It is a decision. last_promoted_at has to be released here because
+// nothing else ever releases it, so leaving it would wedge the restores of
+// any pair failed over twice. last_replicated_at is stripped by every sync
+// into a replica (libvirtsync.syncRedefineStrips), so it clears itself one
+// sync after the inversion -- which leaves only the choice between deleting
+// a true record now and letting it expire shortly. This domain did
+// replicate outward, right up to the inversion, and those fields exist to
+// answer "when did this VM last replicate, and where to" from whichever
+// host is still reachable.
+//
+// Pinned so that a later tidy-up reaching for symmetry has to read the
+// reasoning first.
+func TestInvertKeepsTheDemotedEndsOutwardReplicationHistory(t *testing.T) {
+	// Spelled out rather than imported: pkg/failover cannot import
+	// libvirtsync (that package's tests import this one), and these two
+	// fields are the only vmsync metadata names this package never needed a
+	// constant for. libvirtsync's own tests pin the constants to these
+	// strings.
+	const (
+		lastReplicatedAt = "last_replicated_at"
+		lastReplicatedTo = "last_replicated_to"
+	)
+
+	plan, err := AssessInvert(invertible())
+	if err != nil {
+		t.Fatalf("AssessInvert: %v", err)
+	}
+
+	for _, f := range []string{lastReplicatedAt, lastReplicatedTo} {
+		if contains(plan.NewTargetRemovals, f) {
+			t.Errorf("an inversion strips %s from the demoted end. That record is TRUE -- this domain replicated outward until the moment of the inversion -- and the next sync into it clears the field anyway, so the deletion buys one sync's worth of tidiness at the cost of the answer these fields exist to give", f)
+		}
+	}
+	// ...and the promoted end, which is becoming the source, must not lose
+	// them either: it is about to start writing them itself.
+	for _, f := range []string{lastReplicatedAt, lastReplicatedTo} {
+		if contains(plan.NewSourceRemovals, f) {
+			t.Errorf("an inversion strips %s from the end becoming the SOURCE, which is the one domain they describe", f)
+		}
+	}
+	// The list has to be the real one, or both assertions above are
+	// vacuously true against an empty slice.
+	if !contains(plan.NewTargetRemovals, FieldLastPromotedAt) {
+		t.Fatal("NewTargetRemovals no longer releases last_promoted_at; this is not the list these assertions were written against")
+	}
+}
