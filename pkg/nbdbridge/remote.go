@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"strings"
 	"time"
 
 	"vmsync/pkg/remotessh"
@@ -93,13 +94,18 @@ func StartRemote(ctx context.Context, client *remotessh.Client, key string, brid
 		// The backgrounded helper may or may not have actually forked before
 		// the SSH call itself failed -- ambiguous, but killOrphanedRemoteBridge
 		// is safe to run either way (see its own doc comment).
-		killOrphanedRemoteBridge(client, pidFile, logFile, bridgePort)
-		return "", fmt.Errorf("start remote nbd bridge on port %d: %w: %s", bridgePort, err, out)
+		said := killOrphanedRemoteBridge(client, pidFile, logFile, bridgePort, cfg.HelperPath)
+		return "", fmt.Errorf("start remote nbd bridge on port %d: %w: %s%s", bridgePort, err, out, said)
 	}
 
 	if err := waitForRemoteListening(ctx, client, bridgePort, pidFile, 10*time.Second); err != nil {
-		killOrphanedRemoteBridge(client, pidFile, logFile, bridgePort)
-		return "", fmt.Errorf("remote nbd bridge on port %d did not start: %w", bridgePort, err)
+		// The helper's own log is the only place its reason went -- its
+		// stdout and stderr are redirected there by BuildStartCommand -- and
+		// the cleanup below removes that file. Without this the error names
+		// the SYMPTOM this function observed from outside (a port that never
+		// reached LISTEN) and destroys the cause on its way out.
+		said := killOrphanedRemoteBridge(client, pidFile, logFile, bridgePort, cfg.HelperPath)
+		return "", fmt.Errorf("remote nbd bridge on port %d did not start: %w%s", bridgePort, err, said)
 	}
 
 	return BuildStopCommand(pidFile, logFile), nil
@@ -130,12 +136,73 @@ func StartRemote(ctx context.Context, client *remotessh.Client, key string, brid
 // cmd/vmsync/main.go's own cleanupTargetNBD/cleanupSourceBridge closures,
 // which build a fresh context.Background() for their teardown SSH calls for
 // this identical reason.
-func killOrphanedRemoteBridge(client *remotessh.Client, pidFile, logFile string, bridgePort int) {
+// It returns a sentence naming what the helper wrote to its own log, ready
+// to append to the caller's error, or "" when nothing could be read.
+//
+// READ BEFORE REMOVED, and that ordering is the whole point. BuildStopCommand
+// rm's the log file as well as the pid file, and BuildStartCommand sends the
+// helper's stdout and stderr to exactly that log -- so cleaning up after a
+// failed start destroyed the only record of WHY it failed. What reached the
+// operator was the caller describing a symptom observed from the outside:
+// "the port never reached LISTEN", with the helper's own "connection
+// refused" or "no such file or directory" already deleted.
+func killOrphanedRemoteBridge(client *remotessh.Client, pidFile, logFile string, bridgePort int, helperPath string) (said string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	said = remoteBridgeLogTail(ctx, client, logFile, helperPath)
 	if out, err := client.Run(ctx, BuildStopCommand(pidFile, logFile)); err != nil {
 		trace.Warning("failed to clean up remote nbd bridge helper after a failed start -- it may still be running on the remote host", "port", bridgePort, "error", err, "output", out)
 	}
+	return said
+}
+
+// bridgeLogTailBytes bounds what travels back inside an error message. A
+// failed start writes a line or two, so this is generous; it exists so a
+// helper stuck in a loop cannot turn one error into a screenful.
+const bridgeLogTailBytes = 2000
+
+// remoteBridgeLogTail fetches the end of the helper's log, for appending to
+// the error that is about to be returned.
+//
+// Best-effort and quiet about its own failures: this runs on a path that is
+// already failing, and an unreadable log must not replace the caller's error
+// with one about reading a log.
+//
+// An EMPTY log is reported rather than passed over, because it means
+// something specific. The helper produced no output at all, which on a
+// failed start usually means it never ran -- commonest causes being a binary
+// that is not on that host or is not executable, since vmsync never uploads
+// it. That is a cause the old message could not name and the one an operator
+// most often had to guess.
+func remoteBridgeLogTail(ctx context.Context, client *remotessh.Client, logFile, helperPath string) string {
+	// Bytes first, then lines: a helper emitting one enormous line would
+	// defeat a line-only bound.
+	cmd := fmt.Sprintf("tail -c %d %s 2>/dev/null | tail -n 20", bridgeLogTailBytes, util.ShQuote(logFile))
+	out, err := client.Run(ctx, cmd)
+	return bridgeLogSentence(out, err, helperPath)
+}
+
+// bridgeLogSentence turns what the read produced into the clause appended to
+// the caller's error.
+//
+// Pure, and its own function, so the three outcomes can be asserted without
+// a remote host: remoteBridgeLogTail above needs a live ssh client, and the
+// wording is the whole value of this change.
+func bridgeLogSentence(out string, readErr error, helperPath string) string {
+	if readErr != nil {
+		// Silent: the caller already has a real error, and replacing it with
+		// one about reading a log would be the second time this code path
+		// lost the operator's actual problem.
+		return ""
+	}
+	if tail := strings.TrimSpace(out); tail != "" {
+		return " -- the helper's own log on that host said: " + tail
+	}
+	named := helperPath
+	if named == "" {
+		named = "vmsync-bridge-helper"
+	}
+	return " -- the helper wrote nothing to its log, which on a failed start usually means it never ran: check that " + named + " exists on that host and is executable (vmsync never uploads it)"
 }
 
 // waitForRemoteListening polls the remote host's own socket table (via "ss")
