@@ -708,6 +708,39 @@ func verifyCaveat(v string) string {
 // a replica whose contents are OLDER than its metadata claims -- which is
 // precisely the state the next incremental sync cannot detect and will corrupt.
 // One of those two failure modes is recoverable and one is not.
+// restoreCleanupTimeout bounds each command that undoes a restore.
+//
+// Every one of them is a rename or a reflink inside a single directory, so
+// the only way to spend this is a target host that has stopped answering --
+// in which case the rollback is not going to work anyway and the operator
+// needs to be told that rather than left waiting.
+const restoreCleanupTimeout = 30 * time.Second
+
+// restoreCleanupCtx is a FRESH context for work that has to happen because
+// the restore is being abandoned.
+//
+// It deliberately does not derive from the run's own context. The mode
+// dispatch builds that one with signal.NotifyContext (main.go), so a
+// SIGTERM or SIGINT cancels it -- and then every cleanup command issued on
+// it fails instantly at remotessh's `select { case <-ctx.Done(): }` with
+// "open ssh session: context canceled".
+//
+// What that cost is the whole point of the swap being reversible. A signal
+// arriving between the first and last disk left the replica assembled from
+// two moments, the staged and aside copies on disk with nothing reaping
+// them, and the disks' ownership unrestored -- because the rollback that
+// exists to prevent exactly that could not issue a single command. The
+// armed replica_incomplete and the failure_count written through libvirt
+// still refuse a promotion of it, so nothing unsafe was reachable; what was
+// lost is the automatic repair, leaving an operator to put disks back by
+// hand from the aside stamp.
+//
+// Bounded rather than unbounded, so a second signal is not needed to escape
+// a target that has gone away; see restoreCleanupTimeout.
+func restoreCleanupCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), restoreCleanupTimeout)
+}
+
 func applyRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.Manager, cfg syncConfig, plan restorePlan) error {
 	// Remembered before anything displaces the files, exactly as -reinit does:
 	// the copies are created by the SSH user (often root), and a replica qemu
@@ -725,7 +758,9 @@ func applyRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.
 		if staged == 0 {
 			return
 		}
-		if _, err := client.Run(ctx, restorepoint.RestoreDiscardCommand(plan.temps[:staged]...)); err != nil {
+		cctx, cancel := restoreCleanupCtx()
+		defer cancel()
+		if _, err := client.Run(cctx, restorepoint.RestoreDiscardCommand(plan.temps[:staged]...)); err != nil {
 			trace.Warning("restore: could not remove the staged copies after standing down; they cost nothing but should be removed by hand",
 				"paths", plan.temps[:staged], "error", err)
 		}
@@ -751,7 +786,9 @@ func applyRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.
 		if asided == 0 {
 			return
 		}
-		if _, err := client.Run(ctx, restorepoint.RestoreDiscardCommand(plan.asides[:asided]...)); err != nil {
+		cctx, cancel := restoreCleanupCtx()
+		defer cancel()
+		if _, err := client.Run(cctx, restorepoint.RestoreDiscardCommand(plan.asides[:asided]...)); err != nil {
 			trace.Warning("restore: could not remove the aside copies after standing down. No disk was replaced, so each of these is an exact copy of the live disk beside it and holds nothing -- but they are full-size files that will diverge as the replica is written, so remove them by hand",
 				"paths", plan.asides[:asided], "error", err)
 			return
@@ -807,7 +844,7 @@ func applyRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.
 				// stand-down case wearing the rollback's clothes.
 				discardAsides()
 			}
-			undoRestore(ctx, client, tgtMgr, cfg, plan, i, owners)
+			undoRestore(client, tgtMgr, cfg, plan, i, owners)
 			return fmt.Errorf("restore: replace %s with the restored copy: %w: %s", d, err, out)
 		}
 		trace.Info("restore: replaced a replica disk", "disk", d, "from", path.Join(plan.dir, plan.status.Disks[i]))
@@ -902,7 +939,12 @@ func applyRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.
 // reported individually and loudly. The end state is named explicitly either
 // way, because "some disks are from Tuesday and some are from today" is a state
 // nobody should have to work out from a stack trace.
-func undoRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.Manager, cfg syncConfig, plan restorePlan, upTo int, owners []util.DiskOwner) {
+// NO ctx PARAMETER, deliberately. This function runs only when a restore is
+// being abandoned, which is routinely because the run's context was
+// cancelled by a signal -- so accepting one would mean accepting the dead
+// one on the very path that must still work. It makes its own; see
+// restoreCleanupCtx.
+func undoRestore(client remoteRunner, tgtMgr *libvirtsync.Manager, cfg syncConfig, plan restorePlan, upTo int, owners []util.DiskOwner) {
 	if upTo == 0 {
 		// The asides are removed by the caller on this path, not left "for
 		// inspection": nothing was replaced, so each one is a byte-identical
@@ -915,7 +957,9 @@ func undoRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.M
 	}
 	failed := 0
 	for i := 0; i < upTo; i++ {
-		if out, err := client.Run(ctx, restorepoint.RestoreUndoCommand(plan.asides[i], plan.disks[i])); err != nil {
+		cctx, cancel := restoreCleanupCtx()
+		if out, err := client.Run(cctx, restorepoint.RestoreUndoCommand(plan.asides[i], plan.disks[i])); err != nil {
+			cancel()
 			failed++
 			trace.Warning("restore: could not put back a disk that had already been replaced -- this disk is from the restore point while others are not",
 				"disk", plan.disks[i], "aside", plan.asides[i], "error", err, "output", out)
@@ -927,10 +971,11 @@ func undoRestore(ctx context.Context, client remoteRunner, tgtMgr *libvirtsync.M
 		// cannot open is not a replica. The ordinary success path does this
 		// too; skipping it here would mean a failed restore left the domain
 		// unbootable when it had been bootable before.
-		if err := applyTargetDiskOwner(ctx, client, cfg, plan.disks[i], owners[i]); err != nil {
+		if err := applyTargetDiskOwner(cctx, client, cfg, plan.disks[i], owners[i]); err != nil {
 			trace.Warning("restore: put a disk's contents back but could not restore its ownership; chown it by hand before starting the domain",
 				"disk", plan.disks[i], "error", err)
 		}
+		cancel()
 	}
 	if failed > 0 {
 		// A log line is not an interlock, and this is the one state in the
