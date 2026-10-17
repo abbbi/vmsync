@@ -1112,27 +1112,79 @@ func (m *Manager) Close() error {
 // role, then redefine the domain with it -- and reconnecting once has to fix
 // all of them.
 //
-// Safe only where nothing else is using the old connection concurrently. Every
-// caller today is past the disk workers' barrier, on run()'s own goroutine.
+// NOT SAFE FOR CONCURRENT USE, and nothing here makes it so. Manager has no
+// lock and Conn is a public field read directly by callers, so a Manager
+// being reconnected on one goroutine while another dereferences it is a data
+// race whichever way this function is written -- and worse than a race, since
+// the loser can call into a virConnectPtr this function has already closed,
+// which is a use-after-free in C rather than a Go panic.
 //
-// The old connection is closed best-effort: it is already broken by
-// assumption, and failing to close a broken connection is not a reason to
-// refuse a working replacement.
+// So the rule is a rule about CALLERS: every one of them is on run()'s own
+// goroutine, past the disk workers' barrier. That invariant was broken once,
+// silently, by a signal handler that captured the same Manager -- captured
+// state needs no declaration to become shared, which is why it was the one
+// object in run() that never got the mutex every other shared one has. The
+// handler now owns its own connection, and cmd/vmsync's
+// tgtmgrhandoff_test.go fails if it reaches for run()'s again.
+//
+// THE DIAL HAPPENS BEFORE THE SWAP. Clearing Conn first and assigning the
+// new one afterwards left a window, and on the failure path left it
+// permanently: a Manager whose Conn is nil, which every other method here
+// dereferences without a guard -- libvirt-go reads c.ptr off the receiver
+// with no nil check of its own. A target hypervisor that went away late in a
+// run turned an orderly, well-worded failure into a nil-pointer panic in the
+// final metadata phase. On failure the old connection is left in place
+// instead: it is already broken, but a broken connection fails with
+// libvirt's own error, which callers handle, where nil does not.
+//
+// One consequence of that worth knowing before relying on it: the old
+// ordering made a CONCURRENT misuse fail loudly, as a Go nil panic, and this
+// one makes the same misuse fail quietly, as a call into a virConnectPtr
+// that has been closed. The trade is only worth taking because the caller
+// invariant above is now checked by a test rather than hoped for -- so if
+// that guard is ever deleted, this reordering stops being free.
+//
+// The old connection is closed best-effort, and only once the replacement is
+// in hand: it is broken by assumption, and failing to close a broken
+// connection is not a reason to refuse a working replacement.
 func (m *Manager) Reconnect() error {
+	return m.reconnectWith(libvirt.NewConnect, func(old *libvirt.Connect) {
+		if _, err := old.Close(); err != nil {
+			trace.Debug("closing the old libvirt connection after reconnecting failed; it was already broken", "uri", m.URI, "error", err)
+		}
+	})
+}
+
+// reconnectWith is Reconnect with its two outside effects injected, so the
+// ordering above can be tested without a hypervisor.
+//
+// Every other test in this package is pure, and one needing a live libvirt
+// would be skipped exactly where it matters, CI included.
+//
+// BOTH are injected, not just the dial, because the ordering has two halves
+// and only one of them is observable from m.Conn afterwards. Whether the old
+// connection was closed -- once, on success, and never on the failure path --
+// leaves no trace on the Manager, so a test with only a fake dial pins half
+// the contract and silently permits the other half to be deleted. That is
+// not hypothetical: it was true of the first version of this, and dropping
+// the close leaks one libvirt connection per reconnect, in precisely the
+// hour-long runs Reconnect exists to serve.
+func (m *Manager) reconnectWith(dial func(string) (*libvirt.Connect, error), closeOld func(*libvirt.Connect)) error {
 	if m == nil {
 		return fmt.Errorf("reconnect: nil manager")
 	}
-	if m.Conn != nil {
-		if _, err := m.Conn.Close(); err != nil {
-			trace.Debug("closing the old libvirt connection before reconnecting failed; it was already broken", "uri", m.URI, "error", err)
-		}
-		m.Conn = nil
-	}
-	conn, err := libvirt.NewConnect(m.URI)
+	conn, err := dial(m.URI)
 	if err != nil {
+		// m.Conn deliberately untouched, and the old connection deliberately
+		// NOT closed: see the note above about nil. A caller handed back a
+		// closed handle is no better off than one handed nil.
 		return fmt.Errorf("reconnect libvirt %s: %w", m.URI, err)
 	}
+	old := m.Conn
 	m.Conn = conn
+	if old != nil {
+		closeOld(old)
+	}
 	return nil
 }
 
