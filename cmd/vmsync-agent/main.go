@@ -487,20 +487,27 @@ func run(lv *live, reloads *reloader) error {
 	// MORE likely to be a split-brain risk, not less. Gating this on the
 	// schedule would switch off the protection exactly where it is needed.
 	//
-	// Monitor mode is the exception, and it is a deliberate trade rather than
-	// an oversight. Fencing is the only thing this agent does that stops a
-	// running VM, and a mode whose entire contract is "this host does not
-	// act" cannot carry it: an operator who adds --monitor to watch a
-	// cron-driven site would otherwise get unattended VM shutdowns they did
-	// not ask for, since autofence is on by default. The cost is real -- a
-	// monitored site has no split-brain protection from this agent -- and the
-	// answer to wanting both is --controlled with "features.schedule": false,
-	// which fences without scheduling.
-	if cfg.Mode.actsOnItsOwn() {
-		wg.Add(1)
-		go func() { defer wg.Done(); fenceLoop(ctx, lv, state, fences) }()
-	} else {
-		trace.Info(`monitor mode: not fencing. Nothing on this host will be stopped by this agent; run it --controlled with "features.schedule": false if you want fencing without scheduling`)
+	// Started in EVERY mode, monitor included, and the distinction that
+	// makes that safe is between detecting and acting.
+	//
+	// Monitor mode must not fence: fencing is the only thing this agent does
+	// that stops a running guest, and an operator who adds --monitor to
+	// watch a cron-driven site would otherwise get unattended shutdowns they
+	// did not ask for, since autofence is on by default. That has not
+	// changed -- checkOneFence refuses to act in this mode, the same way it
+	// refuses under -no-autofence and on an excluded domain.
+	//
+	// What DID change is that the sweep now runs. Skipping it entirely meant
+	// vmsync_agent_split_brain_vms was emitted as 0 for the life of a
+	// monitor-mode process: not absent, but an affirmative "no VM here is
+	// running in two places" about a question the agent never asked. An
+	// alert on the one metric the README calls "the one to alert on" could
+	// therefore never fire on a monitored site -- and reporting is precisely
+	// what that mode exists to do.
+	wg.Add(1)
+	go func() { defer wg.Done(); fenceLoop(ctx, lv, state, fences) }()
+	if !cfg.Mode.actsOnItsOwn() {
+		trace.Info(`monitor mode: detecting split brain but not fencing. Nothing on this host will be stopped by this agent; findings are reported and left for a person. Run it --controlled with "features.schedule": false if you want fencing without scheduling`)
 	}
 
 	wg.Add(2)

@@ -593,6 +593,26 @@ func checkOneFence(ctx context.Context, cfg agentConfig, cached UIConfig, ledger
 		return fenceClear
 	}
 
+	// REPORTED BUT NOT ACTED ON, in monitor mode.
+	//
+	// The mode's contract is that this host does not act, and fencing is
+	// the one thing this agent does that stops a running guest -- so it
+	// must not. But REPORTING is not acting, and a mode whose entire job is
+	// to report was the one mode that said nothing: the sweep never ran, so
+	// vmsync_agent_split_brain_vms was emitted as 0 for the life of the
+	// process. Not absent -- zero, which is an affirmative "both copies are
+	// not running" about a question nobody asked, and an alert on it could
+	// never fire.
+	//
+	// Same shape as -no-autofence below and as the exclusion above: the
+	// finding stands, the shutdown does not happen, and the warning repeats
+	// every cycle because nothing has resolved it.
+	if !cfg.Mode.actsOnItsOwn() {
+		trace.Warning("SPLIT BRAIN: this host is still running a VM that has been failed over, and this agent is in monitor mode, so nothing will be done about it automatically -- stop the domain by hand, or run the agent --controlled with \"features.schedule\": false to let it fence without scheduling",
+			"vm", d.Name, "peer", peerRef, "reason", verdict.Reason)
+		return fenceSplit
+	}
+
 	if cfg.NoAutoFence {
 		// Asked not to act, so it does not -- but this is exactly the
 		// situation the operator needs told about, and it is NOT latched:
