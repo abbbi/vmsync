@@ -110,11 +110,18 @@ func runRestoreRestorePoint(ctx context.Context, cfg syncConfig, tagName string)
 	if err != nil {
 		return fmt.Errorf("%w -- run -list-restore-points to see the available tags", err)
 	}
-	// libvirt first, and before the SSH connection: the two questions that can
-	// refuse this outright -- what role the domain has, and whether it is
-	// running -- are both answered there, and asking them first means a
-	// misdirected restore costs one libvirt round trip rather than a staged
-	// copy of every disk.
+	// libvirt first, and before the SSH connection: the questions that can
+	// refuse this outright -- what role the domain has, whether it is
+	// running, whether it ever served live -- are all answered there, and
+	// asking them first means a misdirected restore costs one libvirt round
+	// trip rather than a staged copy of every disk.
+	//
+	// THIS PASS IS A COURTESY, NOT THE GATE. It runs before the run lock,
+	// so everything it establishes can stop being true before a single disk
+	// is touched. The authoritative pass is the one after the lock below;
+	// this one exists to refuse the obvious cases cheaply, and it also
+	// supplies the disk topology that restoreRootFor needs in order to find
+	// the directory the lock is taken beside.
 	tgtMgr, err := libvirtsync.Connect(cfg.TargetURI)
 	if err != nil {
 		return fmt.Errorf("connect to the target hypervisor: %w", err)
@@ -147,6 +154,33 @@ func runRestoreRestorePoint(ctx context.Context, cfg syncConfig, tagName string)
 		return fmt.Errorf("restore: %w", err)
 	}
 	defer lock.Close()
+
+	// ASKED AGAIN, NOW THAT NOTHING ELSE CAN ACT.
+	//
+	// The pass above ran before this lock existed, so every answer it got
+	// had a window after it. runPromote takes this same key
+	// (targetLockKey), so a failover that started while the lock was being
+	// acquired completes without being seen -- and a restore then replaces
+	// the disks of a domain that has since become the live copy, or been
+	// started, on the strength of facts that were true a moment ago.
+	//
+	// The window is small and the thing that fits in it is the single most
+	// destructive coincidence this verb has: an agent executing a promote
+	// operation, or an operator on the other end of a phone, is exactly who
+	// is active during the incident that makes somebody reach for a restore.
+	//
+	// Cheap to do twice -- one libvirt round trip -- and it cannot drift
+	// from the first pass because it is the same function. It also refreshes
+	// plan.domXML, which makes checkRestoreIdentity's disk-set comparison
+	// authoritative rather than a check against a topology read before the
+	// lock.
+	wasRole := plan.role
+	if err := checkRestoreTargetState(tgtMgr, cfg, &plan); err != nil {
+		if wasRole != plan.role {
+			return fmt.Errorf("restore: the target changed while this run was taking its lock (role was %s): %w", orNone(wasRole), err)
+		}
+		return fmt.Errorf("restore: %w", err)
+	}
 
 	// Beside the replica's own disks, reached the same way every other command
 	// in this verb reaches them -- over SSH when the target is remote, with os
