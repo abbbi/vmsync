@@ -269,12 +269,45 @@ func (l *fenceLedger) LatestByVM() map[string]fenceRecord {
 // One configuration snapshot per SWEEP, taken at the top and used for the
 // whole of it. A sweep that started under one libvirt_uri must not finish
 // under another: half its peer queries would name a different host.
+// fenceVerdict is what one peer query established about one VM.
+//
+// THREE VALUES, because the two questions "is this VM in split brain" and
+// "could we find out" have different answers and only one of them may clear
+// an alarm. This was a bool, and both "the peer says it is not promoted" and
+// "the peer did not answer" were false -- so a VM already known to be split
+// dropped out of the gauge the moment its peer stopped responding, which is
+// exactly when the partition that caused the failover sets in. Two live
+// copies, taking writes, and the alert resolving itself.
+//
+// sweepFences already states the rule at the host level and follows it
+// there: when local libvirt cannot be reached it returns without touching
+// the metric, because "failing to look is not evidence that the problem went
+// away". This type is that rule applied per VM.
+type fenceVerdict int
+
+const (
+	// fenceClear: the peer answered, and it is not displacing this VM.
+	fenceClear fenceVerdict = iota
+	// fenceSplit: the peer answered, and both copies are live.
+	fenceSplit
+	// fenceUnknown: no answer. Says nothing in either direction, so it
+	// neither raises an alarm nor clears one.
+	fenceUnknown
+)
+
 func fenceLoop(ctx context.Context, lv *live, state *sharedState, ledger *fenceLedger) {
 	ticker := time.NewTicker(fenceTickInterval)
 	defer ticker.Stop()
 
+	// The previous pass's findings, carried across ticks so that a VM whose
+	// peer has gone quiet keeps the last answer anybody actually got
+	// instead of being silently cleared. Owned here rather than read back
+	// out of the metrics, so the gauge stays a report of this state and not
+	// also its storage.
+	var lastSplit map[string]bool
+
 	for {
-		sweepFences(ctx, *lv.get(), state, ledger)
+		lastSplit = sweepFences(ctx, *lv.get(), state, ledger, lastSplit)
 		select {
 		case <-ctx.Done():
 			return
@@ -292,7 +325,21 @@ func fenceLoop(ctx context.Context, lv *live, state *sharedState, ledger *fenceL
 // incrementally maintained gauge would therefore latch at 1 and stay there
 // forever after the first successful fence -- an alert nobody could clear,
 // which trains people to ignore the one metric that must never be ignored.
-func sweepFences(ctx context.Context, cfg agentConfig, state *sharedState, ledger *fenceLedger) {
+// prevSplit is what the last completed pass found, and unreachable peers
+// inherit their entry from it: silence must not clear an alarm. The return
+// value is what this pass published, or prevSplit unchanged when it
+// published nothing, so the caller can carry it forward again.
+//
+// Carrying forward does NOT reintroduce the latching this function's comment
+// above warns about. A VM that gets shut down -- the ordinary way a split
+// brain ends -- is skipped as inactive and appears in neither set, so it
+// leaves the gauge on the next pass however long its peer has been quiet.
+// Only a VM that is still running AND whose peer cannot be asked keeps its
+// last answer, which is the one case where clearing would be a lie.
+func sweepFences(ctx context.Context, cfg agentConfig, state *sharedState, ledger *fenceLedger, prevSplit map[string]bool) (published map[string]bool) {
+	// Unchanged unless this pass completes; every early return below is a
+	// pass that looked at some VMs and not others.
+	published = prevSplit
 	mgr, err := libvirtsync.Connect(cfg.LibvirtURI)
 	if err != nil {
 		trace.Error("fence check could not reach local libvirt", "error", err)
@@ -327,10 +374,20 @@ func sweepFences(ctx context.Context, cfg agentConfig, state *sharedState, ledge
 	}
 
 	split := map[string]bool{}
+	// VMs this pass could not get an answer about. Its own set rather than
+	// folded into split, for the same reason fencedRunningVMs is its own:
+	// the two call for different actions. A split brain asks which copy
+	// wins; this says the question could not be put, and the thing to fix
+	// is the link to the peer -- or, if that link is down because the site
+	// is down, it is the strongest hint available that the other copy may
+	// be live and unreachable rather than stopped.
+	unknown := map[string]bool{}
 	completed := false
 	defer func() {
 		if completed {
 			cfg.metrics.setSplitBrain(split)
+			cfg.metrics.setSplitBrainUnknown(unknown)
+			published = split
 		}
 	}()
 
@@ -408,25 +465,72 @@ func sweepFences(ctx context.Context, cfg agentConfig, state *sharedState, ledge
 			// been fenced.
 			continue
 		}
+		verdicts := make([]fenceVerdict, 0, len(d.ReplicaTargets))
 		for _, ref := range d.ReplicaTargets {
 			if ctx.Err() != nil {
 				return
 			}
-			if checkOneFence(ctx, cfg, cached, ledger, d, ref) {
-				split[d.Name] = true
-			}
+			verdicts = append(verdicts, checkOneFence(ctx, cfg, cached, ledger, d, ref))
+		}
+		isSplit, isUnknown := splitStateFor(verdicts, prevSplit[d.Name])
+		if isSplit {
+			split[d.Name] = true
+		}
+		if isUnknown {
+			unknown[d.Name] = true
 		}
 	}
 	completed = true
+	return published
+}
+
+// splitStateFor decides one VM's two gauge entries from this pass's peer
+// verdicts and what the last completed pass concluded.
+//
+// Pure, and its own function, for the reason droppedFenceToReport gives
+// just below: inline, this was the one decision in this file that nothing
+// could check, and it is the decision an alarm clears on.
+//
+// A source may fan out, so the verdicts have to be combined. One peer
+// saying "I have taken over" settles it. Otherwise a single peer that could
+// not be reached makes the whole answer unknown -- concluding "not split"
+// from the peers that did reply would be the same mistake at a smaller
+// scale, since the silent one is exactly where a promotion would be.
+//
+// wasSplit is carried forward only into the unknown case. That is the whole
+// fix: a VM known to be split, whose peer then goes quiet, keeps its entry
+// instead of being cleared by silence -- while a VM that gets shut down is
+// never passed here at all (the sweep skips it as inactive), so the gauge
+// still clears itself the ordinary way and does not latch.
+func splitStateFor(verdicts []fenceVerdict, wasSplit bool) (split, unknown bool) {
+	anyUnknown := false
+	for _, v := range verdicts {
+		switch v {
+		case fenceSplit:
+			// Settled, and no amount of silence elsewhere softens it.
+			return true, false
+		case fenceUnknown:
+			anyUnknown = true
+		}
+	}
+	if anyUnknown {
+		return wasSplit, true
+	}
+	// Every peer answered, and none is displacing this VM. The one
+	// outcome allowed to clear the alarm.
+	return false, false
 }
 
 // checkOneFence asks one peer about one VM, and acts if it must. It reports
 // whether this VM is currently in split brain, for the caller's metric.
-func checkOneFence(ctx context.Context, cfg agentConfig, cached UIConfig, ledger *fenceLedger, d inventory.Domain, peerRef string) bool {
+func checkOneFence(ctx context.Context, cfg agentConfig, cached UIConfig, ledger *fenceLedger, d inventory.Domain, peerRef string) fenceVerdict {
 	host, peerVM := splitReplicaRef(peerRef)
 	if host == "" || peerVM == "" {
 		trace.Error("fence check skipped a replica target that is not in host:domain form", "vm", d.Name, "target", peerRef)
-		return false
+		// Unknown, not clear: a reference nobody can parse is a peer that
+		// can never be asked, so it must not be the thing that clears an
+		// alarm about this VM.
+		return fenceUnknown
 	}
 
 	rep, err := readPeerFence(ctx, cfg, host, peerVM)
@@ -435,11 +539,11 @@ func checkOneFence(ctx context.Context, cfg agentConfig, cached UIConfig, ledger
 		// able to ask is not evidence of anything, and the safe reading of
 		// silence is "keep serving".
 		trace.Error("fence check could not query a peer", "vm", d.Name, "peer", peerRef, "error", err)
-		return false
+		return fenceUnknown
 	}
 	if !rep.Reachable {
 		trace.Debug("fence check: peer unreachable, continuing to serve", "vm", d.Name, "peer", peerRef, "error", rep.Error)
-		return false
+		return fenceUnknown
 	}
 
 	self := replicaSelfRef(cfg, d.Name)
@@ -481,7 +585,12 @@ func checkOneFence(ctx context.Context, cfg agentConfig, cached UIConfig, ledger
 			trace.Warning("SPLIT BRAIN: this host is running a VM that has been failed over, and its fence was already acted on -- it will NOT be retried; resolve this by hand",
 				"vm", d.Name, "peer", peerRef, "reason", verdict.Reason)
 		}
-		return verdict.Alarm
+		if verdict.Alarm {
+			return fenceSplit
+		}
+		// The peer answered and is not displacing this VM: a positive
+		// clear, which is the one thing allowed to drop it from the gauge.
+		return fenceClear
 	}
 
 	if cfg.NoAutoFence {
@@ -491,7 +600,7 @@ func checkOneFence(ctx context.Context, cfg agentConfig, cached UIConfig, ledger
 		// somebody resolves it. That repetition is the feature.
 		trace.Warning("SPLIT BRAIN: this host is still running a VM that has been failed over, and -no-autofence is set, so nothing will be done about it automatically",
 			"vm", d.Name, "peer", peerRef, "reason", verdict.Reason)
-		return true
+		return fenceSplit
 	}
 
 	// REPORTED, NOT ACTED ON -- the same shape as -no-autofence above, and
@@ -506,11 +615,11 @@ func checkOneFence(ctx context.Context, cfg agentConfig, cached UIConfig, ledger
 	// finding AND cleared its gauge, so an excluded VM in a split brain
 	// read as healthy for ever.
 	//
-	// Returning true is what keeps it in the split-brain gauge.
+	// Returning fenceSplit is what keeps it in the split-brain gauge.
 	if excluded := libvirtsync.Excluded(d.Exclude); excluded.ReportOnly || excluded.Hidden {
 		trace.Warning("SPLIT BRAIN: this host is still running a VM that has been failed over, and the domain carries vmsync metadata exclude, so nothing will be done about it automatically -- stop it by hand, or remove the metadata field `exclude` to let autofencing act",
 			"vm", d.Name, "peer", peerRef, "exclude", d.Exclude, "reason", verdict.Reason)
-		return true
+		return fenceSplit
 	}
 
 	fenceOneDomain(ctx, cfg, cached, ledger, d.Name, peerRef, rep, verdict)
@@ -520,7 +629,7 @@ func checkOneFence(ctx context.Context, cfg agentConfig, cached UIConfig, ledger
 	// what the metric reports; the next sweep is what establishes whether it
 	// still is -- by finding the domain inactive and leaving it out of the
 	// rebuilt set, or by finding it running and alarming again.
-	return true
+	return fenceSplit
 }
 
 // fenceOneDomain records intent, shuts the domain down, and records what

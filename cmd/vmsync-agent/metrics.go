@@ -136,10 +136,25 @@ type agentMetrics struct {
 	// after a fence that failed, the VM stays in the set and the metric
 	// stays up. That is the whole point -- the case where nothing was done
 	// about it is exactly the case somebody must be told about.
-	splitBrainVMs    map[string]bool
-	fencesActed      atomic.Uint64
-	fencesFailed     atomic.Uint64
-	fencesUnrecorded atomic.Uint64
+	splitBrainVMs map[string]bool
+	// splitBrainUnknownVMs is the set this agent could not get an answer
+	// about: the peer could not be queried, or answered unreachable.
+	//
+	// Its own set rather than folded into splitBrainVMs, for the same
+	// reason fencedRunningVMs is its own: the two call for different
+	// actions. A split brain asks which copy wins. This says the question
+	// could not be put -- so the thing to fix is the link to the peer, or,
+	// if that link is down because the far site is down, it is the
+	// strongest hint available that the other copy may be live and simply
+	// unreachable.
+	//
+	// It is NOT an alarm on its own. A VM here whose last known state was
+	// split stays in splitBrainVMs too, carried by the sweep; one that was
+	// never known to be split appears only here.
+	splitBrainUnknownVMs map[string]bool
+	fencesActed          atomic.Uint64
+	fencesFailed         atomic.Uint64
+	fencesUnrecorded     atomic.Uint64
 
 	// incompleteVMs is the set of VMs on this host whose domain carries
 	// replica_incomplete: a full rebuild was started on them and never
@@ -244,6 +259,24 @@ func (m *agentMetrics) setSplitBrain(vms map[string]bool) {
 	m.splitBrainVMs = make(map[string]bool, len(vms))
 	for vm := range vms {
 		m.splitBrainVMs[vm] = true
+	}
+}
+
+// setSplitBrainUnknown replaces the whole set from one complete sweep, for
+// the same reason setSplitBrain does.
+//
+// Replacing rather than accumulating is what lets a peer coming back clear
+// the uncertainty by itself: the next completed sweep gets an answer and
+// simply does not list the VM.
+func (m *agentMetrics) setSplitBrainUnknown(vms map[string]bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.splitBrainUnknownVMs = make(map[string]bool, len(vms))
+	for vm := range vms {
+		m.splitBrainUnknownVMs[vm] = true
 	}
 }
 
@@ -601,6 +634,8 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	m.mu.Lock()
 	split := len(m.splitBrainVMs)
 	splitVMs := sortedKeys(m.splitBrainVMs)
+	splitUnknown := len(m.splitBrainUnknownVMs)
+	splitUnknownVMs := sortedKeys(m.splitBrainUnknownVMs)
 	incompleteVMs := sortedKeys(m.incompleteVMs)
 	servedLiveVMs := sortedKeys(m.servedLiveVMs)
 	fencedRunningVMs := sortedKeys(m.fencedRunningVMs)
@@ -617,6 +652,17 @@ func (m *agentMetrics) render(cached CachedConfig, sched *Scheduler, hostLimit i
 	m.mu.Unlock()
 
 	g("vmsync_agent_split_brain_vms", "VMs running on this host that a peer reports having been failed over from, OR that this host has already marked replication_role=fenced and is still running. Non-zero means one VM is live in two places; alert on it. The second case needs no peer query, so it is reported even when the peer is unreachable -- see vmsync_agent_fenced_running, which says what to DO about it.", split, "")
+	g("vmsync_agent_split_brain_unknown_vms", "VMs running on this host whose peer could not be asked on the last sweep, so whether they are in split brain is unknown. NOT an alarm by itself: it says the question could not be put. Its value is that silence is now visible -- a VM already known to be split keeps its entry in vmsync_agent_split_brain_vms while it is listed here, rather than being cleared because nobody answered.", splitUnknown, "")
+	// HELP and TYPE once, then one line per VM -- NOT g() per VM, for the
+	// reason the split-brain gauge spells out. Named rather than only
+	// counted, because "2 unknown" tells an operator nothing about which
+	// peer to go and look at.
+	if len(splitUnknownVMs) > 0 {
+		fmt.Fprintf(&b, "# HELP vmsync_agent_split_brain_unknown 1 while that VM is running here and its peer could not be asked, so whether a second copy is live is unknown. Check the link to the peer host.\n# TYPE vmsync_agent_split_brain_unknown gauge\n")
+		for _, vm := range splitUnknownVMs {
+			fmt.Fprintf(&b, "vmsync_agent_split_brain_unknown{host=%q,vm=%q} 1\n", host, vm)
+		}
+	}
 	// HELP and TYPE once, then one sample line per VM -- NOT g() per VM.
 	//
 	// g() emits its own HELP and TYPE on every call, and the Prometheus text

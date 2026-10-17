@@ -18,6 +18,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"strconv"
 	"testing"
 
@@ -333,5 +336,178 @@ func TestFencedRunningVMsUsesTheSamePredicateAsTheSweep(t *testing.T) {
 	}
 	if n := len(fencedRunningVMs(nil)); n != 0 {
 		t.Errorf("fencedRunningVMs(nil) = %d entries", n)
+	}
+}
+
+// THE RULE AN ALARM CLEARS ON.
+//
+// checkOneFence used to return a bool, and both "the peer says it is not
+// promoted" and "the peer did not answer" were false. sweepFences rebuilds
+// the gauge from each pass and publishes it wholesale, so a VM already
+// known to be in split brain dropped out of that gauge the moment its peer
+// stopped answering -- which is exactly when the partition that caused the
+// failover sets in. Two live copies taking writes, and the alert resolving
+// itself.
+//
+// sweepFences already stated the rule at the HOST level and followed it
+// there: local libvirt unreachable returns without touching the metric,
+// because "failing to look is not evidence that the problem went away".
+// This is that rule per VM.
+func TestSilenceNeitherRaisesAnAlarmNorClearsOne(t *testing.T) {
+	cases := []struct {
+		name        string
+		verdicts    []fenceVerdict
+		wasSplit    bool
+		wantSplit   bool
+		wantUnknown bool
+	}{
+		{"a peer that answers 'not me' clears it",
+			[]fenceVerdict{fenceClear}, true, false, false},
+		{"a peer that answers 'I took over' raises it",
+			[]fenceVerdict{fenceSplit}, false, true, false},
+
+		// THE DEFECT. Silence used to read as "not split".
+		{"a peer that goes quiet does NOT clear a known split brain",
+			[]fenceVerdict{fenceUnknown}, true, true, true},
+		{"...and does not invent one either",
+			[]fenceVerdict{fenceUnknown}, false, false, true},
+
+		// Fan-out: a source with several targets.
+		{"one peer displacing settles it however many others are quiet",
+			[]fenceVerdict{fenceUnknown, fenceSplit, fenceUnknown}, false, true, false},
+		{"a single unreachable peer makes the whole answer unknown",
+			[]fenceVerdict{fenceClear, fenceUnknown}, true, true, true},
+		{"only when EVERY peer answers is it cleared",
+			[]fenceVerdict{fenceClear, fenceClear}, true, false, false},
+
+		// A VM with no targets never reaches here; an empty verdict list
+		// is the degenerate case and must not carry anything forward.
+		{"no peers to ask is not the same as a peer that did not answer",
+			nil, true, false, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			split, unknown := splitStateFor(tc.verdicts, tc.wasSplit)
+			if split != tc.wantSplit {
+				t.Errorf("split = %v, want %v -- %s", split, tc.wantSplit, tc.name)
+			}
+			if unknown != tc.wantUnknown {
+				t.Errorf("unknown = %v, want %v -- %s", unknown, tc.wantUnknown, tc.name)
+			}
+			// A finding and an inability to look are different states, and
+			// a VM reported as both would make the unknown gauge an alarm
+			// of its own rather than a reason the other one did not move.
+			if split && unknown && len(tc.verdicts) > 0 {
+				hasSplit := false
+				for _, v := range tc.verdicts {
+					if v == fenceSplit {
+						hasSplit = true
+					}
+				}
+				if hasSplit {
+					t.Error("a positively observed split brain is also reported as unknown")
+				}
+			}
+		})
+	}
+}
+
+// The anti-latch property the carry-forward must not break.
+//
+// sweepFences' own comment explains why the gauge is rebuilt wholesale: the
+// ordinary way a split brain ends is the domain being shut down, after
+// which the sweep skips it as inactive and an incrementally maintained
+// gauge would latch at 1 for ever -- "an alert nobody could clear, which
+// trains people to ignore the one metric that must never be ignored".
+//
+// Carrying a previous answer forward is the one thing that could
+// reintroduce that, so the boundary is worth stating: carry-forward happens
+// only for a VM that is still running AND still being asked about. A VM
+// that stops is never passed to splitStateFor at all, which this asserts by
+// construction -- the only way out of the gauge is not appearing in a pass.
+func TestAClearedPeerStillClearsTheGauge(t *testing.T) {
+	// However long it was split, one complete round of answers clears it.
+	split, unknown := splitStateFor([]fenceVerdict{fenceClear}, true)
+	if split || unknown {
+		t.Errorf("split=%v unknown=%v after every peer answered 'not me'; the gauge would latch and nobody could clear the alert", split, unknown)
+	}
+}
+
+// NOTHING MAY BE CONCLUDED BEFORE THE PEER ANSWERS.
+//
+// splitStateFor above pins what the verdicts MEAN; this pins that the
+// conditions map onto them correctly, which no table test can reach --
+// checkOneFence needs a peer host to query, so the branches that matter are
+// exactly the ones a unit test cannot drive.
+//
+// The invariant is positional and simple: failover.AssessFence is the point
+// at which this function first has an answer to reason from. Every return
+// before it is a return taken because the question could not be put, and
+// must therefore be fenceUnknown. A fenceClear there is the original defect
+// -- silence reported as "no split brain", clearing the gauge for a VM
+// whose peer had just gone quiet.
+func TestCheckOneFenceConcludesNothingBeforeThePeerAnswers(t *testing.T) {
+	const file = "fence.go"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+
+	var fn *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "checkOneFence" {
+			fn = fd
+			break
+		}
+	}
+	if fn == nil {
+		t.Fatal("no func checkOneFence in " + file)
+	}
+
+	// Where the peer's answer first exists.
+	var assessPos token.Pos
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "AssessFence" {
+			return true
+		}
+		if assessPos == 0 {
+			assessPos = call.Pos()
+		}
+		return true
+	})
+	if assessPos == 0 {
+		t.Fatal("checkOneFence no longer calls failover.AssessFence; this test located the boundary by that call, so rename it here rather than deleting the check that keeps silence out of the gauge")
+	}
+
+	var early int
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok || ret.Pos() >= assessPos || len(ret.Results) != 1 {
+			return true
+		}
+		early++
+		id, ok := ret.Results[0].(*ast.Ident)
+		if !ok || id.Name != "fenceUnknown" {
+			got := "a non-identifier expression"
+			if ok {
+				got = id.Name
+			}
+			t.Errorf("checkOneFence returns %s at line %d, before the peer has answered. Everything before failover.AssessFence is a path taken because the question could not be put, so it must return fenceUnknown -- anything else lets silence clear the split-brain gauge for a VM whose peer just went quiet",
+				got, fset.Position(ret.Pos()).Line)
+		}
+		return true
+	})
+	// The three early returns: an unparsable peer ref, a failed query, and
+	// an unreachable peer. A count of zero would mean this walk found
+	// nothing and passed for that reason.
+	if early < 3 {
+		t.Errorf("found only %d early returns in checkOneFence, expected at least 3 (bad peer ref, query error, peer unreachable); this audit is no longer covering them", early)
 	}
 }
