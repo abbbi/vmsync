@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package libvirtsync
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -231,5 +232,43 @@ func TestDoublePrefixedContainerIsNotAnExclusion(t *testing.T) {
 	got, _ := ParseMetadata(malformed, MetadataFieldExclude)
 	if Excluded(got).ReportOnly || Excluded(got).Hidden {
 		t.Errorf("a double-prefixed container read as exclude=%q; malformed metadata must not be actionable", got)
+	}
+}
+
+// MALFORMED METADATA MUST NOT READ AS "NOT EXCLUDED", and this is the
+// shape that makes it urgent rather than theoretical: it is what
+// `virsh metadata --set` stores from a prefixed payload, which is the
+// obvious wrong spelling of the documented command. The person most
+// likely to produce it is the one who was trying to exclude the domain.
+//
+// The gates key on ErrMetadataUnreadable rather than on any error, so a
+// host that simply could not be reached still proceeds -- a transient
+// fault is not somebody's instruction.
+func TestUnreadableMetadataIsDistinguishableFromAbsent(t *testing.T) {
+	// Absent: no element at all. Not an error, not an exclusion.
+	fields, err := metadataFieldsFromFragment("")
+	if err != nil {
+		t.Errorf("an absent vmsync element errored: %v -- every domain that has never been synced looks like this", err)
+	}
+	if len(fields) != 0 {
+		t.Errorf("an absent element produced fields: %v", fields)
+	}
+
+	// Present and well-formed: parses, no error.
+	good := `<vmsync:vmsync xmlns:vmsync="` + metadataNamespace + `"><exclude id="report-only"/></vmsync:vmsync>`
+	if _, err := metadataFieldsFromFragment(good); err != nil {
+		t.Errorf("a well-formed element errored: %v", err)
+	}
+
+	// Present and malformed: the double-prefixed container virsh writes
+	// from a prefixed payload. Must error, and the error must carry the
+	// sentinel the gates test for.
+	bad := `<vmsync:vmsync:vmsync xmlns:vmsync="` + metadataNamespace + `"><vmsync:exclude id="report-only"/></vmsync:vmsync:vmsync>`
+	_, err = metadataFieldsFromFragment(bad)
+	if err == nil {
+		t.Fatal("a double-prefixed container parsed cleanly; the exclude gates would read it as 'not excluded'")
+	}
+	if !errors.Is(err, ErrMetadataUnreadable) {
+		t.Errorf("the error does not carry ErrMetadataUnreadable: %v -- the gates cannot tell it from an unreachable host, and would proceed", err)
 	}
 }

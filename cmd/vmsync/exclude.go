@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"errors"
 	"fmt"
 
 	"vmsync/pkg/libvirtsync"
@@ -117,6 +118,14 @@ func refuseExcludedMode(cfg syncConfig, mode string) error {
 		raw, rerr := libvirtsync.ReadDomainMetadataField(mgr, side.domain, libvirtsync.MetadataFieldExclude)
 		mgr.Close()
 		if rerr != nil {
+			// Present but unreadable refuses, for the reason the sync gate
+			// gives at length: a malformed element is what the wrong virsh
+			// payload produces, so the person who wrote it was most likely
+			// trying to exclude this domain.
+			if errors.Is(rerr, libvirtsync.ErrMetadataUnreadable) {
+				return fmt.Errorf("%w: %s refused -- %s domain %q carries vmsync metadata that cannot be parsed, so whether it is excluded cannot be established: %v",
+					libvirtsync.ErrExcludeRefusesAction, mode, side.what, side.domain, rerr)
+			}
 			// Debug, unlike the connect failure above: an absent vmsync
 			// element reads as "" with no error, so the common cause here
 			// is a domain that does not exist on that side -- which the

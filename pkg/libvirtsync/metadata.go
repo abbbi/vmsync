@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package libvirtsync
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 
@@ -81,15 +82,30 @@ func ReadDomainMetadata(dom *libvirt.Domain) (string, error) {
 //
 // An absent element is not an error: a domain with no vmsync metadata is the
 // ordinary first-run state. Nor is a container that is genuinely empty.
+// ErrMetadataUnreadable marks the case where a domain DOES carry a vmsync
+// metadata element and it cannot be parsed, as distinct from a domain that
+// could not be reached or has no element at all.
+//
+// THE DISTINCTION DECIDES WHICH WAY A READER SHOULD FAIL. "I could not
+// reach libvirt" is a transient fault and a caller is usually right to
+// proceed, because refusing would turn a network blip into a blocked
+// operation. "The element is right there and I cannot read it" is an
+// operator error -- somebody wrote something into this domain's metadata --
+// and a caller that proceeds is overriding a person who was trying to say
+// something. The exclude gate is the sharp case: a malformed element is
+// exactly what `virsh metadata --set` produces from a prefixed payload, so
+// treating it as absent runs a sync on a domain somebody excluded.
+var ErrMetadataUnreadable = errors.New("vmsync metadata present but unreadable")
+
 func metadataFieldsFromFragment(fragment string) (map[string]string, error) {
 	fields, sawContainer, malformed := metadataFragmentFields(fragment)
 	if fragment == "" {
 		return fields, nil
 	}
 	if malformed || (!sawContainer && len(fields) == 0) {
-		return nil, fmt.Errorf("the vmsync metadata already on this domain could not be read, refusing to overwrite it: "+
+		return nil, fmt.Errorf("%w: the vmsync metadata already on this domain could not be read, refusing to overwrite it: "+
 			"this update merges into what was read back, so writing now would drop whatever that element holds "+
-			"(replication_role and the promotion record among it). The fragment read was: %s", fragment)
+			"(replication_role and the promotion record among it). The fragment read was: %s", ErrMetadataUnreadable, fragment)
 	}
 	return fields, nil
 }

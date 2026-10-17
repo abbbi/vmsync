@@ -3103,11 +3103,26 @@ func run(cfg syncConfig) (runErr error) {
 		}
 		raw, rerr := libvirtsync.ReadDomainMetadataField(mgr, side.domain, libvirtsync.MetadataFieldExclude)
 		if rerr != nil {
-			// Unreadable metadata is not an exclusion. Every other reader
-			// here treats an absent field as the ordinary case, and a
-			// domain whose XML could not be read will fail for that reason
-			// a few lines further on, with a better message than this
-			// could give.
+			// PRESENT BUT UNREADABLE REFUSES; unreachable proceeds.
+			//
+			// The first justification written here was that a domain whose
+			// metadata could not be read "will fail for that reason a few
+			// lines further on". That is a different failure: the element
+			// can be unparseable while the domain reads perfectly, and the
+			// sync then carries on having silently skipped this gate.
+			//
+			// It is not hypothetical. A malformed vmsync element is
+			// precisely what `virsh metadata --set` writes from a prefixed
+			// payload -- the shape an operator gets from the obvious wrong
+			// spelling -- so the one person most likely to produce it is
+			// the one who was trying to exclude this domain. Proceeding
+			// overrides them. Excluded() already fails closed on a value it
+			// does not recognise; this is the same rule for markup it
+			// cannot parse.
+			if errors.Is(rerr, libvirtsync.ErrMetadataUnreadable) {
+				return fmt.Errorf("%w: %s domain %q carries vmsync metadata that cannot be parsed, so whether it is excluded cannot be established -- refusing rather than assuming it is not. Read it with `virsh metadata` and correct it: %v",
+					libvirtsync.ErrExcludeRefusesSync, side.what, side.domain, rerr)
+			}
 			trace.Debug("could not read the exclude metadata field", "side", side.what, "vm", side.domain, "error", rerr)
 			continue
 		}

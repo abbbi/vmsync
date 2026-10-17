@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"errors"
 	"fmt"
 
 	"vmsync/pkg/libvirtsync"
@@ -52,6 +53,20 @@ func domainExclusion(cfg agentConfig, vm string) libvirtsync.ExcludeDecision {
 
 	raw, err := libvirtsync.ReadDomainMetadataField(mgr, vm, libvirtsync.MetadataFieldExclude)
 	if err != nil {
+		// Present but unreadable counts AS an exclusion, the same way an
+		// unrecognised value does. A malformed element is what the wrong
+		// `virsh metadata --set` payload writes, so the operator who
+		// produced it was most likely excluding this domain -- and acting
+		// on it would override them on the strength of their typo.
+		//
+		// Reported as report-only, not hidden, so the domain stays visible
+		// carrying the reason. Unreachable libvirt still proceeds: that is
+		// a transient fault, not somebody's instruction.
+		if errors.Is(err, libvirtsync.ErrMetadataUnreadable) {
+			trace.Warning("a domain's vmsync metadata cannot be parsed, so it is treated as excluded until it is corrected",
+				"vm", vm, "error", err)
+			return libvirtsync.ExcludeDecision{ReportOnly: true, Raw: "unreadable", Unrecognised: true}
+		}
 		trace.Debug("could not read the exclude metadata field; proceeding",
 			"vm", vm, "error", err)
 		return libvirtsync.ExcludeDecision{}
