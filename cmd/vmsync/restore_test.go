@@ -409,3 +409,218 @@ func TestCheckRestoreIdentityRefusesAnUnreadableDomainDefinition(t *testing.T) {
 		t.Fatal("a domain whose definition could not be parsed was accepted -- the disk check could not have run")
 	}
 }
+
+// THE DIRECTION THE IDENTITY CHECKS DID NOT LOOK.
+//
+// Check 1 proves every disk the POINT holds is one the domain owns, and the
+// replica-presence check in loadRestorePlan proves the same thing again
+// against the files. Neither proves the point is not SHORTER than the
+// machine. A disk added to the VM after the point was taken appears in
+// neither list, so it is rolled back by nothing: every other volume goes
+// back in time and this one stays where it is.
+//
+// A database with data and log on separate volumes is the ordinary shape of
+// this, and the replica's metadata afterwards asserts one coherent
+// checkpoint -- so evidenceProblems finds nothing and -promote accepts it.
+func TestCheckRestoreIdentityRefusesAPointShorterThanTheMachine(t *testing.T) {
+	// THREE disks, of which the point holds two. Two would prove the
+	// refusal fires, but not that it says anything useful: with one disk in
+	// the point and one out, "names the extra" and "dumps every disk the
+	// domain owns" produce the same substring, and a count of 1 is
+	// indistinguishable from a count of everything. On a real VM with forty
+	// volumes that is the whole difference between a refusal an operator can
+	// act on and a wall of paths.
+	const threeDisks = `<domain type='kvm'>
+  <name>web01</name>
+  <metadata>
+    <vmsync:vmsync xmlns:vmsync="http://vmsync.org/xmlns/libvirt/domain/1.0">
+      <replica_source id="srchost:web01"/>
+    </vmsync:vmsync>
+  </metadata>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/data/replicas/web01.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/data/replicas/web01-data.qcow2'/>
+      <target dev='vdb' bus='virtio'/>
+    </disk>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/data/replicas/web01-log.qcow2'/>
+      <target dev='vdc' bus='virtio'/>
+    </disk>
+  </devices>
+</domain>`
+
+	plan := restoreTestPlan(t)
+	plan.domXML = threeDisks
+	// The point predates web01-log.qcow2 being added to the domain.
+	plan.disks = []string{"/data/replicas/web01.qcow2", "/data/replicas/web01-data.qcow2"}
+	plan.status.Disks = []string{"web01.qcow2", "web01-data.qcow2"}
+
+	err := checkRestoreIdentity(restoreTestCfg(), plan)
+	if err == nil {
+		t.Fatal("a restore point holding fewer disks than the domain was accepted; the disk it does not hold would keep its current contents while the rest rolled back, producing a machine assembled from two different moments")
+	}
+	msg := err.Error()
+
+	// It names the disk that is unaccounted for, the domain, the tag, and
+	// the remedy -- the same remedy the opposite direction offers.
+	for _, want := range []string{"/data/replicas/web01-log.qcow2", "web01", "1756041600-vmsync-cpt-000042", "-clone-restore-point"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("refusal %q does not mention %q", msg, want)
+		}
+	}
+	// ...and names ONLY that one. Listing the disks the point does hold
+	// turns a precise refusal into a dump of the domain, which is the
+	// failure the assertion above cannot see on its own.
+	for _, unwanted := range []string{"/data/replicas/web01.qcow2", "/data/replicas/web01-data.qcow2"} {
+		if strings.Contains(msg, unwanted) {
+			t.Errorf("refusal names %q, which the restore point DOES hold; an operator reading this cannot tell which disk is the problem: %s", unwanted, msg)
+		}
+	}
+	// The count is the other half of being precise, and nothing else
+	// asserts it: "3 disk(s)" for one missing disk is as misleading as
+	// listing all three.
+	if !strings.Contains(msg, "1 disk(s)") {
+		t.Errorf("refusal does not report exactly one unaccounted disk: %s", msg)
+	}
+	// ...and it must not be mistaken for the crossed-flags refusal above,
+	// whose remedy is a different one entirely.
+	if strings.Contains(msg, "-target-disk-path name the same replica") {
+		t.Error("the short-point refusal reports itself as the crossed-flags case, sending the operator to check flags that are correct")
+	}
+}
+
+// THE ASSUMPTION THE WHOLE CHECK RESTS ON. ParseQcowDisks drops cdroms and
+// non-qcow2 disks via util.IgnoreDevice, so the domain's qcow2 set is
+// exactly what a sync would have copied.
+//
+// If that ever stops being true, the new check above refuses every restore
+// of a perfectly ordinary domain -- a cdrom is on nearly every VM -- and it
+// would do so at the worst possible moment, during an incident. Pinned
+// here rather than trusted.
+func TestCheckRestoreIdentityIgnoresDevicesVmsyncNeverReplicates(t *testing.T) {
+	const withExtras = `<domain type='kvm'>
+  <name>web01</name>
+  <metadata>
+    <vmsync:vmsync xmlns:vmsync="http://vmsync.org/xmlns/libvirt/domain/1.0">
+      <replica_source id="srchost:web01"/>
+    </vmsync:vmsync>
+  </metadata>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/data/replicas/web01.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/data/replicas/web01-data.qcow2'/>
+      <target dev='vdb' bus='virtio'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='/iso/debian.iso'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source file='/data/replicas/scratch.raw'/>
+      <target dev='vdc' bus='virtio'/>
+    </disk>
+  </devices>
+</domain>`
+
+	plan := restoreTestPlan(t)
+	plan.domXML = withExtras
+
+	if err := checkRestoreIdentity(restoreTestCfg(), plan); err != nil {
+		t.Fatalf("a domain carrying a cdrom and a raw disk was refused: %v -- vmsync replicates neither, so neither can be in a restore point, and refusing on them would block every restore of an ordinary VM", err)
+	}
+}
+
+// Equality, not merely inclusion: the two halves of check 1 together have to
+// mean "the same set", so a point and a domain that disagree in EITHER
+// direction are refused.
+func TestCheckRestoreIdentityRequiresTheDiskSetsToMatchBothWays(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		planDisks []string
+		pointDisk []string
+	}{
+		{"the point holds a disk the domain does not own",
+			[]string{"/data/replicas/web01.qcow2", "/data/replicas/web01-data.qcow2", "/data/replicas/gone.qcow2"},
+			[]string{"web01.qcow2", "web01-data.qcow2", "gone.qcow2"}},
+		{"the domain owns a disk the point does not hold",
+			[]string{"/data/replicas/web01.qcow2"},
+			[]string{"web01.qcow2"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := restoreTestPlan(t)
+			plan.disks = tc.planDisks
+			plan.status.Disks = tc.pointDisk
+			if err := checkRestoreIdentity(restoreTestCfg(), plan); err == nil {
+				t.Error("accepted; the restore would produce a machine whose volumes come from two different moments")
+			}
+		})
+	}
+}
+
+// A qcow2 disk that is not FILE-backed -- type='block', 'network', 'volume',
+// 'nvme', or one with no <source> at all.
+//
+// IgnoreDevice filters on device type and driver format, never on where the
+// bytes live, so these reach checkRestoreIdentity with an empty Source.
+// Refusing is correct: nothing ever copied such a disk, so no restore point
+// can hold it, and rolling the rest back would leave it at its current
+// contents. But an empty path renders the whole list as "[]", which tells an
+// operator nothing about which device to deal with.
+func TestCheckRestoreIdentityNamesADiskThatHasNoFilePath(t *testing.T) {
+	const blockBacked = `<domain type='kvm'>
+  <name>web01</name>
+  <metadata>
+    <vmsync:vmsync xmlns:vmsync="http://vmsync.org/xmlns/libvirt/domain/1.0">
+      <replica_source id="srchost:web01"/>
+    </vmsync:vmsync>
+  </metadata>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/data/replicas/web01.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/data/replicas/web01-data.qcow2'/>
+      <target dev='vdb' bus='virtio'/>
+    </disk>
+    <disk type='block' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source dev='/dev/vg0/scratch'/>
+      <target dev='vdz' bus='virtio'/>
+    </disk>
+  </devices>
+</domain>`
+
+	plan := restoreTestPlan(t)
+	plan.domXML = blockBacked
+
+	err := checkRestoreIdentity(restoreTestCfg(), plan)
+	if err == nil {
+		t.Fatal("a domain carrying a qcow2 disk no sync could have copied was accepted for restore")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "vdz") {
+		t.Errorf("the refusal does not name the device, so an operator cannot tell which disk it means: %s", msg)
+	}
+	// The empty-string rendering this exists to prevent.
+	if strings.Contains(msg, "hold: []") || strings.Contains(msg, "[]") {
+		t.Errorf("the refusal renders the unaccounted disk as an empty list: %s", msg)
+	}
+}

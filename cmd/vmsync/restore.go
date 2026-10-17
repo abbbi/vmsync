@@ -390,6 +390,59 @@ func checkRestoreIdentity(cfg syncConfig, plan restorePlan) error {
 		}
 	}
 
+	// THE LOOP ABOVE PROVES ONLY point ⊆ domain. Together with the replica
+	// presence check in loadRestorePlan -- which is the same direction again,
+	// against the files rather than the definition -- nothing established
+	// that the point is not SHORTER than the machine it is being restored
+	// into. A disk added to the VM after the point was taken is in neither
+	// list, so it was rolled back by nothing and quietly left at its current
+	// contents while every other volume went back in time.
+	//
+	// That is the failure this whole function exists to prevent, arriving
+	// from the one direction it did not look: a database whose data and log
+	// volumes end up hours apart is the ordinary shape of it, and the
+	// replica's own metadata then asserts one coherent checkpoint over the
+	// top, so failover.evidenceProblems finds nothing wrong and -promote
+	// accepts it with an honest-looking plan.
+	//
+	// Refused rather than offered under -force-restore, because the opposite
+	// direction is refused outright with the same words and the same remedy
+	// (loadRestorePlan, "two different moments"). One hazard cannot be a
+	// refusal read left to right and an override read right to left.
+	//
+	// Safe against the devices vmsync never replicates: ParseQcowDisks has
+	// already dropped cdroms and non-qcow2 disks through util.IgnoreDevice,
+	// so `disks` is exactly the set a sync would have copied. Comparing
+	// anything wider would refuse every restore of a domain with a cdrom.
+	inPoint := make(map[string]bool, len(plan.disks))
+	for _, p := range plan.disks {
+		inPoint[p] = true
+	}
+	var extra []string
+	for _, d := range disks {
+		if inPoint[d.Source] {
+			continue
+		}
+		// Named by target dev when it has no file path, which is the shape
+		// ParseQcowDisks returns for a qcow2 disk that is not file-backed --
+		// type='block', 'network', 'volume', 'nvme', or one with no <source>
+		// at all. IgnoreDevice filters on device type and driver format, not
+		// on where the bytes live, so those arrive here with Source "". The
+		// refusal is still right -- nothing ever copied such a disk, so the
+		// point cannot hold it -- but printing it as "" renders the whole
+		// list as `[]` and tells the operator nothing about which device to
+		// deal with.
+		if d.Source == "" {
+			extra = append(extra, d.TargetDev+" (no file source: this disk is not file-backed, so no sync ever copied it)")
+			continue
+		}
+		extra = append(extra, d.Source)
+	}
+	if len(extra) > 0 {
+		return fmt.Errorf("target domain %s has %d disk(s) that restore point %s does not hold: %v -- the point was taken before they were part of this machine, so restoring it would roll the rest back and leave these at their current contents: a machine assembled from two different moments. Use -clone-restore-point to materialise the point somewhere else and inspect it",
+			cfg.TargetDomain, len(extra), plan.tag, extra)
+	}
+
 	// 2. Was this restore point taken from the same source this domain is a
 	// replica of? Both strings are built by the same expression on both
 	// sides, so a genuine pair matches byte for byte.
