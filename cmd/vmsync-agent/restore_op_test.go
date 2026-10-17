@@ -69,7 +69,7 @@ func TestValidateRefusesAnUnusableRestoreTag(t *testing.T) {
 
 func TestRestoreArgvIsLocalAndForced(t *testing.T) {
 	cfg := agentConfig{LibvirtURI: "qemu:///system", TargetURIPattern: "qemu+ssh://%s/system"}
-	args, err := operationArgs(cfg, nil, restoreOp())
+	args, err := operationArgs(cfg, UIConfig{}, restoreOp())
 	if err != nil {
 		t.Fatalf("operationArgs: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestFullResyncKindsRefuseAVMWithNoScheduleEntry(t *testing.T) {
 			cfg := agentConfig{LibvirtURI: "qemu:///system"}
 			op := Operation{ID: "op-2", Kind: kind, VM: "web01"}
 
-			_, err := operationArgs(cfg, nil, op)
+			_, err := operationArgs(cfg, UIConfig{}, op)
 			if err == nil {
 				t.Fatalf("a %s with no schedule entry was accepted", kind)
 			}

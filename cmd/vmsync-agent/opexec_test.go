@@ -55,7 +55,7 @@ func TestOperationArgsCarriesTheActionID(t *testing.T) {
 		{"restore", Operation{ID: id, Kind: OpRestore, VM: "web01", Tag: "1756041600-vmsync-cpt-000040"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			args, err := operationArgs(cfg, nil, tc.op)
+			args, err := operationArgs(cfg, UIConfig{}, tc.op)
 			if err != nil {
 				t.Fatalf("operationArgs: %v", err)
 			}
@@ -172,7 +172,7 @@ func countArg(args []string, flag string) int {
 func TestOperationArgsDropsAnUnusableActionIDWithoutRefusingTheOperation(t *testing.T) {
 	cfg := agentConfig{LibvirtURI: "qemu:///system", TargetURIPattern: "qemu+ssh://%s/system"}
 
-	args, err := operationArgs(cfg, nil, Operation{
+	args, err := operationArgs(cfg, UIConfig{}, Operation{
 		ID: "id,with=separators", Kind: OpPromote, VM: "web01", Mode: "planned",
 	})
 	if err != nil {
@@ -187,5 +187,155 @@ func TestOperationArgsDropsAnUnusableActionIDWithoutRefusingTheOperation(t *test
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "-promote") || !strings.Contains(joined, "-target-domain web01") {
 		t.Errorf("args = %v are no longer the promotion that was asked for", args)
+	}
+}
+
+// A CONSOLE-ISSUED RESYNC MUST USE THE SAME SETTINGS A SCHEDULED ONE DOES.
+//
+// The scheduler acts on ResolveSchedule(schedule, templates, syncable); this
+// path read the published schedule raw. For an entry that inherits from a
+// template -- which is every entry in the shipped
+// contrib/agent/schedule.json.example, web01 having no profile of its own --
+// the inherited fields arrived unset.
+//
+// target_disk_path is the one that does damage. Absent, the engine derives
+// the replica directory from somewhere else, so a full resync rebuilds the
+// replica in a DIFFERENT directory: the real replica and its entire
+// restore-point history are orphaned, the run reports success, and the
+// target's metadata is rewritten to describe the new file. Nothing refuses
+// afterwards, because as far as every later check can tell the pair is
+// healthy.
+func TestAReinitInheritsTemplateSettingsLikeAScheduledSyncDoes(t *testing.T) {
+	// The shape of the shipped example: a default template carrying the
+	// profile, and an entry that names only the VM and its cadence.
+	uiCfg := UIConfig{
+		Templates: map[string]ScheduleTemplate{
+			DefaultTemplateName: {
+				Name: DefaultTemplateName, Enabled: true, IntervalSeconds: 900,
+				Profile: SyncProfile{
+					Compress: "zstd", CompressLevel: "5", Verify: "full",
+					TargetDiskPath: "/data/replicas",
+				},
+			},
+		},
+		Schedule: []ScheduleEntry{
+			{VM: "web01", Enabled: true, IntervalSeconds: 900, TargetHost: "dr01"},
+		},
+	}
+
+	entry, ok := resolvedEntryForOperation(uiCfg, "web01", nil)
+	if !ok {
+		t.Fatal("web01 has an explicit entry and was not found")
+	}
+	if entry.Profile.TargetDiskPath != "/data/replicas" {
+		t.Errorf("resolved target_disk_path = %q, want the template s %q -- a full resync without it rebuilds the replica somewhere else, orphaning the real one and every restore point beside it, and reports success", entry.Profile.TargetDiskPath, "/data/replicas")
+	}
+	// The rest of the inherited profile has to arrive too, or a one-shot
+	// resync runs with different transport settings from every scheduled
+	// run of the same pair.
+	if entry.Profile.Compress != "zstd" || entry.Profile.Verify != "full" {
+		t.Errorf("resolved profile lost inherited settings: %+v", entry.Profile)
+	}
+
+	// ...and an explicit entry needs no libvirt scan to resolve, which is
+	// what keeps this cheap for every VM in the shipped example.
+	if operationNeedsSyncableScan(uiCfg, "web01") {
+		t.Error("resolving an explicit entry asks libvirt for the host's domain list, which it does not need")
+	}
+	// A VM with no entry, where only a default template could cover it, is
+	// the one case that does.
+	if !operationNeedsSyncableScan(uiCfg, "unlisted") {
+		t.Error("a VM with no entry and a default template present must consult the host's domain list; without it a template-covered VM cannot be reinit'd at all")
+	}
+	// No default template: nothing to synthesise, so nothing to ask.
+	if operationNeedsSyncableScan(UIConfig{}, "unlisted") {
+		t.Error("a config with no default template still asks libvirt")
+	}
+}
+
+// An entry with its OWN settings must keep them: resolution fills gaps, it
+// does not overwrite.
+func TestAReinitPrefersTheEntrysOwnSettingsOverTheTemplates(t *testing.T) {
+	uiCfg := UIConfig{
+		Templates: map[string]ScheduleTemplate{
+			DefaultTemplateName: {
+				Name: DefaultTemplateName, Enabled: true, IntervalSeconds: 900,
+				Profile: SyncProfile{TargetDiskPath: "/data/replicas"},
+			},
+		},
+		Schedule: []ScheduleEntry{
+			{VM: "db01", Enabled: true, IntervalSeconds: 300, TargetHost: "dr01",
+				Profile: SyncProfile{TargetDiskPath: "/data/replicas/db01"}},
+		},
+	}
+
+	entry, ok := resolvedEntryForOperation(uiCfg, "db01", nil)
+	if !ok {
+		t.Fatal("db01 was not found")
+	}
+	if entry.Profile.TargetDiskPath != "/data/replicas/db01" {
+		t.Errorf("the entry's own target_disk_path was replaced by the template's: %q", entry.Profile.TargetDiskPath)
+	}
+}
+
+// A VM covered ONLY by a default template resolves once the host's domain
+// list says it is syncable. Before this it had no entry at all, so a
+// console-issued resync was refused outright and blamed the operator's
+// schedule for something the agent resolves elsewhere.
+func TestAReinitResolvesAVMCoveredOnlyByTheDefaultTemplate(t *testing.T) {
+	uiCfg := UIConfig{
+		Templates: map[string]ScheduleTemplate{
+			DefaultTemplateName: {
+				Name: DefaultTemplateName, Enabled: true, IntervalSeconds: 900,
+				Profile: SyncProfile{TargetDiskPath: "/data/replicas", Verify: "full"},
+			},
+		},
+	}
+
+	if _, ok := resolvedEntryForOperation(uiCfg, "web01", nil); ok {
+		t.Error("web01 resolved without the host's domain list saying it is syncable; a default template must not cover a VM that records no replica_targets")
+	}
+	entry, ok := resolvedEntryForOperation(uiCfg, "web01", []string{"web01"})
+	if !ok {
+		t.Fatal("a VM the host reports as syncable is not covered by the default template, so it cannot be reinit'd at all")
+	}
+	if entry.Profile.TargetDiskPath != "/data/replicas" {
+		t.Errorf("the synthesised entry carries no target_disk_path: %+v", entry.Profile)
+	}
+}
+
+// The resolved profile is validated, as the scheduled path validates before
+// every run. Nothing checked this before, so the one path that builds a sync
+// from an operator's click was the one that would run with an out-of-range
+// profile -- and it is the destructive one.
+func TestAReinitRefusesAnUnusableResolvedProfile(t *testing.T) {
+	cfg := agentConfig{LibvirtURI: "qemu:///system", TargetURIPattern: "qemu+ssh://%s/system"}
+	uiCfg := UIConfig{
+		Schedule: []ScheduleEntry{
+			{VM: "web01", Enabled: true, IntervalSeconds: 900, TargetHost: "dr01",
+				// Out of range, and inherited by nothing: the entry's own.
+				Profile: SyncProfile{Compress: "zstd", CompressLevel: "99"}},
+		},
+	}
+
+	_, err := operationArgs(cfg, uiCfg, Operation{ID: "op-3", Kind: OpReinit, VM: "web01"})
+	if err == nil {
+		t.Fatal("a reinit was built from a profile the scheduled path would have refused; this is the destructive verb and the only one an operator triggers by hand")
+	}
+	if !strings.Contains(err.Error(), "web01") {
+		t.Errorf("the refusal does not name the VM: %v", err)
+	}
+}
+
+// The refusal for a VM nothing covers must not blame the operator's
+// schedule for something the agent resolves elsewhere.
+func TestAReinitForAnUncoveredVMSaysTemplatesWereCheckedToo(t *testing.T) {
+	cfg := agentConfig{LibvirtURI: "qemu:///system", TargetURIPattern: "qemu+ssh://%s/system"}
+	_, err := operationArgs(cfg, UIConfig{}, Operation{ID: "op-4", Kind: OpReinit, VM: "ghost"})
+	if err == nil {
+		t.Fatal("a reinit for a VM with no entry and no template was accepted")
+	}
+	if !strings.Contains(err.Error(), "template") {
+		t.Errorf("the refusal blames only the schedule, though a template could have covered this VM: %v", err)
 	}
 }

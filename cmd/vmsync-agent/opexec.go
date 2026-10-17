@@ -93,7 +93,7 @@ func operationsPass(ctx context.Context, cfg agentConfig, cached CachedConfig, p
 	published := map[string]bool{}
 	for _, op := range cached.Config.Operations {
 		published[op.ID] = true
-		runOperation(ctx, cfg, cached.Config.Schedule, op, ledger)
+		runOperation(ctx, cfg, cached.Config, op, ledger)
 		if ctx.Err() != nil {
 			return
 		}
@@ -123,7 +123,7 @@ func operationsPass(ctx context.Context, cfg agentConfig, cached CachedConfig, p
 }
 
 // runOperation executes one operation, exactly once, ever.
-func runOperation(ctx context.Context, cfg agentConfig, schedule []ScheduleEntry, op Operation, ledger *operationLedger) {
+func runOperation(ctx context.Context, cfg agentConfig, uiCfg UIConfig, op Operation, ledger *operationLedger) {
 	if _, seen := ledger.Seen(op.ID); seen {
 		// Already acted on, in some state. Its stored result is re-reported
 		// until the UI stops publishing it; nothing else to do.
@@ -165,7 +165,7 @@ func runOperation(ctx context.Context, cfg agentConfig, schedule []ScheduleEntry
 		return
 	}
 
-	args, err := operationArgs(cfg, schedule, op)
+	args, err := operationArgs(cfg, uiCfg, op)
 	if err != nil {
 		finishOperation(ledger, op, OperationResult{State: OpStateRefused, Error: err.Error()}, now)
 		return
@@ -329,7 +329,7 @@ func scheduleEntryFor(schedule []ScheduleEntry, vm string) (ScheduleEntry, bool)
 // kinds that write a replica_incomplete marker -- reinit and force-clean --
 // because that marker carries the same id, so a promotion refused months
 // later on a host whose peer is gone still names the action that armed it.
-func operationArgs(cfg agentConfig, schedule []ScheduleEntry, op Operation) ([]string, error) {
+func operationArgs(cfg agentConfig, uiCfg UIConfig, op Operation) ([]string, error) {
 	// Resolved once, here, rather than per branch: a kind added later that
 	// forgot it would produce a journal record nobody can trace, and the
 	// omission would be invisible -- vmsync mints its own id and the run
@@ -438,9 +438,53 @@ func operationArgs(cfg agentConfig, schedule []ScheduleEntry, op Operation) ([]s
 		// lives in the schedule, not on the operation. Built from the same
 		// SyncRequest a scheduled run uses, so they differ from an ordinary
 		// sync by exactly one flag and cannot drift from it.
-		entry, ok := scheduleEntryFor(schedule, op.VM)
+		// RESOLVED, exactly as the scheduler resolves it.
+		//
+		// This read the published schedule raw, and the two divergences that
+		// produced were not cosmetic. A VM covered only by a DEFAULT
+		// template has no explicit entry at all, so it could not be
+		// reinit'd or force-cleaned -- and the refusal blamed the
+		// operator's schedule for something the agent resolves elsewhere.
+		// Worse, an entry that EXISTS but inherits settings from its
+		// template arrived here with those settings still unset, including
+		// target_disk_path: with the shipped schedule.json.example a
+		// console-issued full resync rebuilt the replica in a different
+		// directory, orphaning the real replica and its whole
+		// restore-point history, then reported success and rewrote the
+		// target's metadata to describe the new file.
+		//
+		// Resolution itself is free; see the scan guard below for the one
+		// case that is not.
+		// The scan is needed for one thing only: deciding whether a DEFAULT
+		// template covers a VM that has no entry of its own. An explicit
+		// entry resolves from the templates alone, so the common case --
+		// including every VM in the shipped schedule.json.example -- costs
+		// no libvirt round trip at all.
+		var syncable []string
+		if operationNeedsSyncableScan(uiCfg, op.VM) {
+			vms, _, scanErr := scanSyncableVMs(&cfg)
+			if scanErr != nil {
+				// Refused rather than resolved without it: carrying on
+				// would silently skip the synthesised entries and
+				// reintroduce the first divergence above, reporting the
+				// operator's schedule as the problem.
+				return nil, fmt.Errorf("%s operation %s: could not list this host's syncable domains, which a default template needs in order to resolve %s's settings: %w", op.Kind, op.ID, op.VM, scanErr)
+			}
+			syncable = vms
+		}
+		entry, ok := resolvedEntryForOperation(uiCfg, op.VM, syncable)
 		if !ok {
-			return nil, fmt.Errorf("%s operation %s names %s, which this agent has no schedule entry for -- it is a full resync and needs that pair's source, target and transport settings, which live on the schedule. Note it runs on the SOURCE's agent, unlike promote and restore which run on the target's", op.Kind, op.ID, op.VM)
+			return nil, fmt.Errorf("%s operation %s names %s, which this agent has no schedule entry for, and no template covers it either -- it is a full resync and needs that pair's source, target and transport settings, which live on the schedule. Note it runs on the SOURCE's agent, unlike promote and restore which run on the target's", op.Kind, op.ID, op.VM)
+		}
+		// Validated, as the scheduled path validates before every run.
+		//
+		// Nothing checked this before, so the one path that builds a sync
+		// from an operator's click was the one path that would run with an
+		// out-of-range profile -- and it is the destructive one. The
+		// scheduled path logs and defers; here there is a caller waiting
+		// for an answer, so it is reported as a refusal instead.
+		if err := entry.Profile.Validate(); err != nil {
+			return nil, fmt.Errorf("%s operation %s: %s's resolved sync profile is not usable: %w", op.Kind, op.ID, op.VM, err)
 		}
 		plan, err := buildSyncRequest(cfg, entry)
 		if err != nil {
@@ -471,6 +515,39 @@ func operationArgs(cfg agentConfig, schedule []ScheduleEntry, op Operation) ([]s
 // that did set one must not produce a second -action-id whose value silently
 // wins over this operation's. The plan is taken by value for the neighbouring
 // reason: a caller's copy must not come back wearing one operation's id.
+// resolvedEntryForOperation is the schedule entry a sync operation acts on,
+// resolved against the templates exactly as the scheduler resolves it.
+//
+// Pure, and its own function, because operationArgs cannot be reached in a
+// test -- buildSyncRequest below it opens a libvirt connection -- and this
+// is the step that was wrong. The scheduler calls
+// ResolveSchedule(schedule, templates, syncable) and this path read the
+// published schedule raw, so an entry inheriting its profile from a
+// template arrived with those fields unset.
+//
+// syncable is a parameter rather than scanned here for the same reason:
+// the one input that needs libvirt is injected, so the resolution itself
+// stays checkable.
+func resolvedEntryForOperation(uiCfg UIConfig, vm string, syncable []string) (ScheduleEntry, bool) {
+	return scheduleEntryFor(ResolveSchedule(uiCfg.Schedule, uiCfg.Templates, syncable), vm)
+}
+
+// operationNeedsSyncableScan reports whether resolving this VM's entry
+// requires asking libvirt what is on this host.
+//
+// Only one case does: a VM with no entry of its own, where a DEFAULT
+// template might cover it, which is a question only the host's domain list
+// can answer. An explicit entry resolves from the templates alone -- which
+// includes every VM in the shipped schedule.json.example -- so the common
+// case costs no round trip.
+func operationNeedsSyncableScan(uiCfg UIConfig, vm string) bool {
+	if _, explicit := scheduleEntryFor(uiCfg.Schedule, vm); explicit {
+		return false
+	}
+	_, hasDefault := uiCfg.Templates[DefaultTemplateName]
+	return hasDefault
+}
+
 func reinitArgs(plan syncPlan, actionID string, forceClean bool) []string {
 	flag := "-reinit"
 	if forceClean {

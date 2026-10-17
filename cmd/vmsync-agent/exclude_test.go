@@ -68,10 +68,15 @@ func TestEveryAgentActionPathConsultsTheExclusion(t *testing.T) {
 		"checkOneFence":    "fence.go",
 		"runOperation":     "opexec.go",
 		"buildSyncRequest": "scheduler.go",
-		// scanCache, not syncableVMs: the scan now produces both the
-		// template-coverable set and the excluded set in one pass, and
-		// syncableVMs is a thin accessor over it.
-		"scanCache": "syncable.go",
+		// scanSyncableVMs, not scanCache or syncableVMs: the scan produces
+		// both the template-coverable set and the excluded set in one
+		// pass, and the other two are wrappers over it -- scanCache adds
+		// the scheduler's TTL cache, syncableVMs is a thin accessor. The
+		// gate belongs where the domains are actually read, which is also
+		// the function the OPERATION path calls: it has no Scheduler to
+		// borrow a cache from, and an excluded VM must not be picked up by
+		// a default template there either.
+		"scanSyncableVMs": "syncable.go",
 		// The effective schedule the console renders, which is built from
 		// the control plane's list rather than from a scan and so needs
 		// its own filter -- an explicit entry for an excluded VM would

@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"fmt"
 	"time"
 
 	"vmsync/pkg/inventory"
@@ -62,32 +63,31 @@ func (s *Scheduler) excludedVMs(cfg *agentConfig, now time.Time) map[string]bool
 	return excluded
 }
 
-func (s *Scheduler) scanCache(cfg *agentConfig, now time.Time) ([]string, map[string]bool) {
-	s.mu.Lock()
-	if !s.syncableAt.IsZero() && now.Sub(s.syncableAt) < syncableTTL {
-		vms, ex := s.syncable, s.excluded
-		s.mu.Unlock()
-		return vms, ex
-	}
-	last, lastEx := s.syncable, s.excluded
-	s.mu.Unlock()
-
+// scanSyncableVMs asks libvirt which domains on this host a DEFAULT
+// template may cover, and which ones an operator has set aside.
+//
+// A free function rather than a Scheduler method because it has two callers
+// with different needs. The scheduler wraps it in a TTL cache (scanCache
+// below): it asks on every tick, and a libvirt round trip per tick for an
+// answer that rarely changes is work a loop whose virtue is being cheap must
+// not do. The operation path asks once, when a human has issued a one-shot
+// resync, and has no Scheduler to borrow a cache from -- there is none in
+// monitor mode or under "features.schedule": false, both of which still run
+// the operations loop on purpose.
+func scanSyncableVMs(cfg *agentConfig) (vms []string, excluded map[string]bool, err error) {
 	mgr, err := libvirtsync.Connect(cfg.LibvirtURI)
 	if err != nil {
-		trace.Debug("could not connect to libvirt to list template-covered VMs; keeping the previous list",
-			"uri", cfg.LibvirtURI, "error", err)
-		return last, lastEx
+		return nil, nil, fmt.Errorf("connect to %s: %w", cfg.LibvirtURI, err)
 	}
 	defer mgr.Close()
 
 	domains, err := inventory.Scan(mgr)
 	if err != nil {
-		trace.Debug("could not scan domains to list template-covered VMs; keeping the previous list", "error", err)
-		return last, lastEx
+		return nil, nil, fmt.Errorf("scan domains on %s: %w", cfg.LibvirtURI, err)
 	}
 
-	vms := make([]string, 0, len(domains))
-	excluded := make(map[string]bool)
+	vms = make([]string, 0, len(domains))
+	excluded = make(map[string]bool)
 	for _, d := range domains {
 		// Recorded for every domain, not only the syncable ones: the
 		// effective schedule is built from the control plane's list, which
@@ -108,6 +108,25 @@ func (s *Scheduler) scanCache(cfg *agentConfig, now time.Time) ([]string, map[st
 			continue
 		}
 		vms = append(vms, d.Name)
+	}
+	return vms, excluded, nil
+}
+
+func (s *Scheduler) scanCache(cfg *agentConfig, now time.Time) ([]string, map[string]bool) {
+	s.mu.Lock()
+	if !s.syncableAt.IsZero() && now.Sub(s.syncableAt) < syncableTTL {
+		vms, ex := s.syncable, s.excluded
+		s.mu.Unlock()
+		return vms, ex
+	}
+	last, lastEx := s.syncable, s.excluded
+	s.mu.Unlock()
+
+	vms, excluded, err := scanSyncableVMs(cfg)
+	if err != nil {
+		trace.Debug("could not list template-covered VMs; keeping the previous list",
+			"uri", cfg.LibvirtURI, "error", err)
+		return last, lastEx
 	}
 
 	s.mu.Lock()
