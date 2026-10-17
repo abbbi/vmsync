@@ -3575,17 +3575,40 @@ func run(cfg syncConfig) (runErr error) {
 	}
 
 	// recordReplicaWrittenAt writes the stamp onto the TARGET domain,
-	// best-effort.
+	// best-effort, through a connection the CALLER owns.
 	//
 	// A narrow metadata merge, not a DefineDomain: this can run against a
 	// target that is promoted and RUNNING, and rewriting a live domain's
 	// whole definition from a typed round-trip is how configuration goes
 	// missing. No removals, so failure_count is untouched.
-	recordReplicaWrittenAt := func(trigger, value string) {
+	//
+	// THE CONNECTION IS A PARAMETER, not tgtMgr captured, and that is the
+	// whole reason this signature is shaped this way. Two of the three
+	// callers are run()'s own goroutine and pass tgtMgr; the third is the
+	// signal handler, which deliberately does not wait for run() (see the
+	// handler below) and so must not touch run()'s connection.
+	//
+	// What sharing it costs: libvirtsync.Manager carries no lock, and the
+	// Reconnect calls below replace its Conn in place. A disk goroutine
+	// still using that Manager would read the pointer while this goroutine
+	// wrote it -- a data race the detector sees -- and in the bad
+	// interleaving would call into a virConnectPtr this goroutine had
+	// already closed, which is a use-after-free in C, not a Go panic. On
+	// the one path whose entire job is to leave the stamp that stops the
+	// NEXT run being refused as an out-of-band write.
+	//
+	// Captured state is how that happened: every other object this handler
+	// shares with run() got a mutex and a written rationale -- sshClientMu,
+	// interruptedMu, srcDomMu, defineDomainMu, stampMu, checkpointMu -- and
+	// this one was simply missed, because a captured variable needs no
+	// declaration to be shared. Passing it in makes the sharing visible at
+	// the call site, and tgtmgrhandoff_test.go fails if the handler ever
+	// reaches for tgtMgr again.
+	recordReplicaWrittenAt := func(trigger string, mgr *libvirtsync.Manager, value string) {
 		if value == "" {
 			return
 		}
-		exists, err := libvirtsync.DomainExists(tgtMgr.Conn, cfg.TargetDomain)
+		exists, err := libvirtsync.DomainExists(mgr.Conn, cfg.TargetDomain)
 		if err != nil {
 			// NOT the same as "the domain is not there", and conflating the
 			// two is how this failed silently. A connection that has died --
@@ -3601,12 +3624,12 @@ func run(cfg syncConfig) (runErr error) {
 			// can sync into without intervening by hand.
 			trace.Warning("could not reach the target to record the replica write; reconnecting and retrying once",
 				"trigger", trigger, "vm", cfg.TargetDomain, "error", err)
-			if reconnErr := tgtMgr.Reconnect(); reconnErr != nil {
+			if reconnErr := mgr.Reconnect(); reconnErr != nil {
 				trace.Error("could not reconnect to the target to record when this run wrote the replica disks -- if this run fails, the NEXT one's out-of-band-write check will refuse it, because the disks are now newer than the timestamp on record. Clearing that needs -timestamp-tolerance-sec or a resync",
 					"trigger", trigger, "vm", cfg.TargetDomain, "error", reconnErr)
 				return
 			}
-			exists, err = libvirtsync.DomainExists(tgtMgr.Conn, cfg.TargetDomain)
+			exists, err = libvirtsync.DomainExists(mgr.Conn, cfg.TargetDomain)
 			if err != nil {
 				trace.Error("could not reach the target to record when this run wrote the replica disks, even after reconnecting -- if this run fails, the NEXT one's out-of-band-write check will refuse it",
 					"trigger", trigger, "vm", cfg.TargetDomain, "error", err)
@@ -3622,19 +3645,19 @@ func run(cfg syncConfig) (runErr error) {
 			trace.Debug("no target domain to record the replica write against yet", "trigger", trigger, "vm", cfg.TargetDomain)
 			return
 		}
-		if err := libvirtsync.SetDomainMetadataFields(tgtMgr, cfg.TargetDomain, map[string]string{
+		if err := libvirtsync.SetDomainMetadataFields(mgr, cfg.TargetDomain, map[string]string{
 			libvirtsync.MetadataFieldReplicaWrittenAt: value,
 		}); err != nil {
 			// Same reasoning as above: retry once through a fresh connection
 			// before accepting that the replica will refuse its next sync.
 			trace.Warning("could not record when this run wrote the replica disks; reconnecting and retrying once",
 				"trigger", trigger, "vm", cfg.TargetDomain, "error", err)
-			if reconnErr := tgtMgr.Reconnect(); reconnErr != nil {
+			if reconnErr := mgr.Reconnect(); reconnErr != nil {
 				trace.Error("could not record when this run wrote the replica disks, and reconnecting to the target failed too; if this run fails, the next one's out-of-band-write check will refuse it",
 					"trigger", trigger, "vm", cfg.TargetDomain, "error", reconnErr)
 				return
 			}
-			if err := libvirtsync.SetDomainMetadataFields(tgtMgr, cfg.TargetDomain, map[string]string{
+			if err := libvirtsync.SetDomainMetadataFields(mgr, cfg.TargetDomain, map[string]string{
 				libvirtsync.MetadataFieldReplicaWrittenAt: value,
 			}); err != nil {
 				trace.Error("could not record when this run wrote the replica disks, even after reconnecting; if this run fails, the next one's out-of-band-write check will refuse it",
@@ -3970,7 +3993,67 @@ func run(cfg syncConfig) (runErr error) {
 			// may still refuse, exactly as it does today -- and never
 			// over-records, which is the safe direction. See
 			// MetadataFieldReplicaWrittenAt.
-			recordReplicaWrittenAt(sig.String(), measureReplicaWrittenAt(sig.String()))
+			// Through a connection of its OWN, never tgtMgr.
+			//
+			// This goroutine does not wait for run() -- that is decided
+			// just above, for reasons that have nothing to do with
+			// libvirt -- so run() may still be using tgtMgr right now, and
+			// recordReplicaWrittenAt reconnects on failure by replacing
+			// that Manager's Conn in place. Sharing it would race a disk
+			// goroutine's dereference and, in the bad interleaving, call
+			// into a connection this goroutine had just closed.
+			//
+			// A one-shot connection is the right shape HERE in a way it is
+			// not in run(): Reconnect's own comment explains that it heals
+			// the Manager because run()'s later calls -- the role read,
+			// then DefineDomain -- have to complete as a unit. Nothing
+			// follows this one but the metrics file, the result file and
+			// os.Exit. It is also what the SOURCE side of this handler
+			// already does: resume, stop-backup and delete-checkpoint all
+			// go through ViaReconnect helpers that open their own
+			// connection, which is why srcMgr was never exposed this way.
+			//
+			// The DIAL is bounded at five seconds, like those three.
+			// Reusing run()'s open connection used to make this step free;
+			// dialling our own does not, and a libvirt dial has no timeout
+			// of its own, so a wedged target network would hang the one
+			// path whose job is to exit promptly. A dial still running when
+			// the bound fires is abandoned, as theirs are. Only the dial:
+			// the measure already carries its own 30s ssh deadline and the
+			// metadata write was unbounded here before this change, so this
+			// bounds the one thing the change added rather than redefining
+			// the path's budget.
+			//
+			// Measured FIRST, and the dial skipped when there is nothing to
+			// write. measureReplicaWrittenAt returns "" after two mutex
+			// reads and no I/O when no disk has been stamped yet or the
+			// target ssh client was never dialled -- which is most
+			// interrupts, since vmsync-agent SIGTERMs every scheduled sync
+			// on shutdown or reload, often before a byte has moved. Dialling
+			// before measuring would spend a libvirt connection on every one
+			// of those for a value that is about to be discarded.
+			if stamp := measureReplicaWrittenAt(sig.String()); stamp != "" {
+				var stampMgr *libvirtsync.Manager
+				stampErr := callWithTimeout("connect to the target to record the replica write", 5*time.Second, func() error {
+					m, err := libvirtsync.Connect(cfg.TargetURI)
+					if err != nil {
+						return err
+					}
+					stampMgr = m
+					return nil
+				})
+				// If the dial fails there is nothing to be done but say so,
+				// and say what it costs: the same outcome the
+				// reconnect-failed branches inside recordReplicaWrittenAt
+				// already report, with the same consequence for the next run.
+				if stampErr != nil {
+					trace.Error("could not reach the target to record when this run wrote the replica disks -- if this run is retried, the NEXT one's out-of-band-write check may refuse it, because the disks are now newer than the timestamp on record. Clearing that needs -timestamp-tolerance-sec or a resync",
+						"trigger", sig.String(), "vm", cfg.TargetDomain, "uri", cfg.TargetURI, "error", stampErr)
+				} else {
+					recordReplicaWrittenAt(sig.String(), stampMgr, stamp)
+					_ = stampMgr.Close()
+				}
+			}
 			// Mirrors the deferred metrics write further up in run() --
 			// duplicated here for the same reason as the checkpoint cleanup
 			// above: os.Exit below skips that defer entirely. An interrupted
@@ -7768,7 +7851,7 @@ func run(cfg syncConfig) (runErr error) {
 	// Unconditional, like the one below: a commit that failed partway, or one
 	// refused because this run lost the target lock, is exactly when the next
 	// run most needs to know a disk was touched.
-	recordReplicaWrittenAt("post-commit", measureReplicaWrittenAt("post-commit"))
+	recordReplicaWrittenAt("post-commit", tgtMgr, measureReplicaWrittenAt("post-commit"))
 
 	// Phase two: everything that needs the delta to be in the base --
 	// restore points and -verify. Skipped when a disk failed to copy or a
@@ -7813,7 +7896,7 @@ func run(cfg syncConfig) (runErr error) {
 	// XML only -- so this is the last moment a replica disk can change.
 	cleanupTargetNBD("stamp")
 	replicaWrittenAt := measureReplicaWrittenAt("post-copy")
-	recordReplicaWrittenAt("post-copy", replicaWrittenAt)
+	recordReplicaWrittenAt("post-copy", tgtMgr, replicaWrittenAt)
 
 	// Written here for the same reason recordReplicaWrittenAt is: the drain
 	// below returns on the first worker error, and a verify mismatch IS one of
