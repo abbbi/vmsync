@@ -27,6 +27,7 @@ import (
 	"io"
 	"log"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -5714,7 +5715,11 @@ func run(cfg syncConfig) (runErr error) {
 			"source nbd bridge",
 			sourcePortAlloc,
 			func(port int) error {
-				cmd, serr := nbdbridge.StartRemote(ctx, sourceSSHClient, "src-"+cfg.SourceDomain, port, cfg.SourceNBDPort, bridgeCfg)
+				// Per-side: this bridge runs on the SOURCE and dials the
+				// export -source-nbd-bind placed there.
+				srcBridgeCfg := bridgeCfg
+				srcBridgeCfg.ConnectHost = util.ConnectHostFromBindSameHost(cfg.SourceNBDBind)
+				cmd, serr := nbdbridge.StartRemote(ctx, sourceSSHClient, "src-"+cfg.SourceDomain, port, cfg.SourceNBDPort, srcBridgeCfg)
 				if serr != nil {
 					return serr
 				}
@@ -6830,7 +6835,10 @@ func run(cfg syncConfig) (runErr error) {
 				fmt.Sprintf("target nbd bridge for %s", d.TargetDev),
 				targetPortAlloc,
 				func(port int) error {
-					cmd, serr := nbdbridge.StartRemote(ctx, targetSSHClient, cfg.TargetDomain+"-"+d.TargetDev, port, targetPort, bridgeCfg)
+					// On the TARGET, dialling what -target-nbd-bind placed.
+					tgtBridgeCfg := bridgeCfg
+					tgtBridgeCfg.ConnectHost = util.ConnectHostFromBindSameHost(cfg.TargetNBDBind)
+					cmd, serr := nbdbridge.StartRemote(ctx, targetSSHClient, cfg.TargetDomain+"-"+d.TargetDev, port, targetPort, tgtBridgeCfg)
 					if serr != nil {
 						return serr
 					}
@@ -7202,7 +7210,10 @@ func run(cfg syncConfig) (runErr error) {
 				fmt.Sprintf("verify nbd bridge for %s", d.TargetDev),
 				targetPortAlloc,
 				func(port int) error {
-					cmd, serr := nbdbridge.StartRemote(ctx, targetSSHClient, "verify-"+cfg.TargetDomain+"-"+d.TargetDev, port, verifyPort, bridgeCfg)
+					// The verify export, on the TARGET, same bind.
+					verBridgeCfg := bridgeCfg
+					verBridgeCfg.ConnectHost = util.ConnectHostFromBindSameHost(cfg.TargetNBDBind)
+					cmd, serr := nbdbridge.StartRemote(ctx, targetSSHClient, "verify-"+cfg.TargetDomain+"-"+d.TargetDev, port, verifyPort, verBridgeCfg)
 					if serr != nil {
 						return serr
 					}
@@ -7391,8 +7402,24 @@ func run(cfg syncConfig) (runErr error) {
 					// adds no port of its own: vmsync needs that export on
 					// TCP anyway (it read base:allocation through it above,
 					// possibly bridged from another host), and the helper
-					// reaches the same export over loopback.
-					targetBlocks, targetErr = askTargetDigests(hashCtx, d.TargetDev, fmt.Sprintf("127.0.0.1:%d", verifyPort), verifyExportName, plan)
+					// reaches the same export from the target's own side.
+					//
+					// NOT HARDCODED LOOPBACK, which is what this was.
+					// qemu-nbd is started with --bind cfg.TargetNBDBind, so
+					// an operator narrowing that to one interface leaves
+					// nothing listening on 127.0.0.1 -- and the helper's
+					// connection is then refused on every run. vmsync's own
+					// leg of the same comparison already derives its
+					// address from the bind (verifyTargetHost above), so
+					// this was the one address in the digest path that did
+					// not, and a verify is exactly half useless if only one
+					// side can read.
+					//
+					// The port is still verifyPort even under a bridge: the
+					// helper dials the target's qemu-nbd directly, not
+					// vmsync's local bridge endpoint.
+					helperDialAddr := net.JoinHostPort(util.ConnectHostFromBindSameHost(cfg.TargetNBDBind), strconv.Itoa(verifyPort))
+					targetBlocks, targetErr = askTargetDigests(hashCtx, d.TargetDev, helperDialAddr, verifyExportName, plan)
 					if targetErr != nil {
 						// Safe to cut the source leg short: HashRangesTCP's
 						// ctx case breaks to its drain rather than returning

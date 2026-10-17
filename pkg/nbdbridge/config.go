@@ -53,6 +53,20 @@ type Config struct {
 	// tunnel (an SSH direct-tcpip channel), at the cost of SSH's own
 	// channel-level flow-control overhead.
 	UseSSH bool
+
+	// ConnectHost is the address, ON THE REMOTE HOST, where the real
+	// qemu-nbd is listening. Empty means loopback.
+	//
+	// It is per-side rather than estate-wide: the source bridge dials the
+	// export that -source-nbd-bind placed, the target bridges dial
+	// -target-nbd-bind's, and one field shared between them would be wrong
+	// for whichever side was set second.
+	//
+	// Loopback was hardcoded here, which is right for the default wildcard
+	// bind and wrong for a narrowed one -- qemu-nbd is then not listening
+	// on loopback, the helper's connection is refused, and the only trace
+	// is in the helper's log file on the far host.
+	ConnectHost string
 }
 
 // NetBufferEnabled reports whether --netbuffer was set.

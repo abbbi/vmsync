@@ -361,3 +361,66 @@ func TestRemoteClockSkewDirection(t *testing.T) {
 		t.Error("a failed round trip did not produce an error")
 	}
 }
+
+// ConnectHostFromBindSameHost is asked by two things vmsync starts ON the
+// target host -- vmsync-bridge-helper and the digest helper during -verify --
+// both of which dial the target's own qemu-nbd. Both hardcoded 127.0.0.1,
+// which is right for the default wildcard bind and wrong for every narrowed
+// one: qemu-nbd is then not listening on loopback, the connection is
+// refused, and the feature fails on every run.
+func TestConnectHostFromBindSameHost(t *testing.T) {
+	cases := []struct {
+		bind string
+		want string
+		why  string
+	}{
+		// The default. Bound everywhere, so loopback reaches it and is the
+		// cheapest address that does.
+		{"0.0.0.0", "127.0.0.1", "the -target-nbd-bind default"},
+		{"::", "127.0.0.1", "the IPv6 wildcard"},
+		{"", "127.0.0.1", "unset: qemu-nbd's own default is every interface"},
+
+		// THE CASES THAT WERE BROKEN. A narrowed bind means loopback is
+		// not listening.
+		{"10.0.0.5", "10.0.0.5", "a narrowed bind, the hardening case this exists for"},
+		{"192.168.1.20", "192.168.1.20", "another"},
+		{"2001:db8::5", "2001:db8::5", "a specific IPv6 address"},
+
+		// Loopback asked for explicitly is still loopback.
+		{"127.0.0.1", "127.0.0.1", "loopback by name"},
+		{"::1", "::1", "IPv6 loopback, returned as given rather than rewritten"},
+
+		// A hostname resolved the same way on the same host.
+		{"dr01.example.org", "dr01.example.org", "a hostname: qemu-nbd resolved it to bind, and so will the dialler"},
+	}
+
+	for _, tc := range cases {
+		if got := ConnectHostFromBindSameHost(tc.bind); got != tc.want {
+			t.Errorf("ConnectHostFromBindSameHost(%q) = %q, want %q -- %s", tc.bind, got, tc.want, tc.why)
+		}
+	}
+}
+
+// The sibling it must not be confused with. ConnectHostFromBindOrURI
+// answers the same question for something dialling ACROSS the network, so
+// its fallback is the URI's host; using it on the target would send a
+// local dialler out over the network to come back to itself.
+func TestTheTwoBindHelpersDifferOnlyInTheirFallback(t *testing.T) {
+	const uri = "qemu+ssh://dr01/system"
+
+	// A specific bind: both answer the same thing, because the bind is the
+	// answer and neither fallback is reached.
+	if a, b := ConnectHostFromBindOrURI("10.0.0.5", uri), ConnectHostFromBindSameHost("10.0.0.5"); a != b {
+		t.Errorf("a narrowed bind gives %q across the network and %q on the host; it is one address and both must name it", a, b)
+	}
+	// A wildcard bind: the fallbacks diverge, and that divergence is the
+	// whole reason there are two functions.
+	across := ConnectHostFromBindOrURI("0.0.0.0", uri)
+	onHost := ConnectHostFromBindSameHost("0.0.0.0")
+	if across != "dr01" {
+		t.Errorf("ConnectHostFromBindOrURI(wildcard) = %q, want the URI's host", across)
+	}
+	if onHost != "127.0.0.1" {
+		t.Errorf("ConnectHostFromBindSameHost(wildcard) = %q, want loopback", onHost)
+	}
+}

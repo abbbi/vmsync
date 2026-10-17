@@ -302,3 +302,60 @@ func TestQuoteArgs(t *testing.T) {
 		})
 	}
 }
+
+// The bridge helper runs on the far host and dials the real qemu-nbd
+// there. That address was hardcoded to loopback, which is right for the
+// default wildcard bind and wrong for a narrowed one: qemu-nbd is then not
+// listening on loopback, so -source-nbd-bind/-target-nbd-bind narrowed to
+// one interface made every bridged transport (--compress, --netbuffer)
+// fail -- with the only trace in the helper's own log file on the far host.
+func TestBuildStartCommandDialsTheBoundAddress(t *testing.T) {
+	base := Config{HelperPath: "/usr/local/bin/vmsync-bridge-helper"}
+
+	t.Run("unset means loopback, as before", func(t *testing.T) {
+		got := BuildStartCommand(base, 10809, 10800, "/run/p.pid", "/run/l.log")
+		if !strings.Contains(got, "127.0.0.1:10800") {
+			t.Errorf("command does not dial loopback by default: %s", got)
+		}
+	})
+
+	t.Run("a narrowed bind is dialled", func(t *testing.T) {
+		cfg := base
+		cfg.ConnectHost = "10.0.0.5"
+		got := BuildStartCommand(cfg, 10809, 10800, "/run/p.pid", "/run/l.log")
+		if !strings.Contains(got, "10.0.0.5:10800") {
+			t.Errorf("command still dials loopback though qemu-nbd is bound elsewhere: %s", got)
+		}
+		if strings.Contains(got, "127.0.0.1:10800") {
+			t.Errorf("command dials loopback as well as the bound address: %s", got)
+		}
+	})
+
+	// An IPv6 address has to arrive bracketed or the helper cannot parse
+	// its own -connect argument, which is why this uses net.JoinHostPort
+	// rather than Sprintf.
+	t.Run("an IPv6 bind is bracketed", func(t *testing.T) {
+		cfg := base
+		cfg.ConnectHost = "2001:db8::5"
+		got := BuildStartCommand(cfg, 10809, 10800, "/run/p.pid", "/run/l.log")
+		if !strings.Contains(got, "[2001:db8::5]:10800") {
+			t.Errorf("an IPv6 connect address is not bracketed, so the helper cannot parse it: %s", got)
+		}
+	})
+
+	// The LISTEN side keeps its own rule -- wildcard, or loopback under
+	// -use-ssh -- and must not pick up the connect address.
+	t.Run("the listen address is unaffected", func(t *testing.T) {
+		cfg := base
+		cfg.ConnectHost = "10.0.0.5"
+		got := BuildStartCommand(cfg, 10809, 10800, "/run/p.pid", "/run/l.log")
+		if !strings.Contains(got, "0.0.0.0:10809") {
+			t.Errorf("the listen address changed with the connect address: %s", got)
+		}
+		cfg.UseSSH = true
+		got = BuildStartCommand(cfg, 10809, 10800, "/run/p.pid", "/run/l.log")
+		if !strings.Contains(got, "127.0.0.1:10809") {
+			t.Errorf("-use-ssh no longer listens on loopback only: %s", got)
+		}
+	})
+}

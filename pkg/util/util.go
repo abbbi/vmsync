@@ -108,6 +108,41 @@ func ConnectHostFromBindOrURI(bind, rawURI string) string {
 	return HostFromURIOrLocal(rawURI)
 }
 
+// ConnectHostFromBindSameHost answers "what address do I connect to for an
+// export bound like this, from the machine it is running ON".
+//
+// The sibling of ConnectHostFromBindOrURI above, and the suffix names the
+// only difference: where that one falls back to the host in the URI -- the
+// right answer for something dialling ACROSS the network -- this one falls
+// back to loopback, which is the right answer for something already on the
+// box.
+//
+// It exists because two things vmsync starts on the target host dial the
+// target's own qemu-nbd: vmsync-bridge-helper, and the digest helper during
+// -verify. Both hardcoded 127.0.0.1, which is correct for the default
+// wildcard bind and wrong for every other value of -target-nbd-bind: a
+// narrowed bind means qemu-nbd is NOT listening on loopback, so those
+// connections are refused and the feature they implement fails outright.
+//
+// A hostname is returned as given. qemu-nbd resolved it to bind, and the
+// same name resolves the same way on the same host.
+func ConnectHostFromBindSameHost(bind string) string {
+	ip := net.ParseIP(bind)
+	switch {
+	case bind == "":
+		// qemu-nbd's own default is every interface, so loopback is there.
+		return "127.0.0.1"
+	case ip == nil:
+		// A hostname. Hand it back rather than guessing.
+		return bind
+	case ip.IsUnspecified():
+		// 0.0.0.0 or ::. Bound everywhere, so loopback is the cheapest
+		// and most robust of the addresses that reach it.
+		return "127.0.0.1"
+	}
+	return bind
+}
+
 func ShQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }

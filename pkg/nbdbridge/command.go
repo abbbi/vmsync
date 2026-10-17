@@ -19,6 +19,8 @@ package nbdbridge
 
 import (
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
 
 	"vmsync/pkg/streamrelay"
@@ -48,6 +50,10 @@ func quoteArgs(args ...string) string {
 // cfg.UseSSH is set (reachable only through the caller's own SSH tunnel) --
 // see Config.UseSSH's doc comment for the tradeoff.
 //
+// The CONNECT address is the real qemu-nbd on that same host: loopback,
+// unless a narrowed -source-nbd-bind/-target-nbd-bind means it is not
+// listening there. See Config.ConnectHost.
+//
 // No socat (or any other external tool) is involved: the helper does its own
 // listening, accepting, compression, and buffering natively in one program.
 func BuildStartCommand(cfg Config, bridgePort, realPort int, pidFile, logFile string) string {
@@ -55,10 +61,19 @@ func BuildStartCommand(cfg Config, bridgePort, realPort int, pidFile, logFile st
 	if cfg.UseSSH {
 		listenHost = "127.0.0.1"
 	}
+	// Where the real qemu-nbd is, as seen from the far host. Loopback
+	// unless -source-nbd-bind/-target-nbd-bind narrowed it, in which case
+	// qemu-nbd is not on loopback at all; see Config.ConnectHost.
+	connectHost := cfg.ConnectHost
+	if connectHost == "" {
+		connectHost = "127.0.0.1"
+	}
 	args := []string{
 		cfg.HelperPath,
-		"-listen", fmt.Sprintf("%s:%d", listenHost, bridgePort),
-		"-connect", fmt.Sprintf("127.0.0.1:%d", realPort),
+		"-listen", net.JoinHostPort(listenHost, strconv.Itoa(bridgePort)),
+		// JoinHostPort, not Sprintf: an IPv6 bind has to arrive bracketed
+		// or the helper cannot parse its own argument.
+		"-connect", net.JoinHostPort(connectHost, strconv.Itoa(realPort)),
 	}
 	if cfg.Compress {
 		algo := cfg.CompressAlgo
