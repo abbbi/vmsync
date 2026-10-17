@@ -54,11 +54,41 @@ import (
 // remote one: -shutdown-domain on the source's own host, then -promote on
 // the target's. The control plane sequences them; each runs where it needs
 // no credentials it does not already have.
+// THE QUESTION IS "IS THIS MACHINE", NOT "IS THIS NOT SSH". They are
+// different, and answering the second one here let every non-ssh remote
+// transport through: qemu+tcp://, qemu+tls:// with or without its port,
+// a bare qemu://host/ and qemu+ext:// all passed a gate whose entire
+// purpose is that no network is involved. Five of libvirt's twelve
+// transports, all of them a remote hypervisor.
+//
+// What that cost is not theoretical, because the verbs behind this gate go
+// on to mix that remote libvirt with LOCAL state. runPromote takes
+// util.AcquireRunLock on the host vmsync is running on, so a sync driving
+// that replica holds its lock on the other machine and contends with
+// nothing; disk-presence evidence is read from the wrong machine's files;
+// and -invert, through dropCheckpointsOffline below, reads the REMOTE
+// domain's disk paths out of its definition and then runs qemu-img
+// bitmap --remove against those paths HERE. The collision is the PATH,
+// not the domain name, which makes it likelier rather than less: a
+// symmetric DR pair lays its images out the same way on both hosts.
+//
+// uriRunsCommandsLocally (restorepoints.go) is the predicate that already
+// asked this correctly, and its own comment names this exact hazard --
+// "qemu+tcp://otherhost/system is neither ssh nor local". It was one file
+// away the whole time. requirelocaluri_test.go pins that the two keep
+// agreeing, because a disagreement means one verb acting locally while
+// another refuses to, on the same URI in the same incident.
+//
+// Conservative by construction: it recognises only an empty host, localhost
+// and the loopback addresses, so qemu+tcp://<this machine's own name>/
+// is refused too. That is the right direction for a gate -- the remedy is
+// qemu:///system, which is what the error says.
 func requireLocalURI(uri, flagName string) error {
-	if util.UriUsesSSH(uri) {
-		return fmt.Errorf("%s must name a LOCAL libvirt URI (for example qemu:///system): this command acts on the host it runs on, so that it works when the other site is unreachable and needs no credentials to reach it", flagName)
+	if uriRunsCommandsLocally(uri) {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("%s names %q, which is not this machine: %s must be a LOCAL libvirt URI (for example qemu:///system). This command acts on the host it runs on, so that it works when the other site is unreachable and needs no credentials to reach it -- pointed at a remote hypervisor it would read and lock the wrong machine's state",
+		flagName, uri, flagName)
 }
 
 // promoteTargetState maps what was observed of a replica onto the input the

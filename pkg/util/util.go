@@ -31,6 +31,20 @@ import (
 	"libvirt.org/go/libvirtxml"
 )
 
+// UriUsesSSH answers "would reaching this URI go over ssh", which is only
+// ever a question about whether a caller needs an ssh runner, a key and a
+// known_hosts entry.
+//
+// IT IS NOT A TEST FOR "IS THIS LOCAL", and reading it as one is a mistake
+// this codebase has already made. qemu+tcp://otherhost/system, qemu+tls://,
+// a bare qemu://otherhost/ and qemu+ext:// are all remote hypervisors that
+// this function reports false for -- five of libvirt's twelve transports.
+// A guard built on it therefore admits a remote host while believing it has
+// excluded one, and the caller goes on to pair that remote libvirt with
+// local files, local locks and local /proc.
+//
+// If the question is "does this URI name the machine I am running on", the
+// answer is cmd/vmsync's uriRunsCommandsLocally, not this.
 func UriUsesSSH(raw string) bool {
 	u, err := url.Parse(raw)
 	if err != nil {

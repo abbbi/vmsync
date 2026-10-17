@@ -446,7 +446,15 @@ func newLocalDomainRecorder(cfg syncConfig, mgr *libvirtsync.Manager, uri, domai
 	// the far host's disk path: a journal beside nothing, for a domain whose
 	// real history is elsewhere, which is worse than no journal at all
 	// because somebody reading it would believe it complete.
-	if util.UriUsesSSH(uri) {
+	//
+	// Asked as "is this machine", not "is this not ssh", for the reason
+	// requireLocalURI gives at length: the second question lets qemu+tcp://
+	// and the other non-ssh remote transports through, and this gate is the
+	// one standing between them and the directory described above. It is a
+	// separate gate rather than a call to requireLocalURI because
+	// -update-role deliberately does not require a local URI, so this verb
+	// has to decline the journal without declining the action.
+	if !uriRunsCommandsLocally(uri) {
 		trace.Warning("no action journal will be written for this action: it acts on a domain at a remote libvirt URI, and this journal is written beside that domain's own disks on the host that holds them. The action itself is unaffected: the journal is evidence, never an input to a decision",
 			"vm", domain, "uri", uri)
 		return nil
