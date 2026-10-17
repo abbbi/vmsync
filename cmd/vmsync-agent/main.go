@@ -515,6 +515,20 @@ func run(lv *live, reloads *reloader) error {
 type sharedState struct {
 	mu     sync.Mutex
 	cached CachedConfig
+	// fromUI records that a FULL configuration document has been adopted
+	// from the control plane in THIS process lifetime.
+	//
+	// It exists for one consumer -- operationsPass -- and answers a
+	// narrower question than "has the UI answered". Store.LoadCache drops
+	// Operations by construction, so a restarted agent holds a config whose
+	// empty operation list says nothing about what the UI is publishing.
+	// Acting on it as though it did is what erased the operation ledger on
+	// every restart.
+	//
+	// A 304 does NOT set this. It is a successful exchange, but what it
+	// confirms is the document we already hold -- operations and all, which
+	// after a restart means none.
+	fromUI bool
 }
 
 func (s *sharedState) get() CachedConfig {
@@ -523,10 +537,33 @@ func (s *sharedState) get() CachedConfig {
 	return s.cached
 }
 
+// snapshot returns the cached configuration together with whether it came
+// from the control plane in this process.
+//
+// Both under one lock, because a caller that read them separately could
+// pair a pre-poll operation list with a post-poll provenance and conclude
+// the UI had acknowledged operations it has never mentioned.
+func (s *sharedState) snapshot() (CachedConfig, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cached, s.fromUI
+}
+
 func (s *sharedState) set(c CachedConfig) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cached = c
+}
+
+// adoptFromUI replaces the cached configuration with a full document the
+// control plane just sent, and records that provenance.
+//
+// Distinct from set() precisely so the 304 path cannot reach it: see fromUI.
+func (s *sharedState) adoptFromUI(c CachedConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cached = c
+	s.fromUI = true
 }
 
 // runEnrolOnly performs a modeless enrolment and exits: it exchanges the
@@ -704,6 +741,22 @@ func pollLoop(ctx context.Context, client *Client, lv *live, store Store, state 
 	const minBackoff, maxBackoff = 5 * time.Second, 5 * time.Minute
 	backoff := minBackoff
 
+	// The first successful poll of this process is UNCONDITIONAL, even
+	// though the cache carries an ETag.
+	//
+	// That ETag attests to a document this agent does not hold. Store.
+	// LoadCache drops Operations by construction -- deliberately, so a
+	// restart cannot replay a failover off disk -- while the envelope keeps
+	// the ETag of the document they arrived in. Presenting it asks "anything
+	// newer than what I have?" about something we have only a lossy copy of.
+	// A UI still publishing a failover answers 304, and that operation is
+	// then never delivered: published, pending, and silently inert until
+	// some unrelated edit changes the document and bumps the ETag.
+	//
+	// The cost is one full config fetch per agent start, which is also what
+	// a cache whose envelope cannot be parsed already costs.
+	firstPoll := true
+
 	for {
 		if ctx.Err() != nil {
 			return
@@ -711,7 +764,11 @@ func pollLoop(ctx context.Context, client *Client, lv *live, store Store, state 
 		cached := state.get()
 		wait := time.Duration(cached.Config.PollWaitSeconds) * time.Second
 
-		cfg, etag, err := client.PollConfig(ctx, cached.ETag, wait)
+		known := cached.ETag
+		if firstPoll {
+			known = ""
+		}
+		cfg, etag, err := client.PollConfig(ctx, known, wait)
 		switch {
 		case ctx.Err() != nil:
 			return
@@ -747,15 +804,29 @@ func pollLoop(ctx context.Context, client *Client, lv *live, store Store, state 
 			continue
 		}
 
-		// Complain BEFORE adopting it, and only here -- this branch is reached
-		// only when the document actually changed, since an unchanged one comes
-		// back 304. Warning per poll would repeat every thirty seconds forever.
+		// Whether this document actually DIFFERS from the one already held.
+		//
+		// Reaching a 200 used to be sufficient evidence of that, because the
+		// only way to get one was to present a non-matching ETag. The first
+		// poll of a process now presents none at all (see firstPoll above),
+		// so the UI answers 200 whether or not anything changed, and the
+		// question has to be asked rather than inferred. On every later poll
+		// the two are equivalent: a 200 there means the ETag we sent --
+		// cached.ETag -- did not match.
+		changed := etag != cached.ETag
+
+		// Complain BEFORE adopting it, and only on a document that changed.
+		// Complaining once per poll would repeat every thirty seconds
+		// forever; once per agent start would make a crash-looping host
+		// reproduce that flood at the restart rate.
 		//
 		// Complaints, not refusals: a control plane is a separately-versioned
 		// program, and rejecting its document outright would let a newer UI take
 		// an estate offline over one out-of-range field. The values are still
 		// clamped exactly as before; what is new is that the operator is told.
-		complainAbout(cfg, "control plane")
+		if changed {
+			complainAbout(cfg, "control plane")
+		}
 
 		// The one rule that spans BOTH files, so neither validator can see it
 		// alone. The UI holds a poll open for poll_wait_seconds; if this
@@ -772,7 +843,11 @@ func pollLoop(ctx context.Context, client *Client, lv *live, store Store, state 
 		}
 
 		updated := CachedConfig{ETag: etag, FetchedAtUnix: time.Now().Unix(), Config: cfg}
-		state.set(updated)
+		// adoptFromUI, not set: this is a full document, so from here on
+		// its operation list IS what the control plane is publishing, and
+		// operationsPass may prune the ledger against it.
+		state.adoptFromUI(updated)
+		firstPoll = false
 		if err := store.SaveCache(updated); err != nil {
 			// Not fatal: the agent has the new configuration in memory and
 			// keeps working. It just would not survive a restart, so this
@@ -780,7 +855,16 @@ func pollLoop(ctx context.Context, client *Client, lv *live, store Store, state 
 			trace.Warning("new configuration could not be cached to disk; it will be lost on restart", "error", err)
 		}
 		m.uiContacted(time.Now())
-		trace.Info("configuration updated from the UI", "report_interval_s", cfg.ReportIntervalSeconds, "poll_wait_s", cfg.PollWaitSeconds, "cadences", len(cfg.CadenceSeconds))
+		if changed {
+			trace.Info("configuration updated from the UI", "report_interval_s", cfg.ReportIntervalSeconds, "poll_wait_s", cfg.PollWaitSeconds, "cadences", len(cfg.CadenceSeconds))
+		} else {
+			// The unconditional first poll, answered with the document we
+			// already had. Saying "updated" here would be false, and would
+			// cost an operator the one log line that answers "when did the
+			// control plane last change this host?". Silent at Info for the
+			// same reason the 304 path is: nothing changed.
+			trace.Debug("configuration confirmed unchanged by the first poll of this process", "etag", etag)
+		}
 		backoff = minBackoff
 	}
 }

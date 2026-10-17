@@ -270,9 +270,13 @@ func (c UIConfig) Complaints() []string {
 
 // ComplainAbout logs everything wrong with a document the control plane sent.
 //
-// Called when a NEW configuration is adopted, not on every poll: the UI
-// answers 304 while nothing has changed, so this fires once per actual change
-// rather than every thirty seconds forever.
+// Called when a CHANGED configuration is adopted, not on every poll, so this
+// fires once per actual change rather than every thirty seconds forever.
+//
+// The caller establishes that by comparing ETags, not by having received a
+// 200. The two used to be the same thing; they are not since the first poll
+// of a process became unconditional (see pollLoop), and a host restarting in
+// a loop would otherwise reproduce the very flood this placement avoids.
 func complainAbout(c UIConfig, source string) {
 	problems := c.Complaints()
 	if len(problems) == 0 {

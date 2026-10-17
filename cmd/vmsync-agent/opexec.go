@@ -56,23 +56,16 @@ func operationsLoop(ctx context.Context, lv *live, state *sharedState, ledger *o
 		// in this process lifetime -- Store.LoadCache strips them, so a
 		// restart cannot replay one off disk. See the reasoning there.
 		//
-		// Executed one at a time, deliberately. These are failovers; two
-		// running concurrently on one host is not a throughput problem to
-		// solve but a situation nobody should be able to create by clicking
-		// twice. A long one blocking the loop is the correct behaviour.
+		// The configuration and its provenance are read under ONE lock.
+		// Taking them separately would let a poll land in between and pair
+		// a pre-poll operation list with a post-poll "the UI has spoken",
+		// which is precisely the combination that must never occur.
 		cfg := *lv.get()
-		cached := state.get()
-		published := map[string]bool{}
-		for _, op := range cached.Config.Operations {
-			published[op.ID] = true
-			runOperation(ctx, cfg, cached.Config.Schedule, op, ledger)
-			if ctx.Err() != nil {
-				return
-			}
+		cached, publishedKnown := state.snapshot()
+		operationsPass(ctx, cfg, cached, publishedKnown, ledger)
+		if ctx.Err() != nil {
+			return
 		}
-		// Anything the UI has stopped publishing has been acknowledged, so
-		// its result no longer needs carrying.
-		ledger.Forget(published)
 
 		select {
 		case <-ctx.Done():
@@ -80,6 +73,53 @@ func operationsLoop(ctx context.Context, lv *live, state *sharedState, ledger *o
 		case <-ticker.C:
 		}
 	}
+}
+
+// operationsPass is one cycle of operationsLoop: execute everything
+// currently published, then drop the records the UI has acknowledged.
+//
+// Its own function so the guard below can be tested without a clock.
+//
+// publishedKnown says whether cached.Config.Operations may be read as
+// "everything the UI is publishing to this agent". It is FALSE until a full
+// configuration document has arrived in this process, and that distinction
+// is the whole point -- see the comment on the Forget call.
+//
+// Operations are executed one at a time, deliberately. These are failovers;
+// two running concurrently on one host is not a throughput problem to solve
+// but a situation nobody should be able to create by clicking twice. A long
+// one blocking the loop is the correct behaviour.
+func operationsPass(ctx context.Context, cfg agentConfig, cached CachedConfig, publishedKnown bool, ledger *operationLedger) {
+	published := map[string]bool{}
+	for _, op := range cached.Config.Operations {
+		published[op.ID] = true
+		runOperation(ctx, cfg, cached.Config.Schedule, op, ledger)
+		if ctx.Err() != nil {
+			return
+		}
+	}
+
+	// Anything the UI has stopped publishing has been acknowledged, so its
+	// result no longer needs carrying.
+	//
+	// ONLY once this process has actually been told what is published.
+	// Until then the empty list is an artefact of our own cache, not a
+	// statement by the UI: Store.LoadCache decodes as a ScheduleDoc, which
+	// has no Operations field, so a restarted agent's published set is
+	// empty by construction. Forgetting on the strength of it deleted the
+	// whole ledger on the first pass after every restart -- destroying the
+	// record of operations that HAD run, so the console showed them pending
+	// forever, and leaving the next poll that re-delivered one free to
+	// execute it a second time.
+	//
+	// Not merely "the UI answered", either. A 304 is a successful exchange,
+	// but the document it confirms is the one we hold -- and after a restart
+	// that copy has no operations in it. Only a full document counts; see
+	// sharedState.adoptFromUI.
+	if !publishedKnown {
+		return
+	}
+	ledger.Forget(published)
 }
 
 // runOperation executes one operation, exactly once, ever.
