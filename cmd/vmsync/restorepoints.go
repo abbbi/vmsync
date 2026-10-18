@@ -341,7 +341,7 @@ func (r *restorePoints) commit(ctx context.Context, verifyState, source string, 
 	status := restorepoint.Status{
 		Checkpoint:   effectiveCheckpoint,
 		CheckpointAt: checkpointAt.Unix(),
-		TakenAt:      time.Now().Unix(),
+		TakenAt:      r.targetNow(ctx).Unix(),
 		Source:       source,
 		Verify:       verifyState,
 		Disks:        disks,
@@ -380,6 +380,54 @@ func (r *restorePoints) commit(ctx context.Context, verifyState, source string, 
 // costs disk, while failing the run over it would throw away a sync that
 // succeeded. What it must not do is stay silent -- a prune that keeps failing
 // is how a target fills up.
+// targetNow reads the clock of the host the restore points live on.
+//
+// Falls back to this process's clock, which is what the sidecar used to carry
+// unconditionally and is wrong in exactly the case retention cares about: the
+// checkpoint instant comes from here too, so one skewed clock moves both and
+// the ordering learns nothing. The fallback is still better than refusing to
+// publish a copy that has already been made, and it is loud, because a store
+// that quietly goes back to one clock is the whole defect returning.
+func (r *restorePoints) targetNow(ctx context.Context) time.Time {
+	out, err := r.runner.Run(ctx, restorepoint.TargetNowCommand())
+	if err == nil {
+		if at, perr := restorepoint.ParseTargetNow(out); perr == nil {
+			return at
+		} else {
+			err = perr
+		}
+	}
+	trace.Warning("could not read the target's clock; stamping this restore point with the local one instead. Retention orders by that stamp, and a local clock cannot order copies correctly when it is the clock that is wrong",
+		"error", err, "tag", r.point.Tag().String())
+	return time.Now()
+}
+
+// publishInstants reads every sidecar's taken_at in one round trip.
+//
+// ok is false only when the store could not be READ -- not when it holds
+// points without sidecars, which is an answer rather than a failure.
+func (r *restorePoints) publishInstants(ctx context.Context) (map[string]time.Time, bool) {
+	cmd, err := restorepoint.ReadAllStatusCommand(r.store)
+	if err != nil {
+		trace.Warning("could not build the restore point sidecar read", "error", err)
+		return nil, false
+	}
+	out, err := r.runner.Run(ctx, cmd)
+	if err != nil {
+		trace.Warning("could not read the restore point sidecars", "error", err, "output", strings.TrimSpace(out))
+		return nil, false
+	}
+	published, err := restorepoint.ParseAllStatus(out)
+	if err != nil {
+		// Exit 0 with unrecognisable output: the command ran and answered
+		// something else. Treated as a failure to read, not as an empty
+		// store, because the two would otherwise be the same answer here.
+		trace.Warning("the target answered the restore point sidecar read with something unrecognisable", "error", err, "output", strings.TrimSpace(out))
+		return nil, false
+	}
+	return published, true
+}
+
 func (r *restorePoints) prune(ctx context.Context) {
 	listing, err := listRestorePoints(ctx, r.runner, r.store)
 	if err != nil {
@@ -417,20 +465,49 @@ func (r *restorePoints) prune(ctx context.Context) {
 	// Over this domain's own points only. Pruning every point in the shared
 	// directory applies a retention count meant for one machine to the sum of
 	// several, and one domain's churn silently evicts another's history.
-	plan := restorepoint.Prune(listing.Points, r.policy)
-	for _, tag := range plan.Remove {
-		cmd, err := restorepoint.RemoveCommand(r.store.Point(tag))
-		if err != nil {
-			trace.Warning("leaving a restore point in place", "tag", tag.String(), "error", err)
-			continue
+	// r.point is this run's own, and it must survive its own pruning: the
+	// ordering is by the SOURCE's checkpoint instant, so a source running
+	// ahead can leave the point just published sorted below older ones and
+	// chosen for deletion. See Prune.
+	//
+	// Passed unconditionally: if this tag is in the listing it is either the
+	// point this run just published or an identical earlier one, and neither
+	// is something this run should delete.
+	// The target's own record of when it published each point, which is what
+	// retention is ordered by. Tag.At is the checkpoint instant and shares a
+	// clock with whatever skewed it; see Prune.
+	//
+	// A FAILED READ STOPS THE PRUNE, and does not fall back to ordering by
+	// Tag.At. The two outcomes are not comparable: ordering by Tag.At under
+	// skew deletes the point the previous run published, every cycle, and a
+	// deletion cannot be taken back -- while not pruning costs disk and says
+	// so out loud, because Summarize's Over stays positive and that is the
+	// documented signal for "pruning is failing". Growth is recoverable and
+	// visible; the wrong deletion is neither.
+	//
+	// A read that SUCCEEDS and finds no sidecars is a different answer and is
+	// not this branch: those points rank below any that can account for
+	// themselves, and the prune proceeds.
+	publishedAt, ok := r.publishInstants(ctx)
+	if !ok {
+		trace.Warning("not pruning this cycle: the restore point sidecars could not be read, and ordering by the checkpoint instant instead can delete the copy the previous run made. Restore points will accumulate until this succeeds, which vmsync_restore_points_over_count reports",
+			"dir", r.store.String())
+	} else {
+		plan := restorepoint.Prune(listing.Points, r.point.Tag(), publishedAt, r.policy)
+		for _, tag := range plan.Remove {
+			cmd, err := restorepoint.RemoveCommand(r.store.Point(tag))
+			if err != nil {
+				trace.Warning("leaving a restore point in place", "tag", tag.String(), "error", err)
+				continue
+			}
+			if out, err := r.runner.Run(ctx, cmd); err != nil {
+				trace.Warning("could not remove an expired restore point; restore points will accumulate until this succeeds", "tag", tag.String(), "error", err, "output", strings.TrimSpace(out))
+				continue
+			}
+			trace.Info("removed an expired restore point", "tag", tag.String())
 		}
-		if out, err := r.runner.Run(ctx, cmd); err != nil {
-			trace.Warning("could not remove an expired restore point; restore points will accumulate until this succeeds", "tag", tag.String(), "error", err, "output", strings.TrimSpace(out))
-			continue
-		}
-		trace.Info("removed an expired restore point", "tag", tag.String())
+		trace.Info("restore points on target", "kept", len(plan.Keep), "removed", len(plan.Remove), "dir", r.store.String())
 	}
-	trace.Info("restore points on target", "kept", len(plan.Keep), "removed", len(plan.Remove), "dir", r.store.String())
 
 	// Re-read rather than computed from the plan, so what is published is what
 	// the store actually holds and not what the prune intended. A prune failure
@@ -661,6 +738,54 @@ func restorePointStore(cfg syncConfig) (restorepoint.Store, error) {
 }
 
 // runListRestorePoints prints what is available to go back to.
+// restorePointRow is one line of the -list-restore-points table, with the
+// two instants it has to show kept apart: when the copy was published and
+// when its contents are from.
+type restorePointRow struct {
+	tag        restorepoint.Tag
+	takenAt    time.Time
+	verify     string
+	checkpoint string
+}
+
+// restorePointRowFor builds a row from a tag and whatever its sidecar said.
+//
+// takenAt FALLS BACK to the tag instant when the sidecar could not be read or
+// carries no taken_at. That is the only instant there is in that case, and it
+// keeps the point roughly where it belongs in the table -- a zero would sort
+// it to 1970 and put an unreadable point at the top of an oldest-first list,
+// which is the opposite of what an operator should read first.
+//
+// "unknown" rather than a guess for verify: the whole reason the sidecar
+// exists is to say how much confidence a restore point has earned, and
+// inventing one would defeat it.
+func restorePointRowFor(tag restorepoint.Tag, s restorepoint.Status, readable bool) restorePointRow {
+	r := restorePointRow{tag: tag, takenAt: tag.At.UTC(), verify: "unknown", checkpoint: tag.Checkpoint}
+	if !readable {
+		return r
+	}
+	r.verify = s.Verify
+	if s.Checkpoint != "" {
+		r.checkpoint = s.Checkpoint
+	}
+	if s.TakenAt > 0 {
+		r.takenAt = time.Unix(s.TakenAt, 0).UTC()
+	}
+	return r
+}
+
+// sortRestorePointRows puts the table in the order the copies were actually
+// made, oldest first. See the note in runListRestorePoints for why that is
+// not the same as the order of their tags.
+func sortRestorePointRows(rows []restorePointRow) {
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].takenAt.Equal(rows[j].takenAt) {
+			return rows[i].tag.Checkpoint < rows[j].tag.Checkpoint
+		}
+		return rows[i].takenAt.Before(rows[j].takenAt)
+	})
+}
+
 func runListRestorePoints(ctx context.Context, cfg syncConfig) error {
 	store, err := restorePointStore(cfg)
 	if err != nil {
@@ -680,29 +805,38 @@ func runListRestorePoints(ctx context.Context, cfg syncConfig) error {
 		trace.Info("no restore points on the target for this domain", "domain", cfg.TargetDomain, "dir", store.String())
 	}
 
-	// Oldest first: read top to bottom, this is the history in the order it
-	// happened.
 	points := append([]restorepoint.Tag(nil), listing.Points...)
-	sort.Slice(points, func(i, j int) bool { return points[i].At.Before(points[j].At) })
 
 	// What the loop below could not read, reported once after the table.
 	unreadable := 0
 	firstTag, firstReason := "", ""
 
-	fmt.Printf("%-20s  %-20s  %-10s  %s\n", "TAKEN", "CHECKPOINT", "VERIFY", "TAG")
+	// Read first, SORT SECOND, print last.
+	//
+	// The order this table is in is "the history in the order it happened",
+	// and that is the order the target published the copies -- which only the
+	// sidecars know. Sorting by the tag would order by the checkpoint instant,
+	// stamped by the host running the sync, so a clock that is wrong there
+	// puts mislabelled copies at the bottom of an oldest-first table and
+	// presents them to an operator as the most recent thing available. That is
+	// the same mistake retention used to make (see restorepoint.Prune), on the
+	// screen a person actually reads during an incident. The sidecar was
+	// already being read in this loop for VERIFY; its taken_at was discarded.
+	rows := make([]restorePointRow, 0, len(points))
 	for _, tag := range points {
-		verify, checkpoint := "unknown", tag.Checkpoint
 		// Each of the three stages can fail, and each used to fail silently
-		// into the same "unknown" the next line defends. The value is right;
-		// the silence was not. A root-written 0600 sidecar read as another
-		// user yields "Permission denied" on EVERY row, and the table was
-		// then indistinguishable from one where nothing had ever been
+		// into the same "unknown" restorePointRowFor defends. The value is
+		// right; the silence was not. A root-written 0600 sidecar read as
+		// another user yields "Permission denied" on EVERY row, and the table
+		// was then indistinguishable from one where nothing had ever been
 		// verified -- a difference that decides which copy gets restored.
 		//
 		// The reason is remembered rather than printed here: this loop is
 		// writing a table to stdout, and a diagnostic in the middle of it
 		// would corrupt the thing being read. One line goes to stderr after
 		// the table instead.
+		var status restorepoint.Status
+		readable := false
 		if cmd, cerr := restorepoint.ReadStatusCommand(store.Point(tag)); cerr != nil {
 			unreadable++
 			if firstReason == "" {
@@ -719,17 +853,23 @@ func runListRestorePoints(ctx context.Context, cfg syncConfig) error {
 				firstTag, firstReason = tag.String(), "decode it: "+derr.Error()
 			}
 		} else {
-			verify = s.Verify
-			if s.Checkpoint != "" {
-				checkpoint = s.Checkpoint
-			}
+			status, readable = s, true
 		}
-		// "unknown" rather than a guess when the sidecar is missing or
-		// unreadable: the whole reason it exists is to say how much
-		// confidence a restore point has earned, and inventing one would
-		// defeat it.
-		fmt.Printf("%-20s  %-20s  %-10s  %s\n",
-			tag.At.UTC().Format("2006-01-02 15:04:05"), checkpoint, verify, tag.String())
+		rows = append(rows, restorePointRowFor(tag, status, readable))
+	}
+
+	sortRestorePointRows(rows)
+
+	// TAKEN is when the target published the copy; DATA is the instant its
+	// contents correspond to. They are the same on a healthy pair, and the
+	// two columns differing is itself the diagnosis -- a clock is wrong on
+	// the host running the sync.
+	fmt.Printf("%-20s  %-20s  %-20s  %-10s  %s\n", "TAKEN", "DATA", "CHECKPOINT", "VERIFY", "TAG")
+	for _, r := range rows {
+		fmt.Printf("%-20s  %-20s  %-20s  %-10s  %s\n",
+			r.takenAt.Format("2006-01-02 15:04:05"),
+			r.tag.At.UTC().Format("2006-01-02 15:04:05"),
+			r.checkpoint, r.verify, r.tag.String())
 	}
 
 	// One line for however many rows were affected, naming the first and its

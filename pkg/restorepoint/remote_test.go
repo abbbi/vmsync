@@ -645,7 +645,7 @@ func TestOneRetentionCycle(t *testing.T) {
 
 	fresh := mustTag(t, now.Unix(), "vmsync-cpt-000043")
 	// Prune counts the new one, and runs after it is in place.
-	plan := Prune(append(append([]Tag{}, existing...), fresh), p)
+	plan := Prune(append(append([]Tag{}, existing...), fresh), fresh, nil, p)
 	if len(plan.Keep) != 3 || len(plan.Remove) != 1 {
 		t.Fatalf("plan = %+v, want 3 kept and 1 removed", plan)
 	}

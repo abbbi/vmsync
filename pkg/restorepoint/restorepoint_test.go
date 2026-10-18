@@ -264,7 +264,7 @@ func TestPruneKeepsTheNewest(t *testing.T) {
 	// Deliberately unsorted going in.
 	shuffled := []Tag{tags[3], tags[0], tags[5], tags[1], tags[4], tags[2]}
 
-	plan := Prune(shuffled, Policy{Count: 3, Interval: time.Hour})
+	plan := Prune(shuffled, Tag{}, nil, Policy{Count: 3, Interval: time.Hour})
 	if len(plan.Keep) != 3 || len(plan.Remove) != 3 {
 		t.Fatalf("kept %d, removed %d, want 3 and 3", len(plan.Keep), len(plan.Remove))
 	}
@@ -288,7 +288,7 @@ func TestPruneUnderCount(t *testing.T) {
 		mustTag(t, 1756041600, "vmsync-cpt-000001"),
 		mustTag(t, 1756045200, "vmsync-cpt-000002"),
 	}
-	plan := Prune(tags, Policy{Count: 24, Interval: time.Hour})
+	plan := Prune(tags, Tag{}, nil, Policy{Count: 24, Interval: time.Hour})
 	if len(plan.Remove) != 0 {
 		t.Errorf("removed %v while under the retention count", plan.Remove)
 	}
@@ -299,14 +299,14 @@ func TestPruneUnderCount(t *testing.T) {
 
 func TestPruneWithRetentionOffReportsEverythingAsLeftovers(t *testing.T) {
 	tags := []Tag{mustTag(t, 1756041600, "vmsync-cpt-000001")}
-	plan := Prune(tags, Policy{})
+	plan := Prune(tags, Tag{}, nil, Policy{})
 	if len(plan.Keep) != 0 || len(plan.Remove) != 1 {
 		t.Errorf("with retention off, kept %v removed %v; want nothing kept", plan.Keep, plan.Remove)
 	}
 }
 
 func TestPruneEmpty(t *testing.T) {
-	plan := Prune(nil, Policy{Count: 24, Interval: time.Hour})
+	plan := Prune(nil, Tag{}, nil, Policy{Count: 24, Interval: time.Hour})
 	if len(plan.Keep) != 0 || len(plan.Remove) != 0 {
 		t.Errorf("Prune(nil) = %+v, want empty", plan)
 	}

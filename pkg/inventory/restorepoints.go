@@ -52,7 +52,33 @@ import (
 type RestorePointInfo struct {
 	// Tag is the directory name, and the identifier an operation names.
 	Tag string `json:"tag"`
-	// TakenAtUnix is when the copy was made.
+	// TagAtUnix is the checkpoint instant encoded in the directory name:
+	// when the copy's CONTENTS are from, on the clock of the host that ran
+	// the sync. Always present, because the tag is the directory name.
+	//
+	// Kept beside TakenAtUnix rather than folded into it because the two
+	// answer different questions and two different readers need them. "How
+	// old is this data" is this one, and it is what the newest/oldest gauges
+	// publish and what the engine publishes beside them. "Which copy is the
+	// most recent" is TakenAtUnix, and it is what this list is sorted by and
+	// what retention prunes by. They are equal on a healthy pair and come
+	// apart exactly when a clock is wrong, which is when both are worth
+	// having.
+	TagAtUnix int64 `json:"tag_at_unix"`
+	// TakenAtUnix is when the copy was made, from the sidecar's taken_at,
+	// which the TARGET stamps at publish.
+	//
+	// Not the same thing as CheckpointAtUnix, and this is the field that has
+	// to be the independent one: the checkpoint instant comes from the host
+	// running vmsync, so when that clock is wrong it dates points in the
+	// future, and a reader that sorted by it would call those the newest
+	// copies for as long as the skew lasted. This reader sorts by TakenAtUnix
+	// (see readRestorePointDir), and vmsync_agent_restore_point_newest and
+	// _oldest_timestamp_seconds are derived from it.
+	//
+	// FALLS BACK to the tag instant when no sidecar can be read, which is the
+	// only instant available then. Incomplete is set in that case, so a
+	// caller can tell the two apart.
 	TakenAtUnix int64 `json:"taken_at_unix"`
 	// CheckpointAtUnix is the instant the CONTENTS correspond to, which is
 	// earlier than TakenAt and is what a promotion would measure data loss
@@ -138,7 +164,7 @@ func readRestorePointDir(dir string) []RestorePointInfo {
 		if err != nil {
 			continue
 		}
-		info := RestorePointInfo{Tag: tag.String(), TakenAtUnix: tag.At.Unix(), Checkpoint: tag.Checkpoint}
+		info := RestorePointInfo{Tag: tag.String(), TagAtUnix: tag.At.Unix(), TakenAtUnix: tag.At.Unix(), Checkpoint: tag.Checkpoint}
 
 		b, err := os.ReadFile(filepath.Join(dir, e.Name(), restorepoint.StatusName))
 		if err != nil {
@@ -153,6 +179,14 @@ func readRestorePointDir(dir string) []RestorePointInfo {
 			continue
 		}
 		info.CheckpointAtUnix = st.CheckpointAt
+		// The target's own record of when it published this copy, which is
+		// what the field has always claimed to be and what this list is
+		// sorted by. It was previously filled from the tag -- the checkpoint
+		// instant -- making it a duplicate of CheckpointAtUnix and leaving
+		// st.TakenAt, decoded two lines above, unread.
+		if st.TakenAt > 0 {
+			info.TakenAtUnix = st.TakenAt
+		}
 		info.Source = st.Source
 		info.Verify = st.Verify
 		info.Disks = st.Disks

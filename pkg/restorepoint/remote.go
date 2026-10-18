@@ -198,6 +198,12 @@ type Listing struct {
 }
 
 // ParseListing reads ListCommand's output.
+//
+// Output carrying NEITHER marker is already an error rather than an empty
+// store, because parseEntries refuses it -- see the end of that function.
+// Worth knowing when reading ParseAllStatus, which had to grow the same
+// refusal of its own: a sidecar read is a different command against the same
+// directory, and the two answers must not be interchangeable.
 func ParseListing(out string) (Listing, error) {
 	var l Listing
 	entries, none, err := parseEntries(out)
@@ -381,6 +387,181 @@ func ReadStatusCommand(p Point) (string, error) {
 		return "", err
 	}
 	return "cat " + shQuote(path.Join(dir, StatusName)), nil
+}
+
+// Markers for ReadAllStatusCommand and TargetNowCommand.
+//
+// Distinct from the listing's, INCLUDING the outer pair. An earlier version of
+// this bracketed the sidecar read with markerListing/markerListingNone and
+// claimed in this comment that the two could not be confused -- which was
+// false in the direction that mattered: ParseListing read a sidecar dump as a
+// successful listing of a store with no points, and ParseAllStatus read a
+// listing as a store whose points have no sidecars. Both answers are wrong and
+// neither is an error, which is the shape of mistake this package's marker
+// convention exists to make impossible.
+const (
+	markerStatus      = "__VMSYNC_RP_SC_LIST__"
+	markerStatusNone  = "__VMSYNC_RP_SC_NONE__"
+	markerStatusPoint = "__VMSYNC_RP_SC__"
+	markerStatusEnd   = "__VMSYNC_RP_SC_END__"
+	markerNow         = "__VMSYNC_RP_NOW__"
+)
+
+// TargetNowCommand asks the target for its own clock, as a unix time.
+//
+// WHY THE TARGET'S AND NOT OURS: a restore point's publish instant is what
+// retention is ordered by, and it has to come from a clock that is the same
+// one from run to run. vmsync's own time.Now() is not that clock -- vmsync
+// runs on the source side and drives the target over SSH, so a source whose
+// clock is wrong stamps every instant wrong, including the one meant to be
+// independent of it. The store lives on the target; the target's clock is the
+// only one that stays put underneath it.
+func TargetNowCommand() string {
+	return "echo " + markerNow + "; date +%s"
+}
+
+// ParseTargetNow reads TargetNowCommand's output.
+func ParseTargetNow(out string) (time.Time, error) {
+	started := false
+	for _, raw := range strings.Split(out, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if line == markerNow {
+			started = true
+			continue
+		}
+		if !started {
+			continue
+		}
+		secs, err := strconv.ParseInt(line, 10, 64)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("asked the target for its clock and it answered %q, which is not a unix time", line)
+		}
+		return time.Unix(secs, 0).UTC(), nil
+	}
+	return time.Time{}, fmt.Errorf("asked the target for its clock and got no answer")
+}
+
+// ReadAllStatusCommand fetches every sidecar in one domain's store, in a
+// single round trip, each preceded by the directory it came from.
+//
+// ONE command rather than ReadStatusCommand per point, because this runs on
+// the prune path once per sync: a store at -retention=24 would otherwise pay
+// twenty-four SSH round trips to answer a question the caller needs in full
+// before it can decide anything.
+//
+// The shell only cats. Every byte between the markers is decoded in Go by
+// DecodeStatus -- nothing here reads JSON in sh, which would be fragile and a
+// second implementation of a format Status already owns.
+//
+// A point whose sidecar is missing or unreadable yields an EMPTY body rather
+// than failing the command, and that distinction matters: "this point has no
+// recorded publish time" and "the store could not be read at all" are
+// different answers, and Prune treats them differently.
+func ReadAllStatusCommand(s Store) (string, error) {
+	root, err := s.Path()
+	if err != nil {
+		return "", err
+	}
+	q := shQuote(root)
+	// Concatenated rather than Sprintf'd, because the command contains a
+	// printf format of its own and the two sets of verbs would have to be
+	// escaped past each other to no benefit.
+	//
+	// printf with the directory as an ARGUMENT, not inside the format and not
+	// via echo -- the same rule StatusCommand states, for the same reason one
+	// step further on. echo with a variable argument is the one construct
+	// POSIX leaves unspecified: under dash, which is /bin/sh on Debian and
+	// Ubuntu, a backslash in the value is expanded, and the store root is
+	// built from an operator-supplied -target-disk-path. A single "\n" in it
+	// would split every marker line in two and make the whole read parse as
+	// nothing.
+	return "if [ -d " + q + " ]; then echo " + markerStatus +
+		"; for d in " + q + "/*/; do " +
+		"printf '%s %s\\n' " + shQuote(markerStatusPoint) + " \"${d}\"; " +
+		"cat \"${d}" + StatusName + "\" 2>/dev/null; echo; echo " + markerStatusEnd + "; " +
+		"done; else echo " + markerStatusNone + "; fi; exit 0", nil
+}
+
+// ParseAllStatus reads ReadAllStatusCommand's output into the instant THIS
+// host published each point, keyed by tag.
+//
+// Best-effort per point, and OMISSION is the failure mode rather than a
+// default: a sidecar that cannot be decoded, or that carries no taken_at, is
+// left out of the map entirely. Prune distinguishes "published at this
+// instant" from "no recorded instant", and a zero time would be neither --
+// it would claim the point was published in 1970 and make it the first thing
+// deleted.
+//
+// A directory name that is not a tag is skipped in silence. The listing is
+// what reports unrecognised entries; doing it here too would warn twice about
+// the same directory on every single sync.
+//
+// AN ERROR AND AN EMPTY MAP ARE DIFFERENT ANSWERS, which is why this returns
+// both. "The store holds no points, or none with sidecars" is a fact the
+// caller can prune on. "This output is not mine" -- no opening marker, so a
+// listing, an error banner, an SSH MOTD or a truncated stream -- is not: it
+// is indistinguishable from the first if both come back as an empty map, and
+// the caller would then prune by the checkpoint instant believing it had
+// looked. That is the defect this whole change exists to stop, reachable by
+// a mismatched marker rather than by a skewed clock.
+func ParseAllStatus(out string) (map[string]time.Time, error) {
+	published := map[string]time.Time{}
+	var name string
+	var body []string
+	started := false
+
+	flush := func() {
+		if name == "" {
+			return
+		}
+		defer func() { name, body = "", nil }()
+		tag, err := ParseTag(name)
+		if err != nil {
+			return
+		}
+		st, err := DecodeStatus([]byte(strings.Join(body, "\n")))
+		if err != nil || st.TakenAt <= 0 {
+			return
+		}
+		published[tag.String()] = time.Unix(st.TakenAt, 0).UTC()
+	}
+
+	for _, raw := range strings.Split(out, "\n") {
+		line := strings.TrimRight(raw, "\r")
+		trimmed := strings.TrimSpace(line)
+		if !started {
+			switch trimmed {
+			case markerStatus:
+				started = true
+			case markerStatusNone:
+				// The store does not exist, which is the ordinary state of a
+				// pair that has never used -retention.
+				return published, nil
+			}
+			continue
+		}
+		switch {
+		case trimmed == markerStatusEnd:
+			flush()
+		case strings.HasPrefix(trimmed, markerStatusPoint+" "):
+			// A truncated transfer can leave a record unterminated; starting a
+			// new one flushes what came before rather than merging two bodies
+			// into one unparseable blob.
+			flush()
+			dir := strings.TrimSpace(strings.TrimPrefix(trimmed, markerStatusPoint+" "))
+			name = path.Base(strings.TrimRight(dir, "/"))
+		case name != "":
+			body = append(body, line)
+		}
+	}
+	flush()
+	if !started {
+		return nil, fmt.Errorf("the target's answer did not begin with %s, so it is not a restore point sidecar read", markerStatus)
+	}
+	return published, nil
 }
 
 // CloneCommand materialises a restore point's disks at a path the operator

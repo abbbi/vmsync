@@ -283,26 +283,122 @@ type Plan struct {
 // Pruning AFTER the new one is in place, never before, so an interrupted run
 // leaves too many rather than too few. Too many costs disk; too few costs the
 // thing the feature exists to provide.
-func Prune(existing []Tag, p Policy) Plan {
-	sorted := make([]Tag, len(existing))
-	copy(sorted, existing)
-	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].At.Equal(sorted[j].At) {
-			return sorted[i].Checkpoint > sorted[j].Checkpoint
-		}
-		return sorted[i].At.After(sorted[j].At)
-	})
+//
+// RETENTION IS ORDERED BY publishedAt, NOT BY Tag.At, and that is the whole
+// reason this function takes a map. Tag.At is the checkpoint instant: it says
+// when the DATA is from, which is the right answer for "how far back can this
+// replica be taken" and the wrong one for "which copy should go". It is
+// stamped by the host running vmsync, so a clock that is wrong there dates
+// points in the future, and they then rank above every honestly-dated copy
+// for as long as the skew lasts -- the store deleting real history to keep
+// mislabelled directories. Measured over eight publish-and-prune cycles with
+// a corrected 48h skew, ordering by Tag.At left the store holding two ghosts
+// plus a single real point, and every intervening run had paid for a full
+// reflink copy that the next run deleted.
+//
+// publishedAt comes from each sidecar's taken_at, which is read from THE
+// TARGET's clock at publish time (TargetNowCommand) precisely so that the two
+// instants cannot share a fault. An earlier version of this fix stamped
+// taken_at with vmsync's own time.Now() and was therefore inert: both values
+// came from one clock, so skewing it moved them together and the order did
+// not change at all.
+//
+// A point MISSING from publishedAt ranks below every point that has an entry,
+// ordered among its peers by Tag.At. Not defaulted to zero, and not trusted at
+// face value: a sidecar that cannot be read is a point whose place in the
+// order is unknown, and an unknown must not be able to outrank a known. With
+// publishedAt nil -- no sidecars readable at all -- every point is in that
+// tier and the ordering degrades to exactly what it was before, which is the
+// correct behaviour for a store this run could not learn anything about.
+//
+// keep is the tag this run has just published, and it is NEVER in Remove.
+// Pass the zero Tag when pruning without having published one. That is not
+// redundant with the ordering above: the sidecar of a point published moments
+// ago may not be readable yet on a target that has not fsynced, and the one
+// copy a run must never delete is the one it just made.
+//
+// Reserving its slot rather than appending it keeps the policy honest: the
+// store still ends at Count, with the newest-by-policy filling what is left.
+func Prune(existing []Tag, keep Tag, publishedAt map[string]time.Time, p Policy) Plan {
+	sorted := sortTagsNewestFirst(existing, publishedAt)
+	protected := ""
+	if !keep.At.IsZero() {
+		protected = keep.String()
+	}
+	isKept := func(t Tag) bool { return protected != "" && t.String() == protected }
 
 	if !p.Enabled() {
 		// Retention off: nothing is kept by policy, so everything present is
 		// somebody's leftovers. The caller decides whether to act on that;
-		// this only reports it.
-		return Plan{Remove: reversed(sorted)}
+		// this only reports it -- except for a point this very run made,
+		// which is not somebody's leftovers by any reading.
+		var rm []Tag
+		for _, t := range reversed(sorted) {
+			if isKept(t) {
+				continue
+			}
+			rm = append(rm, t)
+		}
+		return Plan{Remove: rm}
 	}
 	if len(sorted) <= p.Count {
 		return Plan{Keep: sorted}
 	}
-	return Plan{Keep: sorted[:p.Count], Remove: reversed(sorted[p.Count:])}
+
+	// One slot reserved for the new point, the rest filled newest-first.
+	budget := p.Count
+	if protected != "" {
+		budget--
+	}
+	kept := make([]Tag, 0, p.Count)
+	var remove []Tag
+	for _, t := range sorted {
+		switch {
+		case isKept(t):
+			// Placed below, so it cannot be spent out of the budget.
+		case budget > 0:
+			kept = append(kept, t)
+			budget--
+		default:
+			remove = append(remove, t)
+		}
+	}
+	if protected != "" {
+		kept = append(kept, keep)
+		kept = sortTagsNewestFirst(kept, publishedAt)
+	}
+	return Plan{Keep: kept, Remove: reversed(remove)}
+}
+
+// sortTagsNewestFirst orders newest first, with the checkpoint breaking a tie
+// -- two points in the same second are ordered by the chain that produced
+// them.
+//
+// Two tiers, and the tier beats the instant. A point with a recorded publish
+// time is ordered by THAT, and always ranks above one without, which falls
+// back to Tag.At. See Prune for why a source-supplied instant cannot be
+// allowed to outrank one this host recorded itself.
+func sortTagsNewestFirst(in []Tag, publishedAt map[string]time.Time) []Tag {
+	out := make([]Tag, len(in))
+	copy(out, in)
+	rank := func(t Tag) (time.Time, int) {
+		if at, ok := publishedAt[t.String()]; ok {
+			return at, 0
+		}
+		return t.At, 1
+	}
+	sort.Slice(out, func(i, j int) bool {
+		ai, ti := rank(out[i])
+		aj, tj := rank(out[j])
+		if ti != tj {
+			return ti < tj
+		}
+		if ai.Equal(aj) {
+			return out[i].Checkpoint > out[j].Checkpoint
+		}
+		return ai.After(aj)
+	})
+	return out
 }
 
 func reversed(in []Tag) []Tag {

@@ -369,6 +369,7 @@ type ReportLeftover struct {
 
 type ReportRestorePoint struct {
 	Tag              string `json:"tag"`
+	TagAtUnix        int64  `json:"tag_at_unix"`
 	TakenAtUnix      int64  `json:"taken_at_unix"`
 	CheckpointAtUnix int64  `json:"checkpoint_at_unix,omitempty"`
 	Checkpoint       string `json:"checkpoint,omitempty"`

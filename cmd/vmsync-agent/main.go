@@ -1060,6 +1060,7 @@ func reportRestorePoints(in []inventory.RestorePointInfo) []ReportRestorePoint {
 	for _, r := range in {
 		out = append(out, ReportRestorePoint{
 			Tag:              r.Tag,
+			TagAtUnix:        r.TagAtUnix,
 			TakenAtUnix:      r.TakenAtUnix,
 			CheckpointAtUnix: r.CheckpointAtUnix,
 			Checkpoint:       r.Checkpoint,
@@ -1122,17 +1123,23 @@ func restorePointGaugeFor(points []ReportRestorePoint) restorePointGauge {
 		if p.Verify == restorepoint.VerifyFailed {
 			g.VerifyFailed++
 		}
-		// The TAG instant, never CheckpointAtUnix, so this is the same number
-		// the engine publishes as vmsync_restore_point_last_taken_timestamp_seconds.
-		// The two are equal by construction today -- the tag is built from the
-		// same checkpoint instant the sidecar records -- and an alert and a
-		// screen disagreeing about the age of one copy would be worse than
-		// either being slightly off.
-		if p.TakenAtUnix > g.NewestUnix {
-			g.NewestUnix = p.TakenAtUnix
+		// The TAG instant, never TakenAtUnix, so this is the same number the
+		// engine publishes as vmsync_restore_point_last_taken_timestamp_seconds,
+		// which is derived from Summarize's Newest and therefore from the tag.
+		// An alert and a screen disagreeing about the age of one copy would be
+		// worse than either being slightly off.
+		//
+		// These gauges answer "how old is this data", which is the checkpoint
+		// instant by definition. TakenAtUnix answers "which copy is the most
+		// recent", which is what the list is sorted by and what retention
+		// prunes by -- a different question with a different right answer as
+		// soon as a clock is wrong. Filling these from it would quietly move
+		// an operator's staleness alert onto the other one.
+		if p.TagAtUnix > g.NewestUnix {
+			g.NewestUnix = p.TagAtUnix
 		}
-		if g.OldestUnix == 0 || p.TakenAtUnix < g.OldestUnix {
-			g.OldestUnix = p.TakenAtUnix
+		if g.OldestUnix == 0 || p.TagAtUnix < g.OldestUnix {
+			g.OldestUnix = p.TagAtUnix
 		}
 	}
 	return g
