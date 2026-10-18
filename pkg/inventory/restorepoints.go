@@ -72,9 +72,15 @@ type RestorePointInfo struct {
 	// to be the independent one: the checkpoint instant comes from the host
 	// running vmsync, so when that clock is wrong it dates points in the
 	// future, and a reader that sorted by it would call those the newest
-	// copies for as long as the skew lasted. This reader sorts by TakenAtUnix
-	// (see readRestorePointDir), and vmsync_agent_restore_point_newest and
-	// _oldest_timestamp_seconds are derived from it.
+	// copies for as long as the skew lasted. RestorePointsFor sorts by this
+	// field -- readRestorePointDir below only reads the directory and does
+	// not order it.
+	//
+	// The agent's newest/oldest gauges are NOT derived from this. They come
+	// from TagAtUnix, because they answer how old the DATA is and are
+	// published beside the engine's gauge of the same meaning. Which copy is
+	// most recent and how old its contents are are different questions, and
+	// they part company exactly when a clock is wrong.
 	//
 	// FALLS BACK to the tag instant when no sidecar can be read, which is the
 	// only instant available then. Incomplete is set in that case, so a

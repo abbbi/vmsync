@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"vmsync/pkg/restorepoint"
+	"vmsync/pkg/util"
 )
 
 // The markers are restorepoint's, repeated here because they are unexported.
@@ -39,7 +40,6 @@ const (
 	testMarkerStatusEnd   = "__VMSYNC_RP_SC_END__"
 	testMarkerStatusList  = "__VMSYNC_RP_SC_LIST__"
 	testMarkerListing     = "__VMSYNC_RP_LIST__"
-	testMarkerNow         = "__VMSYNC_RP_NOW__"
 )
 
 // sidecarRunner answers every command the retention path issues -- the target
@@ -57,30 +57,83 @@ type sidecarRunner struct {
 	failClock       bool
 	garbleClock     bool // exit 0, but the answer is not a unix time
 
+	// dead models what actually happens when the sidecar read fails for
+	// real. ReadAllStatusCommand ends in `exit 0`, so remotessh.Client.Run
+	// can only error on it for a session-level reason -- a failed
+	// NewSession, a wedged transport, a cancelled context. A session that
+	// cannot carry that command cannot carry the listing issued immediately
+	// after it either, so every later command fails too.
+	//
+	// Without this, a fixture that fails only the sidecar read lets the
+	// final re-read succeed and refresh the stats, and a test asserting on
+	// those stats passes whatever the skip path does. That is how the first
+	// version of TestAWithheldPruneReportsTheStoreItActuallyLeftBehind came
+	// to pass against a build with the skip-path summary deleted.
+	dead *bool
+
 	ran       *[]string
 	readCount *int
 }
 
+// askedOrder reads back the points the command names, in order.
+//
+// Derived from the command rather than from the fixture's own list, so the
+// answer is always for the question that was actually asked. A fixture that
+// replied from its own list would keep passing if the command started asking
+// for something else.
+func (r sidecarRunner) askedOrder(cmd string) []string {
+	var out []string
+	rest := cmd
+	for {
+		i := strings.Index(rest, testMarkerStatusPoint+"' '")
+		if i < 0 {
+			return out
+		}
+		rest = rest[i+len(testMarkerStatusPoint)+3:]
+		j := strings.Index(rest, "'")
+		if j < 0 {
+			return out
+		}
+		out = append(out, rest[:j])
+		rest = rest[j:]
+	}
+}
+
 func (r sidecarRunner) Run(_ context.Context, cmd string) (string, error) {
 	*r.ran = append(*r.ran, cmd)
+	if r.dead != nil && *r.dead {
+		return "", fmt.Errorf("ssh: session closed")
+	}
 
 	switch {
-	case strings.Contains(cmd, testMarkerNow):
+	// util.RemoteEpochCommand, which is what targetNow sends. Matched on the
+	// exported constant rather than on "date": if the shared command ever
+	// changes shape this branch stops matching, the stamp falls back to the
+	// local clock, and TestCommitStampsTheSidecarWithTheTargetsClock fails --
+	// which is the right way round for a test to notice.
+	case cmd == util.RemoteEpochCommand:
 		if r.failClock {
 			return "", fmt.Errorf("ssh: connection closed")
 		}
 		if r.garbleClock {
 			// The command ran and exited 0; date was not there to answer it.
 			// Distinct from the branch above, and reached by different code.
-			return testMarkerNow + "\nsh: date: command not found\n", nil
+			return "sh: date: command not found\n", nil
 		}
-		return testMarkerNow + "\n" + fmt.Sprintf("%d", r.targetAt.Unix()) + "\n", nil
+		// A login banner ahead of the answer, which is why targetNow borrows
+		// util.ParseRemoteEpoch instead of reading the first line: plenty of
+		// real hosts print an MOTD on every SSH session.
+		return "Welcome to target01. Last login: Tue Oct 14 09:12:03 2026\n" +
+			fmt.Sprintf("%d", r.targetAt.Unix()) + "\n", nil
 
 	// Checked before the listing: the sidecar read names the same directory.
 	case strings.Contains(cmd, testMarkerStatusPoint):
 		*r.readCount++
 		if r.failSidecarRead {
-			return "cat: permission denied", fmt.Errorf("exit status 1")
+			if r.dead != nil {
+				*r.dead = true
+			}
+			return "", fmt.Errorf("ssh: session closed")
 		}
 		if r.garbleSidecar {
 			// Exit 0, but it is the LISTING's answer. A parser that only
@@ -91,17 +144,22 @@ func (r sidecarRunner) Run(_ context.Context, cmd string) (string, error) {
 		}
 		var b strings.Builder
 		b.WriteString(testMarkerStatusList + "\n")
-		for _, name := range r.entries {
-			st, ok := r.sidecars[name]
-			if !ok {
-				continue
+		// ONE RECORD PER POINT THE COMMAND ASKED ABOUT, in the order it asked,
+		// which is what the real shell emits: the header and end marker are
+		// echoed unconditionally and only the `cat` in between can fail. A
+		// fixture that skipped the points with no sidecar would answer with
+		// fewer records than were asked for, which ParseAllStatus now refuses
+		// outright -- rightly, since it cannot tell which record is which.
+		for _, name := range r.askedOrder(cmd) {
+			b.WriteString(testMarkerStatusPoint + " " + name + "\n")
+			if st, ok := r.sidecars[name]; ok {
+				body, err := st.Encode()
+				if err != nil {
+					return "", err
+				}
+				b.Write(body)
 			}
-			body, err := st.Encode()
-			if err != nil {
-				return "", err
-			}
-			b.WriteString(testMarkerStatusPoint + " " + r.dir + "/" + name + "/\n")
-			b.Write(body)
+			b.WriteString("\n")
 			b.WriteString(testMarkerStatusEnd + "\n")
 		}
 		return b.String(), nil
@@ -222,11 +280,12 @@ func TestPruneDeletesNothingWhenTheSidecarReadFails(t *testing.T) {
 
 	var ran []string
 	reads := 0
+	dead := false
 	r := &restorePoints{
 		runner: sidecarRunner{
 			dir: f.dir, entries: f.names, sidecars: f.status,
-			failSidecarRead: true,
-			ran:             &ran, readCount: &reads,
+			failSidecarRead: true, dead: &dead,
+			ran: &ran, readCount: &reads,
 		},
 		store:  f.store,
 		point:  f.store.Point(f.tags[3]),
@@ -391,14 +450,21 @@ func TestCommitStampsTheSidecarWithTheTargetsClock(t *testing.T) {
 }
 
 // The clock read failing must not fail a copy that has already been made,
-// and it must fall back to the LOCAL clock -- not to the zero time, which
-// would stamp the point 1970 and send the next prune straight at it.
+// and it must record NO publish time rather than this host's.
 //
-// Both ways the read can fail, because they are different branches:
-// the command erroring, and the command succeeding with an answer that is
-// not a unix time. Asserting only that a sidecar was written would pass
-// against either of them stamping anything at all.
-func TestCommitFallsBackToTheLocalClockWhenTheTargetsCannotBeRead(t *testing.T) {
+// Writing time.Now() here was the one mistake this whole change exists to
+// undo: it is the clock that also stamped checkpoint_at, nothing in Status
+// says which clock wrote the field, and Prune trusts any positive value at
+// face value -- so one failed read under a local skew plants a point that
+// outranks every honestly-dated copy, and a target that can never answer
+// makes the whole store carry the local clock while the ordering claims
+// otherwise. Zero is the truthful answer: the point lands in Prune's unknown
+// tier, below every copy that can account for itself.
+//
+// Both ways the read can fail, because they are different branches: the
+// command erroring, and the command succeeding with an answer that is not a
+// unix time.
+func TestCommitRecordsNoPublishTimeWhenTheTargetsClockCannotBeRead(t *testing.T) {
 	for _, c := range []struct {
 		name   string
 		fail   bool
@@ -418,7 +484,6 @@ func TestCommitFallsBackToTheLocalClockWhenTheTargetsCannotBeRead(t *testing.T) 
 
 			var ran []string
 			reads := 0
-			before := time.Now().Unix()
 			r := &restorePoints{
 				runner: sidecarRunner{
 					dir: dir, entries: []string{tag.String()},
@@ -437,7 +502,6 @@ func TestCommitFallsBackToTheLocalClockWhenTheTargetsCannotBeRead(t *testing.T) 
 			if err := r.commit(context.Background(), "ok", "src01", checkpointAt, "vmsync-cpt-000008"); err != nil {
 				t.Fatalf("commit refused to publish a copy that was already made: %v", err)
 			}
-			after := time.Now().Unix()
 
 			var sidecar string
 			for _, cmd := range ran {
@@ -456,8 +520,13 @@ func TestCommitFallsBackToTheLocalClockWhenTheTargetsCannotBeRead(t *testing.T) 
 			if err != nil {
 				t.Fatalf("taken_at %q: %v", m[1], err)
 			}
-			if got < before || got > after {
-				t.Errorf("taken_at = %d, want this host's clock between %d and %d. A zero or a stale value here would stamp the point far in the past and make it the first thing the next prune deletes", got, before, after)
+			if got != 0 {
+				t.Errorf("taken_at = %d, want 0. Any positive value here is indistinguishable from an instant the target vouched for, and Prune trusts it at face value", got)
+			}
+			// And specifically NOT this host's clock, which is the value an
+			// earlier version wrote and the one that makes the ordering inert.
+			if now := time.Now().Unix(); got > now-120 && got < now+120 {
+				t.Errorf("taken_at = %d is this host's clock, which is also the clock that stamped checkpoint_at", got)
 			}
 		})
 	}

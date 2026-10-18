@@ -296,12 +296,12 @@ type Plan struct {
 // plus a single real point, and every intervening run had paid for a full
 // reflink copy that the next run deleted.
 //
-// publishedAt comes from each sidecar's taken_at, which is read from THE
-// TARGET's clock at publish time (TargetNowCommand) precisely so that the two
-// instants cannot share a fault. An earlier version of this fix stamped
-// taken_at with vmsync's own time.Now() and was therefore inert: both values
-// came from one clock, so skewing it moved them together and the order did
-// not change at all.
+// publishedAt comes from each sidecar's taken_at, which the caller reads from
+// THE TARGET's clock at publish time (util.RemoteEpochCommand, the same pair
+// util.RemoteClockSkew uses) precisely so that the two instants cannot share a
+// fault. An earlier version of this fix stamped taken_at with vmsync's own
+// time.Now() and was therefore inert: both values came from one clock, so
+// skewing it moved them together and the order did not change at all.
 //
 // A point MISSING from publishedAt ranks below every point that has an entry,
 // ordered among its peers by Tag.At. Not defaulted to zero, and not trusted at
@@ -333,13 +333,13 @@ func Prune(existing []Tag, keep Tag, publishedAt map[string]time.Time, p Policy)
 		// this only reports it -- except for a point this very run made,
 		// which is not somebody's leftovers by any reading.
 		var rm []Tag
-		for _, t := range reversed(sorted) {
+		for _, t := range sorted {
 			if isKept(t) {
 				continue
 			}
 			rm = append(rm, t)
 		}
-		return Plan{Remove: rm}
+		return Plan{Remove: oldestFirst(rm)}
 	}
 	if len(sorted) <= p.Count {
 		return Plan{Keep: sorted}
@@ -367,7 +367,37 @@ func Prune(existing []Tag, keep Tag, publishedAt map[string]time.Time, p Policy)
 		kept = append(kept, keep)
 		kept = sortTagsNewestFirst(kept, publishedAt)
 	}
-	return Plan{Keep: kept, Remove: reversed(remove)}
+	return Plan{Keep: kept, Remove: oldestFirst(remove)}
+}
+
+// oldestFirst orders what is being deleted by the instant its CONTENTS are
+// from, oldest first, which is what Plan.Remove promises.
+//
+// Not the reverse of the rank order, which is what this used to be. The rank
+// has two tiers -- points with a recorded publish instant, then points
+// without -- so reversing it frees least-useful-BY-RANK first, and with both
+// tiers populated that is not oldest-first by any clock. On a bulk prune
+// (a store that grew while the sidecar read was failing, or while -retention
+// was off) the two orders diverge badly: a deletion interrupted part-way
+// through had destroyed a copy from an hour ago while copies from days
+// earlier were still on disk, which is the opposite of the "stays
+// recoverable if it is interrupted" the contract is there for.
+//
+// The rank decides WHAT goes. It does not have to decide the order the caller
+// frees it in.
+func oldestFirst(in []Tag) []Tag {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]Tag, len(in))
+	copy(out, in)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].At.Equal(out[j].At) {
+			return out[i].Checkpoint < out[j].Checkpoint
+		}
+		return out[i].At.Before(out[j].At)
+	})
+	return out
 }
 
 // sortTagsNewestFirst orders newest first, with the checkpoint breaking a tie
@@ -398,17 +428,6 @@ func sortTagsNewestFirst(in []Tag, publishedAt map[string]time.Time) []Tag {
 		}
 		return ai.After(aj)
 	})
-	return out
-}
-
-func reversed(in []Tag) []Tag {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]Tag, len(in))
-	for i, t := range in {
-		out[len(in)-1-i] = t
-	}
 	return out
 }
 

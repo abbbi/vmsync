@@ -341,7 +341,7 @@ func (r *restorePoints) commit(ctx context.Context, verifyState, source string, 
 	status := restorepoint.Status{
 		Checkpoint:   effectiveCheckpoint,
 		CheckpointAt: checkpointAt.Unix(),
-		TakenAt:      r.targetNow(ctx).Unix(),
+		TakenAt:      r.targetPublishInstant(ctx),
 		Source:       source,
 		Verify:       verifyState,
 		Disks:        disks,
@@ -380,50 +380,105 @@ func (r *restorePoints) commit(ctx context.Context, verifyState, source string, 
 // costs disk, while failing the run over it would throw away a sync that
 // succeeded. What it must not do is stay silent -- a prune that keeps failing
 // is how a target fills up.
-// targetNow reads the clock of the host the restore points live on.
+// targetPublishInstant reads the clock of the host the restore points live
+// on, as unix seconds, and returns 0 when it cannot be read.
 //
-// Falls back to this process's clock, which is what the sidecar used to carry
-// unconditionally and is wrong in exactly the case retention cares about: the
-// checkpoint instant comes from here too, so one skewed clock moves both and
-// the ordering learns nothing. The fallback is still better than refusing to
-// publish a copy that has already been made, and it is loud, because a store
-// that quietly goes back to one clock is the whole defect returning.
-func (r *restorePoints) targetNow(ctx context.Context) time.Time {
-	out, err := r.runner.Run(ctx, restorepoint.TargetNowCommand())
+// util.RemoteEpochCommand and util.ParseRemoteEpoch rather than anything of
+// this file's own. They already existed for util.RemoteClockSkew, which this
+// same sync runs against this same runner, and the parser is the part worth
+// borrowing: it reads the LAST field of the output precisely because a login
+// banner or an MOTD arrives ahead of the answer on plenty of real hosts. A
+// second implementation here was both a duplicate and the worse of the two.
+//
+// One round trip, on the publish path only. Not on every sync -- publishing
+// happens once per retention interval -- so the cheaper alternative of
+// reusing the skew this run already measured would save nothing worth the
+// coupling, and would carry a value sampled much earlier in a long sync.
+//
+// What it does when the read fails is explained at the return below, because
+// that choice is the whole point of the function.
+func (r *restorePoints) targetPublishInstant(ctx context.Context) int64 {
+	out, err := r.runner.Run(ctx, util.RemoteEpochCommand)
 	if err == nil {
-		if at, perr := restorepoint.ParseTargetNow(out); perr == nil {
-			return at
-		} else {
-			err = perr
+		at, perr := util.ParseRemoteEpoch(out)
+		if perr == nil {
+			return at.UTC().Unix()
 		}
+		err = perr
 	}
-	trace.Warning("could not read the target's clock; stamping this restore point with the local one instead. Retention orders by that stamp, and a local clock cannot order copies correctly when it is the clock that is wrong",
+	// ZERO, not this host's clock. Writing time.Now() here would be the one
+	// mistake this whole change exists to undo: it is the same clock that
+	// stamped checkpoint_at, nothing in Status records which clock wrote the
+	// field, and Prune trusts any positive value at face value -- so a single
+	// failed read under a local skew plants a point that outranks every
+	// honestly-dated copy for as long as it survives, and a target that can
+	// never answer (no date on PATH, a command-restricted ssh account) makes
+	// the entire store carry the local clock while the ordering claims
+	// otherwise. There is no way to tell afterwards.
+	//
+	// Absent is the truthful answer: the point lands in Prune's unknown tier,
+	// ranked below every copy that can account for itself and ordered among
+	// its peers by the checkpoint instant, which is exactly what "we do not
+	// know when this was published" should look like. The copy is still
+	// published -- a clock that cannot be read is no reason to throw away
+	// disks that have already been written.
+	trace.Warning("could not read the target's clock, so this restore point is published without a recorded publish time. Retention will rank it below copies that have one, and order it among its peers by the checkpoint instant",
 		"error", err, "tag", r.point.Tag().String())
-	return time.Now()
+	return 0
 }
 
 // publishInstants reads every sidecar's taken_at in one round trip.
 //
 // ok is false only when the store could not be READ -- not when it holds
 // points without sidecars, which is an answer rather than a failure.
-func (r *restorePoints) publishInstants(ctx context.Context) (map[string]time.Time, bool) {
-	cmd, err := restorepoint.ReadAllStatusCommand(r.store)
-	if err != nil {
-		trace.Warning("could not build the restore point sidecar read", "error", err)
-		return nil, false
-	}
-	out, err := r.runner.Run(ctx, cmd)
-	if err != nil {
-		trace.Warning("could not read the restore point sidecars", "error", err, "output", strings.TrimSpace(out))
-		return nil, false
-	}
-	published, err := restorepoint.ParseAllStatus(out)
-	if err != nil {
-		// Exit 0 with unrecognisable output: the command ran and answered
-		// something else. Treated as a failure to read, not as an empty
-		// store, because the two would otherwise be the same answer here.
-		trace.Warning("the target answered the restore point sidecar read with something unrecognisable", "error", err, "output", strings.TrimSpace(out))
-		return nil, false
+// readStatusChunk bounds how many points one command asks about.
+//
+// The command names every point it reads, so its LENGTH grows with the store
+// -- and it is passed to the remote shell as a single argument, which Linux
+// caps at MAX_ARG_STRLEN (128 KiB) regardless of how much room the whole argv
+// has. At roughly 220 bytes per point that ceiling arrives somewhere under a
+// thousand points, and E2BIG on this path would withhold the prune forever on
+// exactly the store that most needs pruning: one that has already grown.
+//
+// A store at -retention=24 is a single chunk. The bound exists for the store
+// that is already too big, which is the one case where getting this wrong
+// compounds.
+const readStatusChunk = 100
+
+func (r *restorePoints) publishInstants(ctx context.Context, points []restorepoint.Tag) (map[string]time.Time, bool) {
+	published := make(map[string]time.Time, len(points))
+	for start := 0; start < len(points); start += readStatusChunk {
+		end := start + readStatusChunk
+		if end > len(points) {
+			end = len(points)
+		}
+		chunk := points[start:end]
+
+		cmd, err := restorepoint.ReadAllStatusCommand(r.store, chunk)
+		if err != nil {
+			trace.Warning("could not build the restore point sidecar read", "error", err)
+			return nil, false
+		}
+		out, err := r.runner.Run(ctx, cmd)
+		if err != nil {
+			trace.Warning("could not read the restore point sidecars", "error", err, "output", strings.TrimSpace(out))
+			return nil, false
+		}
+		part, err := restorepoint.ParseAllStatus(out, chunk)
+		if err != nil {
+			// Exit 0 with unrecognisable output: the command ran and answered
+			// something else. Treated as a failure to read, not as an empty
+			// store, because the two would otherwise be the same answer here.
+			trace.Warning("the target answered the restore point sidecar read with something unrecognisable", "error", err, "output", strings.TrimSpace(out))
+			return nil, false
+		}
+		// ANY chunk failing fails the whole read. A partial map would be
+		// indistinguishable from a store whose later points have no sidecars,
+		// and Prune would rank every unread point below every read one --
+		// deleting the ones it happened not to ask about first.
+		for k, v := range part {
+			published[k] = v
+		}
 	}
 	return published, true
 }
@@ -488,10 +543,27 @@ func (r *restorePoints) prune(ctx context.Context) {
 	// A read that SUCCEEDS and finds no sidecars is a different answer and is
 	// not this branch: those points rank below any that can account for
 	// themselves, and the prune proceeds.
-	publishedAt, ok := r.publishInstants(ctx)
+	publishedAt, ok := r.publishInstants(ctx, listing.Points)
 	if !ok {
 		trace.Warning("not pruning this cycle: the restore point sidecars could not be read, and ordering by the checkpoint instant instead can delete the copy the previous run made. Restore points will accumulate until this succeeds, which vmsync_restore_points_over_count reports",
 			"dir", r.store.String())
+		// Published from the listing ALREADY IN HAND, not from the re-read
+		// below, because in this branch the re-read cannot succeed.
+		//
+		// ReadAllStatusCommand ends in `exit 0`, so a Run error on it is never
+		// the shell disliking the answer -- it is the session. A session that
+		// could not carry the sidecar read cannot carry a listing issued a
+		// moment later either, so the re-read fails too, silently, and the run
+		// goes on reporting the summary computed BEFORE it published its own
+		// point: count one short, over=0, store_readable=1. Every documented
+		// alert stays quiet, and the claim in the warning just above -- that
+		// accumulation shows up in over_count -- was false in exactly the case
+		// that produces it.
+		//
+		// This listing is the post-publish, pre-prune state, and nothing was
+		// pruned, so it is also the final state. Over goes positive here, which
+		// is what makes the sentence above true.
+		applyRestorePointSummary(&r.stats, restorepoint.Summarize(listing, r.policy))
 	} else {
 		plan := restorepoint.Prune(listing.Points, r.point.Tag(), publishedAt, r.policy)
 		for _, tag := range plan.Remove {
@@ -515,6 +587,13 @@ func (r *restorePoints) prune(ctx context.Context) {
 	// becomes visible from outside.
 	if after, err := listRestorePoints(ctx, r.runner, r.store); err == nil {
 		applyRestorePointSummary(&r.stats, restorepoint.Summarize(after, r.policy))
+	} else if ok {
+		// Was silent, and it is the only failure in this function that was.
+		// A run whose re-read fails keeps the summary taken before it
+		// published, so it under-reports the store by its own new point --
+		// worth a line, because the numbers that follow are stale rather
+		// than wrong in any way the reader could spot.
+		trace.Warning("could not re-read the restore point directory after pruning; the counts this run publishes are from before it published its own point", "error", err, "dir", r.store.String())
 	}
 }
 

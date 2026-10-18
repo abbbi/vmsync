@@ -389,7 +389,7 @@ func ReadStatusCommand(p Point) (string, error) {
 	return "cat " + shQuote(path.Join(dir, StatusName)), nil
 }
 
-// Markers for ReadAllStatusCommand and TargetNowCommand.
+// Markers for ReadAllStatusCommand.
 //
 // Distinct from the listing's, INCLUDING the outer pair. An earlier version of
 // this bracketed the sidecar read with markerListing/markerListingNone and
@@ -401,48 +401,17 @@ func ReadStatusCommand(p Point) (string, error) {
 // convention exists to make impossible.
 const (
 	markerStatus      = "__VMSYNC_RP_SC_LIST__"
-	markerStatusNone  = "__VMSYNC_RP_SC_NONE__"
 	markerStatusPoint = "__VMSYNC_RP_SC__"
-	markerStatusEnd   = "__VMSYNC_RP_SC_END__"
-	markerNow         = "__VMSYNC_RP_NOW__"
+	// markerStatusEnd terminates a record. REDUNDANT BY CONSTRUCTION today
+	// and kept deliberately: the next header closes the record before it,
+	// and the end of the stream closes the last one, so removing its echo
+	// changes no behaviour and no test can tell the difference. It is here
+	// because a record whose extent is stated is one a future change cannot
+	// silently extend -- anything added between records would otherwise be
+	// read as the previous record's body. Do not write a test asserting it
+	// is load-bearing; it is not, and that comment would be the defect.
+	markerStatusEnd = "__VMSYNC_RP_SC_END__"
 )
-
-// TargetNowCommand asks the target for its own clock, as a unix time.
-//
-// WHY THE TARGET'S AND NOT OURS: a restore point's publish instant is what
-// retention is ordered by, and it has to come from a clock that is the same
-// one from run to run. vmsync's own time.Now() is not that clock -- vmsync
-// runs on the source side and drives the target over SSH, so a source whose
-// clock is wrong stamps every instant wrong, including the one meant to be
-// independent of it. The store lives on the target; the target's clock is the
-// only one that stays put underneath it.
-func TargetNowCommand() string {
-	return "echo " + markerNow + "; date +%s"
-}
-
-// ParseTargetNow reads TargetNowCommand's output.
-func ParseTargetNow(out string) (time.Time, error) {
-	started := false
-	for _, raw := range strings.Split(out, "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" {
-			continue
-		}
-		if line == markerNow {
-			started = true
-			continue
-		}
-		if !started {
-			continue
-		}
-		secs, err := strconv.ParseInt(line, 10, 64)
-		if err != nil {
-			return time.Time{}, fmt.Errorf("asked the target for its clock and it answered %q, which is not a unix time", line)
-		}
-		return time.Unix(secs, 0).UTC(), nil
-	}
-	return time.Time{}, fmt.Errorf("asked the target for its clock and got no answer")
-}
 
 // ReadAllStatusCommand fetches every sidecar in one domain's store, in a
 // single round trip, each preceded by the directory it came from.
@@ -460,29 +429,55 @@ func ParseTargetNow(out string) (time.Time, error) {
 // than failing the command, and that distinction matters: "this point has no
 // recorded publish time" and "the store could not be read at all" are
 // different answers, and Prune treats them differently.
-func ReadAllStatusCommand(s Store) (string, error) {
+func ReadAllStatusCommand(s Store, points []Tag) (string, error) {
 	root, err := s.Path()
 	if err != nil {
 		return "", err
 	}
-	q := shQuote(root)
+	if len(points) == 0 {
+		// Nothing to ask about. Answered rather than skipped so the caller
+		// still gets "the store was read" instead of a failure.
+		return "echo " + markerStatus + "; exit 0", nil
+	}
+
+	// NAMED, NOT GLOBBED, and the record header carries the TAG rather than
+	// the directory. This is the whole defence of the framing.
+	//
+	// The framing is newline-delimited, so whatever sits on a header line
+	// decides where one record ends and the next begins. A shell glob puts a
+	// FILESYSTEM path there -- built from an operator-supplied
+	// -target-disk-path and -target-domain, neither of which rejects a
+	// newline (see store.go's SafeKey, which says so outright). One newline
+	// in that path splits every header in two, every record is dropped, and
+	// ParseAllStatus has still seen its opening marker: it returns an empty
+	// map and NO error, the caller reads that as "the store has no publish
+	// instants", and retention silently falls back to ordering by the
+	// checkpoint instant -- which is audit item 4.9 restored in full, with
+	// every number healthy. printf instead of echo does not help: it stops
+	// the two-character sequence being expanded, not a literal newline.
+	//
+	// A Tag cannot do that. It is unix seconds, a hyphen, and a checkpoint
+	// name that checkpointRe has already constrained to [A-Za-z0-9._-], so a
+	// header built from one holds no newline, no marker and no shell
+	// metacharacter. The caller has the tags already: they come from the
+	// listing it just parsed, which takes the path only as a quoted argument
+	// to ls and is immune to all of this.
+	//
 	// Concatenated rather than Sprintf'd, because the command contains a
 	// printf format of its own and the two sets of verbs would have to be
-	// escaped past each other to no benefit.
-	//
-	// printf with the directory as an ARGUMENT, not inside the format and not
-	// via echo -- the same rule StatusCommand states, for the same reason one
-	// step further on. echo with a variable argument is the one construct
-	// POSIX leaves unspecified: under dash, which is /bin/sh on Debian and
-	// Ubuntu, a backslash in the value is expanded, and the store root is
-	// built from an operator-supplied -target-disk-path. A single "\n" in it
-	// would split every marker line in two and make the whole read parse as
-	// nothing.
-	return "if [ -d " + q + " ]; then echo " + markerStatus +
-		"; for d in " + q + "/*/; do " +
-		"printf '%s %s\\n' " + shQuote(markerStatusPoint) + " \"${d}\"; " +
-		"cat \"${d}" + StatusName + "\" 2>/dev/null; echo; echo " + markerStatusEnd + "; " +
-		"done; else echo " + markerStatusNone + "; fi; exit 0", nil
+	// escaped past each other to no benefit. The tag still goes through
+	// printf as an ARGUMENT, never inside the format -- StatusCommand's rule,
+	// kept here even though a validated tag could not exploit it, because the
+	// next person to edit this line should not have to re-derive why.
+	var b strings.Builder
+	b.WriteString("echo " + markerStatus + "; ")
+	for _, t := range points {
+		b.WriteString("printf '%s %s\\n' " + shQuote(markerStatusPoint) + " " + shQuote(t.String()) + "; ")
+		b.WriteString("cat " + shQuote(path.Join(root, t.String(), StatusName)) + " 2>/dev/null; echo; ")
+		b.WriteString("echo " + markerStatusEnd + "; ")
+	}
+	b.WriteString("exit 0")
+	return b.String(), nil
 }
 
 // ParseAllStatus reads ReadAllStatusCommand's output into the instant THIS
@@ -507,59 +502,89 @@ func ReadAllStatusCommand(s Store) (string, error) {
 // the caller would then prune by the checkpoint instant believing it had
 // looked. That is the defect this whole change exists to stop, reachable by
 // a mismatched marker rather than by a skewed clock.
-func ParseAllStatus(out string) (map[string]time.Time, error) {
+func ParseAllStatus(out string, asked []Tag) (map[string]time.Time, error) {
 	published := map[string]time.Time{}
-	var name string
-	var body []string
+
+	// POSITION DECIDES WHICH POINT A RECORD IS ABOUT. The header is only
+	// checked against it.
+	//
+	// The framing is in-band: a line inside a sidecar BODY that begins with
+	// the point marker opens a new record. If the header were authoritative,
+	// a hand-edited or foreign status.json could name any point it liked --
+	// and naming one that WAS asked about is the case that matters, because
+	// the command asks in listing order and a tag begins with unix seconds,
+	// so the oldest point is read first and its body can speak for every
+	// point after it. A forged instant in the future pins that point at the
+	// top of the order and gets the honest copies around it deleted: audit
+	// 4.9's steady state with no clock wrong anywhere.
+	//
+	// An earlier version here kept a set of asked-for names and took the
+	// first record per point. That stops a forgery that FOLLOWS the genuine
+	// record and not one that precedes it -- and preceding is the reachable
+	// direction. Correlating by position removes the question: the command
+	// is built from this same slice, in this order, one record each.
+	//
+	// A record count that does not match is an ERROR, not a partial answer.
+	// An injected header shifts every record after it, so refusing the whole
+	// read is both the only safe reading and the one that fails closed: the
+	// caller withholds the prune rather than deleting by an order it cannot
+	// account for.
+	type record struct {
+		header string
+		body   []string
+	}
+	var records []record
+	var cur *record
 	started := false
 
-	flush := func() {
-		if name == "" {
-			return
+	closeRecord := func() {
+		if cur != nil {
+			records = append(records, *cur)
+			cur = nil
 		}
-		defer func() { name, body = "", nil }()
-		tag, err := ParseTag(name)
-		if err != nil {
-			return
-		}
-		st, err := DecodeStatus([]byte(strings.Join(body, "\n")))
-		if err != nil || st.TakenAt <= 0 {
-			return
-		}
-		published[tag.String()] = time.Unix(st.TakenAt, 0).UTC()
 	}
 
 	for _, raw := range strings.Split(out, "\n") {
 		line := strings.TrimRight(raw, "\r")
 		trimmed := strings.TrimSpace(line)
 		if !started {
-			switch trimmed {
-			case markerStatus:
+			if trimmed == markerStatus {
 				started = true
-			case markerStatusNone:
-				// The store does not exist, which is the ordinary state of a
-				// pair that has never used -retention.
-				return published, nil
 			}
 			continue
 		}
 		switch {
 		case trimmed == markerStatusEnd:
-			flush()
+			closeRecord()
 		case strings.HasPrefix(trimmed, markerStatusPoint+" "):
-			// A truncated transfer can leave a record unterminated; starting a
-			// new one flushes what came before rather than merging two bodies
-			// into one unparseable blob.
-			flush()
-			dir := strings.TrimSpace(strings.TrimPrefix(trimmed, markerStatusPoint+" "))
-			name = path.Base(strings.TrimRight(dir, "/"))
-		case name != "":
-			body = append(body, line)
+			// Opening a record closes the one before it, so a transfer cut
+			// mid-body costs that record and not the one after it.
+			closeRecord()
+			cur = &record{header: strings.TrimSpace(strings.TrimPrefix(trimmed, markerStatusPoint+" "))}
+		case cur != nil:
+			cur.body = append(cur.body, line)
 		}
 	}
-	flush()
+	closeRecord()
+
 	if !started {
 		return nil, fmt.Errorf("the target's answer did not begin with %s, so it is not a restore point sidecar read", markerStatus)
+	}
+	if len(records) != len(asked) {
+		return nil, fmt.Errorf("asked the target about %d restore points and its answer held %d records; refusing to guess which is which", len(asked), len(records))
+	}
+	for i, rec := range records {
+		want := asked[i].String()
+		if rec.header != want {
+			return nil, fmt.Errorf("record %d of the target's answer is headed %q where %q was asked for", i+1, rec.header, want)
+		}
+		st, err := DecodeStatus([]byte(strings.Join(rec.body, "\n")))
+		if err != nil || st.TakenAt <= 0 {
+			// Omitted, not defaulted. A zero would claim the point was
+			// published in 1970 and make it the first thing deleted.
+			continue
+		}
+		published[want] = time.Unix(st.TakenAt, 0).UTC()
 	}
 	return published, nil
 }

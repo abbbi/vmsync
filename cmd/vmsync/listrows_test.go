@@ -48,9 +48,14 @@ func TestTheRestorePointTableIsOrderedByWhenCopiesWereMade(t *testing.T) {
 	ghost := listTag(t, T.Add(48*time.Hour), "vmsync-cpt-000001") // tag says two days hence
 	honest := listTag(t, T.Add(-time.Hour), "vmsync-cpt-000002")
 
+	// Built in the WRONG order deliberately. The fixture used to be in the
+	// order it then asserted, so replacing the comparator body with
+	// `return false` passed -- the test caught the two wrong orderings it
+	// was written for and not the deletion of the sort, which is the
+	// mutation a refactor actually produces.
 	rows := []restorePointRow{
-		restorePointRowFor(ghost, restorepoint.Status{TakenAt: T.Add(-3 * time.Hour).Unix(), Verify: "ok"}, true),
 		restorePointRowFor(honest, restorepoint.Status{TakenAt: T.Add(-time.Hour).Unix(), Verify: "ok"}, true),
+		restorePointRowFor(ghost, restorepoint.Status{TakenAt: T.Add(-3 * time.Hour).Unix(), Verify: "ok"}, true),
 	}
 	sortRestorePointRows(rows)
 

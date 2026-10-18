@@ -46,7 +46,16 @@ func (r recordingListingRunner) Run(ctx context.Context, cmd string) (string, er
 	// rejects, which skips the prune, which would make every assertion below
 	// pass for the wrong reason.
 	if strings.Contains(cmd, testMarkerStatusPoint) {
-		return testMarkerStatusList + "\n", nil
+		// One empty record per point asked about, which is what the real
+		// shell emits when no sidecar can be read. Answering with none would
+		// be a record-count mismatch, which ParseAllStatus now refuses.
+		var b strings.Builder
+		b.WriteString(testMarkerStatusList + "\n")
+		for _, name := range (sidecarRunner{}).askedOrder(cmd) {
+			b.WriteString(testMarkerStatusPoint + " " + name + "\n\n")
+			b.WriteString(testMarkerStatusEnd + "\n")
+		}
+		return b.String(), nil
 	}
 	return r.fakeListingRunner.Run(ctx, cmd)
 }
@@ -99,6 +108,11 @@ func TestPruneDoesNotDeleteThePointThisRunJustPublished(t *testing.T) {
 	r.prune(context.Background())
 
 	for _, cmd := range ran {
+		// The sidecar read asks about every point by name, so it mentions
+		// this tag by design; only a removal counts.
+		if strings.Contains(cmd, testMarkerStatusPoint) {
+			continue
+		}
 		if strings.Contains(cmd, fresh.String()) {
 			t.Fatalf("prune ran a command naming the point this run just published (%s): %q\nthe run copied every disk, published the point, then deleted it -- and reported outcome=taken", fresh, cmd)
 		}
@@ -106,6 +120,9 @@ func TestPruneDoesNotDeleteThePointThisRunJustPublished(t *testing.T) {
 	// Not vacuous: the policy was over its count, so something had to go.
 	removedOldest := false
 	for _, cmd := range ran {
+		if strings.Contains(cmd, testMarkerStatusPoint) {
+			continue
+		}
 		if strings.Contains(cmd, stale[2].String()) {
 			removedOldest = true
 		}

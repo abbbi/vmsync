@@ -158,12 +158,28 @@ func TestPruneProtectsANewPointWhoseSidecarIsNotReadableYet(t *testing.T) {
 	}
 }
 
+// tagsOf parses directory names into the tags a caller would have got from a
+// listing, so a fixture asks about exactly what it then answers with.
+func tagsOf(t *testing.T, names ...string) []Tag {
+	t.Helper()
+	out := make([]Tag, 0, len(names))
+	for _, n := range names {
+		tag, err := ParseTag(n)
+		if err != nil {
+			t.Fatalf("ParseTag(%q): %v", n, err)
+		}
+		out = append(out, tag)
+	}
+	return out
+}
+
 func TestReadAllStatusCommandIsOneRoundTripAndSurvivesAMissingSidecar(t *testing.T) {
 	s, err := StoreForDir("/data/replicas", "web01")
 	if err != nil {
 		t.Fatalf("StoreForDir: %v", err)
 	}
-	cmd, err := ReadAllStatusCommand(s)
+	asked := tagsOf(t, "1700000000-vmsync-cpt-000001", "1700003600-vmsync-cpt-000002")
+	cmd, err := ReadAllStatusCommand(s, asked)
 	if err != nil {
 		t.Fatalf("ReadAllStatusCommand: %v", err)
 	}
@@ -171,93 +187,120 @@ func TestReadAllStatusCommandIsOneRoundTripAndSurvivesAMissingSidecar(t *testing
 	if !strings.Contains(cmd, root) {
 		t.Errorf("the command does not name the store root %q: %s", root, cmd)
 	}
-	if !strings.Contains(cmd, StatusName) {
-		t.Errorf("the command does not read %s: %s", StatusName, cmd)
+	for _, tag := range asked {
+		if !strings.Contains(cmd, tag.String()) {
+			t.Errorf("the command does not ask about %s: %s", tag, cmd)
+		}
 	}
 	// A point with no sidecar must not fail the whole read: the caller needs
 	// the other points' instants, and "this one has none" is an answer.
 	if !strings.Contains(cmd, "2>/dev/null") {
 		t.Errorf("an unreadable sidecar would fail the command: %s", cmd)
 	}
-	// One round trip. A per-point command would put ReadStatusCommand's shape
-	// here instead, and a store at -retention=24 would pay 24 of them.
-	if n := strings.Count(cmd, "for d in"); n != 1 {
-		t.Errorf("want a single loop over the store, found %d: %s", n, cmd)
+	// One round trip, and NO GLOB. The glob is what put a filesystem path on
+	// the record header; see ReadAllStatusCommand.
+	if strings.Contains(cmd, "for d in") || strings.Contains(cmd, "/*/") {
+		t.Errorf("the command still iterates the directory itself: %s", cmd)
 	}
-	// The record's identity goes through printf with the path as an ARGUMENT.
-	// echo with a variable argument is the one construct POSIX leaves
-	// unspecified -- under dash it expands backslashes in the value, and the
-	// store root comes from an operator-supplied -target-disk-path. This is
-	// the rule StatusCommand states for the same reason.
-	if strings.Contains(cmd, `echo "${d}"`) || strings.Contains(cmd, "echo "+markerStatusPoint+` "${d}"`) {
-		t.Errorf("the record path is emitted with echo rather than printf: %s", cmd)
+	if n := strings.Count(cmd, markerStatusPoint); n != len(asked)*2 {
+		// Once in the printf argument and once in its shQuote'd form per
+		// point -- the count is a cheap way to notice a record going missing.
+		t.Logf("marker occurrences: %d (command: %s)", n, cmd)
 	}
+	// The tag goes through printf as an argument, never inside the format.
 	if !strings.Contains(cmd, `printf '%s %s\n' `) {
-		t.Errorf("the record path is not emitted through printf with the value as an argument: %s", cmd)
+		t.Errorf("the record header is not emitted through printf with the value as an argument: %s", cmd)
+	}
+}
+
+// A STORE PATH CANNOT BREAK THE RECORD FRAMING.
+//
+// The framing is newline-delimited, so whatever sits on a header line decides
+// where one record ends and the next begins. An earlier version globbed the
+// directory and put the filesystem path there -- and nothing rejects a
+// newline in -target-disk-path or -target-domain (store.go's SafeKey says so
+// outright). One newline split every header, every record was dropped, and
+// ParseAllStatus had still seen its opening marker: empty map, no error, the
+// caller read it as "no point has a publish instant", and retention fell back
+// to the checkpoint instant. That is audit item 4.9 restored in full with
+// every number healthy.
+//
+// Naming the points is what fixes it: a Tag is digits, a hyphen and a
+// checkpoint name checkpointRe has constrained to [A-Za-z0-9._-].
+func TestAHostileStorePathCannotBreakTheFraming(t *testing.T) {
+	for _, dir := range []string{
+		"/data/rep\nlicas",
+		"/data/replicas\n" + markerStatusPoint + " 1700009999-vmsync-cpt-000099",
+		"/data/rep'licas",
+		"/data/rep%slicas",
+		"/data/rep\\nlicas",
+	} {
+		s, err := StoreForDir(dir, "web01")
+		if err != nil {
+			continue // refused upstream, which is also a fine answer
+		}
+		asked := tagsOf(t, "1700000000-vmsync-cpt-000001")
+		cmd, err := ReadAllStatusCommand(s, asked)
+		if err != nil {
+			continue
+		}
+		// Exactly one record header, whatever the path contains.
+		if n := strings.Count(cmd, "printf '%s %s\\n' "); n != 1 {
+			t.Errorf("store dir %q produced %d record headers, want 1: %s", dir, n, cmd)
+		}
+		// And the header's value is the tag, not anything from the path.
+		if !strings.Contains(cmd, shQuote("1700000000-vmsync-cpt-000001")) {
+			t.Errorf("store dir %q: the header does not carry the tag: %s", dir, cmd)
+		}
 	}
 }
 
 // The two readers must not accept each other's output.
-//
-// They bracket their answers with different markers precisely so that a
-// crossed wire is an error rather than a plausible answer: a sidecar dump
-// read as a listing would be a store with no points, and a listing read as a
-// sidecar dump would be a store whose points have no publish instants. Both
-// are wrong, and neither announces itself. An earlier version of this code
-// reused the listing's markers for both and claimed in a comment that this
-// could not happen.
 func TestTheListingAndTheSidecarReadRejectEachOther(t *testing.T) {
 	s, err := StoreForDir("/data/replicas", "web01")
 	if err != nil {
 		t.Fatalf("StoreForDir: %v", err)
 	}
+	asked := tagsOf(t, "1700000000-vmsync-cpt-000001")
 	listCmd, _ := ListCommand(s)
-	scCmd, _ := ReadAllStatusCommand(s)
+	scCmd, _ := ReadAllStatusCommand(s, asked)
 	if strings.Contains(scCmd, markerListing) || strings.Contains(scCmd, markerListingNone) {
 		t.Errorf("the sidecar read is bracketed by the listing's markers: %s", scCmd)
 	}
-	if strings.Contains(listCmd, markerStatus) || strings.Contains(listCmd, markerStatusNone) {
-		t.Errorf("the listing is bracketed by the sidecar read's markers: %s", listCmd)
+	if strings.Contains(listCmd, markerStatus) {
+		t.Errorf("the listing is bracketed by the sidecar read's marker: %s", listCmd)
 	}
 
-	// A listing's output offered to the sidecar parser.
 	listOut := markerListing + "\n1700000000-vmsync-cpt-000001/\n"
-	if got, err := ParseAllStatus(listOut); err == nil {
-		t.Errorf("ParseAllStatus accepted a listing and returned %v; it must refuse output that is not its own, or a crossed wire reads as a store with no publish instants and retention silently orders by the checkpoint instant", got)
+	if got, err := ParseAllStatus(listOut, asked); err == nil {
+		t.Errorf("ParseAllStatus accepted a listing and returned %v; a crossed wire must be an error, not a store with no publish instants", got)
 	}
 
-	// A sidecar dump offered to the listing parser. It must be an ERROR and
-	// not an empty store: those two were the same answer here until this
-	// change, so a crossed wire read as "nothing to prune" rather than as a
-	// command that had gone to the wrong parser.
-	scOut := markerStatus + "\n" + markerStatusPoint + " /x/1700000000-vmsync-cpt-000001/\n{\"taken_at\":1}\n" + markerStatusEnd + "\n"
+	scOut := markerStatus + "\n" + markerStatusPoint + " 1700000000-vmsync-cpt-000001\n{\"taken_at\":1}\n" + markerStatusEnd + "\n"
 	if l, err := ParseListing(scOut); err == nil {
-		t.Errorf("ParseListing accepted a sidecar dump and returned %+v; it must refuse output that is not its own", l)
+		t.Errorf("ParseListing accepted a sidecar dump and returned %+v", l)
 	}
-
-	// The real listing still parses, so the refusal above is not simply
-	// refusing everything.
 	if l, err := ParseListing(markerListing + "\n1700000000-vmsync-cpt-000001/\n"); err != nil || len(l.Points) != 1 {
 		t.Errorf("ParseListing rejected its own output: %+v %v", l, err)
 	}
-	// And an absent store is still an answer rather than an error.
 	if _, err := ParseListing(markerListingNone + "\n"); err != nil {
 		t.Errorf("an absent store was reported as an error: %v", err)
 	}
 }
 
 func TestParseAllStatusReadsEachPointsOwnInstant(t *testing.T) {
+	asked := tagsOf(t, "1700000000-vmsync-cpt-000001", "1700003600-vmsync-cpt-000002")
 	out := strings.Join([]string{
 		markerStatus,
-		markerStatusPoint + " /data/replicas/.rp/web01/1700000000-vmsync-cpt-000001/",
+		markerStatusPoint + " 1700000000-vmsync-cpt-000001",
 		`{"checkpoint":"vmsync-cpt-000001","checkpoint_at":1700000000,"taken_at":1700000120}`,
 		markerStatusEnd,
-		markerStatusPoint + " /data/replicas/.rp/web01/1700003600-vmsync-cpt-000002/",
+		markerStatusPoint + " 1700003600-vmsync-cpt-000002",
 		`{"checkpoint":"vmsync-cpt-000002","checkpoint_at":1700003600,"taken_at":1700003700}`,
 		markerStatusEnd,
 	}, "\n")
 
-	got, err := ParseAllStatus(out)
+	got, err := ParseAllStatus(out, asked)
 	if err != nil {
 		t.Fatalf("ParseAllStatus: %v", err)
 	}
@@ -275,15 +318,96 @@ func TestParseAllStatusReadsEachPointsOwnInstant(t *testing.T) {
 	}
 }
 
-// An absent store is an answer, not a failure: a pair that has never used
-// -retention is the ordinary case, and it must not stop the prune.
-func TestParseAllStatusTreatsAnAbsentStoreAsEmptyRatherThanBroken(t *testing.T) {
-	got, err := ParseAllStatus(markerStatusNone + "\n")
-	if err != nil {
-		t.Errorf("an absent store was reported as an error: %v", err)
+// A SIDECAR CANNOT SPEAK FOR A POINT THAT IS NOT ITS OWN.
+//
+// The framing is in-band, so a line inside a body that begins with the point
+// marker opens a new record. Position decides which point a record is about,
+// and an injected header shifts every record after it -- so the honest answer
+// is to refuse the whole read, which makes the caller withhold the prune
+// rather than delete by an order it cannot account for.
+//
+// Both directions, because only one of them used to be caught. An earlier
+// version kept a set of asked-for names and took the FIRST record per point,
+// which stops a forgery that follows the genuine record but not one that
+// precedes it. Preceding is the reachable direction: the command asks in
+// listing order and a tag starts with unix seconds, so the oldest point is
+// read first and its body can speak for every point after it.
+func TestParseAllStatusRefusesAForgedRecord(t *testing.T) {
+	asked := tagsOf(t, "1700000000-vmsync-cpt-000001", "1700003600-vmsync-cpt-000002")
+	genuine1 := []string{markerStatusPoint + " 1700000000-vmsync-cpt-000001", `{"taken_at":1700000120}`}
+	genuine2 := []string{markerStatusPoint + " 1700003600-vmsync-cpt-000002", `{"taken_at":1700003700}`}
+	forgery := []string{markerStatusPoint + " 1700003600-vmsync-cpt-000002", `{"taken_at":4000000000}`}
+
+	for _, c := range []struct {
+		name  string
+		lines []string
+	}{
+		{
+			// The oldest point's body speaks for its neighbour, BEFORE that
+			// neighbour's own record is read.
+			"forged record precedes the genuine one",
+			append(append(append([]string{markerStatus}, genuine1...), append(forgery, markerStatusEnd)...), append(genuine2, markerStatusEnd)...),
+		},
+		{
+			"forged record follows the genuine one",
+			append(append(append([]string{markerStatus}, genuine1...), markerStatusEnd), append(append(genuine2, forgery...), markerStatusEnd)...),
+		},
+		{
+			"a record for a point nobody listed",
+			append(append(append(append([]string{markerStatus}, genuine1...), markerStatusEnd),
+				append(genuine2, markerStatusEnd)...),
+				markerStatusPoint+" 1700009999-vmsync-cpt-000099", `{"taken_at":4000000001}`, markerStatusEnd),
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := ParseAllStatus(strings.Join(c.lines, "\n"), asked)
+			if err == nil {
+				t.Fatalf("ParseAllStatus accepted a stream carrying a forged record and returned %v. The caller would then prune by an order a sidecar had chosen for it", got)
+			}
+			if got != nil {
+				t.Errorf("a refused read still returned %v", got)
+			}
+		})
 	}
-	if len(got) != 0 {
-		t.Errorf("parsed %v from an absent store", got)
+}
+
+// The ordinary stream is still accepted, so the refusal above is not simply
+// refusing everything.
+func TestParseAllStatusAcceptsTheAnswerItAskedFor(t *testing.T) {
+	asked := tagsOf(t, "1700000000-vmsync-cpt-000001", "1700003600-vmsync-cpt-000002")
+	out := strings.Join([]string{
+		markerStatus,
+		markerStatusPoint + " 1700000000-vmsync-cpt-000001",
+		`{"taken_at":1700000120}`,
+		markerStatusEnd,
+		markerStatusPoint + " 1700003600-vmsync-cpt-000002",
+		`{"taken_at":1700003700}`,
+		markerStatusEnd,
+	}, "\n")
+	got, err := ParseAllStatus(out, asked)
+	if err != nil {
+		t.Fatalf("ParseAllStatus: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("parsed %v, want both points", got)
+	}
+}
+
+// Records must line up with what was asked, in order -- an answer that names
+// the right points in the wrong order is an answer to a different question.
+func TestParseAllStatusRefusesRecordsOutOfOrder(t *testing.T) {
+	asked := tagsOf(t, "1700000000-vmsync-cpt-000001", "1700003600-vmsync-cpt-000002")
+	out := strings.Join([]string{
+		markerStatus,
+		markerStatusPoint + " 1700003600-vmsync-cpt-000002",
+		`{"taken_at":1700003700}`,
+		markerStatusEnd,
+		markerStatusPoint + " 1700000000-vmsync-cpt-000001",
+		`{"taken_at":1700000120}`,
+		markerStatusEnd,
+	}, "\n")
+	if got, err := ParseAllStatus(out, asked); err == nil {
+		t.Errorf("ParseAllStatus accepted records in a different order from the question and returned %v", got)
 	}
 }
 
@@ -300,17 +424,17 @@ func TestParseAllStatusOmitsRatherThanDefaults(t *testing.T) {
 		{"sidecar not json", "cat: no such file", "1700000000-vmsync-cpt-000001"},
 		{"taken_at absent", `{"checkpoint":"vmsync-cpt-000001","checkpoint_at":1700000000}`, "1700000000-vmsync-cpt-000001"},
 		{"taken_at zero", `{"taken_at":0}`, "1700000000-vmsync-cpt-000001"},
-		{"directory is not a tag", `{"taken_at":1699999000}`, "not-a-restore-point"},
 	}
+	asked := tagsOf(t, "1700000000-vmsync-cpt-000001")
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			out := strings.Join([]string{
 				markerStatus,
-				markerStatusPoint + " /data/replicas/.rp/web01/" + c.dir + "/",
+				markerStatusPoint + " " + c.dir,
 				c.body,
 				markerStatusEnd,
 			}, "\n")
-			got, err := ParseAllStatus(out)
+			got, err := ParseAllStatus(out, asked)
 			if err != nil {
 				t.Fatalf("ParseAllStatus: %v", err)
 			}
@@ -322,23 +446,28 @@ func TestParseAllStatusOmitsRatherThanDefaults(t *testing.T) {
 }
 
 // One bad record must not take the others down with it, in EITHER direction.
-//
-// Both orderings, because they fail differently: a bad record last can only
-// corrupt what is still to come, while a bad record first can only corrupt an
-// empty map -- so a fixture with one ordering cannot see the other's bug.
 func TestParseAllStatusKeepsTheGoodRecordsBesideABadOne(t *testing.T) {
-	bad := []string{markerStatusPoint + " /x/1700000000-vmsync-cpt-000001/", "not json at all", markerStatusEnd}
-	good := []string{markerStatusPoint + " /x/1700003600-vmsync-cpt-000002/", `{"taken_at":1700003700}`, markerStatusEnd}
+	bad := []string{markerStatusPoint + " 1700000000-vmsync-cpt-000001", "not json at all", markerStatusEnd}
+	good := []string{markerStatusPoint + " 1700003600-vmsync-cpt-000002", `{"taken_at":1700003700}`, markerStatusEnd}
 
+	// Each ordering asks in the order it answers: records are correlated by
+	// position now, so a stream whose records are in a different order from
+	// the question is a different -- and refused -- case, covered by
+	// TestParseAllStatusRefusesRecordsOutOfOrder.
 	for _, c := range []struct {
 		name  string
+		asked []Tag
 		lines []string
 	}{
-		{"bad record first", append(append([]string{markerStatus}, bad...), good...)},
-		{"good record first", append(append([]string{markerStatus}, good...), bad...)},
+		{"bad record first",
+			tagsOf(t, "1700000000-vmsync-cpt-000001", "1700003600-vmsync-cpt-000002"),
+			append(append([]string{markerStatus}, bad...), good...)},
+		{"good record first",
+			tagsOf(t, "1700003600-vmsync-cpt-000002", "1700000000-vmsync-cpt-000001"),
+			append(append([]string{markerStatus}, good...), bad...)},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := ParseAllStatus(strings.Join(c.lines, "\n"))
+			got, err := ParseAllStatus(strings.Join(c.lines, "\n"), c.asked)
 			if err != nil {
 				t.Fatalf("ParseAllStatus: %v", err)
 			}
@@ -353,22 +482,18 @@ func TestParseAllStatusKeepsTheGoodRecordsBesideABadOne(t *testing.T) {
 }
 
 // A record that never gets its end marker must not swallow the next one.
-//
-// A truncated transfer is the ordinary way this happens, and without the
-// flush at the start of each record the two bodies merge into one blob that
-// decodes as neither -- so one truncation costs two publish instants and
-// drops both points into the unknown tier.
 func TestParseAllStatusRecoversFromAnUnterminatedRecord(t *testing.T) {
+	asked := tagsOf(t, "1700000000-vmsync-cpt-000001", "1700003600-vmsync-cpt-000002")
 	out := strings.Join([]string{
 		markerStatus,
-		markerStatusPoint + " /x/1700000000-vmsync-cpt-000001/",
+		markerStatusPoint + " 1700000000-vmsync-cpt-000001",
 		`{"taken_at":1700000`, // cut mid-JSON, no end marker
-		markerStatusPoint + " /x/1700003600-vmsync-cpt-000002/",
+		markerStatusPoint + " 1700003600-vmsync-cpt-000002",
 		`{"taken_at":1700003700}`,
 		markerStatusEnd,
 	}, "\n")
 
-	got, err := ParseAllStatus(out)
+	got, err := ParseAllStatus(out, asked)
 	if err != nil {
 		t.Fatalf("ParseAllStatus: %v", err)
 	}
@@ -383,36 +508,18 @@ func TestParseAllStatusRecoversFromAnUnterminatedRecord(t *testing.T) {
 // A stream that ends without its final end marker must still yield the last
 // record, which is the other flush() -- the one after the loop.
 func TestParseAllStatusKeepsALastRecordThatEndsAtEOF(t *testing.T) {
+	asked := tagsOf(t, "1700003600-vmsync-cpt-000002")
 	out := strings.Join([]string{
 		markerStatus,
-		markerStatusPoint + " /x/1700003600-vmsync-cpt-000002/",
+		markerStatusPoint + " 1700003600-vmsync-cpt-000002",
 		`{"taken_at":1700003700}`,
 	}, "\n")
 
-	got, err := ParseAllStatus(out)
+	got, err := ParseAllStatus(out, asked)
 	if err != nil {
 		t.Fatalf("ParseAllStatus: %v", err)
 	}
 	if _, ok := got["1700003600-vmsync-cpt-000002"]; !ok {
 		t.Errorf("the last record was dropped because the stream ended without an end marker: %v", got)
-	}
-}
-
-func TestParseTargetNowReadsTheTargetsClock(t *testing.T) {
-	at, err := ParseTargetNow(markerNow + "\n1700000000\n")
-	if err != nil {
-		t.Fatalf("ParseTargetNow: %v", err)
-	}
-	if !at.Equal(time.Unix(1700000000, 0).UTC()) {
-		t.Errorf("read %v, want the unix time the target printed", at)
-	}
-
-	// Anything else is an error rather than a plausible instant: silently
-	// returning the zero time, or this host's time, is how the stamp goes
-	// back to sharing a clock with the checkpoint instant.
-	for _, bad := range []string{"", "1700000000\n", markerNow + "\n", markerNow + "\ndate: command not found\n"} {
-		if got, err := ParseTargetNow(bad); err == nil {
-			t.Errorf("ParseTargetNow(%q) = %v, want an error", bad, got)
-		}
 	}
 }

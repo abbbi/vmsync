@@ -111,19 +111,22 @@ func TestRestorePointsForOrdersByWhenTheTargetPublishedThem(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	// Lexically, the ghost's directory sorts AFTER the honest one, so a
-	// reader that did not sort at all would also put it last. It is the
-	// publish instant that has to decide, and here it disagrees with both
-	// the tag instant and the name.
-	writeStampedPoint(t, root, "1700172800-vmsync-cpt-000001", 1700172800, 1699996400)
-	writeStampedPoint(t, root, "1700000000-vmsync-cpt-000002", 1700000000, 1700000100)
+	// os.ReadDir returns these in LEXICAL order, and the fixture is built so
+	// that lexical order is the WRONG answer: the ghost's directory sorts
+	// first and its copy was published first, while the honest point sorts
+	// last and was published last. A reader that did not sort at all would
+	// therefore return them ghost-first, which is what this test rejects.
+	// The earlier fixture had lexical order already matching the answer, so
+	// deleting RestorePointsFor's sort.Slice passed it.
+	writeStampedPoint(t, root, "1700000000-vmsync-cpt-000001", 1700000000, 1699996400)
+	writeStampedPoint(t, root, "1700172800-vmsync-cpt-000002", 1700172800, 1700000100)
 
 	got := RestorePointsFor(d)
 	if len(got) != 2 {
 		t.Fatalf("read %d points, want 2: %+v", len(got), got)
 	}
-	if got[0].Tag != "1700000000-vmsync-cpt-000002" {
-		t.Errorf("the list starts with %s, want the copy the target published most recently. This list is what an operator reads down during an incident, and ordering it by the tag puts a mislabelled copy at the top", got[0].Tag)
+	if got[0].Tag != "1700172800-vmsync-cpt-000002" {
+		t.Errorf("the list starts with %s, want the copy the target published most recently (1700172800-vmsync-cpt-000002). This list is what an operator reads down during an incident, and leaving it in directory order puts the older copy at the top", got[0].Tag)
 	}
 }
 
