@@ -177,18 +177,27 @@ func TestDescribeLockHolderIsActionable(t *testing.T) {
 		t.Errorf("describing an unattributed lock gave %q", got)
 	}
 
-	writeStamp(t, dir, "target-web01", RunLockIdentity{
-		PID: 1 << 30, Kind: "sync", SourceDomain: "web01",
-		TargetRef: "dr01:web01", RunID: "run-abc", StartedAtUnix: 1800000000,
-	})
+	// PROVABLY gone, because the clearance advice asserted below is only
+	// earned by a proof. This fixture carried no boot id, which the
+	// description did not need while it consulted RunLockHeld -- so the
+	// fixture itself was a state where the advice said "stale" and
+	// BreakRunLockDecision refused. deadIdentity proves death by the reboot
+	// proof, which needs nothing from /proc.
+	requireProvableHolderDeath(t)
+	id := deadIdentity()
+	id.Kind, id.SourceDomain, id.TargetRef, id.RunID = "sync", "web01", "dr01:web01", "run-abc"
+	id.StartedAtUnix = 1800000000
+	writeStamp(t, dir, "target-web01", id)
 	got := DescribeLockHolder(dir, "target-web01")
 	for _, want := range []string{"sync", "web01", "dr01:web01", "run-abc", "2027-01-15"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("description %q is missing %q", got, want)
 		}
 	}
-	// And it tells the operator the lock is stale, which is the actionable half.
-	if !strings.Contains(got, "-break-target-lock") {
+	// And it tells the operator the lock is stale, which is the actionable
+	// half. Nothing holds this lock, so the clearance is the true answer here
+	// -- which is the whole distinction holderadvice_test.go is about.
+	if !strings.Contains(got, "-break-target-lock can clear it") {
 		t.Errorf("description %q does not name the way past a stale lock", got)
 	}
 }

@@ -73,16 +73,17 @@ func stampedLock(t *testing.T, id RunLockIdentity) (string, string) {
 //
 // The record says its holder is gone AND that is true -- but the record
 // describes whoever last WROTE the file, and the lock belongs to whoever holds
-// the flock. Nothing clears the stamp on any release path, and three acquirers
-// of the target lock write none of their own, so a live holder routinely
-// inherits a dead predecessor's record. Deciding from the record alone unlinked
-// the lock from under a running restore.
+// the flock. Nothing clears the stamp on any release path, the unleased shell
+// hold writes none of its own, and every other acquirer's stamp is best-effort
+// by contract -- so a live holder routinely inherits a dead predecessor's
+// record. Deciding from the record alone unlinked the lock from under a running
+// restore.
 func TestBreakRunLockDecisionRefusesWhileTheLockIsStillHeld(t *testing.T) {
 	requireProvableHolderDeath(t)
 	dir, key := stampedLock(t, deadIdentity())
 
-	// A live holder that wrote nothing, exactly like the unleased shell hold,
-	// -promote and a local -restore.
+	// A live holder that wrote nothing, exactly like the unleased shell hold --
+	// or like any other acquirer whose best-effort stamp failed.
 	holder, err := os.OpenFile(RunLockPath(dir, key), os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatalf("open the lock file as a holder: %v", err)

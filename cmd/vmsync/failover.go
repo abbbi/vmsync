@@ -210,9 +210,10 @@ func runPromote(ctx context.Context, cfg syncConfig) (runErr error) {
 	// sshd session by hand.
 	//
 	// Worse than nothing, in fact: acquisition never truncates the file, so a
-	// previous holder's stamp survives underneath this one. The blocked
-	// caller is then shown a DEAD process's identity and told the lock is
-	// stale, while a live promotion holds it.
+	// previous holder's stamp survives underneath this one. The blocked caller
+	// is then shown a DEAD process's identity while a live promotion holds the
+	// lock -- and, before DescribeLockHolder learned to probe the lock itself,
+	// was told that lock was stale and safe to break.
 	//
 	// Best-effort, as everywhere else this is written: provenance, not
 	// correctness, and refusing to promote during a disaster because a

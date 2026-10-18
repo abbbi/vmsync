@@ -303,10 +303,13 @@ func acquireTargetRunLock(ctx context.Context, cfg syncConfig, runner remoteRunn
 	// empty either: acquisition never truncates, so a predecessor's stamp
 	// survives underneath a new holder. What -break-target-lock and
 	// DescribeLockHolder then read is a DEAD process's identity while a live
-	// restore holds the lock -- so an operator blocked by this restore is
-	// told the lock is stale and pointed at the verb that breaks it, which
-	// would unlink the lock from under the restore and let a sync overwrite
-	// the disks it is rolling back.
+	// restore holds the lock. Both ask the kernel before concluding anything
+	// now (util.runLockFree), so neither clears it and neither calls it stale
+	// -- but an operator blocked by this restore is still shown a record
+	// naming the wrong process, and everything they do next rests on their own
+	// reading of which host is driving. Before that probe existed, the verb
+	// unlinked the lock from under the restore and let a sync overwrite the
+	// disks it was rolling back.
 	//
 	// Best-effort for the reason main()'s copy gives: this is provenance,
 	// not correctness, and refusing a restore because a diagnostic could not

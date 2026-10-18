@@ -64,9 +64,11 @@ type BreakLockDecision struct {
 // BreakRunLockDecision decides whether the lock for key may be broken, from the
 // provenance its holder recorded and the state of this host.
 //
-// Pure with respect to everything except /proc and the lock file: it takes no
-// lock, kills nothing and deletes nothing, so a caller can print the decision and
-// then ask a human. The action itself is the caller's.
+// Pure with respect to everything except /proc and the lock file: it kills
+// nothing and deletes nothing, so a caller can print the decision and then ask a
+// human. The action itself is the caller's. It does take the flock, but only to
+// ask whether it could -- see runLockFree, which releases it in the same breath
+// and leaves nothing behind.
 //
 // FAILS CLOSED, the opposite of RunLockHeld, and for the opposite reason. There,
 // "cannot tell" means launch and let the real lock decide, which costs a wasted
@@ -97,11 +99,13 @@ func BreakRunLockDecision(dir, key, expectBinary string) BreakLockDecision {
 	// currently holds the flock, and those are not the same process.
 	//
 	// Nothing clears the stamp: the file is never unlinked on any release path,
-	// and three acquirers of the target lock write no stamp of their own -- the
-	// unleased shell hold (remotelock.go's `exec 9>>`, append-only by design),
-	// -promote, and a local -restore, the last two launched by the agent. So a
-	// LIVE holder routinely inherits a dead predecessor's record, every link of
-	// that confirmed by test on 2026-10-06. Without this check the decision
+	// and the unleased shell hold (remotelock.go's `exec 9>>`, append-only by
+	// design) writes no stamp at all. Every other acquirer -- a sync, -promote,
+	// a local -restore, the helper's leased hold -- does stamp, but
+	// WriteRunLockIdentity is best-effort by contract, so one failed stamp puts
+	// a LIVE holder under a dead predecessor's record again. That is why the
+	// stamping cannot be the guarantee and this check is. Every link of it
+	// confirmed by test on 2026-10-06. Without this check the decision
 	// read "its holder is gone" and unlinked the lock from under a running
 	// restore, after which the next sync created a fresh file, won it, and
 	// wrote the same qcow2 images the restore was rolling back.
@@ -242,6 +246,48 @@ func proveHolderGone(id RunLockIdentity, f hostFacts) (bool, string) {
 // Used by the refusals that must not be a bare exit 75. "Another vmsync is
 // working on this" is not actionable during a disaster; "the sync from hv-a that
 // started at 02:14 holds it, run id 0b9f5c2e" is.
+//
+// THREE OUTCOMES, NOT TWO, and the third is the one this had wrong. The record
+// describes whoever last WROTE the file; the lock belongs to whoever holds the
+// flock, and those are not the same process. Nothing unlinks the file on any
+// release path, the unleased shell hold stamps nothing at all, and every other
+// stamp is best-effort by contract -- so a live holder routinely inherits a
+// dead predecessor's record, and a description that reads only the record
+// calls a live lock stale.
+//
+// Not a corner case here: the caller reaches this ONLY after AcquireRunLock
+// returned ErrLockHeld, so the kernel has just proven something holds the
+// lock. "Stale, safe to break" was wrong by construction every time the record
+// looked dead. And it composed badly -- -break-target-lock then refuses and
+// tells the operator to end the holder "if that process is genuinely gone",
+// which vmsync has just said it is. During a promote, in the disaster the
+// replica exists for, that reads as an instruction to kill whatever holds the
+// lock. Sometimes that is a live restore rolling the disks back.
+//
+// So it asks the same two questions BreakRunLockDecision asks, in the same
+// order, and has to keep agreeing with it: a description that promises what
+// the verb refuses is worse than the bare exit 75 it replaced, which at least
+// made the operator look. Deliberately holderProvablyGone and not RunLockHeld
+// -- that one FAILS OPEN by design, every "cannot tell" answering "not held",
+// which is the right direction for deciding whether to launch a process and
+// exactly the wrong one for telling an operator a lock is safe to break. On a
+// host where /proc cannot be read for another user's pid it called every live
+// holder stale.
+//
+// THE THIRD OUTCOME MUST NOT TELL THE OPERATOR TO END THE HOLDER. It has proven
+// the RECORDED holder gone, so whatever holds the flock is somebody else -- and
+// nothing here can say who. In the states that reach it that somebody is a live
+// sync or a live restore at least as often as it is an abandoned session, so a
+// bare "end whatever holds the lock" is the two-writer incident with an extra
+// step removed: the operator does not even have to run the verb to get there.
+// It offers the wait first, carries the same hazard clause
+// BreakRunLockDecision states for this state, and only then says how to
+// identify an orphan.
+//
+// A caller that holds this lock itself would see its own hold as "something
+// still holds the lock": flock lives on the open file description, so the
+// probe's fresh descriptor contends with it. Both this and
+// BreakRunLockDecision describe locks their caller failed to take.
 func DescribeLockHolder(dir, key string) string {
 	id, ok, err := ReadRunLockIdentity(dir, key)
 	if err != nil {
@@ -251,7 +297,14 @@ func DescribeLockHolder(dir, key string) string {
 		return "it records no holder, which is what an older vmsync and the unleased shell lock both leave"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "held by pid %d", id.PID)
+	if id.PID > 0 {
+		fmt.Fprintf(&b, "held by pid %d", id.PID)
+	} else {
+		// ReadRunLockIdentity accepts any parseable object, so a record with
+		// no pid field arrives here as pid 0. "held by pid 0" stated a fact
+		// about a process that cannot exist.
+		b.WriteString("held by something the record does not name (it carries no pid)")
+	}
 	if id.Kind != "" {
 		fmt.Fprintf(&b, " running a %s", id.Kind)
 	}
@@ -267,11 +320,22 @@ func DescribeLockHolder(dir, key string) string {
 	if id.RunID != "" {
 		fmt.Fprintf(&b, ", run id %s", id.RunID)
 	}
-	if alive, why := RunLockHeld(id, ""); alive {
-		fmt.Fprintf(&b, " -- still running (%s)", why)
-	} else {
-		fmt.Fprintf(&b, " -- NOT running (%s), so this lock is stale and -break-target-lock can clear it", why)
+	gone, why := holderProvablyGone(id)
+	if !gone {
+		// One sentence for all six of proveHolderGone's refusals, from "it is
+		// still running" to the four that cannot tell. It must not lead with a
+		// hedge, because one of them is a certainty, and it must not point at
+		// the holder: in the cannot-tell states the recorded pid may BE the
+		// live holder, so the advice that is safe in the branch below would be
+		// an instruction to kill a running sync here.
+		fmt.Fprintf(&b, " -- the lock stands (%s). Waiting is the safe option here: in this state the record may be describing the live holder, so identify it before ending anything", why)
+		return b.String()
 	}
+	if free, whyNot := runLockFree(RunLockPath(dir, key)); !free {
+		fmt.Fprintf(&b, " -- that process is gone (%s), but %s, so this record describes a previous holder rather than the live one, and the live one is unidentified. It may be a sync or a restore writing this replica right now, and ending it would leave two writers on this replica -- the thing this lock exists to prevent. So waiting is the first option: a leased hold releases itself one lease after its driver stops beating, and an unleased one goes when this host's sshd expires the session (see ClientAliveInterval). -break-target-lock refuses this state and has no override; if the holder does turn out to be an abandoned session, `ss -tp | grep sshd` and `loginctl`/`ps` name it", why, whyNot)
+		return b.String()
+	}
+	fmt.Fprintf(&b, " -- NOT running (%s), and nothing is holding the lock, so it is stale and -break-target-lock can clear it", why)
 	return b.String()
 }
 
