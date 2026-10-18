@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"vmsync/pkg/restorepoint"
 )
@@ -641,5 +642,41 @@ func TestCheckRestoreIdentityNamesADiskThatHasNoFilePath(t *testing.T) {
 	// The empty-string rendering this exists to prevent.
 	if strings.Contains(msg, "hold: []") || strings.Contains(msg, "[]") {
 		t.Errorf("the refusal renders the unaccounted disk as an empty list: %s", msg)
+	}
+}
+
+// THE ASSESSMENT MUST NOT DATE A POINT TO 1970.
+//
+// An operator reads this screen while deciding whether to restore. Formatting
+// a zero taken_at gives 1970-01-01 and an age of fifty-odd years, which reads
+// as a corrupt or ancient copy -- when the truth is only that the target's
+// clock could not be read when the point was published, and the copy is as
+// good as any other. The instant the CONTENTS are from is on the line above
+// and is always recorded.
+func TestTakenAtDescriptionDoesNotInventADate(t *testing.T) {
+	got := takenAtDescription(0)
+	if strings.Contains(got, "1970") {
+		t.Errorf("a missing publish time renders as %q, which an operator reads as an ancient copy", got)
+	}
+	if !strings.Contains(got, "unknown") {
+		t.Errorf("a missing publish time renders as %q, which does not say it is unknown", got)
+	}
+
+	// A recorded one still reads as a date and an age.
+	at := time.Now().Add(-90 * time.Minute).Unix()
+	got = takenAtDescription(at)
+	if strings.Contains(got, "unknown") {
+		t.Errorf("a recorded publish time renders as %q", got)
+	}
+	if !strings.Contains(got, "ago") {
+		t.Errorf("a recorded publish time renders as %q, with no age", got)
+	}
+	if !strings.Contains(got, time.Unix(at, 0).UTC().Format("2006-01-02")) {
+		t.Errorf("a recorded publish time renders as %q, without its own date", got)
+	}
+	// Negative is as impossible as zero and must read the same way rather
+	// than as a date before the epoch.
+	if got := takenAtDescription(-1); !strings.Contains(got, "unknown") {
+		t.Errorf("a negative publish time renders as %q", got)
 	}
 }

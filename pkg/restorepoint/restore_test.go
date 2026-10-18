@@ -446,3 +446,73 @@ func TestMetadataPlanArmsAndDisarmsTheInFlightRecord(t *testing.T) {
 		}
 	})
 }
+
+// REMOVING last_sync_timestamp IS NOT A SAFE DEFAULT, and this is the test
+// that says so.
+//
+// The next sync reads that field to decide whether the replica was modified
+// out of band. When it is ABSENT the check is skipped entirely with a warning
+// rather than refused (cmd/vmsync/main.go, the `metadataEntryTimestamp == ""`
+// branch) -- so a restore that removed it would silently disable the one
+// guard that exists for a replica whose disks were just replaced wholesale.
+//
+// This became reachable when taken_at gained a legitimate zero: the target's
+// clock may not be readable at publish, in which case vmsync records no
+// publish time rather than one from the wrong clock. Before that, taken_at
+// was always positive and the removal branch was effectively dead.
+func TestMetadataPlanAlwaysLeavesALastSyncTimestampItCan(t *testing.T) {
+	const checkpointAt = 1700000000
+	const takenAt = 1700000120
+
+	hasField := func(updates map[string]string, removals []string, field string) (string, bool, bool) {
+		v, set := updates[field]
+		removed := false
+		for _, r := range removals {
+			if r == field {
+				removed = true
+			}
+		}
+		return v, set, removed
+	}
+
+	t.Run("taken_at recorded: that is what a sync records here", func(t *testing.T) {
+		updates, removals := MetadataPlan(Status{Checkpoint: "c", CheckpointAt: checkpointAt, TakenAt: takenAt}, Provenance{Tag: "t"})
+		v, set, removed := hasField(updates, removals, FieldLastSync)
+		if !set || removed {
+			t.Fatalf("last_sync_timestamp set=%v removed=%v, want set", set, removed)
+		}
+		if v != "1700000120" {
+			t.Errorf("last_sync_timestamp = %q, want the publish instant", v)
+		}
+	})
+
+	t.Run("no taken_at: the checkpoint instant rather than nothing", func(t *testing.T) {
+		updates, removals := MetadataPlan(Status{Checkpoint: "c", CheckpointAt: checkpointAt}, Provenance{Tag: "t"})
+		v, set, removed := hasField(updates, removals, FieldLastSync)
+		if removed {
+			t.Error("last_sync_timestamp was removed, which skips the next sync's out-of-band-write check entirely instead of refusing it")
+		}
+		if !set {
+			t.Fatal("last_sync_timestamp was neither set nor removed")
+		}
+		if v != "1700000000" {
+			t.Errorf("last_sync_timestamp = %q, want the checkpoint instant as the only attested fallback", v)
+		}
+		// And it has to stay OLDER than the mtimes the restore just gave
+		// these files, or the refusal the comment relies on stops firing.
+		if v >= "1700000120" {
+			t.Errorf("the fallback %q is not older than the publish instant, so the next sync would no longer refuse", v)
+		}
+	})
+
+	t.Run("neither recorded: nothing to put there", func(t *testing.T) {
+		updates, removals := MetadataPlan(Status{Checkpoint: "c"}, Provenance{Tag: "t"})
+		_, set, removed := hasField(updates, removals, FieldLastSync)
+		if set {
+			t.Error("last_sync_timestamp was set from a sidecar that records no instant at all")
+		}
+		if !removed {
+			t.Error("last_sync_timestamp was left in place, so it would still describe the replica this restore replaced")
+		}
+	})
+}

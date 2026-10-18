@@ -28,8 +28,9 @@ import (
 // writeStampedPoint materialises a point whose tag and sidecar DISAGREE, which
 // is what a wrong clock on the host running vmsync produces: the directory
 // name carries the checkpoint instant it stamped, the sidecar carries what the
-// target said the time was when it published.
-func writeStampedPoint(t *testing.T, dir, tag string, checkpointAt, takenAt int64) {
+// target said the time was when it published, and publish_seq carries the
+// order it was actually published in.
+func writeStampedPoint(t *testing.T, dir, tag string, checkpointAt, takenAt, seq int64) {
 	t.Helper()
 	p := filepath.Join(dir, tag)
 	if err := os.MkdirAll(p, 0o755); err != nil {
@@ -37,7 +38,7 @@ func writeStampedPoint(t *testing.T, dir, tag string, checkpointAt, takenAt int6
 	}
 	b, err := restorepoint.Status{
 		Checkpoint: "vmsync-cpt-000042", CheckpointAt: checkpointAt, TakenAt: takenAt,
-		Source: "src01", Verify: restorepoint.VerifyNotRun,
+		PublishSeq: seq, Source: "src01", Verify: restorepoint.VerifyNotRun,
 	}.Encode()
 	if err != nil {
 		t.Fatalf("encode: %v", err)
@@ -47,56 +48,107 @@ func writeStampedPoint(t *testing.T, dir, tag string, checkpointAt, takenAt int6
 	}
 }
 
-// taken_at_unix must be the sidecar's taken_at, not the tag's instant.
+// EVERY FIELD REPORTS ITS OWN FACT, and none of them substitutes for another.
 //
-// The field is named for, and documented as, when the copy was made. It was
-// filled from the tag -- the CHECKPOINT instant -- which made it a duplicate
-// of checkpoint_at_unix and left st.TakenAt unread two lines after it was
-// decoded. That is not cosmetic: this list is sorted by it, and the agent
-// derives vmsync_agent_restore_point_newest_timestamp_seconds from it, so a
-// host whose clock ran ahead put its mislabelled copies at the top of the
-// operator's rollback list and called them the newest.
-func TestRestorePointsReportTheInstantTheTargetPublishedThem(t *testing.T) {
+// taken_at_unix used to fall back to the tag instant when the sidecar did not
+// record one -- a different fact, on a different host's clock, under this
+// field's name. The two are now separate and either can be absent without the
+// other covering for it.
+func TestRestorePointsReportEachInstantSeparately(t *testing.T) {
 	dir := replicaDir(t)
 	// Written while the clock ran 48h fast: the tag says two days hence, the
-	// target's own record says it happened first.
-	writeStampedPoint(t, dir, "1700172800-vmsync-cpt-000001", 1700172800, 1699996400)
-	// Written after the correction, and genuinely the newest copy.
-	writeStampedPoint(t, dir, "1700000000-vmsync-cpt-000002", 1700000000, 1700000100)
+	// target's own record says it happened first, and the sequence says it
+	// was published first of the two.
+	writeStampedPoint(t, dir, "1700172800-vmsync-cpt-000001", 1700172800, 1699996400, 1)
+	// Written after the correction.
+	writeStampedPoint(t, dir, "1700000000-vmsync-cpt-000002", 1700000000, 1700000100, 2)
 
 	got := readRestorePointDir(dir)
 	if len(got) != 2 {
 		t.Fatalf("read %d points, want 2: %+v", len(got), got)
 	}
-
 	by := map[string]RestorePointInfo{}
 	for _, p := range got {
 		by[p.Tag] = p
 	}
+
 	ghost := by["1700172800-vmsync-cpt-000001"]
 	if ghost.TakenAtUnix != 1699996400 {
-		t.Errorf("taken_at_unix = %d, want the sidecar's taken_at 1699996400 -- %d is the tag's checkpoint instant, which is a different fact about a different clock",
-			ghost.TakenAtUnix, ghost.CheckpointAtUnix)
+		t.Errorf("taken_at_unix = %d, want the sidecar's taken_at 1699996400", ghost.TakenAtUnix)
 	}
-	if ghost.TakenAtUnix == ghost.CheckpointAtUnix {
-		t.Error("taken_at_unix and checkpoint_at_unix are the same value, so one of the two fields is reporting nothing")
-	}
-
-	// The tag instant is kept beside it, and they must NOT be the same
-	// field: the gauges report how old the data is, the list is ordered by
-	// which copy is most recent, and under a wrong clock those differ.
 	if ghost.TagAtUnix != 1700172800 {
 		t.Errorf("tag_at_unix = %d, want the checkpoint instant from the directory name", ghost.TagAtUnix)
 	}
+	if ghost.PublishSeq != 1 {
+		t.Errorf("publish_seq = %d, want 1", ghost.PublishSeq)
+	}
+	// Three different facts, three different values. Any two of them being
+	// equal here would mean one is standing in for another.
+	if ghost.TakenAtUnix == ghost.TagAtUnix {
+		t.Error("taken_at_unix and tag_at_unix hold the same value, so one of the two is reporting nothing")
+	}
 }
 
-// The ordering lives in RestorePointsFor, not in readRestorePointDir, and has
-// to be asserted through the function that actually does it.
+// A SIDECAR THAT DOES NOT RECORD taken_at REPORTS ZERO, not a substitute.
 //
-// readRestorePointDir appends in os.ReadDir order, which is lexical -- and
-// lexical order over these fixtures happens to match the answer, so asserting
-// the sort against it passes whatever the sort does, including not existing.
-func TestRestorePointsForOrdersByWhenTheTargetPublishedThem(t *testing.T) {
+// Reachable deliberately: the target's clock may not be readable at publish,
+// in which case vmsync records no publish time rather than one from the wrong
+// clock (cmd/vmsync's targetPublishInstant). A reader that filled the gap
+// with the tag instant would present that decision as a fact about the
+// target.
+func TestRestorePointWithNoTakenAtReportsZero(t *testing.T) {
+	dir := replicaDir(t)
+	writeStampedPoint(t, dir, "1700000000-vmsync-cpt-000004", 1700000000, 0, 3)
+
+	got := readRestorePointDir(dir)
+	if len(got) != 1 {
+		t.Fatalf("read %d points, want 1", len(got))
+	}
+	if got[0].TakenAtUnix != 0 {
+		t.Errorf("taken_at_unix = %d, want 0 -- the sidecar does not record one, and anything else here is a different fact wearing this name", got[0].TakenAtUnix)
+	}
+	// The instant the contents are from is still reported, so nothing an
+	// operator needs has gone missing.
+	if got[0].TagAtUnix != 1700000000 {
+		t.Errorf("tag_at_unix = %d, want the checkpoint instant", got[0].TagAtUnix)
+	}
+	// And it still has a place in the order, which is what the list sorts by.
+	if got[0].PublishSeq != 3 {
+		t.Errorf("publish_seq = %d, want 3", got[0].PublishSeq)
+	}
+}
+
+// With no sidecar at all there is nothing but the tag, and Incomplete is what
+// tells a caller that is what they are looking at.
+func TestRestorePointWithoutASidecarReportsOnlyTheTag(t *testing.T) {
+	dir := replicaDir(t)
+	writePoint(t, dir, "1700000000-vmsync-cpt-000003", "")
+
+	got := readRestorePointDir(dir)
+	if len(got) != 1 {
+		t.Fatalf("read %d points, want 1", len(got))
+	}
+	if !got[0].Incomplete {
+		t.Error("a point with no sidecar was not reported as incomplete, so a caller cannot tell an absent record from a recorded zero")
+	}
+	if got[0].TagAtUnix != 1700000000 {
+		t.Errorf("tag_at_unix = %d, want the checkpoint instant, which is all there is", got[0].TagAtUnix)
+	}
+	if got[0].TakenAtUnix != 0 || got[0].PublishSeq != 0 {
+		t.Errorf("a point with no sidecar reported taken_at=%d seq=%d, want both absent", got[0].TakenAtUnix, got[0].PublishSeq)
+	}
+}
+
+// THE LIST IS ORDERED BY THE PUBLISH SEQUENCE, which no clock can reorder.
+//
+// The ordering lives in RestorePointsFor, not in readRestorePointDir, and has
+// to be asserted through the function that actually does it --
+// readRestorePointDir appends in os.ReadDir order.
+//
+// The fixture makes every clock disagree with the answer: the point published
+// SECOND has the older tag and the older taken_at, so only the sequence picks
+// it out. Ordering by either instant would put the other one first.
+func TestRestorePointsForOrdersByThePublishSequence(t *testing.T) {
 	parent := replicaDir(t)
 	d := domainIn(t, parent, "web01", "prod01:web01")
 	store, ok := restorePointStoreFor(d)
@@ -111,55 +163,46 @@ func TestRestorePointsForOrdersByWhenTheTargetPublishedThem(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	// os.ReadDir returns these in LEXICAL order, and the fixture is built so
-	// that lexical order is the WRONG answer: the ghost's directory sorts
-	// first and its copy was published first, while the honest point sorts
-	// last and was published last. A reader that did not sort at all would
-	// therefore return them ghost-first, which is what this test rejects.
-	// The earlier fixture had lexical order already matching the answer, so
-	// deleting RestorePointsFor's sort.Slice passed it.
-	writeStampedPoint(t, root, "1700000000-vmsync-cpt-000001", 1700000000, 1699996400)
-	writeStampedPoint(t, root, "1700172800-vmsync-cpt-000002", 1700172800, 1700000100)
+	// seq 1: the newest tag and the newest taken_at, published FIRST.
+	writeStampedPoint(t, root, "1700172800-vmsync-cpt-000001", 1700172800, 1700172900, 1)
+	// seq 2: the oldest tag and the oldest taken_at, published SECOND.
+	writeStampedPoint(t, root, "1700000000-vmsync-cpt-000002", 1700000000, 1700000100, 2)
 
 	got := RestorePointsFor(d)
 	if len(got) != 2 {
 		t.Fatalf("read %d points, want 2: %+v", len(got), got)
 	}
-	if got[0].Tag != "1700172800-vmsync-cpt-000002" {
-		t.Errorf("the list starts with %s, want the copy the target published most recently (1700172800-vmsync-cpt-000002). This list is what an operator reads down during an incident, and leaving it in directory order puts the older copy at the top", got[0].Tag)
+	if got[0].Tag != "1700000000-vmsync-cpt-000002" {
+		t.Errorf("the list starts with %s, want the copy published most recently (publish_seq 2). Ordering by either instant would have put the other one first, which is the mistake a wrong clock produces", got[0].Tag)
 	}
 }
 
-// With no sidecar there is no target-side instant, so the tag's is all there
-// is -- and Incomplete is what tells a caller which of the two they got.
-func TestRestorePointWithoutASidecarFallsBackToTheTagInstant(t *testing.T) {
-	dir := replicaDir(t)
-	writePoint(t, dir, "1700000000-vmsync-cpt-000003", "")
+// A point with no sequence ranks below every point that has one -- the same
+// two-tier rule retention uses, so the list and the prune cannot disagree
+// about which copy is most recent.
+func TestRestorePointsForRanksUnsequencedPointsLast(t *testing.T) {
+	parent := replicaDir(t)
+	d := domainIn(t, parent, "web01", "prod01:web01")
+	store, _ := restorePointStoreFor(d)
+	root, _ := store.Path()
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
 
-	got := readRestorePointDir(dir)
-	if len(got) != 1 {
-		t.Fatalf("read %d points, want 1", len(got))
-	}
-	if got[0].TakenAtUnix != 1700000000 {
-		t.Errorf("taken_at_unix = %d, want the tag instant 1700000000 as the only thing available", got[0].TakenAtUnix)
-	}
-	if !got[0].Incomplete {
-		t.Error("a point with no sidecar was not reported as incomplete, so a caller cannot tell the fallback instant from a recorded one")
-	}
-}
+	// No sequence, and the NEWEST tag of the three, so any instant-based
+	// order would put it first.
+	writeStampedPoint(t, root, "1700900000-vmsync-cpt-000001", 1700900000, 1700900100, 0)
+	writeStampedPoint(t, root, "1700000000-vmsync-cpt-000002", 1700000000, 1700000100, 1)
+	writeStampedPoint(t, root, "1700003600-vmsync-cpt-000003", 1700003600, 1700003700, 2)
 
-// A sidecar that is present but carries no taken_at -- written by a vmsync
-// from before the target stamped it -- must also fall back rather than
-// reporting 1970, which would put it at the bottom of every list.
-func TestRestorePointWithASidecarMissingTakenAtFallsBack(t *testing.T) {
-	dir := replicaDir(t)
-	writeStampedPoint(t, dir, "1700000000-vmsync-cpt-000004", 1700000000, 0)
-
-	got := readRestorePointDir(dir)
-	if len(got) != 1 {
-		t.Fatalf("read %d points, want 1", len(got))
+	got := RestorePointsFor(d)
+	if len(got) != 3 {
+		t.Fatalf("read %d points, want 3", len(got))
 	}
-	if got[0].TakenAtUnix != 1700000000 {
-		t.Errorf("taken_at_unix = %d, want the tag instant; a zero here reads as 1970 and sorts the point below everything", got[0].TakenAtUnix)
+	if got[0].Tag != "1700003600-vmsync-cpt-000003" {
+		t.Errorf("the list starts with %s, want the highest sequence", got[0].Tag)
+	}
+	if got[2].Tag != "1700900000-vmsync-cpt-000001" {
+		t.Errorf("the list ends with %s, want the point with no sequence -- an unknown must not outrank a known however it is dated", got[2].Tag)
 	}
 }

@@ -623,13 +623,29 @@ func loadRestorePlan(ctx context.Context, client remoteRunner, cfg syncConfig, p
 // Printed on every run, including the one that goes ahead: an operator who
 // passed -force-restore because they had already read this still wants the
 // record of what it did in the same log as the doing.
+// takenAtDescription is what the assessment says about when a restore point
+// was published.
+//
+// "unknown" rather than a date, when the sidecar has no taken_at. Formatting
+// a zero gives 1970-01-01 and an age of fifty-odd years, which an operator
+// reads as a corrupt or ancient copy at the exact moment they are deciding
+// whether to restore it -- when the truth is only that the target's clock
+// could not be read when it was published, and the copy is as good as any
+// other. The instant the CONTENTS are from is on the line above this one and
+// is always recorded, so nothing an operator needs is missing.
+func takenAtDescription(takenAt int64) string {
+	if takenAt <= 0 {
+		return "unknown (the target's clock could not be read when this point was published)"
+	}
+	at := time.Unix(takenAt, 0)
+	return fmt.Sprintf("%s (%s ago)", at.UTC().Format("2006-01-02 15:04:05 UTC"), time.Since(at).Round(time.Minute))
+}
+
 func printRestoreAssessment(cfg syncConfig, plan restorePlan) {
-	age := time.Since(time.Unix(plan.status.TakenAt, 0)).Round(time.Minute)
 
 	fmt.Printf("\nRestore assessment for %s on %s\n", cfg.TargetDomain, cfg.TargetURI)
 	fmt.Printf("  restore point   %s\n", plan.tag)
-	fmt.Printf("  taken           %s (%s ago)\n",
-		time.Unix(plan.status.TakenAt, 0).UTC().Format("2006-01-02 15:04:05 UTC"), age)
+	fmt.Printf("  taken           %s\n", takenAtDescription(plan.status.TakenAt))
 	fmt.Printf("  checkpoint      %s\n", orNone(plan.status.Checkpoint))
 	// Both, side by side. These are the two values the operator is being
 	// asked to trust are the same pair, and checkRestoreIdentity has just

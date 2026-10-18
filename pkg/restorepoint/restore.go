@@ -372,9 +372,38 @@ func MetadataPlan(s Status, r Provenance) (updates map[string]string, removals [
 	} else {
 		removals = append(removals, FieldLastCheckpoint)
 	}
-	if s.TakenAt > 0 {
+	// last_sync_timestamp, and REMOVING IT IS NOT A SAFE DEFAULT.
+	//
+	// The next sync reads this field to decide whether the replica was
+	// modified out of band, and when it is ABSENT that check is skipped
+	// entirely with a warning rather than refused (cmd/vmsync/main.go, the
+	// `metadataEntryTimestamp == ""` branch). So a restore that removed it
+	// would silently disable the one guard that exists for a replica whose
+	// disks have just been replaced wholesale -- which is the opposite of
+	// what the note below about replica_written_at relies on.
+	//
+	// TakenAt is the first choice: it is when the target published this
+	// point, which is the same fact a sync records here, and it is older
+	// than the mtimes the restore has just given these files, so the next
+	// sync still refuses exactly as the note below says.
+	//
+	// CheckpointAt is the fallback, and it IS a different fact -- when the
+	// data is from rather than when it was written. Substituted knowingly:
+	// it is an instant the sidecar actually attests, it is necessarily at or
+	// before the publish time, so it preserves the refusal, and the only
+	// alternatives are a value nothing attests or removing the field and
+	// losing the check. TakenAt is zero when the target's clock could not be
+	// read at publish (see cmd/vmsync's targetPublishInstant), which is a
+	// deliberate "unknown" rather than a malformed sidecar.
+	//
+	// With neither recorded there is nothing to put here and the field goes,
+	// taking the check with it -- unknowable rather than unsafe-by-choice.
+	switch {
+	case s.TakenAt > 0:
 		updates[FieldLastSync] = strconv.FormatInt(s.TakenAt, 10)
-	} else {
+	case s.CheckpointAt > 0:
+		updates[FieldLastSync] = strconv.FormatInt(s.CheckpointAt, 10)
+	default:
 		removals = append(removals, FieldLastSync)
 	}
 	if s.CheckpointAt > 0 {

@@ -82,10 +82,23 @@ type RestorePointInfo struct {
 	// most recent and how old its contents are are different questions, and
 	// they part company exactly when a clock is wrong.
 	//
-	// FALLS BACK to the tag instant when no sidecar can be read, which is the
-	// only instant available then. Incomplete is set in that case, so a
-	// caller can tell the two apart.
+	// ZERO WHEN THE SIDECAR DOES NOT RECORD IT, which it does not when the
+	// target's clock could not be read at publish (see cmd/vmsync's
+	// targetPublishInstant) or when the point predates the field.
+	//
+	// It used to fall back to the tag instant, which is a different fact --
+	// when the DATA is from, on a different host's clock -- presented under
+	// this field's name. TagAtUnix carries that one, so a caller wanting it
+	// can have it and nothing has to guess which of the two it is holding.
 	TakenAtUnix int64 `json:"taken_at_unix"`
+	// PublishSeq is the order the target published this point in, counting
+	// from 1, and zero for a point written before the field existed.
+	//
+	// What this list is SORTED by, because it is the only value here that no
+	// clock can reorder: see restorepoint.Status.PublishSeq. Sorting by an
+	// instant means a host whose clock ran ahead puts its mislabelled copies
+	// at the top of the list an operator reads down during an incident.
+	PublishSeq int64 `json:"publish_seq"`
 	// CheckpointAtUnix is the instant the CONTENTS correspond to, which is
 	// earlier than TakenAt and is what a promotion would measure data loss
 	// from. Zero on a sidecar written before the field existed.
@@ -138,7 +151,30 @@ func RestorePointsFor(d Domain) []RestorePointInfo {
 	// Newest first: an operator reaching for one of these is usually asking
 	// "what is the most recent copy from before the damage", and reads down
 	// until they reach it.
-	sort.Slice(out, func(i, j int) bool { return out[i].TakenAtUnix > out[j].TakenAtUnix })
+	//
+	// BY THE PUBLISH SEQUENCE, which is the only value here no clock can
+	// reorder -- ordering by an instant means a host whose clock ran ahead
+	// puts its mislabelled copies at the top of this list. Points with no
+	// sequence rank below every point that has one, among themselves by the
+	// tag instant, which is the same two-tier rule retention uses
+	// (restorepoint.Prune) so that the list and the prune cannot disagree
+	// about which copy is most recent.
+	sort.Slice(out, func(i, j int) bool {
+		ti, tj := 0, 0
+		if out[i].PublishSeq <= 0 {
+			ti = 1
+		}
+		if out[j].PublishSeq <= 0 {
+			tj = 1
+		}
+		if ti != tj {
+			return ti < tj
+		}
+		if ti == 0 {
+			return out[i].PublishSeq > out[j].PublishSeq
+		}
+		return out[i].TagAtUnix > out[j].TagAtUnix
+	})
 	if len(out) == 0 {
 		return nil
 	}
@@ -170,7 +206,7 @@ func readRestorePointDir(dir string) []RestorePointInfo {
 		if err != nil {
 			continue
 		}
-		info := RestorePointInfo{Tag: tag.String(), TagAtUnix: tag.At.Unix(), TakenAtUnix: tag.At.Unix(), Checkpoint: tag.Checkpoint}
+		info := RestorePointInfo{Tag: tag.String(), TagAtUnix: tag.At.Unix(), Checkpoint: tag.Checkpoint}
 
 		b, err := os.ReadFile(filepath.Join(dir, e.Name(), restorepoint.StatusName))
 		if err != nil {
@@ -185,14 +221,13 @@ func readRestorePointDir(dir string) []RestorePointInfo {
 			continue
 		}
 		info.CheckpointAtUnix = st.CheckpointAt
-		// The target's own record of when it published this copy, which is
-		// what the field has always claimed to be and what this list is
-		// sorted by. It was previously filled from the tag -- the checkpoint
-		// instant -- making it a duplicate of CheckpointAtUnix and leaving
-		// st.TakenAt, decoded two lines above, unread.
-		if st.TakenAt > 0 {
-			info.TakenAtUnix = st.TakenAt
-		}
+		// Both straight from the sidecar, and neither substituted for the
+		// other. taken_at was previously filled from the tag -- the
+		// checkpoint instant -- which made it a duplicate of
+		// CheckpointAtUnix and left st.TakenAt, decoded two lines above,
+		// unread. Zero here means the sidecar does not record it.
+		info.TakenAtUnix = st.TakenAt
+		info.PublishSeq = st.PublishSeq
 		info.Source = st.Source
 		info.Verify = st.Verify
 		info.Disks = st.Disks
