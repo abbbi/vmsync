@@ -25,7 +25,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // THE COMMAND AND THE PARSER, CHECKED AGAINST EACH OTHER.
@@ -46,7 +45,7 @@ import (
 func runSidecarRoundTrip(t *testing.T, base string, specs []struct {
 	name    string
 	takenAt int64
-}) (map[string]time.Time, error, []Tag) {
+}) (map[string]Status, error, []Tag) {
 	t.Helper()
 	store, err := StoreForDir(base, "web01")
 	if err != nil {
@@ -74,7 +73,9 @@ func runSidecarRoundTrip(t *testing.T, base string, specs []struct {
 		if sp.takenAt == 0 {
 			continue // a point with no sidecar at all
 		}
-		b, err := Status{Checkpoint: tag.Checkpoint, CheckpointAt: tag.At.Unix(), TakenAt: sp.takenAt}.Encode()
+		// A sequence too, since that is what retention actually orders by
+		// and the round trip has to carry it.
+		b, err := Status{Checkpoint: tag.Checkpoint, CheckpointAt: tag.At.Unix(), TakenAt: sp.takenAt, PublishSeq: sp.takenAt % 1000}.Encode()
 		if err != nil {
 			t.Fatalf("encode: %v", err)
 		}
@@ -112,16 +113,18 @@ func TestTheCommandAndTheParserAgreeAgainstARealShell(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("parsed %v, want the two points that have a sidecar", got)
 	}
-	if at := got["1700000000-vmsync-cpt-000001"]; !at.Equal(time.Unix(1700000120, 0).UTC()) {
-		t.Errorf("first point published at %v", at)
+	if st := got["1700000000-vmsync-cpt-000001"]; st.TakenAt != 1700000120 || st.PublishSeq != 1700000120%1000 {
+		t.Errorf("first point = %+v, want its own taken_at and publish_seq", st)
 	}
-	if at := got["1700007200-vmsync-cpt-000003"]; !at.Equal(time.Unix(1700007300, 0).UTC()) {
-		t.Errorf("third point published at %v", at)
+	if st := got["1700007200-vmsync-cpt-000003"]; st.TakenAt != 1700007300 || st.PublishSeq != 1700007300%1000 {
+		t.Errorf("third point = %+v", st)
 	}
-	// The point with no sidecar is ABSENT, not zero: a zero would read as
-	// 1970 and make it the first thing the next prune deletes.
+	// The point with no sidecar is ABSENT, not present with zeroes: a zero
+	// sequence is not a place in the publish order, and a record defaulted to
+	// zeroes would be indistinguishable from a real sidecar whose fields are
+	// genuinely absent.
 	if _, ok := got["1700003600-vmsync-cpt-000002"]; ok {
-		t.Errorf("a point with no sidecar was given an instant: %v", got)
+		t.Errorf("a point with no sidecar got a record anyway: %v", got)
 	}
 }
 
@@ -196,15 +199,15 @@ func TestARealShellCannotBeTalkedIntoAForgedRecord(t *testing.T) {
 	// The OLDEST point is read first, so its body is the one that can speak
 	// for the points after it. It claims its neighbour was published in 2096.
 	forged := strings.Join([]string{
-		`{"taken_at":1700000120}`,
+		`{"taken_at":1700000120,"publish_seq":1}`,
 		markerStatusEnd,
 		markerStatusPoint + " 1700003600-vmsync-cpt-000002",
-		`{"taken_at":4000000000}`,
+		`{"taken_at":4000000000,"publish_seq":9999}`,
 	}, "\n")
 	if err := os.WriteFile(filepath.Join(root, names[0], StatusName), []byte(forged), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	b, _ := Status{TakenAt: 1700003700}.Encode()
+	b, _ := Status{TakenAt: 1700003700, PublishSeq: 2}.Encode()
 	if err := os.WriteFile(filepath.Join(root, names[1], StatusName), b, 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -217,8 +220,8 @@ func TestARealShellCannotBeTalkedIntoAForgedRecord(t *testing.T) {
 	got, perr := ParseAllStatus(string(out), tags)
 
 	if perr == nil {
-		if at := got["1700003600-vmsync-cpt-000002"]; at.Equal(time.Unix(4000000000, 0).UTC()) {
-			t.Fatalf("a sidecar forged its neighbour's publish instant: %v", got)
+		if st := got["1700003600-vmsync-cpt-000002"]; st.PublishSeq == 9999 {
+			t.Fatalf("a sidecar forged its neighbour's place in the publish order: %v", got)
 		}
 		t.Errorf("the forged stream was accepted and returned %v; an injected record shifts every record after it, so the only honest answer is to refuse the read", got)
 	}

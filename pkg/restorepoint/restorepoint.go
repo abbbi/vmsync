@@ -203,12 +203,55 @@ const StatusName = "status.json"
 // failed. The image is still valid; what varies is how much confidence to
 // place in it, and that is what this records.
 type Status struct {
-	Checkpoint   string   `json:"checkpoint"`
-	CheckpointAt int64    `json:"checkpoint_at"`
-	TakenAt      int64    `json:"taken_at"`
-	Source       string   `json:"source"`
-	Verify       string   `json:"verify"`
-	Disks        []string `json:"disks"`
+	Checkpoint   string `json:"checkpoint"`
+	CheckpointAt int64  `json:"checkpoint_at"`
+	TakenAt      int64  `json:"taken_at"`
+	// PublishSeq is the order this point was published in, counting from 1.
+	//
+	// RETENTION ORDERS BY THIS AND BY NOTHING ELSE, and it exists because
+	// every instant in this struct comes from a clock that can be wrong.
+	// CheckpointAt is stamped by the host running vmsync; TakenAt by the
+	// target. Ordering by either means a clock step reorders the store: a
+	// host whose clock ran 48h fast leaves points that rank above every
+	// honestly-dated copy until real time catches up, so the store deletes
+	// real history to keep mislabelled directories while every published
+	// number stays healthy. Measured over eight publish-and-prune cycles,
+	// that converges on two ghosts plus a single real point.
+	//
+	// A counter cannot be stepped. Each run takes the highest value already
+	// in the store and adds one, so the sequence is monotonic by
+	// construction whatever any clock does -- the same guarantee a Lamport
+	// clock gives, and for the same reason: when you cannot trust a clock
+	// you can still guarantee order.
+	//
+	// This is also why TakenAt stays exactly what its name says. An earlier
+	// design bent TakenAt into this role, which would have made an
+	// operator-visible timestamp read ahead of real time under skew. Two
+	// fields, each true: this one orders, TakenAt reports.
+	//
+	// ZERO MEANS UNKNOWN -- a point written before this field existed. Prune
+	// ranks those below every point that has one; see sortTagsNewestFirst.
+	PublishSeq int64    `json:"publish_seq"`
+	Source     string   `json:"source"`
+	Verify     string   `json:"verify"`
+	Disks      []string `json:"disks"`
+}
+
+// MaxPublishSeq is the highest sequence any of these points carries, or 0
+// when none of them does.
+//
+// What a publishing run adds one to. Over the whole store rather than over
+// the newest point alone: the newest BY SEQUENCE is the one with the highest
+// value by definition, and asking for the maximum directly means no reader
+// has to agree with any other about which point that is.
+func MaxPublishSeq(statuses map[string]Status) int64 {
+	var max int64
+	for _, st := range statuses {
+		if st.PublishSeq > max {
+			max = st.PublishSeq
+		}
+	}
+	return max
 }
 
 // Encode renders a sidecar. Indented because the first reader of one of these
@@ -284,24 +327,35 @@ type Plan struct {
 // leaves too many rather than too few. Too many costs disk; too few costs the
 // thing the feature exists to provide.
 //
-// RETENTION IS ORDERED BY publishedAt, NOT BY Tag.At, and that is the whole
-// reason this function takes a map. Tag.At is the checkpoint instant: it says
-// when the DATA is from, which is the right answer for "how far back can this
-// replica be taken" and the wrong one for "which copy should go". It is
-// stamped by the host running vmsync, so a clock that is wrong there dates
-// points in the future, and they then rank above every honestly-dated copy
-// for as long as the skew lasts -- the store deleting real history to keep
-// mislabelled directories. Measured over eight publish-and-prune cycles with
-// a corrected 48h skew, ordering by Tag.At left the store holding two ghosts
-// plus a single real point, and every intervening run had paid for a full
-// reflink copy that the next run deleted.
+// RETENTION IS ORDERED BY seq, NOT BY ANY CLOCK, and that is the whole
+// reason this function takes a map.
 //
-// publishedAt comes from each sidecar's taken_at, which the caller reads from
-// THE TARGET's clock at publish time (util.RemoteEpochCommand, the same pair
-// util.RemoteClockSkew uses) precisely so that the two instants cannot share a
-// fault. An earlier version of this fix stamped taken_at with vmsync's own
-// time.Now() and was therefore inert: both values came from one clock, so
-// skewing it moved them together and the order did not change at all.
+// Tag.At is the checkpoint instant: it says when the DATA is from, which is
+// the right answer for "how far back can this replica be taken" and the wrong
+// one for "which copy should go". Ordering by it means a clock step reorders
+// the store, because a host whose clock runs ahead dates points in the future
+// and they then rank above every honestly-dated copy until real time catches
+// up. Measured over eight publish-and-prune cycles with a corrected 48h skew,
+// that left the store holding two ghosts plus a single real point, with every
+// intervening run paying for a reflink copy the next run deleted.
+//
+// Two earlier fixes each moved the problem rather than removing it. Ordering
+// by the sidecar's taken_at stamped with vmsync's own clock was INERT, since
+// that is the clock that also stamps Tag.At -- skewing it moved both together.
+// Ordering by taken_at read from the TARGET's clock was better but still rested
+// on one wall clock: driven over 18 cycles with a target clock that stepped and
+// was corrected, it reproduced the same steady state.
+//
+// seq is Status.PublishSeq: a counter each run raises by one, monotonic by
+// construction, with no clock in it anywhere. See Status.PublishSeq.
+//
+// A point MISSING from seq ranks below every point that has one, ordered among
+// its peers by Tag.At. Not defaulted to zero, and not trusted at face value: a
+// point written before the field existed has no place in the sequence, and an
+// unknown must not be able to outrank a known. With seq nil -- nothing
+// readable at all -- every point is in that tier and the ordering degrades to
+// what it was before, which is the correct behaviour for a store this run
+// could not learn anything about.
 //
 // A point MISSING from publishedAt ranks below every point that has an entry,
 // ordered among its peers by Tag.At. Not defaulted to zero, and not trusted at
@@ -319,8 +373,8 @@ type Plan struct {
 //
 // Reserving its slot rather than appending it keeps the policy honest: the
 // store still ends at Count, with the newest-by-policy filling what is left.
-func Prune(existing []Tag, keep Tag, publishedAt map[string]time.Time, p Policy) Plan {
-	sorted := sortTagsNewestFirst(existing, publishedAt)
+func Prune(existing []Tag, keep Tag, seq map[string]int64, p Policy) Plan {
+	sorted := sortTagsNewestFirst(existing, seq)
 	protected := ""
 	if !keep.At.IsZero() {
 		protected = keep.String()
@@ -365,7 +419,7 @@ func Prune(existing []Tag, keep Tag, publishedAt map[string]time.Time, p Policy)
 	}
 	if protected != "" {
 		kept = append(kept, keep)
-		kept = sortTagsNewestFirst(kept, publishedAt)
+		kept = sortTagsNewestFirst(kept, seq)
 	}
 	return Plan{Keep: kept, Remove: oldestFirst(remove)}
 }
@@ -404,18 +458,24 @@ func oldestFirst(in []Tag) []Tag {
 // -- two points in the same second are ordered by the chain that produced
 // them.
 //
-// Two tiers, and the tier beats the instant. A point with a recorded publish
-// time is ordered by THAT, and always ranks above one without, which falls
-// back to Tag.At. See Prune for why a source-supplied instant cannot be
-// allowed to outrank one this host recorded itself.
-func sortTagsNewestFirst(in []Tag, publishedAt map[string]time.Time) []Tag {
+// Two tiers, and the tier beats the value. A point with a publish sequence is
+// ordered by THAT and always ranks above one without, which falls back to
+// Tag.At. See Prune for why no clock can be allowed to decide this.
+//
+// The two tiers are deliberately not comparable: a sequence counts publishes
+// and an instant counts seconds, so there is no arithmetic that relates them.
+// Ranking every known value above every unknown one is the only ordering that
+// does not invent a relationship between the two.
+func sortTagsNewestFirst(in []Tag, seq map[string]int64) []Tag {
 	out := make([]Tag, len(in))
 	copy(out, in)
-	rank := func(t Tag) (time.Time, int) {
-		if at, ok := publishedAt[t.String()]; ok {
-			return at, 0
+	// tier 0 carries a sequence and is ranked by it; tier 1 does not and is
+	// ranked by the checkpoint instant, in seconds.
+	rank := func(t Tag) (int64, int) {
+		if s, ok := seq[t.String()]; ok && s > 0 {
+			return s, 0
 		}
-		return t.At, 1
+		return t.At.Unix(), 1
 	}
 	sort.Slice(out, func(i, j int) bool {
 		ai, ti := rank(out[i])
@@ -423,10 +483,10 @@ func sortTagsNewestFirst(in []Tag, publishedAt map[string]time.Time) []Tag {
 		if ti != tj {
 			return ti < tj
 		}
-		if ai.Equal(aj) {
+		if ai == aj {
 			return out[i].Checkpoint > out[j].Checkpoint
 		}
-		return ai.After(aj)
+		return ai > aj
 	})
 	return out
 }

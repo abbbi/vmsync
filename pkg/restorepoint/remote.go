@@ -480,8 +480,8 @@ func ReadAllStatusCommand(s Store, points []Tag) (string, error) {
 	return b.String(), nil
 }
 
-// ParseAllStatus reads ReadAllStatusCommand's output into the instant THIS
-// host published each point, keyed by tag.
+// ParseAllStatus reads ReadAllStatusCommand's output into each point's
+// sidecar, keyed by tag.
 //
 // Best-effort per point, and OMISSION is the failure mode rather than a
 // default: a sidecar that cannot be decoded, or that carries no taken_at, is
@@ -502,8 +502,8 @@ func ReadAllStatusCommand(s Store, points []Tag) (string, error) {
 // the caller would then prune by the checkpoint instant believing it had
 // looked. That is the defect this whole change exists to stop, reachable by
 // a mismatched marker rather than by a skewed clock.
-func ParseAllStatus(out string, asked []Tag) (map[string]time.Time, error) {
-	published := map[string]time.Time{}
+func ParseAllStatus(out string, asked []Tag) (map[string]Status, error) {
+	published := map[string]Status{}
 
 	// POSITION DECIDES WHICH POINT A RECORD IS ABOUT. The header is only
 	// checked against it.
@@ -579,12 +579,13 @@ func ParseAllStatus(out string, asked []Tag) (map[string]time.Time, error) {
 			return nil, fmt.Errorf("record %d of the target's answer is headed %q where %q was asked for", i+1, rec.header, want)
 		}
 		st, err := DecodeStatus([]byte(strings.Join(rec.body, "\n")))
-		if err != nil || st.TakenAt <= 0 {
-			// Omitted, not defaulted. A zero would claim the point was
-			// published in 1970 and make it the first thing deleted.
+		if err != nil {
+			// Omitted, not defaulted: a record this function could not read
+			// is a point it knows nothing about, and the caller distinguishes
+			// that from one whose sidecar says its fields are absent.
 			continue
 		}
-		published[want] = time.Unix(st.TakenAt, 0).UTC()
+		published[want] = st
 	}
 	return published, nil
 }

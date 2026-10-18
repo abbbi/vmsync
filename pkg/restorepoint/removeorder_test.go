@@ -39,18 +39,18 @@ func TestRemoveIsOldestFirstEvenWithBothTiersPopulated(t *testing.T) {
 	base := time.Unix(1_700_000_000, 0).UTC()
 
 	var all []Tag
-	publishedAt := map[string]time.Time{}
+	seq := map[string]int64{}
 	for i := 0; i < 10; i++ {
 		tag := Tag{At: base.Add(time.Duration(i) * time.Hour), Checkpoint: fmt.Sprintf("vmsync-cpt-%06d", i+1)}
 		all = append(all, tag)
-		// Only the even ones can account for themselves, so half land in the
+		// Only the even ones carry a publish sequence, so half land in the
 		// known tier and half in the unknown one.
 		if i%2 == 0 {
-			publishedAt[tag.String()] = tag.At
+			seq[tag.String()] = int64(i + 1)
 		}
 	}
 
-	plan := Prune(all, Tag{}, publishedAt, Policy{Count: 3, Interval: time.Hour})
+	plan := Prune(all, Tag{}, seq, Policy{Count: 3, Interval: time.Hour})
 	if len(plan.Remove) != 7 {
 		t.Fatalf("Remove holds %d, want 7 -- the fixture did not reach the bulk path", len(plan.Remove))
 	}
@@ -76,10 +76,10 @@ func TestRemoveIsOldestFirstWithRetentionOff(t *testing.T) {
 	a := Tag{At: base, Checkpoint: "vmsync-cpt-000001"}
 	b := Tag{At: base.Add(time.Hour), Checkpoint: "vmsync-cpt-000002"}
 	c := Tag{At: base.Add(2 * time.Hour), Checkpoint: "vmsync-cpt-000003"}
-	// c can account for itself, so it ranks in the other tier from a and b.
-	publishedAt := map[string]time.Time{c.String(): c.At}
+	// c carries a sequence, so it ranks in the other tier from a and b.
+	seq := map[string]int64{c.String(): 1}
 
-	plan := Prune([]Tag{c, a, b}, Tag{}, publishedAt, Policy{})
+	plan := Prune([]Tag{c, a, b}, Tag{}, seq, Policy{})
 	if len(plan.Remove) != 3 {
 		t.Fatalf("Remove holds %d, want all 3", len(plan.Remove))
 	}

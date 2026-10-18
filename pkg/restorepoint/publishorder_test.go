@@ -49,23 +49,26 @@ func TestPruneAccumulatesHistoryAcrossRuns(t *testing.T) {
 	start := time.Unix(1_700_000_000, 0).UTC()
 	policy := Policy{Count: 3, Interval: time.Hour}
 
-	publishedAt := map[string]time.Time{}
+	seq := map[string]int64{}
 	var store []Tag
 	// The ghosts: published for real in the three hours before the clock was
-	// corrected, and so labelled two days hence.
+	// corrected, and so labelled two days hence. Their SEQUENCES are 1, 2, 3
+	// -- they were published first, whatever any clock says.
 	for i, ahead := range []time.Duration{48 * time.Hour, 47 * time.Hour, 46 * time.Hour} {
 		g := Tag{At: start.Add(ahead), Checkpoint: fmt.Sprintf("ghost-%03d", i+1)}
 		store = append(store, g)
-		publishedAt[g.String()] = start.Add(-time.Duration(3-i) * time.Hour)
+		seq[g.String()] = int64(i + 1)
 	}
+	next := int64(len(store))
 
 	const runs = 8
 	for i := 1; i <= runs; i++ {
 		now := start.Add(time.Duration(i) * time.Hour)
 		fresh := Tag{At: now, Checkpoint: fmt.Sprintf("run-%03d", i)}
-		publishedAt[fresh.String()] = now
+		next++
+		seq[fresh.String()] = next
 
-		plan := Prune(append(append([]Tag{}, store...), fresh), fresh, publishedAt, policy)
+		plan := Prune(append(append([]Tag{}, store...), fresh), fresh, seq, policy)
 		if inRemove(plan, fresh) {
 			t.Fatalf("run %d deleted the point it had just published", i)
 		}
@@ -99,24 +102,24 @@ func TestPruneRanksUnknownPublishTimesLast(t *testing.T) {
 	ghost := Tag{At: now.Add(48 * time.Hour), Checkpoint: "vmsync-cpt-000001"} // no sidecar
 	older := Tag{At: now.Add(-2 * time.Hour), Checkpoint: "vmsync-cpt-000002"}
 	fresh := Tag{At: now, Checkpoint: "vmsync-cpt-000003"}
-	publishedAt := map[string]time.Time{
-		older.String(): now.Add(-2 * time.Hour),
-		fresh.String(): now,
+	seq := map[string]int64{
+		older.String(): 1,
+		fresh.String(): 2,
 	}
 
-	plan := Prune([]Tag{ghost, older, fresh}, fresh, publishedAt, Policy{Count: 2, Interval: time.Hour})
+	plan := Prune([]Tag{ghost, older, fresh}, fresh, seq, Policy{Count: 2, Interval: time.Hour})
 
 	if !inRemove(plan, ghost) {
-		t.Errorf("the point with no recorded publish time was kept over one that had it; Keep=%v Remove=%v", tagNames(plan.Keep), tagNames(plan.Remove))
+		t.Errorf("the point with no publish sequence was kept over one that had it; Keep=%v Remove=%v", tagNames(plan.Keep), tagNames(plan.Remove))
 	}
 	if inRemove(plan, older) {
-		t.Error("a point with a recorded publish time was dropped in favour of one dated in the future by its source")
+		t.Error("a point with a publish sequence was dropped in favour of one dated in the future by a clock")
 	}
 }
 
-// With nothing known, the order must be exactly what it was before -- a store
+// With no sequences known, the order falls back to the tag instant -- a store
 // this run learned nothing about is not a store to start reordering.
-func TestPruneWithNoPublishTimesOrdersByTagInstant(t *testing.T) {
+func TestPruneWithNoSequencesOrdersByTagInstant(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	tags := []Tag{
 		{At: now.Add(-2 * time.Hour), Checkpoint: "vmsync-cpt-000001"},
@@ -142,13 +145,13 @@ func TestPruneProtectsANewPointWhoseSidecarIsNotReadableYet(t *testing.T) {
 	a := Tag{At: now.Add(-3 * time.Hour), Checkpoint: "vmsync-cpt-000001"}
 	b := Tag{At: now.Add(-2 * time.Hour), Checkpoint: "vmsync-cpt-000002"}
 	fresh := Tag{At: now, Checkpoint: "vmsync-cpt-000003"}
-	publishedAt := map[string]time.Time{
-		a.String(): now.Add(-3 * time.Hour),
-		b.String(): now.Add(-2 * time.Hour),
+	seq := map[string]int64{
+		a.String(): 1,
+		b.String(): 2,
 		// fresh deliberately absent
 	}
 
-	plan := Prune([]Tag{a, b, fresh}, fresh, publishedAt, Policy{Count: 2, Interval: time.Hour})
+	plan := Prune([]Tag{a, b, fresh}, fresh, seq, Policy{Count: 2, Interval: time.Hour})
 
 	if inRemove(plan, fresh) {
 		t.Error("the point this run just published was deleted because its sidecar was not readable yet")
@@ -293,10 +296,10 @@ func TestParseAllStatusReadsEachPointsOwnInstant(t *testing.T) {
 	out := strings.Join([]string{
 		markerStatus,
 		markerStatusPoint + " 1700000000-vmsync-cpt-000001",
-		`{"checkpoint":"vmsync-cpt-000001","checkpoint_at":1700000000,"taken_at":1700000120}`,
+		`{"checkpoint":"vmsync-cpt-000001","checkpoint_at":1700000000,"taken_at":1700000120,"publish_seq":7}`,
 		markerStatusEnd,
 		markerStatusPoint + " 1700003600-vmsync-cpt-000002",
-		`{"checkpoint":"vmsync-cpt-000002","checkpoint_at":1700003600,"taken_at":1700003700}`,
+		`{"checkpoint":"vmsync-cpt-000002","checkpoint_at":1700003600,"taken_at":1700003700,"publish_seq":8}`,
 		markerStatusEnd,
 	}, "\n")
 
@@ -307,14 +310,13 @@ func TestParseAllStatusReadsEachPointsOwnInstant(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("parsed %d sidecars, want 2: %v", len(got), got)
 	}
-	// taken_at, not checkpoint_at. They are close together on a healthy pair
-	// -- the copy takes as long as it takes -- so a fixture that made them
-	// far apart would be asserting against a store the system cannot produce.
-	if at := got["1700000000-vmsync-cpt-000001"]; !at.Equal(time.Unix(1700000120, 0).UTC()) {
-		t.Errorf("first point published at %v, want the sidecar's taken_at and not its checkpoint_at", at)
+	// Each point's own sidecar, whole: the publish path wants the sequence
+	// and the prune path wants it too, so one read serves both.
+	if st := got["1700000000-vmsync-cpt-000001"]; st.PublishSeq != 7 || st.TakenAt != 1700000120 {
+		t.Errorf("first point = %+v, want publish_seq 7 and taken_at 1700000120", st)
 	}
-	if at := got["1700003600-vmsync-cpt-000002"]; !at.Equal(time.Unix(1700003700, 0).UTC()) {
-		t.Errorf("second point published at %v", at)
+	if st := got["1700003600-vmsync-cpt-000002"]; st.PublishSeq != 8 || st.TakenAt != 1700003700 {
+		t.Errorf("second point = %+v, want publish_seq 8 and taken_at 1700003700", st)
 	}
 }
 
@@ -334,9 +336,9 @@ func TestParseAllStatusReadsEachPointsOwnInstant(t *testing.T) {
 // read first and its body can speak for every point after it.
 func TestParseAllStatusRefusesAForgedRecord(t *testing.T) {
 	asked := tagsOf(t, "1700000000-vmsync-cpt-000001", "1700003600-vmsync-cpt-000002")
-	genuine1 := []string{markerStatusPoint + " 1700000000-vmsync-cpt-000001", `{"taken_at":1700000120}`}
-	genuine2 := []string{markerStatusPoint + " 1700003600-vmsync-cpt-000002", `{"taken_at":1700003700}`}
-	forgery := []string{markerStatusPoint + " 1700003600-vmsync-cpt-000002", `{"taken_at":4000000000}`}
+	genuine1 := []string{markerStatusPoint + " 1700000000-vmsync-cpt-000001", `{"taken_at":1700000120,"publish_seq":1}`}
+	genuine2 := []string{markerStatusPoint + " 1700003600-vmsync-cpt-000002", `{"taken_at":1700003700,"publish_seq":2}`}
+	forgery := []string{markerStatusPoint + " 1700003600-vmsync-cpt-000002", `{"taken_at":4000000000,"publish_seq":9999}`}
 
 	for _, c := range []struct {
 		name  string
@@ -356,7 +358,7 @@ func TestParseAllStatusRefusesAForgedRecord(t *testing.T) {
 			"a record for a point nobody listed",
 			append(append(append(append([]string{markerStatus}, genuine1...), markerStatusEnd),
 				append(genuine2, markerStatusEnd)...),
-				markerStatusPoint+" 1700009999-vmsync-cpt-000099", `{"taken_at":4000000001}`, markerStatusEnd),
+				markerStatusPoint+" 1700009999-vmsync-cpt-000099", `{"taken_at":4000000001,"publish_seq":9999}`, markerStatusEnd),
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -378,10 +380,10 @@ func TestParseAllStatusAcceptsTheAnswerItAskedFor(t *testing.T) {
 	out := strings.Join([]string{
 		markerStatus,
 		markerStatusPoint + " 1700000000-vmsync-cpt-000001",
-		`{"taken_at":1700000120}`,
+		`{"taken_at":1700000120,"publish_seq":1}`,
 		markerStatusEnd,
 		markerStatusPoint + " 1700003600-vmsync-cpt-000002",
-		`{"taken_at":1700003700}`,
+		`{"taken_at":1700003700,"publish_seq":2}`,
 		markerStatusEnd,
 	}, "\n")
 	got, err := ParseAllStatus(out, asked)
@@ -403,7 +405,7 @@ func TestParseAllStatusRefusesRecordsOutOfOrder(t *testing.T) {
 		`{"taken_at":1700003700}`,
 		markerStatusEnd,
 		markerStatusPoint + " 1700000000-vmsync-cpt-000001",
-		`{"taken_at":1700000120}`,
+		`{"taken_at":1700000120,"publish_seq":1}`,
 		markerStatusEnd,
 	}, "\n")
 	if got, err := ParseAllStatus(out, asked); err == nil {
@@ -411,26 +413,29 @@ func TestParseAllStatusRefusesRecordsOutOfOrder(t *testing.T) {
 	}
 }
 
-// Every way a record can be useless must leave it OUT of the map, not in it
-// with a zero. A zero would read as "published in 1970" and make that point
-// the first thing the next prune deletes.
-func TestParseAllStatusOmitsRatherThanDefaults(t *testing.T) {
+// A RECORD THIS FUNCTION CANNOT READ IS ABSENT, never present with zeroes.
+//
+// Absent and "present, saying nothing" are different facts and the callers
+// treat them differently: the prune path omits a point with no sequence from
+// the order, and the publish path takes the maximum over whatever it got. A
+// record defaulted to zeroes would be indistinguishable from a real sidecar
+// whose fields are genuinely absent, and a zero sequence is not a place in
+// the order.
+func TestParseAllStatusOmitsRecordsItCannotRead(t *testing.T) {
 	cases := []struct {
 		name string
 		body string
-		dir  string
 	}{
-		{"sidecar missing entirely", "", "1700000000-vmsync-cpt-000001"},
-		{"sidecar not json", "cat: no such file", "1700000000-vmsync-cpt-000001"},
-		{"taken_at absent", `{"checkpoint":"vmsync-cpt-000001","checkpoint_at":1700000000}`, "1700000000-vmsync-cpt-000001"},
-		{"taken_at zero", `{"taken_at":0}`, "1700000000-vmsync-cpt-000001"},
+		{"sidecar missing entirely", ""},
+		{"sidecar not json", "cat: no such file"},
+		{"sidecar truncated mid-json", `{"publish_seq":4`},
 	}
 	asked := tagsOf(t, "1700000000-vmsync-cpt-000001")
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			out := strings.Join([]string{
 				markerStatus,
-				markerStatusPoint + " " + c.dir,
+				markerStatusPoint + " 1700000000-vmsync-cpt-000001",
 				c.body,
 				markerStatusEnd,
 			}, "\n")
@@ -439,16 +444,64 @@ func TestParseAllStatusOmitsRatherThanDefaults(t *testing.T) {
 				t.Fatalf("ParseAllStatus: %v", err)
 			}
 			if len(got) != 0 {
-				t.Errorf("parsed %v, want nothing -- an unusable record must be absent, not zero", got)
+				t.Errorf("parsed %v, want nothing -- a record that could not be read must be absent", got)
 			}
 		})
+	}
+}
+
+// A sidecar written before publish_seq existed reads back as a sequence of
+// zero, which is what the prune path filters on. Present, not absent: the
+// record WAS readable, and its other fields are good.
+func TestParseAllStatusKeepsASidecarWithNoSequence(t *testing.T) {
+	asked := tagsOf(t, "1700000000-vmsync-cpt-000001")
+	out := strings.Join([]string{
+		markerStatus,
+		markerStatusPoint + " 1700000000-vmsync-cpt-000001",
+		`{"checkpoint":"vmsync-cpt-000001","taken_at":1700000120}`,
+		markerStatusEnd,
+	}, "\n")
+	got, err := ParseAllStatus(out, asked)
+	if err != nil {
+		t.Fatalf("ParseAllStatus: %v", err)
+	}
+	st, ok := got["1700000000-vmsync-cpt-000001"]
+	if !ok {
+		t.Fatalf("a readable sidecar with no sequence was dropped: %v", got)
+	}
+	if st.PublishSeq != 0 {
+		t.Errorf("publish_seq = %d, want 0 for a sidecar that predates the field", st.PublishSeq)
+	}
+	if st.TakenAt != 1700000120 {
+		t.Errorf("the rest of the sidecar was lost: %+v", st)
+	}
+}
+
+// MaxPublishSeq is what a publishing run adds one to.
+func TestMaxPublishSeq(t *testing.T) {
+	if got := MaxPublishSeq(nil); got != 0 {
+		t.Errorf("MaxPublishSeq(nil) = %d, want 0 so the first point published is 1", got)
+	}
+	if got := MaxPublishSeq(map[string]Status{"a": {}, "b": {}}); got != 0 {
+		t.Errorf("a store whose points predate the field = %d, want 0", got)
+	}
+	// The maximum over the whole store, not the last one seen: map iteration
+	// has no order, and the newest BY SEQUENCE is the highest by definition.
+	got := MaxPublishSeq(map[string]Status{
+		"a": {PublishSeq: 3},
+		"b": {PublishSeq: 41},
+		"c": {PublishSeq: 7},
+		"d": {},
+	})
+	if got != 41 {
+		t.Errorf("MaxPublishSeq = %d, want 41", got)
 	}
 }
 
 // One bad record must not take the others down with it, in EITHER direction.
 func TestParseAllStatusKeepsTheGoodRecordsBesideABadOne(t *testing.T) {
 	bad := []string{markerStatusPoint + " 1700000000-vmsync-cpt-000001", "not json at all", markerStatusEnd}
-	good := []string{markerStatusPoint + " 1700003600-vmsync-cpt-000002", `{"taken_at":1700003700}`, markerStatusEnd}
+	good := []string{markerStatusPoint + " 1700003600-vmsync-cpt-000002", `{"taken_at":1700003700,"publish_seq":2}`, markerStatusEnd}
 
 	// Each ordering asks in the order it answers: records are correlated by
 	// position now, so a stream whose records are in a different order from

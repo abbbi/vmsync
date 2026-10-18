@@ -58,6 +58,7 @@ func TestAStoreLargerThanOneChunkIsReadInFull(t *testing.T) {
 		names = append(names, tag.String())
 		status[tag.String()] = restorepoint.Status{
 			Checkpoint: tag.Checkpoint, CheckpointAt: at.Unix(), TakenAt: at.Unix(),
+			PublishSeq: int64(i + 1),
 		}
 	}
 
@@ -79,12 +80,12 @@ func TestAStoreLargerThanOneChunkIsReadInFull(t *testing.T) {
 		tags = append(tags, tag)
 	}
 
-	got, ok := r.publishInstants(context.Background(), tags)
+	got, ok := r.publishOrder(context.Background(), tags)
 	if !ok {
 		t.Fatalf("the read failed over %d points; commands issued: %d", points, reads)
 	}
 	if len(got) != points {
-		t.Errorf("read %d publish instants from a store of %d. The points missing from the map rank below every point that was read, so a prune would delete them first", len(got), points)
+		t.Errorf("read %d publish sequences from a store of %d. The points missing from the map rank below every point that was read, so a prune would delete them first", len(got), points)
 	}
 	// Specifically the ones past the first batch, which is what a
 	// first-chunk-only read would lose.
@@ -128,7 +129,7 @@ func TestAFailedBatchFailsTheWholeRead(t *testing.T) {
 		}
 		names = append(names, tag.String())
 		tags = append(tags, tag)
-		status[tag.String()] = restorepoint.Status{TakenAt: at.Unix()}
+		status[tag.String()] = restorepoint.Status{TakenAt: at.Unix(), PublishSeq: int64(i + 1)}
 	}
 
 	var ran []string
@@ -143,7 +144,7 @@ func TestAFailedBatchFailsTheWholeRead(t *testing.T) {
 		store: store,
 	}
 
-	if got, ok := r.publishInstants(context.Background(), tags); ok {
-		t.Errorf("a failed batch still reported success with %d instants", len(got))
+	if got, ok := r.publishOrder(context.Background(), tags); ok {
+		t.Errorf("a failed batch still reported success with %d sequences", len(got))
 	}
 }

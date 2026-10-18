@@ -180,17 +180,20 @@ type rpFixture struct {
 	tags   []restorepoint.Tag
 	status map[string]restorepoint.Status
 	names  []string
+	// seq counts the points this fixture has published, so each gets the
+	// next place in the order -- the ghosts first, because they really were
+	// published first whatever their tags say.
+	seq int64
 }
 
 // Builds a store whose tags and sidecars DISAGREE in the way a wrong clock
 // on the host running vmsync produces: that host stamps checkpoint_at two
 // days hence, while the target stamps taken_at with the real time.
 //
-// taken_at BELOW checkpoint_at is exactly what that looks like, and it is
-// reachable only because the two now come from different clocks -- when both
-// were time.Now() in one process, taken_at was always at or after
-// checkpoint_at by the duration of the copy, and a fixture like this one
-// described a store the system could not produce.
+// What orders these is neither of those. publish_seq runs 1,2,3,4 in the
+// order the points were actually published -- the two ghosts first, because
+// they were -- so retention gets the right answer with both clocks wrong.
+// That is the whole point of the field: a counter cannot be stepped.
 func skewedStore(t *testing.T, T time.Time) rpFixture {
 	t.Helper()
 	store := rpTestStore(t)
@@ -204,8 +207,10 @@ func skewedStore(t *testing.T, T time.Time) rpFixture {
 		}
 		f.tags = append(f.tags, tag)
 		f.names = append(f.names, tag.String())
+		f.seq++
 		f.status[tag.String()] = restorepoint.Status{
 			Checkpoint: cpt, CheckpointAt: at.Unix(), TakenAt: taken.Unix(), Source: "src01",
+			PublishSeq: f.seq,
 		}
 		return tag
 	}
@@ -234,7 +239,7 @@ func (f rpFixture) removalsAmong(ran []string) []string {
 	return out
 }
 
-// prune must order by what the SIDECARS say, not by the tag instant.
+// prune must order by the publish SEQUENCE, not by any clock.
 //
 // This is the test that catches the call site forgetting to pass the map --
 // Prune's own tests cannot see a caller that hands it nil.
@@ -260,9 +265,9 @@ func TestPruneOrdersByTheSidecarsNotTheTagInstant(t *testing.T) {
 		t.Fatalf("prune read the sidecars %d times; want exactly one round trip for the whole store", reads)
 	}
 	got := f.removalsAmong(ran)
-	want := []string{f.tags[0].String()} // the one the target published longest ago
+	want := []string{f.tags[0].String()} // publish_seq 1: the first one published
 	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Errorf("removed %v, want %v -- ordering by the tag instant would have taken %s, the copy from an hour ago",
+		t.Errorf("removed %v, want %v -- ordering by the tag instant would have taken %s, the copy published most recently before this run",
 			got, want, f.tags[2])
 	}
 }

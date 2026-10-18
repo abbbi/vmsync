@@ -66,6 +66,17 @@ type restorePoints struct {
 	// conditionals of their own.
 	armed bool
 
+	// nextSeq is the Status.PublishSeq this run will stamp, one above the
+	// highest already in the store. Read once, before anything is copied,
+	// while the target run lock guarantees nothing else can add a point to
+	// this domain's store -- so it cannot go stale between here and commit.
+	//
+	// Zero is impossible on an armed run: a store that could not be read
+	// disarms this one instead, because a point published without a place in
+	// the sequence would rank below every point that has one and be the first
+	// thing the next prune deletes. See newRestorePoints.
+	nextSeq int64
+
 	// wantDisks is how many disks this run is copying, so commit can refuse to
 	// publish a set that is short of one. take() fails the run if any single
 	// reflink fails, so a short set can only come from an accounting error in
@@ -221,6 +232,26 @@ func newRestorePoints(ctx context.Context, policy restorepoint.Policy, runner re
 		return nil, fmt.Errorf("-retention: %w", err)
 	}
 
+	// The sequence this run will publish at, decided before a byte is
+	// copied.
+	//
+	// Read here rather than at commit for two reasons. The target run lock is
+	// held for the whole run, so nothing else can add a point to this
+	// domain's store in between and the value cannot go stale. And a store
+	// that cannot be read has to disarm the restore point BEFORE the copy
+	// rather than after it: a point stamped with no sequence would rank below
+	// every point that has one and be the first thing the next prune deleted,
+	// so publishing one would be paying for a reflink copy of every disk in
+	// order to throw it away. Skipping costs this cycle's point and nothing
+	// else -- the sync itself is unaffected, and the next cycle retries.
+	nextSeq, seqErr := nextPublishSeq(ctx, runner, store, existing.Points)
+	if seqErr != nil {
+		trace.Warning("not taking a restore point this cycle: the existing restore points' sidecars could not be read, so this one could not be given a place in the publish order. Retention orders by that sequence, and a point without one would be the first thing the next prune removed",
+			"error", seqErr, "dir", store.String())
+		stats.Outcome = rpOutcomeFailed
+		return &restorePoints{store: store, policy: policy, stats: stats}, nil
+	}
+
 	point := store.Point(tag)
 	stage, err := restorepoint.StageCommand(point)
 	if err != nil {
@@ -238,6 +269,7 @@ func newRestorePoints(ctx context.Context, policy restorepoint.Policy, runner re
 		point:     point,
 		policy:    policy,
 		armed:     true,
+		nextSeq:   nextSeq,
 		wantDisks: len(targetDiskPaths),
 		stats:     stats,
 	}, nil
@@ -342,6 +374,7 @@ func (r *restorePoints) commit(ctx context.Context, verifyState, source string, 
 		Checkpoint:   effectiveCheckpoint,
 		CheckpointAt: checkpointAt.Unix(),
 		TakenAt:      r.targetPublishInstant(ctx),
+		PublishSeq:   r.nextSeq,
 		Source:       source,
 		Verify:       verifyState,
 		Disks:        disks,
@@ -380,6 +413,57 @@ func (r *restorePoints) commit(ctx context.Context, verifyState, source string, 
 // costs disk, while failing the run over it would throw away a sync that
 // succeeded. What it must not do is stay silent -- a prune that keeps failing
 // is how a target fills up.
+// nextPublishSeq is one above the highest publish sequence in the store.
+//
+// The whole of the ordering guarantee is in the "+1": a counter raised by one
+// each time is monotonic however wrong any clock on either host is, which is
+// what neither the checkpoint instant nor the target's clock could promise.
+// See restorepoint.Status.PublishSeq.
+//
+// Starts at 1 on a store whose points predate the field, which puts every new
+// point above all of them -- correct, because they were all published before
+// any of these.
+func nextPublishSeq(ctx context.Context, runner remoteRunner, store restorepoint.Store, points []restorepoint.Tag) (int64, error) {
+	statuses, err := readStatuses(ctx, runner, store, points)
+	if err != nil {
+		return 0, err
+	}
+	return restorepoint.MaxPublishSeq(statuses) + 1, nil
+}
+
+// readStatuses reads every listed point's sidecar, in batches.
+//
+// Shared by the publish path, which wants the highest sequence, and the prune
+// path, which wants them all. One parser and one batching rule, so the two
+// cannot come to disagree about what the store holds.
+func readStatuses(ctx context.Context, runner remoteRunner, store restorepoint.Store, points []restorepoint.Tag) (map[string]restorepoint.Status, error) {
+	all := make(map[string]restorepoint.Status, len(points))
+	for start := 0; start < len(points); start += readStatusChunk {
+		end := start + readStatusChunk
+		if end > len(points) {
+			end = len(points)
+		}
+		chunk := points[start:end]
+
+		cmd, err := restorepoint.ReadAllStatusCommand(store, chunk)
+		if err != nil {
+			return nil, err
+		}
+		out, err := runner.Run(ctx, cmd)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(out))
+		}
+		part, err := restorepoint.ParseAllStatus(out, chunk)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range part {
+			all[k] = v
+		}
+	}
+	return all, nil
+}
+
 // targetPublishInstant reads the clock of the host the restore points live
 // on, as unix seconds, and returns 0 when it cannot be read.
 //
@@ -445,42 +529,26 @@ func (r *restorePoints) targetPublishInstant(ctx context.Context) int64 {
 // compounds.
 const readStatusChunk = 100
 
-func (r *restorePoints) publishInstants(ctx context.Context, points []restorepoint.Tag) (map[string]time.Time, bool) {
-	published := make(map[string]time.Time, len(points))
-	for start := 0; start < len(points); start += readStatusChunk {
-		end := start + readStatusChunk
-		if end > len(points) {
-			end = len(points)
-		}
-		chunk := points[start:end]
-
-		cmd, err := restorepoint.ReadAllStatusCommand(r.store, chunk)
-		if err != nil {
-			trace.Warning("could not build the restore point sidecar read", "error", err)
-			return nil, false
-		}
-		out, err := r.runner.Run(ctx, cmd)
-		if err != nil {
-			trace.Warning("could not read the restore point sidecars", "error", err, "output", strings.TrimSpace(out))
-			return nil, false
-		}
-		part, err := restorepoint.ParseAllStatus(out, chunk)
-		if err != nil {
-			// Exit 0 with unrecognisable output: the command ran and answered
-			// something else. Treated as a failure to read, not as an empty
-			// store, because the two would otherwise be the same answer here.
-			trace.Warning("the target answered the restore point sidecar read with something unrecognisable", "error", err, "output", strings.TrimSpace(out))
-			return nil, false
-		}
-		// ANY chunk failing fails the whole read. A partial map would be
-		// indistinguishable from a store whose later points have no sidecars,
-		// and Prune would rank every unread point below every read one --
-		// deleting the ones it happened not to ask about first.
-		for k, v := range part {
-			published[k] = v
+func (r *restorePoints) publishOrder(ctx context.Context, points []restorepoint.Tag) (map[string]int64, bool) {
+	// ANY failure fails the whole read, including one batch of several. A
+	// partial map would be indistinguishable from a store whose later points
+	// have no sequence, and Prune ranks every point without one below every
+	// point with one -- so it would delete exactly the points this run
+	// happened not to ask about.
+	statuses, err := readStatuses(ctx, r.runner, r.store, points)
+	if err != nil {
+		trace.Warning("could not read the restore point sidecars", "error", err, "dir", r.store.String())
+		return nil, false
+	}
+	seq := make(map[string]int64, len(statuses))
+	for tag, st := range statuses {
+		// Omitted rather than defaulted: a point whose sidecar predates the
+		// sequence has no place in it, and zero is not a place.
+		if st.PublishSeq > 0 {
+			seq[tag] = st.PublishSeq
 		}
 	}
-	return published, true
+	return seq, true
 }
 
 func (r *restorePoints) prune(ctx context.Context) {
@@ -543,7 +611,7 @@ func (r *restorePoints) prune(ctx context.Context) {
 	// A read that SUCCEEDS and finds no sidecars is a different answer and is
 	// not this branch: those points rank below any that can account for
 	// themselves, and the prune proceeds.
-	publishedAt, ok := r.publishInstants(ctx, listing.Points)
+	order, ok := r.publishOrder(ctx, listing.Points)
 	if !ok {
 		trace.Warning("not pruning this cycle: the restore point sidecars could not be read, and ordering by the checkpoint instant instead can delete the copy the previous run made. Restore points will accumulate until this succeeds, which vmsync_restore_points_over_count reports",
 			"dir", r.store.String())
@@ -565,7 +633,7 @@ func (r *restorePoints) prune(ctx context.Context) {
 		// is what makes the sentence above true.
 		applyRestorePointSummary(&r.stats, restorepoint.Summarize(listing, r.policy))
 	} else {
-		plan := restorepoint.Prune(listing.Points, r.point.Tag(), publishedAt, r.policy)
+		plan := restorepoint.Prune(listing.Points, r.point.Tag(), order, r.policy)
 		for _, tag := range plan.Remove {
 			cmd, err := restorepoint.RemoveCommand(r.store.Point(tag))
 			if err != nil {
