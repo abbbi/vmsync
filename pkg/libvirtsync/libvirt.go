@@ -841,8 +841,8 @@ func ExcludeRefusal(domain string, d ExcludeDecision) string {
 		return fmt.Sprintf("domain %q carries vmsync metadata exclude=%q, which is not a value this version understands (expected %q or %q). Treating it as %s and doing nothing, because an exclusion nobody can read is still somebody asking vmsync to keep away. Correct it, or remove the metadata field `exclude` with `virsh metadata`",
 			domain, d.Raw, ExcludeReportOnly, ExcludeFullyIgnored, ExcludeReportOnly)
 	}
-	return fmt.Sprintf("domain %q carries vmsync metadata exclude=%s, so vmsync will not act on it. Remove the metadata field `exclude` with `virsh metadata` to bring it back",
-		domain, d.Raw)
+	return fmt.Sprintf("domain carries vmsync metadata exclude=%s, so vmsync will not act on it. Remove the metadata field `exclude` with `virsh metadata %q http://vmsync.org/xmlns/libvirt/domain/1.0 --edit vmsync` to bring it back",
+		d.Raw, domain)
 }
 
 // The values MetadataFieldAutostartIntent can hold. Strings rather than a
