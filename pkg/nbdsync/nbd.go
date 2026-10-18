@@ -1047,6 +1047,25 @@ func CompareTCP(ctx context.Context, aHost string, aPort int, aExport string, bH
 // CompareTCPCollect returns its findings as data instead.
 var ErrImagesDiffer = errors.New("images differ")
 
+// ErrSizeMismatch marks a compare that could not start because the two
+// exports are different sizes.
+//
+// SEPARATE FROM ErrImagesDiffer, and deliberately not wrapped by it: this is
+// not a finding about the data. Nothing was compared at all, so it cannot be
+// said whether the bytes agree -- and isVerifyMismatch must not treat it as
+// a mismatch, because that would latch verify_state=failed on a replica
+// nothing has looked at.
+//
+// Separate from a plain error too, because the CALLER has to be able to
+// recognise it. A size difference means different things depending on what
+// the run just did, and only the caller knows which: a run that staged a
+// delta has had its base grown to the source's size by the commit, so a
+// mismatch afterwards is a real fault; a run that copied nothing created no
+// overlay and committed nothing, so the base is still whatever size it was
+// and a mismatch is the ordinary, self-healing state after an operator
+// resized the source. See cmd/vmsync, where that decision is made.
+var ErrSizeMismatch = errors.New("image size mismatch")
+
 // ErrExportUnreachable reports that an NBD export did not answer a handshake
 // at the address it was dialled on.
 //
@@ -1264,7 +1283,7 @@ func CompareChunkPlanTCP(ctx context.Context, aHost string, aPort int, aExport s
 		return nil, stats, fmt.Errorf("nbd get target size: %w", err)
 	}
 	if sizeA != sizeB {
-		return nil, stats, fmt.Errorf("image size mismatch: source=%d target=%d", sizeA, sizeB)
+		return nil, stats, fmt.Errorf("%w: source=%d target=%d", ErrSizeMismatch, sizeA, sizeB)
 	}
 	size := sizeA
 
@@ -1616,7 +1635,7 @@ func compareTCP(ctx context.Context, aHost string, aPort int, aExport string, bH
 		return nil, fmt.Errorf("nbd get target size: %w", err)
 	}
 	if sizeA != sizeB {
-		return nil, fmt.Errorf("image size mismatch: source=%d target=%d", sizeA, sizeB)
+		return nil, fmt.Errorf("%w: source=%d target=%d", ErrSizeMismatch, sizeA, sizeB)
 	}
 	size := sizeA
 

@@ -1943,6 +1943,35 @@ func isVerifyMismatch(err error) bool {
 	return errors.Is(err, nbdsync.ErrImagesDiffer) || errors.Is(err, disk.ErrImagesDiffer)
 }
 
+// sizeMismatchIsExplained reports whether a verify error is a size difference
+// this run has an innocent account of, and so must not fail over.
+//
+// A SIZE DIFFERENCE MEANS DIFFERENT THINGS DEPENDING ON WHAT THE RUN DID,
+// which is why the comparators only state the fact and the decision lives
+// here.
+//
+// stagedDelta true: this run created an image for the disk -- a fresh base on
+// a full sync, an overlay on an incremental -- both at the source's CURRENT
+// size, and qemu-img commit grows a base to its overlay's virtual size
+// unconditionally. So the base must now match the source, and a size
+// difference afterwards is a real fault. Not explained.
+//
+// stagedDelta false: an incremental with no dirty extents, which returns
+// before creating anything. Nothing grew the base, so an operator who
+// resized the source since the last copy leaves exactly this state. It
+// clears itself on the next run with any dirty extent at all. Explained --
+// and failing over it would turn a supported operation into a broken pair,
+// since the recovery for a failed verify is a full re-copy of the replica.
+//
+// Only ErrSizeMismatch qualifies. A real data difference (ErrImagesDiffer)
+// is never explained by anything this function knows about.
+func sizeMismatchIsExplained(verr error, stagedDelta bool) bool {
+	if verr == nil || stagedDelta {
+		return false
+	}
+	return errors.Is(verr, nbdsync.ErrSizeMismatch)
+}
+
 // syncFloor picks the timestamp a replica disk's mtime is judged against,
 // and reports whether it came from replica_written_at.
 //
@@ -6429,9 +6458,25 @@ func run(cfg syncConfig) (runErr error) {
 	// widening what either closure captures, and it keeps the handover
 	// readable if the two are ever driven from different goroutines again.
 	type diskPhase1Result struct {
-		diskStart            time.Time
-		targetPath           string
-		diskSize             uint64
+		diskStart  time.Time
+		targetPath string
+		diskSize   uint64
+		// stagedDelta is true when this run created an image for this disk --
+		// a fresh base on a full sync, or an overlay on an incremental.
+		//
+		// Which is the same thing as "the base is now the source's size".
+		// Both are created at d.VirtualSize, and qemu-img commit grows a base
+		// to its overlay's virtual size unconditionally (measured: an empty
+		// 20G overlay over a 10G base leaves a 20G base). So after a run that
+		// staged anything, the sizes MUST agree, and a size mismatch at
+		// verify time is a real fault.
+		//
+		// False only on the one path that creates nothing: an incremental
+		// with no dirty extents, which returns early without an overlay. The
+		// base is then untouched, and if the operator has grown the source
+		// since the last copy the sizes legitimately differ until the next
+		// run with anything to copy. See where this is read in phase two.
+		stagedDelta          bool
 		writtenBytes         uint64
 		targetBridgeCounters *nbdbridge.ByteCounters
 	}
@@ -6602,7 +6647,11 @@ func run(cfg syncConfig) (runErr error) {
 		targetPath := util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
 		res.targetPath = targetPath
 
-		if dirty == 0 && incrementalMode {
+		// One expression decides both whether to skip and whether anything
+		// was staged, so a future edit cannot change one without the other.
+		skipCopy := dirty == 0 && incrementalMode
+		res.stagedDelta = !skipCopy
+		if skipCopy {
 			// Only safe to skip entirely when a base already exists from an
 			// earlier full sync -- for a full sync (parent == ""), this is
 			// the only place the target file ever gets created at all. A
@@ -7507,7 +7556,21 @@ func run(cfg syncConfig) (runErr error) {
 		case verifyFast:
 			compareErr = nbdsync.CompareTCP(ctx, effectiveSourceHost, effectiveSourcePort, d.TargetDev, verifyTargetHost, verifyTargetPort, verifyExportName, cfg.IODepth)
 		default:
-			compareErr = disk.CompareImages(sourceNBDURL, nbdURL)
+			var said string
+			said, compareErr = disk.CompareImages(sourceNBDURL, nbdURL)
+			// Surfaced even when the verdict is a pass. qemu-img prints
+			// "Warning: Image size mismatch!" beside "Images are identical."
+			// when the two differ in size and the larger one's extra region
+			// is all zeros -- a correct verdict about the data, and the only
+			// notice an operator gets that a resize has not reached the
+			// replica yet. It used to be discarded with the rest of the
+			// output on success.
+			if compareErr == nil && strings.Contains(said, "size mismatch") {
+				trace.Warning("verify: the replica and the source are different sizes, and every byte the source holds is present in the replica -- so no data is missing, but the replica is still the size it was. Most likely the source was resized since the last copy",
+					"disk", d.TargetDev, "qemu_img", said)
+			} else if said != "" {
+				trace.Debug("verify: qemu-img compare said", "disk", d.TargetDev, "output", said)
+			}
 		}
 
 		// Best-effort: a read-only export (or its bridge) left behind
@@ -7685,7 +7748,41 @@ func run(cfg syncConfig) (runErr error) {
 			}
 		}
 		if cfg.Verify != "" {
-			return runVerify(d, r.res)
+			verr := runVerify(d, r.res)
+			// A SIZE DIFFERENCE IS ONLY A FAULT WHEN THIS RUN STAGED
+			// SOMETHING, and that decision belongs here rather than in the
+			// comparator or in runVerify.
+			//
+			// The comparator states a fact (the exports are different
+			// sizes). runVerify records what that means for the metric
+			// (nothing was compared, so the outcome is "not performed" --
+			// ErrSizeMismatch is deliberately not an ErrImagesDiffer, so it
+			// never reads as a finding about the data). Only here is it known
+			// whether the difference is explained.
+			//
+			// Unexplained -- this run created an image at the source's
+			// current size and committed it -- means the base should match
+			// and does not. Fail.
+			//
+			// Explained: an incremental with nothing to copy creates no
+			// overlay, so nothing grew the base and an operator who resized
+			// the source since the last copy leaves exactly this state. It
+			// clears itself on the next run with any dirty extent at all,
+			// because the overlay is created at the new size and the commit
+			// grows the base to it. Failing the run over that would turn a
+			// supported operation into a broken pair -- and the recovery for
+			// a failed verify is a full re-copy of the replica.
+			//
+			// NOT silent: the warning says so, and the published verify
+			// outcome stays "not performed" rather than becoming "passed",
+			// because nothing was compared. An operator alerting on
+			// verifications that did not happen still sees it.
+			if sizeMismatchIsExplained(verr, r.res.stagedDelta) {
+				trace.Warning("verify: the replica and the source are different sizes and this run had nothing to copy, so nothing grew the replica -- most likely the source was resized since the last copy. Not verified, and not failed: the next sync with any change will resize the replica and the verify after it will compare normally",
+					"disk", d.TargetDev, "error", verr)
+				return nil
+			}
+			return verr
 		}
 		trace.Info("disk sync complete", "disk", d.TargetDev, "elapsed", time.Since(r.start).Round(time.Millisecond).String())
 		return nil

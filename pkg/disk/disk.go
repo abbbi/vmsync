@@ -326,15 +326,45 @@ func RemoveBitmap(path, name string) error {
 // automation that discards and recopies it.
 var ErrImagesDiffer = errors.New("images differ")
 
-func CompareImages(refA, refB string) error {
+// NOT -s, AND THAT IS DELIBERATE. Do not add it.
+//
+// qemu-img's strict mode fails on "different image size OR sector allocation
+// status", and only the first of those is wanted here. vmsync writes only
+// the extents the source's dirty bitmap names and skips extents that read as
+// zeros, so a healthy replica routinely has regions left unallocated where
+// the source has them allocated-and-zero. Measured over two NBD exports of
+// the same size holding identical data and differing only in allocation:
+//
+//	qemu-img compare -U      -> "Images are identical."           exit 0
+//	qemu-img compare -U -s   -> "Offset 0 block status mismatch!"  exit 1
+//
+// So -s would refuse healthy replicas. It is not a stricter version of this
+// check; it is a different check that this system deliberately does not
+// satisfy.
+//
+// What the default mode does about size is also right, and is easy to
+// misread as a gap: images of different sizes are reported identical when
+// the larger one's extra region reads as zeros, and different when it holds
+// data. Measured both ways. That is exactly the question worth asking -- "is
+// any data missing from the replica" -- and it answers it. A size difference
+// where nothing is at stake is reported through the returned output instead,
+// for the caller to surface.
+//
+// The output is returned on SUCCESS as well as failure, because qemu-img
+// prints "Warning: Image size mismatch!" alongside "Images are identical."
+// and this function used to return on err == nil without reading it. That
+// warning is how an operator learns a resize is mid-flight; discarding it
+// made the one signal qemu-img goes to the trouble of printing invisible.
+func CompareImages(refA, refB string) (output string, err error) {
 	cmd := exec.Command("qemu-img", "compare", "-U", refA, refB)
 	out, err := cmd.CombinedOutput()
+	said := strings.TrimSpace(string(out))
 	if err == nil {
-		return nil
+		return said, nil
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-		return fmt.Errorf("%w: %s", ErrImagesDiffer, strings.TrimSpace(string(out)))
+		return said, fmt.Errorf("%w: %s", ErrImagesDiffer, said)
 	}
-	return fmt.Errorf("qemu-img compare %s vs %s: %w: %s", refA, refB, err, strings.TrimSpace(string(out)))
+	return said, fmt.Errorf("qemu-img compare %s vs %s: %w: %s", refA, refB, err, said)
 }
