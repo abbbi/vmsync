@@ -225,6 +225,12 @@ func TestRunLockExitMapsEveryOutcome(t *testing.T) {
 		{"somebody else holds it", errLockBusy, util.RemoteLockBusy, util.RemoteLockExitBusy},
 		{"no lock directory", errLockNoDir, util.RemoteLockNoDir, util.RemoteLockExitNoDir},
 		{"cannot create the file", errLockNoCreate, util.RemoteLockNoCreate, util.RemoteLockExitNoCreate},
+		// Deliberately markerless and non-zero. The shell implementation
+		// cannot produce this outcome, and the two are required to be
+		// indistinguishable to a caller, so inventing a marker for it would
+		// break that equivalence; the driver learns of it through the closed
+		// channel like any other helper exit.
+		{"dispossessed of its lock file", errLockDispossessed, "", 1},
 		{"anything else", errors.New("disk on fire"), "", 1},
 	} {
 		marker, code := runLockExit(tc.err)

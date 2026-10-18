@@ -211,8 +211,8 @@ func TestLockRefersToCurrentPath(t *testing.T) {
 		}
 		defer f.Close()
 
-		if !lockRefersToCurrentPath(f, path) {
-			t.Error("lockRefersToCurrentPath() = false for a file still linked at its own path, want true")
+		if !RunLockIsAtPath(f, path) {
+			t.Error("RunLockIsAtPath() = false for a file still linked at its own path, want true")
 		}
 	})
 
@@ -232,8 +232,8 @@ func TestLockRefersToCurrentPath(t *testing.T) {
 			t.Fatalf("Remove() error = %v", err)
 		}
 
-		if lockRefersToCurrentPath(f, path) {
-			t.Error("lockRefersToCurrentPath() = true for an fd whose path no longer exists, want false")
+		if RunLockIsAtPath(f, path) {
+			t.Error("RunLockIsAtPath() = true for an fd whose path no longer exists, want false")
 		}
 	})
 
@@ -259,14 +259,14 @@ func TestLockRefersToCurrentPath(t *testing.T) {
 			t.Fatalf("recreate lock file at %s: %v", path, err)
 		}
 
-		if lockRefersToCurrentPath(f, path) {
-			t.Error("lockRefersToCurrentPath() = true for an fd whose path was replaced by a different file, want false")
+		if RunLockIsAtPath(f, path) {
+			t.Error("RunLockIsAtPath() = true for an fd whose path was replaced by a different file, want false")
 		}
 	})
 }
 
 // TestAcquireRunLock_IgnoresStaleOrphanedLock proves the end-to-end
-// behavior lockRefersToCurrentPath's retry loop exists for: a lock held on
+// behavior RunLockIsAtPath's retry loop exists for: a lock held on
 // an orphaned inode (path already deleted and recreated out from under it)
 // must never block, corrupt, or otherwise interfere with a fresh
 // acquisition against the current file at that path.
@@ -298,10 +298,10 @@ func TestAcquireRunLock_IgnoresStaleOrphanedLock(t *testing.T) {
 	}
 	defer fresh.Close()
 
-	if lockRefersToCurrentPath(stale, path) {
+	if RunLockIsAtPath(stale, path) {
 		t.Error("the stale handle unexpectedly still refers to the current path -- test setup did not actually orphan it")
 	}
-	if !lockRefersToCurrentPath(fresh, path) {
+	if !RunLockIsAtPath(fresh, path) {
 		t.Error("AcquireRunLock() returned a file that does not refer to the current path")
 	}
 }

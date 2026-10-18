@@ -43,6 +43,13 @@ import (
 // the lock is doing its job and must not be broken.
 var ErrLockHolderAlive = errors.New("the run lock's holder is still running")
 
+// ErrLockReplaced is the lock file at a path having been swapped for another
+// one. Distinct from ErrLockHolderAlive because the branch that reports it has
+// proved nothing about any holder: it knows only that the file it locked is no
+// longer the file at that path, which is a different fact and a different
+// remedy.
+var ErrLockReplaced = errors.New("the run lock file was replaced while it was being locked")
+
 // ErrLockUnattributed reports that the lock file names no holder, so nothing can
 // be proven about it either way.
 var ErrLockUnattributed = errors.New("the run lock records no holder")
@@ -342,21 +349,75 @@ func DescribeLockHolder(dir, key string) string {
 // BreakRunLock removes the lock file, so the next acquirer creates a fresh one
 // and locks that instead.
 //
-// Unlinking does not revoke the dead holder's flock -- nothing can, from outside
-// the process that owns the descriptor -- and it does not need to: the lock lives
-// on the inode, and after the unlink no acquirer ever sees that inode again. The
-// orphan goes when whatever still holds it does.
+// IT TAKES THE LOCK BEFORE UNLINKING IT, and refuses if it cannot. The decision
+// is made by BreakRunLockDecision, which does probe the flock -- but that probe
+// releases in the same breath, and the caller then connects to libvirt, reads a
+// domain definition and appends a journal record before arriving here. A run
+// that acquires the lock inside that window used to have its lock file unlinked
+// from under it, and nothing told it: its flock survives on the orphaned inode,
+// the next acquirer creates a fresh file and wins that, and two writers share
+// one replica. Measured on 2026-10-18, both inodes named in the output.
 //
-// The race this opens is already handled where it has to be. AcquireRunLock
-// re-checks, after locking, that the path still refers to the inode it locked,
-// and retries when it does not -- so a run acquiring the lock at the moment it is
-// broken either gets the old inode and retries, or gets the new one and wins.
-// Both are correct; neither ends up believing it holds a lock it does not.
+// Holding the lock closes the window for every acquirer that checks, after
+// locking, that it locked the file the path still names -- AcquireRunLock does,
+// and so does vmsync-bridge-helper's leased hold. Such a run either already
+// holds the lock, in which case the non-blocking flock below fails and nothing
+// is removed; or its own acquisition is refused while this holds the lock; or
+// it locked the old inode and its own re-check sends it round again. Every one
+// of those is a refusal or a retry.
+//
+// The unleased shell hold is the exception, and it is narrowed rather than
+// closed: remotelock.go parks `exec 9>>` and `flock -n 9` in a POSIX shell that
+// compares no inodes, so a shell holding the file open before this takes the
+// lock can still flock the orphan afterwards and believe it holds the run lock.
+// Nothing on this side can fix that -- the shell would have to compare inodes
+// itself -- and the window is now only between its own open and its own flock.
+//
+// Unlinking still revokes nobody's flock -- nothing can, from outside the
+// process owning the descriptor -- and it does not need to: the lock lives on
+// the inode, and after the unlink no acquirer ever sees that inode again. The
+// orphan here goes when this function returns.
 //
 // Reports whether a file was actually removed, so a caller can tell "broken" from
 // "there was nothing there", which look identical afterwards.
+// lockStillAtPath is RunLockIsAtPath, indirected for one reason: the window it
+// guards is between BreakRunLock's own OpenFile and its own Flock, two adjacent
+// statements, and nothing outside the function can be scheduled into it. Every
+// structural way of asserting the check is present is satisfied by syntax --
+// measured on 2026-10-19, where a bare call, a call behind an always-false
+// condition and a call moved into a defer all left the suite green. A seam on
+// the STAT lets a test force the answer and watch what BreakRunLock does with
+// it, which is the behaviour that matters; it fakes neither the flock nor the
+// unlink, so nothing about the interlock itself becomes test-controlled.
+var lockStillAtPath = RunLockIsAtPath
+
 func BreakRunLock(dir, key string) (bool, error) {
 	path := RunLockPath(dir, key)
+
+	// No O_CREATE: a lock file that is already gone is nothing to break, and
+	// creating one here only to remove it again would turn "there was nothing
+	// there" into "broken".
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("open the lock file %s in order to break it: %w", path, err)
+	}
+	defer f.Close()
+
+	if err := FlockExclusiveNB(f); err != nil {
+		return false, fmt.Errorf("refusing to remove the lock file %s: something has taken the lock since the decision to break it was made (%v) -- removing it now would leave two writers on this replica: %w", path, err, ErrLockHolderAlive)
+	}
+	// Locked, but possibly not the lock that is at path any more: the file
+	// could have been replaced between the open above and the flock just
+	// taken. Removing it then would unlink somebody else's live lock while
+	// holding a worthless one, which is precisely the thing this function
+	// exists to stop doing.
+	if !lockStillAtPath(f, path) {
+		return false, fmt.Errorf("refusing to remove the lock file %s: it was replaced between being opened and being locked, so the file there now is not the one this locked: %w", path, ErrLockReplaced)
+	}
+
 	if err := os.Remove(path); err != nil {
 		if os.IsNotExist(err) {
 			return false, nil

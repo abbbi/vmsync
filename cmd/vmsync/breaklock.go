@@ -92,6 +92,6 @@ func runBreakTargetLock(ctx context.Context, cfg syncConfig) error {
 	// somebody needs to find later, and INFO is where lines go to be unread.
 	trace.Error("BROKE the target-side run lock", "vm", cfg.TargetDomain,
 		"evidence", d.Reason, "holder_pid", d.Holder.PID, "holder_run", d.Holder.RunID,
-		"note", "operations on this replica are possible again. If the host that held this lock comes back and resumes writing, it will find the lock gone -- its own gates before commit and before define refuse on that, which is what stops two writers")
+		"note", "operations on this replica are possible again. Nothing was dispossessed by this: the lock was taken before the file was removed, so there was no holder to dispossess. What protects the replica if the old driver comes back is its own heartbeat -- a run whose session died learns it on the next beat and refuses both to commit and to redefine. It does NOT learn it from the lock file being gone; that was claimed here and was never true")
 	return nil
 }

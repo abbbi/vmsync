@@ -69,6 +69,23 @@ type runLockConfig struct {
 // released for whoever needs it next.
 var errLeaseExpired = errors.New("run lock lease expired")
 
+// errLockDispossessed is the lock file going away under a holder that is still
+// alive and still beating.
+//
+// Nothing in vmsync does this any more -- BreakRunLock takes the lock before it
+// unlinks it -- so reaching this means something outside did: a tmpfiles.d rule
+// clearing /run, or an operator with rm. Exiting is the only correct response,
+// because the flock this process holds is now on an orphaned inode and excludes
+// nobody, while a fresh file at the same path may already have a second writer
+// on it.
+//
+// It deliberately gets no marker of its own and falls to runLockExit's default
+// of exit 1. The shell implementation cannot produce this outcome, and the two
+// are required to be indistinguishable to a caller; the driver learns of it the
+// way it learns of any helper exit, through the closed channel, and turns that
+// into the refusal at its own commit and redefine gates.
+var errLockDispossessed = errors.New("the run lock was removed from under this holder")
+
 // The ways the lock cannot be taken, each mapping to one marker and one exit
 // code that vmsync's shell path also uses, so the two implementations are
 // interchangeable from the caller's side.
@@ -119,18 +136,11 @@ func holdRunLock(cfg runLockConfig, stdin io.Reader, stdout io.Writer) error {
 		return fmt.Errorf("%w: %v", errLockNoDir, err)
 	}
 
-	// No O_TRUNC. The file is truncated only after the lock is held, because
-	// truncating first would blank the CURRENT holder's provenance on the way
-	// to discovering that it is the current holder.
-	f, err := os.OpenFile(cfg.Path, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := lockTheRunLockFile(cfg.Path)
 	if err != nil {
-		return fmt.Errorf("%w: %v", errLockNoCreate, err)
+		return err
 	}
 	defer f.Close()
-
-	if err := util.FlockExclusiveNB(f); err != nil {
-		return fmt.Errorf("%w: %v", errLockBusy, err)
-	}
 	// The flock lives on the open file description, so it is released by this
 	// process exiting for ANY reason -- a clean return, a panic, a SIGKILL, the
 	// host rebooting. That is what makes the lease safe to be the only timer:
@@ -142,7 +152,54 @@ func holdRunLock(cfg runLockConfig, stdin io.Reader, stdout io.Writer) error {
 		return fmt.Errorf("announce the run lock: %w", err)
 	}
 
-	return awaitHeartbeats(stdin, cfg.Lease)
+	return awaitHeartbeats(stdin, cfg.Lease, f, cfg.Path)
+}
+
+// lockTheRunLockFile takes the lock and returns it only once it is the lock
+// that path actually names.
+//
+// The open-then-flock window is the one util.AcquireRunLock has always guarded,
+// and this holder needs it for a sharper reason: the next thing it does is
+// print VMSYNC-LOCK-ACQUIRED, and a driver that reads that line starts writing
+// a replica. If path were unlinked and recreated in between -- a tmpfiles.d
+// rule clearing /run, or anything else that mistakes a live lock for litter --
+// the flock would land on an orphaned inode that excludes nobody, and READY
+// would be a lie for the whole length of the sync. Checking only on the
+// heartbeat is too late, because the heartbeat starts after READY.
+//
+// Fails CLOSED, via RunLockIsAtPath: at acquisition a "cannot tell" costs one
+// retry, and after ten of them a refusal the driver reports, which is a far
+// better outcome than announcing a lock this cannot vouch for.
+//
+// No O_TRUNC on the open. The file is truncated only after the lock is held,
+// because truncating first would blank the CURRENT holder's provenance on the
+// way to discovering that it is the current holder.
+// lockIsAtPath is util.RunLockIsAtPath, indirected for the same reason
+// pkg/util does it for BreakRunLock: the window it guards is between this
+// function's own OpenFile and its own Flock, and nothing outside can be
+// scheduled there. Forcing the answer is the only way to prove the retry
+// happens and that READY is withheld when it cannot be earned.
+var lockIsAtPath = util.RunLockIsAtPath
+
+func lockTheRunLockFile(path string) (*os.File, error) {
+	const maxAttempts = 10
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", errLockNoCreate, err)
+		}
+		if err := util.FlockExclusiveNB(f); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("%w: %v", errLockBusy, err)
+		}
+		if lockIsAtPath(f, path) {
+			return f, nil
+		}
+		// Locked an inode that is no longer at path. Let it go -- which also
+		// releases the useless lock -- and take whatever is there now.
+		f.Close()
+	}
+	return nil, fmt.Errorf("%w: %s kept being replaced out from under repeated attempts to lock it (%d tries)", errLockNoCreate, path, maxAttempts)
 }
 
 // writeLockStamp records who holds the lock, for an operator who has to decide
@@ -166,14 +223,21 @@ func writeLockStamp(f *os.File, stamp string) {
 	}
 }
 
-// awaitHeartbeats returns when the driver stops talking, by either route.
+// awaitHeartbeats returns when the driver stops talking, by either route, or
+// when this process stops being the holder of the lock it took.
 //
 // Any line is a heartbeat: the content carries nothing, because the only fact
 // being transmitted is that the driver is still there to send it. EOF is the
 // clean path -- the driver closed stdin, or the SSH channel went with it -- and
 // it is distinguished from the lease expiring because the two mean different
 // things to whoever reads the log afterwards.
-func awaitHeartbeats(stdin io.Reader, lease time.Duration) error {
+//
+// The dispossession check rides on the beat rather than on a timer of its own.
+// A beat is already the moment this process has something to do, it arrives at
+// a third of the lease so the check is as prompt as anything here needs to be,
+// and a silent driver loses the lock to the lease regardless -- so a second
+// ticker would only add a way for the two to disagree.
+func awaitHeartbeats(stdin io.Reader, lease time.Duration, held *os.File, path string) error {
 	beats := make(chan struct{}, 1)
 	done := make(chan struct{})
 	go func() {
@@ -195,6 +259,9 @@ func awaitHeartbeats(stdin io.Reader, lease time.Duration) error {
 		// lock that either never expires or expires while its driver is healthy.
 		select {
 		case <-beats:
+			if why := util.RunLockWasReplaced(held, path); why != "" {
+				return fmt.Errorf("%w: %s", errLockDispossessed, why)
+			}
 		case <-done:
 			return nil
 		case <-time.After(lease):

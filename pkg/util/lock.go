@@ -115,7 +115,7 @@ func AcquireRunLock(dir, key string) (*os.File, error) {
 			return nil, fmt.Errorf("another vmsync is already running for %q (lock %s held): %w (%v)", key, path, ErrLockHeld, err)
 		}
 
-		if lockRefersToCurrentPath(f, path) {
+		if RunLockIsAtPath(f, path) {
 			return f, nil
 		}
 		// path no longer refers to the inode we just locked -- something
@@ -126,13 +126,24 @@ func AcquireRunLock(dir, key string) (*os.File, error) {
 	return nil, fmt.Errorf("lock file %s kept being replaced out from under repeated acquisition attempts (%d tries) -- check whether something (e.g. a tmpfiles.d rule) is deleting it", path, maxAttempts)
 }
 
-// lockRefersToCurrentPath reports whether f (an already-open, already-
-// locked file) is still the same file path currently refers to -- false if
-// path was deleted, replaced by a different file, or can no longer be
-// stat'd at all. Split out from AcquireRunLock purely so this comparison is
-// directly, deterministically testable without needing to win a real
-// open-then-flock timing race.
-func lockRefersToCurrentPath(f *os.File, path string) bool {
+// RunLockIsAtPath reports whether f (an already-open, already-locked file) is
+// still the same file path currently refers to -- false if path was deleted,
+// replaced by a different file, or can no longer be stat'd at all. Split out
+// from AcquireRunLock purely so this comparison is directly, deterministically
+// testable without needing to win a real open-then-flock timing race.
+//
+// FAILS CLOSED: "cannot tell" answers false. That is the right policy at
+// ACQUISITION, where the caller's response is to go round again and the cost is
+// one iteration. It is the wrong policy for a lock already held and in use, so
+// that case has its own function, RunLockWasReplaced, which reports only a
+// positive answer. The two exist separately because the single most damaging
+// edit either could suffer is being given the other's policy.
+//
+// Exported so that every acquirer of a run lock can make the same check:
+// AcquireRunLock, BreakRunLock before it unlinks, and vmsync-bridge-helper's
+// leased hold, which announces READY to a driver and so must not announce it
+// about an orphan.
+func RunLockIsAtPath(f *os.File, path string) bool {
 	fi, err := f.Stat()
 	if err != nil {
 		return false
@@ -142,4 +153,37 @@ func lockRefersToCurrentPath(f *os.File, path string) bool {
 		return false
 	}
 	return os.SameFile(fi, pathInfo)
+}
+
+// RunLockWasReplaced reports why the lock held on f no longer protects path, or
+// "" while it still does.
+//
+// The mirror of the check AcquireRunLock makes at acquisition, for the rest of
+// the lock's held life -- and with the OPPOSITE error policy, which is why it is
+// a separate function rather than the same one. There, "cannot tell" means go
+// round the loop again, and costs one iteration. Here it would mean a holder
+// abandoning a lock in the middle of a sync, so only a POSITIVE answer counts:
+// the path is gone, or it resolves to a different inode. Every other stat
+// failure reports nothing, because a transient error reading the lock directory
+// must not be the reason a replica goes uncommitted.
+//
+// A holder that unlinks nothing and is unlinked by nobody never sees this fire.
+// What does fire it is the lock file being removed out of band -- a tmpfiles.d
+// rule clearing /run, an operator with rm, anything that mistakes a live lock
+// for litter.
+func RunLockWasReplaced(f *os.File, path string) string {
+	fi, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	pathInfo, err := os.Stat(path)
+	switch {
+	case os.IsNotExist(err):
+		return fmt.Sprintf("%s has been removed, so the lock held on it protects nothing and somebody else may hold the one that replaced it", path)
+	case err != nil:
+		return ""
+	case !os.SameFile(fi, pathInfo):
+		return fmt.Sprintf("%s is a different file now, so the lock held on it protects nothing and somebody else holds the one that replaced it", path)
+	}
+	return ""
 }
