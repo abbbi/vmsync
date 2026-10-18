@@ -142,6 +142,16 @@ type helperConfig struct {
 	// netbuffer.ParseSpec. Both empty means the buffering stage is off.
 	NetBufferBlock string
 	NetBufferSize  string
+
+	// PIDFile is where this process records its own pid once it is
+	// listening, so that whoever started it can find it again even if the
+	// SSH session that launched it is already gone. Empty records nothing.
+	// See writeOwnPIDFile.
+	PIDFile string
+	// IdleLease is how long the relay keeps listening with no connection
+	// using it before ending itself. Zero disables it, which leaves the
+	// relay dependent on something else noticing. See defaultRelayLease.
+	IdleLease time.Duration
 }
 
 func main() {
@@ -179,6 +189,12 @@ func main() {
 	superviseStallWarn := flag.Duration("stall-warn", 0, "Like -stall-after, but REPORTS and never signals. For a command that must not be abandoned part-way -- qemu-img commit, whose base image would be left in a state no later run can describe -- where being unkillable was never a reason not to watch: the liveness line then says how long it has been doing nothing instead of merely that it is still there. Mutually exclusive with -stall-after")
 	superviseWatchArgv := flag.String("watch-argv", "", "A substring of the command line of a process to measure and signal alongside the process group. For a child that daemonises out of the group: qemu-nbd --fork calls setsid(), so it survives a kill aimed at the group it started in and its progress is invisible to a group-wide measurement. Empty matches nothing")
 	superviseLabel := flag.String("label", "", "What to call a supervised command in the liveness line. The command itself is never logged here -- it is already in the caller's log, and repeating it every minute would bury the fields that change")
+	// Written by the helper rather than by the shell that launched it, and
+	// an idle lease so the relay can end itself. Both exist because a relay
+	// outlives its driver by design (setsid) and so has to be able to be
+	// found, and to give up, without it. See relaylease.go.
+	pidFile := flag.String("pidfile", "", "Record this process's pid in this file once the relay is listening, and remove it on a clean exit. Written by the helper itself: the shell that starts it belongs to the SSH session and can die between forking the helper and recording it, leaving a listener nothing names")
+	idleLease := flag.Duration("idle-timeout", defaultRelayLease, "How long the relay keeps listening with nothing connected to it before ending itself. A live connection suspends it entirely, so a copy of any length is unaffected; only the gaps count. ZERO DISABLES IT, which leaves a relay whose driver dies listening until something else notices -- on another host, which is the situation this exists for")
 	showVersion := flag.Bool("v", false, "Show version and exit")
 	showVersionLong := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
@@ -368,6 +384,8 @@ func main() {
 		Level:          *level,
 		NetBufferBlock: netbufferBlock,
 		NetBufferSize:  netbufferSize,
+		PIDFile:        *pidFile,
+		IdleLease:      *idleLease,
 	}
 
 	if err := serve(cfg); err != nil {
@@ -377,9 +395,12 @@ func main() {
 }
 
 // serve listens on listenAddr and hands each accepted connection to
-// handleConn on its own goroutine, indefinitely -- the same "listen, fork
-// per connection" role as socat's "TCP-LISTEN:...,fork", done natively so
-// the remote host needs no socat installed at all.
+// handleConn on its own goroutine -- the same "listen, fork per connection"
+// role as socat's "TCP-LISTEN:...,fork", done natively so the remote host
+// needs no socat installed at all.
+//
+// Returns nil when the idle lease ends it, which is an ordinary way for a
+// relay to finish and not a failure: the thing it was fronting is gone.
 func serve(cfg helperConfig) error {
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -387,12 +408,61 @@ func serve(cfg helperConfig) error {
 	}
 	defer ln.Close()
 
+	// Recorded only once the port is actually bound, so a helper that lost a
+	// port race leaves nothing for the winner's readiness check to read.
+	if cfg.PIDFile != "" {
+		if err := writeOwnPIDFile(cfg.PIDFile); err != nil {
+			return fmt.Errorf("record pid in %s: %w", cfg.PIDFile, err)
+		}
+		defer os.Remove(cfg.PIDFile)
+	}
+
+	// The only thing this process ever says about itself unless something
+	// goes wrong. See relayStartupLine.
+	fmt.Fprintln(os.Stderr, relayStartupLine(cfg, cfg.IdleLease))
+
+	lease := newRelayLease(cfg.IdleLease, time.Now)
+	// expired is closed by the watcher before it closes the listener, so the
+	// Accept error below can tell "the lease ended this" from a real fault.
+	expired := make(chan struct{})
+	if cfg.IdleLease > 0 {
+		go func() {
+			t := time.NewTicker(relayLeaseTick(cfg.IdleLease))
+			defer t.Stop()
+			for range t.C {
+				if lease.expired() {
+					close(expired)
+					// Unblocks Accept, which is the only way to leave the
+					// loop below from the outside.
+					ln.Close()
+					return
+				}
+			}
+		}()
+	}
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			select {
+			case <-expired:
+				// A connection accepted in the instant the lease fired is
+				// already being relayed; ending the process now would cut it.
+				lease.drain()
+				fmt.Fprintf(os.Stderr, "vmsync-bridge-helper: nothing used %s for %s, so this relay is ending itself. Its driver is on another host and may be gone\n",
+					cfg.ListenAddr, cfg.IdleLease)
+				return nil
+			default:
+			}
 			return fmt.Errorf("accept on %s: %w", cfg.ListenAddr, err)
 		}
-		go handleConn(conn, cfg)
+		// Counted before the goroutine starts, so a connection accepted in
+		// the same instant the watcher is deciding cannot be missed.
+		lease.begin()
+		go func() {
+			defer lease.end()
+			handleConn(conn, cfg)
+		}()
 	}
 }
 

@@ -102,10 +102,20 @@ func BuildStartCommand(cfg Config, bridgePort, realPort int, pidFile, logFile st
 		// (-netbuffer is also an optional-value flag on the helper side).
 		args = append(args, "-netbuffer="+cfg.NetBufferBlock+","+cfg.NetBufferSize)
 	}
+	// THE HELPER RECORDS ITS OWN PID, via -pidfile, and this command does
+	// not. It used to end in `& echo $! > pidFile`, which looks equivalent
+	// and is not: the redirection runs after the fork, in a shell that
+	// belongs to the SSH session, while setsid has already carried the
+	// helper out of that session. A driver that dies in between takes the
+	// recording shell with it and leaves the helper running under no name --
+	// invisible to BuildStopCommand, to killOrphanedRemoteBridge and to any
+	// sweep, all of which begin by reading this file. One was found that way
+	// on a production target, still listening two hours later.
+	args = append(args, "-pidfile", pidFile)
 	helperCmd := quoteArgs(args...)
 
-	return fmt.Sprintf("setsid sh -c %s </dev/null >%s 2>&1 & echo $! > %s",
-		util.ShQuote(helperCmd), util.ShQuote(logFile), util.ShQuote(pidFile))
+	return fmt.Sprintf("setsid sh -c %s </dev/null >%s 2>&1 &",
+		util.ShQuote(helperCmd), util.ShQuote(logFile))
 }
 
 // BuildStopCommand returns a shell command that kills the process group
