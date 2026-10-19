@@ -1784,6 +1784,45 @@ func planCheckpointRecovery(pending, lastAccepted string, existing []libvirtsync
 	return pending, nil
 }
 
+// incompleteReplicaRefusal refuses an incremental into a replica whose own
+// metadata says a full copy into it did not finish.
+//
+// Pure, and separate from run(), for the same reason checkpointChainConsistent
+// below is: run() needs two libvirt connections and an SSH client to enter, and
+// this is the decision that keeps a delta off a half-written image.
+//
+// The marker means the image on the target is part old and part new with no
+// record of where the join is. A delta computed from a dirty bitmap describes
+// changes since a checkpoint; applied to that image it produces a file
+// consistent with no point in time -- and the run then SUCCEEDS, which clears
+// the marker on the way out, so the evidence goes with it.
+//
+// Non-empty rather than parsed, exactly as pkg/failover's refusal and the
+// displaced-set sweep treat it: the field's PRESENCE is the finding, so a value
+// this build cannot read still refuses.
+//
+// Reachable without exotic input, which is why it is a refusal and not a
+// warning. A full sync writes no pending_checkpoint, on the reasoning that a
+// failed full sync is followed by another full sync regardless -- true only
+// while checkpoint names do not repeat, and they repeat after a chain drop
+// (CI-04). A full sync that armed the marker, created a fresh
+// vmsync-cpt-000001 and died mid-copy leaves a target whose last_checkpoint is
+// the PREVIOUS generation's vmsync-cpt-000001, which equals the next run's
+// parent -- so the chain check passes and the delta lands.
+//
+// Refused rather than quietly converted into a full copy: spending a full copy
+// over the WAN is the operator's decision, and the branch that arms this marker
+// for a parentless run is far above the point where this is checked, so
+// flipping to a full copy here would write base images over the replica with
+// the marker NOT armed -- the state it exists to refuse.
+func incompleteReplicaRefusal(targetDomain, replicaIncomplete string) error {
+	if strings.TrimSpace(replicaIncomplete) == "" {
+		return nil
+	}
+	return fmt.Errorf("refusing to sync an incremental into %s: it carries replica_incomplete=%q, so a full copy into those disks did not finish and the image is part old and part new. A delta describes changes since a checkpoint and says nothing about where that join is, so applying one would produce a replica consistent with no point in time -- and this run would then report success and clear the marker. Repair it with a full copy (-reinit), or drop the source's checkpoint chain so the next run is parentless; -reinit-after-failures does the former on its own if it is set",
+		targetDomain, replicaIncomplete)
+}
+
 func checkpointChainConsistent(metadataEntryCheckpoint, parent string) bool {
 	if metadataEntryCheckpoint == "" {
 		return true
@@ -5305,6 +5344,12 @@ func run(cfg syncConfig) (runErr error) {
 	tgtDom, err := tgtMgr.LookupDomain(cfg.TargetDomain)
 	var metadataEntryCheckpoint string
 	var metadataEntryTimestamp string
+	// The target's own record that a full copy into it did not finish. Read
+	// here with the rest because an incremental onto a replica carrying it is
+	// never valid, and until this nothing in the sync path looked at it at all
+	// -- its only readers were the promote refusal, the journal and the
+	// displaced-set sweep.
+	var metadataEntryReplicaIncomplete string
 	// The checkpoint a previous run recorded that it was about to advance
 	// to, but which the target never accepted. Empty on every healthy
 	// replica; see MetadataFieldPendingCheckpoint.
@@ -5376,6 +5421,12 @@ func run(cfg syncConfig) (runErr error) {
 			// is therefore not worth failing the run over: treated as
 			// absent, which is the pre-existing behaviour.
 			metadataEntryPendingCheckpoint, _ = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldPendingCheckpoint)
+			// Treated as PRESENT on a parse failure, which is the opposite of
+			// the pending-checkpoint field above and deliberate: pending is a
+			// hint that costs a wasted full copy if it is wrong, this is the
+			// interlock that stops a delta landing on a half-written image. A
+			// value this build cannot read still means somebody wrote one.
+			metadataEntryReplicaIncomplete, _ = libvirtsync.ParseMetadata(tgtXML, libvirtsync.MetadataFieldReplicaIncomplete)
 			if metadataEntryPendingCheckpoint != "" {
 				trace.Info("Target domain metadata", "pending_checkpoint", metadataEntryPendingCheckpoint)
 			}
@@ -5521,6 +5572,11 @@ func run(cfg syncConfig) (runErr error) {
 	if parent == "" {
 		trace.Info("created initial", "checkpoint", checkpointName)
 	} else {
+		// An incremental onto a replica marked incomplete is never valid, and
+		// the chain check below cannot catch it. See the function.
+		if err := incompleteReplicaRefusal(cfg.TargetDomain, metadataEntryReplicaIncomplete); err != nil {
+			return err
+		}
 		if !checkpointChainConsistent(metadataEntryCheckpoint, parent) {
 			return fmt.Errorf("checkpoint inconsistency detected: target VM definition lists [%s] as parent checkpoint, but parent checkpoint defined is [%s]", metadataEntryCheckpoint, parent)
 		}
@@ -5615,11 +5671,22 @@ func run(cfg syncConfig) (runErr error) {
 	// this write fails the run stops here, with the source's chain untouched
 	// and nothing to reconcile.
 	//
-	// Only for an incremental against an existing target. A full sync has no
-	// parent to diverge from -- if it fails, the next run is another full
-	// sync regardless -- and on a -reinit the target domain may not exist
-	// yet, so there is nowhere to write. Same existence test
-	// recordReplicaWrittenAt makes, and for the same reason.
+	// Only for an incremental against an existing target, and on a -reinit the
+	// target domain may not exist yet so there is nowhere to write. Same
+	// existence test recordReplicaWrittenAt makes, and for the same reason.
+	//
+	// This used to also reason that a full sync needs no record because "if it
+	// fails, the next run is another full sync regardless". That is true only
+	// while checkpoint names do not repeat. After a chain drop they restart at
+	// vmsync-cpt-000001 (CI-04), so a failed full sync can leave a source tip
+	// whose name equals the target's recorded last_checkpoint from the
+	// PREVIOUS generation, and the next run reads that as a consistent chain
+	// and goes incremental onto a half-written image. What stops that is the
+	// replica_incomplete refusal at the chain check above, not anything here:
+	// a full sync arms that marker before it writes a byte, and only a
+	// successful one clears it. Writing a pending_checkpoint for a full sync
+	// as well would be a second belt, and is worth considering when CI-04's
+	// identity work lands -- it is not what closes the hole today.
 	if parent != "" {
 		targetExists, existsErr := libvirtsync.DomainExists(tgtMgr.Conn, cfg.TargetDomain)
 		if existsErr != nil {
