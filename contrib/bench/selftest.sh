@@ -226,6 +226,57 @@ for fn in verify_skip_checks stage_failover_disk_owner; do
 	fi
 done
 
+echo "=== the harness says what it is ==="
+
+# A results set used to carry no record of which bench.sh produced it. The
+# harness version-checks the engine on both hosts and warns on mere
+# uncertainty -- "cannot tell whether the failover stages are testing the build
+# you just made" -- and was the one version nothing recorded. That is not a
+# cosmetic gap: commit 782a7b8 replaced stage 4e's assertion with its opposite,
+# so a deployed copy from before it reports stage 4 FAIL on a healthy host, and
+# nothing in the report would say which harness said so.
+
+# Behavioural, and the only assertion here that runs the real script. --version
+# exits before any config is read, so this is safe anywhere.
+ident="$(bash "$BENCH" --version 2>&1)"
+rc=$?
+check "--version exits 0" "0" "$rc"
+want_sum="$(sha256sum "$BENCH" | cut -d' ' -f1)"
+want_lines="$(wc -l < "$BENCH" | tr -d ' ')"
+check "--version reports this file's own sha256 and line count" \
+	"bench.sh sha256:$want_sum ($want_lines lines)" "$ident"
+
+# Source-level, because the report and the run directory cannot be produced
+# without a bench run. Both of these are a single line that is easy to drop.
+if grep -A1 'echo "- Run: \$RUN_ID"' "$BENCH" | grep -q 'Harness'; then
+	PASS=$((PASS + 1))
+	printf '  ok    report.md names the harness beside the run\n'
+else
+	FAIL=$((FAIL + 1))
+	printf '  FAIL  report.md does not name the harness, so a pasted report cannot be attributed to a bench.sh\n'
+fi
+
+if grep -q 'bench-ident\.txt' "$BENCH"; then
+	PASS=$((PASS + 1))
+	printf '  ok    the run directory keeps the harness identity in a file of its own\n'
+else
+	FAIL=$((FAIL + 1))
+	printf '  FAIL  nothing writes bench-ident.txt, so only the report carries the identity and a later script cannot read it\n'
+fi
+
+# Ordering: the report is generated long after setup, but an edit that moved
+# the assignment below its use would leave every report saying "- Harness:"
+# and nothing else, which reads like a harness that declined to answer.
+assign="$(grep -n '^BENCH_IDENT=' "$BENCH" | head -1 | cut -d: -f1)"
+use="$(grep -n 'echo "- Harness: \$BENCH_IDENT"' "$BENCH" | head -1 | cut -d: -f1)"
+if [ -n "$assign" ] && [ -n "$use" ] && [ "$assign" -lt "$use" ]; then
+	PASS=$((PASS + 1))
+	printf '  ok    the identity is computed before the report prints it\n'
+else
+	FAIL=$((FAIL + 1))
+	printf '  FAIL  BENCH_IDENT is used at line %s but assigned at line %s\n' "${use:-none}" "${assign:-none}"
+fi
+
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

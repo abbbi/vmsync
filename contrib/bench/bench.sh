@@ -84,11 +84,65 @@ ALL_STAGES="matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-lon
 INTERRUPTED=no
 trap 'INTERRUPTED=yes' INT TERM
 
+# bench_ident -- what this harness is, as a content hash of itself.
+#
+# WHY A HASH AND NOT A VERSION NUMBER. There is nothing here to bump: this is
+# one script, edited in the tree and copied to wherever it runs, and the copy on
+# a bench host is routinely ahead of or behind the tree it came from with
+# nothing recording which. A number needs somebody to remember; a hash is true
+# by construction. It also resolves to an exact commit, because every
+# historical blob of this file is distinct:
+#
+#   git log --format=%H -- contrib/bench/bench.sh | while read h; do
+#     printf '%s %s\n' "$(git show "$h:contrib/bench/bench.sh" | sha256sum | cut -d' ' -f1)" "$h"; done
+#
+# and a hash matching NOTHING in that list is itself the answer -- the deployed
+# copy was edited in place.
+#
+# NOT `git describe`. The tree is not always beside the script, and the thing
+# that produced a results set is frequently not a commit at all: the run in
+# results/20260921-141557 matches no revision that existed when it ran, and the
+# only revision emitting its report shape is six days later. A hash says what
+# ran. A revision says what somebody meant to run.
+#
+# WHY THIS EXISTS AT ALL. The harness already refuses to trust a stale engine:
+# preflight warns that a skewed target binary makes "the report read as an
+# engine regression", and warns on mere uncertainty -- "cannot tell whether the
+# failover stages are testing the build you just made". The same argument
+# applies one level up and was the one version nothing recorded. A stale
+# harness is not a quieter version of the same report: commit 782a7b8 replaced
+# stage 4e's assertion with its opposite, so a deployed copy from before it
+# reports stage 4 FAIL on a healthy host.
+#
+# sha256sum first, because that is what the matching procedure above uses;
+# md5sum as the fallback because preflight already requires it. The algorithm
+# is named in the value so two of these can never be compared to each other by
+# mistake.
+bench_ident() {
+	local self="${BASH_SOURCE[0]}"
+	if [ ! -r "$self" ]; then
+		printf 'unknown (bench.sh is not readable at %s)' "$self"
+		return 0
+	fi
+	if command -v sha256sum >/dev/null 2>&1; then
+		printf 'sha256:%s (%s lines)' \
+			"$(sha256sum "$self" | cut -d' ' -f1)" "$(wc -l < "$self" | tr -d ' ')"
+	elif command -v md5sum >/dev/null 2>&1; then
+		printf 'md5:%s (%s lines)' \
+			"$(md5sum "$self" | cut -d' ' -f1)" "$(wc -l < "$self" | tr -d ' ')"
+	else
+		printf 'unknown (neither sha256sum nor md5sum is available)'
+	fi
+}
+
 usage() {
         cat <<'EOF'
 Usage: bench.sh [options]
 
 Options:
+      --version           print this harness's content hash and exit. The one
+                           question a deployed copy could not previously be
+                           asked: which bench.sh is this?
   -c, --config FILE       config file (default: ./bench.conf)
   -s, --scenarios FILE    transport matrix file (default: ./scenarios.conf)
   --only PATTERN          only run Stage 1 scenarios whose name matches
@@ -527,6 +581,13 @@ while [ $# -gt 0 ]; do
                 DRY_RUN=yes
                 shift
                 ;;
+        --version)
+                # Before any config is read and long before anything is
+                # written, so this is safe to run against a deployed copy on a
+                # host in the middle of other work.
+                printf 'bench.sh %s\n' "$(bench_ident)"
+                exit 0
+                ;;
         -h | --help)
                 usage
                 exit 0
@@ -676,12 +737,20 @@ mkdir -p "$RUN_DIR/logs" "$RUN_DIR/prom"
 CSV="$RUN_DIR/results.csv"
 results_init "$CSV"
 
+# Written to a file of its own as well as into the report, because the report is
+# the thing that gets pasted into a ticket and the file is the thing a later
+# script can read. Not a results.csv row: every row there is a check, and
+# stage_verdict counts rows.
+BENCH_IDENT="$(bench_ident)"
+printf '%s\n' "$BENCH_IDENT" > "$RUN_DIR/bench-ident.txt"
+
 # Seeded from the run id when unset, and logged either way. A randomly placed
 # corruption is only worth having if the exact sequence can be replayed: rerun
 # with TAMPER_SEED=<this value> and every draw below repeats identically.
 TAMPER_SEED="${TAMPER_SEED:-$RUN_ID}"
 
 log "vmsync benchmark harness -- run id $RUN_ID"
+log "harness: $BENCH_IDENT"
 log "config: $CONF"
 log "scenarios: $SCENARIOS"
 log "results directory: $RUN_DIR"
@@ -12006,6 +12075,7 @@ generate_report() {
                 done | sort -n | cut -f2-
                 echo
                 echo "- Run: $RUN_ID"
+                echo "- Harness: $BENCH_IDENT"
                 echo "- Source: $SOURCE_DOMAIN @ $SOURCE_URI"
                 echo "- Target: $TARGET_DOMAIN @ $TARGET_URI"
                 echo "- Dry run: $DRY_RUN"
