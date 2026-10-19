@@ -4292,6 +4292,12 @@ func run(cfg syncConfig) (runErr error) {
 			detail["displaced_sets"] = strconv.Itoa(len(displaced.Found))
 			detail["displaced_bytes"] = strconv.FormatInt(displaced.FoundBytes, 10)
 		}
+		if len(displaced.Unreclaimable) > 0 {
+			// Recorded even though no run will act on it: a journal that shows
+			// only what changed cannot answer "why is this disk still full".
+			detail["unreclaimable_sets"] = strconv.Itoa(len(displaced.Unreclaimable))
+			detail["unreclaimable_bytes"] = strconv.FormatInt(displaced.UnreclaimableBytes, 10)
+		}
 		if len(displaced.Removed) > 0 {
 			detail["reclaimed_sets"] = strconv.Itoa(len(displaced.Removed))
 			detail["reclaimed_bytes"] = strconv.FormatInt(displaced.RemovedBytes, 10)
@@ -7661,7 +7667,14 @@ func run(cfg syncConfig) (runErr error) {
 	// anybody keeps restore points. This is also deliberately BEFORE the copy
 	// below -- the harm is an ENOSPC on the DR host, and space reclaimed after
 	// the copy that ran out of it is space reclaimed too late.
-	displaced = sweepDisplacedSets(ctx, cfg, targetSSHClient, tgtMgr, targetDiskPaths, time.Now())
+	// Read here, immediately before the sweep, because it is the reason the
+	// sweep may delete nothing and so has to be the state as of the moment of
+	// deciding -- and passed in rather than read inside, because it is the one
+	// thing in there that needs a libvirt connection and it made the removal
+	// loop unreachable to any test. The error travels with it: the sweep fails
+	// closed on it.
+	incompleteFields, incompleteErr := libvirtsync.ReadDomainMetadataFields(tgtMgr, cfg.TargetDomain, libvirtsync.MetadataFieldReplicaIncomplete)
+	displaced = sweepDisplacedSets(ctx, cfg, targetSSHClient, incompleteFields[libvirtsync.MetadataFieldReplicaIncomplete], incompleteErr, targetDiskPaths, time.Now())
 
 	rp, err := newRestorePoints(ctx, cfg.RetentionPolicy, targetSSHClient, targetDiskPaths, cfg.TargetDomain, checkpointName, checkpointAt)
 	if err != nil {

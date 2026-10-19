@@ -53,7 +53,8 @@ func TestNothingIsReclaimedUnlessAnOperatorSetADuration(t *testing.T) {
 		leftoverAged(restorepoint.LeftoverAsideStore, 365*24*time.Hour),
 	}
 	for _, after := range []time.Duration{0, -time.Hour} {
-		reclaim, keep, refused := leftoversToReclaim(found, after, reclaimNow, "")
+		d := leftoversToReclaim(found, after, reclaimNow, "")
+		reclaim, keep, refused := d.Reclaim, d.Keep, d.Refused
 		if len(reclaim) != 0 {
 			t.Errorf("after=%s reclaimed %+v; with no duration set nothing has been asked for", after, reclaim)
 		}
@@ -76,10 +77,11 @@ func TestLeftoversToReclaimTakesOnlyWhatIsOldEnough(t *testing.T) {
 	// Neither the name nor the filesystem could say when this was displaced.
 	unknown := restorepoint.Leftover{Path: "/data/unknown.qcow2" + restorepoint.ReplicaReplacedSuffix + "1", Kind: restorepoint.LeftoverReplacedDisk}
 
-	reclaim, keep, refused := leftoversToReclaim(
+	d := leftoversToReclaim(
 		[]restorepoint.Leftover{older, exactly, newer, unknown},
 		30*24*time.Hour, reclaimNow, "",
 	)
+	reclaim, keep, unstamped, refused := d.Reclaim, d.Keep, d.Unstamped, d.Refused
 	if refused != "" {
 		t.Fatalf("refused = %q", refused)
 	}
@@ -101,6 +103,13 @@ func TestLeftoversToReclaimTakesOnlyWhatIsOldEnough(t *testing.T) {
 	}
 	if len(keep) != 2 {
 		t.Errorf("kept %d, want the 2 that are not old enough: %+v", len(keep), keep)
+	}
+	// Every fixture here either carries a stamp in its name or has no age at
+	// all, so none of them lands in the third bucket. Asserted so that a
+	// change which started routing stamped sets there shows up as a failure
+	// of this test rather than as a sweep that quietly stops reclaiming.
+	if len(unstamped) != 0 {
+		t.Errorf("unstamped = %+v, want none: these fixtures are all name-stamped", unstamped)
 	}
 }
 
@@ -127,7 +136,8 @@ func TestAnIncompleteReplicaRefusesTheWholeSweep(t *testing.T) {
 		"something this build has never seen",
 		"  verb=reinit  ",
 	} {
-		reclaim, keep, refused := leftoversToReclaim(found, 24*time.Hour, reclaimNow, marker)
+		d := leftoversToReclaim(found, 24*time.Hour, reclaimNow, marker)
+		reclaim, keep, refused := d.Reclaim, d.Keep, d.Refused
 		if refused == "" {
 			t.Errorf("marker %q did not refuse the sweep: these asides are the only complete copy of the replica there is", marker)
 		}
@@ -139,7 +149,7 @@ func TestAnIncompleteReplicaRefusesTheWholeSweep(t *testing.T) {
 		}
 	}
 	// And whitespace alone is not a marker: an empty element is not a finding.
-	if _, _, refused := leftoversToReclaim(found, 24*time.Hour, reclaimNow, "   "); refused != "" {
+	if refused := leftoversToReclaim(found, 24*time.Hour, reclaimNow, "   ").Refused; refused != "" {
 		t.Errorf("whitespace was read as a finding (%q); the marker is absent, and refusing for ever on it would make the sweep unreachable", refused)
 	}
 }
@@ -165,7 +175,7 @@ func TestReclaimFloorIsLongerThanAWorkingDay(t *testing.T) {
 	// Sanity: a set younger than the floor can never be reclaimed at the
 	// shortest duration the flag accepts.
 	fresh := leftoverAged(restorepoint.LeftoverReplacedDisk, time.Hour)
-	reclaim, _, _ := leftoversToReclaim([]restorepoint.Leftover{fresh}, minReclaimLeftoversAfter, reclaimNow, "")
+	reclaim := leftoversToReclaim([]restorepoint.Leftover{fresh}, minReclaimLeftoversAfter, reclaimNow, "").Reclaim
 	if len(reclaim) != 0 {
 		t.Errorf("an aside made an hour ago was reclaimed at the shortest accepted duration: %+v", reclaim)
 	}
