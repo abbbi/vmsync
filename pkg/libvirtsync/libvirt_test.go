@@ -1777,10 +1777,14 @@ func TestNextCheckpointName(t *testing.T) {
 		}
 	})
 
-	t.Run("increments from the latest (last) existing checkpoint", func(t *testing.T) {
+	// The fixture carried no parent links when this only ever took the last
+	// element of a slice. Two parentless checkpoints is not a chain of two --
+	// it is a fork, which is now refused -- so the links are set here, which
+	// is what libvirt actually returns for a chain vmsync built.
+	t.Run("increments from the end of the chain", func(t *testing.T) {
 		existing := []Checkpoint{
 			{Name: "vmsync-cpt-000001"},
-			{Name: "vmsync-cpt-000002"},
+			{Name: "vmsync-cpt-000002", Parent: "vmsync-cpt-000001"},
 		}
 		name, parent, err := NextCheckpointName(existing)
 		if err != nil {

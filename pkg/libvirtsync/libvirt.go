@@ -3994,8 +3994,18 @@ func ListManagedCheckpoints(dom *libvirt.Domain) ([]Checkpoint, error) {
 		return nil, fmt.Errorf("list checkpoints: incomplete listing, at least one entry could not be read: %w", lookupErr)
 	}
 
+	// Name as the tie-break, because Time alone is not a total order here and
+	// sort.Slice is not stable. <creationTime> is second-granular and libvirt
+	// validates nothing about it -- buildAdoptionXML's comment says so, and the
+	// adoption path writes time.Now() into it -- so two checkpoints sharing a
+	// second used to come back in whichever order the sort happened to leave
+	// them. Nothing downstream should depend on this order any more (see
+	// chainTip), but an unstable listing is a bad thing to hand anybody.
 	sort.Slice(out, func(i, j int) bool {
-		return out[i].Time.Before(out[j].Time)
+		if !out[i].Time.Equal(out[j].Time) {
+			return out[i].Time.Before(out[j].Time)
+		}
+		return out[i].Name < out[j].Name
 	})
 	return out, nil
 }
@@ -4271,21 +4281,102 @@ func ClearOrphanBitmap(dom *libvirt.Domain, bitmap string, creationUnix int64, d
 	return nil
 }
 
+// chainTip is the one checkpoint no other checkpoint claims as its parent.
+//
+// THE CHAIN SAYS WHICH IS LAST; THE CLOCK DOES NOT. This used to be
+// existing[len(existing)-1] off a listing sorted by <creationTime>, which is
+// second-granular, unvalidated by libvirt, and written by vmsync's own bitmap
+// adoption path as time.Now() -- so two checkpoints sharing a second gave an
+// arbitrary tip, and an arbitrary tip is an arbitrary PARENT for the next
+// incremental. The parent decides which dirty bitmap the delta is computed
+// from; the wrong one silently omits everything that changed before it.
+//
+// The reachable way to get two: ClearOrphanBitmap adopts an orphaned bitmap as
+// a checkpoint in order to delete it, and a run killed between the adopt and
+// the delete leaves that adoption behind. It is prefixed, so it is managed; it
+// is parentless and nobody's parent, so it is a second tip; and it was stamped
+// with the clock of the run that adopted it.
+//
+// Returns an error rather than a guess when the shape is not a single chain.
+// A fork means something is in the chain's namespace that vmsync did not put
+// there in sequence, and choosing either branch risks a delta against a bitmap
+// that does not describe the replica. The caller refuses the run; an operator
+// reading the names can see which one is the stray.
+func chainTip(existing []Checkpoint) (Checkpoint, error) {
+	claimed := make(map[string]bool, len(existing))
+	for _, c := range existing {
+		if c.Parent != "" {
+			claimed[c.Parent] = true
+		}
+	}
+	var tips []Checkpoint
+	for _, c := range existing {
+		if !claimed[c.Name] {
+			tips = append(tips, c)
+		}
+	}
+	switch len(tips) {
+	case 1:
+		return tips[0], nil
+	case 0:
+		// Every checkpoint is somebody's parent, so the parent links form a
+		// cycle. libvirt should not permit it and nothing here can repair it.
+		names := make([]string, 0, len(existing))
+		for _, c := range existing {
+			names = append(names, c.Name)
+		}
+		return Checkpoint{}, fmt.Errorf("the %d vmsync checkpoints on this domain have no end: every one of them is named as another's parent, so the chain is a cycle and no incremental can be based on it (%s)",
+			len(existing), strings.Join(names, ", "))
+	default:
+		names := make([]string, 0, len(tips))
+		for _, c := range tips {
+			names = append(names, fmt.Sprintf("%s (parent %q)", c.Name, c.Parent))
+		}
+		sort.Strings(names)
+		return Checkpoint{}, fmt.Errorf("the vmsync checkpoint chain on this domain has %d ends rather than one, so which of them an incremental should build on is not decidable: %s. One of these is a stray -- most likely a bitmap adoption that was interrupted before its checkpoint was deleted again. Remove the one that is not part of the chain (virsh checkpoint-delete --metadata) and re-run, or drop the chain entirely to force a full copy",
+			len(tips), strings.Join(names, "; "))
+	}
+}
+
+// highestCheckpointNumber is the largest numeric suffix in use, so the next
+// name cannot collide with a checkpoint that already exists.
+//
+// Taken across ALL of them rather than from the tip, because libvirt refuses a
+// create whose name is already taken -- "domain moment ... already exists" --
+// and that refusal is not the bitmap collision CreateCheckpoint knows how to
+// heal from, so the run would simply die. In a well-formed chain the tip holds
+// the highest number and this is the same answer.
+func highestCheckpointNumber(existing []Checkpoint) (n int, width int, ok bool) {
+	re := regexp.MustCompile(`^(.*-)(\d+)$`)
+	for _, c := range existing {
+		m := re.FindStringSubmatch(c.Name)
+		if m == nil {
+			continue
+		}
+		v, err := strconv.Atoi(m[2])
+		if err != nil {
+			continue
+		}
+		if !ok || v > n {
+			n, width, ok = v, len(m[2]), true
+		}
+	}
+	return n, width, ok
+}
+
 func NextCheckpointName(existing []Checkpoint) (name string, parent string, err error) {
 	if len(existing) == 0 {
 		return fmt.Sprintf("%s-%06d", CheckpointPrefix, 1), "", nil
 	}
-	latest := existing[len(existing)-1]
-
-	re := regexp.MustCompile(`^(.*-)(\d+)$`)
-	m := re.FindStringSubmatch(latest.Name)
-	if m == nil {
-		return "", "", fmt.Errorf("checkpoint name %q does not end in a numeric suffix, cannot determine next checkpoint name", latest.Name)
+	tip, err := chainTip(existing)
+	if err != nil {
+		return "", "", err
 	}
-	numStr := m[2]
-	n, _ := strconv.Atoi(numStr)
-	n = n + 1
-	return fmt.Sprintf("%s-%0*d", CheckpointPrefix, len(numStr), n), latest.Name, nil
+	n, width, ok := highestCheckpointNumber(existing)
+	if !ok {
+		return "", "", fmt.Errorf("no vmsync checkpoint on this domain ends in a numeric suffix, cannot determine the next checkpoint name (tip is %q)", tip.Name)
+	}
+	return fmt.Sprintf("%s-%0*d", CheckpointPrefix, width, n+1), tip.Name, nil
 }
 
 func FailIfBlockJobActive(dom *libvirt.Domain, qcowDisks []disk.QcowDisk) error {
