@@ -1697,8 +1697,12 @@ verify_skip_checks() {
 
         # qemu-img has no plan to prune: it shells out to a separate
         # implementation that reads every byte on both sides, so neither gauge
-        # describes anything there. Nothing to grade, and nothing missing.
+        # describes anything there. Nothing to grade -- but recorded as not
+        # applicable rather than left out, so the stage's arithmetic still adds
+        # up to the number of checks the stage contains.
         if [ "$mode" = qemu-img ]; then
+                ungraded_row "$scenario" "$label" "N/A" "qemu-img reads every byte through a separate implementation and reports no allocation map"
+                ungraded_row "$scenario" "$used" "N/A" "qemu-img has no comparison plan to prune"
                 return 0
         fi
 
@@ -1726,7 +1730,7 @@ verify_skip_checks() {
         # ahead of the plan; nothing had failed. A SKIP whose stated cause
         # did not happen is worse than no row, because somebody reads it.
         if [ "$planned" != yes ]; then
-                log "   (no plan to grade: -no-checksum puts -verify on the byte comparator, which plans internally and reports no figures)"
+                ungraded_row "$scenario" "$used" "N/A" "-no-checksum puts -verify on the byte comparator, which plans internally and reports no figures"
                 return 0
         fi
 
@@ -3444,6 +3448,31 @@ fo_check() {
 	fi
 }
 
+# ungraded_row records a check that did NOT run, so the stage verdict can
+# still account for it. The sibling of fo_check, and it takes the same label so
+# the row lands in the same phase column: that is what lets two runs be diffed
+# on a named check rather than on a count.
+#
+# KIND is one of two words and the difference is not decoration:
+#   N/A  -- the check does not apply to this configuration. Nothing is missing.
+#   SKIP -- it applies and could not be attempted. Somebody may want to chase it.
+# A SKIP whose stated cause did not happen is worse than no row at all, because
+# somebody reads it -- which is why the two are separate rather than one word
+# covering both.
+#
+# WHY THIS EXISTS. stage_verdict is computed by awk over the results CSV, so a
+# check that returns without leaving a row is indistinguishable from one that
+# was never in the suite: the denominator simply moves. The verify stage read
+# "14 checks passed" where fifteen were intended, the fifteenth present only as
+# a log line no tooling reads, and no amount of diffing two runs could show
+# that a check had stopped running. Returning quietly is the one thing a check
+# must not do.
+ungraded_row() {
+	local scenario="$1" label="$2" kind="$3" reason="${4:-}"
+	log "   ${kind}: ${label}${reason:+ -- $reason}"
+	results_row "$CSV" "$scenario" "${label// /_}" "" "" "" "" "" "" "$kind $reason"
+}
+
 FAILOVER_FAILURES=0
 
 # clear_target_promotion -> puts the target back to role=target. Prints
@@ -3681,6 +3710,22 @@ expected_qemu_owner() {
 # stage_failover_disk_owner asserts the three ways a target disk can end up
 # with the right owner, each of which only happens when a file is CREATED --
 # hence a full sync per property.
+# owner_checks_ungraded records the three ownership checks below as not run.
+#
+# One list, because stage_failover_disk_owner abandons them from three
+# different points and three copies of the same labels would drift apart --
+# and a label that drifts lands in a different phase column, which is exactly
+# the diffability these rows exist to provide.
+owner_checks_ungraded() {
+	local kind="$1" reason="$2" label
+	for label in \
+		"-reinit preserves the ownership it replaces" \
+		"an explicit -target-disk-owner overrides the preserved one" \
+		"every replica disk is readable by the qemu account"; do
+		ungraded_row "$sc" "$label" "$kind" "$reason"
+	done
+}
+
 stage_failover_disk_owner() {
 	local sc="$1"
 	if [ "$DRY_RUN" = yes ]; then
@@ -3688,6 +3733,10 @@ stage_failover_disk_owner() {
 		# there is nothing meaningful to print for a dry run -- but saying so
 		# beats a preview that silently omits two full syncs.
 		log "   (dry run: the disk-ownership checks read live state and run two extra -reinit syncs, so they do nothing here)"
+		# Recorded, because fo_check records its own dry runs and a stage that
+		# silently contributes nothing on --dry-run is the one shape that
+		# cannot be told from a stage whose checks were removed.
+		owner_checks_ungraded "SKIP" "dry run -- these checks read live state and run two extra -reinit syncs"
 		return 0
 	fi
 
@@ -3721,7 +3770,7 @@ stage_failover_disk_owner() {
 		"disk is '$owner' -- a root-owned disk is one the promoted domain cannot open"
 
 	if [ -z "$expected_group" ]; then
-		log "   (skipping the preserve/override checks: no group to use as a sentinel)"
+		owner_checks_ungraded "N/A" "no group was available to use as an ownership sentinel"
 		return 0
 	fi
 
@@ -3738,11 +3787,13 @@ stage_failover_disk_owner() {
 	local path
 	path="$(disk_source_path "$TARGET_URI" "$TARGET_DOMAIN" "$TAMPER_DISK_DEV")" || true
 	if [ -z "$path" ]; then
-		warn "could not resolve the target disk path -- skipping the reinit ownership checks"
+		warn "could not resolve the target disk path -- the reinit ownership checks cannot be attempted"
+		owner_checks_ungraded "SKIP" "the target disk path could not be resolved"
 		return 0
 	fi
 	if ! ssh_host_cmd "$TARGET_HOST" chown "${expected_user}:root" "$path"; then
-		warn "could not set the sentinel ownership -- skipping the reinit ownership checks"
+		warn "could not set the sentinel ownership -- the reinit ownership checks cannot be attempted"
+		owner_checks_ungraded "SKIP" "the sentinel ownership could not be set"
 		return 0
 	fi
 
@@ -11690,13 +11741,22 @@ stage_verdict() {
 			if      ($9 ~ /^FAIL/) f++
 			else if ($9 ~ /^PASS/) p++
 			else if ($9 ~ /^SKIP/) s++
+			else if ($9 ~ /^N\/A/) na++
 		}
 		END {
-			if (f > 0)                  printf "FAIL\t%d of %d checks failed", f, f+p
+			# Reported, never folded into the pass or skip counts. A check
+			# that does not apply is not a check that passed, and it is not
+			# one anybody needs to chase either -- but it has to be in the
+			# arithmetic, because the whole reason these rows exist is that a
+			# verdict which silently covers fourteen of fifteen checks reads
+			# exactly like one that covers all fourteen there are.
+			na_note = (na > 0) ? sprintf(", %d not applicable", na) : ""
+			if (f > 0)                  printf "FAIL\t%d of %d checks failed%s", f, f+p, na_note
 			else if (stood_down > 0)    printf "SKIPPED\tstood down after %d check(s) passed", p
-			else if (p > 0 && s > 0)    printf "PASS\t%d checks passed, %d skipped", p, s
-			else if (p > 0)             printf "PASS\t%d checks passed", p
-			else if (s > 0)             printf "SKIPPED\t%d checks skipped", s
+			else if (p > 0 && s > 0)    printf "PASS\t%d checks passed, %d skipped%s", p, s, na_note
+			else if (p > 0)             printf "PASS\t%d checks passed%s", p, na_note
+			else if (s > 0)             printf "SKIPPED\t%d checks skipped%s", s, na_note
+			else if (na > 0)            printf "SKIPPED\tnothing graded here, %d checks not applicable", na
 			else                        printf "SKIPPED\tnothing recorded"
 		}' "$CSV"
 }
