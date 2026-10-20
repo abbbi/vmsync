@@ -35,8 +35,9 @@ SOURCE_BASE_PORT=10809
 DESTINATION_HOST=hv02.replica.local
 DESTINATION_SSH_KEY=/root/.ssh/hyper02p
 DESTINATION_BASE_PORT=20809
-LOCK_DIR="/run/vmsync.lock"
-PID_FILE="${LOCK_DIR}/vmsync.pid"
+
+LOCK_FILE="/run/vmsync-parallel.lock"
+PID_FILE="/run/vmsync-parallel.pid"
 SCRIPT_PID=$$
 
 # Transfer options (need /usr/local/bin/vmsync-bridge-helper on target)
@@ -142,40 +143,58 @@ log_quit() {
 }
 
 release_lock() {
-    rm -rf "${LOCK_DIR}"
+    # The flock is released by this process ending, whatever ends it. Nothing
+    # here removes the lock file: that is the whole reason the lock cannot go
+    # stale, and a release path that unlinked it would hand the next instance
+    # an inode nobody else can see.
+    rm -f "${PID_FILE}"
     # Cleanup temp files -- deliberately unquoted so the "*" actually globs;
     # quoting the whole path suppresses expansion and silently removes
     # nothing.
     rm -f $RUN_DIR/$PROGRAM.*.$SCRIPT_PID.$TSTAMP
 }
 
-acquire_lock() {
-        if mkdir "${LOCK_DIR}" 2>/dev/null; then
-                echo "${SCRIPT_PID}" > "${PID_FILE}"
-        else
-                pid="$(cat "${PID_FILE}" 2>/dev/null)"
-                if [ -n "${pid}" ] && ps -p "${pid}" > /dev/null 2>&1; then
-                        log "$(date): Another instance of $0 script already running (pid ${pid}). exiting"
-                        exit 0
-                fi
-                log "$(date): There's a stale lock from $0 (pid ${pid:-unknown}). Removing it and taking over."
-                # Actually clear and re-claim the lock -- a stale PID that's
-                # merely logged (not overwritten) leaves every subsequent
-                # invocation seeing that same dead PID and *also* concluding
-                # "stale, proceed", with nothing to stop them all running
-                # concurrently until whichever one most recently took this
-                # path happens to exit.
-                rm -rf "${LOCK_DIR}"
-                if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
-                        # Lost the race: another instance claimed the lock
-                        # between our rm and mkdir. Back off instead of running
-                        # alongside it.
-                        log "$(date): Another instance of $0 claimed the lock while it was being cleared. exiting"
-                        exit 0
-                fi
-                echo "${SCRIPT_PID}" > "${PID_FILE}"
+holder_note() {
+        __holder="$(cat "${PID_FILE}" 2>/dev/null)"
+        if [ -n "${__holder}" ]; then
+                printf ' (pid %s)' "${__holder}"
         fi
+}
+
+acquire_lock() {
+        command -v flock > /dev/null 2>&1 \
+                || log_quit "flock is not installed. It is what stops two launchers driving the same hypervisor at once, and this script will not run without it -- install util-linux."
+
+        # `>>`, never `>`: it creates the file when absent and touches nothing
+        # when present. A contender that opened this truncating would rewrite a
+        # file whose inode the current holder has open, before flock had decided
+        # anything -- harmless to the lock itself, which lives on the inode, and
+        # still the wrong instinct to leave in a lock path.
+        #
+        # exec, so the descriptor belongs to this shell. Every child inherits
+        # it, which is deliberate: a launcher killed while its vmsync children
+        # are still running keeps the lock until they finish, because the work
+        # the lock protects is still in flight.
+        exec 9>> "${LOCK_FILE}" \
+                || log_quit "cannot open ${LOCK_FILE} for locking. This script will not run without the lock: it is what stops two launchers driving the same hypervisor at once."
+
+        if ! flock -n 9; then
+                # Somebody holds it. There is no second opinion to seek and
+                # nothing to take over -- that is the point of asking the
+                # kernel.
+                log "$(date): another instance of $0 is already running$(holder_note); exiting"
+                exit 0
+        fi
+
+        # Won. Record who, for a human reading the file later.
+        echo "${SCRIPT_PID}" > "${PID_FILE}" 2>/dev/null \
+                || log "could not record this instance's pid in ${PID_FILE}; the lock is held, but anybody looking will not see whose" WARN
+
         trap 'release_lock; exit $?' INT QUIT TERM EXIT
+
+        if [ -d "${LEGACY_LOCK_DIR}" ]; then
+                log "${LEGACY_LOCK_DIR} is left over from the directory-based lock this script used to use. Nothing creates or reads it any more; it can be removed." WARN
+        fi
 }
 
 replicate() {
