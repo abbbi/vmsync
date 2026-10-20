@@ -7631,11 +7631,40 @@ sweep_replaced_disks() {
 # in -target-runtime-dir, which this harness never overrides, so /run/vmsync).
 # The `[ -f ]` guard is there because an unmatched glob arrives at the remote
 # shell as its own literal text.
+#
+# The pid is VERIFIED against the process's argv before anything is signalled,
+# for the reason util.VerifiedKillCommand exists: kill -9 succeeds against any
+# live pid, recycled or not, so a number read out of a file proves nothing by
+# itself. This pidfile is the worst case for that. It is left behind by a
+# -test=die-writing-base run that calls os.Exit with nothing unwinding, so
+# nobody removes it; by the time a later invocation sweeps it, the number in it
+# may belong to anything the target has started since. The sweep runs as root
+# on a machine that is running the bench.
+#
+# qemu-nbd is started with `--pid-file <this same path>`, so the path is one of
+# its own argv words and an argv carrying it verbatim cannot belong to anything
+# else.
+#
+# `${dir%/}` because the path in that argv comes from path.Join, which CLEANS
+# its result: a TARGET_RUNTIME_DIR ending in a slash would make this glob
+# produce `/run/vmsync//vmsync-...pid`, which is not the spelling qemu-nbd
+# carries, so the check would refuse every export and sweep nothing. An
+# interior double slash still would. This fails CLOSED -- the orphan is left
+# running rather than a stranger killed -- and a refusal is reported rather
+# than discarded, so a sweep that did nothing cannot read as a clean one.
+#
+# `2>/dev/null` goes BEFORE `< /proc/$q/cmdline`, not after. Redirections are
+# applied left to right, so with the input redirect first the shell tries the
+# open while stderr is still ours and announces "No such file or directory"
+# for every pid that has already gone -- which here is the usual case.
 kill_orphaned_target_exports() {
 	local dir="${TARGET_RUNTIME_DIR:-/run/vmsync}"
-	ssh_host_cmd "$TARGET_HOST" \
-		"for p in ${dir}/vmsync-qemu-nbd-${TARGET_DOMAIN}-*.pid; do [ -f \"\$p\" ] || continue; kill -9 \"\$(cat \"\$p\")\" 2>/dev/null || true; rm -f \"\$p\"; done" \
-		>/dev/null 2>&1 || true
+	dir="${dir%/}"
+	local refused
+	refused="$(ssh_host_cmd "$TARGET_HOST" \
+		"for p in ${dir}/vmsync-qemu-nbd-${TARGET_DOMAIN}-*.pid; do [ -f \"\$p\" ] || continue; q=\$(cat \"\$p\" 2>/dev/null); case \"\${q:-x}\" in *[!0-9]*) q= ;; esac; if [ -n \"\$q\" ] && tr '\\0' '\\n' 2>/dev/null < \"/proc/\$q/cmdline\" | grep -qxF \"\$p\"; then kill -9 \"\$q\" 2>/dev/null || true; else echo \"\$p (recorded pid '\$q' does not carry it in argv)\"; fi; rm -f \"\$p\"; done" \
+		2>/dev/null)" || true
+	[ -n "$refused" ] && warn "orphan export sweep refused to signal and left a process running: $refused"
 	return 0
 }
 

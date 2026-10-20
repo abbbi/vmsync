@@ -278,5 +278,112 @@ else
 fi
 
 echo
-printf '%d passed, %d failed\n' "$PASS" "$FAIL"
+echo "=== the orphan-export sweep ==="
+
+# WHY THIS IS HERE. kill_orphaned_target_exports aims a kill -9 at the target
+# using a number read out of a pidfile, and kill -9 succeeds against any live
+# pid, recycled or not. The pidfile it reads is the worst case for that: it is
+# left behind by a -test=die-writing-base run that called os.Exit with nothing
+# unwinding, so nobody removed it, and a later invocation against the same
+# target sweeps it as root. The sweep has to prove the pid is still that export
+# before it signals.
+#
+# The source rules run anywhere, and are written as what the sweep MUST say
+# rather than as a list of wrong spellings -- a denylist only forbids the
+# mistakes somebody already thought of. The behavioural half needs /proc, and
+# where there is none the cases are skipped and SAID to be skipped: a green run
+# that quietly omitted them is the same failure this file exists to catch.
+SKIPPED=0
+sweep_src="$(extract "$BENCH" kill_orphaned_target_exports)"
+[ -n "$sweep_src" ] || { echo "EXTRACT FAILED: kill_orphaned_target_exports"; exit 2; }
+
+has() { case "$2" in *"$1"*) echo yes ;; *) echo no ;; esac; }
+
+check "the sweep matches the pid against /proc before it signals" \
+	yes "$(has 'grep -qxF' "$sweep_src")"
+check "the kill is aimed at a validated variable, not at a substitution" \
+	yes "$(has 'kill -9 \"\$q\"' "$sweep_src")"
+# Redirections apply left to right: with the input redirect first, a pid that
+# has already gone makes the shell announce "No such file or directory" on the
+# commonest path there is.
+check "stderr is silenced before the /proc read, not after" \
+	yes "$(has '2>/dev/null < ' "$sweep_src")"
+
+if [ -r "/proc/$$/cmdline" ]; then
+	SWEEPDIR="$WORK/sweep"
+	REFUSED="$WORK/refused"
+	REC="$WORK/rec"
+	mkdir -p "$SWEEPDIR"
+
+	# STUB_KILL, when set, is prepended to the command so a kill is RECORDED
+	# instead of sent. Several pidfile contents below would otherwise be
+	# catastrophic -- "-1" is every process this user owns, "0" is this
+	# shell's own process group -- and the case that proves the guard refuses
+	# them must not be the case that takes out the machine when it does not.
+	STUB_KILL=""
+	ssh_host_cmd() { shift; sh -c "${STUB_KILL}$*"; }
+	warn() { printf '%s\n' "$*" >> "$REFUSED"; }
+	eval "$sweep_src"
+
+	sweep() {
+		: > "$REFUSED"
+		rm -f "$REC"
+		TARGET_HOST=stub TARGET_DOMAIN=web01 TARGET_RUNTIME_DIR="$SWEEPDIR" \
+			kill_orphaned_target_exports > /dev/null 2>&1
+	}
+
+	# MARKER as its own argv word, which is how qemu-nbd carries the operand
+	# of --pid-file. Output to /dev/null because this runs inside $(...) and a
+	# background child holding that pipe open never lets it return.
+	spawn() {
+		sh -c 'while :; do sleep 0.2; done' "$1" > /dev/null 2>&1 &
+		local p=$!
+		local n=0
+		while [ ! -r "/proc/$p/cmdline" ] && [ "$n" -lt 60 ]; do
+			n=$((n + 1)); sleep 0.05
+		done
+		echo "$p"
+	}
+	alive() { if kill -0 "$1" 2>/dev/null; then echo alive; else echo dead; fi; }
+
+	P="$SWEEPDIR/vmsync-qemu-nbd-web01-vda.pid"
+	real="$(spawn "$P")"
+	printf '%s\n' "$real" > "$P"
+	sweep
+	sleep 0.4
+	check "an export whose argv carries its pidfile path is killed" dead "$(alive "$real")"
+	check "and nothing is reported when the kill went ahead" "" "$(cat "$REFUSED")"
+
+	# THE FINDING: a live process holding the recorded number, which is what a
+	# recycled pid looks like.
+	P="$SWEEPDIR/vmsync-qemu-nbd-web01-vdb.pid"
+	stranger="$(spawn an-unrelated-process)"
+	printf '%s\n' "$stranger" > "$P"
+	sweep
+	sleep 0.4
+	check "a stranger holding the recorded pid is left alone" alive "$(alive "$stranger")"
+	check "the refusal is reported, so a sweep that did nothing cannot read as a clean one" \
+		yes "$(has 'does not carry it in argv' "$(cat "$REFUSED")")"
+	kill -9 "$stranger" 2>/dev/null
+
+	STUB_KILL="kill() { printf '%s\n' \"kill \$*\" >> $REC; }; "
+	for junk in "" "notanumber" "-1" "0" "1" "123 456" "4194303"; do
+		P="$SWEEPDIR/vmsync-qemu-nbd-web01-junk.pid"
+		printf '%s\n' "$junk" > "$P"
+		sweep
+		check "a pidfile holding '$junk' attempts no signal" "" "$(cat "$REC" 2>/dev/null)"
+	done
+	STUB_KILL=""
+else
+	SKIPPED=1
+	printf '  SKIP  this machine has no /proc, so the sweep cannot be exercised\n'
+	printf '        against real processes here; the source rules above still ran\n'
+fi
+
+echo
+if [ "$SKIPPED" -ne 0 ]; then
+	printf '%d passed, %d failed -- the sweep cases were SKIPPED on this machine, so a clean run here does not mean the sweep is safe\n' "$PASS" "$FAIL"
+else
+	printf '%d passed, %d failed\n' "$PASS" "$FAIL"
+fi
 [ "$FAIL" -eq 0 ]
