@@ -309,7 +309,11 @@ func RemoveStagingCommand(s Store, name string) (string, error) {
 		return "", fmt.Errorf("refusing to remove %q: not a staging directory", name)
 	}
 	rest := strings.TrimPrefix(name, StagingPrefix)
-	if _, err := ParseTag(rest); err != nil {
+	// parseTagShape, not ParseTag: this removes the verbatim name below, so a
+	// non-canonical spelling addresses exactly the directory ParseListing
+	// offered. Canonicality is only required where a name is re-rendered
+	// before use, which is the restore-point path, not this one.
+	if _, err := parseTagShape(rest); err != nil {
 		return "", fmt.Errorf("refusing to remove %q: %w", name, err)
 	}
 	root, err := s.Path()

@@ -165,12 +165,45 @@ func NewTag(at time.Time, checkpoint string) (Tag, error) {
 	if at.IsZero() {
 		return Tag{}, fmt.Errorf("refusing a restore point tag with no checkpoint time")
 	}
+	// BEFORE THE EPOCH IS THE OTHER HALF OF THE ROUND-TRIP INVARIANT.
+	//
+	// ParseTag requires that a name render back to itself. Nothing enforced
+	// the same on the mint side, and a negative time breaks it in a way no
+	// amount of parsing care can repair: NewTag(time.Unix(-100, 0), "cpt")
+	// rendered "-100-cpt", and ParseTag cuts at the FIRST '-', leaving an
+	// empty unix half that it then refuses. So a tag could be minted whose
+	// own name is unparseable -- a restore point that could be written and
+	// never listed again.
+	//
+	// Refused rather than escaped, because a checkpoint time before 1970 is
+	// not a spelling problem: it means the source's clock was wrong by
+	// decades, and a restore point stamped with it is not something to
+	// quietly accept a workaround for.
+	if at.Unix() < 0 {
+		return Tag{}, fmt.Errorf("refusing a restore point tag stamped %s: a checkpoint time before 1970 means the source's clock is wrong by decades, and the name it would produce (%q) cannot be read back as a tag at all",
+			at.UTC().Format(time.RFC3339), strconv.FormatInt(at.Unix(), 10)+"-"+checkpoint)
+	}
 	return Tag{At: at.UTC().Truncate(time.Second), Checkpoint: checkpoint}, nil
 }
 
 // ParseTag reads a directory name back into a Tag. Cut at the FIRST separator,
 // because checkpoint names contain hyphens of their own.
-func ParseTag(name string) (Tag, error) {
+// parseTagShape reads a name as <unix>-<checkpoint> and validates both halves,
+// WITHOUT requiring that the name be the canonical spelling of what it parses
+// to.
+//
+// Split out from ParseTag because the two sites need different things from the
+// same string, and conflating them was a regression: RemoveStagingCommand
+// removes path.Join(root, name) -- the caller's VERBATIM string, never a
+// re-rendering -- so what it needs from a name is that the characters are
+// bounded, which is what checkpointRe gives it. Requiring canonicality there
+// made ParseListing offer a staging directory that the sweep then refused on
+// every run, for ever: the two halves of one subsystem disagreeing about what
+// a staging directory is.
+//
+// Canonicality is ParseTag's business, and only because Point.tagName
+// re-renders. See ParseTag.
+func parseTagShape(name string) (Tag, error) {
 	unix, checkpoint, ok := strings.Cut(name, "-")
 	if !ok {
 		return Tag{}, fmt.Errorf("%q is not a restore point tag: no separator", name)
@@ -180,6 +213,44 @@ func ParseTag(name string) (Tag, error) {
 		return Tag{}, fmt.Errorf("%q is not a restore point tag: %q is not a unix time", name, unix)
 	}
 	return NewTag(time.Unix(secs, 0).UTC(), checkpoint)
+}
+
+func ParseTag(name string) (Tag, error) {
+	t, err := parseTagShape(name)
+	if err != nil {
+		return Tag{}, err
+	}
+	// A TAG MUST ROUND-TRIP, and this is the only thing that makes the
+	// re-rendering downstream safe.
+	//
+	// Point.tagName deliberately addresses a directory by the name its tag
+	// RENDERS to rather than by the string a caller supplied -- "so a tag
+	// whose fields survive validation but render differently cannot slip a
+	// second spelling of one directory past the checks above" -- and
+	// RemoveCommand builds rm -rf from that. The two together are only sound
+	// if parsing a name yields a tag that renders back to it.
+	//
+	// strconv.ParseInt does not give that. It accepts a leading '+' and
+	// leading zeros, so "+1700000000-cpt" and "01700000000-cpt" both parsed,
+	// both rendered as "1700000000-cpt", and every later command addressed
+	// THAT directory instead: ParseListing counted the odd one as a point,
+	// Prune could select it, and the rm named its canonical sibling -- which,
+	// if a point by that name existed, is one the retention policy had decided
+	// to KEEP. With both spellings present Prune put one rendered name in both
+	// buckets. Measured on 2026-10-19.
+	//
+	// Refused here rather than papered over at the removal, because this is
+	// where the asymmetry lives: checkpointRe already bounds the checkpoint
+	// half for exactly this reason -- it "bounds what may appear in a tag, and
+	// therefore in a directory name that is interpolated into remote shell
+	// commands including rm -rf" -- and the unix half had no equivalent guard.
+	// A name this rejects is reported as Unknown by ParseListing, like any
+	// other directory vmsync did not write, which is the honest answer: vmsync
+	// writes only the canonical spelling, so it did not create this.
+	if rendered := t.String(); rendered != name {
+		return Tag{}, fmt.Errorf("%q is not a restore point tag: it is a non-canonical spelling of %q, and vmsync writes only the canonical one -- addressing a point by this name would send every later command, including rm -rf, to %q instead", name, rendered, rendered)
+	}
+	return t, nil
 }
 
 // Addressing a store, a point or a staging directory lives in store.go, behind
