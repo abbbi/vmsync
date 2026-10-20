@@ -108,7 +108,7 @@ func StartRemote(ctx context.Context, client *remotessh.Client, key string, brid
 		return "", fmt.Errorf("remote nbd bridge on port %d did not start: %w%s", bridgePort, err, said)
 	}
 
-	return BuildStopCommand(pidFile, logFile), nil
+	return BuildStopCommand(pidFile, logFile, cfg.HelperPath), nil
 }
 
 // killOrphanedRemoteBridge best-effort kills and removes the bookkeeping
@@ -150,7 +150,7 @@ func killOrphanedRemoteBridge(client *remotessh.Client, pidFile, logFile string,
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	said = remoteBridgeLogTail(ctx, client, logFile, helperPath)
-	if out, err := client.Run(ctx, BuildStopCommand(pidFile, logFile)); err != nil {
+	if out, err := client.Run(ctx, BuildStopCommand(pidFile, logFile, helperPath)); err != nil {
 		trace.Warning("failed to clean up remote nbd bridge helper after a failed start -- it may still be running on the remote host", "port", bridgePort, "error", err, "output", out)
 	}
 	return said

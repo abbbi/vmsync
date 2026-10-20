@@ -20,6 +20,7 @@ package nbdbridge
 import (
 	"fmt"
 	"net"
+	"path"
 	"strconv"
 	"strings"
 
@@ -125,9 +126,25 @@ func BuildStartCommand(cfg Config, bridgePort, realPort int, pidFile, logFile st
 // only redirections, no pipeline), the helper ends up running as that same
 // PID/PGID, so a negative-PID kill reaches it (and, defensively, anything
 // else that might ever share its process group) directly.
-func BuildStopCommand(pidFile, logFile string) string {
-	return fmt.Sprintf("kill -9 -$(cat %s) || true; rm -f %s %s",
-		util.ShQuote(pidFile), util.ShQuote(pidFile), util.ShQuote(logFile))
+func BuildStopCommand(pidFile, logFile, helperPath string) string {
+	// Proved before it signals, and a GROUP kill: the helper is
+	// setsid-detached and its own group leader, so its relay children have to
+	// go with it. A kill aimed by the pidfile's number alone would signal the
+	// group of whatever now answers to it, and the number goes stale for
+	// reasons this package documents elsewhere -- the helper exits on its own
+	// lease, and a kill -9 of it leaves the pidfile behind.
+	//
+	// helperPath is here for the comm half of that proof. The expected
+	// executable name is the installed helper's, which the operator chooses,
+	// so it cannot be a constant: a target running the helper from
+	// /usr/local/bin/vmsync-helper has comm "vmsync-helper". VerifiedKill
+	// truncates it the way the kernel does.
+	return util.VerifiedKill{
+		PidFile: pidFile,
+		Comm:    path.Base(helperPath),
+		Group:   true,
+		Remove:  []string{logFile},
+	}.Command()
 }
 
 // BuildReadinessCheckCommand returns a shell command that succeeds (exit 0)

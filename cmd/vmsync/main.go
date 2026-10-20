@@ -6319,9 +6319,9 @@ func run(cfg syncConfig) (runErr error) {
 		// that no longer exists is exactly what makes the next run's
 		// reclaim a no-op.
 		stopCmd := "p=$(cat " + util.ShQuote(pidFile) + " 2>/dev/null); " +
-			"if [ -n \"$p\" ] && tr '\\0' '\\n' < \"/proc/$p/cmdline\" 2>/dev/null | grep -qxF " + util.ShQuote(sockPath) + "; then " +
+			"if [ -n \"$p\" ] && tr '\\0' '\\n' 2>/dev/null < \"/proc/$p/cmdline\" | grep -qxF " + util.ShQuote(sockPath) + "; then " +
 			"kill -9 \"$p\" 2>/dev/null || true; " +
-			"n=0; while kill -0 \"$p\" 2>/dev/null && [ \"$n\" -lt 50 ]; do n=$((n+1)); sleep 0.1; done; " +
+			"n=0; while kill -0 \"$p\" 2>/dev/null && [ \"$n\" -lt 20 ]; do n=$((n+1)); sleep 0.1; done; " +
 			"fi; " +
 			"rm -f " + util.ShQuote(pidFile) + " " + util.ShQuote(sockPath)
 
@@ -6867,7 +6867,13 @@ func run(cfg syncConfig) (runErr error) {
 		// The same stop string the cleanup paths below register, needed here
 		// too so a failed attempt cannot leave a qemu-nbd holding the image
 		// open -- which would block the commit and, on a -reinit, the rm.
-		killExportCmd := "kill -9 $(cat " + util.ShQuote(pidFile) + ") || true; rm -f " + util.ShQuote(pidFile)
+		// Proved before it signals: qemu-nbd is started with
+		// --pid-file <pidFile>, and that path carries the domain and the
+		// device, so a pid the OS recycled onto something else cannot match
+		// both it and comm "qemu-nbd". The same pair of readings the checksum
+		// export's stopCmd above and reclaimAbandonedExportCmd already take,
+		// now from one builder instead of three spellings.
+		killExportCmd := util.VerifiedKill{PidFile: pidFile, Comm: "qemu-nbd"}.Command()
 
 		// Before the first attempt, never between them: an abandoned export
 		// from an EARLIER run still holds this disk's image open and will
@@ -7238,7 +7244,7 @@ func run(cfg syncConfig) (runErr error) {
 		//
 		// Built before the start rather than after, so the bind retry below
 		// can clean up a failed attempt with the same string.
-		stopVerifyCmd := "kill -9 $(cat " + util.ShQuote(verifyPidFile) + ") || true; rm -f " + util.ShQuote(verifyPidFile)
+		stopVerifyCmd := util.VerifiedKill{PidFile: verifyPidFile, Comm: "qemu-nbd"}.Command()
 
 		// Same reclaim as the write export's, for the same reason: a verify
 		// export abandoned by an earlier run holds the replica open and

@@ -212,20 +212,70 @@ func TestBuildStartCommandUseSSHOnlyChangesListenHost(t *testing.T) {
 	}
 }
 
+// BuildStopCommand's job is a CHOICE now, not a string: which verified kill to
+// ask for. How that command behaves -- that it refuses a pid it cannot prove is
+// still the helper, that it ends the process GROUP rather than the leader alone,
+// that it waits for the process to actually go -- is asserted against real
+// processes in pkg/util/verifiedkill_test.go, which is where a shell command
+// belongs under test. What belongs here is that this package asks for the right
+// one, and that what it used to emit cannot come back.
+//
+// This test previously pinned the old command as its contract, substring by
+// substring, "|| true" included. It passed for as long as the defect existed
+// and would have failed the day somebody fixed it -- which is what it just did.
+// A test that describes the implementation cannot notice the implementation is
+// wrong.
 func TestBuildStopCommand(t *testing.T) {
 	const pidFile = "/run/vmsync-bridge/vmsync-bridge-20200.pid"
 	const logFile = "/run/vmsync-bridge/vmsync-bridge-20200.log"
 
-	got := BuildStopCommand(pidFile, logFile)
+	const helperPath = "/usr/local/bin/vmsync-bridge-helper"
 
-	wantSubstrings := []string{
-		"kill -9 -$(cat " + util.ShQuote(pidFile) + ")",
-		"|| true",
-		"rm -f " + util.ShQuote(pidFile) + " " + util.ShQuote(logFile),
+	got := BuildStopCommand(pidFile, logFile, helperPath)
+
+	// GROUP form, because the helper setsid()s out of its parent's group and
+	// its relay children have to go with it; the log removed alongside the
+	// pidfile, because a log naming a dead helper is what makes the next
+	// run's diagnosis wrong; and comm taken from the INSTALLED helper's name,
+	// because the operator chooses where that binary lives and a constant
+	// would refuse every kill on a target that put it somewhere else.
+	want := util.VerifiedKill{
+		PidFile: pidFile,
+		Comm:    "vmsync-bridge-helper",
+		Group:   true,
+		Remove:  []string{logFile},
+	}.Command()
+	if got != want {
+		t.Errorf("BuildStopCommand(%q, %q, %q) does not ask for the verified group kill.\n got: %s\nwant: %s", pidFile, logFile, helperPath, got, want)
 	}
-	for _, want := range wantSubstrings {
-		if !strings.Contains(got, want) {
-			t.Errorf("BuildStopCommand(%q, %q) = %q, missing expected substring %q", pidFile, logFile, got, want)
+
+	// And the comm it compares has to be what /proc actually holds.
+	// "vmsync-bridge-helper" is twenty characters; the kernel stores fifteen.
+	// Comparing the full name would refuse every kill against the very
+	// process this command exists to stop.
+	if !strings.Contains(got, `[ "$c" = 'vmsync-bridge-h' ]`) {
+		t.Errorf("the comm comparison is not the kernel's truncation of %q, so it can never match:\n%s", "vmsync-bridge-helper", got)
+	}
+
+	// The defect, named in the three spellings it had here, so that this
+	// function going back to building its own string is caught with a message
+	// that says what is wrong rather than printing two long commands side by
+	// side. kill -9 succeeds against any live pid, recycled or not, and
+	// "|| true" hides that; aimed at a GROUP it takes out everything that now
+	// answers to a number read out of a stale file.
+	//
+	// It does NOT guard the shared builder: a gutted VerifiedKill that still
+	// produced one of these three strings would be caught, and one gutted any
+	// other way would satisfy both this and the equality above, since the
+	// equality compares against that same builder. What guards the builder is
+	// its own behavioural suite in pkg/util, run against real processes.
+	for _, forbidden := range []string{
+		"kill -9 -$(cat",
+		"kill -9 $(cat",
+		"kill -9 -" + util.ShQuote(pidFile),
+	} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("the unverified stop command is back: %q contains %q", got, forbidden)
 		}
 	}
 }
