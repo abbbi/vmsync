@@ -155,3 +155,141 @@ func TestHoldAttachesStderrBeforeStarting(t *testing.T) {
 		t.Errorf("session.Stderr is attached at line %d, after Start at line %d -- too late to catch anything the command says", attached, started)
 	}
 }
+
+// Said is the whole of 4.22's fix on this side: without it the buffer the
+// session keeps filling is unreachable the moment HoldCommand returns.
+func TestHeldCommandReportsWhatTheCommandSaid(t *testing.T) {
+	var buf holdStderr
+	h := &heldCommand{said: &buf}
+	if got := h.Said(); got != "" {
+		t.Errorf("Said() = %q before anything was written, want empty", got)
+	}
+	if _, err := buf.Write([]byte("vmsync-bridge-helper: run lock lease expired\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got, want := h.Said(), "vmsync-bridge-helper: run lock lease expired"; got != want {
+		t.Errorf("Said() = %q, want %q", got, want)
+	}
+
+	// A handle built without one must not panic: Exited is found by shape in
+	// pkg/util and so is this, and a nil buffer is what a future constructor
+	// that forgets it would leave.
+	if got := (&heldCommand{}).Said(); got != "" {
+		t.Errorf("Said() on a handle with no buffer = %q, want empty", got)
+	}
+}
+
+// WHAT MAKES Said COMPLETE, asserted structurally because it is a property of
+// the order two statements appear in and nothing observable distinguishes them
+// here without a live SSH server.
+//
+// session.Wait drains the session's copy goroutines -- the stderr copier among
+// them -- before it returns. So publishing the exit only AFTER Wait returns is
+// what lets a caller read Said() on receiving from Exited() and see everything
+// the command said. Publish it first and a consumer can win the race against
+// the last line of the explanation, which is the line that usually matters.
+//
+// MUTATION CAUGHT: moving the send above the Wait, which compiles and leaves
+// every other test here passing.
+func TestTheExitIsPublishedOnlyAfterWaitReturns(t *testing.T) {
+	const file = "hold.go"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+
+	waited, published := 0, 0
+	ast.Inspect(f, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Wait" {
+				if x, ok := sel.X.(*ast.Ident); ok && x.Name == "session" {
+					waited = fset.Position(call.Pos()).Line
+				}
+			}
+		}
+		if send, ok := n.(*ast.SendStmt); ok {
+			if sel, ok := send.Chan.(*ast.SelectorExpr); ok && sel.Sel.Name == "exited" {
+				published = fset.Position(send.Pos()).Line
+			}
+		}
+		return true
+	})
+
+	switch {
+	case waited == 0:
+		t.Fatal("hold.go no longer calls session.Wait; this test needs rewriting")
+	case published == 0:
+		t.Fatal("hold.go no longer publishes the exit on h.exited; this test needs rewriting")
+	case published < waited:
+		t.Errorf("the exit is published at line %d, before session.Wait at line %d -- so a caller can read Said() before the stderr copier has finished and miss the end of the command's explanation", published, waited)
+	}
+}
+
+// AND THE WIRING, which is the half that has caught this audit out five times
+// now: a decision tested while nothing checks it is reached.
+//
+// Said() can be perfect and the handle can still be built with no buffer in it.
+// There is no SSH server in this package's tests, so HoldCommand cannot be
+// called to find out -- what can be checked is that the handle is given the
+// SAME buffer the session was told to write into. Two separate `holdStderr`
+// values, or a missing field, both compile and both leave Said() permanently
+// empty while every other test here passes.
+func TestTheHandleIsGivenTheBufferTheSessionWritesInto(t *testing.T) {
+	const file = "hold.go"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+
+	// Which variable the session's stderr is pointed at.
+	attachedTo := ""
+	// Which variable the handle was given.
+	handedTo := ""
+	handleLit := false
+
+	ast.Inspect(f, func(n ast.Node) bool {
+		if assign, ok := n.(*ast.AssignStmt); ok && len(assign.Lhs) == 1 && len(assign.Rhs) == 1 {
+			if sel, ok := assign.Lhs[0].(*ast.SelectorExpr); ok && sel.Sel.Name == "Stderr" {
+				if u, ok := assign.Rhs[0].(*ast.UnaryExpr); ok {
+					if id, ok := u.X.(*ast.Ident); ok {
+						attachedTo = id.Name
+					}
+				}
+			}
+		}
+		if lit, ok := n.(*ast.CompositeLit); ok {
+			if id, ok := lit.Type.(*ast.Ident); ok && id.Name == "heldCommand" {
+				handleLit = true
+				for _, el := range lit.Elts {
+					kv, ok := el.(*ast.KeyValueExpr)
+					if !ok {
+						continue
+					}
+					key, ok := kv.Key.(*ast.Ident)
+					if !ok || key.Name != "said" {
+						continue
+					}
+					if u, ok := kv.Value.(*ast.UnaryExpr); ok {
+						if id, ok := u.X.(*ast.Ident); ok {
+							handedTo = id.Name
+						}
+					}
+				}
+			}
+		}
+		return true
+	})
+
+	switch {
+	case !handleLit:
+		t.Fatal("hold.go no longer builds a heldCommand literal; this test needs rewriting")
+	case attachedTo == "":
+		t.Fatal("hold.go does not point session.Stderr at a variable; TestHoldAttachesStderrBeforeStarting covers that and should have failed first")
+	case handedTo == "":
+		t.Error("the heldCommand is built without a `said` buffer, so Said() is permanently empty and a holder's reason for letting go is unreachable again -- which is the whole of 4.22")
+	case handedTo != attachedTo:
+		t.Errorf("the session writes stderr into %q but the handle was given %q, so Said() reports a buffer nothing fills", attachedTo, handedTo)
+	}
+}

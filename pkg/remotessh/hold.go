@@ -116,6 +116,13 @@ type heldCommand struct {
 	stdin   io.WriteCloser
 	desc    string
 
+	// said is the stderr buffer x/crypto/ssh keeps filling for this session's
+	// whole life. Held here because the command's own explanation of why it
+	// ended is written there, and without a reference it is unreachable the
+	// moment HoldCommand returns: the buffer stays alive, attached to the
+	// session, with nothing able to read it.
+	said *holdStderr
+
 	// exited carries the remote command's own exit, once. It is what makes a
 	// caller's loss of whatever the command held PROMPT rather than discovered
 	// on the next write: a lock holder that releases on its own exits, and that
@@ -133,6 +140,31 @@ type heldCommand struct {
 // instance. Either way, receiving anything here means the caller no longer holds
 // what the command was holding.
 func (h *heldCommand) Exited() <-chan error { return h.exited }
+
+// Said is what the remote command wrote to stderr, or "" if it wrote nothing.
+//
+// WHY THIS IS NOT FOLDED INTO Exited's ERROR. The reason a holder let go is on
+// stderr REGARDLESS of how it exited, and the two cases that matter most differ
+// in exit status. vmsync-bridge-helper prints "run lock lease expired" and exits
+// ZERO -- its own runLockExit calls that "the lock doing its job ... the outcome
+// it exists to produce" -- while a dispossessed holder prints why and exits 1.
+// Wrapping only the non-nil error would therefore deliver the dispossession and
+// lose the lease expiry, which is the one an operator asks about most. Wrapping
+// the nil one too would destroy the distinction Exited documents, where nil
+// means the command let go deliberately rather than failed.
+//
+// COMPLETE ONCE Exited HAS FIRED, and that is not incidental. session.Wait
+// drains the session's copy goroutines before it returns -- the stderr copier
+// among them -- and the exit is published only after Wait returns, so a caller
+// that reads this after receiving from Exited sees everything the command said.
+// Reading it earlier is safe but may see less; holdStderr is mutex-guarded, so
+// it is never a race.
+func (h *heldCommand) Said() string {
+	if h.said == nil {
+		return ""
+	}
+	return h.said.String()
+}
 
 // ErrHoldRefused reports that the remote command started but signalled a
 // refusal rather than readiness.
@@ -184,7 +216,7 @@ func (c *Client) HoldCommand(ctx context.Context, command, readyLine string) (io
 		return nil, fmt.Errorf("start remote command: %w", err)
 	}
 
-	h := &heldCommand{session: session, stdin: stdin, desc: readyLine, exited: make(chan error, 1)}
+	h := &heldCommand{session: session, stdin: stdin, desc: readyLine, said: &stderr, exited: make(chan error, 1)}
 	// Reaped here rather than in Close, so the exit is observable while the
 	// handle is still open. Wait returns for every reason the command can end,
 	// including the connection being closed under it, which is what the
@@ -279,12 +311,15 @@ func (h *heldCommand) Close() error {
 	return h.closeErr
 }
 
-// The handle reports its command's exit as well as being a WriteCloser, which
-// util.AcquireRemoteRunLock looks for to learn promptly that a lock holder let
-// go. Asserted here so renaming the method breaks the build rather than quietly
-// costing that promptness: pkg/util finds it by shape, because it deliberately
-// does not import this package.
+// The handle reports its command's exit and what the command said, as well as
+// being a WriteCloser. util.AcquireRemoteRunLock looks for the first to learn
+// promptly that a lock holder let go, and for the second to say WHY -- without
+// it the driver can only report "Process exited with status 1" about a holder
+// that explained itself perfectly well on stderr. Asserted here so renaming
+// either breaks the build rather than quietly costing the diagnosis: pkg/util
+// finds them by shape, because it deliberately does not import this package.
 var _ interface {
 	io.WriteCloser
 	Exited() <-chan error
+	Said() string
 } = (*heldCommand)(nil)
