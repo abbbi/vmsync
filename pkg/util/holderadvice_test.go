@@ -241,8 +241,10 @@ func TestALiveLockWithADeadRecordTellsTheOperatorWhatToDo(t *testing.T) {
 		// The cost of getting it wrong, which BreakRunLockDecision states for
 		// this same state and this used to drop.
 		"two writers",
-		// The option that is always safe, before any that is not.
-		"wait",
+		// The option that is always safe. Its position relative to the
+		// unsafe one is asserted below rather than left to the order of this
+		// list, which proves nothing about the text.
+		"ait for",
 		// That the obvious next command will refuse, before they try it.
 		"refuses",
 		// And how to identify an orphan, if that is what it turns out to be.
@@ -254,6 +256,21 @@ func TestALiveLockWithADeadRecordTellsTheOperatorWhatToDo(t *testing.T) {
 	}
 	if strings.Contains(got, "this lock is stale") {
 		t.Errorf("a live lock is described as stale: %s", got)
+	}
+
+	// THE ORDER, which is the point and not the politeness. Ending the holder
+	// is the faster path and the dangerous one, and in this state the live
+	// holder is explicitly unidentified -- so the description must offer
+	// waiting before it mentions ending anything.
+	lower := strings.ToLower(got)
+	wait, end := strings.Index(lower, "wait for"), strings.Index(lower, "end the process")
+	switch {
+	case wait < 0:
+		t.Errorf("the description never offers waiting:\n%s", got)
+	case end < 0:
+		t.Errorf("the description never names the lever for when waiting will not do:\n%s", got)
+	case end < wait:
+		t.Errorf("the description tells an operator to end the holder before it tells them they can wait, in the one state where the holder is unidentified:\n%s", got)
 	}
 	// The imperative must be conditional. "find and end whatever holds the
 	// lock" as an instruction is how a live restore gets killed.

@@ -83,6 +83,28 @@ func (s *holdStderr) String() string {
 	return strings.TrimSpace(string(s.buf))
 }
 
+// Mark is how much has been said so far, for a caller that wants to read only
+// what comes after some point.
+func (s *holdStderr) Mark() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.buf)
+}
+
+// StringFrom is what was said after mark, trimmed.
+//
+// Clamped rather than panicking on a mark from a longer buffer: the buffer only
+// grows, so that cannot happen today, but a diagnostic path is the wrong place
+// to turn a bookkeeping slip into a crash.
+func (s *holdStderr) StringFrom(mark int) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if mark < 0 || mark > len(s.buf) {
+		return strings.TrimSpace(string(s.buf))
+	}
+	return strings.TrimSpace(string(s.buf[mark:]))
+}
+
 // holdStderrSuffix renders what the command said for appending to an error,
 // or "" when it said nothing.
 //
@@ -122,6 +144,12 @@ type heldCommand struct {
 	// moment HoldCommand returns: the buffer stays alive, attached to the
 	// session, with nothing able to read it.
 	said *holdStderr
+	// saidFrom is how much had been said by the time the command declared
+	// itself ready, so Said reports why it LET GO rather than everything it
+	// ever wrote. A helper that warns about something at startup would
+	// otherwise lead the loss message with that warning and bury the reason
+	// behind it.
+	saidFrom int
 
 	// exited carries the remote command's own exit, once. It is what makes a
 	// caller's loss of whatever the command held PROMPT rather than discovered
@@ -163,7 +191,7 @@ func (h *heldCommand) Said() string {
 	if h.said == nil {
 		return ""
 	}
-	return h.said.String()
+	return h.said.StringFrom(h.saidFrom)
 }
 
 // ErrHoldRefused reports that the remote command started but signalled a
@@ -253,6 +281,10 @@ func (c *Client) HoldCommand(ctx context.Context, command, readyLine string) (io
 			_ = h.Close()
 			return nil, fmt.Errorf("remote command produced no output: %w%s", r.err, holdStderrSuffix(stderr.String()))
 		case r.line == readyLine:
+			// Everything said up to here belongs to starting up, and the
+			// pre-ready branches below are what report that. Said() is about
+			// why the command LET GO, so it starts counting from now.
+			h.saidFrom = stderr.Mark()
 			return h, nil
 		case r.line == "":
 			_ = h.Close()

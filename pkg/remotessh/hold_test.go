@@ -199,22 +199,44 @@ func TestTheExitIsPublishedOnlyAfterWaitReturns(t *testing.T) {
 		t.Fatalf("parse %s: %v", file, err)
 	}
 
+	// Scoped to ONE function literal, which the first version of this was not:
+	// it took the last session.Wait anywhere in the file and the last send on
+	// h.exited anywhere in the file and compared their line numbers, so moving
+	// the send into a different function further down satisfied it while
+	// destroying the ordering it claims to guard.
 	waited, published := 0, 0
 	ast.Inspect(f, func(n ast.Node) bool {
-		if call, ok := n.(*ast.CallExpr); ok {
-			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Wait" {
-				if x, ok := sel.X.(*ast.Ident); ok && x.Name == "session" {
-					waited = fset.Position(call.Pos()).Line
+		lit, ok := n.(*ast.FuncLit)
+		if !ok {
+			return true
+		}
+		w, p := 0, 0
+		ast.Inspect(lit.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Wait" {
+					if x, ok := sel.X.(*ast.Ident); ok && x.Name == "session" {
+						w = fset.Position(call.Pos()).Line
+					}
 				}
 			}
-		}
-		if send, ok := n.(*ast.SendStmt); ok {
-			if sel, ok := send.Chan.(*ast.SelectorExpr); ok && sel.Sel.Name == "exited" {
-				published = fset.Position(send.Pos()).Line
+			if send, ok := n.(*ast.SendStmt); ok {
+				if sel, ok := send.Chan.(*ast.SelectorExpr); ok && sel.Sel.Name == "exited" {
+					p = fset.Position(send.Pos()).Line
+				}
 			}
+			return true
+		})
+		// The goroutine that does both is the one this is about. A literal
+		// holding only one of them says nothing either way.
+		if w != 0 && p != 0 {
+			waited, published = w, p
+			return false
 		}
 		return true
 	})
+	if waited == 0 || published == 0 {
+		t.Fatal("no single function in hold.go both waits for the session and publishes the exit; they have been separated, and nothing now orders the stderr copier before a caller can read Said()")
+	}
 
 	switch {
 	case waited == 0:
@@ -282,14 +304,85 @@ func TestTheHandleIsGivenTheBufferTheSessionWritesInto(t *testing.T) {
 		return true
 	})
 
+	// And the mark, wired the same way and just as invisible if it is not:
+	// without it Said() reports everything the command ever wrote, so a
+	// startup warning leads the loss message and the 4 KiB cap can crowd the
+	// actual reason out of the buffer.
+	markedFrom := ""
+	ast.Inspect(f, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+			return true
+		}
+		sel, ok := assign.Lhs[0].(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "saidFrom" {
+			return true
+		}
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if m, ok := call.Fun.(*ast.SelectorExpr); ok && m.Sel.Name == "Mark" {
+			if id, ok := m.X.(*ast.Ident); ok {
+				markedFrom = id.Name
+			}
+		}
+		return true
+	})
+
 	switch {
 	case !handleLit:
 		t.Fatal("hold.go no longer builds a heldCommand literal; this test needs rewriting")
+	case markedFrom == "":
+		t.Error("hold.go never sets saidFrom from the buffer's Mark(), so Said() reports everything the command said including its startup output, and the reason it let go arrives behind that")
+	case attachedTo != "" && markedFrom != attachedTo:
+		t.Errorf("saidFrom is marked from %q but the session writes into %q, so the mark counts a different buffer", markedFrom, attachedTo)
 	case attachedTo == "":
 		t.Fatal("hold.go does not point session.Stderr at a variable; TestHoldAttachesStderrBeforeStarting covers that and should have failed first")
 	case handedTo == "":
 		t.Error("the heldCommand is built without a `said` buffer, so Said() is permanently empty and a holder's reason for letting go is unreachable again -- which is the whole of 4.22")
 	case handedTo != attachedTo:
 		t.Errorf("the session writes stderr into %q but the handle was given %q, so Said() reports a buffer nothing fills", attachedTo, handedTo)
+	}
+}
+
+// Said reports why the command LET GO, not everything it ever wrote.
+//
+// The buffer is attached before Start so the pre-ready refusal branches can
+// quote a startup failure, which means it also holds whatever the command said
+// while starting. A helper that warns about something at startup -- a
+// permission it could not read, a flag it ignored -- would otherwise lead the
+// loss message with that warning and bury the actual reason behind it, and the
+// 4 KiB cap is kept from the FRONT, so a noisy startup could crowd the reason
+// out of the buffer entirely.
+func TestSaidReportsOnlyWhatWasSaidAfterReady(t *testing.T) {
+	var buf holdStderr
+	if _, err := buf.Write([]byte("vmsync-bridge-helper: ignoring an unknown flag\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Where HoldCommand starts counting, once the ready line has arrived.
+	h := &heldCommand{said: &buf, saidFrom: buf.Mark()}
+
+	if got := h.Said(); got != "" {
+		t.Errorf("Said() = %q straight after ready, want empty: everything so far was startup", got)
+	}
+
+	if _, err := buf.Write([]byte("vmsync-bridge-helper: run lock lease expired\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got, want := h.Said(), "vmsync-bridge-helper: run lock lease expired"; got != want {
+		t.Errorf("Said() = %q, want %q -- the reason for letting go, with the startup line left out", got, want)
+	}
+
+	// The whole buffer is still what a PRE-ready refusal reports, because
+	// there the startup output is the diagnosis.
+	if got := buf.String(); !strings.Contains(got, "unknown flag") {
+		t.Errorf("the pre-ready view lost the startup output it exists to report: %q", got)
+	}
+
+	// A mark from a longer buffer must not panic or mislead.
+	if got := (&heldCommand{said: &buf, saidFrom: 1 << 20}).Said(); got == "" {
+		t.Error("an out-of-range mark produced nothing at all; it should fall back to the whole buffer rather than hide the reason")
 	}
 }

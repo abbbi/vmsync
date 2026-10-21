@@ -46,6 +46,19 @@ const DefaultRemoteLockLease = 90 * time.Second
 // anything that would write to the replica has to stop.
 var ErrRemoteLockLost = errors.New("the target-side run lock was lost")
 
+// heldReasonSuffix renders what a holder said for appending to a loss, or ""
+// when it said nothing.
+//
+// A suffix rather than a wrapped error, for the reason pkg/remotessh gives for
+// its own: this is the remote command's words, not a Go error, and errors.Is on
+// ErrRemoteLockLost has to keep working for every caller that refuses on it.
+func heldReasonSuffix(said string) string {
+	if said == "" {
+		return ""
+	}
+	return ", saying: " + said
+}
+
 // RemoteRunLock is a held target-side run lock.
 //
 // Two kinds, and a caller has to be able to tell them apart because they make
@@ -71,6 +84,9 @@ type RemoteRunLock struct {
 
 	mu   sync.Mutex
 	lost error
+	// lostAuthoritative records whether lost came from the holder itself
+	// rather than from an observation here. See setLostAuthoritatively.
+	lostAuthoritative bool
 }
 
 // startHeartbeat begins telling the far end that this process is still here.
@@ -98,6 +114,13 @@ func startHeartbeat(handle io.WriteCloser, path string, lease time.Duration, lea
 	// named type, because this package deliberately does not import the SSH one;
 	// a holder without it still works, just discovering the loss on the next
 	// beat instead.
+	// What the holder said, when the handle can tell us. Optional for the same
+	// reason Exited is: this package finds both by shape and a handle without
+	// them still works, just less informatively.
+	said := func() string { return "" }
+	if s, ok := handle.(interface{ Said() string }); ok {
+		said = s.Said
+	}
 	if ex, ok := handle.(interface{ Exited() <-chan error }); ok {
 		l.beating.Add(1)
 		go func() {
@@ -109,7 +132,12 @@ func startHeartbeat(handle io.WriteCloser, path string, lease time.Duration, lea
 				if !open {
 					return
 				}
-				l.setLost(fmt.Errorf("%w: the process holding %s on the target exited (%v)", ErrRemoteLockLost, path, err))
+				// The exit status says THAT it ended; stderr says why, and
+				// the two do not agree about which cases matter. A lease
+				// that expired exits 0, so without this the most ordinary
+				// reason for losing a target lock arrives as a nil error
+				// and no explanation at all.
+				l.setLostAuthoritatively(fmt.Errorf("%w: the process holding %s on the target %s%s", ErrRemoteLockLost, path, heldExitPhrase(err), heldReasonSuffix(said())))
 			}
 		}()
 	}
@@ -136,12 +164,66 @@ func startHeartbeat(handle io.WriteCloser, path string, lease time.Duration, lea
 	return l
 }
 
-func (l *RemoteRunLock) setLost(err error) {
+// setLost records a loss this side OBSERVED, and keeps the first one.
+func (l *RemoteRunLock) setLost(err error) { l.recordLoss(err, false) }
+
+// setLostAuthoritatively records a loss whose cause came from the holder
+// itself, and it outranks an observation.
+//
+// WHY THERE ARE TWO. Both goroutines above can discover the same loss, and they
+// know different amounts about it. The exit watcher knows the CAUSE: the holder
+// ended, its status is in hand, and its reason is on stderr. The heartbeat only
+// knows that its write failed -- which, when the holder has exited, is a
+// consequence of that exit rather than an independent cause.
+//
+// They are woken separately, so the heartbeat's one pending tick can arrive
+// first. With first-wins that reported "heartbeat to <path> failed: EOF" and
+// silently discarded "run lock lease expired" arriving microseconds behind it:
+// the symptom kept, the cause thrown away, in exactly the scenario the stderr
+// plumbing was added for. The operator then reads a network fault where the
+// truth is that the target released the lock and may already have given it to a
+// promotion.
+//
+// Only this direction. An observation never overwrites a cause, and a cause
+// never overwrites another cause. A genuine partition is unaffected and must
+// be: nothing exits there, no cause is ever offered, and the heartbeat failure
+// is the only true thing anybody can say about it.
+func (l *RemoteRunLock) setLostAuthoritatively(err error) { l.recordLoss(err, true) }
+
+// recordLoss keeps the first loss, except that a cause outranks an observation.
+//
+// The `authoritative &&` conjunct is redundant today, and deleting it is an
+// equivalent mutation no test can catch: at most one observation and one cause
+// ever arrive, because the heartbeat goroutine returns after its first failed
+// write and the exit fires once. Across all four reachable orderings -- neither,
+// either alone, observation then cause, cause then observation -- both
+// spellings behave identically.
+//
+// It stays because it is the half that will still be right if the heartbeat
+// ever stops returning on failure. Without it, a second observation would
+// replace the first, and after a cause had been recorded the ranking would then
+// depend on nothing having beaten since -- which is the kind of coupling that
+// is invisible until it is wrong.
+func (l *RemoteRunLock) recordLoss(err error, authoritative bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.lost == nil {
+	if l.lost == nil || (authoritative && !l.lostAuthoritative) {
 		l.lost = err
+		l.lostAuthoritative = authoritative
 	}
+}
+
+// heldExitPhrase says how the holder ended.
+//
+// A nil error means it ended cleanly, which for a lock holder means it let go
+// deliberately -- a lease that expired being the ordinary case. Rendering that
+// through %v produced "exited (<nil>)", which is the least informative
+// available spelling of the most common reason a target lock is lost.
+func heldExitPhrase(err error) string {
+	if err == nil {
+		return "let go deliberately and exited cleanly"
+	}
+	return "exited (" + err.Error() + ")"
 }
 
 // Lost reports why this process can no longer prove it holds the lock, or nil

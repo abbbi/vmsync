@@ -68,6 +68,54 @@ type BreakLockDecision struct {
 	HasHolder bool
 }
 
+// UnleasedLockEscape is what to do about a target run lock held WITHOUT a
+// lease, written from the point of view of the host named.
+//
+// One text, because two places need it and must not disagree: the warning every
+// unleased run prints on the driver, and -break-target-lock's refusal on the
+// target when the lock records no holder. They disagreed. The warning named
+// that verb as "the way past a stale lock", and the verb refuses every unleased
+// lock there is -- the hold writes no stamp, so nothing proves its holder
+// stopped, and a stamp inherited from a dead predecessor under a live hold is
+// refused by the kernel probe instead. So the advice that actually works was
+// reachable only by running the verb and reading its refusal, during the
+// disaster the warning is read in.
+//
+// THE WAIT IS OFFERED FIRST, and that ordering is the point rather than a
+// politeness. Ending the session is the faster path and the dangerous one: this
+// lock is the only thing keeping two writers off the replica, and "the driver
+// looks gone" is precisely the judgement that is wrong during a partition --
+// where the driver is alive, still writing, and simply unable to say so.
+//
+// NAMING THE HOLDER IS NOT OBVIOUS, which is why the command is spelled out
+// here. The process holding the lock has the argv `cat`: flock(1) locks the
+// descriptor it inherited and EXITS, the lock lives on the shell's open file
+// description, and the shell then execs its reader. So looking for `flock` --
+// which docs/RUNBOOK.md told an operator to do until this was measured -- finds
+// nothing, and neither does looking for anything with "vmsync" in its name.
+// `fuser`/`lsof` on the lock file ask the kernel which process holds the file
+// open and answer with the pid directly.
+func UnleasedLockEscape(host, lockPath, helperPath string) string {
+	// The arithmetic, because the clause used to credit it to the wrong
+	// mechanism: sshd's ClientAliveInterval defaults to 0, so with stock
+	// configuration NOTHING IN SSHD expires the session. What ends it is the
+	// kernel's TCP keepalive -- tcp_keepalive_time 7200s plus
+	// tcp_keepalive_probes 9 at tcp_keepalive_intvl 75s, so 7875s, 2h11m15s --
+	// and `TCPKeepAlive no` disables even that. ClientAliveInterval and
+	// ClientAliveCountMax are what an operator SETS to shorten the window, not
+	// what produces it.
+	s := "Wait for the session holding it on " + host + " to end (with sshd's defaults nothing in sshd expires it -- ClientAliveInterval is 0 -- so it ends when the kernel's TCP keepalive gives up, about 2 h 11 min; under `TCPKeepAlive no` it never ends at all, and setting ClientAliveInterval with ClientAliveCountMax on " + host + " is what shortens the window)"
+	s += ", or, once you are certain the run that took it is really gone, end the process holding it on " + host
+	if lockPath != "" {
+		s += " -- `fuser -v " + lockPath + "` or `lsof " + lockPath + "` names its pid, and do not be put off that its argv is just `cat`: flock(1) exits as soon as it has locked the descriptor the shell keeps, so nothing in the holder's name says vmsync --"
+	}
+	s += " bearing in mind that ending it while that run is still alive leaves two writers on the replica"
+	if helperPath != "" {
+		s += ". Deploying vmsync-bridge-helper at " + helperPath + " on " + host + " makes future locks release themselves a lease after the driver stops beating, which removes this situation instead of working around it"
+	}
+	return s
+}
+
 // BreakRunLockDecision decides whether the lock for key may be broken, from the
 // provenance its holder recorded and the state of this host.
 //
@@ -339,7 +387,12 @@ func DescribeLockHolder(dir, key string) string {
 		return b.String()
 	}
 	if free, whyNot := runLockFree(RunLockPath(dir, key)); !free {
-		fmt.Fprintf(&b, " -- that process is gone (%s), but %s, so this record describes a previous holder rather than the live one, and the live one is unidentified. It may be a sync or a restore writing this replica right now, and ending it would leave two writers on this replica -- the thing this lock exists to prevent. So waiting is the first option: a leased hold releases itself one lease after its driver stops beating, and an unleased one goes when this host's sshd expires the session (see ClientAliveInterval). -break-target-lock refuses this state and has no override; if the holder does turn out to be an abandoned session, `ss -tp | grep sshd` and `loginctl`/`ps` name it", why, whyNot)
+		// The ways past come from UnleasedLockEscape like the warning's and
+		// the refusal's do. This was a third, independently worded copy, and
+		// it still told an operator to find the holder with `ps` -- which
+		// cannot work, because flock(1) exits once it has locked and the
+		// holder's argv is `cat`.
+		fmt.Fprintf(&b, " -- that process is gone (%s), but %s, so this record describes a previous holder rather than the live one, and the live one is unidentified. It may be a sync or a restore writing this replica right now, and ending it would leave two writers on this replica -- the thing this lock exists to prevent. -break-target-lock refuses this state and has no override. %s", why, whyNot, UnleasedLockEscape("this host", RunLockPath(dir, key), ""))
 		return b.String()
 	}
 	fmt.Fprintf(&b, " -- NOT running (%s), and nothing is holding the lock, so it is stale and -break-target-lock can clear it", why)

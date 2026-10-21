@@ -25,6 +25,42 @@ import (
 	"vmsync/pkg/util"
 )
 
+// unleasedLockWarning is the warning every unleased run prints, and
+// unattributedLockRefusal is what -break-target-lock answers when it is asked
+// to break the lock that warning is about. They live next to each other because
+// they disagreed, and because the disagreement was only visible to somebody who
+// read both.
+//
+// WHAT THE WARNING USED TO SAY: "until then vmsync -break-target-lock is the
+// way past a stale lock". That verb refuses every unleased lock -- the hold
+// records no holder, so there is no evidence its holder stopped -- and it has
+// to run ON the target, not on the host printing the warning.
+// docs/RUNBOOK.md calls this warning "the inventory of hosts where a disaster
+// costs two hours", so it is read exactly when there is no time left to
+// discover that the remedy named in it cannot work. The project's own bench
+// asserts the refusal while treating this line as trustworthy.
+//
+// Both now take their ways-past from util.UnleasedLockEscape, so the warning
+// cannot promise something the refusal contradicts.
+func unleasedLockWarning(targetDomain, host, helperPath, reason string) (string, []any) {
+	return "the target-side run lock is NOT leased on this target, so a power loss or a partition here will block -promote and -restore on the target for as long as its sshd takes to notice (about two hours by default)",
+		[]any{
+			"vm", targetDomain, "host", host,
+			"reason", reason,
+			"remedy", "deploy a matching vmsync-bridge-helper at " + helperPath + " on the target, which makes the lock release itself a lease after this host stops beating",
+			// The verb is named only to say that it will refuse. Saying so
+			// here costs one line; finding it out costs part of a disaster.
+			"if-this-host-dies", "-break-target-lock will REFUSE this lock, and has to run ON the target rather than here in any case: an unleased hold records no holder, so there is no evidence that whoever holds it has stopped. " + util.UnleasedLockEscape("the target", util.RunLockPath(runLockDir, targetLockKey(targetDomain)), ""),
+		}
+}
+
+// unattributedLockRefusal is the refusal for a lock that records no holder,
+// which is every lock the unleased shell hold takes.
+func unattributedLockRefusal(targetDomain, reason, helperPath string) error {
+	return fmt.Errorf("refusing to break the run lock for %s: %s. An unleased lock records nothing, so there is no evidence to break it on. %s: %w",
+		targetDomain, reason, util.UnleasedLockEscape("this host", util.RunLockPath(runLockDir, targetLockKey(targetDomain)), helperPath), util.ErrLockUnattributed)
+}
+
 // runBreakTargetLock clears a target-side run lock whose holder is gone.
 //
 // The situation it exists for: a sync driven from another host took this host's
@@ -62,8 +98,7 @@ func runBreakTargetLock(ctx context.Context, cfg syncConfig) error {
 			return fmt.Errorf("refusing to break the run lock for %s: %s. If that process is genuinely gone, kill it or its ssh session on this host and the lock goes with it: %w",
 				cfg.TargetDomain, d.Reason, util.ErrLockHolderAlive)
 		}
-		return fmt.Errorf("refusing to break the run lock for %s: %s. An unleased lock records nothing, so the only safe ways past it are to wait for this host's sshd to expire the session (see ClientAliveInterval), or to find and end that session yourself -- `ss -tp | grep sshd` and `loginctl`/`ps` name it. Deploying vmsync-bridge-helper on this host makes future locks release themselves: %w",
-			cfg.TargetDomain, d.Reason, util.ErrLockUnattributed)
+		return unattributedLockRefusal(cfg.TargetDomain, d.Reason, cfg.BridgeHelperPath)
 	}
 
 	// Journalled before it acts, like every other destructive verb: the record

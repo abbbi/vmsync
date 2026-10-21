@@ -4539,10 +4539,9 @@ func run(cfg syncConfig) (runErr error) {
 		if err := targetLock.FellBackBecause(); err != nil {
 			reason = err.Error()
 		}
-		trace.Warning("the target-side run lock is NOT leased on this target, so a power loss or a partition here will block -promote and -restore on the target for as long as its sshd takes to notice (about two hours by default)",
-			"vm", cfg.TargetDomain, "host", util.HostFromURIOrLocal(cfg.TargetURI),
-			"reason", reason,
-			"remedy", "deploy a matching vmsync-bridge-helper at "+cfg.BridgeHelperPath+" on the target; until then vmsync -break-target-lock is the way past a stale lock")
+		msg, fields := unleasedLockWarning(cfg.TargetDomain,
+			util.HostFromURIOrLocal(cfg.TargetURI), cfg.BridgeHelperPath, reason)
+		trace.Warning(msg, fields...)
 	}
 
 	// HERE, and the position is the whole fault. The lock is held, whichever

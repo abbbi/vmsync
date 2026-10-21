@@ -52,6 +52,17 @@ type fakeCloser struct {
 	closed *bool
 
 	exited chan error
+	// said is what the remote command wrote to stderr, which is where a
+	// holder's reason for letting go actually lives.
+	//
+	// Revealed only once the exit has been delivered, through exitWith below,
+	// and that is the point of it. The real Said() is complete only after
+	// Exited() has fired, because session.Wait drains the stderr copier before
+	// returning; a fake that answered the same thing at every instant could
+	// not fail if the production code read it too early, which is exactly the
+	// mistake worth catching here.
+	said      string
+	saidReady bool
 
 	mu       sync.Mutex
 	beats    int
@@ -445,3 +456,278 @@ func TestADeliberateCloseIsNotALoss(t *testing.T) {
 
 // Exited is the optional hook AcquireRemoteRunLock looks for by shape.
 func (f *fakeCloser) Exited() <-chan error { return f.exited }
+
+func (f *fakeCloser) Said() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.saidReady {
+		return ""
+	}
+	return f.said
+}
+
+// exitWith delivers the command's exit the way the real handle does: whatever
+// it said on stderr becomes readable at the moment the exit is published, not
+// before.
+func (f *fakeCloser) exitWith(err error) {
+	f.mu.Lock()
+	f.saidReady = true
+	f.mu.Unlock()
+	f.exited <- err
+}
+
+// THE FINDING. A holder that let go explains itself on stderr, and until that
+// reason reached the driver the loss arrived as "exited (Process exited with
+// status 1)" -- or, worse, as "exited (<nil>)".
+//
+// Both cases are here because the exit status and the interesting-ness of the
+// case do not agree. vmsync-bridge-helper's own runLockExit maps a lease that
+// expired to status ZERO, calling it "the lock doing its job ... the outcome it
+// exists to produce", while a dispossessed holder exits 1. So a fix that only
+// decorated the non-nil error would have delivered the rarer case and lost the
+// ordinary one, which is the question an operator actually arrives with: the
+// sync refused to commit, and why.
+func TestTheLossSaysWhyTheHolderLetGo(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		exit     error
+		said     string
+		wantSaid string
+	}{
+		{
+			// The lease ran out: the helper prints this and exits 0.
+			name:     "a lease that expired, which exits cleanly",
+			exit:     nil,
+			said:     "vmsync-bridge-helper: run lock lease expired",
+			wantSaid: "run lock lease expired",
+		},
+		{
+			// The lock file went away under a live holder: exit 1.
+			name:     "a holder dispossessed by something clearing the lock directory",
+			exit:     errors.New("Process exited with status 1"),
+			said:     "vmsync-bridge-helper: the run lock was removed from under this holder: /run/vmsync-locks/target-web01.lock has been removed",
+			wantSaid: "removed from under this holder",
+		},
+		{
+			// Nothing said: the message must not grow an empty clause.
+			name:     "a holder that said nothing",
+			exit:     errors.New("Process exited with status 1"),
+			said:     "",
+			wantSaid: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &fakeHolder{handle: &fakeCloser{exited: make(chan error, 1), said: tc.said}}
+			lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
+				HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+				Lease:      time.Hour,
+			})
+			if err != nil {
+				t.Fatalf("AcquireRemoteRunLock: %v", err)
+			}
+			defer lock.Close()
+
+			h.handle.exitWith(tc.exit)
+
+			deadline := time.Now().Add(3 * time.Second)
+			for lock.Lost() == nil && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			lost := lock.Lost()
+			if lost == nil {
+				t.Fatal("the holder exited and the lock still reports itself held")
+			}
+			if !errors.Is(lost, ErrRemoteLockLost) {
+				t.Errorf("loss does not wrap ErrRemoteLockLost, so the gates before the commit and the define will not refuse on it: %v", lost)
+			}
+			if tc.wantSaid == "" {
+				if strings.Contains(lost.Error(), "saying:") {
+					t.Errorf("a holder that said nothing produced an empty explanation clause: %v", lost)
+				}
+				return
+			}
+			if !strings.Contains(lost.Error(), tc.wantSaid) {
+				t.Errorf("the loss does not say why the holder let go.\n got: %v\nwant it to contain: %q", lost, tc.wantSaid)
+			}
+		})
+	}
+}
+
+// THE RACE. Two goroutines can discover the same loss, and the one that knows
+// least can get here first.
+//
+// The heartbeat only knows its write failed. The exit watcher knows the holder
+// ended and why. With first-wins, a pending beat failing a moment before the
+// exit arrives meant the operator read "heartbeat to <path> failed: EOF" while
+// "run lock lease expired" was discarded behind it -- the symptom kept, the
+// cause thrown away, in the one scenario the stderr plumbing exists for.
+//
+// Driven in that order deliberately: the observed loss is established FIRST,
+// and only then does the explanation arrive.
+func TestAnExplainedLossReplacesAnObservedOne(t *testing.T) {
+	h := &fakeHolder{handle: &fakeCloser{
+		exited: make(chan error, 1),
+		said:   "vmsync-bridge-helper: run lock lease expired",
+	}}
+	// Short, so a beat is attempted at once and the heartbeat path wins.
+	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
+		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		Lease:      90 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("AcquireRemoteRunLock: %v", err)
+	}
+	defer lock.Close()
+
+	h.handle.failWrites()
+	deadline := time.Now().Add(3 * time.Second)
+	for lock.Lost() == nil && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	observed := lock.Lost()
+	if observed == nil {
+		t.Fatal("a failing heartbeat did not report the lock as lost")
+	}
+	if !strings.Contains(observed.Error(), "heartbeat") {
+		t.Fatalf("expected the heartbeat to be the first to notice; got %v", observed)
+	}
+
+	// Now the holder's own account of it arrives.
+	h.handle.exitWith(nil)
+
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(lock.Lost().Error(), "lease expired") {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	final := lock.Lost()
+	if !strings.Contains(final.Error(), "lease expired") {
+		t.Errorf("the holder's own reason never replaced the heartbeat's observation.\n got: %v\nThe operator is left reading a network fault where the truth is that the target released the lock.", final)
+	}
+	if strings.Contains(final.Error(), "heartbeat") {
+		t.Errorf("the loss still reports the heartbeat failure, which is a consequence of the exit rather than the cause: %v", final)
+	}
+	if !errors.Is(final, ErrRemoteLockLost) {
+		t.Errorf("the replacement no longer wraps ErrRemoteLockLost, so the commit and define gates would stop refusing: %v", final)
+	}
+}
+
+// AND THE OTHER DIRECTION MUST NOT HAPPEN. A partition is the case where the
+// heartbeat is the only thing that can notice: nothing exits, so no explanation
+// is ever offered, and the observation is the whole truth.
+func TestAPartitionKeepsTheHeartbeatsAccount(t *testing.T) {
+	h := &fakeHolder{handle: &fakeCloser{
+		exited: make(chan error, 1),
+		said:   "this must never appear: nothing exited",
+	}}
+	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
+		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		Lease:      90 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("AcquireRemoteRunLock: %v", err)
+	}
+	defer lock.Close()
+
+	h.handle.failWrites()
+	deadline := time.Now().Add(3 * time.Second)
+	for lock.Lost() == nil && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	lost := lock.Lost()
+	if lost == nil {
+		t.Fatal("a failing heartbeat did not report the lock as lost")
+	}
+	if !strings.Contains(lost.Error(), "heartbeat") {
+		t.Errorf("a partition must be reported as what it is -- the heartbeat failing -- not as something the holder said: %v", lost)
+	}
+	// Nothing exited, so nothing may be attributed to the holder.
+	if strings.Contains(lost.Error(), "this must never appear") {
+		t.Errorf("stderr was attributed to a loss no exit explained: %v", lost)
+	}
+	// And it stays that way.
+	time.Sleep(150 * time.Millisecond)
+	if !strings.Contains(lock.Lost().Error(), "heartbeat") {
+		t.Errorf("the heartbeat's account was replaced although nothing exited: %v", lock.Lost())
+	}
+}
+
+// A lease that expired exits CLEANLY, and that has to read as something.
+func TestACleanExitDoesNotReportItselfAsNil(t *testing.T) {
+	h := &fakeHolder{handle: &fakeCloser{
+		exited: make(chan error, 1),
+		said:   "vmsync-bridge-helper: run lock lease expired",
+	}}
+	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
+		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		Lease:      time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("AcquireRemoteRunLock: %v", err)
+	}
+	defer lock.Close()
+
+	h.handle.exitWith(nil)
+	deadline := time.Now().Add(3 * time.Second)
+	for lock.Lost() == nil && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	lost := lock.Lost()
+	if lost == nil {
+		t.Fatal("the holder exited and the lock still reports itself held")
+	}
+	if strings.Contains(lost.Error(), "<nil>") {
+		t.Errorf("the most ordinary reason for losing a target lock renders as \"exited (<nil>)\": %v", lost)
+	}
+	if !strings.Contains(lost.Error(), "deliberately") {
+		t.Errorf("a clean exit does not say that the holder let go on purpose, which is what distinguishes it from a crash: %v", lost)
+	}
+}
+
+// AND THE MIRROR ORDER, which the first pair of these tests did not cover and
+// a mutation walked straight through.
+//
+// The exit can arrive first and the next beat fail a moment later -- the holder
+// is gone, so of course the write fails. If an observation may overwrite a
+// cause, the explanation the driver had just been given is replaced by
+// "heartbeat failed: EOF", and the reason is lost again by a different route
+// than the one 4.22 fixed.
+func TestAnObservationNeverOverwritesACause(t *testing.T) {
+	h := &fakeHolder{handle: &fakeCloser{
+		exited: make(chan error, 1),
+		said:   "vmsync-bridge-helper: run lock lease expired",
+	}}
+	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
+		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		// Short, so beats keep being attempted after the exit.
+		Lease: 90 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("AcquireRemoteRunLock: %v", err)
+	}
+	defer lock.Close()
+
+	// The cause arrives first this time.
+	h.handle.exitWith(nil)
+	deadline := time.Now().Add(3 * time.Second)
+	for lock.Lost() == nil && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if lost := lock.Lost(); lost == nil || !strings.Contains(lost.Error(), "lease expired") {
+		t.Fatalf("the holder's reason was not recorded first: %v", lost)
+	}
+
+	// Now the writes start failing, which is what a gone holder does to them.
+	h.handle.failWrites()
+	time.Sleep(200 * time.Millisecond) // several beat intervals
+
+	final := lock.Lost()
+	if !strings.Contains(final.Error(), "lease expired") {
+		t.Errorf("a failing heartbeat overwrote the holder's own account of why the lock went.\n got: %v\nThe write failing is a consequence of the holder being gone, not a second cause.", final)
+	}
+	if strings.Contains(final.Error(), "heartbeat") {
+		t.Errorf("the loss now reports the heartbeat rather than the reason: %v", final)
+	}
+}
