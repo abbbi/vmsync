@@ -9373,9 +9373,17 @@ stage_lock_lease() {
 	# `set -e`, or an early return added here later. Idempotent: cleanup_stalled
 	# returns at once once STALLED_PID is empty.
 	#
-	# A RETURN trap does not fire on `exit`, so a Ctrl+C taken mid-stall still
-	# leaves the process: `vmsync -break-target-lock` on the target is the way
-	# past the lock it holds, and the stage prints that remedy below.
+	# A RETURN trap does not fire on `exit`, so a Ctrl+C taken mid-stall leaves
+	# the process running and still holding the lock. The way past that is to
+	# end the process itself -- its pid is $STALLED_PID, and
+	# `pgrep -af stall-after-lock` finds it on this host afterwards.
+	#
+	# NOT `vmsync -break-target-lock` on the target, which this very stage
+	# asserts will REFUSE a few hundred lines below: a live unleased lock
+	# records no holder of its own, and any record it does carry belongs to a
+	# previous one, so nothing there can prove the process actually holding the
+	# lock has stopped. Breaking it anyway is what would leave two writers on
+	# one replica.
 	# shellcheck disable=SC2064
 	trap 'cleanup_stalled' RETURN
 
