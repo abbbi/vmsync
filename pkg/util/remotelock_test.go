@@ -192,6 +192,12 @@ func TestAcquireRemoteRunLockContentionIsNotAnError(t *testing.T) {
 		{RemoteLockNoFlock, false, "no flock"},
 		{RemoteLockNoDir, false, "lock directory"},
 		{RemoteLockNoCreate, false, "lock file"},
+		// Not contention: a host that cannot prove which file it locked
+		// cannot lock at all, and must read as a misconfiguration rather
+		// than as somebody else holding it. The substring is the actionable
+		// half -- an operator needs to be told which capability is missing,
+		// not merely that something could not be compared.
+		{RemoteLockNoSameFile, false, "test -ef"},
 	} {
 		t.Run(tc.marker, func(t *testing.T) {
 			h := &fakeHolder{failWith: tc.marker}

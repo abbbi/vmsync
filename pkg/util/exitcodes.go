@@ -38,6 +38,9 @@ package util
 //	  4  RemoteLockExitNoDir    -- the lock directory could not be made
 //	  5  RemoteLockExitNoCreate -- the lock file could not be created
 //	  6  RemoteLockExitBusy     -- the target-side lock is held
+//	  7  RemoteLockExitNoSameFile -- the target's shell cannot compare two
+//	     files for identity, so a lock taken there cannot be shown to be the
+//	     lock the path names
 //	 75  ExitBusy               -- stood down, nothing touched
 //	124  ExitSupervisedTimeout  -- a supervised command outlived -max-runtime
 //	125  ExitSuperviseFailed    -- the supervision itself failed
@@ -63,6 +66,16 @@ const (
 	RemoteLockExitNoDir    = 4
 	RemoteLockExitNoCreate = 5
 	RemoteLockExitBusy     = 6
+
+	// RemoteLockExitNoSameFile means the shell hold could not prove that the
+	// file it locked is the file the lock path names, because the test it
+	// needs does not work on that host: no `test -ef`, or no /proc.
+	//
+	// Refusing is the point. Without that test the hold can flock a file that
+	// has since been unlinked and replaced, which excludes nobody, and then
+	// announce VMSYNC-LOCK-ACQUIRED about it -- so a second vmsync takes the
+	// file that replaced it and both run against the same replica.
+	RemoteLockExitNoSameFile = 7
 
 	// ExitBusy means "stood down without doing anything, because another
 	// vmsync holds the lock for this domain".

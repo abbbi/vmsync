@@ -17,7 +17,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package util
 
-import "testing"
+import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strconv"
+	"testing"
+)
 
 // exitStatuses is every status these binaries can leave behind, including
 // the ones defined elsewhere and the bare literals, because the collision
@@ -30,10 +36,65 @@ var exitStatuses = map[int]string{
 	4:   "RemoteLockExitNoDir",
 	5:   "RemoteLockExitNoCreate",
 	6:   "RemoteLockExitBusy",
+	7:   "RemoteLockExitNoSameFile",
 	75:  "ExitBusy",
 	124: "ExitSupervisedTimeout",
 	125: "ExitSuperviseFailed",
 	137: "test-only self-kill (-test=die-writing-base)",
+}
+
+// definedExitConstants returns every integer constant exitcodes.go declares, by
+// name, read from the file itself.
+//
+// It used to be a list written by hand next to the loop below, and that is
+// exactly how RemoteLockExitNoSameFile = 7 was added without being registered
+// anywhere: the loop iterated the hand-written list, so a constant missing from
+// THAT list was never checked at all. The guard whose entire purpose is to stop
+// the next number colliding with an existing meaning reported health about a
+// number nobody had recorded, and the suite stayed green.
+//
+// Reading the declarations inverts that. The only way to add a status without
+// documenting it is now to fail this test, which is what it was for.
+func definedExitConstants(t *testing.T) map[string]int {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), "exitcodes.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse exitcodes.go: %v", err)
+	}
+	out := map[string]int{}
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for i, name := range vs.Names {
+				if i >= len(vs.Values) {
+					continue
+				}
+				lit, ok := vs.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.INT {
+					continue
+				}
+				n, err := strconv.Atoi(lit.Value)
+				if err != nil {
+					continue
+				}
+				out[name.Name] = n
+			}
+		}
+	}
+	// ANTI-VACUITY. A parse that silently returned nothing, or a rename of the
+	// file, would leave the loop below with no work and report success -- the
+	// same shape of blindness this function exists to remove.
+	if len(out) < 4 {
+		t.Fatalf("only %d integer constants found in exitcodes.go; this guard has stopped reading the file it guards", len(out))
+	}
+	return out
 }
 
 // TestExitStatusesDoNotCollide is the reason these were collected into one
@@ -57,17 +118,7 @@ var exitStatuses = map[int]string{
 //
 // MUTATION CAUGHT: renumbering a status, or adding one without listing it.
 func TestExitStatusesDoNotCollide(t *testing.T) {
-	// Duplicate constant keys here are a compile error. See above.
-	defined := map[int]string{
-		ExitBusy:               "ExitBusy",
-		ExitSupervisedTimeout:  "ExitSupervisedTimeout",
-		ExitSuperviseFailed:    "ExitSuperviseFailed",
-		RemoteLockExitNoFlock:  "RemoteLockExitNoFlock",
-		RemoteLockExitNoDir:    "RemoteLockExitNoDir",
-		RemoteLockExitNoCreate: "RemoteLockExitNoCreate",
-		RemoteLockExitBusy:     "RemoteLockExitBusy",
-	}
-	for value, name := range defined {
+	for name, value := range definedExitConstants(t) {
 		documented, known := exitStatuses[value]
 		if !known {
 			t.Errorf("%s = %d is not in the map in exitcodes.go; the next person choosing a number will not see it taken", name, value)

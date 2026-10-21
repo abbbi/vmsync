@@ -366,12 +366,14 @@ func DescribeLockHolder(dir, key string) string {
 // it locked the old inode and its own re-check sends it round again. Every one
 // of those is a refusal or a retry.
 //
-// The unleased shell hold is the exception, and it is narrowed rather than
-// closed: remotelock.go parks `exec 9>>` and `flock -n 9` in a POSIX shell that
-// compares no inodes, so a shell holding the file open before this takes the
-// lock can still flock the orphan afterwards and believe it holds the run lock.
-// Nothing on this side can fix that -- the shell would have to compare inodes
-// itself -- and the window is now only between its own open and its own flock.
+// The unleased shell hold is included in that, which took doing: it parks
+// `exec 9>>` and `flock -n 9` in a POSIX shell, so the comparison has to be
+// made by the shell itself. It asks `[ path -ef /proc/$$/fd/9 ]` -- os.SameFile
+// spelled in test(1), which is a builtin and so costs the fallback path no new
+// dependency -- and drops the descriptor and goes round its own loop when the
+// answer is no. A shell that held the file open before this took the lock
+// therefore cannot keep the orphan it locked; it takes whatever is at the path
+// now, or refuses.
 //
 // Unlinking still revokes nobody's flock -- nothing can, from outside the
 // process owning the descriptor -- and it does not need to: the lock lives on
