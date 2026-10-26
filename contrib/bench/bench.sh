@@ -404,9 +404,18 @@ domain's aside must be left alone (the sweep reads this domain's disks, not the
 directory -- stage 18's lesson in a new reader), and a replica marked
 replica_incomplete must have nothing reclaimed at all, because there the aside
 set is the only complete copy of the replica there is. That last one is produced
-with the same injected fault stage 16 uses, and it also checks that the sweep
-standing down is a warning rather than a failed sync -- the run it happens inside
-is the one repairing the replica. Ages are faked by rewriting the unix stamp in
+with the same injected fault stage 16 uses, and the run that measures it is a
+-reinit: with the marker set, a plain sync is refused long before the sweep, so
+the whole check passed on nothing until 2026-10-22. It asserts the aged files by
+NAME rather than by counting them, because the measuring rebuild sets a fresh
+set aside of its own and a count is satisfied by that set standing in for the
+one a broken sweep deleted. Three more checks hang off it: that the sweep said
+it was standing down (as against never having run), that standing down is a
+warning rather than a failed sync -- the run it happens inside is the one
+repairing the replica -- and a control, an incremental afterwards, which must
+reclaim those same files once the replica is whole again. Without the control,
+"nothing was reclaimed" proves nothing about the marker.
+Ages are faked by rewriting the unix stamp in
 each name rather than by moving a clock: the stamp is what vmsync reads, and
 moving the host's time would invalidate every other timestamp the replica carries.
 
@@ -1247,7 +1256,7 @@ stage_matrix() {
                                         build_scenario_name "$compress" "$netbuf" "$use_ssh" "$iodepth"
                                         name="$SCEN_NAME"
                                         if [ -n "$ONLY_PATTERN" ]; then
-                                                # shellcheck disable=SC2053 -- intentional glob match, not literal.
+                                                # shellcheck disable=SC2053 # intentional glob match, not literal.
                                                 [[ "$name" == $ONLY_PATTERN ]] || continue
                                         fi
                                         n=$((n + 1))
@@ -8683,7 +8692,6 @@ stage_colocated() {
 stage_leftovers() {
 	log "=== Stage 19: displaced sets are reported, and reclaimed only when asked ==="
 	local sc=leftovers
-	local fo_ok=0
 
 	if [ "$DRY_RUN" = yes ]; then
 		# rename, not the harness's usual delete: this stage is about the files
@@ -8699,7 +8707,8 @@ stage_leftovers() {
 		bench_sync "$sc" too-new "-reclaim-leftovers-after=8760h"
 		bench_sync "$sc" reclaim "-reclaim-leftovers-after=24h"
 		bench_sync "$sc" incomplete -reinit "-test=$VMSYNC_TEST_DIE_WRITING_BASE"
-		bench_sync "$sc" refused "-reclaim-leftovers-after=24h"
+		bench_sync "$sc" refused -reinit "-reclaim-leftovers-after=24h"
+		bench_sync "$sc" reclaim-after-repair "-reclaim-leftovers-after=24h"
 		bench_sync "$sc" repaired -reinit
 		REPLACED_DISK_ACTION="$LO_SAVED_REPLACED_DISK_ACTION"
 		fo_check "$sc" "a rebuild leaves one aside file per disk" 0
@@ -8710,7 +8719,9 @@ stage_leftovers() {
 		fo_check "$sc" "a co-located domain's aside is left alone" 0
 		fo_check "$sc" "a restore point store moved aside is reclaimed" 0
 		fo_check "$sc" "nothing is reclaimed while the replica is marked incomplete" 0
-		fo_check "$sc" "the refusal does not fail the sync" 0
+		fo_check "$sc" "the sweep said it was standing down" 0
+		fo_check "$sc" "the stand-down does not fail the sync" 0
+		fo_check "$sc" "the same sets are reclaimed once the replica is complete" 0
 		return 0
 	fi
 
@@ -8785,15 +8796,25 @@ stage_leftovers() {
 	}
 
 	# --- 19a. a rebuild leaves an aside set -----------------------------------
+	#
+	# Swept first, which is what makes the count below EXACT rather than a
+	# lower bound: a set an earlier stage left beside the same disks would
+	# satisfy ">= 1" on behalf of a rebuild that displaced nothing. See
+	# sweep_replaced_disks' own doc -- this is the call site it names.
+	sweep_replaced_disks
 	bench_sync "$sc" baseline; bench_sync_ok || { bench_sync_hint; fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "the baseline sync itself failed, see $RUN_LOG"; return 0; }
 	bench_sync "$sc" rebuild -reinit; bench_sync_ok || { fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "the rebuild failed, see $RUN_LOG"; return 0; }
 
 	local n
 	n="$(aside_count)"
-	if [ "${n:-0}" -ge 1 ]; then
+	# ONE PER DISK, counted exactly. ">= 1" passed a two-disk domain that
+	# displaced one disk -- the precise failure aside_count's own comment says
+	# summing over every disk exists to catch, asserted away again by the
+	# comparison.
+	if [ "${n:-0}" -eq "${#replicas[@]}" ]; then
 		fo_check "$sc" "a rebuild leaves one aside file per disk" 0
 	else
-		fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "no <disk>.vmsync-replaced-* beside any of ${#replicas[@]} disk(s) of $TARGET_DOMAIN on $TARGET_HOST (${replicas[*]}) after a -reinit with -replaced-disk-action=rename; the rest of this stage has nothing to act on"
+		fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "found ${n:-0} <disk>.vmsync-replaced-* file(s) beside the ${#replicas[@]} disk(s) of $TARGET_DOMAIN on $TARGET_HOST (${replicas[*]}) after a -reinit with -replaced-disk-action=rename, want one each; the rest of this stage has nothing exact to act on"
 		return 0
 	fi
 
@@ -8802,11 +8823,16 @@ stage_leftovers() {
 	# The reporting half is the one that matters on an estate that has been
 	# running for a year: the files are already there, and until a run said so
 	# nothing named them at all.
-	bench_sync "$sc" report; bench_sync_ok || fo_ok=1
-	if [ "$(aside_count)" = "$n" ] && grep -q "displaced sets beside the replica" "$RUN_LOG" 2>/dev/null; then
+	# The grep is on the REPORT's own words, not on "displaced sets beside the
+	# replica": that phrase is also the opening of the scan-failure warning
+	# (leftovers.go, "could not look for displaced sets beside the replica"),
+	# so a build that cannot even list the directory printed it, removed
+	# nothing, and passed this check twice over.
+	bench_sync "$sc" report; bench_sync_ok || warn "the no-duration run exited ${RUN_RC:-0}; the check below still reads its log, but see $RUN_LOG"
+	if [ "$(aside_count)" = "$n" ] && grep -q "which nothing removes on its own" "$RUN_LOG" 2>/dev/null; then
 		fo_check "$sc" "a run with no duration reports the sets and removes none" 0
 	else
-		fo_check "$sc" "a run with no duration reports the sets and removes none" 1 "expected $n aside files still present and a report line in $RUN_LOG, found $(aside_count)"
+		fo_check "$sc" "a run with no duration reports the sets and removes none" 1 "expected $n aside files still present and the report line in $RUN_LOG, found $(aside_count)"
 	fi
 
 	# --- 19c. under the floor is refused at startup ---------------------------
@@ -8814,22 +8840,32 @@ stage_leftovers() {
 	# Refused BEFORE anything is touched, and that is the point: "0h" is what
 	# somebody writes meaning "off", and a sweep that obeyed it would delete an
 	# aside made minutes earlier.
+	# The refusal is identified by its own words, not by a non-zero exit. "The
+	# run failed" is satisfied by every ordinary breakage -- a missing bridge
+	# helper, a recorded verify_state, the wrong binary -- which made this the
+	# one check in the stage that got EASIER to pass the more broken the build
+	# was, while asserting nothing about the floor.
 	bench_sync "$sc" under-floor "-reclaim-leftovers-after=1h"; bench_sync_ok || true
-	if [ "${RUN_RC:-0}" != 0 ] && [ "$(aside_count)" = "$n" ]; then
+	if [ "${RUN_RC:-0}" != 0 ] && [ "$(aside_count)" = "$n" ] &&
+		grep -q "floor: these files are the documented recovery" "$RUN_LOG" 2>/dev/null; then
 		fo_check "$sc" "a duration under the floor is refused at startup" 0
 	else
-		fo_check "$sc" "a duration under the floor is refused at startup" 1 "the run exited ${RUN_RC:-0} and left $(aside_count) of $n aside files; an under-floor duration must stop the run before it acts"
+		fo_check "$sc" "a duration under the floor is refused at startup" 1 "the run exited ${RUN_RC:-0}, left $(aside_count) of $n aside files, and $(grep -q 'floor: these files are the documented recovery' "$RUN_LOG" 2>/dev/null && echo 'named the floor' || echo 'never named the floor'); an under-floor duration must stop the run before it acts, and for that reason. See $RUN_LOG"
 	fi
 
 	# --- 19d. old enough is the only thing that gets swept -------------------
 	#
 	# A year's duration against a set made a minute ago, so the age test is the
 	# only thing that can keep it.
-	bench_sync "$sc" too-new "-reclaim-leftovers-after=8760h"; bench_sync_ok || fo_ok=1
-	if [ "$(aside_count)" = "$n" ]; then
+	# A pure negative needs evidence that the sweep RAN, or it passes on any
+	# run refused before reaching it -- which is how the "refused" sub-test
+	# below came to report PASS on a run that died 2,000 lines earlier. The
+	# summary line is printed only once the age decision has been taken.
+	bench_sync "$sc" too-new "-reclaim-leftovers-after=8760h"; bench_sync_ok || warn "the year-duration run exited ${RUN_RC:-0}; see $RUN_LOG"
+	if [ "$(aside_count)" = "$n" ] && grep -q "displaced sets after reclaiming" "$RUN_LOG" 2>/dev/null; then
 		fo_check "$sc" "a fresh aside is not reclaimed" 0
 	else
-		fo_check "$sc" "a fresh aside is not reclaimed" 1 "$(aside_count) of $n aside files left after a run whose duration was a year"
+		fo_check "$sc" "a fresh aside is not reclaimed" 1 "$(aside_count) of $n aside files left after a run whose duration was a year, and $(grep -q 'displaced sets after reclaiming' "$RUN_LOG" 2>/dev/null && echo 'the sweep ran' || echo 'the sweep never reached its age decision -- so nothing surviving proves anything'). See $RUN_LOG"
 	fi
 
 	# Age them by rewriting the stamp in the name rather than by touching a
@@ -8845,7 +8881,7 @@ stage_leftovers() {
 	local theirs="${TARGET_DISK_PATH%/}/not-${TARGET_DOMAIN}.qcow2.vmsync-replaced-${old_stamp}"
 	ssh_host_cmd "$TARGET_HOST" "dd if=/dev/zero of='$theirs' bs=1k count=8 2>/dev/null" >/dev/null 2>&1 || true
 
-	bench_sync "$sc" reclaim "-reclaim-leftovers-after=24h"; bench_sync_ok || fo_ok=1
+	bench_sync "$sc" reclaim "-reclaim-leftovers-after=24h"; bench_sync_ok || warn "the reclaiming run exited ${RUN_RC:-0}; see $RUN_LOG"
 	if [ "$(aside_count)" = 0 ]; then
 		fo_check "$sc" "an aside older than the duration is reclaimed" 0
 	else
@@ -8864,14 +8900,14 @@ stage_leftovers() {
 	# per-domain stores, so -list-restore-points cannot see them and the points
 	# inside them are outside every store.
 	local rp_parent="${TARGET_DISK_PATH%/}/.vmsync-rp"
-	bench_sync "$sc" store-baseline "-retention=2,0"; bench_sync_ok || fo_ok=1
-	bench_sync "$sc" store-rebuild -reinit "-retention=2,0"; bench_sync_ok || fo_ok=1
+	bench_sync "$sc" store-baseline "-retention=2,0"; bench_sync_ok || warn "the store baseline exited ${RUN_RC:-0}; see $RUN_LOG"
+	bench_sync "$sc" store-rebuild -reinit "-retention=2,0"; bench_sync_ok || warn "the store rebuild exited ${RUN_RC:-0}; see $RUN_LOG"
 	local asides
 	asides="$(ssh_host_cmd "$TARGET_HOST" "ls -1d '$rp_parent'/.replaced-vm-${TARGET_DOMAIN}-* 2>/dev/null | wc -l" 2>/dev/null | tr -d '[:space:]' || true)"
 	if [ "${asides:-0}" -ge 1 ]; then
 		# Age it the same way, then sweep.
 		ssh_host_cmd "$TARGET_HOST" "for d in '$rp_parent'/.replaced-vm-${TARGET_DOMAIN}-*; do [ -d \"\$d\" ] || continue; mv -n \"\$d\" \"${rp_parent}/.replaced-vm-${TARGET_DOMAIN}-${old_stamp}\"; done" >/dev/null 2>&1 || true
-		bench_sync "$sc" store-reclaim "-reclaim-leftovers-after=24h"; bench_sync_ok || fo_ok=1
+		bench_sync "$sc" store-reclaim "-reclaim-leftovers-after=24h"; bench_sync_ok || warn "the store reclaim exited ${RUN_RC:-0}; see $RUN_LOG"
 		local left
 		left="$(ssh_host_cmd "$TARGET_HOST" "ls -1d '$rp_parent'/.replaced-vm-${TARGET_DOMAIN}-* 2>/dev/null | wc -l" 2>/dev/null | tr -d '[:space:]' || true)"
 		if [ "${left:-1}" = 0 ]; then
@@ -8890,11 +8926,33 @@ stage_leftovers() {
 
 	# --- 19f. an incomplete replica is never swept ---------------------------
 	#
-	# The interlock the feature could not ship without. A fault-injected rebuild
-	# leaves replica_incomplete AND a fresh aside set, and that aside set is the
-	# complete replica the rebuild replaced -- putting it back is the documented
-	# recovery. A sweep that took it would leave a half-written image whose
-	# metadata still reads healthy.
+	# The interlock the feature could not ship without. An interrupted rebuild
+	# leaves replica_incomplete AND an aside set, and that set is the complete
+	# replica the rebuild replaced -- putting it back over the disks is the
+	# documented recovery. A sweep that took it would leave a half-written
+	# image whose metadata still reads healthy.
+	#
+	# DRIVEN BY THE ENGINE'S OWN MARKER, and the measuring run is a -reinit.
+	# Both were the other way round before, and both reasons are worth keeping
+	# because each wrong choice looks like the obvious one:
+	#
+	#   - A plain sync cannot be the measuring run. With the marker set it is
+	#     refused at the incremental-into-an-incomplete-replica gate, which
+	#     sits ~2,000 lines before the sweep. So "nothing was reclaimed" held
+	#     because nothing could have been, and the refusal line was missing
+	#     because the code that prints it was never reached. That is what this
+	#     stage reported on 2026-10-22, and the FAIL was right.
+	#   - A hand-written marker is not needed, and is weaker. The sweep reads
+	#     the field BEFORE this run arms its own, so on a -reinit the value it
+	#     decides on is the one the dead rebuild left. The engine's own marker
+	#     drives the real decision and covers that ordering too, which a
+	#     hand-armed fixture cannot see at all (runorder_test.go pins the
+	#     ordering in source; this is the only place it is exercised).
+	#
+	# Swept first so the counts are exact: 19e's store-rebuild left a set of
+	# its own, and restamp_asides uses `mv -n`, so with two sets present only
+	# the first would take the old stamp.
+	sweep_replaced_disks
 	bench_sync "$sc" incomplete -reinit "-test=$VMSYNC_TEST_DIE_WRITING_BASE"
 	# bench_sync_ok, not `if bench_sync ...`: bench_sync always returns 0 (see
 	# its own doc comment), so `if bench_sync ...; then warn` fired on EVERY
@@ -8907,87 +8965,93 @@ stage_leftovers() {
 	# The fault exits without unwinding, so vmsync never runs its own
 	# abortBackup and the SOURCE keeps an active libvirt pull-backup job.
 	# libvirt allows one per domain and vmsync refuses at preflight while one
-	# exists, so the `refused` sub-test below would fail for that reason
-	# instead of the one it tests -- which is what happened on 2026-10-06:
-	# "active block job detected on disk vda" where a reclaim refusal was
-	# expected. Stage 16 already clears this after its own fault injections;
-	# this stage injects the same kind of fault and did not.
+	# exists, so the runs below would fail for that reason instead of the one
+	# being tested -- which is what happened on 2026-10-06: "active block job
+	# detected on disk vda" where a reclaim refusal was expected.
 	#
 	# Before aside_count, so a stranded job cannot outlive an early return.
 	abort_orphaned_source_backup
 
 	n="$(aside_count)"
-	if [ "${n:-0}" -lt 1 ]; then
-		log "   SKIP: the interrupted rebuild left no aside set, so there is nothing for the refusal to protect"
-		results_row "$CSV" "$sc" nothing_is_reclaimed_while_the_replica_is_marked_incomplete SKIP "" "" "" "" "" "SKIP no aside set after the injected failure"
+	local marker
+	marker="$(replica_incomplete "$TARGET_URI" "$TARGET_DOMAIN" 2>/dev/null || true)"
+	if [ "${n:-0}" -lt 1 ] || [ -z "$marker" ]; then
+		# The fixture is the genuine article or it is nothing. With no
+		# hand-written marker in play, a fault that left neither leaves
+		# nothing to observe -- recorded rather than passed.
+		log "   SKIP: the interrupted rebuild left ${n:-0} aside file(s) and replica_incomplete='${marker}'"
+		results_row "$CSV" "$sc" nothing_is_reclaimed_while_the_replica_is_marked_incomplete SKIP "" "" "" "" "" "SKIP the injected failure left no fixture"
+		results_row "$CSV" "$sc" the_sweep_said_it_was_standing_down SKIP "" "" "" "" "" "SKIP the injected failure left no fixture"
+		results_row "$CSV" "$sc" the_stand_down_does_not_fail_the_sync SKIP "" "" "" "" "" "SKIP the injected failure left no fixture"
+		results_row "$CSV" "$sc" the_same_sets_are_reclaimed_once_the_replica_is_complete SKIP "" "" "" "" "" "SKIP the injected failure left no fixture"
 	else
-		# The sync below is EXPECTED to run: what is tested is that the sweep
-		# inside it stood down, not that the run was refused.
-		#
-		# Which is why the fixture is rebuilt here instead of inherited from
-		# the killed fault above. That fault proved what it can -- it armed
-		# replica_incomplete and left an aside set, the shape stage 16 asserts
-		# in detail -- but it also left the replica unusable for this check,
-		# and no combination of flags fixes that. A plain sync after a
-		# fault-injected -reinit meets two gates, both of them gates a -reinit
-		# itself skips, which is why nothing else in this stage meets either:
-		#
-		#   1. the out-of-band-write guard. The fault wrote into the base and
-		#      recorded no stamp, so the replica's mtime leads the last sync
-		#      time -- seen as "an mtime 2s newer than the last sync
-		#      timestamp" (2026-10-06). -timestamp-tolerance-sec gets past it,
-		#      at the price of suppressing a finding that is TRUE.
-		#   2. the checkpoint-chain check, which nothing gets past: the fault
-		#      dies AFTER creating its checkpoint, so the source's chain was
-		#      dropped and restarted while the target still records the
-		#      previous one, and checkpointChainConsistent refuses. Its
-		#      documented remedy is a -reinit -- which this check cannot use,
-		#      because a -reinit arms replica_incomplete itself and would pass
-		#      even if the marker were ignored entirely.
-		#
-		# Both assertions below were therefore passing on nothing: the run was
-		# refused before the sweep ran, so "nothing was reclaimed" held because
-		# nothing could have been, and the refusal line was missing because the
-		# code that prints it was never reached.
-		#
-		# Healing first and arming the marker BY HAND is faithful rather than a
-		# shortcut: leftoversToReclaim keys on nothing more than a non-empty
-		# replica_incomplete, so a hand-written value drives exactly the
-		# decision the engine's own value would.
-		bench_sync "$sc" refusal-fixture -reinit
-		local saved_meta=""
-		if bench_sync_ok; then
-			n="$(aside_count)"
-			restamp_asides "$old_stamp"
-			saved_meta="$(vmsync_meta_set_field "$TARGET_URI" "$TARGET_DOMAIN" replica_incomplete bench-leftovers-fixture)" || saved_meta=""
-		fi
-	fi
-	if [ -n "${saved_meta:-}" ] && [ "${n:-0}" -ge 1 ]; then
-		bench_sync "$sc" refused "-reclaim-leftovers-after=24h"
+		# Age the set the dead rebuild left, and remember its exact paths.
+		# Restamping invalidates the aside=<stamp> carried inside the marker,
+		# so nothing below may read that correspondence -- stage 16 is where
+		# it is asserted, before any restamp.
+		restamp_asides "$old_stamp"
+		local p aged=()
+		for p in "${replicas[@]}"; do aged+=("${p}.vmsync-replaced-${old_stamp}"); done
+
+		bench_sync "$sc" refused -reinit "-reclaim-leftovers-after=24h"
 		local rc_refused="${RUN_RC:-0}" log_refused="$RUN_LOG"
-		if [ "$(aside_count)" = "$n" ]; then
+
+		# (1) IDENTITY, never arithmetic. This -reinit sets a fresh set aside
+		# of its own, so a count is satisfied by that set standing in for the
+		# aged one a marker-ignoring sweep had just deleted: D before, D
+		# after. The old check compared counts and would have PASSED exactly
+		# the mutant it existed to catch.
+		local missing=""
+		for p in "${aged[@]}"; do
+			if ! ssh_host_cmd "$TARGET_HOST" "test -e '$p'" >/dev/null 2>&1; then
+				missing="${missing}${missing:+ }$p"
+			fi
+		done
+		if [ -z "$missing" ]; then
 			fo_check "$sc" "nothing is reclaimed while the replica is marked incomplete" 0
 		else
-			fo_check "$sc" "nothing is reclaimed while the replica is marked incomplete" 1 "$(aside_count) of $n aside files survived; these ARE the complete replica while replica_incomplete is set, so the sweep has just deleted the recovery it is documented to leave alone"
+			fo_check "$sc" "nothing is reclaimed while the replica is marked incomplete" 1 "gone: $missing -- these ARE the complete replica while replica_incomplete is set, so the sweep has just deleted the recovery it is documented to leave alone. See $log_refused"
 		fi
-		# And the refusal must not be an error: a sweep standing down is a
-		# warning on a run whose job is to repair the replica.
+
+		# (2) STOOD DOWN, as against never swept. Only the sweep prints this,
+		# and only after it found something, so the line proves both that it
+		# ran and that it saw the sets. This is the check that caught the
+		# unreachable fixture, and it stays for that reason.
 		if grep -q "REFUSING to reclaim displaced sets" "$log_refused" 2>/dev/null; then
-			fo_check "$sc" "the refusal does not fail the sync" "$rc_refused" "the run that repaired the replica exited $rc_refused; the sweep standing down must be a warning, not a failure"
+			fo_check "$sc" "the sweep said it was standing down" 0
 		else
-			fo_check "$sc" "the refusal does not fail the sync" 1 "no refusal line in $log_refused, so it cannot be told from a sweep that simply found nothing"
+			fo_check "$sc" "the sweep said it was standing down" 1 "no refusal line in $log_refused, so (1) above cannot be told from a sweep that never ran or that found nothing$(bench_sync_hint)"
 		fi
-		# Put the metadata back verbatim before anything else reads it: the
-		# marker is a fixture, and a replica left marked incomplete refuses
-		# every promotion for the rest of the run.
-		vmsync_meta_restore "$TARGET_URI" "$TARGET_DOMAIN" "$saved_meta"
-	elif [ "${n:-0}" -ge 1 ]; then
-		# The aside set exists but the marker could not be armed, so the sweep
-		# would have nothing to stand down for and both assertions would be
-		# measuring an ordinary reclaim. Skipped rather than reported.
-		log "   SKIP: could not arm replica_incomplete by hand, so there is no refusal to observe"
-		results_row "$CSV" "$sc" nothing_is_reclaimed_while_the_replica_is_marked_incomplete SKIP "" "" "" "" "" "SKIP could not arm replica_incomplete"
-		results_row "$CSV" "$sc" the_refusal_does_not_fail_the_sync SKIP "" "" "" "" "" "SKIP could not arm replica_incomplete"
+
+		# (3) and it was a WARNING. Separate from (2) on purpose: one label
+		# cannot report both "it did not stand down" and "standing down killed
+		# the run", and the old check printed the second label for the first
+		# finding.
+		fo_check "$sc" "the stand-down does not fail the sync" "$rc_refused" \
+			"the run that repaired the replica exited $rc_refused; a sweep standing down must be a warning, not a failure. See $log_refused"
+
+		# (4) THE CONTROL, and what keeps (1) from being a test of nothing:
+		# the same files, the same duration, and the marker now cleared by the
+		# repairing run above. An INCREMENTAL deliberately -- both arming
+		# sites precede the sweep's read of the marker, so a full copy reads
+		# no marker of its own but also never has one to clear.
+		if [ "$rc_refused" = 0 ]; then
+			bench_sync "$sc" reclaim-after-repair "-reclaim-leftovers-after=24h"
+			local still=""
+			for p in "${aged[@]}"; do
+				if ssh_host_cmd "$TARGET_HOST" "test -e '$p'" >/dev/null 2>&1; then
+					still="${still}${still:+ }$p"
+				fi
+			done
+			if [ -z "$still" ]; then
+				fo_check "$sc" "the same sets are reclaimed once the replica is complete" 0
+			else
+				fo_check "$sc" "the same sets are reclaimed once the replica is complete" 1 "still present after the replica was repaired: $still -- so (1) passing says nothing about the marker, since these files survive a sweep that ought to take them. See $RUN_LOG"
+			fi
+		else
+			log "   SKIP: the repairing run exited $rc_refused, so the control cannot tell a marker refusal from files this sweep never takes"
+			results_row "$CSV" "$sc" the_same_sets_are_reclaimed_once_the_replica_is_complete SKIP "" "" "" "" "" "SKIP the repairing run exited $rc_refused"
+		fi
 	fi
 
 	# Leave the replica complete and clean, whatever happened above: the next
