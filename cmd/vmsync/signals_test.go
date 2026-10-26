@@ -18,6 +18,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -178,7 +179,7 @@ func TestMainIgnoresSIGPIPEBeforeItCanLog(t *testing.T) {
 		if len(call.Args) != 1 {
 			t.Fatalf("signal.Ignore takes %d arguments, want exactly SIGPIPE", len(call.Args))
 		}
-		if got := exprText(fset, call.Args[0]); !strings.Contains(got, "SIGPIPE") {
+		if got := exprText(call.Args[0]); !strings.Contains(got, "SIGPIPE") {
 			t.Errorf("main() ignores %s, want syscall.SIGPIPE", got)
 		}
 		return
@@ -187,14 +188,25 @@ func TestMainIgnoresSIGPIPEBeforeItCanLog(t *testing.T) {
 }
 
 // exprText renders an expression back to source, for error messages.
-func exprText(fset *token.FileSet, e ast.Expr) string {
-	sel, ok := e.(*ast.SelectorExpr)
-	if !ok {
-		return "an unrecognised expression"
+//
+// Only the shapes these tests plausibly find are spelled out; anything else
+// falls back to its node type, which is still enough for a message to say
+// what it is not. Shared with reclaimwiring_test.go, which needs an Ident and
+// an index expression told apart -- "an unrecognised expression" for both
+// would hide which mutation had been made.
+func exprText(e ast.Expr) string {
+	switch n := e.(type) {
+	case *ast.Ident:
+		return n.Name
+	case *ast.SelectorExpr:
+		return exprText(n.X) + "." + n.Sel.Name
+	case *ast.IndexExpr:
+		return exprText(n.X) + "[" + exprText(n.Index) + "]"
+	case *ast.CallExpr:
+		return exprText(n.Fun) + "(...)"
+	case *ast.BasicLit:
+		return n.Value
+	default:
+		return fmt.Sprintf("an unrecognised expression (%T)", e)
 	}
-	pkg, ok := sel.X.(*ast.Ident)
-	if !ok {
-		return sel.Sel.Name
-	}
-	return pkg.Name + "." + sel.Sel.Name
 }

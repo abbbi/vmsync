@@ -268,13 +268,21 @@ func sweepDisplacedSets(ctx context.Context, cfg syncConfig, runner remoteRunner
 	// The interlock's input is READ BY THE CALLER, on the line before this is
 	// called, and passed in with whatever error that read produced.
 	//
-	// Still the state as of the moment of deciding, which is why the read sits
-	// immediately before the call rather than anywhere earlier in the run. It
-	// is a parameter because the read is the only thing in this function that
-	// needs a libvirt connection, and keeping it here made everything past
-	// this point -- including the loop that runs rm -rf -- unreachable to any
-	// test: a nil Manager panics inside ReadDomainMetadataFields rather than
-	// returning the error the branch below is written to absorb.
+	// Taken at the TOP of the run lock, before the caller arms the field for
+	// its own copy. That is the whole point of it being a parameter: read
+	// beside this call it would be the value the same run had just written on
+	// every rebuild, and the refusal below would stand the sweep down on the
+	// one run that both creates aside sets and writes full-size bases. What
+	// this function is asking is whether a PREVIOUS copy left the replica
+	// unusable -- the state the field's own doc describes -- so the answer has
+	// to predate this run's arm.
+	//
+	// It is a parameter for a second reason: the read is the only thing in
+	// here that needs a libvirt connection, and keeping it inside made
+	// everything past this point -- including the loop that runs rm -rf --
+	// unreachable to any test, because a nil Manager panics inside
+	// ReadDomainMetadataFields rather than returning the error the branch
+	// below is written to absorb.
 	//
 	// Fails CLOSED. An unreadable marker might be a set marker, and the cost of
 	// being wrong is asymmetric to the point of not being a judgement call: keep

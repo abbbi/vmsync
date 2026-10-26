@@ -141,6 +141,7 @@ func (s *orderedStep) note(fset *token.FileSet, pos token.Pos, how string) {
 // runSteps are the landmarks whose relative order is the mechanism.
 type runSteps struct {
 	intent      orderedStep
+	markerRead  orderedStep
 	armReinit   orderedStep
 	armFullSync orderedStep
 	sweep       orderedStep
@@ -149,7 +150,7 @@ type runSteps struct {
 }
 
 func (s *runSteps) all() []*orderedStep {
-	return []*orderedStep{&s.intent, &s.armReinit, &s.armFullSync, &s.sweep, &s.displace, &s.createBase}
+	return []*orderedStep{&s.intent, &s.markerRead, &s.armReinit, &s.armFullSync, &s.sweep, &s.displace, &s.createBase}
 }
 
 // findRunSteps walks run()'s body and reports where each landmark sits.
@@ -179,6 +180,7 @@ func findRunSteps(path string) (runSteps, error) {
 	}
 
 	steps.intent.what = "the sync intent reaching the target"
+	steps.markerRead.what = "reading replica_incomplete for the displaced-set sweep"
 	steps.armReinit.what = "arming replica_incomplete for the reinit path"
 	steps.armFullSync.what = "arming replica_incomplete for the non-reinit full sync"
 	steps.sweep.what = "the restore-point sweep"
@@ -191,6 +193,13 @@ func findRunSteps(path string) (runSteps, error) {
 	steps.intent.latest = true
 	steps.armReinit.latest = true
 	steps.armFullSync.latest = true
+	// Judged on its LATEST occurrence for a reason specific to this landmark:
+	// the defect being guarded against is a SECOND read of the field placed
+	// down beside the sweep, which is where this read used to live. Keeping
+	// the earliest would let the correct early read vouch for a late one added
+	// beside the sweep, and the late one is the value the sweep would then
+	// decide on -- this run's own arm, which is the whole defect.
+	steps.markerRead.latest = true
 
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch node := n.(type) {
@@ -207,6 +216,8 @@ func findRunSteps(path string) (runSteps, error) {
 				}
 			case isFuncCallNamed(node, "sweepRestorePointsForReinit"):
 				steps.sweep.note(fset, node.Pos(), "a call to sweepRestorePointsForReinit")
+			case isMethodCallNamed(node, "ReadDomainMetadataFields") && hasSelectorArgNamed(node, "MetadataFieldReplicaIncomplete"):
+				steps.markerRead.note(fset, node.Pos(), "ReadDomainMetadataFields(..., MetadataFieldReplicaIncomplete)")
 			}
 		case *ast.Ident:
 			// The suffix the good disks are renamed to. Named as well as the
@@ -320,6 +331,23 @@ func TestRunArmsTheReplicaBeforeItDisplacesAnything(t *testing.T) {
 
 	mustComeBefore(t, steps.armFullSync, steps.createBase,
 		"A full sync with no checkpoint parent writes base images directly, with no overlay to throw away, while the domain keeps the metadata of the replica it is overwriting. The qemu-img create is the first byte of that. Arming after it means every earlier failure leaves a half-written base behind a clean bill of health.")
+
+	// THE OTHER DIRECTION, and the only pair here where the arming must come
+	// second.
+	//
+	// sweepDisplacedSets asks whether a PREVIOUS full copy left the replica
+	// unusable, because where one did, the aside files are the only complete
+	// copy and must not be reclaimed. Read after this run's own arming, the
+	// answer was always yes on every rebuild -- so the one run that creates
+	// aside sets and writes full-size bases was also the only run that could
+	// never reclaim an old one, which is the ENOSPC the sweep sits before the
+	// copy to prevent. Both armings, because either one alone is enough to
+	// poison the answer.
+	mustComeBefore(t, steps.markerRead, steps.armReinit,
+		"The marker read feeds the displaced-set sweep, and the field means a PREVIOUS copy did not finish. Taken after the reinit path arms it, the sweep reads the value this run just wrote and stands down on every rebuild -- so the run that renames a full-size set aside is the one run that can never reclaim an older one.")
+
+	mustComeBefore(t, steps.markerRead, steps.armFullSync,
+		"Same for the parentless path, which arms the same field without renaming anything. A sweep deciding on this run's own arm reclaims nothing on any full copy, and a full copy is where the space is needed.")
 
 	// The non-reinit path deserves the same guard on the journal as the
 	// reinit path gets above: it displaces nothing by renaming, so the arming

@@ -2316,29 +2316,22 @@ func armReplicaIncomplete(tgtMgr *libvirtsync.Manager, cfg syncConfig, verb, asi
 		// being replaced.
 		return nil
 	}
-	// An existing record that names an aside stamp is never replaced by one
-	// that does not, and that is a data-recovery rule rather than tidiness:
-	// the stamp is the only thing on this host that says where the last
-	// COMPLETE copy went. failover.KeepExistingReplicaIncomplete holds the
-	// rule and the whole argument for it, kept there because it is a decision
-	// about evidence and this file cannot be compiled without libvirt.
+	// An existing record that names an aside stamp is never replaced, and that
+	// is a data-recovery rule rather than tidiness: the stamp is the only
+	// thing on this host that says where the last COMPLETE copy went.
+	// failover.KeepExistingReplicaIncomplete holds the rule and the whole
+	// argument for it, kept there because it is a decision about evidence and
+	// this file cannot be compiled without libvirt.
 	//
-	// Read first, every time, and let the helper decide -- rather than
-	// skipping the read when this run has a stamp of its own.
-	//
-	// Skipping would be one libvirt round trip cheaper per rebuild and would
-	// reach the same answer, but it would leave half of
-	// KeepExistingReplicaIncomplete's contract unreachable from production:
-	// the branch that says "the incoming record names files of its own, so
-	// replacing loses nothing" would be exercised only by its unit test. A
-	// rule that is tested where it is not used is a rule that can drift from
-	// its caller without anything failing, which is the shape of defect this
-	// whole field exists to answer.
+	// The stamp this run is about to arm does not enter the decision, and the
+	// reason is the sequence that made the rule wrong before: a rebuild
+	// following an interrupted one sets aside the HALF-WRITTEN disks, so
+	// preferring its own fresher stamp aims the pointer at garbage.
 	existing, readErr := libvirtsync.ReadDomainMetadataField(tgtMgr, cfg.TargetDomain, libvirtsync.MetadataFieldReplicaIncomplete)
 	if readErr != nil {
 		return fmt.Errorf("read the existing interrupted-copy record on %s before replacing it: %w", cfg.TargetDomain, readErr)
 	}
-	if failover.KeepExistingReplicaIncomplete(existing, asideStamp) {
+	if failover.KeepExistingReplicaIncomplete(existing) {
 		trace.Warning("this replica already carries an interrupted-copy record naming the disks a previous rebuild set aside; keeping that record rather than replacing it, because it is the only thing that says where the last complete copy went",
 			"vm", cfg.TargetDomain, libvirtsync.MetadataFieldReplicaIncomplete, existing)
 		return nil
@@ -4525,6 +4518,29 @@ func run(cfg syncConfig) (runErr error) {
 		return fmt.Errorf("target %s on %s: %w", cfg.TargetDomain, util.HostFromURIOrLocal(cfg.TargetURI), lockErr)
 	}
 	defer targetLock.Close()
+
+	// The displaced-set sweep's input, read HERE and not beside the sweep
+	// itself, because the field means "a PREVIOUS full copy did not finish"
+	// and this run arms it for its own copy further down -- the -reinit path
+	// and the parentless one both call armReplicaIncomplete before the sweep
+	// runs. Read beside the sweep, every rebuild saw the value it had just
+	// written and stood the sweep down, so the one run that creates aside sets
+	// and writes full-size bases was also the only run that could never
+	// reclaim an old one. That is the ENOSPC sweepDisplacedSets sits early to
+	// prevent.
+	//
+	// Here is also before -force-clean undefines the target domain, which the
+	// read needs: taken afterwards it fails to look the domain up and the
+	// sweep refuses with "the marker could not be read, and while it might be
+	// set" -- against a domain this same run removed, so it cannot be.
+	//
+	// Inside the target-side run lock either way, which is the half of
+	// sweepDisplacedSets' contract that matters for what it may delete.
+	//
+	// The error travels with the value: the sweep fails closed on it.
+	incompleteFields, incompleteErr := libvirtsync.ReadDomainMetadataFields(tgtMgr, cfg.TargetDomain, libvirtsync.MetadataFieldReplicaIncomplete)
+	replicaIncompleteAtStart := incompleteFields[libvirtsync.MetadataFieldReplicaIncomplete]
+
 	// Set by the lock gate before the commit, and read again before the define.
 	var commitErrFromLock error
 	if targetLock.Leased() {
@@ -7739,14 +7755,9 @@ func run(cfg syncConfig) (runErr error) {
 	// anybody keeps restore points. This is also deliberately BEFORE the copy
 	// below -- the harm is an ENOSPC on the DR host, and space reclaimed after
 	// the copy that ran out of it is space reclaimed too late.
-	// Read here, immediately before the sweep, because it is the reason the
-	// sweep may delete nothing and so has to be the state as of the moment of
-	// deciding -- and passed in rather than read inside, because it is the one
-	// thing in there that needs a libvirt connection and it made the removal
-	// loop unreachable to any test. The error travels with it: the sweep fails
-	// closed on it.
-	incompleteFields, incompleteErr := libvirtsync.ReadDomainMetadataFields(tgtMgr, cfg.TargetDomain, libvirtsync.MetadataFieldReplicaIncomplete)
-	displaced = sweepDisplacedSets(ctx, cfg, targetSSHClient, incompleteFields[libvirtsync.MetadataFieldReplicaIncomplete], incompleteErr, targetDiskPaths, time.Now())
+	// The marker was read at the top of the run lock, deliberately: see there.
+	// It is a previous copy's unfinished state, never this run's own arm.
+	displaced = sweepDisplacedSets(ctx, cfg, targetSSHClient, replicaIncompleteAtStart, incompleteErr, targetDiskPaths, time.Now())
 
 	rp, err := newRestorePoints(ctx, cfg.RetentionPolicy, targetSSHClient, targetDiskPaths, cfg.TargetDomain, checkpointName, checkpointAt)
 	if err != nil {

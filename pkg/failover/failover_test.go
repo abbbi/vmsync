@@ -616,31 +616,18 @@ func TestKeepExistingReplicaIncomplete(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		existing string
-		newStamp string
 		want     bool
 		why      string
 	}{
 		{
-			// THE case this exists for: an interrupted reinit's record, and
-			// the full sync that follows it, which renames nothing and so
-			// names nothing.
-			name:     "existing names files aside, incoming names none",
+			// THE case this exists for, and it does not depend on what runs
+			// next: a full sync that renames nothing, or another rebuild that
+			// sets the half-written disks aside under a stamp of its own.
+			// Neither may take the pointer off the last complete copy.
+			name:     "existing names files aside",
 			existing: "verb=reinit,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=" + asideStamp,
-			newStamp: "",
 			want:     true,
-			why:      "the incoming full-sync record carries no stamp, so overwriting loses the only pointer to the .vmsync-replaced files",
-		},
-		{
-			// A second reinit set a complete copy aside of its own, under a
-			// stamp of its own. Its record describes the disks that are on
-			// the host NOW; the older one describes files the second reinit
-			// has just replaced. Keeping the stale one would name the wrong
-			// set.
-			name:     "existing names files aside, incoming names its own",
-			existing: "verb=reinit,at=1758441600,host=hv-a,aside=" + asideStamp,
-			newStamp: "1758445200",
-			want:     false,
-			why:      "the incoming record names a displaced set of its own, so nothing is lost by replacing",
+			why:      "the stamp is the only pointer to the .vmsync-replaced files that hold the last complete copy",
 		},
 		{
 			// An interrupted full sync, then another. Neither record points
@@ -648,14 +635,12 @@ func TestKeepExistingReplicaIncomplete(t *testing.T) {
 			// but the action id and host of the run that is actually running.
 			name:     "existing names nothing aside",
 			existing: "verb=full-sync,at=1758441600,action=abc123,host=hv-a",
-			newStamp: "",
 			want:     false,
 			why:      "there is no stamp to protect, so the newer record wins on freshness",
 		},
 		{
 			name:     "no existing record at all",
 			existing: "",
-			newStamp: "",
 			want:     false,
 			why:      "an unarmed replica has nothing to keep",
 		},
@@ -669,7 +654,6 @@ func TestKeepExistingReplicaIncomplete(t *testing.T) {
 			// presence rather than on its contents.
 			name:     "unparsable existing value that still carries an aside",
 			existing: "written by something newer,aside=" + asideStamp + ",,,",
-			newStamp: "",
 			want:     true,
 			why:      "the stamp is readable even though the record is not, and it is still the only pointer to the displaced disks",
 		},
@@ -679,7 +663,6 @@ func TestKeepExistingReplicaIncomplete(t *testing.T) {
 			// field, so there is no stamp here, only the word.
 			name:     "unparsable existing value with no aside field",
 			existing: "aside from that it is not the grammar at all",
-			newStamp: "",
 			want:     false,
 			why:      "nothing here is a usable stamp, so there is nothing to protect",
 		},
@@ -689,17 +672,34 @@ func TestKeepExistingReplicaIncomplete(t *testing.T) {
 			// and nothing to keep the record for.
 			name:     "existing carries an empty aside",
 			existing: "verb=reinit,at=1758441600,host=hv-a,aside=",
-			newStamp: "",
 			want:     false,
 			why:      "an empty stamp names no files",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := KeepExistingReplicaIncomplete(tc.existing, tc.newStamp); got != tc.want {
-				t.Errorf("KeepExistingReplicaIncomplete(%q, %q) = %v, want %v: %s",
-					tc.existing, tc.newStamp, got, tc.want, tc.why)
+			if got := KeepExistingReplicaIncomplete(tc.existing); got != tc.want {
+				t.Errorf("KeepExistingReplicaIncomplete(%q) = %v, want %v: %s",
+					tc.existing, got, tc.want, tc.why)
 			}
 		})
+	}
+}
+
+// The sequence the rule used to get wrong, pinned on its own because the table
+// above cannot show it: the inputs are identical and only the story differs.
+//
+// A rebuild arming its own stamp used to win, on the reasoning that it "is
+// itself setting a complete copy aside". It is not. The first interrupted
+// rebuild moved the good disks to .vmsync-replaced-<s1> and left half-written
+// bases in their place; the second one sets THOSE aside, under <s2>. The files
+// <s1> names are untouched -- a different stamp, and `mv -n` -- so they are
+// still the only complete copy of the machine, and the single-valued field is
+// the only thing on the host that names them. Preferring <s2> aimed an
+// operator at a half-written machine and called it the recovery.
+func TestASecondInterruptedRebuildDoesNotRepointTheStamp(t *testing.T) {
+	const firstRebuild = "verb=reinit,at=1758441600,action=9f3c1a2b4d5e6f70,host=hv-a,aside=1758441600"
+	if !KeepExistingReplicaIncomplete(firstRebuild) {
+		t.Error("the record naming the first rebuild's aside set was replaced; the disks it names are the last complete copy, and nothing else on the host says where they went")
 	}
 }
 
@@ -710,7 +710,7 @@ func TestKeepExistingReplicaIncomplete(t *testing.T) {
 // which names exactly the same kind of displaced-aside files.
 func TestKeepExistingReplicaIncompleteIgnoresTheVerb(t *testing.T) {
 	for _, verb := range []string{"reinit", "force-clean", "restore", "rebase-from-cold"} {
-		if !KeepExistingReplicaIncomplete("verb="+verb+",at=1758441600,host=hv-a,aside=1758441600", "") {
+		if !KeepExistingReplicaIncomplete("verb=" + verb + ",at=1758441600,host=hv-a,aside=1758441600") {
 			t.Errorf("a record with verb=%q and an aside stamp was not kept; the stamp is what matters, whatever wrote it", verb)
 		}
 	}

@@ -419,7 +419,7 @@ func ParseReplicaIncomplete(raw string) ReplicaIncomplete {
 // engine is about to arm.
 //
 // The rule is one line and it is about RECOVERY, not tidiness: a record
-// naming an aside stamp is never replaced by one that names none.
+// naming an aside stamp is never replaced.
 //
 // What the stamp is. A -reinit renames the good disks to
 // .vmsync-replaced-<stamp> and arms verb=reinit carrying that number. The
@@ -444,17 +444,24 @@ func ParseReplicaIncomplete(raw string) ReplicaIncomplete {
 // would throw away recovery information over a vocabulary difference. Same
 // failing-closed instinct as the refusal itself, applied to the evidence.
 //
-// newAsideStamp non-empty means the incoming record names files of its own, so
-// nothing is lost by replacing: the caller is arming a rebuild that is itself
-// setting a complete copy aside.
+// An incoming record is not preferred even when it names files of its own.
+// That exception existed, on the reasoning that such a caller "is arming a
+// rebuild that is itself setting a complete copy aside" -- and that premise is
+// false in the one sequence where the answer matters. A second interrupted
+// rebuild sets aside the HALF-WRITTEN disks the first one left behind, so
+// replacing would aim the only pointer there is at garbage and discard the
+// stamp naming the last complete copy. The field is single-valued and the
+// stamp is nowhere else on the host, so there is no second place to look, and
+// an operator who follows it copies a half-written machine over the disks.
+//
+// A record naming NO stamp is still replaced by one that does: there was no
+// pointer to lose, and where an interrupted full copy wrote the bases directly
+// there is no complete copy anywhere to be misdirected away from.
 //
 // Pure and stdlib-only like the rest of this package, so the engine's call
 // site is a lookup and a branch, and the rule itself is exercised here on a
 // machine with no libvirt at all.
-func KeepExistingReplicaIncomplete(existingRaw, newAsideStamp string) bool {
-	if newAsideStamp != "" {
-		return false
-	}
+func KeepExistingReplicaIncomplete(existingRaw string) bool {
 	return ParseReplicaIncomplete(existingRaw).AsideStamp != ""
 }
 
