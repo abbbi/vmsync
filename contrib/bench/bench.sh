@@ -69,7 +69,7 @@ STAGES="matrix,verify,reinit,snapshot,journal,retention"
 # The "want ..." list this was first copied from had checksum third, for
 # historical reasons, which made `--stages all` run stage 13 before stage 3
 # while --help promised stage-number order.
-ALL_STAGES="matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,checksum,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease,redefine-probe,reinit-orphan,supervise,exclude"
+ALL_STAGES="matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,checksum,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease,redefine-probe,reinit-orphan,supervise,exclude,generation"
 
 # INTERRUPTED: vmsync catches SIGINT/SIGTERM itself (cleanup, then a plain
 # os.Exit(1) -- see cmd/vmsync/main.go's own signal handling), so a Ctrl+C
@@ -161,6 +161,7 @@ Options:
                             11  invert       23  reinit-orphan
                             12  wedge       24  supervise
                                                      25  exclude
+                                                     26  generation
                            Or one of two shorthands, used on their own rather
                            than inside a list:
                              all             every stage above, in that order
@@ -178,7 +179,7 @@ Options:
                            invert, wedge, checksum, verify-failure,
                            commit-barrier, interrupted-reinit, colocated,
                            leftovers, reinit-order, lock-lease,
-                           redefine-probe, reinit-orphan, supervise and exclude are
+                           redefine-probe, reinit-orphan, supervise, exclude and generation are
                            opt-in, see below. commit-barrier additionally
                            needs a source domain with two or more qcow2 disks,
                            and skips cleanly without one. colocated needs
@@ -482,16 +483,24 @@ a bitmap made during the running qemu's life need not be in the image at all.
 
 Stage 23 (reinit-orphan) checks that vmsync does what stage 22 proved it CAN do: it
 seeds a -reinit (a plain full sync refuses to overwrite a target disk that is already
-there), drops libvirt's record of the checkpoint it made -- so the orphan is on
-every disk vmsync manages, as a real one is -- and runs a plain -reinit over it. The
-planted name is vmsync-cpt-000001 deliberately -- the name the rebuild's own new chain
-takes -- so the orphan is a real collision rather than a bitmap sitting out of the way,
-and a clean exit is itself the proof it was cleared, since a surviving orphan is exactly
-what makes qemu refuse that checkpoint. It then checks the name is a real CHECKPOINT
-afterwards rather than an orphan again, and that the sync after it is incremental, since
-a rebuild that clears the orphan and leaves no usable chain has fixed nothing. Both
-routes are covered by one run: the sweep after the chain drop, and the self-healing
-retry inside CreateCheckpoint for when the sweep cannot see the bitmap. WHICH one did
+there), plants a checkpoint from a DEAD generation and drops libvirt's record of it,
+and runs a plain -reinit over the orphan that leaves behind. The planted name carries
+an obviously foreign generation token, vmsync-cpt-2510010000-dead-099001, which is the
+opposite of what it used to be: the plant was vmsync-cpt-000001, the name the rebuild's
+own chain would take, so the orphan collided and a clean exit was itself proof it had
+been cleared. Generation tokens remove that collision -- a rebuild mints its own
+generation and never asks for the orphan's name -- so the exit code can no longer see
+it, and the stage observes the two things directly instead. qemu must no longer hold
+the orphan's name afterwards, a question the collision version could not ask (a
+successful rebuild used to hold that very name legitimately, so the answer could not
+tell a surviving orphan from a healthy replica); and the rebuilt chain must carry a
+generation token distinct from the orphan's, or a build that reused the dead chain's
+token would pass everything else. It then checks that the sync after it is incremental,
+since a rebuild that clears the orphan and leaves no usable chain has fixed nothing.
+The route taken is recorded either way: the sweep after the chain drop, or the
+self-healing retry inside CreateCheckpoint for when the sweep cannot see the bitmap --
+the latter now reachable only within one generation, since a rebuilt chain cannot
+collide. WHICH one did
 the work is a finding about the host rather than a detail -- the retry means a fresh
 bitmap is not in the image yet, the sweep means it was -- so the stage prints a ROUTE
 line, quotes the line from vmsync's own log that decided it, and records an INFO row the
@@ -4859,7 +4868,7 @@ stage_fence_agent() {
 # counting as one of its own transport runs -- so a full --stages all run
 # reported Stage 1 as FAILED, with a count of "N of M vmsync runs exited
 # non-zero" that no transport combination in the matrix table accounts for.
-NON_MATRIX_SCENARIOS='^(verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$|colocated$|leftovers$|reinit-order$|lock-lease$|redefine-probe$|reinit-orphan$|supervise$|exclude$)'
+NON_MATRIX_SCENARIOS='^(generation$|verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$|colocated$|leftovers$|reinit-order$|lock-lease$|redefine-probe$|reinit-orphan$|supervise$|exclude$)'
 
 # stage_pattern STAGE -> the regex matching that stage's scenario column.
 # --- Stage 8: verify after a long incremental chain --------------------------
@@ -6304,13 +6313,31 @@ checksum_real_corruption_subtest() {
 	fi
 	local hit_overlay hit_base
 	hit_overlay="$(printf '%s' "$line" | sed -n 's/.*[[:space:]]image=\([^ ]*\).*/\1/p')"
-	hit_base="$(printf '%s' "$hit_overlay" | sed 's/_vmsync-cpt-[0-9]\{1,\}$//')"
+	# BOTH NAME SHAPES. The overlay is "<base>_<parent checkpoint>", and a
+	# checkpoint name carries a generation token now:
+	# _vmsync-cpt-2610211430-a1b2-000001, not _vmsync-cpt-000001. Matching only
+	# the digits made the substitution a no-op, hit_base equal to hit_overlay,
+	# and the guard below fire -- so this stage returned before its qemu-io
+	# read and recorded "PASS" without ever looking at a byte, which is the one
+	# assertion 13c exists for and the one 13b cannot make.
+	#
+	# The token alternative is spelled out rather than loosened to .* because a
+	# greedy wildcard here would eat a base whose own filename contains the
+	# prefix, and the base is what gets read for the corrupted pattern.
+	hit_base="$(printf '%s' "$hit_overlay" |
+		sed -e 's/_vmsync-cpt-[0-9]\{10\}-[0-9a-f]\{4\}-[0-9]\{1,\}$//' -e 's/_vmsync-cpt-[0-9]\{1,\}$//')"
 	if [ -z "$hit_overlay" ] || [ "$hit_base" = "$hit_overlay" ]; then
 		# An incremental run that injected into something not named like an
 		# overlay. Reporting it beats asserting against a path this did not
 		# parse -- a wrong path makes qemu-io fail, which reads as a pass.
-		warn "SKIP: the injection line names '${hit_overlay:-<unparsed>}', which is not an overlay of the form <base>_vmsync-cpt-NNNNNN, so the base to check cannot be derived. See $RUN_LOG"
-		results_row "$CSV" checksum real-corruption-result 0 "" "" "" "" "" "PASS real corruption detected (overlay path not parsable)"
+		# STOOD DOWN, not passed. This wrote rc 0 and a note beginning "PASS",
+		# so a run that never read a byte of the base was indistinguishable in
+		# the CSV from one that did -- and the byte-level read is the whole
+		# point of this sub-test. SKIP in the status column is what the rest of
+		# the harness uses for evidence it could not obtain (stage 22 does the
+		# same), and it is what keeps an unparsed path from counting as proof.
+		warn "SKIP: the injection line names '${hit_overlay:-<unparsed>}', which is not an overlay of the form <base>_<checkpoint>, so the base to check cannot be derived. The refusal itself was verified above; what could not be checked is that the bad bytes stayed out of the base. See $RUN_LOG"
+		results_row "$CSV" checksum real-corruption-result SKIP "" "" "" "" "" "SKIP overlay path not parsable, so the base was never read"
 		return 0
 	fi
 	log "   the injection landed on $hit_overlay; checking its base $hit_base"
@@ -10569,14 +10596,30 @@ stage_reinit_orphan() {
 	# It also means a stage that dies halfway leaves the pair in exactly the
 	# state this feature exists to fix, so the cleanup below adopts and deletes
 	# rather than printing a recipe.
-	local probe=vmsync-cpt-000001
+	# A DEAD GENERATION'S NAME, fixed and obviously not this chain's.
+	#
+	# This was vmsync-cpt-000001, chosen because the rebuild under test used to
+	# produce exactly that name, so the planted orphan was a genuine collision
+	# and a clean exit was itself proof it had been cleared. Checkpoint names
+	# carry a generation token now: the rebuild mints its own, so no plant can
+	# collide with it and that inference is gone. What the stage measures
+	# instead is that the rebuild CLEARS a dead generation's leftover and mints
+	# a generation of its own -- and both of those are observed directly, which
+	# the collision-based version could not do.
+	#
+	# The date half is deliberately in the past and the random half is a word,
+	# so a leftover is unmistakable in any state this stage dies in. The number
+	# is far outside the range a real chain counts into, for the same reason.
+	local probe=vmsync-cpt-2510010000-dead-099001
+	local held=2
 
 	if [ "$DRY_RUN" = yes ]; then
 		log "   (would plant an orphaned $probe on $SOURCE_DOMAIN and -reinit the pair)"
 		fo_check "$sc" "the planted bitmap is an orphan qemu holds" 0
 		fo_check "$sc" "-reinit completed" 0
 		fo_check "$sc" "the replica still matches the source" 0
-		fo_check "$sc" "the name is a real checkpoint afterwards, not an orphan" 0
+		fo_check "$sc" "the orphan is gone from qemu" 0
+		fo_check "$sc" "the rebuilt chain carries a new generation" 0
 		fo_check "$sc" "the sync after it is incremental" 0
 		return 0
 	fi
@@ -10628,7 +10671,7 @@ stage_reinit_orphan() {
 			log "   cleaned up: qemu accepts $probe again"
 			return 0
 		fi
-		warn "stage 23 LEFT $probe ON $SOURCE_DOMAIN and could not clear it. EVERY later sync for this pair will fail with \"Bitmap already exists\" until it is gone. Clear it with 'virsh -c $SOURCE_URI checkpoint-create $SOURCE_DOMAIN --xmlfile $PROBE_XML.adopt --redefine' then 'virsh -c $SOURCE_URI checkpoint-delete $SOURCE_DOMAIN --checkpointname $probe', or shut the domain down and 'qemu-img bitmap --remove -f qcow2 $active $probe'."
+		warn "stage 23 LEFT $probe ON $SOURCE_DOMAIN and could not clear it. Nothing will ever use it and nothing removes it on its own, so it is space in the qcow2 until somebody clears it -- and because a rebuilt chain mints a new generation, no later sync collides with it and nothing will fail over it. Clear it with 'virsh -c $SOURCE_URI checkpoint-create $SOURCE_DOMAIN --xmlfile $PROBE_XML.adopt --redefine' then 'virsh -c $SOURCE_URI checkpoint-delete $SOURCE_DOMAIN --checkpointname $probe', or shut the domain down and 'qemu-img bitmap --remove -f qcow2 $active $probe'."
 		results_row "$CSV" "$sc" cleanup 1 "" "" "" "" "" "FAIL left $probe behind"
 	}
 
@@ -10666,9 +10709,18 @@ stage_reinit_orphan() {
 		return 0
 	fi
 	log_state "after the seeding rebuild"
+
+	# PLANTED, not taken from the seed. The seed's own checkpoint belongs to a
+	# live chain; what this stage needs is a bitmap from a chain that is GONE,
+	# which is what an interrupted rebuild leaves and what -reinit has to
+	# clear. Creating it and then dropping libvirt's record of it is the
+	# documented orphan factory, and it is what stage 22 proved can be undone.
+	if ! cp_listed "$probe" && ! qemu_holds_probe; then
+		virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$PROBE_XML" >/dev/null 2>&1 || true
+	fi
 	if ! cp_listed "$probe"; then
-		warn "SKIP $sc: the seeding sync left no checkpoint called $probe, so an orphan of that name would not be the one the next chain collides with."
-		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP seeding sync left no checkpoint"
+		warn "SKIP $sc: could not plant a checkpoint called $probe on $SOURCE_DOMAIN, so there is nothing to orphan."
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP could not plant the orphan"
 		return 0
 	fi
 
@@ -10709,18 +10761,62 @@ stage_reinit_orphan() {
 	run_vmsync "$sc" reinit -reinit
 	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "-reinit completed" "$fo_ok" \
-		"exit $RUN_RC against a source carrying an orphaned $probe. That name is the one the new chain takes, so this is what a surviving orphan looks like -- the failure this feature exists to prevent. $(log_reason "$RUN_LOG")"
+		"exit $RUN_RC against a source carrying an orphaned $probe. $(log_reason "$RUN_LOG")"
 	if [ "$RUN_RC" != 0 ]; then
 		orphan_cleanup
 		return 0
 	fi
 
-	# And the end state is a CHECKPOINT of that name rather than a bitmap with
-	# nothing behind it: same name, opposite meaning, and only libvirt can tell
-	# them apart.
-	if cp_listed "$probe"; then fo_ok=0; else fo_ok=1; fi
-	fo_check "$sc" "the name is a real checkpoint afterwards, not an orphan" "$fo_ok" \
-		"-reinit exited 0 but libvirt lists no checkpoint called $probe, so whatever qemu holds under that name has nothing behind it -- an orphan again, and the next sync will refuse"
+	# THE ASSERTION CHANGED, and the old one would now fail by design.
+	#
+	# It used to read "the name is a real checkpoint afterwards", because the
+	# rebuilt chain restarted at vmsync-cpt-000001 -- the planted orphan's own
+	# name -- so a clean exit was itself proof the orphan had gone, and the end
+	# state was a checkpoint of that name. Checkpoint names carry a generation
+	# token now: the rebuild mints a new generation, so it never asks for the
+	# orphan's name and libvirt will never list it again.
+	#
+	# What the token gives back is better than the inference it removed. The
+	# stage could not previously ask "does qemu still hold that name", and said
+	# why: "after a successful rebuild qemu holds it legitimately, as the new
+	# chain's first checkpoint ... that reading cannot tell a surviving orphan
+	# from a healthy replica". It can now -- the healthy replica's names carry a
+	# different token -- so the orphan's disappearance is observed directly
+	# instead of inferred from an exit code.
+	#
+	# qemu_holds_probe and not the image: qemu-img reads the file, which lags
+	# what qemu holds, and this question is about what qemu holds right now.
+	# Its own contract is 0 = still held, 1 = gone, 2 = inconclusive.
+	qemu_holds_probe && held=0 || held=$?
+	case "$held" in
+	1)
+		fo_check "$sc" "the orphan is gone from qemu" 0
+		;;
+	0)
+		fo_check "$sc" "the orphan is gone from qemu" 1 \
+			"-reinit exited 0 but qemu still holds a bitmap called $probe, and libvirt lists no checkpoint for it -- so the rebuild left the orphan exactly where it was. It no longer blocks a sync, which is why the exit code cannot see it: the leak is now silent and only this check and the per-sync report can find it"
+		;;
+	*)
+		results_row "$CSV" "$sc" the_orphan_is_gone_from_qemu SKIP "" "" "" "" "" "SKIP existence probe inconclusive"
+		log "   SKIP: the existence probe could not answer whether qemu still holds $probe, so this run cannot say either way"
+		;;
+	esac
+
+	# AND THE REBUILD MINTED A GENERATION rather than reusing the one whose
+	# leftovers it just cleared. Without this, a build that carried the old
+	# token forward onto the new chain would pass everything above: the orphan
+	# would be cleared, the run would exit 0, and the next incremental would
+	# build on a name indistinguishable from the dead generation's -- which is
+	# the whole defect the token exists to remove.
+	local new_tip new_token
+	new_tip="$(virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>/dev/null | grep '^vmsync-cpt-' | head -1 || true)"
+	new_token="$(printf '%s' "$new_tip" | sed -n 's/^vmsync-cpt-\([0-9]\{10\}-[0-9a-f]\{4\}\)-[0-9]\{1,\}$/\1/p')"
+	if [ -n "$new_token" ] && [ "$new_tip" != "$probe" ]; then
+		fo_check "$sc" "the rebuilt chain carries a new generation" 0
+	else
+		fo_check "$sc" "the rebuilt chain carries a new generation" 1 \
+			"after the rebuild the source's chain starts at '${new_tip:-<nothing listed>}', which carries no readable generation token distinct from the orphan's name ($probe). A rebuild that reuses a generation leaves the next incremental building on a name a dead chain also used"
+	fi
 
 	log_state "after the rebuild under test"
 
@@ -10794,6 +10890,206 @@ stage_reinit_orphan() {
 
 	orphan_cleanup
 	unset -f orphan_cleanup
+	return 0
+}
+
+stage_generation() {
+	log "=== Stage 26: a rebuilt chain is a new generation, and the old one's leftovers are reported ==="
+	local sc=generation
+	local fo_ok=0
+
+	# WHAT THIS STAGE IS FOR, and why stage 23 does not already cover it.
+	#
+	# Stage 23 proves a -reinit CLEARS a dead generation's orphan. These are
+	# the three things that happen when it is NOT cleared, which is the
+	# ordinary case on a running source: nothing collides any more, so nothing
+	# fails, and the only way anybody finds out is that every sync says so.
+	#
+	#   1. a chain's names carry a generation token at all;
+	#   2. an ordinary sync REPORTS a dead generation's bitmaps, naming the
+	#      generation and leaving them alone -- clearing is an explicit verb;
+	#   3. an incremental whose target records ANOTHER generation's checkpoint
+	#      is refused, which is the defect this whole design exists to close:
+	#      before the token both names were spelled vmsync-cpt-000001, the
+	#      chain check passed, and a delta landed on a half-written replica.
+	#
+	# Point 3 is checked by writing the stale name onto the target by hand.
+	# Reaching that state for real needs a full copy to die mid-flight and the
+	# chain to be rebuilt afterwards; the metadata it would leave is one field,
+	# and leftoverBitmapReport's own tests cover the wording. What cannot be
+	# faked is whether the ENGINE refuses on it, which is what this runs.
+
+	if [ "$DRY_RUN" = yes ]; then
+		log "   (would plant a dead generation's bitmap on $SOURCE_DOMAIN and sync over it)"
+		fo_check "$sc" "the chain carries a generation token" 0
+		fo_check "$sc" "an ordinary sync succeeds with a dead generation's bitmap present" 0
+		fo_check "$sc" "the dead generation is named in the report" 0
+		fo_check "$sc" "an ordinary sync does not clear it" 0
+		fo_check "$sc" "an incremental against another generation is refused" 0
+		return 0
+	fi
+
+	if [ -z "${SOURCE_HOST:-}" ] || [ -z "${TAMPER_DISK_DEV:-}" ]; then
+		warn "SKIP stage 26: needs SOURCE_HOST and TAMPER_DISK_DEV in $CONF -- it plants a bitmap in the source's own image."
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP SOURCE_HOST/TAMPER_DISK_DEV unset"
+		return 0
+	fi
+	if [ "$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN" 2>/dev/null || true)" != running ]; then
+		warn "SKIP stage 26: $SOURCE_DOMAIN is not running, and the case this stage is about is the one where the bitmap cannot be removed. Start it and re-run."
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP source not running"
+		return 0
+	fi
+
+	local active
+	active="$(disk_source_path "$SOURCE_URI" "$SOURCE_DOMAIN" "$TAMPER_DISK_DEV")" || true
+	if [ -z "$active" ]; then
+		warn "SKIP stage 26: could not resolve $SOURCE_DOMAIN's active path for dev='$TAMPER_DISK_DEV'."
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP source disk path unresolved"
+		return 0
+	fi
+
+	# A generation that is obviously not this chain's, and obviously not a
+	# real mint: a date in the past and a word where the random half goes, so
+	# anything this stage leaves behind is unmistakable. The number is far
+	# outside the range a chain counts into, so it cannot be confused with a
+	# live checkpoint even before the token is read.
+	local dead_token=2509010000-f00d
+	local probe="vmsync-cpt-${dead_token}-098001"
+	local stale="vmsync-cpt-${dead_token}-000001"
+
+	PROBE_ACTIVE="$active"
+	PROBE_NAME="$probe"
+	PROBE_XML="$RUN_DIR/${sc}.checkpoint.xml"
+	write_probe_fixture
+
+	stage_cleanup_generation() {
+		if cp_listed "$probe" || qemu_holds_probe; then
+			if adopt_and_delete && ! qemu_holds_probe; then
+				log "   cleanup: $probe is gone"
+				return 0
+			fi
+			warn "stage 26 LEFT $probe ON $SOURCE_DOMAIN. Nothing will use it and nothing removes it on its own, so it is space in the qcow2 until somebody clears it -- and because every chain mints its own generation, no later sync will collide with it or fail over it. Clear it with 'virsh -c $SOURCE_URI checkpoint-create $SOURCE_DOMAIN --xmlfile $PROBE_XML.adopt --redefine' then 'virsh -c $SOURCE_URI checkpoint-delete $SOURCE_DOMAIN --checkpointname $probe', or shut the domain down and 'qemu-img bitmap --remove -f qcow2 $active $probe'."
+			results_row "$CSV" "$sc" cleanup 1 "" "" "" "" "" "FAIL left $probe behind"
+		fi
+		return 0
+	}
+
+	# --- 26a. a live chain, and its names carry a generation ----------------
+	log_state "before seeding"
+	bench_sync "$sc" baseline
+	if ! bench_sync_ok; then
+		bench_sync_hint
+		warn "SKIP $sc: the seeding sync failed (exit ${RUN_RC:-0}), so there is no chain to read a generation from. $(log_reason "$RUN_LOG")"
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP seeding sync failed"
+		return 0
+	fi
+
+	local tip live_token
+	tip="$(virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>/dev/null | grep '^vmsync-cpt-' | head -1 || true)"
+	live_token="$(printf '%s' "$tip" | sed -n 's/^vmsync-cpt-\([0-9]\{10\}-[0-9a-f]\{4\}\)-[0-9]\{1,\}$/\1/p')"
+	if [ -n "$live_token" ]; then
+		fo_check "$sc" "the chain carries a generation token" 0
+	else
+		fo_check "$sc" "the chain carries a generation token" 1 \
+			"the source's chain tip is '${tip:-<nothing listed>}', which carries no generation token. Everything below reads that token to tell this chain from a dead one, and nothing downstream can tell two generations apart without it"
+		stage_cleanup_generation
+		return 0
+	fi
+	log "   the live chain is generation $live_token (tip $tip)"
+
+	# --- 26b. plant a dead generation's bitmap ------------------------------
+	#
+	# Created as a checkpoint and then stripped of its metadata: the documented
+	# orphan factory, and the one stage 22 proved can be undone again.
+	if ! cp_listed "$probe" && ! qemu_holds_probe; then
+		virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$PROBE_XML" >/dev/null 2>&1 || true
+	fi
+	if ! cp_listed "$probe"; then
+		warn "SKIP $sc: could not plant a checkpoint called $probe, so there is no dead generation to report."
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP could not plant the dead generation"
+		stage_cleanup_generation
+		return 0
+	fi
+	virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" --metadata >/dev/null 2>&1 || true
+	if cp_listed "$probe"; then
+		warn "SKIP $sc: the metadata-only delete of $probe did not take, so it is still a live checkpoint rather than an orphan."
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP could not orphan the plant"
+		stage_cleanup_generation
+		return 0
+	fi
+	if ! qemu_holds_probe; then
+		warn "SKIP $sc: after dropping its metadata, qemu no longer holds $probe either, so this host does not produce the leftover this stage is about. Stage 22 reports the same thing in more detail."
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP no leftover was produced"
+		stage_cleanup_generation
+		return 0
+	fi
+	log_state "with a dead generation's bitmap planted"
+
+	# --- 26c. an ordinary sync reports it, succeeds, and leaves it alone ----
+	#
+	# All three in one run, because they are one claim: the leak is now silent
+	# unless the report speaks, and the report is on the ordinary path.
+	bench_sync "$sc" report
+	local rc_report="${RUN_RC:-0}" log_report="$RUN_LOG"
+
+	if [ "$rc_report" = 0 ]; then
+		fo_check "$sc" "an ordinary sync succeeds with a dead generation's bitmap present" 0
+	else
+		fo_check "$sc" "an ordinary sync succeeds with a dead generation's bitmap present" 1 \
+			"exit $rc_report. A leftover from a dead generation cannot collide with the names this chain mints, so it must not stop a sync -- if this failed, something is still treating an orphan as an obstacle. $(log_reason "$log_report")"
+	fi
+
+	# The generation has to be NAMED. A count would say something is wrong and
+	# nothing about which chain it came from or how old it is, which is the
+	# whole difference between this report and the bare refusal it replaced.
+	if grep -q "$dead_token" "$log_report" 2>/dev/null &&
+		grep -q 'no libvirt checkpoint accounts for' "$log_report" 2>/dev/null; then
+		fo_check "$sc" "the dead generation is named in the report" 0
+	else
+		fo_check "$sc" "the dead generation is named in the report" 1 \
+			"the run did not name generation $dead_token as unaccounted for. Nothing else in vmsync mentions such a bitmap -- virsh checkpoint-list cannot see it and no sync fails over it -- so a report that omits it means the leak is invisible. See $log_report"
+	fi
+
+	# AND NOT CLEARED. Removing one needs the domain down or an adoption
+	# through libvirt, and an ordinary sync doing that unasked is the trade
+	# this design refuses to make.
+	qemu_holds_probe && fo_ok=0 || fo_ok=1
+	if [ "$fo_ok" = 0 ]; then
+		fo_check "$sc" "an ordinary sync does not clear it" 0
+	else
+		fo_check "$sc" "an ordinary sync does not clear it" 1 \
+			"qemu no longer holds $probe after an ordinary sync, so the sync cleared a bitmap nobody asked it to. Clearing is an explicit verb (-reinit, stage 23); a sync that does it unasked can also do it to a bitmap it misread"
+	fi
+
+	# --- 26d. an incremental against another generation is refused ----------
+	#
+	# THE DEFECT THIS WHOLE DESIGN CLOSES. The target records a checkpoint
+	# from a chain that no longer exists; before generation tokens both names
+	# were spelled vmsync-cpt-000001, so checkpointChainConsistent compared
+	# them equal and a delta landed on a replica no bitmap described.
+	local saved_meta=""
+	saved_meta="$(vmsync_meta_set_field "$TARGET_URI" "$TARGET_DOMAIN" last_checkpoint "$stale")" || saved_meta=""
+	if [ -z "$saved_meta" ]; then
+		log "   SKIP: could not write a foreign generation's checkpoint onto $TARGET_DOMAIN by hand, so the refusal cannot be observed"
+		results_row "$CSV" "$sc" an_incremental_against_another_generation_is_refused SKIP "" "" "" "" "" "SKIP could not set last_checkpoint"
+	else
+		bench_sync "$sc" stale-parent
+		local rc_stale="${RUN_RC:-0}" log_stale="$RUN_LOG"
+		# Restored before anything else reads it: a target left recording a
+		# checkpoint the source does not have refuses every later sync.
+		vmsync_meta_restore "$TARGET_URI" "$TARGET_DOMAIN" "$saved_meta"
+
+		if [ "$rc_stale" != 0 ] && grep -q 'generation' "$log_stale" 2>/dev/null &&
+			grep -q "$dead_token" "$log_stale" 2>/dev/null; then
+			fo_check "$sc" "an incremental against another generation is refused" 0
+		else
+			fo_check "$sc" "an incremental against another generation is refused" 1 \
+				"exit $rc_stale against a target recording $stale while the source's chain is generation $live_token. A run that proceeds here applies a delta to a replica that no bitmap on the source describes, and reports success -- and a run that refuses without naming the generations leaves an operator comparing two thirty-three-character names by eye. See $log_stale"
+		fi
+	fi
+
+	stage_cleanup_generation
+	unset -f stage_cleanup_generation
 	return 0
 }
 
@@ -11826,6 +12122,7 @@ stage_pattern() {
 	# Stage 23 plants a bitmap in the chain's own name space on purpose, so its
 	# cleanup row is a failure of the stage and belongs to its verdict.
 	reinit-orphan) printf '^(reinit-orphan|precondition|stood-down|cleanup)$' ;;
+	generation) printf '^(generation|precondition|stood-down|cleanup)$' ;;
 	supervise) printf '^(supervise|precondition)$' ;;
 	exclude) printf '^(exclude|precondition)$' ;;
 	*) printf '$^' ;; # matches nothing
@@ -11871,6 +12168,7 @@ stage_number() {
 	reinit-orphan) printf '23' ;;
 	supervise) printf '24' ;;
 	exclude) printf '25' ;;
+	generation) printf '26' ;;
 	*) printf '?' ;;
 	esac
 }
@@ -12527,6 +12825,16 @@ generate_report() {
                         section_no_rows_note supervise "opt in with \`--stages supervise\`; it replaces one target command with one that cannot finish, so a sync fails on purpose, and it waits a full reporting interval to catch a liveness line"
                 fi
                 echo
+                echo "## Stage 26: a rebuilt chain is a new generation, and the old one's leftovers are reported"
+                echo
+                if awk -F, 'NR>1 && $1=="generation" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="generation" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                else
+                        section_no_rows_note generation "opt in with \`--stages generation\`; it plants a dead generation's bitmap and checks that an ordinary sync reports it, leaves it alone, and refuses an incremental whose target records another generation. Needs SOURCE_HOST and TAMPER_DISK_DEV set"
+                fi
+                echo
                 echo "Full machine-readable data: \`results.csv\`. Per-run logs: \`logs/\`. Raw prometheus textfiles: \`prom/\`."
         } >"$report"
         # Only the report reads it, and a stale one left in the run directory
@@ -12602,6 +12910,7 @@ for s in "${stage_list[@]}"; do
         lock-lease) stage_lock_lease || stage_rc=$? ;;
         redefine-probe) stage_redefine_probe || stage_rc=$? ;;
         reinit-orphan) stage_reinit_orphan || stage_rc=$? ;;
+        generation) stage_generation || stage_rc=$? ;;
         supervise) stage_supervise || stage_rc=$? ;;
         exclude) stage_exclude || stage_rc=$? ;;
         *) die "unknown stage '$s' in --stages (want one of: $ALL_STAGES -- or the shorthands 'all' and 'all-but-matrix', which stand alone rather than inside a list)" ;;
