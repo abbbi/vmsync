@@ -1488,13 +1488,36 @@ func TestBuildCheckpointXML(t *testing.T) {
 		}
 	})
 
+	// THE IDENTITY THE STALE-BITMAP REPORT RESTS ON, which is why the name
+	// here is tokenised rather than bare.
+	//
+	// This line is what writes a name into the only place a qcow2 keeps one.
+	// orphanBitmaps subtracts the libvirt checkpoint names from the qcow2
+	// bitmap names by exact string equality -- checkpointNames' own comment
+	// says "a bitmap carries its checkpoint's name and nothing else" -- so the
+	// two sides are equal only because this attribute reproduces the name
+	// verbatim.
+	//
+	// With a bare name the assertion is satisfied by any implementation that
+	// is the identity on a tokenless string, INCLUDING one that shortens the
+	// name; 33 bytes in every bitmap directory invites exactly that. Such a
+	// build passes, and in the field the qcow2 holds the short form while
+	// libvirt holds the long one, so orphanBitmaps finds no match for the LIVE
+	// bitmap of the current tip and reports the baseline the next incremental
+	// diffs against as a dead generation's reclaimable leftover.
 	t.Run("every disk gets its own bitmap entry named after the checkpoint", func(t *testing.T) {
-		xmlStr := buildCheckpointXML("vmsync-cpt-000003", "", disks)
-		if !strings.Contains(xmlStr, `name="vda" checkpoint="bitmap" bitmap="vmsync-cpt-000003"`) {
-			t.Errorf("expected a vda bitmap entry, got: %s", xmlStr)
+		name := checkpointNameFor(testToken, 3)
+		xmlStr := buildCheckpointXML(name, "", disks)
+		for _, dev := range []string{"vda", "vdb"} {
+			want := `name="` + dev + `" checkpoint="bitmap" bitmap="` + name + `"`
+			if !strings.Contains(xmlStr, want) {
+				t.Errorf("expected %s, got: %s", want, xmlStr)
+			}
 		}
-		if !strings.Contains(xmlStr, `name="vdb" checkpoint="bitmap" bitmap="vmsync-cpt-000003"`) {
-			t.Errorf("expected a vdb bitmap entry, got: %s", xmlStr)
+		// Stated separately so a failure says which half broke: the bitmap
+		// attribute has to carry the token, not merely some form of the name.
+		if !strings.Contains(xmlStr, `bitmap="`+CheckpointPrefix+"-"+testToken+`-000003"`) {
+			t.Errorf("the bitmap attribute does not reproduce the generation token, so the qcow2 and libvirt would disagree about the live bitmap's name: %s", xmlStr)
 		}
 	})
 }
@@ -1764,16 +1787,36 @@ func TestBuildAdoptionXML(t *testing.T) {
 }
 
 func TestNextCheckpointName(t *testing.T) {
-	t.Run("empty existing produces the first name", func(t *testing.T) {
+	// THE MINTING SITE, and the only one. A shape rather than a literal,
+	// because the token is random and a time: there is nothing constant to
+	// compare against.
+	t.Run("an empty chain mints a generation and starts at one", func(t *testing.T) {
 		name, parent, err := NextCheckpointName(nil)
 		if err != nil {
 			t.Fatalf("NextCheckpointName() error = %v", err)
 		}
-		if name != "vmsync-cpt-000001" {
-			t.Errorf("name = %q, want vmsync-cpt-000001", name)
-		}
 		if parent != "" {
-			t.Errorf("parent = %q, want empty", parent)
+			t.Errorf("parent = %q, want empty: nothing precedes the first checkpoint of a chain", parent)
+		}
+		token, ok := GenerationToken(name)
+		if !ok {
+			t.Fatalf("the minted name %q carries no readable generation token, so nothing downstream can tell this chain from the one it replaced", name)
+		}
+		if want := CheckpointPrefix + "-" + token + "-000001"; name != want {
+			t.Errorf("name = %q, want %q: a new chain starts at one", name, want)
+		}
+
+		// DISTINCTNESS IS THE WHOLE PROPERTY, and it is the one thing a
+		// shape check cannot cover: a mint that returned a constant would
+		// satisfy every assertion above while leaving generation B's first
+		// checkpoint spelled exactly like generation A's, which is the
+		// defect the token exists to remove.
+		second, _, err := NextCheckpointName(nil)
+		if err != nil {
+			t.Fatalf("NextCheckpointName() second call: %v", err)
+		}
+		if second == name {
+			t.Errorf("two chains minted the same first name %q, so a stale last_checkpoint from the previous generation still matches the next one's parent and an incremental lands on it", name)
 		}
 	})
 
@@ -1781,40 +1824,113 @@ func TestNextCheckpointName(t *testing.T) {
 	// element of a slice. Two parentless checkpoints is not a chain of two --
 	// it is a fork, which is now refused -- so the links are set here, which
 	// is what libvirt actually returns for a chain vmsync built.
-	t.Run("increments from the end of the chain", func(t *testing.T) {
+	// THE REUSE RULE: the counter advances, the token does not.
+	t.Run("increments from the end of the chain and keeps the generation", func(t *testing.T) {
 		existing := []Checkpoint{
-			{Name: "vmsync-cpt-000001"},
-			{Name: "vmsync-cpt-000002", Parent: "vmsync-cpt-000001"},
+			{Name: checkpointNameFor(testToken, 1)},
+			{Name: checkpointNameFor(testToken, 2), Parent: checkpointNameFor(testToken, 1)},
 		}
 		name, parent, err := NextCheckpointName(existing)
 		if err != nil {
 			t.Fatalf("NextCheckpointName() error = %v", err)
 		}
-		if name != "vmsync-cpt-000003" {
-			t.Errorf("name = %q, want vmsync-cpt-000003", name)
+		if want := checkpointNameFor(testToken, 3); name != want {
+			t.Errorf("name = %q, want %q: within one chain only the counter moves", name, want)
 		}
-		if parent != "vmsync-cpt-000002" {
-			t.Errorf("parent = %q, want vmsync-cpt-000002", parent)
+		if parent != checkpointNameFor(testToken, 2) {
+			t.Errorf("parent = %q, want %q", parent, checkpointNameFor(testToken, 2))
 		}
 	})
 
 	t.Run("preserves the zero-padding width of the existing numeric suffix", func(t *testing.T) {
-		existing := []Checkpoint{{Name: "vmsync-cpt-000099"}}
+		existing := []Checkpoint{{Name: checkpointNameFor(testToken, 99)}}
 		name, _, err := NextCheckpointName(existing)
 		if err != nil {
 			t.Fatalf("NextCheckpointName() error = %v", err)
 		}
-		if name != "vmsync-cpt-000100" {
-			t.Errorf("name = %q, want vmsync-cpt-000100 (padding preserved)", name)
+		if want := checkpointNameFor(testToken, 100); name != want {
+			t.Errorf("name = %q, want %q (padding preserved)", name, want)
 		}
 	})
 
-	t.Run("a latest checkpoint name with no numeric suffix is a hard error", func(t *testing.T) {
-		existing := []Checkpoint{{Name: "some-other-checkpoint"}}
-		if _, _, err := NextCheckpointName(existing); err == nil {
-			t.Fatal("expected an error when the latest checkpoint name has no numeric suffix")
-		}
-	})
+	// THE REFUSALS. Each of these is a tip the chain cannot be extended from,
+	// and the table is the grammar read backwards: anything that is not
+	// prefix + token + counter stops the run.
+	//
+	// Every case asserts WHICH refusal fired, not merely that one did. The
+	// reason is a mutation that survived the first version of this table:
+	// dropping the grammar's trailing anchor lets
+	// `vmsync-cpt-2610211430-a1b2-000001-stray` parse as a token, after which
+	// the run is refused anyway -- by highestCheckpointNumber, for ending in
+	// "stray" rather than digits. Same outcome, different reason, and a test
+	// that reads only `err != nil` cannot tell them apart. Every case here
+	// expects the generation-token wording, because every one of these names
+	// is a name whose GENERATION cannot be read.
+	for _, tc := range []struct {
+		name string
+		tip  string
+		why  string
+	}{
+		{
+			name: "no numeric suffix at all",
+			tip:  "some-other-checkpoint",
+			why:  "nothing here is a chain position, so there is no next number",
+		},
+		{
+			name: "the shape this design replaced",
+			tip:  "vmsync-cpt-000007",
+			why:  "a chain with no generation token is one whose next name could repeat a previous generation's -- the estate is re-synced rather than migrated, so this is a refusal and not a legacy path",
+		},
+		{
+			name: "a token-shaped middle that is not a token",
+			tip:  "vmsync-cpt-foo-bar-000001",
+			why:  "three segments, but the middle is not a date and four hex: nothing in this tree mints it, so its presence means something else is writing vmsync-shaped checkpoints",
+		},
+		{
+			// THE ORDERING CASE. highestCheckpointNumber's `^(.*-)(\d+)$`
+			// reads 1234 as the chain position here and reports success, so
+			// consulted before the token it would hand back a confident wrong
+			// answer: vmsync-cpt-2610211430-1235, extending a chain whose
+			// generation nobody established.
+			name: "a counter missing behind an all-digit salt",
+			tip:  "vmsync-cpt-2610211430-1234",
+			why:  "the token refusal has to come BEFORE the number is read, or this parses as a chain at position 1234",
+		},
+		{
+			name: "an uppercase salt",
+			tip:  "vmsync-cpt-2610211430-A1B2-000001",
+			why:  "one spelling, so a name this tree cannot mint is refused rather than guessed at",
+		},
+		{
+			name: "a short date",
+			tip:  "vmsync-cpt-261021143-a1b2-000001",
+			why:  "nine digits is not YYMMDDHHMM, and a date that parses loosely is a date an operator reads wrongly",
+		},
+		{
+			// Anchored at both ends, so this is not a near-miss of a valid
+			// name -- it is a different name, and it becomes a path component
+			// (the restore-point tag and the incremental overlay both
+			// interpolate it).
+			name: "a valid name with something appended",
+			tip:  "vmsync-cpt-2610211430-a1b2-000001-stray",
+			why:  "a name that merely BEGINS with a readable one is not readable; accepting it would carry a token onto a chain whose tip vmsync did not mint",
+		},
+	} {
+		t.Run("refused: "+tc.name, func(t *testing.T) {
+			_, _, err := NextCheckpointName([]Checkpoint{{Name: tc.tip}})
+			if err == nil {
+				t.Fatalf("NextCheckpointName extended a chain whose tip is %q: %s", tc.tip, tc.why)
+			}
+			// The tip has to be NAMED. An operator reading this has to know
+			// which checkpoint to look at, and there may be several.
+			if !strings.Contains(err.Error(), tc.tip) {
+				t.Errorf("the refusal does not name the tip %q, so it says a chain is unreadable without saying which name made it so: %v", tc.tip, err)
+			}
+			if !strings.Contains(err.Error(), "no readable generation token") {
+				t.Errorf("the run was refused for some other reason than an unreadable generation token, so this case proves nothing about the grammar -- %s: %v", tc.why, err)
+			}
+		})
+	}
 }
 
 // TestCheckpointDeletionOrder covers the ordering DeleteAllManagedCheckpoints

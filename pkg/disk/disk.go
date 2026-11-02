@@ -248,9 +248,15 @@ func ResolveRootSource(chain []QemuImgInfo, source string) string {
 // checkpoint normally has qemu remove its bitmap, which only qemu can
 // do and only while the domain runs -- so an offline domain's checkpoints can
 // only be removed by dropping libvirt's metadata and then deleting these by
-// hand. Getting that pair out of step is what leaves an image that refuses
-// every future sync with "Bitmap already exists" while `virsh checkpoint-list`
-// shows nothing at all.
+// hand. Getting that pair out of step leaves a bitmap nothing accounts for:
+// invisible to `virsh checkpoint-list`, unusable by any incremental, and
+// removed by nothing on its own.
+//
+// It used to be louder than that -- the next chain restarted at the same name
+// and qemu refused every future sync with "Bitmap already exists" -- and a
+// generation token in the checkpoint name has removed that collision. So this
+// list is now the ONLY way such a bitmap is ever noticed, which is what the
+// per-sync report in cmd/vmsync reads it for.
 //
 // Reads the nested shape qemu-img actually emits -- format-specific.data
 // .bitmaps[].name -- defensively at every level, because this is

@@ -1777,7 +1777,26 @@ func planCheckpointRecovery(pending, lastAccepted string, existing []libvirtsync
 	// the chain advanced past a checkpoint the target never accepted --
 	// which this design is supposed to make impossible, so refuse rather
 	// than improvise.
-	if tip := existing[len(existing)-1]; tip.Name != pending {
+	//
+	// THE PARENT LINKS DECIDE WHICH IS NEWEST, not the slice order. This was
+	// existing[len(existing)-1], which asks ListManagedCheckpoints' sort --
+	// and that sort is by <creationTime>, a field libvirt does not validate
+	// and vmsync's own adoption path writes as time.Now(), with a
+	// lexicographic tie-break on the name. The same reasoning removed the
+	// positional tip from NextCheckpointName; this copy was left behind, in
+	// the one function whose non-empty return is fed straight to
+	// DeleteCheckpointIfExists. A sort that put the wrong entry last here
+	// deletes a checkpoint, and its bitmap with it.
+	tip, tipErr := libvirtsync.ChainTip(existing)
+	if tipErr != nil {
+		// A chain with two ends, or a cycle. Which checkpoint is newest has
+		// no answer, so whether `pending` is safe to delete has none either
+		// -- and the answer this function gives is deleted, not merely
+		// reported. Refusing hands the operator both problems at once, which
+		// is better than resolving one by guessing at the other.
+		return "", fmt.Errorf("checkpoint %s was recorded as pending on target %q, and the source's own chain cannot be resolved to a single newest checkpoint, so whether that pending one is still the tip has no answer: %w", pending, lastAccepted, tipErr)
+	}
+	if tip.Name != pending {
 		return "", fmt.Errorf("checkpoint %s was recorded as pending on target %q but is no longer the newest on the source (%s is) -- the chain advanced past a checkpoint the target never accepted, which vmsync does not do on its own. Inspect the source's checkpoints before syncing again; -force-clean plus a full resync is the blunt recovery",
 			pending, lastAccepted, tip.Name)
 	}
@@ -1828,6 +1847,79 @@ func checkpointChainConsistent(metadataEntryCheckpoint, parent string) bool {
 		return true
 	}
 	return metadataEntryCheckpoint == parent
+}
+
+// rewoundOverwriteRefusal decides whether a run the pending-checkpoint rewind
+// made parentless may copy base images over the disks already on the target,
+// and returns nil when it may.
+//
+// present is the first target disk found to exist, "" when none do.
+//
+// replica_incomplete is the whole of the decision, because it is the only
+// thing that says what those disks ARE:
+//
+//   - set: a previous full copy into them did not finish, so they are not a
+//     replica anybody can use and copying over them is the repair. The copy
+//     proceeds, and the caller re-arms the marker so an interruption of THIS
+//     copy is survivable too.
+//   - absent: the disks hold a replica that was complete as of some earlier
+//     checkpoint. Overwriting it is destructive and nothing asked for it,
+//     which is exactly what the full-sync preflight refuses -- so this
+//     refuses too, and names the verb that does ask.
+//
+// Pure, and separate from run(), for the same reason checkpointChainConsistent
+// is: run() needs two libvirt connections and an SSH client to enter, and this
+// is the decision that stands between a rewind and an overwritten replica.
+func rewoundOverwriteRefusal(domain, orphan, lastAccepted, replicaIncomplete, present string) error {
+	if strings.TrimSpace(replicaIncomplete) != "" {
+		return nil
+	}
+	if present == "" {
+		return nil
+	}
+	return fmt.Errorf("removing checkpoint %s left %s with no checkpoint chain, so this run would copy base images directly over the replica already on the target (%s), which is complete as of %s and which nothing has asked to replace. Re-run with -reinit: it displaces the current disks according to -replaced-disk-action and records what it did, so the copy is undoable",
+		orphan, domain, present, lastAccepted)
+}
+
+// checkpointChainMismatch says WHY a chain check failed, in the terms that
+// tell the two reachable causes apart.
+//
+// The bare form of this message gave two names and left the reader to spot
+// the difference, which for `vmsync-cpt-2610211430-a1b2-000007` against
+// `vmsync-cpt-2610221500-9f3c-000001` is thirty-three characters of
+// near-identical string. The two causes need different remedies:
+//
+//   - DIFFERENT GENERATIONS. The source's chain was rebuilt and the target
+//     still records a checkpoint from the chain before it. The target's disks
+//     describe a copy that no bitmap on the source can produce a delta
+//     against, so the only way forward is a full copy. This is the state
+//     CI-04 exists to make visible: before the generation token both names
+//     were spelled `vmsync-cpt-000001` and this check PASSED.
+//   - THE SAME GENERATION, OUT OF STEP. One chain, and the target's record is
+//     not the checkpoint this run means to build on. That is the older
+//     failure -- a run that advanced the source and never told the target --
+//     and planCheckpointRecovery is what normally repairs it.
+//
+// Pure, for the reason checkpointChainConsistent is: run() cannot be entered
+// from a test, and the message is what an operator acts on.
+func checkpointChainMismatch(targetDomain, recorded, parent string) error {
+	recordedGen, recordedOK := libvirtsync.GenerationToken(recorded)
+	parentGen, parentOK := libvirtsync.GenerationToken(parent)
+
+	switch {
+	case recordedOK && parentOK && recordedGen != parentGen:
+		return fmt.Errorf("refusing to sync an incremental into %s: its disks were last written by checkpoint %s, from generation %s, but this run would build on %s, from generation %s. The source's checkpoint chain has been rebuilt since that copy landed, so no bitmap on the source describes what changed since -- a delta would produce a replica consistent with no point in time. Repair it with a full copy (-reinit), or drop the source's chain so the next run is parentless",
+			targetDomain, recorded, recordedGen, parent, parentGen)
+	case recordedOK && parentOK:
+		return fmt.Errorf("refusing to sync an incremental into %s: its disks were last written by checkpoint %s and this run would build on %s, which is the same generation (%s) at a different position. A previous run advanced the source's chain without the target accepting it. Inspect the source's checkpoints before syncing again; -force-clean plus a full resync is the blunt recovery",
+			targetDomain, recorded, parent, recordedGen)
+	default:
+		// One of the two carries no readable generation, so there is nothing
+		// to compare and nothing to claim about why they differ. Said plainly
+		// rather than guessed at.
+		return fmt.Errorf("refusing to sync an incremental into %s: its disks were last written by checkpoint %s and this run would build on %s, and at least one of those names carries no readable generation, so which chain each belongs to cannot be established. Drop the source's chain to force a full copy",
+			targetDomain, recorded, parent)
+	}
 }
 
 // targetFileNewerThanSync reports whether a replica disk looks like it was
@@ -5107,11 +5199,30 @@ func run(cfg syncConfig) (runErr error) {
 		// A shut-down source needs none of this: dropCheckpointsOffline removes
 		// the bitmaps itself with qemu-img, orphaned or not, because it can.
 		//
-		// The refusal stays for what cannot be cleared, and it is still a strict
-		// improvement on qemu's own message, which names neither the file nor
-		// the remedy. Letting the sync proceed on an orphan instead -- by
-		// choosing a different checkpoint name, say -- would leave it to collide
-		// again later, which is how a one-off becomes permanent.
+		// WHAT CANNOT BE CLEARED IS NOW REPORTED, NOT REFUSED, and the reason
+		// this changed is written out because the code argued the other way
+		// and was right to at the time.
+		//
+		// It said: "Letting the sync proceed on an orphan instead -- by
+		// choosing a different checkpoint name, say -- would leave it to
+		// collide again later, which is how a one-off becomes permanent." That
+		// objection is correct and generation tokens do not answer it. A new
+		// chain now picks a name that cannot collide, so the orphan stops
+		// being an obstacle -- and an obstacle nobody trips over is exactly
+		// what becomes permanent.
+		//
+		// What answers it is the report, which runs on EVERY sync and names
+		// each dead generation and its age (attributeDeadBitmaps). The leak is
+		// visible without anything having to fail over it, which is the trade
+		// the refusal was standing in for. The two ship together: retiring
+		// this refusal without that report would be precisely the deferral the
+		// old comment warned about.
+		//
+		// A refusal here also cost something real. The bitmap it cannot clear
+		// has nothing to do with the rebuild being asked for, so -reinit on a
+		// source carrying one was refused for a reason that no longer applies
+		// -- fail-closed with nothing behind it, on the one verb an operator
+		// reaches for when a pair is already broken.
 		leftover, err := leftoverCheckpointBitmaps(ctx, sourceNeedsSSH, sourceSSHClient, qcowDisks)
 		switch {
 		case err != nil:
@@ -5128,16 +5239,14 @@ func run(cfg syncConfig) (runErr error) {
 			case activeErr != nil:
 				trace.Warning("could not tell whether the source is running, so its leftover checkpoint bitmaps were left alone",
 					"vm", cfg.SourceDomain, "error", activeErr)
-				if refusal := leftoverBitmapRefusal(cfg.SourceDomain, leftover); refusal != nil {
-					return refusal
-				}
+				reportLeftoverBitmaps(cfg.SourceDomain, leftover)
 			case !srcActive:
 				// The offline drop above already removes bitmaps with qemu-img,
 				// so anything still here survived that and is not something
-				// another attempt at the same thing will fix.
-				if refusal := leftoverBitmapRefusal(cfg.SourceDomain, leftover); refusal != nil {
-					return refusal
-				}
+				// another attempt at the same thing will fix. Said once, and
+				// the rebuild continues: the names it will mint cannot collide
+				// with these.
+				reportLeftoverBitmaps(cfg.SourceDomain, leftover)
 			default:
 				trace.Info("the source still carries checkpoint bitmaps that no checkpoint accounts for; clearing them",
 					"vm", cfg.SourceDomain, "bitmaps", countBitmaps(leftover))
@@ -5154,16 +5263,16 @@ func run(cfg syncConfig) (runErr error) {
 				}
 				trace.Info("cleared the source's orphaned checkpoint bitmaps", "vm", cfg.SourceDomain, "removed", cleared)
 
-				// Re-read rather than trust the removals. Everything after this
-				// assumes the source's bitmap namespace is empty, and the first
-				// thing that finds out otherwise is qemu refusing the sync's own
-				// checkpoint with the error this exists to prevent.
+				// Re-read rather than trust the removals. What survives a
+				// clearing that reported success is the interesting case: it
+				// is not something another attempt at the same thing fixes,
+				// and the removals said they worked.
 				after, afterErr := leftoverCheckpointBitmaps(ctx, sourceNeedsSSH, sourceSSHClient, qcowDisks)
 				if afterErr != nil {
-					trace.Warning("could not re-read the source's disks after clearing its orphaned bitmaps; if this sync fails with \"Bitmap already exists\", that is why",
+					trace.Warning("could not re-read the source's disks after clearing its orphaned bitmaps, so this run cannot say whether any survived",
 						"vm", cfg.SourceDomain, "error", afterErr)
-				} else if refusal := leftoverBitmapRefusal(cfg.SourceDomain, after); refusal != nil {
-					return refusal
+				} else {
+					reportLeftoverBitmaps(cfg.SourceDomain, after)
 				}
 			}
 		}
@@ -5281,6 +5390,30 @@ func run(cfg syncConfig) (runErr error) {
 	if err != nil {
 		return err
 	}
+
+	// EVERY SYNC, and that is the change: the enumeration used to run only
+	// around the chain-drop paths, which is where accumulation would not be
+	// noticed, because a pair that never reinits never looks. A dead
+	// generation's bitmaps cost space in the qcow2 for ever and nothing else
+	// in vmsync mentions them -- virsh checkpoint-list cannot see them, and
+	// before generation tokens there was nothing in a name to attribute them
+	// by either.
+	//
+	// Reported, never cleared. Removing one needs the domain down or an
+	// adoption through libvirt, and doing that unasked inside an ordinary sync
+	// is not a trade this makes; -reinit clears them as part of a rebuild it
+	// was told to do.
+	//
+	// NEVER FAILS THE RUN, for the reason the displaced-set sweep gives: a
+	// check that cannot be run is not evidence that anything is wrong, and
+	// this one reads a guest-writable image on a running source.
+	if bitmaps, bmErr := leftoverCheckpointBitmaps(ctx, sourceNeedsSSH, sourceSSHClient, qcowDisks); bmErr != nil {
+		trace.Warning("could not read the source's disks for dirty bitmaps, so this run cannot say whether a dead generation's bitmaps are accumulating there",
+			"vm", cfg.SourceDomain, "error", bmErr)
+	} else if report := attributeDeadBitmaps(orphanBitmaps(bitmaps, checkpointNames(existing)), time.Now()); report != "" {
+		trace.Warning(report, "vm", cfg.SourceDomain)
+	}
+
 	checkpointMu.Lock()
 	checkpointName, parent, err = libvirtsync.NextCheckpointName(existing)
 	checkpointMu.Unlock()
@@ -5582,6 +5715,63 @@ func run(cfg syncConfig) (runErr error) {
 			return fmt.Errorf("recompute checkpoint name after removing %s: %w", orphan, err)
 		}
 		trace.Info("checkpoint chain rewound to the last accepted checkpoint", "checkpoint", checkpointName, "parent", parent)
+
+		// THE REWIND CAN MAKE THIS RUN PARENTLESS, and both guarantees a
+		// parentless run rests on were settled far above, against the parent
+		// this rewind has just discarded.
+		//
+		// Deleting the pending checkpoint empties the chain whenever it was
+		// the only one, so NextCheckpointName above has just minted a new
+		// generation and returned no parent. From here this run writes base
+		// images DIRECTLY, with no overlay to commit -- which is both the
+		// case the preflight refuses without -reinit and the case
+		// armReplicaIncomplete arms for. Neither fired: both are guarded by
+		// `parent == ""`, and parent was still set when they were evaluated.
+		//
+		// Which of the two applies depends on what the replica already is,
+		// and replica_incomplete is the only thing that says:
+		//
+		//   - MARKED INCOMPLETE. A previous full copy into those disks did
+		//     not finish, so they are not a replica anybody can use and
+		//     copying over them is the repair. Proceed, re-arming so an
+		//     interruption of THIS copy is survivable too.
+		//   - NOT MARKED. The disks hold a replica that was complete as of
+		//     some earlier checkpoint. Overwriting it is destructive and
+		//     nobody asked for it, which is exactly what the preflight
+		//     refuses. Refuse, and name the verb that does ask.
+		//
+		// Checked before arming, deliberately: arming and then refusing
+		// would leave replica_incomplete on a target this run never touched,
+		// which refuses every later incremental until some full copy clears
+		// it -- worse than what it was protecting against.
+		if parent == "" && !cfg.Reinit {
+			// The scan is here and the DECISION is not: which replica may be
+			// overwritten is the part worth testing, and run() cannot be
+			// entered from a test. Same split as checkpointChainConsistent
+			// and incompleteReplicaRefusal.
+			present := ""
+			for _, d := range qcowDisks {
+				p := util.SetTargetPath(cfg.TargetDiskPath, d.RootSource)
+				exists, exErr := util.RemotePathExists(ctx, targetSSHClient, p)
+				if exErr != nil {
+					// Same posture as the preflight above: this gates a
+					// destructive action, so an inconclusive answer fails the
+					// run rather than proceeding as if the path were absent.
+					return fmt.Errorf("removing checkpoint %s left %s with no checkpoint chain, so this run would become a full copy; checking whether target disk %s already exists: %w", orphan, cfg.SourceDomain, p, exErr)
+				}
+				if exists {
+					present = p
+					break
+				}
+			}
+			if err := rewoundOverwriteRefusal(cfg.SourceDomain, orphan, metadataEntryCheckpoint,
+				metadataEntryReplicaIncomplete, present); err != nil {
+				return err
+			}
+			if err := armReplicaIncomplete(tgtMgr, cfg, libvirtsync.ReplicaIncompleteVerbFullSync, ""); err != nil {
+				return fmt.Errorf("rewinding %s's chain left this run parentless, so it is a full copy: %w -- refusing to start, so nothing on the target has been written yet", cfg.SourceDomain, err)
+			}
+		}
 	}
 
 	if parent == "" {
@@ -5593,7 +5783,7 @@ func run(cfg syncConfig) (runErr error) {
 			return err
 		}
 		if !checkpointChainConsistent(metadataEntryCheckpoint, parent) {
-			return fmt.Errorf("checkpoint inconsistency detected: target VM definition lists [%s] as parent checkpoint, but parent checkpoint defined is [%s]", metadataEntryCheckpoint, parent)
+			return checkpointChainMismatch(cfg.TargetDomain, metadataEntryCheckpoint, parent)
 		}
 		if metadataEntryCheckpoint != "" {
 			trace.Info("Successfully verified checkpoint chain")

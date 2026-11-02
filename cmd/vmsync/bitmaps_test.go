@@ -15,26 +15,31 @@ const (
 	testBitmap   = "vmsync-cpt-000001"
 )
 
-// No leftovers is the overwhelmingly common case and must not produce an error.
-func TestNoLeftoversIsNotARefusal(t *testing.T) {
-	if err := leftoverBitmapRefusal(testDomain, nil); err != nil {
+// No leftovers is the overwhelmingly common case and must say nothing at all.
+func TestNoLeftoversSaysNothing(t *testing.T) {
+	if err := leftoverBitmapReport(testDomain, nil); err != "" {
 		t.Fatalf("an empty result produced a refusal: %v", err)
 	}
-	if err := leftoverBitmapRefusal(testDomain, map[string][]string{}); err != nil {
+	if err := leftoverBitmapReport(testDomain, map[string][]string{}); err != "" {
 		t.Fatalf("an empty map produced a refusal: %v", err)
 	}
 }
 
 // The message is the whole feature. It replaces qemu's "Bitmap already exists:
-// vmsync-cpt-000001", which names a thing the operator cannot find, on a host
-// it does not identify, with no remedy. Everything asserted here is something
-// that message lacked.
-func TestRefusalCarriesEverythingNeededToFixIt(t *testing.T) {
-	err := leftoverBitmapRefusal(testDomain, map[string][]string{testDiskPath: {testBitmap}})
-	if err == nil {
-		t.Fatal("a leftover bitmap did not produce a refusal")
+// vmsync-cpt-000001", which named a thing the operator could not find, on a
+// host it did not identify, with no remedy. Everything asserted here is
+// something that message lacked.
+//
+// It is now a WARNING rather than a refusal: generation tokens mean the next
+// chain cannot collide with these bitmaps, so a rebuild is no longer blocked
+// by one. The message therefore has to carry the remedy AND say that nothing
+// is stopping -- a leak nobody trips over is the thing that becomes
+// permanent, and the report is what replaces tripping over it.
+func TestTheReportCarriesEverythingNeededToFixIt(t *testing.T) {
+	msg := leftoverBitmapReport(testDomain, map[string][]string{testDiskPath: {testBitmap}})
+	if msg == "" {
+		t.Fatal("a leftover bitmap produced no report")
 	}
-	msg := err.Error()
 
 	for _, want := range []struct{ what, s string }{
 		{"the domain", testDomain},
@@ -50,26 +55,37 @@ func TestRefusalCarriesEverythingNeededToFixIt(t *testing.T) {
 		// they do not need.
 		{"the no-downtime route", "--redefine"},
 		{"what that route requires", "creationTime"},
-		{"the qemu error this explains", "Bitmap already exists"},
 		{"why virsh shows nothing", "checkpoint-list"},
+		// THE PREMISE THAT CHANGED. This used to assert "Bitmap already
+		// exists", because the leftover stopped the next sync and the message
+		// existed to explain that failure. It no longer stops anything, so a
+		// message still promising that error would send an operator looking
+		// for a failure that cannot arrive -- and the cost of the leftover,
+		// which is now the whole point, would go unsaid.
+		{"that the rebuild is not blocked", "NOT blocked"},
+		{"what it costs instead", "space in the qcow2"},
 	} {
 		if !strings.Contains(msg, want.s) {
-			t.Errorf("the refusal does not mention %s (%q)", want.what, want.s)
+			t.Errorf("the report does not mention %s (%q)", want.what, want.s)
 		}
+	}
+
+	// And it must NOT promise the error that generation tokens removed.
+	if strings.Contains(msg, "Bitmap already exists") {
+		t.Error(`the report still names qemu's "Bitmap already exists", which a new chain's name can no longer provoke: an operator told to expect it waits for a failure that will not come`)
 	}
 }
 
 // Multiple disks and multiple bitmaps must each get their own removal command,
 // or an operator fixes one and hits the next on the following run.
 func TestEveryBitmapGetsItsOwnCommand(t *testing.T) {
-	err := leftoverBitmapRefusal(testDomain, map[string][]string{
+	msg := leftoverBitmapReport(testDomain, map[string][]string{
 		"/vm/a.qcow2": {"vmsync-cpt-000001", "vmsync-cpt-000002"},
 		"/vm/b.qcow2": {"vmsync-cpt-000001"},
 	})
-	if err == nil {
-		t.Fatal("no refusal")
+	if msg == "" {
+		t.Fatal("no report")
 	}
-	msg := err.Error()
 	for _, want := range []string{
 		"qemu-img bitmap --remove -f qcow2 /vm/a.qcow2 vmsync-cpt-000001",
 		"qemu-img bitmap --remove -f qcow2 /vm/a.qcow2 vmsync-cpt-000002",
@@ -95,9 +111,9 @@ func TestMessageIsStableAcrossRuns(t *testing.T) {
 		"/vm/a.qcow2": {"vmsync-cpt-000001"},
 		"/vm/m.qcow2": {"vmsync-cpt-000003"},
 	}
-	first := leftoverBitmapRefusal(testDomain, in).Error()
+	first := leftoverBitmapReport(testDomain, in)
 	for i := 0; i < 50; i++ {
-		if got := leftoverBitmapRefusal(testDomain, in).Error(); got != first {
+		if got := leftoverBitmapReport(testDomain, in); got != first {
 			t.Fatalf("the message varies between runs:\n%s\n---\n%s", first, got)
 		}
 	}

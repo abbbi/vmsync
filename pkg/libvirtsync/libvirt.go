@@ -18,6 +18,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package libvirtsync
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -4000,7 +4002,7 @@ func ListManagedCheckpoints(dom *libvirt.Domain) ([]Checkpoint, error) {
 	// adoption path writes time.Now() into it -- so two checkpoints sharing a
 	// second used to come back in whichever order the sort happened to leave
 	// them. Nothing downstream should depend on this order any more (see
-	// chainTip), but an unstable listing is a bad thing to hand anybody.
+	// ChainTip), but an unstable listing is a bad thing to hand anybody.
 	sort.Slice(out, func(i, j int) bool {
 		if !out[i].Time.Equal(out[j].Time) {
 			return out[i].Time.Before(out[j].Time)
@@ -4281,7 +4283,7 @@ func ClearOrphanBitmap(dom *libvirt.Domain, bitmap string, creationUnix int64, d
 	return nil
 }
 
-// chainTip is the one checkpoint no other checkpoint claims as its parent.
+// ChainTip is the one checkpoint no other checkpoint claims as its parent.
 //
 // THE CHAIN SAYS WHICH IS LAST; THE CLOCK DOES NOT. This used to be
 // existing[len(existing)-1] off a listing sorted by <creationTime>, which is
@@ -4302,7 +4304,7 @@ func ClearOrphanBitmap(dom *libvirt.Domain, bitmap string, creationUnix int64, d
 // there in sequence, and choosing either branch risks a delta against a bitmap
 // that does not describe the replica. The caller refuses the run; an operator
 // reading the names can see which one is the stray.
-func chainTip(existing []Checkpoint) (Checkpoint, error) {
+func ChainTip(existing []Checkpoint) (Checkpoint, error) {
 	claimed := make(map[string]bool, len(existing))
 	for _, c := range existing {
 		if c.Parent != "" {
@@ -4364,19 +4366,108 @@ func highestCheckpointNumber(existing []Checkpoint) (n int, width int, ok bool) 
 	return n, width, ok
 }
 
+// tokenisedCheckpointRe is the one accepted spelling of a managed checkpoint
+// name: the prefix, a generation token, and the chain position.
+//
+// ONE grammar rather than a family. The alternative is a parser that accepts
+// something nothing mints and then has to decide what it means, and the shape
+// it would have to accept is exactly the one this design exists to retire.
+//
+// The counter is {6,} rather than {6}: six is what is minted, and a chain that
+// reaches 1000000 widens by itself (see NextCheckpointName). Anchored at both
+// ends, so a name with anything else appended is not a near-miss, it is a
+// different name.
+//
+// docs/design/checkpoint-naming.md says what each part is for.
+var tokenisedCheckpointRe = regexp.MustCompile(
+	`^` + regexp.QuoteMeta(CheckpointPrefix) + `-([0-9]{10}-[0-9a-f]{4})-([0-9]{6,})$`)
+
+// GenerationToken returns the generation token a checkpoint name carries.
+//
+// A generation is one unbroken chain: the token is minted when a chain begins
+// and every later name in that chain repeats it, so two names share a token if
+// and only if they belong to the same chain. That is the whole point -- a
+// checkpoint's bare position in the chain says nothing about WHICH chain, and
+// the numbering restarts at 1 every time one is rebuilt.
+//
+// Reports false for anything it cannot read, and the callers divide on what
+// that means. The minting path REFUSES, because a chain it cannot identify is
+// one it must not extend. The stale-bitmap attribution CLASSIFIES, because a
+// name it cannot read is precisely the dead leftover it exists to report. A
+// parse failure is an error in one and data in the other, which is why this
+// returns a bool rather than deciding for them.
+func GenerationToken(name string) (string, bool) {
+	m := tokenisedCheckpointRe.FindStringSubmatch(name)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
+
+// MintGenerationToken makes the token one chain carries for its whole life.
+//
+// Minute resolution and four random hex. The minute is the half an operator
+// reads -- these names reach -list-restore-points, restore-point directory
+// names and the overlay filename -- and the random half is what keeps two
+// chains minted inside one minute apart, which a rebuild that fails and is
+// retried produces for real.
+//
+// UTC, like every other instant vmsync renders, so two hosts in different
+// zones cannot mint names that sort against each other wrongly.
+//
+// crypto/rand rather than math/rand, for the reason mintActionID gives: the
+// global math/rand source is not something this program seeds, and two vmsync
+// processes started in the same instant by a scheduler are exactly the case
+// that must not agree.
+func MintGenerationToken() (string, error) {
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("mint a checkpoint generation token: %w", err)
+	}
+	return time.Now().UTC().Format("0601021504") + "-" + hex.EncodeToString(b[:]), nil
+}
+
 func NextCheckpointName(existing []Checkpoint) (name string, parent string, err error) {
 	if len(existing) == 0 {
-		return fmt.Sprintf("%s-%06d", CheckpointPrefix, 1), "", nil
+		// A CHAIN BEGINS HERE, and this is the only place one can. Nothing
+		// else may mint: a second token while a chain still exists would be a
+		// second generation sharing one chain, which is the state the token
+		// exists to make impossible.
+		token, err := MintGenerationToken()
+		if err != nil {
+			return "", "", err
+		}
+		return fmt.Sprintf("%s-%s-%06d", CheckpointPrefix, token, 1), "", nil
 	}
-	tip, err := chainTip(existing)
+	tip, err := ChainTip(existing)
 	if err != nil {
 		return "", "", err
 	}
+	// BEFORE highestCheckpointNumber, and the order is the point.
+	//
+	// That function's regexp is `^(.*-)(\d+)$` over the whole name, so on a
+	// malformed `vmsync-cpt-2610211430-1234` -- a token whose counter is
+	// missing and whose random half happens to be all digits -- it reads 1234
+	// as the chain position and reports success. Consulted first, it would
+	// hand back a confident wrong answer where a refusal belongs.
+	token, ok := GenerationToken(tip.Name)
+	if !ok {
+		return "", "", fmt.Errorf("refusing to extend the checkpoint chain on this domain: its tip is %q, which carries no readable generation token (expected %s-<YYMMDDHHMM>-<4 hex>-<NNNNNN>). A chain whose generation cannot be identified must not be extended, because a name minted onto it could repeat one from a previous generation and an incremental would then build on the wrong copy. Drop the chain to force a full copy, which mints a new generation", tip.Name, CheckpointPrefix)
+	}
+	// Unreachable while the refusal above stands, and kept because that is an
+	// interdependency rather than a certainty: the token grammar requires the
+	// name to END in six or more digits, so a tip that parsed as a token
+	// always gives this function something to read, and it scans every entry
+	// and takes the maximum. If the two ever stop agreeing on what a name
+	// looks like, this is where it surfaces.
 	n, width, ok := highestCheckpointNumber(existing)
 	if !ok {
 		return "", "", fmt.Errorf("no vmsync checkpoint on this domain ends in a numeric suffix, cannot determine the next checkpoint name (tip is %q)", tip.Name)
 	}
-	return fmt.Sprintf("%s-%0*d", CheckpointPrefix, width, n+1), tip.Name, nil
+	// The TIP's token, carried forward unchanged. Not re-minted, and not taken
+	// from whichever entry held the highest number: those are the same entry
+	// in a well-formed chain and the tip is the one that defines the chain.
+	return fmt.Sprintf("%s-%s-%0*d", CheckpointPrefix, token, width, n+1), tip.Name, nil
 }
 
 func FailIfBlockJobActive(dom *libvirt.Domain, qcowDisks []disk.QcowDisk) error {

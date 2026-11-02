@@ -1148,13 +1148,20 @@ func dropCheckpointChain(dom *libvirt.Domain, domainName, uri, verb string) erro
 // the domain's vmsync checkpoints -- both libvirt's record of them AND the
 // bitmaps they are made of.
 //
-// It is two halves that MUST both happen. Doing only the metadata half is what
-// broke every sync for a pair once already: the images keep bitmaps named after
-// checkpoints libvirt no longer knows about, the next sync restarts its chain
-// at vmsync-cpt-000001, and qemu refuses with "Bitmap already exists" while
-// checkpoint-list shows nothing. That is the invisible failure this function
-// exists to prevent, so the two halves stay welded together here rather than
-// being offered separately to callers.
+// It is two halves that MUST both happen. Doing only the metadata half leaves
+// the images carrying bitmaps named after checkpoints libvirt no longer knows
+// about, which checkpoint-list shows nothing about: nothing will ever use them
+// and nothing removes them on its own, so they are space in the qcow2 for
+// good.
+//
+// That used to be worse and the reason has changed, which is why the welding
+// stays. It broke every sync for a pair once: the next chain restarted at
+// vmsync-cpt-000001 and qemu refused with "Bitmap already exists". A chain now
+// carries a generation token, so a later sync cannot collide with a leftover
+// and nothing trips over one -- which makes a half-done drop quieter, not
+// safer. The two halves stay welded together here rather than being offered
+// separately to callers, because a caller that took only the metadata half
+// would now leave a leak that only the per-sync report mentions.
 //
 // Bitmaps first, metadata second, deliberately. Interrupted after the bitmaps,
 // libvirt still lists the checkpoints and a later delete tidies up -- visible

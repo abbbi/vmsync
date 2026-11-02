@@ -143,10 +143,18 @@ func (p Policy) String() string {
 // Tag identifies one restore point: when the source was checkpointed, and
 // which checkpoint that was.
 //
-// The instant leads, and the checkpoint name alone would not do. -reinit
-// restarts the source's chain at vmsync-cpt-000001, so checkpoint names repeat
-// across reinits and across inversions; the source-clock instant keeps restore
-// points sortable and unambiguous for the life of a pair.
+// The instant leads, and the checkpoint name alone would not do. Two reasons,
+// and the first has outlived the second:
+//
+//   - A tag has to SORT chronologically and parse back. parseTagShape cuts at
+//     the first '-' and requires a numeric leading segment, and restore points
+//     are chosen by when they were taken; a name leading with a prefix gives
+//     neither.
+//   - Names used to repeat. -reinit restarted the chain at vmsync-cpt-000001,
+//     so a name collided across reinits and across inversions. A chain now
+//     carries a generation token, which makes that collision unreachable --
+//     so the instant is no longer load-bearing for uniqueness, and is still
+//     load-bearing for everything else above.
 type Tag struct {
 	At         time.Time
 	Checkpoint string

@@ -141,6 +141,7 @@ func (s *orderedStep) note(fset *token.FileSet, pos token.Pos, how string) {
 // runSteps are the landmarks whose relative order is the mechanism.
 type runSteps struct {
 	intent      orderedStep
+	rewind      orderedStep
 	markerRead  orderedStep
 	armReinit   orderedStep
 	armFullSync orderedStep
@@ -150,7 +151,7 @@ type runSteps struct {
 }
 
 func (s *runSteps) all() []*orderedStep {
-	return []*orderedStep{&s.intent, &s.markerRead, &s.armReinit, &s.armFullSync, &s.sweep, &s.displace, &s.createBase}
+	return []*orderedStep{&s.intent, &s.rewind, &s.markerRead, &s.armReinit, &s.armFullSync, &s.sweep, &s.displace, &s.createBase}
 }
 
 // findRunSteps walks run()'s body and reports where each landmark sits.
@@ -180,6 +181,7 @@ func findRunSteps(path string) (runSteps, error) {
 	}
 
 	steps.intent.what = "the sync intent reaching the target"
+	steps.rewind.what = "the pending-checkpoint rewind"
 	steps.markerRead.what = "reading replica_incomplete for the displaced-set sweep"
 	steps.armReinit.what = "arming replica_incomplete for the reinit path"
 	steps.armFullSync.what = "arming replica_incomplete for the non-reinit full sync"
@@ -214,6 +216,8 @@ func findRunSteps(path string) (runSteps, error) {
 				case hasSelectorArgNamed(node, "ReplicaIncompleteVerbFullSync"):
 					steps.armFullSync.note(fset, node.Pos(), "armReplicaIncomplete(..., ReplicaIncompleteVerbFullSync, ...)")
 				}
+			case isFuncCallNamed(node, "planCheckpointRecovery"):
+				steps.rewind.note(fset, node.Pos(), "a call to planCheckpointRecovery")
 			case isFuncCallNamed(node, "sweepRestorePointsForReinit"):
 				steps.sweep.note(fset, node.Pos(), "a call to sweepRestorePointsForReinit")
 			case isMethodCallNamed(node, "ReadDomainMetadataFields") && hasSelectorArgNamed(node, "MetadataFieldReplicaIncomplete"):
@@ -332,6 +336,19 @@ func TestRunArmsTheReplicaBeforeItDisplacesAnything(t *testing.T) {
 	mustComeBefore(t, steps.armFullSync, steps.createBase,
 		"A full sync with no checkpoint parent writes base images directly, with no overlay to throw away, while the domain keeps the metadata of the replica it is overwriting. The qemu-img create is the first byte of that. Arming after it means every earlier failure leaves a half-written base behind a clean bill of health.")
 
+	// THE REWIND CAN TURN AN INCREMENTAL INTO A FULL COPY, and the arming
+	// that covers that case has to be on the far side of it.
+	//
+	// Deleting the pending checkpoint empties the chain whenever it was the
+	// only one, so the run becomes parentless AFTER the two guards that ask
+	// `parent == ""` have already been evaluated and skipped. Both landmarks
+	// are judged on their latest occurrence, so this pair says: there is a
+	// full-sync arming below the rewind. Without one, the arming the test
+	// finds is the one above it, which ran while the run still had a parent
+	// and therefore did nothing.
+	mustComeBefore(t, steps.rewind, steps.armFullSync,
+		"Removing the pending checkpoint can leave the chain empty, after which this run writes base images directly over the replica. The guards for that case sit far above and were evaluated against a parent the rewind has since discarded, so a parentless run arrives at the copy with replica_incomplete never armed -- and an interruption then leaves a half-written base under metadata that still describes the replica it replaced, which -promote accepts.")
+
 	// THE OTHER DIRECTION, and the only pair here where the arming must come
 	// second.
 	//
@@ -365,4 +382,37 @@ func mustComeBefore(t *testing.T, first, second orderedStep, why string) {
 		first.what, runSourceFile, first.line, first.how,
 		second.what, runSourceFile, second.line, second.how,
 		runFuncName, why)
+}
+
+// BOTH full-sync arming sites must exist, which the ordering pair above
+// cannot say on its own.
+//
+// orderedStep keeps the latest occurrence of a landmark that must come first,
+// so deleting the arming BELOW the rewind leaves the one above it standing in
+// -- and that one is guarded by `parent == ""` evaluated before the rewind,
+// which is false on exactly the path this is about. The ordering check would
+// then compare the rewind against an arming that cannot fire and pass.
+//
+// Two, and what each is for:
+//   - the ordinary parentless run, where the source has no chain to build on
+//     and the preflight above has confirmed the target disks are absent;
+//   - the run the rewind made parentless, where the disks are present and
+//     either already marked incomplete (so copying over them is the repair)
+//     or the run is refused.
+func TestBothFullSyncArmingSitesArePresent(t *testing.T) {
+	body := funcBodyNamed(reclaimWiringFile(t, runSourceFile), runFuncName)
+	if body == nil {
+		t.Fatalf("no func %s() with a body in %s", runFuncName, runSourceFile)
+	}
+	n := 0
+	ast.Inspect(body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if ok && isFuncCallNamed(call, "armReplicaIncomplete") && hasSelectorArgNamed(call, "ReplicaIncompleteVerbFullSync") {
+			n++
+		}
+		return true
+	})
+	if n != 2 {
+		t.Errorf("%s() arms replica_incomplete for a full sync %d time(s), want 2: one for a run that was parentless to begin with, one for a run the pending-checkpoint rewind made parentless. A single site cannot cover both, because the first is guarded by a `parent` the rewind has not happened to yet", runFuncName, n)
+	}
 }

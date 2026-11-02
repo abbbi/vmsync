@@ -20,8 +20,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"vmsync/pkg/disk"
 	"vmsync/pkg/libvirtsync"
@@ -110,18 +112,25 @@ func leftoverCheckpointBitmaps(ctx context.Context, needsSSH bool, ssh *remotess
 	return out, nil
 }
 
-// leftoverBitmapRefusal turns leftover bitmaps into the error that stops the
-// run, or nil when there are none.
+// leftoverBitmapReport turns leftover bitmaps a rebuild could not clear into
+// the message an operator acts on, or "" when there are none.
+//
+// A REPORT AND NOT A REFUSAL. It was a refusal, because a leftover bitmap used
+// to stop the next sync outright: the new chain restarted at the same name and
+// qemu answered "Bitmap already exists". Generation tokens remove that
+// collision, so the rebuild now succeeds and the leftover is a space leak
+// rather than an obstacle -- which is a reason to say so on every run, not a
+// reason to refuse the rebuild that was asked for.
 //
 // Pure, so the message can be tested: it is the entire value of this feature.
-// The failure it replaces is qemu's "Bitmap already exists: vmsync-cpt-000001",
-// which tells an operator the name of something they cannot find, on a host it
-// does not identify, with no way to clear it. Everything here is chosen so that
-// the message alone is enough to fix the problem -- the disk, the bitmap, why
-// vmsync will not remove it, and the three commands that will.
-func leftoverBitmapRefusal(domain string, byDisk map[string][]string) error {
+// What it replaces is qemu's own error, which told an operator the name of
+// something they could not find, on a host it did not identify, with no way to
+// clear it. Everything here is chosen so the message alone is enough to act on
+// -- the disk, the bitmap, why vmsync will not remove it, and the commands
+// that will.
+func leftoverBitmapReport(domain string, byDisk map[string][]string) string {
 	if len(byDisk) == 0 {
-		return nil
+		return ""
 	}
 
 	// Sorted, because a map's order would make the same fault read differently
@@ -144,9 +153,9 @@ func leftoverBitmapRefusal(domain string, byDisk map[string][]string) error {
 		}
 	}
 
-	return fmt.Errorf(`reinit discarded %s's checkpoint chain, but its disks still carry %d dirty bitmap(s) that no checkpoint accounts for: %s
+	return fmt.Sprintf(`reinit discarded %s's checkpoint chain, but its disks still carry %d dirty bitmap(s) that no checkpoint accounts for: %s
 
-These are leftovers from a checkpoint whose bitmap outlived its metadata, and they are why the next step would fail with "Bitmap already exists". libvirt cannot see them (virsh checkpoint-list shows nothing) and reinit does not remove them while the domain is running: qemu holds the image open, so qemu-img cannot write it.
+These are leftovers from a checkpoint whose bitmap outlived its metadata. The rebuild is NOT blocked by them -- the chain it starts carries a new generation token, so the names it mints cannot collide with these -- but nothing will ever use them either, and nothing removes them on its own: they are pure space in the qcow2 from here on. libvirt cannot see them (virsh checkpoint-list shows nothing) and reinit does not remove them while the domain is running, because qemu holds the image open and qemu-img cannot write it.
 
 Clear them by hand, with the domain shut down:
 
@@ -174,6 +183,21 @@ creationTime is required and its value is not checked against anything. Verified
 		domain, len(found), strings.Join(found, ", "),
 		domain, strings.Join(fix, "\n"), domain,
 		domain, domain)
+}
+
+// reportLeftoverBitmaps logs what a rebuild could not clear, once, and says
+// nothing when there is nothing to say.
+//
+// A wrapper rather than three copies of the same two lines, because the three
+// call sites in the reinit path reach this state for three different reasons
+// -- the source's running state was unreadable, the source was shut down and
+// the offline removal did not take, or the online clearing reported success
+// and something survived it -- and the message is the same in all three. What
+// differs is already logged where the branch is taken.
+func reportLeftoverBitmaps(domain string, byDisk map[string][]string) {
+	if report := leftoverBitmapReport(domain, byDisk); report != "" {
+		trace.Warning(report, "vm", domain, "bitmaps", countBitmaps(byDisk))
+	}
 }
 
 // orphanBitmaps reports which vmsync-named bitmaps in the images have no libvirt
@@ -332,4 +356,134 @@ func checkpointNames(cps []libvirtsync.Checkpoint) []string {
 		out = append(out, cp.Name)
 	}
 	return out
+}
+
+// preTokenBitmapRe is the name shape vmsync minted before generation tokens:
+// the prefix and a bare counter, nothing identifying the chain it belonged to.
+//
+// Recognised only so the report can SAY so. No chain is ever extended from one
+// -- NextCheckpointName refuses a tip it cannot read a generation from -- but a
+// bitmap sitting in a real image has to be nameable, and "we cannot tell you
+// anything about this" is a worse answer than "this predates generation
+// tokens, so which chain it belonged to is unknowable".
+var preTokenBitmapRe = regexp.MustCompile(
+	`^` + regexp.QuoteMeta(libvirtsync.CheckpointPrefix) + `-[0-9]+$`)
+
+// deadBitmapGroup is one generation's worth of dead bitmaps, as the report
+// renders it.
+type deadBitmapGroup struct {
+	// token is the generation, "" for the two buckets that have none.
+	token string
+	// minted is when that generation began, zero when it cannot be read.
+	minted time.Time
+	// where is "<bitmap> in <disk path>", sorted.
+	where []string
+}
+
+// attributeDeadBitmaps describes the dead bitmaps a source still carries,
+// grouped by the generation each belonged to.
+//
+// THE SET IS NOT RE-DECIDED HERE. It comes from orphanBitmaps, which subtracts
+// the names libvirt holds checkpoints for from the names the images carry, and
+// a bitmap is dead because no checkpoint accounts for it -- true whatever its
+// name says. This only chooses words for the dead: which generation, and how
+// long ago that generation began.
+//
+// Deciding by token instead would be wrong in both directions. A bitmap with a
+// foreign token but a live checkpoint would be reported as reclaimable when it
+// is the baseline an incremental needs; and -reinit's post-drop clearing would
+// switch off exactly where it is needed, because after a chain drop there is
+// no live generation for a token to be compared against.
+//
+// Pure, and empty when there is nothing to say, so the message is testable the
+// way leftoverBitmapRefusal's is.
+func attributeDeadBitmaps(orphans map[string][]string, now time.Time) string {
+	if len(orphans) == 0 {
+		return ""
+	}
+
+	// Sorted paths, for the reason leftoverBitmapRefusal sorts them: a map's
+	// order would make the same state read differently on every run.
+	paths := make([]string, 0, len(orphans))
+	for p := range orphans {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	// Three buckets, keyed so the two tokenless ones cannot collide with a
+	// token: a token always contains a '-', these keys do not.
+	const (
+		preToken       = "pretoken"
+		unattributable = "unreadable"
+	)
+	groups := map[string]*deadBitmapGroup{}
+	order := []string{}
+	add := func(key, token string, minted time.Time, where string) {
+		g, seen := groups[key]
+		if !seen {
+			g = &deadBitmapGroup{token: token, minted: minted}
+			groups[key] = g
+			order = append(order, key)
+		}
+		g.where = append(g.where, where)
+	}
+
+	for _, path := range paths {
+		names := append([]string(nil), orphans[path]...)
+		sort.Strings(names)
+		for _, name := range names {
+			where := fmt.Sprintf("%s in %s", name, path)
+			switch token, ok := libvirtsync.GenerationToken(name); {
+			case ok:
+				// The grammar admits ten digits, not a calendar, so a date
+				// that is not a date reaches here. Reported as the generation
+				// it is, without an age, rather than refused: this function
+				// describes what is there.
+				// time.Parse already returns the zero Time on failure, so the
+				// branch states the intent rather than effecting it: a date
+				// that is not a date leaves minted zero, and the renderer
+				// below says so instead of computing an age against year one.
+				// Written out because a reader otherwise has to know that
+				// about time.Parse to see that the zero case is handled.
+				minted, err := time.Parse("0601021504", strings.SplitN(token, "-", 2)[0])
+				if err != nil {
+					minted = time.Time{}
+				}
+				add(token, token, minted.UTC(), where)
+			case preTokenBitmapRe.MatchString(name):
+				add(preToken, "", time.Time{}, where)
+			default:
+				add(unattributable, "", time.Time{}, where)
+			}
+		}
+	}
+	sort.Strings(order)
+
+	var lines []string
+	for _, key := range order {
+		g := groups[key]
+		switch key {
+		case preToken:
+			lines = append(lines, fmt.Sprintf("  %d bitmap(s) from before generation tokens existed, so which chain they belonged to cannot be recovered: %s",
+				len(g.where), strings.Join(g.where, ", ")))
+		case unattributable:
+			lines = append(lines, fmt.Sprintf("  %d bitmap(s) whose names vmsync did not mint and cannot attribute: %s",
+				len(g.where), strings.Join(g.where, ", ")))
+		default:
+			age := "minted at an unreadable date"
+			if !g.minted.IsZero() {
+				age = fmt.Sprintf("generation minted %s, %s ago",
+					g.minted.Format(time.RFC3339), now.Sub(g.minted).Round(time.Minute))
+			}
+			lines = append(lines, fmt.Sprintf("  %d bitmap(s) from generation %s (%s): %s",
+				len(g.where), g.token, age, strings.Join(g.where, ", ")))
+		}
+	}
+
+	return fmt.Sprintf(`this source carries %d dirty bitmap(s) that no libvirt checkpoint accounts for, so no incremental can ever use them:
+%s
+They cost space in the qcow2 and nothing removes them on its own. Clearing one needs the domain shut down (qemu-img bitmap --remove) or an adoption through libvirt, and vmsync does neither unasked -- see the -reinit path, which clears them as part of a rebuild it was told to do.
+
+This read is of the qcow2 bitmap directory ON DISK, which is not always what qemu holds: a bitmap created during the current qemu process's life need not be in the file yet. On a running source this is a floor, not a census. It also reads only each disk's own active image, never down a backing chain, so bitmaps belonging to a shared base are out of scope here and not counted`,
+		countBitmaps(orphans), strings.Join(lines, "\n"))
 }

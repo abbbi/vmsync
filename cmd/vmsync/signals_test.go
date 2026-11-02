@@ -206,6 +206,16 @@ func exprText(e ast.Expr) string {
 		return exprText(n.Fun) + "(...)"
 	case *ast.BasicLit:
 		return n.Value
+	// Binary and unary, so a guard's whole CONDITION can be rendered and
+	// compared. An AST walk reads positions and never the conditions a
+	// landmark sits under, which is how `if false && ...` survived a mutation
+	// round: the calls inside stayed exactly where they were.
+	case *ast.BinaryExpr:
+		return exprText(n.X) + " " + n.Op.String() + " " + exprText(n.Y)
+	case *ast.UnaryExpr:
+		return n.Op.String() + exprText(n.X)
+	case *ast.ParenExpr:
+		return "(" + exprText(n.X) + ")"
 	default:
 		return fmt.Sprintf("an unrecognised expression (%T)", e)
 	}
