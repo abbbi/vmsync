@@ -48,6 +48,38 @@ set -euo pipefail
 # it again at the far end -- see lib/common.sh.
 export LC_ALL=C LANG=C
 
+# grep_q PATTERN... -- `grep -q` that cannot report a match as a non-match.
+#
+# `cmd | grep -q X` is a trap under the `set -o pipefail` above. grep -q exits
+# the instant it matches; cmd is then killed by SIGPIPE on its next write, and
+# pipefail makes the pipeline's status that of the rightmost non-zero member --
+# 141. A MATCH is reported as "no match", and the caller reads it as absence.
+#
+# What makes it dangerous is that it is data-dependent. When cmd has already
+# finished writing (output short enough to fit the pipe buffer, or the match on
+# its LAST line) nothing is left to write, no SIGPIPE arrives, and the status is
+# a correct 0. So the check works perfectly until the output grows, and the day
+# it breaks is the day a second record appears.
+#
+# Measured here on 2026-11-03, against a domain with two checkpoints: cp_listed
+# returned 141 for a checkpoint that was present but listed FIRST, and 0 for the
+# one listed LAST. Stage 23 therefore stood down reporting that libvirt had
+# refused to create a checkpoint whose own output said "created" -- the plant
+# had worked, and the verdict named the wrong culprit.
+#
+# Distinct from the hazard bench.sh:9182 describes, which is the left-hand
+# command exiting non-zero of its own accord, after writing everything. Same
+# symptom, opposite cause: there the writer fails on its own, here the reader
+# kills it. Both are cured by not asking the pipeline for the answer.
+#
+# Reading to EOF is the whole cure, so this drops -q and discards the matches
+# instead. Keep using it rather than `grep -q` for anything whose left-hand
+# side is a command: a bare `grep -q` reads as correct and is the thing that
+# hid this for as long as it did.
+grep_q() {
+	grep "$@" >/dev/null
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
@@ -65,7 +97,7 @@ STAGES="matrix,verify,reinit,snapshot,journal,retention"
 # `all-but-matrix` keywords below, the "want ..." list the unknown-stage
 # refusal prints, and --help. A stage added to the dispatcher but not to one of
 # those is invisible in exactly the way that costs an afternoon.
-# Genuinely 1..23, verified against stage_number rather than taken on trust.
+# Genuinely 1..26, verified against stage_number rather than taken on trust.
 # The "want ..." list this was first copied from had checksum third, for
 # historical reasons, which made `--stages all` run stage 13 before stage 3
 # while --help promised stage-number order.
@@ -1635,7 +1667,7 @@ verify_cross_check_subtest() {
                 if [ "$disagree" = 0 ] && [ -n "$first" ]; then
                         log "   PASS: all three modes agree (${agreed[*]})"
                         results_row "$CSV" verify-cross agreement 0 "" "" "" "" "" "PASS all modes agree: ${agreed[*]}"
-                elif printf '%s\n' "${agreed[@]}" | grep -q '=NOT_RUN$'; then
+                elif printf '%s\n' "${agreed[@]}" | grep_q '=NOT_RUN$'; then
                         # A mode that never compared has no opinion, so this is
                         # not a disagreement about bytes and must not be
                         # reported as one. Said separately because the old
@@ -2051,7 +2083,7 @@ guest_exec_available() {
 	}
 	# Each supported command is its own JSON object, so splitting on '{' puts
 	# one command's fields on one line regardless of key order.
-	if printf '%s' "$out" | tr '{' '\n' | grep '"name"[[:space:]]*:[[:space:]]*"guest-exec"' | grep -q '"enabled"[[:space:]]*:[[:space:]]*true'; then
+	if printf '%s' "$out" | tr '{' '\n' | grep '"name"[[:space:]]*:[[:space:]]*"guest-exec"' | grep_q '"enabled"[[:space:]]*:[[:space:]]*true'; then
 		return 0
 	fi
 	GUEST_EXEC_WHY="the guest agent is running but guest-exec is disabled -- on RHEL-family guests remove it from BLOCK_RPCS in /etc/sysconfig/qemu-ga and restart qemu-guest-agent"
@@ -2086,8 +2118,8 @@ guest_dirty() {
 	while [ "$waited" -lt "${GUEST_DIRTY_TIMEOUT:-120}" ]; do
 		status="$(virsh_uri "$SOURCE_URI" qemu-agent-command "$SOURCE_DOMAIN" \
 			"{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":${pid}}}" 2>&1)" || true
-		if printf '%s' "$status" | grep -q '"exited"[[:space:]]*:[[:space:]]*true'; then
-			if printf '%s' "$status" | grep -q '"exitcode"[[:space:]]*:[[:space:]]*0'; then
+		if printf '%s' "$status" | grep_q '"exited"[[:space:]]*:[[:space:]]*true'; then
+			if printf '%s' "$status" | grep_q '"exitcode"[[:space:]]*:[[:space:]]*0'; then
 				return 0
 			fi
 			warn "dd inside $SOURCE_DOMAIN exited non-zero: ${status//$'\n'/ }"
@@ -8163,7 +8195,7 @@ stage_interrupted_reinit() {
 	# `dumpxml --inactive` rather than through the metadata API because that
 	# is also the command the runbook sends an operator to during an incident:
 	# a record only the API can see is one nobody finds.
-	if virsh_uri "$TARGET_URI" dumpxml "$TARGET_DOMAIN" --inactive 2>/dev/null | grep -q 'replica_incomplete'; then fo_ok=0; else fo_ok=1; fi
+	if virsh_uri "$TARGET_URI" dumpxml "$TARGET_DOMAIN" --inactive 2>/dev/null | grep_q 'replica_incomplete'; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "the record is in the domain's persistent definition" "$fo_ok" \
 		"virsh dumpxml --inactive $TARGET_DOMAIN does not mention replica_incomplete, so whatever the metadata API just returned would not survive a libvirtd restart -- and -promote reads the inactive definition"
 
@@ -8829,7 +8861,7 @@ stage_leftovers() {
 	# satisfy ">= 1" on behalf of a rebuild that displaced nothing. See
 	# sweep_replaced_disks' own doc -- this is the call site it names.
 	sweep_replaced_disks
-	bench_sync "$sc" baseline; bench_sync_ok || { bench_sync_hint; fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "the baseline sync itself failed, see $RUN_LOG"; return 0; }
+	bench_sync "$sc" baseline; bench_sync_ok || { fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "the baseline sync itself failed, see $RUN_LOG$(bench_sync_hint)"; return 0; }
 	bench_sync "$sc" rebuild -reinit; bench_sync_ok || { fo_check "$sc" "a rebuild leaves one aside file per disk" 1 "the rebuild failed, see $RUN_LOG"; return 0; }
 
 	local n
@@ -9192,8 +9224,7 @@ stage_reinit_order() {
 
 	# A baseline so there IS a checkpoint chain to protect and a replica to boot.
 	bench_sync "$sc" baseline -reinit; bench_sync_ok || {
-		bench_sync_hint
-		fo_check "$sc" "-reinit over a running target is refused" 1 "the baseline sync itself failed, see $RUN_LOG"
+		fo_check "$sc" "-reinit over a running target is refused" 1 "the baseline sync itself failed, see $RUN_LOG$(bench_sync_hint)"
 		return 0
 	}
 
@@ -9479,8 +9510,7 @@ stage_lock_lease() {
 	trap 'cleanup_stalled' RETURN
 
 	bench_sync "$sc" baseline -reinit; bench_sync_ok || {
-		bench_sync_hint
-		fo_check "$sc" "a leased lock is taken when the helper is there" 1 "the baseline sync failed, see $RUN_LOG"
+		fo_check "$sc" "a leased lock is taken when the helper is there" 1 "the baseline sync failed, see $RUN_LOG$(bench_sync_hint)"
 		return 0
 	}
 
@@ -9580,7 +9610,7 @@ stage_lock_lease() {
 		fi
 		if [ "$rc" = -1 ]; then
 			: # already recorded as a skip above
-		elif [ "$rc" != 0 ] && printf "%s" "$out" | grep -q "REFUSING to break the target-side run lock"; then
+		elif [ "$rc" != 0 ] && printf "%s" "$out" | grep_q "REFUSING to break the target-side run lock"; then
 			fo_check "$sc" "-break-target-lock refuses a lock it cannot attribute" 0
 		else
 			fo_check "$sc" "-break-target-lock refuses a lock it cannot attribute" 1 \
@@ -9662,10 +9692,10 @@ bitmap_names() {
 	bitmap_json | names_in
 }
 bitmap_present() {
-	bitmap_names | grep -qx "$1"
+	bitmap_names | grep_q -x "$1"
 }
 cp_listed() {
-	virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>/dev/null | grep -qx "$1"
+	virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>/dev/null | grep_q -x "$1"
 }
 
 # cp_covers_disk NAME -> 0 when checkpoint NAME declares a bitmap for
@@ -9680,7 +9710,7 @@ cp_covers_disk() {
 	virsh_uri "$SOURCE_URI" checkpoint-dumpxml "$SOURCE_DOMAIN" "$1" 2>/dev/null \
 		| tr -d '\n' | tr '<' '\n' | grep '^disk ' \
 		| grep -E "name=['\"]$TAMPER_DISK_DEV['\"]" \
-		| grep -qE "checkpoint=['\"]bitmap['\"]"
+		| grep_q -E "checkpoint=['\"]bitmap['\"]"
 }
 
 # raw_bitmaps prints every bitmap name qemu-img reports, or says plainly that
@@ -9771,6 +9801,23 @@ qemu_holds_probe() {
 	fi
 	warn "the existence probe created checkpoint $PROBE_NAME on $SOURCE_DOMAIN and could not delete it again -- that is a NEW orphan, and the stage made it. Clear it as described below."
 	return 2
+}
+
+# probe_gone -> 0 only when qemu_holds_probe answered that it does NOT hold
+# PROBE_NAME. An answer it could not give (2) is not "gone".
+#
+# Written as a verb of its own because `! qemu_holds_probe` reads like one and
+# is not: the oracle has three answers, and negating it folds "the question
+# could not be answered" into "the bitmap is gone". Four call sites did that,
+# and the direction of the error was the dangerous one -- a cleanup logging
+# "qemu accepts the name again" on a question it never got an answer to leaves
+# a real orphan behind quietly. Failing the other way is loud and harmless:
+# the operator is told to check by hand, which is the right thing to do about
+# an unknown anyway.
+probe_gone() {
+	local held
+	qemu_holds_probe && held=0 || held=$?
+	[ "$held" = 1 ]
 }
 
 # settle_stopped NAME -> 0 when NAME is in the image with the domain shut
@@ -9963,6 +10010,84 @@ XML
 	virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$x" --redefine >/dev/null 2>&1 || return 1
 	virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$PROBE_NAME" >/dev/null 2>&1 || return 1
 	return 0
+}
+
+# plant_orphan -> 0 once PROBE_NAME is a bitmap qemu holds that no libvirt
+# checkpoint accounts for. The orphan factory both planting stages use, and
+# the one stage 22 proved can be undone again on a running domain: create a
+# checkpoint, then drop libvirt's record of it and leave the bitmap.
+#
+# Through libvirt rather than qemu-img because vmsync checkpoints EVERY qcow2
+# disk it manages, so a real orphan is on all of them. A hand-made bitmap on
+# one disk would leave the adopt-then-delete cleanup claiming a bitmap the
+# other disks do not carry, and the stage would report a failure that exists
+# only in its own fixture.
+#
+# ONE create, and its refusal is read rather than a question asked first.
+# Both stages used to ask qemu_holds_probe before creating -- but that oracle
+# answers "the name is free" by creating a checkpoint and deleting it again,
+# and on a host whose normal delete does NOT take the bitmap with it (the case
+# probe_reset describes in full) the question manufactures the very bitmap it
+# was asking about, after which the real create is refused for "Bitmap already
+# exists". Creating first and reading what comes back distinguishes the two
+# without touching the source twice, and the remaining qemu_holds_probe call
+# below expects the name to be HELD, which is the answer it gives read-only.
+#
+# On failure: 1, with a one-line verdict in PLANT_VERDICT for the results row
+# and the whole reason in PLANT_REASON for the log. Six outcomes, not one:
+# both stages recorded all of these as "no orphan was produced", which names a
+# host behaviour, and a stage that stood down for any other reason sent the
+# reader to the wrong component. A probe that could not ANSWER is the sharpest
+# case -- it is not a host that produces no orphans.
+plant_orphan() {
+	PLANT_VERDICT=""
+	PLANT_REASON=""
+	local out rc held
+	if cp_listed "$PROBE_NAME"; then
+		PLANT_VERDICT="name was already a checkpoint"
+		PLANT_REASON="$SOURCE_DOMAIN already has a checkpoint called $PROBE_NAME, which this stage has not planted yet -- so everything below would be describing a record it did not make. probe_reset clears the chain for exactly this reason; a stage that does not call it stands down rather than adopt a stranger's checkpoint."
+		return 1
+	fi
+	out="$(virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$PROBE_XML" 2>&1)" && rc=0 || rc=$?
+	if [ "$rc" != 0 ] || ! cp_listed "$PROBE_NAME"; then
+		case "$out" in
+		*"Bitmap already exists"*)
+			PLANT_VERDICT="name was already an orphan"
+			PLANT_REASON="qemu already holds a bitmap called $PROBE_NAME while libvirt lists no checkpoint for it -- an orphan an earlier run left behind, not one this run made. Carrying on would test a leftover of unknown age and attribute it to this run. Clear it the way the cleanup message of the run that left it describes, then re-run."
+			;;
+		*)
+			PLANT_VERDICT="plant refused by libvirt"
+			PLANT_REASON="libvirt would not create a checkpoint called $PROBE_NAME on $SOURCE_DOMAIN from $PROBE_XML (exit $rc): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200). Nothing below has a fixture to work with. That command is reproducible by hand: virsh -c $SOURCE_URI checkpoint-create $SOURCE_DOMAIN --xmlfile $PROBE_XML"
+			;;
+		esac
+		return 1
+	fi
+
+	# And now the defect: libvirt's record goes, the bitmap stays.
+	virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$PROBE_NAME" --metadata >/dev/null 2>&1 || true
+	if cp_listed "$PROBE_NAME"; then
+		PLANT_VERDICT="metadata delete did not take"
+		PLANT_REASON="the metadata-only delete of $PROBE_NAME was refused or ignored, so it is still a live checkpoint rather than an orphan. A stage carrying on from here would be testing a healthy chain and calling it a leak."
+		return 1
+	fi
+
+	# Asked of qemu, not of the image: qemu-img reads the file, which can lag
+	# what qemu holds, and a bitmap made during this qemu's life need not be in
+	# the file at all.
+	qemu_holds_probe && held=0 || held=$?
+	case "$held" in
+	0) return 0 ;;
+	1)
+		PLANT_VERDICT="host produces no orphan"
+		PLANT_REASON="after dropping its metadata qemu no longer holds $PROBE_NAME either, so on this host a metadata-only delete takes the bitmap with it and the leftover this stage is about cannot be produced here. A finding about the host rather than a failure, and stage 22 reports it in more detail."
+		return 1
+		;;
+	*)
+		PLANT_VERDICT="existence probe inconclusive"
+		PLANT_REASON="libvirt's record of $PROBE_NAME is gone, but the live existence probe could not say whether qemu still holds the bitmap, so this run cannot tell an orphan from a delete that took it. Deliberately NOT recorded as 'no orphan': a question that was not answered is not an answer, and reading it as one would report a host behaviour this run never observed."
+		return 1
+		;;
+	esac
 }
 
 
@@ -10663,15 +10788,15 @@ stage_reinit_orphan() {
 		if cp_listed "$probe"; then
 			return 0
 		fi
-		if ! qemu_holds_probe; then
+		if probe_gone; then
 			return 0
 		fi
 		log "   cleaning up: $probe is still held, adopting and deleting it"
-		if adopt_and_delete && ! qemu_holds_probe; then
+		if adopt_and_delete && probe_gone; then
 			log "   cleaned up: qemu accepts $probe again"
 			return 0
 		fi
-		warn "stage 23 LEFT $probe ON $SOURCE_DOMAIN and could not clear it. Nothing will ever use it and nothing removes it on its own, so it is space in the qcow2 until somebody clears it -- and because a rebuilt chain mints a new generation, no later sync collides with it and nothing will fail over it. Clear it with 'virsh -c $SOURCE_URI checkpoint-create $SOURCE_DOMAIN --xmlfile $PROBE_XML.adopt --redefine' then 'virsh -c $SOURCE_URI checkpoint-delete $SOURCE_DOMAIN --checkpointname $probe', or shut the domain down and 'qemu-img bitmap --remove -f qcow2 $active $probe'."
+		warn "stage 23 may have LEFT $probe ON $SOURCE_DOMAIN -- the adoption either failed or could not be confirmed gone afterwards. Nothing will ever use it and nothing removes it on its own, so it is space in the qcow2 until somebody clears it -- and because a rebuilt chain mints a new generation, no later sync collides with it and nothing will fail over it. Clear it with 'virsh -c $SOURCE_URI checkpoint-create $SOURCE_DOMAIN --xmlfile $PROBE_XML.adopt --redefine' then 'virsh -c $SOURCE_URI checkpoint-delete $SOURCE_DOMAIN --checkpointname $probe', or shut the domain down and 'qemu-img bitmap --remove -f qcow2 $active $probe'."
 		results_row "$CSV" "$sc" cleanup 1 "" "" "" "" "" "FAIL left $probe behind"
 	}
 
@@ -10702,9 +10827,9 @@ stage_reinit_orphan() {
 	# run against. -reinit displaces the existing disks first, according to
 	# -replaced-disk-action, and that is the only thing here that may do so.
 	log_state "before seeding"
-	run_vmsync "$sc" seed -reinit
+	bench_sync "$sc" seed -reinit
 	if [ "$RUN_RC" != 0 ]; then
-		warn "SKIP $sc: the seeding sync failed (exit $RUN_RC), so there is no checkpoint to orphan and nothing below would be testing anything. $(log_reason "$RUN_LOG")"
+		warn "SKIP $sc: the seeding sync failed (exit $RUN_RC), so there is no checkpoint to orphan and nothing below would be testing anything. $(log_reason "$RUN_LOG")$(bench_sync_hint)"
 		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP seeding sync failed"
 		return 0
 	fi
@@ -10715,28 +10840,17 @@ stage_reinit_orphan() {
 	# which is what an interrupted rebuild leaves and what -reinit has to
 	# clear. Creating it and then dropping libvirt's record of it is the
 	# documented orphan factory, and it is what stage 22 proved can be undone.
-	if ! cp_listed "$probe" && ! qemu_holds_probe; then
-		virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$PROBE_XML" >/dev/null 2>&1 || true
-	fi
-	if ! cp_listed "$probe"; then
-		warn "SKIP $sc: could not plant a checkpoint called $probe on $SOURCE_DOMAIN, so there is nothing to orphan."
-		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP could not plant the orphan"
+	# plant_orphan does it, and says which of its six ways it failed: this
+	# stand-down used to read "no orphan was produced" whatever went wrong,
+	# which names a host behaviour and sent a reader looking at the host when
+	# the cause was a refused create.
+	if ! plant_orphan; then
+		warn "SKIP $sc: $PLANT_REASON"
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP $PLANT_VERDICT"
+		orphan_cleanup
 		return 0
 	fi
-
-	# And now the defect: libvirt's record goes, the bitmaps stay.
-	virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" --metadata >/dev/null 2>&1 || true
 	log_state "after dropping its metadata, which is the defect being planted"
-	if cp_listed "$probe"; then
-		warn "SKIP $sc: the metadata-only delete of $probe did not take, so there is no orphan to test with."
-		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP could not orphan the checkpoint"
-		return 0
-	fi
-	if ! qemu_holds_probe; then
-		warn "SKIP $sc: after dropping its metadata, qemu no longer holds $probe either -- so this host does not produce the orphan this stage needs, and the sync below would have nothing to clear. Stage 22's own fixture check reports the same thing in more detail."
-		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP no orphan was produced"
-		return 0
-	fi
 	fo_check "$sc" "the planted bitmap is an orphan qemu holds" 0
 	log "   fixture: vmsync made $probe across its own disks, libvirt now lists no checkpoint for it, and qemu still holds it -- an orphan, exactly as a bad rebuild leaves one"
 
@@ -10758,7 +10872,7 @@ stage_reinit_orphan() {
 	# checkpoint. That reading cannot tell a surviving orphan from a healthy
 	# replica, and it reported one as the other until the stub harness showed
 	# every mode failing the same check.
-	run_vmsync "$sc" reinit -reinit
+	bench_sync "$sc" reinit -reinit
 	if [ "$RUN_RC" = 0 ]; then fo_ok=0; else fo_ok=1; fi
 	fo_check "$sc" "-reinit completed" "$fo_ok" \
 		"exit $RUN_RC against a source carrying an orphaned $probe. $(log_reason "$RUN_LOG")"
@@ -10874,7 +10988,7 @@ stage_reinit_orphan() {
 	# What this still does NOT establish: that the tracking is right for every
 	# future interval, only for this one. Over-copying would also pass, which is
 	# the safe direction.
-	run_vmsync "$sc" after -verify=fast
+	bench_sync "$sc" after -verify=fast
 	# The LOG decides this one and the exit code decides the next, because the
 	# two now share a run: a verify mismatch exits non-zero, and reading the
 	# exit code here as well would report "the sync was not incremental" about a
@@ -10896,7 +11010,6 @@ stage_reinit_orphan() {
 stage_generation() {
 	log "=== Stage 26: a rebuilt chain is a new generation, and the old one's leftovers are reported ==="
 	local sc=generation
-	local fo_ok=0
 
 	# WHAT THIS STAGE IS FOR, and why stage 23 does not already cover it.
 	#
@@ -10964,11 +11077,11 @@ stage_generation() {
 
 	stage_cleanup_generation() {
 		if cp_listed "$probe" || qemu_holds_probe; then
-			if adopt_and_delete && ! qemu_holds_probe; then
+			if adopt_and_delete && probe_gone; then
 				log "   cleanup: $probe is gone"
 				return 0
 			fi
-			warn "stage 26 LEFT $probe ON $SOURCE_DOMAIN. Nothing will use it and nothing removes it on its own, so it is space in the qcow2 until somebody clears it -- and because every chain mints its own generation, no later sync will collide with it or fail over it. Clear it with 'virsh -c $SOURCE_URI checkpoint-create $SOURCE_DOMAIN --xmlfile $PROBE_XML.adopt --redefine' then 'virsh -c $SOURCE_URI checkpoint-delete $SOURCE_DOMAIN --checkpointname $probe', or shut the domain down and 'qemu-img bitmap --remove -f qcow2 $active $probe'."
+			warn "stage 26 may have LEFT $probe ON $SOURCE_DOMAIN -- the adoption either failed or could not be confirmed gone afterwards. Nothing will use it and nothing removes it on its own, so it is space in the qcow2 until somebody clears it -- and because every chain mints its own generation, no later sync will collide with it or fail over it. Clear it with 'virsh -c $SOURCE_URI checkpoint-create $SOURCE_DOMAIN --xmlfile $PROBE_XML.adopt --redefine' then 'virsh -c $SOURCE_URI checkpoint-delete $SOURCE_DOMAIN --checkpointname $probe', or shut the domain down and 'qemu-img bitmap --remove -f qcow2 $active $probe'."
 			results_row "$CSV" "$sc" cleanup 1 "" "" "" "" "" "FAIL left $probe behind"
 		fi
 		return 0
@@ -10978,8 +11091,7 @@ stage_generation() {
 	log_state "before seeding"
 	bench_sync "$sc" baseline
 	if ! bench_sync_ok; then
-		bench_sync_hint
-		warn "SKIP $sc: the seeding sync failed (exit ${RUN_RC:-0}), so there is no chain to read a generation from. $(log_reason "$RUN_LOG")"
+		warn "SKIP $sc: the seeding sync failed (exit ${RUN_RC:-0}), so there is no chain to read a generation from. $(log_reason "$RUN_LOG")$(bench_sync_hint)"
 		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP seeding sync failed"
 		return 0
 	fi
@@ -11000,26 +11112,14 @@ stage_generation() {
 	# --- 26b. plant a dead generation's bitmap ------------------------------
 	#
 	# Created as a checkpoint and then stripped of its metadata: the documented
-	# orphan factory, and the one stage 22 proved can be undone again.
-	if ! cp_listed "$probe" && ! qemu_holds_probe; then
-		virsh_uri "$SOURCE_URI" checkpoint-create "$SOURCE_DOMAIN" --xmlfile "$PROBE_XML" >/dev/null 2>&1 || true
-	fi
-	if ! cp_listed "$probe"; then
-		warn "SKIP $sc: could not plant a checkpoint called $probe, so there is no dead generation to report."
-		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP could not plant the dead generation"
-		stage_cleanup_generation
-		return 0
-	fi
-	virsh_uri "$SOURCE_URI" checkpoint-delete "$SOURCE_DOMAIN" --checkpointname "$probe" --metadata >/dev/null 2>&1 || true
-	if cp_listed "$probe"; then
-		warn "SKIP $sc: the metadata-only delete of $probe did not take, so it is still a live checkpoint rather than an orphan."
-		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP could not orphan the plant"
-		stage_cleanup_generation
-		return 0
-	fi
-	if ! qemu_holds_probe; then
-		warn "SKIP $sc: after dropping its metadata, qemu no longer holds $probe either, so this host does not produce the leftover this stage is about. Stage 22 reports the same thing in more detail."
-		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP no leftover was produced"
+	# orphan factory, and the one stage 22 proved can be undone again. Same
+	# planter as stage 23, so the two stages cannot drift into producing
+	# different fixtures and calling them the same thing -- and its verdict
+	# says which of six things went wrong, rather than blaming the host for
+	# all of them.
+	if ! plant_orphan; then
+		warn "SKIP $sc: $PLANT_REASON"
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP $PLANT_VERDICT"
 		stage_cleanup_generation
 		return 0
 	fi
@@ -11053,13 +11153,25 @@ stage_generation() {
 	# AND NOT CLEARED. Removing one needs the domain down or an adoption
 	# through libvirt, and an ordinary sync doing that unasked is the trade
 	# this design refuses to make.
-	qemu_holds_probe && fo_ok=0 || fo_ok=1
-	if [ "$fo_ok" = 0 ]; then
+	#
+	# Three-way, like stage 23's own reading of this oracle: an inconclusive
+	# answer recorded as a FAIL would accuse the sync of clearing a bitmap on
+	# the strength of a question that was never answered.
+	local still_held
+	qemu_holds_probe && still_held=0 || still_held=$?
+	case "$still_held" in
+	0)
 		fo_check "$sc" "an ordinary sync does not clear it" 0
-	else
+		;;
+	1)
 		fo_check "$sc" "an ordinary sync does not clear it" 1 \
 			"qemu no longer holds $probe after an ordinary sync, so the sync cleared a bitmap nobody asked it to. Clearing is an explicit verb (-reinit, stage 23); a sync that does it unasked can also do it to a bitmap it misread"
-	fi
+		;;
+	*)
+		results_row "$CSV" "$sc" an_ordinary_sync_does_not_clear_it SKIP "" "" "" "" "" "SKIP existence probe inconclusive"
+		log "   SKIP: the existence probe could not answer whether qemu still holds $probe, so this run cannot say whether the sync left it alone"
+		;;
+	esac
 
 	# --- 26d. an incremental against another generation is refused ----------
 	#

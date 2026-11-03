@@ -40,6 +40,15 @@ extract() {
 	extract "$BENCH" stage_verdict
 	extract "$BENCH" ungraded_row
 	extract "$BENCH" fo_check
+	# The fixture builder the two planting stages share, and the one-line rule
+	# that stops an unanswerable existence question reading as good news. Both
+	# are driven below against stubbed virsh calls.
+	extract "$BENCH" plant_orphan
+	extract "$BENCH" probe_gone
+	# The pipeline guard every existence check in bench.sh now goes through.
+	# Tested directly rather than through a caller: what it has to get right
+	# is an exit status, and the whole defect was that the status was wrong.
+	extract "$BENCH" grep_q
 } > "$WORK/lib.sh"
 for fn in results_row stage_pattern stage_verdict fo_check; do
 	grep -q "^$fn() {" "$WORK/lib.sh" || { echo "EXTRACT FAILED: $fn"; exit 2; }
@@ -48,6 +57,12 @@ done
 # and show which assertions the fix is carrying.
 HAVE_UNGRADED=yes
 grep -q '^ungraded_row() {' "$WORK/lib.sh" || HAVE_UNGRADED=no
+HAVE_PLANT=yes
+for fn in plant_orphan probe_gone; do
+	grep -q "^$fn() {" "$WORK/lib.sh" || HAVE_PLANT=no
+done
+HAVE_GREPQ=yes
+grep -q '^grep_q() {' "$WORK/lib.sh" || HAVE_GREPQ=no
 # shellcheck disable=SC1090
 . "$WORK/lib.sh"
 
@@ -379,6 +394,253 @@ else
 	printf '  SKIP  this machine has no /proc, so the sweep cannot be exercised\n'
 	printf '        against real processes here; the source rules above still ran\n'
 fi
+
+echo
+echo "=== the orphan planter ==="
+#
+# plant_orphan builds the fixture BOTH planting stages depend on (23 and 26),
+# and it is the one part of them that can be exercised without hardware: it
+# makes three calls and reads what comes back, so stubbing those three calls
+# drives every outcome. What this cannot check is whether libvirt and qemu
+# actually behave as the stubs pretend -- that is what the stages themselves
+# are for, and why each failure below carries a verdict an operator can act
+# on rather than a bare SKIP.
+#
+# WHY IT IS HERE. The six ways planting fails used to be recorded as one, "no
+# orphan was produced", which names a host behaviour. A run that stood down
+# because libvirt refused the create, or because an earlier run's plant was
+# still there, said the same words -- so the reader went to the host with a
+# question the host had not answered.
+if [ "$HAVE_PLANT" = no ]; then
+	printf '  SKIP  this bench.sh has no plant_orphan, so the planter cannot be driven\n'
+else
+	SOURCE_URI=qemu+ssh://stub/system
+	SOURCE_DOMAIN=stubvm
+	PROBE_NAME=vmsync-cpt-2509010000-f00d-098001
+	PROBE_XML="$WORK/probe.xml"
+	TRACE="$WORK/trace"
+
+	# cp_listed consumes CP_SEQ, one exit code per call, because the real
+	# answer CHANGES either side of the create and the metadata delete and a
+	# single stubbed value could not express "absent, then present, then
+	# absent".
+	CP_SEQ=""
+	CREATE_RC=0
+	CREATE_OUT=""
+	HOLD_RC=0
+
+	cp_listed() {
+		local next="${CP_SEQ%% *}"
+		case "$CP_SEQ" in
+		*" "*) CP_SEQ="${CP_SEQ#* }" ;;
+		*) CP_SEQ="" ;;
+		esac
+		printf ' listed:%s' "${next:-1}" >> "$TRACE"
+		return "${next:-1}"
+	}
+	# Traced to a FILE, not a variable: the create runs inside a command
+	# substitution, so a shell variable written in there never comes back.
+	# The two deletes are distinguished because the difference is the whole
+	# fixture -- a full delete takes the bitmap with it and plants nothing.
+	virsh_uri() {
+		case "$*" in
+		*checkpoint-create*)
+			printf ' create' >> "$TRACE"
+			[ -n "$CREATE_OUT" ] && printf '%s' "$CREATE_OUT"
+			return "$CREATE_RC"
+			;;
+		*checkpoint-delete*--metadata*)
+			printf ' delete-meta' >> "$TRACE"
+			return 0
+			;;
+		*checkpoint-delete*)
+			printf ' delete-full' >> "$TRACE"
+			return 0
+			;;
+		esac
+		return 0
+	}
+	qemu_holds_probe() {
+		printf ' hold:%s' "$HOLD_RC" >> "$TRACE"
+		return "$HOLD_RC"
+	}
+
+	# plant CP_SEQ CREATE_RC CREATE_OUT HOLD_RC -> sets RC, PLANT_VERDICT
+	plant() {
+		CP_SEQ="$1"
+		CREATE_RC="$2"
+		CREATE_OUT="$3"
+		HOLD_RC="$4"
+		: > "$TRACE"
+		plant_orphan && RC=0 || RC=$?
+	}
+	has_text() { case "$2" in *"$1"*) echo yes ;; *) echo no ;; esac; }
+
+	plant "0" 0 "" 0
+	check "a name that is already a checkpoint is refused" 1 "$RC"
+	check "and named as such" "name was already a checkpoint" "$PLANT_VERDICT"
+	check "and nothing is created or deleted first" " listed:0" "$(cat "$TRACE")"
+
+	plant "1" 1 "error: Bitmap already exists: $PROBE_NAME" 0
+	check "a create refused for the bitmap is an earlier run's orphan" \
+		"name was already an orphan" "$PLANT_VERDICT"
+	check "and the reason says whose it is" yes \
+		"$(has_text "an earlier run left behind" "$PLANT_REASON")"
+
+	plant "1" 1 "error: internal error: unable to execute QEMU command" 0
+	check "a create refused for anything else is libvirt's refusal" \
+		"plant refused by libvirt" "$PLANT_VERDICT"
+	check "and libvirt's own words are quoted" yes \
+		"$(has_text "unable to execute QEMU command" "$PLANT_REASON")"
+	check "and the command is given to run by hand" yes \
+		"$(has_text "virsh -c $SOURCE_URI checkpoint-create" "$PLANT_REASON")"
+
+	# A create that exits 0 and lists nothing is still a refused plant: the
+	# exit code is not the fixture, the checkpoint is.
+	plant "1 1" 0 "" 0
+	check "a create that exits 0 and lists nothing is still refused" \
+		"plant refused by libvirt" "$PLANT_VERDICT"
+
+	plant "1 0 0" 0 "" 0
+	check "a metadata delete that does not take is named" \
+		"metadata delete did not take" "$PLANT_VERDICT"
+
+	plant "1 0 1" 0 "" 1
+	check "a host whose metadata delete removes the bitmap is named" \
+		"host produces no orphan" "$PLANT_VERDICT"
+
+	# THE DISTINCTION THIS SECTION EXISTS FOR. An oracle that could not
+	# answer is not a host that produces no orphans, and reporting it as one
+	# attributes a behaviour to the host that this run never observed.
+	plant "1 0 1" 0 "" 2
+	check "an unanswered oracle is NOT reported as no-orphan" \
+		"existence probe inconclusive" "$PLANT_VERDICT"
+	check "and says that a question is not an answer" yes \
+		"$(has_text "not an answer" "$PLANT_REASON")"
+
+	plant "1 0 1" 0 "" 0
+	check "a planted orphan reports success" 0 "$RC"
+	check "with no verdict to record" "" "$PLANT_VERDICT"
+	# ONE create, and a metadata-only delete. Both stages used to ask the
+	# existence oracle BEFORE creating -- and that oracle answers "the name is
+	# free" by creating a checkpoint and deleting it again, so on a host whose
+	# normal delete leaves the bitmap the question manufactured the very thing
+	# it was asking about and the real create was then refused.
+	check "planting is one create and a metadata-only delete" \
+		" listed:1 create listed:0 delete-meta listed:1 hold:0" "$(cat "$TRACE")"
+
+	# probe_gone exists to stop `! qemu_holds_probe` reading an unanswerable
+	# question as good news, which four call sites did.
+	for rc in 0 1 2; do
+		HOLD_RC="$rc"
+		probe_gone && g=gone || g=not-gone
+		case "$rc" in
+		1) check "probe_gone reads 1 as gone" gone "$g" ;;
+		*) check "probe_gone does not read $rc as gone" not-gone "$g" ;;
+		esac
+	done
+fi
+
+if [ "$HAVE_GREPQ" = no ]; then
+	echo "=== grep_q: NOT PRESENT in this bench.sh, pipeline cases skipped ==="
+else
+	echo
+	echo "=== grep_q: a match must never read as a non-match ==="
+
+	# What decides this is not how much the writer prints but whether it still
+	# has a write LEFT once grep has exited. The real case had 70 bytes of
+	# output in it: `virsh checkpoint-list --name` printed two checkpoints,
+	# grep -q matched the first and exited, and virsh died on the second.
+	#
+	# So the fixture puts the match first and leaves well over a pipe buffer
+	# still to come. 200000 lines is more than a megabyte against a 64 KiB
+	# buffer, so the writer cannot possibly have finished and the SIGPIPE is
+	# guaranteed rather than raced for. `seq 1 5000` was the first attempt and
+	# was wrong for exactly this reason -- about 24 KB, it fits the buffer
+	# whole, seq exits happily before grep matches, and the control below
+	# reported a healthy 0 for a form that is broken in the field.
+	early() { printf 'MATCH\n'; seq 1 200000; }
+	late() { seq 1 200000; printf 'MATCH\n'; }
+
+	# THE CONTROL, and it comes first deliberately. A test for a cure is
+	# worthless unless the disease is present on the machine running it. If
+	# this reports 0, pipelines are not dying here and every assertion below
+	# would pass just as well against the broken form, proving nothing.
+	#
+	# pipefail is turned on inside the subshell because bench.sh sets it
+	# globally (bench.sh:30) and this harness deliberately does not. Without
+	# it the pipeline reports grep's own status and the bug is invisible --
+	# which is why it survived in a file this one has been testing all along.
+	old_rc=0; ( set -o pipefail; early | grep -q '^MATCH$' ) || old_rc=$?
+	check "the bare grep -q form does fail here, so these cases mean something" 141 "$old_rc"
+
+	# The bug itself: the match is EARLY, which is the shape that bit
+	# cp_listed on 2026-11-03 -- two checkpoints, the wanted one listed first,
+	# reported as absent, and stage 23 standing down over it.
+	new_rc=0; ( set -o pipefail; early | grep_q '^MATCH$' ) || new_rc=$?
+	check "grep_q reports an early match as a match" 0 "$new_rc"
+
+	# The case that always worked, kept so a fix that broke it would show.
+	last_rc=0; ( set -o pipefail; late | grep_q '^MATCH$' ) || last_rc=$?
+	check "grep_q reports a last-line match as a match" 0 "$last_rc"
+
+	# And absence must still be absence. A cure that answered 0 for everything
+	# would pass every case above and turn every existence check in the file
+	# into a tautology.
+	none_rc=0; ( set -o pipefail; early | grep_q '^nope$' ) || none_rc=$?
+	check "grep_q still reports a genuine absence as absence" 1 "$none_rc"
+
+	# Flags have to survive the wrapper: the converted call sites pass -x, -E
+	# and -F, and "$@" is the only reason they can.
+	x_rc=0; ( set -o pipefail; early | grep_q -x 'MATCH' ) || x_rc=$?
+	check "grep_q passes -x through" 0 "$x_rc"
+	# The discriminating half, and the case above cannot do without it: a
+	# wrapper that swallowed -x altogether would still find MATCH inside
+	# XMATCHX, so "passes -x through" would pass on a wrapper that does not.
+	padded() { printf 'XMATCHX\n'; seq 1 200000; }
+	xs_rc=0; ( set -o pipefail; padded | grep_q -x 'MATCH' ) || xs_rc=$?
+	check "grep_q -x means whole line, not substring" 1 "$xs_rc"
+	e_rc=0; ( set -o pipefail; early | grep_q -E '^(MATCH|nope)$' ) || e_rc=$?
+	check "grep_q passes -E through" 0 "$e_rc"
+	# -F with a string that is a live regex if it is not taken literally.
+	f_rc=0; ( set -o pipefail; printf '%s\n' 'a.c' 'zzz' | grep_q -F 'a.c' ) || f_rc=$?
+	check "grep_q passes -F through" 0 "$f_rc"
+	f2_rc=0; ( set -o pipefail; printf '%s\n' 'abc' 'zzz' | grep_q -F 'a.c' ) || f2_rc=$?
+	check "grep_q -F is not quietly a regex" 1 "$f2_rc"
+
+	# No local caller may go back to the trap. The three that remain are
+	# inside quoted strings that run on the TARGET host under its own shell,
+	# which has no pipefail, so they are safe where they are -- and they are
+	# recognised by the escaped quoting that makes them remote.
+	stray=0
+	while IFS= read -r line; do
+		case "$line" in
+		*'\"'*|*'\$'*) continue ;;
+		*'#'*'grep -q'*) continue ;;
+		esac
+		stray=$((stray + 1))
+	done < <(grep -E '\|[[:space:]]*grep[[:space:]]+-[a-zA-Z]*q' "$BENCH" || true)
+	check "no local pipeline in bench.sh still ends in a bare grep -q" 0 "$stray"
+fi
+
+echo
+echo "=== bench_sync_hint belongs INSIDE a message ==="
+
+# The hint is built with printf and returns its text; it is not a logger. Four
+# stages called it as a bare statement, so its text went to stdout raw -- no
+# timestamp, no "WARNING:", and glued to whatever the next log line started
+# with. Observed on 2026-11-03, where stage 26's stand-down printed
+#
+#     exit=1 wall=3.038s mode=full transferred=0B
+#      -- if that run ended in under a second ...installed there[2026-11-03 ...
+#
+# The other twenty-three call sites interpolate it, which is what puts it in
+# the message the reader is already reading. This counts the exceptions.
+bare=0
+while IFS= read -r line; do
+	bare=$((bare + 1))
+done < <(grep -nE '^[[:space:]]*bench_sync_hint$|\{[[:space:]]*bench_sync_hint;' "$BENCH" || true)
+check "no stage calls bench_sync_hint as a bare statement" 0 "$bare"
 
 echo
 if [ "$SKIPPED" -ne 0 ]; then
