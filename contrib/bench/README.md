@@ -40,6 +40,37 @@ to exercise all paths.
   then removes it with a live `blockcommit --active --pivot`. This is the
   one stage that touches the source rather than just the target — see its
   own section below before running it against anything you care about.
+- Stage 4 also carries sub-test 4e, on by default and disabled with
+  `BENCH_BITMAP_CHAIN_PROBE=no`, which checks that a checkpoint's dirty
+  bitmap survives intact when its layer leaves the backing chain — the one
+  snapshot hazard the rest of the stage cannot reach, because it only
+  appears once the bitmap's layer is *gone* rather
+  than merely pushed down the chain. It runs on a **throwaway domain it
+  defines and destroys on the source hypervisor** (`vmsync-bench-bmprobe`,
+  a 128 MiB paused guest on its own 64 MiB disk beside the source's
+  images), never on the bench source domain: the only reliable way to drop
+  a layer out of a live chain is `blockpull`, which leaves the domain
+  running on the overlay for good, and that is exactly the state stage 4's
+  own cleanup treats as damage — so the damage is done to a domain nobody
+  needs afterwards, and the probe destroys it either way.
+
+  What it asserts is **not** that libvirt refuses such a backup — libvirt is
+  specified to *merge*, not refuse, unioning every removed layer's fragment
+  into the surviving image on block-pull completion. The probe writes a
+  known range before the snapshot and another after it, flattens the chain,
+  and requires the surviving bitmap to still account for **both**. A total
+  that shrank would mean the next incremental succeeds while silently
+  omitting the pre-snapshot write, which is the only version of this hazard
+  that matters and the only one with no error for vmsync to catch.
+
+  It injects those writes with `qemu-monitor-command --hmp qemu-io`, which
+  taints the throwaway domain; the bench source is never touched. Without
+  the writes the bitmap stays empty and the sub-test cannot tell a working
+  merge from a broken one, so a host where the injection or the bitmap read
+  does not work reports **SKIP**, never a verdict. The same applies to the
+  control: the incremental is first run with the chain intact and must be
+  accepted, because "backup-begin failed" on its own is also what a request
+  this libvirt will not accept looks like.
 - **The target domain must be shut off for the entire run, and stays that
   way throughout.** The harness never starts it. This is also what makes
   tampering it safe — nothing else has the file open at the time.
@@ -1284,8 +1315,10 @@ on the DR host that fails a commit for every VM on it.
 | an aside older than the duration is reclaimed | that it does anything at all — the negative tests above all pass trivially against a sweep that is broken |
 | a co-located domain's aside is left alone | **stage 18's lesson in a new reader.** Replicas normally share one images directory, so a sweep reading the DIRECTORY rather than this domain's own disks charges every machine's asides to every machine, and offers one VM's only good copy as another's reclaimable space |
 | a restore point store moved aside is reclaimed | the sub-case nothing could previously name: these directories sit *beside* the per-domain stores, so `-list-restore-points` cannot see them and every point inside them is outside every store. Recorded as SKIP rather than PASS when `-reinit` had no store to move aside |
-| nothing is reclaimed while the replica is marked incomplete | **the interlock this feature could not ship without.** While `replica_incomplete` is set, the aside files *are* the complete replica the rebuild replaced and putting them back is the documented recovery; a sweep that took them would leave a half-written image whose metadata still reads healthy |
-| the refusal does not fail the sync | that standing down is a warning. The run it happens inside is the one repairing the replica, so failing it would turn a protection into an outage |
+| nothing is reclaimed while the replica is marked incomplete | **the interlock this feature could not ship without.** While `replica_incomplete` is set, the aside files *are* the complete replica the rebuild replaced and putting them back is the documented recovery; a sweep that took them would leave a half-written image whose metadata still reads healthy. Asserted by NAME, not by count: the measuring `-reinit` sets a fresh set aside of its own, so a count is satisfied by that set standing in for the aged one a broken sweep just deleted — D files before, D after |
+| the sweep said it was standing down | that the check above is reading a refusal and not a sweep that never ran. Until 2026-10-22 the measuring run was a plain sync, which with the marker set is refused ~2,000 lines before the sweep: "nothing was reclaimed" held because nothing could have been, and this is the check that caught it |
+| the stand-down does not fail the sync | that standing down is a warning. The run it happens inside is the one repairing the replica, so failing it would turn a protection into an outage |
+| the same sets are reclaimed once the replica is complete | the control. An incremental after the repair must take exactly the files the refusal protected — otherwise "nothing was reclaimed" is satisfied by a sweep that never takes those files at all, and says nothing about the marker |
 
 Ages are faked by rewriting the unix stamp in each name, not by moving a clock:
 the stamp is what vmsync reads, and changing the host's time would invalidate
@@ -1476,15 +1509,28 @@ has. It plants an orphaned bitmap on a **running** source and runs a plain
 `-reinit` over it — no special flags, because an operator hitting this passes
 none.
 
-**The planted name is `vmsync-cpt-000001`, deliberately.** That is the name the
-rebuild's own new chain takes, so the orphan is a real collision rather than a
-bitmap sitting harmlessly out of the way. It also means **a clean exit is itself
-the proof the orphan was cleared**: a surviving one is precisely what makes qemu
-refuse that checkpoint, which is the failure every run of this command used to
-hit. Asking "does qemu still hold the name?" afterwards would prove nothing —
-after a successful rebuild it holds it legitimately, as the new chain's first
-checkpoint — and an earlier draft of this stage reported the one as the other
-until the stub harness showed every mode failing the same check.
+**The planted name carries a DEAD generation, deliberately:**
+`vmsync-cpt-2510010000-dead-099001`. That is the reverse of what it used to be,
+and the reversal is worth reading, because it changed what this stage can
+measure.
+
+The plant was `vmsync-cpt-000001` — the name the rebuild's own new chain would
+take — so the orphan was a real collision, and **a clean exit was itself the
+proof the orphan was cleared**: a surviving one was precisely what made qemu
+refuse the rebuild's checkpoint. Asking "does qemu still hold the name?"
+afterwards proved nothing then, because after a successful rebuild it held that
+very name legitimately, as the new chain's first checkpoint; an earlier draft
+reported the one as the other until the stub harness showed every mode failing
+the same check.
+
+Generation tokens remove the collision: a rebuild mints its own generation and
+never asks for a dead one's name. So the exit code no longer sees the orphan at
+all — and the question that used to be useless becomes the right one. **qemu
+must no longer hold the orphan's name**, which is now unambiguous because a
+healthy replica's names carry a different token. And **the rebuilt chain must
+carry a token distinct from the orphan's**, without which a build that reused
+the dead chain's generation would pass everything else while leaving the next
+incremental building on a name that chain also used.
 
 **vmsync builds the fixture, not the stage.** It seeds with a `-reinit` and then
 drops libvirt's record of the checkpoint that rebuild made. That is the orphan
@@ -1507,8 +1553,12 @@ sync's chain starts at `vmsync-cpt-000001`.
 | check | what the answer decides |
 | --- | --- |
 | the planted bitmap is an orphan qemu holds | that the fixture is real. Confirmed with **qemu**, not with the image: a bitmap made during the current qemu's life need not be in the image at all, and on the host this was written against it is not |
-| **`-reinit` completed** | **the feature.** The name collides, so a surviving orphan makes qemu refuse the rebuild's own checkpoint and this fails |
-| the name is a real checkpoint afterwards, not an orphan | that the end state is consistent. Same name, opposite meaning, and only libvirt can tell them apart |
+| **`-reinit` completed** | that the rebuild ran at all. It no longer proves the orphan was cleared: the names it mints carry a new generation, so a surviving orphan cannot make qemu refuse anything. The two checks below are what prove it |
+| **the orphan is gone from qemu** | **the feature**, asked of the component that knows. `qemu_holds_probe` attempts the create and reads the refusal, because qemu-img reads the file and the file lags what qemu holds. Unambiguous only because the rebuilt chain uses a different name |
+| **the rebuilt chain carries a new generation** | that the rebuild minted a generation rather than reusing the dead one. Without it, a build that carried the old token forward would clear the orphan, exit 0, and leave the next incremental on a name the dead chain also used |
+| **an empty bitmap sweep admits it proves nothing** | that an absence vmsync cannot establish is not reported as one. Graded three ways: *absent* when the audit found bitmaps (telling an operator to reboot a guest over a settled question is how a warning stops being read), *absent* when qemu's own list proved the absence, and **due** when the audit came back empty with only the image having answered. SKIP only when neither reader answered at all |
+| **the monitor taint is announced before it is paid** | that the cost of asking qemu is on the record before it is incurred. libvirt marks the domain `custom-monitor` for the life of its run and only a guest restart clears it, so an operator who finds that mark must be able to learn from vmsync's own log why it is there. vmsync says it *before* the call, because libvirt taints before qemu sees the command and a run killed inside the call must still have left the record |
+| **qemu's own list is what found the planted orphan** | the end-to-end proof of the whole mechanism. On the census route the planted bitmap must appear in the line naming what qemu holds that the image does not carry — which is what shows the monitor read, and not the qcow2 directory, is what made a live orphan findable. **N/A** rather than SKIP on the image route: nothing is missing there, that host simply flushed the fresh bitmap into the file |
 | the sync after it is incremental | that the rebuild left a chain the next run can use. Clearing the orphan and leaving nothing to carry on from has fixed nothing. Decided by the **log**, not the exit code, since that run also verifies |
 | **the replica still matches the source** | **the only check here about data.** The run above carries `-verify=fast`, which reads the replica back and compares it against the source. If adopting and deleting had disturbed the tracking that survives it, this incremental would copy too little and the replica would be silently stale — this is what finds that. `fast` stops at the first differing range, so a clean result means the whole image compared |
 
@@ -1547,9 +1597,186 @@ left in the chain's own name space would break every later sync for the pair,
 including the rest of the bench run. A *checkpoint* of that name is the healthy
 end state and is left alone.
 
+**First hardware answer (2026-11-03, `npftest` acting as both hypervisors): it
+does NOT clear it.** `-reinit` exited 0, rebuilt the chain with a fresh
+generation, left the next sync incremental and `-verify=fast` clean — and left
+the orphan exactly where it was, still held by qemu with no libvirt record. Five
+of the six checks that existed then pass; the one that fails is the one this
+stage was written for.
+
+The orphan is not inert either. Read from QMP on the running domain:
+`"recording": true, "persistent": true`, granularity 64 KiB — so it keeps
+marking dirty blocks for the life of the domain and is flushed back into the
+qcow2, for a bitmap nothing will ever read.
+
+Neither clearing route reported itself, so the `ROUTE:` row reads
+`cleared by unexplained` — which is the row assuming an outcome it should be
+measuring, and is worth re-wording. Filed as finding 3.11 in the consolidated
+audit, with the adopt route stage 22 proves would fix it.
+
+**Why neither route spoke, established afterwards.** All three places that could
+have caught the orphan read the same thing — the qcow2 bitmap directory as the
+*file* holds it — and a running QEMU has not written the current generation's
+bitmaps there. So the pre-drop notice was skipped, the clearing sweep found an
+empty set and did nothing, and the per-sync dead-generation report had nothing
+to attribute. Not a policy gap; a discovery gap. Measured 2026-11-03 on the same
+host: with libvirt's checkpoint alive and *listed*, `qemu-img info --force-share`
+reported no bitmap while QMP reported it `recording` and `persistent` — so the
+blindness lasts as long as the QEMU process and has nothing to do with being
+orphaned. A `virsh save` put the bitmap in the file; so does a reboot.
+
+**Second hardware answer (2026-11-04): it clears it. 8 of 8.** The sweep is no
+longer the image read alone — it is the image read unioned with qemu's own bitmap
+list, since no supported libvirt API enumerates bitmaps and the file cannot show
+one made during the running qemu's life. The `ROUTE:` row now reads *cleared by
+the sweep after the chain drop, informed by qemu's own bitmap list*, and the log
+behind it says, in order: the taint notice before the call, then `qemu holds 1
+checkpoint bitmap(s) … that its qcow2 files do not carry yet:
+vmsync-cpt-2510010000-dead-099001`, then `cleared the source's orphaned checkpoint
+bitmaps removed=1`. The check this stage was written for passes, and `cleared by
+unexplained` is gone — not re-worded, but no longer reachable on this host.
+
+Nothing in the fixture changed to achieve that. The planted name carries a
+deliberately foreign generation token, and it is found anyway because
+`IsManagedCheckpointName` is a bare `vmsync-cpt-` prefix test: the token matters
+for deciding which chain a bitmap belonged to, never for finding it.
+
+The gap that remains is the per-sync report, which still reads the image alone —
+see stage 26 below, where it is measured rather than assumed.
+
+### Stage 26 (`generation`), opt-in — a rebuilt chain is a new generation
+
+Stage 23 asks whether a `-reinit` **clears** a dead generation's orphan; on
+hardware it does not. This one covers the case where nothing clears it, which
+is the ordinary one on a running source: after generation tokens, a leftover
+from a dead chain collides with nothing, so nothing fails, and the only way
+anybody finds out is that every sync says so.
+
+That is the trade the design made, and it has to be checked in both directions —
+the leak must be **reported**, and it must **not** be cleared by a verb nobody
+asked.
+
+| check | what the answer decides |
+| --- | --- |
+| the chain carries a generation token | that names are tokenised at all. Everything below reads the token to tell this chain from a dead one |
+| an ordinary sync succeeds with a dead generation's bitmap present | that a leftover is not an obstacle. It cannot collide with the names this chain mints, so a sync that fails here is still treating an orphan as a blocker |
+| **the dead generation is named in the report** | **the whole trade.** A count would say something is wrong and nothing about which chain it came from or how old it is. This greps for the planted token, not for a number |
+| **an ordinary sync does not clear it** | that clearing stays an explicit verb (`-reinit`, stage 23). A sync that removes a bitmap unasked can also remove one it misread |
+| **an incremental against another generation is refused** | **the defect the whole design closes.** The target is made to record a checkpoint from a chain that no longer exists. Before tokens both names were spelled `vmsync-cpt-000001`, the chain check compared them equal, and a delta landed on a replica no bitmap described |
+
+The last one is arranged by writing the stale name onto the target's metadata by
+hand and restoring it afterwards — a target left recording a checkpoint the
+source does not have refuses every later sync. Reaching that state for real needs
+a full copy to die mid-flight and the chain rebuilt afterwards; what cannot be
+faked is whether the **engine** refuses on it, which is what this runs.
+
+**What has no end-to-end stage, and why.** A collision that survives the token —
+a bitmap left at the next number *inside* one generation — cannot be arranged
+from this harness's primitives. Every failing incremental triggers
+`cleanupOrphanedCheckpoint`, which deletes the checkpoint whose copy did not
+finish; and `die-writing-base`, the one fault that exits without unwinding,
+refuses an incremental by design. The engine prevents that state two independent
+ways. Making it reachable would mean adding a fault hook to production code for
+a test's benefit. It keeps unit coverage (`TestCollidingBitmap`) and hardware
+coverage of adopt-and-clear (stage 22).
+
+**First hardware answer (2026-11-03): the trade is not honoured.** Four of the
+five checks pass — names are tokenised, an ordinary sync succeeds with a dead
+generation's bitmap present, it is not cleared by a verb nobody asked, and an
+incremental against another generation is refused. The one that fails is the one
+carrying the trade: **the dead generation is not named in the report.** Nothing
+in the run mentioned generation `2509010000-f00d` while its bitmap sat there
+recording.
+
+**Second hardware answer (2026-11-04): still 4 of 5, and now by design rather
+than by accident.** The same check fails, and the reason is a decision: the qemu
+bitmap census is wired to the reinit path only, so a pair that never reinits is
+never marked `custom-monitor`. This report runs on every sync of every pair and
+therefore still reads the image alone — which on a running source cannot show a
+bitmap made during the current qemu's life. Measured, not assumed.
+
+What changed around it is that the leak is no longer invisible everywhere:
+stage 23 now clears the orphan, so an existing one is findable by running
+`-reinit`. It is still not findable by watching ordinary syncs, which is what
+this check is about. Finding 3.11.
+
+This stage also seeds with `-reinit` rather than a plain full sync, for the same
+reason stage 23 does: a full sync refuses to overwrite a target disk that already
+exists, and in stage order this one runs after stages that leave a complete
+replica. With a plain seed it stood down and its result went unmeasured — which
+is worse than a measured failure, and was how the 2026-11-04 run first reported
+it. The orphan is planted *after* the seed, so a reinit there has nothing of this
+stage's fixture to clear.
+
+### Stage 27 (`qmp-census`), opt-in — can vmsync ask qemu, and what does it cost?
+
+A **probe**, like stage 22, and read like one: every row is the platform's
+answer on this host and build. A FAIL means this libvirt and this qemu behave
+differently from the host the bitmap census was measured on — not that vmsync is
+broken.
+
+The census exists because **no supported libvirt API enumerates dirty bitmaps**,
+and the qcow2 directory cannot show one made during the running qemu's life. So
+vmsync asks qemu directly, through `query-named-block-nodes`. Everything about
+*parsing* that reply is unit-tested against a captured one with an injected
+query; what no unit test can reach is whether this host still behaves as the
+design assumes — which is also precisely what an unsupported interface can
+change under you at a libvirt upgrade.
+
+| check | what the answer decides |
+| --- | --- |
+| **the monitor answers the bitmap query** | whether the route exists here at all. A host that refuses the passthrough falls back to the image read alone, which is a supported state vmsync warns about rather than failing on — so this FAIL is a capability finding, and the three checks that read the reply record SKIP |
+| **the reply keys each disk by its file path** | the mapping's only key. Never the node name: measured on a two-disk domain, `libvirt-1-format` was **vdb** and `libvirt-2-format` was **vda**, so anything reading the number cross-maps one disk's bitmaps onto another with nothing in the result to show it |
+| **the bitmaps sit on the qcow2 node** | that the mapping stays single-valued. The protocol child reports the *same* file path, so bitmaps on both would be counted twice for one disk and the adoption XML would name its target device twice |
+| **qemu reports a bitmap the image does not carry** | **the premise of the whole route**, asserted directly rather than inferred from stage 23 clearing something. If a host reports it in both, nothing is broken — that host flushes a fresh bitmap into the file — but the census is redundant there rather than load-bearing, and the row says so |
+| **a read-only connection is refused the monitor** | what vmsync's degradation path is written on. The refusal is in the public wrapper, before any driver dispatch, which is why no ACL setting re-enables it and why it taints nothing |
+| **libvirt records the monitor taint once per run** | what asking actually costs. Per domain **run** means one log line per guest boot; per *call* would mean one per reinit, and vmsync's own notice — said once per domain per process — would then understate it |
+
+**It plants nothing.** The live chain's own bitmap is already one qemu holds and
+the image lacks, so there is no fixture to build and nothing to unwind. Stages 22
+and 23 both manufacture an orphan and both have to clean up after it; a stage
+that cannot leave a mess cannot leave one behind on a failure either. The one
+write is a seeding `-reinit`, for the same reason stages 23 and 26 seed that way.
+
+**First hardware answer (2026-11-04, `npftest` acting as both hypervisors): 6 of
+6.** The monitor answers, the file path is the key, the bitmaps are on the qcow2
+node, qemu reports the live chain's bitmap while `qemu-img` does not, a read-only
+connection is refused, and the taint is recorded once and does not grow on a
+second query. Every assumption the census rests on holds on this host.
+
+### When a planting stage stands down (23 and 26)
+
+Both stages build their fixture with the same `plant_orphan`, so a `stood-down`
+row from either carries one of six verdicts. They are **different findings about
+different components**, which is why they are no longer recorded as one:
+
+| verdict in `results.csv` | what it means | what to do |
+| --- | --- | --- |
+| `name was already a checkpoint` | the source already had a checkpoint of the probe's name before the stage planted one | stage 23 clears the chain first (`probe_reset`) and so rarely sees this; for stage 26, look at what put it there |
+| `name was already an orphan` | qemu holds the bitmap and libvirt has no record of it — an **earlier run's** plant, not this one's | clear it as that run's cleanup message describes, then re-run |
+| `plant refused by libvirt` | the `checkpoint-create` itself was refused; libvirt's own words are quoted in the log | run the quoted `virsh` command by hand |
+| `metadata delete did not take` | the probe is still a live checkpoint, so there is no orphan | a libvirt that will not drop metadata for a leaf checkpoint; stage 22 covers the same ground |
+| `host produces no orphan` | after the metadata drop qemu no longer holds the bitmap either, so this host cannot produce the leftover | a finding **about the host**, not a failure. Stage 22 reports it in more detail |
+| `existence probe inconclusive` | the live oracle could not answer whether qemu holds the bitmap | read the probe's own line in the log. Deliberately **not** recorded as `host produces no orphan`: a question that was not answered is not an answer |
+
+The planter makes exactly **one** `checkpoint-create` and a **metadata-only**
+delete. Both stages used to ask the existence oracle *before* creating — and
+that oracle answers "the name is free" by creating a checkpoint and deleting it
+again, so on a host whose normal delete leaves the bitmap behind, the question
+manufactured the very thing it was asking about and the real create was then
+refused for "Bitmap already exists". Reading the create's own refusal
+distinguishes the two cases without touching the source twice.
+
+All six outcomes, and that call sequence, are driven without hardware by
+`./selftest.sh`.
+
 ## Files
 
 - `bench.sh` — the driver.
+- `selftest.sh` — the parts of the driver that need no hardware: the verdict
+  arithmetic, the orphan-export sweep's safety rules and the orphan planter's
+  six outcomes, each extracted from `bench.sh` itself and driven against stubs.
+  Exits non-zero on any failure, so it can go in front of a bench run.
 - `bench.conf.example` — config template; copy to `bench.conf` (gitignored).
 - `scenarios.conf` — the Stage 1 transport matrix; edit freely.
 - `lib/common.sh` — shared shell helpers (logging, ssh/virsh wrappers,

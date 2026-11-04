@@ -101,7 +101,7 @@ STAGES="matrix,verify,reinit,snapshot,journal,retention"
 # The "want ..." list this was first copied from had checksum third, for
 # historical reasons, which made `--stages all` run stage 13 before stage 3
 # while --help promised stage-number order.
-ALL_STAGES="matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,checksum,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease,redefine-probe,reinit-orphan,supervise,exclude,generation"
+ALL_STAGES="matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,checksum,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease,redefine-probe,reinit-orphan,supervise,exclude,generation,qmp-census"
 
 # INTERRUPTED: vmsync catches SIGINT/SIGTERM itself (cleanup, then a plain
 # os.Exit(1) -- see cmd/vmsync/main.go's own signal handling), so a Ctrl+C
@@ -194,6 +194,7 @@ Options:
                             12  wedge       24  supervise
                                                      25  exclude
                                                      26  generation
+                                                     27  qmp-census
                            Or one of two shorthands, used on their own rather
                            than inside a list:
                              all             every stage above, in that order
@@ -536,7 +537,23 @@ collide. WHICH one did
 the work is a finding about the host rather than a detail -- the retry means a fresh
 bitmap is not in the image yet, the sweep means it was -- so the stage prints a ROUTE
 line, quotes the line from vmsync's own log that decided it, and records an INFO row the
-verdict ignores. It prints an EVIDENCE block at each step the way stage 22 does. It
+verdict ignores. There are THREE routes now, and the census one is tested first because it
+and the plain sweep both end in the same log line: the retry, the sweep informed by qemu's
+own bitmap list, and the sweep from the image alone. Which one ran says whether this host
+writes a fresh bitmap into the file, and on the pair this was written against it does not --
+so asking qemu is what makes a live orphan findable, and the stage grades that claim rather
+than only recording it.
+
+Three checks hang off the route. The monitor taint must be announced BEFORE it is paid,
+because asking qemu marks the domain custom-monitor for the life of its run and only a
+restart clears it, so an operator who finds that mark needs vmsync's log to explain it. On
+the census route the planted bitmap must appear in the line naming what qemu holds that the
+image does not, which is the end-to-end proof that the monitor read and not the qcow2
+directory found it; on the image route that check is N/A rather than SKIP, because nothing
+is missing -- that host simply flushed the bitmap out. And the unproven-absence warning is
+graded three ways: absent when the audit found bitmaps, absent when qemu proved the absence,
+and DUE when the audit came back empty with only the image having answered.
+It prints an EVIDENCE block at each step the way stage 22 does. It
 shares stage 22's helpers, and it cleans up by adopting and deleting rather than by
 printing a recipe, because a bitmap left in the chain's name space would break every
 later sync for the pair -- including the rest of the bench run. The sync it runs
@@ -606,6 +623,28 @@ unrecognised value still refuses, fail-closed; and removing the field makes the 
 sync again, which is the property that makes the feature usable at all. It writes to
 the bench SOURCE domain, so it restores the element verbatim on EXIT as well as
 RETURN -- an exclusion left behind would refuse every sync in every later stage.
+
+Stage 27 (qmp-census) is a PROBE, like stage 22, and asks the PLATFORM rather than
+grading vmsync: a FAIL is this libvirt and this qemu answering differently from the
+host the bitmap census was measured on. vmsync asks qemu directly for a domain's
+dirty-bitmap list, because no supported libvirt API enumerates them and the qcow2
+directory cannot show a bitmap made during the running qemu's life. Everything about
+PARSING that answer is unit-tested against a captured reply; what no unit test can
+reach is whether this host still behaves the way the design assumes, which is also
+exactly what would change silently under a libvirt upgrade. Six checks: the monitor
+answers the query at all; the reply still keys each node by its disk's file path,
+which is the only key the mapping uses and never the node name, whose number does
+not follow disk order; the bitmaps still sit on the qcow2 node and not on the
+protocol child, which reports the same path and would otherwise be counted twice for
+one disk; qemu still reports a bitmap the image does not carry, which is the premise
+the whole route exists for, asserted here directly rather than inferred from stage 23
+clearing something; a read-only connection is still refused, which is what vmsync's
+own degradation path is written on; and libvirt still records the taint once per
+domain RUN rather than per call, because that is the difference between one log line
+per guest boot and one per reinit. It is READ-ONLY apart from one seeding sync: the
+live chain's own bitmap is already a bitmap qemu holds and the image lacks, so there
+is no fixture to plant and nothing to clean up -- a stage that cannot leave a mess
+cannot leave one behind on a failure either.
 EOF
 }
 
@@ -4900,7 +4939,7 @@ stage_fence_agent() {
 # counting as one of its own transport runs -- so a full --stages all run
 # reported Stage 1 as FAILED, with a count of "N of M vmsync runs exited
 # non-zero" that no transport combination in the matrix table accounts for.
-NON_MATRIX_SCENARIOS='^(generation$|verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$|colocated$|leftovers$|reinit-order$|lock-lease$|redefine-probe$|reinit-orphan$|supervise$|exclude$)'
+NON_MATRIX_SCENARIOS='^(generation$|verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$|colocated$|leftovers$|reinit-order$|lock-lease$|redefine-probe$|reinit-orphan$|supervise$|exclude$|qmp-census$)'
 
 # stage_pattern STAGE -> the regex matching that stage's scenario column.
 # --- Stage 8: verify after a long incremental chain --------------------------
@@ -10936,26 +10975,169 @@ stage_reinit_orphan() {
 
 	# WHICH ROUTE, said loudly and recorded, not left in the console.
 	#
-	# "It worked" and "it worked via the retry" are different findings about the
-	# host: the retry means the sweep could not see the bitmap, which says a
-	# fresh orphan is not in the image yet, while the sweep means it was. This
-	# used to be one log line among the full vmsync command echoes, where the
-	# owner had to go looking for it -- so it is quoted from vmsync's own output
-	# rather than paraphrased, and written to the results so a later run can be
-	# compared without re-reading a transcript.
+	# Three routes now, and which one ran is a finding about the HOST rather
+	# than a detail, because each says something different about whether a
+	# fresh bitmap is in the image yet:
+	#
+	#   the retry          -- the sweep saw nothing, qemu refused the name, and
+	#                         CreateCheckpoint adopted it and tried again.
+	#   the census sweep   -- the sweep found it because qemu's own bitmap list
+	#                         was unioned into the audit. The image still could
+	#                         not see it; this is the measured steady state on
+	#                         a running source.
+	#   the image sweep    -- the sweep found it in the qcow2 directory with no
+	#                         help from qemu, which means this host flushes a
+	#                         fresh bitmap into the file.
+	#
+	# The census must be tested BEFORE the plain sweep: both end in "cleared
+	# the source", so testing the sweep first would report every census run as
+	# an image read and quietly retire the distinction this row exists for.
+	# Quoted from vmsync's own output rather than paraphrased, and written to
+	# the results so a later run can be compared without re-reading a
+	# transcript.
 	local route="" evidence=""
 	if evidence="$(grep -m1 'adopting that bitmap so it can be deleted' "$RUN_LOG" 2>/dev/null)"; then
 		route="the self-healing retry in CreateCheckpoint"
 		log "   ROUTE: $route. The sweep after the chain drop could not see the bitmap, qemu refused the name, and vmsync adopted it and tried again -- so on this host a bitmap made during the running qemu's life is not in the image."
+	elif grep_q 'do not carry yet' "$RUN_LOG" && evidence="$(grep -m1 'cleared the source' "$RUN_LOG" 2>/dev/null)"; then
+		route="the sweep after the chain drop, informed by qemu's own bitmap list"
+		log "   ROUTE: $route. qemu reported a bitmap its qcow2 files do not carry yet, the audit unioned that in, and the sweep cleared it -- so on this host a bitmap made during the running qemu's life is NOT in the image, and asking qemu is what found it."
 	elif evidence="$(grep -m1 'cleared the source' "$RUN_LOG" 2>/dev/null)"; then
-		route="the sweep after the chain drop"
-		log "   ROUTE: $route, before any checkpoint was attempted -- so on this host the orphan WAS in the image and the audit could see it."
+		route="the sweep after the chain drop, from the image alone"
+		log "   ROUTE: $route, with qemu reporting nothing the image did not already carry -- so on this host the orphan WAS in the image and the audit could see it unaided."
 	else
 		route="unexplained"
 		warn "neither the sweep nor the retry said anything in $RUN_LOG, so how $probe went is unexplained. The checks above still hold -- it is gone and the chain is sound -- but which code path did it is not in evidence."
 	fi
 	[ -n "$evidence" ] && log "     vmsync said: $(printf '%s' "$evidence" | tr -s ' ' | cut -c1-400)"
 	results_row "$CSV" "$sc" route INFO "" "" "" "" "" "INFO cleared by $route"
+
+	# THE COST OF ASKING QEMU MUST BE ANNOUNCED BEFORE IT IS PAID.
+	#
+	# Asking qemu marks the domain "tainted: custom-monitor" in libvirt's own
+	# log, against that domain's RUN, and only restarting the guest clears it.
+	# An operator who finds that mark must be able to learn from vmsync's log
+	# why it is there; otherwise the first they hear of it is a support
+	# question about a domain their hypervisor calls tainted. vmsync says it
+	# BEFORE the call, because libvirt taints before qemu sees the command and
+	# a run killed inside the call must still have left the record.
+	#
+	# Graded unconditionally: this stage needs a RUNNING source and stands down
+	# otherwise, and on a running source the query is always attempted -- even
+	# where it is then refused, which is itself a case the notice must cover.
+	local taint_label="the monitor taint is announced before it is paid"
+	if grep_q -- 'tainted: custom-monitor' "$RUN_LOG"; then
+		fo_check "$sc" "$taint_label" 0
+	else
+		fo_check "$sc" "$taint_label" 1 \
+			"vmsync asked qemu for $SOURCE_DOMAIN's bitmap list without saying in its own log that doing so marks the domain tainted. libvirt records that mark for the life of the domain's run and only a restart clears it, so an operator finding it has nothing from vmsync to explain it"
+	fi
+
+	# AND WHETHER ASKING QEMU IS WHAT FOUND IT.
+	#
+	# The route already says which code path cleared the orphan; this grades
+	# the claim underneath it. On the census route the planted bitmap must
+	# appear in the line reporting what qemu holds that the image does not --
+	# which is the end-to-end proof that the monitor read, and not the qcow2
+	# directory, is what made a live orphan findable. N/A rather than SKIP on
+	# the image route: nothing is missing there, that host simply flushes a
+	# fresh bitmap into the file and the census had nothing to add.
+	local found_label="qemu's own list is what found the planted orphan"
+	case "$route" in
+	*"informed by qemu's own bitmap list"*)
+		if grep_q -F -- "$probe" "$RUN_LOG" && grep_q -- 'do not carry yet' "$RUN_LOG"; then
+			fo_check "$sc" "$found_label" 0
+		else
+			fo_check "$sc" "$found_label" 1 \
+				"the route says qemu's list informed the sweep, but $RUN_LOG does not name $probe as a bitmap qemu holds that the image does not carry. One of the two is wrong, and the route is derived from the weaker evidence"
+		fi
+		;;
+	*"from the image alone"*)
+		ungraded_row "$sc" "$found_label" N/A \
+			"this host wrote the fresh bitmap into the qcow2, so the image read found it unaided and asking qemu added nothing"
+		;;
+	*)
+		ungraded_row "$sc" "$found_label" SKIP \
+			"the route is \"$route\", so what found the orphan is not in evidence"
+		;;
+	esac
+
+	# AND WHETHER AN EMPTY SWEEP ADMITTED IT PROVED NOTHING.
+	#
+	# The route is not only a finding about the host, it is also the condition
+	# of another check. The retry route means the sweep after the chain drop
+	# read the images, found nothing, and was wrong -- the orphan was there,
+	# and the retry had to clear it. That is the one case where an empty answer
+	# is not an answer: the read returns the qcow2 bitmap directory as the FILE
+	# holds it, and a running qemu has not written this generation's bitmaps
+	# there yet. unprovenAbsenceReport is what says so to the operator, and
+	# this stage is the only place that condition is manufactured on purpose,
+	# so it is the only place the warning can be checked end to end.
+	#
+	# Checked BOTH ways, because the wrong half of a two-sided property is the
+	# half that passes by accident. On the sweep route the warning would be
+	# false -- bitmaps were found and cleared, so there is no absence to doubt
+	# -- and an operator told to reboot a guest to settle a question that was
+	# already settled stops reading the warning at all.
+	#
+	# One label whichever way it reads, so two runs on different hosts are
+	# diffable on a named check rather than on whichever branch each took.
+	#
+	# THE WARNING IS DUE EXACTLY WHEN THE AUDIT ENDED UP WITH NOTHING AND
+	# COULD NOT PROVE IT, which is three observable cases and not two:
+	#
+	#   any sweep route      -- the audit found bitmaps, so there was no
+	#                           absence to doubt and the warning must be ABSENT.
+	#                           Matched on the prefix, because the route string
+	#                           now also says which reader informed the sweep.
+	#   nothing found, qemu
+	#   answered             -- the absence IS proven, and the warning must be
+	#                           ABSENT. Telling an operator to save/restore a
+	#                           production guest to settle a question qemu
+	#                           answered a moment ago is how a warning stops
+	#                           being read.
+	#   nothing found, qemu
+	#   did not answer       -- the warning is DUE. Every census failure note
+	#                           says the run has "only the qcow2 directory to
+	#                           go on", which is what distinguishes this from
+	#                           the case above.
+	local unproven_label="an empty bitmap sweep admits it proves nothing"
+	local unproven="" read_failed="" census_failed=""
+	unproven="$(grep -m1 'proof there are none' "$RUN_LOG" 2>/dev/null || true)"
+	read_failed="$(grep -m1 'disks for leftover checkpoint bitmaps after discarding' "$RUN_LOG" 2>/dev/null || true)"
+	census_failed="$(grep -m1 'only the qcow2 directory to go on' "$RUN_LOG" 2>/dev/null || true)"
+	case "$route" in
+	"the sweep after the chain drop"*)
+		if [ -n "$unproven" ]; then
+			fo_check "$sc" "$unproven_label" 1 \
+				"the sweep found the orphan and cleared it, yet $RUN_LOG also carries the warning that an absence could not be proven. That warning belongs to the empty-read branch alone; here it sends an operator to reboot a guest over a question this run already answered"
+		else
+			fo_check "$sc" "$unproven_label" 0
+		fi
+		;;
+	*)
+		if [ -n "$read_failed" ] && [ -n "$census_failed" ]; then
+			# Neither reader answered, so there was no audit to draw a
+			# conclusion from. Each has its own warning; grading this one on
+			# it would be grading the wrong branch.
+			ungraded_row "$sc" "$unproven_label" SKIP \
+				"neither the image read nor qemu answered, so the run never reached the empty audit this check is about"
+		elif [ -n "$census_failed" ]; then
+			if [ -n "$unproven" ]; then
+				fo_check "$sc" "$unproven_label" 0
+				log "     vmsync said: $(printf '%s' "$unproven" | tr -s ' ' | cut -c1-400)"
+			else
+				fo_check "$sc" "$unproven_label" 1 \
+					"the audit came back empty on a RUNNING $SOURCE_DOMAIN with qemu unavailable -- so the only reader that answered was the qcow2 directory, which cannot show $probe while this qemu holds the image -- and nothing in $RUN_LOG says that answer proves nothing. An operator reads 'no leftover checkpoint bitmaps' as 'there are none'"
+			fi
+		elif [ -n "$unproven" ]; then
+			fo_check "$sc" "$unproven_label" 1 \
+				"qemu answered and the audit came back empty, yet $RUN_LOG still says the absence cannot be proven. It can: qemu's own list covered every disk. Sending an operator to save/restore a production guest to settle a question that was just settled is how a warning stops being read"
+		else
+			fo_check "$sc" "$unproven_label" 0
+		fi
+		;;
+	esac
 
 	# --- and the pair still works -------------------------------------------
 	#
@@ -11088,8 +11270,15 @@ stage_generation() {
 	}
 
 	# --- 26a. a live chain, and its names carry a generation ----------------
+	#
+	# The seed is a -reinit for the same reason stage 23's is: a plain FULL sync
+	# refuses to overwrite a target disk that already exists, and in stage order
+	# this stage runs after ones that leave a complete replica behind -- so a
+	# plain seed stands the whole stage down and its result goes unmeasured.
+	# Safe here because the orphan is planted AFTER this sync, not before: a
+	# reinit at this point has nothing of this stage's fixture to clear.
 	log_state "before seeding"
-	bench_sync "$sc" baseline
+	bench_sync "$sc" baseline -reinit
 	if ! bench_sync_ok; then
 		warn "SKIP $sc: the seeding sync failed (exit ${RUN_RC:-0}), so there is no chain to read a generation from. $(log_reason "$RUN_LOG")$(bench_sync_hint)"
 		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP seeding sync failed"
@@ -11203,6 +11392,248 @@ stage_generation() {
 	stage_cleanup_generation
 	unset -f stage_cleanup_generation
 	return 0
+}
+
+stage_qmp_census() {
+	log "=== Stage 27: PROBE -- can vmsync ask qemu for its bitmap list, and what does it cost? ==="
+	local sc=qmp-census
+	local fo_ok=0
+
+	# A PROBE, like stage 22, and for the same reason: every check here asks the
+	# PLATFORM a question whose answer decides whether a design is available on
+	# this host, rather than grading vmsync. A FAIL is this libvirt and this
+	# qemu answering differently from the host the design was measured on, and
+	# the right response is to read the row rather than to look for a bug.
+	#
+	# What it establishes, and why a unit test cannot. pkg/unsupportedqmp parses
+	# query-named-block-nodes and maps its nodes onto the disks vmsync manages;
+	# every branch of that is unit-tested against a captured reply with an
+	# injected query, so what remains unproven is everything about the real
+	# thing: that this libvirt will pass the command through at all, that the
+	# reply still carries the three fields the mapping depends on, that it still
+	# reports a bitmap the image cannot show, that a read-only connection really
+	# is refused, and what the taint actually costs. Those are host facts. They
+	# are also exactly the facts that would change silently under a libvirt
+	# upgrade, which is the stated risk of an unsupported interface.
+	#
+	# READ-ONLY, apart from one seeding sync. It plants nothing and deletes
+	# nothing: the LIVE chain's own bitmap is already a bitmap qemu holds and
+	# the image does not carry, which is the premise the census exists for, so
+	# there is no fixture to build and nothing to clean up afterwards. That is
+	# deliberate -- stages 22 and 23 both manufacture an orphan and both have to
+	# unwind it, and a stage that cannot leave a mess is a stage that cannot
+	# leave one behind on a failure either.
+	if [ "$DRY_RUN" = yes ]; then
+		log "   SKIP (dry run)"
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+	if [ -z "${SOURCE_HOST:-}" ] || [ -z "${TAMPER_DISK_DEV:-}" ]; then
+		warn "SKIP stage 27: needs SOURCE_HOST and TAMPER_DISK_DEV in $CONF -- it compares qemu's bitmap list against the source's own image file."
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP SOURCE_HOST/TAMPER_DISK_DEV unset"
+		return 0
+	fi
+	if [ "$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN")" != "running" ]; then
+		warn "SKIP stage 27: $SOURCE_DOMAIN is not running, and every question here is about what qemu holds while it has the image open. Start it and re-run."
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP source not running"
+		return 0
+	fi
+
+	local active
+	active="$(disk_source_path "$SOURCE_URI" "$SOURCE_DOMAIN" "$TAMPER_DISK_DEV")" || true
+	if [ -z "$active" ]; then
+		warn "SKIP stage 27: could not resolve $SOURCE_DOMAIN's active path for dev='$TAMPER_DISK_DEV'."
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP source disk path unresolved"
+		return 0
+	fi
+	PROBE_ACTIVE="$active"
+	log "   probing against $SOURCE_DOMAIN dev=$TAMPER_DISK_DEV path=$active on $SOURCE_HOST"
+
+	# A chain to look at. Seeded with -reinit for the reason stages 23 and 26
+	# are: a plain full sync refuses to overwrite a target disk that already
+	# exists, and in stage order this runs after stages that leave a complete
+	# replica, so a plain seed would stand the whole stage down.
+	bench_sync "$sc" seed -reinit
+	if ! bench_sync_ok; then
+		warn "SKIP stage 27: the seeding sync failed (exit ${RUN_RC:-0}), so there is no live checkpoint whose bitmap qemu would be holding. $(log_reason "$RUN_LOG")$(bench_sync_hint)"
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP seeding sync failed"
+		return 0
+	fi
+
+	local live
+	live="$(virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>/dev/null | grep '^vmsync-cpt-' | head -1 || true)"
+	if [ -z "$live" ]; then
+		warn "SKIP stage 27: the seeding sync left no vmsync checkpoint on $SOURCE_DOMAIN, so there is no bitmap qemu should be holding."
+		results_row "$CSV" "$sc" stood-down "" "" "" "" "" "" "SKIP no live checkpoint"
+		return 0
+	fi
+	log "   the live chain's tip is $live"
+
+	# --- 27a. does the monitor answer at all? -------------------------------
+	#
+	# The gate. Everything below reads this one reply, so a host that will not
+	# pass the command through has nothing further to be asked -- and that is a
+	# finding, not an error: it is the case pkg/unsupportedqmp degrades to a
+	# warning for, and a pair on such a host keeps the image read alone.
+	local reply
+	reply="$(virsh_uri "$SOURCE_URI" qemu-monitor-command "$SOURCE_DOMAIN" \
+		'{"execute":"query-named-block-nodes"}' 2>&1)" || true
+	log "   EVIDENCE monitor reply: $(printf '%s' "$reply" | tr -s ' \n' ' ' | cut -c1-300)"
+
+	case "$reply" in
+	*'"return"'*)
+		fo_check "$sc" "the monitor answers the bitmap query" 0
+		;;
+	*)
+		fo_check "$sc" "the monitor answers the bitmap query" 1 \
+			"virsh qemu-monitor-command on $SOURCE_DOMAIN did not return a QMP reply with a 'return' key: $(printf '%s' "$reply" | tr -s ' \n' ' ' | cut -c1-200). On this host vmsync's bitmap census is unavailable and every sync falls back to the qcow2 directory alone, which cannot show a bitmap made during the running qemu's life"
+		for lbl in \
+			"the reply keys each disk by its file path" \
+			"the bitmaps sit on the qcow2 node" \
+			"qemu reports a bitmap the image does not carry"
+		do
+			ungraded_row "$sc" "$lbl" SKIP "the monitor did not answer, so there is no reply to read"
+		done
+		stage_qmp_census_readonly_and_taint "$sc"
+		[ "$fo_ok" = 0 ] || return 1
+		return 0
+		;;
+	esac
+
+	# --- 27b. the mapping key ----------------------------------------------
+	#
+	# vmsync ties a node to a disk by the node's `file` field against the disk's
+	# own source path, and by nothing else -- never the node name, whose number
+	# does NOT follow disk order (measured: libvirt-1-format was vdb and
+	# libvirt-2-format was vda on a two-disk domain). If this field ever stops
+	# being the disk's path, the mapping silently claims nothing, which the
+	# census reports as an unplaceable node rather than as an absence.
+	if printf '%s' "$reply" | tr -d ' \n' | grep_q -F -- "\"file\":\"$active\""; then
+		fo_check "$sc" "the reply keys each disk by its file path" 0
+	else
+		fo_check "$sc" "the reply keys each disk by its file path" 1 \
+			"no block node in the reply carries \"file\":\"$active\", which is the only key vmsync maps a node to a disk by. Without it the census can place nothing and reports every bitmap as belonging to a file it does not manage"
+	fi
+
+	# --- 27c. which node carries the bitmaps -------------------------------
+	#
+	# The format node, never the protocol child. They report the SAME file
+	# path, so a mapping keyed on the path alone sees two nodes per disk; what
+	# makes it single-valued is that only the qcow2 node carries bitmaps. A
+	# host where the protocol node carried them too would make the census
+	# double-count, which adoptionPlan turns into an adoption XML naming one
+	# target device twice.
+	local fmt_has prot_has
+	fmt_has="$(printf '%s' "$reply" | tr -d ' \n' | grep -o '"drv":"qcow2"[^}]*"dirty-bitmaps":\[' | wc -l)"
+	prot_has="$(printf '%s' "$reply" | tr -d ' \n' | grep -o '"drv":"file"[^}]*"dirty-bitmaps":\[{' | wc -l)"
+	if [ "${fmt_has:-0}" -ge 1 ] && [ "${prot_has:-0}" = 0 ]; then
+		fo_check "$sc" "the bitmaps sit on the qcow2 node" 0
+	else
+		fo_check "$sc" "the bitmaps sit on the qcow2 node" 1 \
+			"qcow2 nodes carrying bitmaps: ${fmt_has:-0}; protocol nodes carrying bitmaps: ${prot_has:-0}. vmsync expects bitmaps on the format node only -- the protocol child reports the same file path, so bitmaps on both would be counted twice for one disk and the adoption XML would name its target device twice"
+	fi
+
+	# --- 27d. THE PREMISE --------------------------------------------------
+	#
+	# The reason the whole unsupported route exists, asserted directly instead
+	# of inferred from stage 23 clearing something. qemu must report the live
+	# chain's bitmap and `qemu-img` must NOT: that gap is what the image read
+	# cannot cross, and it is what makes an orphan on a running source
+	# invisible without asking qemu.
+	#
+	# A host that reports it in BOTH is not broken -- it flushes a fresh bitmap
+	# into the file -- but it is a different host from the one this design was
+	# measured on, and the census is then redundant rather than load-bearing.
+	# Recorded as a FAIL so the difference is not lost, with the row saying so.
+	local in_qemu=no in_image=no
+	printf '%s' "$reply" | tr -d ' \n' | grep_q -F -- "\"name\":\"$live\"" && in_qemu=yes
+	case " $(raw_bitmaps) " in
+	*" $live "*) in_image=yes ;;
+	esac
+	log "   EVIDENCE $live: held by qemu=$in_qemu, in the qcow2 directory=$in_image"
+
+	if [ "$in_qemu" = yes ] && [ "$in_image" = no ]; then
+		fo_check "$sc" "qemu reports a bitmap the image does not carry" 0
+	elif [ "$in_qemu" = no ]; then
+		fo_check "$sc" "qemu reports a bitmap the image does not carry" 1 \
+			"qemu does not report $live, which libvirt lists as a live checkpoint on $SOURCE_DOMAIN. The census would then add nothing to the image read and an orphan made during the running qemu's life stays invisible -- the state finding 3.11 describes"
+	else
+		fo_check "$sc" "qemu reports a bitmap the image does not carry" 1 \
+			"$live is in BOTH qemu's list and the qcow2 directory, so on this host a fresh bitmap reaches the file while qemu still holds the image. Nothing is broken and the clearing still works -- but the census is redundant here rather than load-bearing, and this host cannot demonstrate the gap the route was built for"
+	fi
+
+	stage_qmp_census_readonly_and_taint "$sc"
+
+	[ "$fo_ok" = 0 ] || return 1
+	return 0
+}
+
+# The two cost-and-safety checks, shared by the answering and non-answering
+# paths above: whichever way the monitor replied, a read-only connection must
+# still be refused and the taint must still be accounted for.
+stage_qmp_census_readonly_and_taint() {
+	local sc="$1"
+
+	# --- 27e. the refusal the non-fatal path rests on ----------------------
+	#
+	# vmsync opens a read-write connection, so it never meets this itself --
+	# but an operator running the same query by hand with `virsh -r` does, and
+	# pkg/unsupportedqmp degrades to a warning quoting libvirt verbatim when it
+	# happens. The refusal is in the public wrapper, before any driver
+	# dispatch, which is why no ACL setting re-enables it and why it taints
+	# nothing. Asserted because "a read-only connection is refused" is a claim
+	# the code's own comments make.
+	local ro_out ro_rc
+	ro_out="$(virsh -c "$SOURCE_URI" -r qemu-monitor-command "$SOURCE_DOMAIN" \
+		'{"execute":"query-named-block-nodes"}' 2>&1)" && ro_rc=0 || ro_rc=$?
+	log "   EVIDENCE read-only attempt: exit=$ro_rc $(printf '%s' "$ro_out" | tr -s ' \n' ' ' | cut -c1-200)"
+	if [ "$ro_rc" != 0 ]; then
+		fo_check "$sc" "a read-only connection is refused the monitor" 0
+	else
+		fo_check "$sc" "a read-only connection is refused the monitor" 1 \
+			"a read-only libvirt connection was allowed to run qemu-monitor-command on $SOURCE_DOMAIN. vmsync's own fallback is written on the premise that this is refused before any driver dispatch; a host where it succeeds lets a read-only caller taint a domain"
+	fi
+
+	# --- 27f. what the taint actually costs --------------------------------
+	#
+	# The price of the whole route, read from libvirt's own log rather than
+	# assumed: the mark is per domain RUN, so it must be there once after the
+	# seeding sync asked, and asking again must not add a second. If a future
+	# libvirt made it per CALL, the cost of the census would change from one
+	# line per guest boot to one per reinit and the owner would want to know.
+	#
+	# SKIP rather than FAIL when the log cannot be found: this stage's rule is
+	# that a check whose evidence is unreadable is not a check that passed.
+	local qlog=""
+	for cand in "$HOME/.cache/libvirt/qemu/log/$SOURCE_DOMAIN.log" \
+		"/var/log/libvirt/qemu/$SOURCE_DOMAIN.log"; do
+		if [ -r "$cand" ]; then
+			qlog="$cand"
+			break
+		fi
+	done
+	if [ -z "$qlog" ] || [ "$SOURCE_LOCAL" != yes ]; then
+		ungraded_row "$sc" "libvirt records the monitor taint once per run" SKIP \
+			"could not read $SOURCE_DOMAIN's qemu log on this host, so what the taint costs is not in evidence"
+		return 0
+	fi
+
+	local before after
+	before="$(grep -c 'is tainted: custom-monitor' "$qlog" 2>/dev/null || true)"
+	virsh_uri "$SOURCE_URI" qemu-monitor-command "$SOURCE_DOMAIN" \
+		'{"execute":"query-named-block-nodes"}' >/dev/null 2>&1 || true
+	after="$(grep -c 'is tainted: custom-monitor' "$qlog" 2>/dev/null || true)"
+	log "   EVIDENCE taint lines in $qlog: before=$before after a second query=$after"
+
+	if [ "${before:-0}" -ge 1 ] && [ "${after:-0}" = "${before:-0}" ]; then
+		fo_check "$sc" "libvirt records the monitor taint once per run" 0
+	elif [ "${before:-0}" = 0 ]; then
+		fo_check "$sc" "libvirt records the monitor taint once per run" 1 \
+			"no 'is tainted: custom-monitor' line in $qlog after a sync that asked qemu for its bitmap list. Either this libvirt does not record the taint -- in which case the route is cheaper here than documented -- or the census never ran during the seeding sync, which the route line of stage 23 would also show"
+	else
+		fo_check "$sc" "libvirt records the monitor taint once per run" 1 \
+			"the taint count went from ${before:-0} to ${after:-0} when a second query was issued, so on this host the mark is recorded per CALL rather than per domain run. The cost of asking qemu is then one log line per reinit instead of one per guest boot, and vmsync's own notice -- said once per domain per process -- understates it"
+	fi
 }
 
 # Stage 24: the commands vmsync runs ON THE TARGET must be supervised --
@@ -12235,6 +12666,7 @@ stage_pattern() {
 	# cleanup row is a failure of the stage and belongs to its verdict.
 	reinit-orphan) printf '^(reinit-orphan|precondition|stood-down|cleanup)$' ;;
 	generation) printf '^(generation|precondition|stood-down|cleanup)$' ;;
+	qmp-census) printf '^(qmp-census|precondition|stood-down|cleanup)$' ;;
 	supervise) printf '^(supervise|precondition)$' ;;
 	exclude) printf '^(exclude|precondition)$' ;;
 	*) printf '$^' ;; # matches nothing
@@ -12281,6 +12713,7 @@ stage_number() {
 	supervise) printf '24' ;;
 	exclude) printf '25' ;;
 	generation) printf '26' ;;
+	qmp-census) printf '27' ;;
 	*) printf '?' ;;
 	esac
 }
@@ -12947,6 +13380,20 @@ generate_report() {
                         section_no_rows_note generation "opt in with \`--stages generation\`; it plants a dead generation's bitmap and checks that an ordinary sync reports it, leaves it alone, and refuses an incremental whose target records another generation. Needs SOURCE_HOST and TAMPER_DISK_DEV set"
                 fi
                 echo
+                echo "## Stage 27: PROBE -- can vmsync ask qemu for its bitmap list, and what does it cost?"
+                echo
+                if awk -F, 'NR>1 && $1=="qmp-census" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="qmp-census" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                        echo
+                        echo "Read the rows as the platform's answer on this host and build: a FAIL here is"
+                        echo "this libvirt and this qemu answering differently from the host the bitmap"
+                        echo "census was measured on, not a vmsync defect. It plants nothing."
+                else
+                        section_no_rows_note qmp-census "opt in with \`--stages qmp-census\`; it asks qemu directly for the source's dirty-bitmap list and compares that against the qcow2 directory, and needs SOURCE_HOST and TAMPER_DISK_DEV set and a running source"
+                fi
+                echo
                 echo "Full machine-readable data: \`results.csv\`. Per-run logs: \`logs/\`. Raw prometheus textfiles: \`prom/\`."
         } >"$report"
         # Only the report reads it, and a stale one left in the run directory
@@ -13023,6 +13470,7 @@ for s in "${stage_list[@]}"; do
         redefine-probe) stage_redefine_probe || stage_rc=$? ;;
         reinit-orphan) stage_reinit_orphan || stage_rc=$? ;;
         generation) stage_generation || stage_rc=$? ;;
+        qmp-census) stage_qmp_census || stage_rc=$? ;;
         supervise) stage_supervise || stage_rc=$? ;;
         exclude) stage_exclude || stage_rc=$? ;;
         *) die "unknown stage '$s' in --stages (want one of: $ALL_STAGES -- or the shorthands 'all' and 'all-but-matrix', which stand alone rather than inside a list)" ;;
