@@ -224,7 +224,7 @@ func TestAdoptionPlanSetsAsideABitmapOnADiskTheDomainDoesNotList(t *testing.T) {
 // the error has to name every failure rather than the first.
 func TestClearingAttemptsEveryOrphanAndNamesEveryFailure(t *testing.T) {
 	var asked []string
-	_, err := clearOrphanBitmapsOnline(testDomain, map[string][]string{
+	_, _, err := clearOrphanBitmapsOnline(testDomain, map[string][]string{
 		"/vm/a.qcow2": {"vmsync-cpt-000001", "vmsync-cpt-000002", "vmsync-cpt-000003"},
 	}, testDisks(), func(bitmap string, devs []string) error {
 		asked = append(asked, bitmap)
@@ -251,7 +251,7 @@ func TestClearingAttemptsEveryOrphanAndNamesEveryFailure(t *testing.T) {
 // The count is what tells a run that cleared nothing apart from a run that had
 // nothing to clear, so it counts removals and not attempts.
 func TestClearingCountsOnlyWhatItRemoved(t *testing.T) {
-	cleared, err := clearOrphanBitmapsOnline(testDomain, map[string][]string{
+	cleared, _, err := clearOrphanBitmapsOnline(testDomain, map[string][]string{
 		"/vm/a.qcow2": {"vmsync-cpt-000001", "vmsync-cpt-000002"},
 	}, testDisks(), func(bitmap string, devs []string) error { return nil })
 	if err != nil {
@@ -261,7 +261,7 @@ func TestClearingCountsOnlyWhatItRemoved(t *testing.T) {
 		t.Errorf("cleared=%d, want 2", cleared)
 	}
 
-	cleared, err = clearOrphanBitmapsOnline(testDomain, map[string][]string{
+	cleared, _, err = clearOrphanBitmapsOnline(testDomain, map[string][]string{
 		"/vm/a.qcow2": {"vmsync-cpt-000001"},
 	}, testDisks(), func(bitmap string, devs []string) error { return errors.New("no") })
 	if err == nil {
@@ -276,7 +276,7 @@ func TestClearingCountsOnlyWhatItRemoved(t *testing.T) {
 // nothing was attempted for it: reporting success would be the clean sweep of
 // something still there.
 func TestClearingFailsOnABitmapItCannotAddress(t *testing.T) {
-	cleared, err := clearOrphanBitmapsOnline(testDomain, map[string][]string{
+	cleared, _, err := clearOrphanBitmapsOnline(testDomain, map[string][]string{
 		"/vm/stranger.qcow2": {"vmsync-cpt-000009"},
 	}, testDisks(), func(bitmap string, devs []string) error {
 		t.Errorf("a bitmap with no target device was attempted anyway: %s", bitmap)

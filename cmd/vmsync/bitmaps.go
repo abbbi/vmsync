@@ -200,6 +200,72 @@ func reportLeftoverBitmaps(domain string, byDisk map[string][]string) {
 	}
 }
 
+// unprovenAbsenceReport returns what to tell an operator when the post-drop
+// bitmap read came back EMPTY on a source whose image qemu still holds open,
+// or "" when that empty answer can be trusted.
+//
+// The other half of the limit leftoverCheckpointBitmaps states from its own
+// side: what that read returns is the qcow2 bitmap directory ON DISK, and qemu
+// does not write a bitmap there until it closes the image. So a non-empty
+// answer is always true, while an empty one is only true for a source whose
+// image is closed -- a shut-down domain. Anywhere else the empty set means
+// "nothing in the file", which is not the claim "no orphan", and the
+// difference is exactly the orphan a failed run has just made.
+//
+// Measured 2026-11-03 on one paused domain, read both ways at each step: with
+// libvirt's checkpoint alive and listed, qemu-img reported no bitmap at all
+// while qemu's own view reported it recording and persistent. The blindness is
+// therefore not specific to orphans and does not depend on how the bitmap was
+// made -- it lasts as long as the qemu process does, and closing the image is
+// what ends it. A guest reboot does that; so does a virsh save followed by a
+// restore, which keeps guest state and was measured to leave the bitmap in the
+// file.
+//
+// Safe to recommend save+restore HERE specifically, which it would not be in
+// general: the same measurement showed a restore does not load the bitmap back
+// into qemu, and this report only ever fires after the chain has been dropped,
+// so there is no live bitmap left for that to strand.
+//
+// Carries no remedy for the rebuild because the rebuild needs none: the chain
+// reinit starts mints names under a fresh generation token, so a bitmap missed
+// here cannot collide with them. What it costs is qcow2 space, silently, for
+// as long as the domain keeps running.
+//
+// Pure, so the wording is testable. The single call site logs it and does
+// nothing else with it.
+func unprovenAbsenceReport(domain string, sourceActive bool, stateErr error, qemuAnswered bool) string {
+	// A closed image has already written its directory out, so a read that
+	// returned nothing was reading everything there was to read.
+	if stateErr == nil && !sourceActive {
+		return ""
+	}
+	// And qemu's own complete answer settles it for a RUNNING source, which is
+	// the one case the file read cannot. Without this the warning fires on
+	// exactly the runs where the absence has just been proven, and sends an
+	// operator to save/restore a production guest to settle a question qemu
+	// already answered. True only for a census that covered every disk and set
+	// nothing aside -- see censusResult.Proven.
+	if qemuAnswered {
+		return ""
+	}
+
+	lead := fmt.Sprintf("reinit found no leftover checkpoint bitmaps on %s, but the source is running, so that is not proof there are none", domain)
+	if stateErr != nil {
+		lead = fmt.Sprintf("reinit found no leftover checkpoint bitmaps on %s and could not tell whether the source is running (%v), so it cannot treat that as proof there are none", domain, stateErr)
+	}
+
+	return fmt.Sprintf(`%s: the check reads the qcow2 bitmap directory ON DISK, and qemu does not write a bitmap there until it closes the image -- so one created during the life of the running qemu, which is exactly what a failed run leaves behind, is invisible to it.
+
+The rebuild is not blocked and nothing here needs repairing: the chain this reinit starts carries a new generation token, so a bitmap missed here cannot collide with the names it mints. What it costs is space in the qcow2, and it keeps costing it silently for as long as the domain runs.
+
+To be sure, close the image once and run -reinit again. Either of these closes it without losing guest state:
+
+    virsh save %s /var/tmp/%s.save && virsh restore /var/tmp/%s.save
+
+or reboot the guest. Both make qemu write the bitmap directory into the file, after which this check sees any orphan and reinit clears it on its own.`,
+		lead, domain, domain, domain)
+}
+
 // orphanBitmaps reports which vmsync-named bitmaps in the images have no libvirt
 // checkpoint behind them.
 //
@@ -231,13 +297,19 @@ func reportLeftoverBitmaps(domain string, byDisk map[string][]string) {
 // attempt, what cannot be attempted at all, what to say when some of it fails
 // -- are testable without a libvirt connection, which is the only way they get
 // tested at all.
-func clearOrphanBitmapsOnline(domainName string, orphans map[string][]string, disks []disk.QcowDisk, clear func(bitmap string, devs []string) error) (cleared int, err error) {
+// Returns the NAMES it could not clear as well as the error, because the
+// caller's refusal now depends on which bitmaps they were: one the image read
+// also found is one vmsync could already see and already refused over, and one
+// only qemu reported was invisible before and must not turn a working run into
+// a refusal. See clearFailureIsFatal.
+func clearOrphanBitmapsOnline(domainName string, orphans map[string][]string, disks []disk.QcowDisk, clear func(bitmap string, devs []string) error) (cleared int, failedBitmaps []string, err error) {
 	plan, unmapped := adoptionPlan(orphans, disks)
 
 	var failed []string
 	for _, a := range plan {
 		if cerr := clear(a.Bitmap, a.Devs); cerr != nil {
 			failed = append(failed, fmt.Sprintf("%s on %s: %v", a.Bitmap, strings.Join(a.Devs, ","), cerr))
+			failedBitmaps = append(failedBitmaps, a.Bitmap)
 			continue
 		}
 		cleared++
@@ -251,13 +323,72 @@ func clearOrphanBitmapsOnline(domainName string, orphans map[string][]string, di
 	for path, names := range unmapped {
 		failed = append(failed, fmt.Sprintf("%s in %s, which %s does not list as one of its disks",
 			strings.Join(names, ", "), path, domainName))
+		failedBitmaps = append(failedBitmaps, names...)
 	}
 
+	sort.Strings(failedBitmaps)
 	if len(failed) > 0 {
-		return cleared, fmt.Errorf("could not clear %d orphaned bitmap(s) on %s: %s",
+		return cleared, failedBitmaps, fmt.Errorf("could not clear %d orphaned bitmap(s) on %s: %s",
 			len(failed), domainName, strings.Join(failed, "; "))
 	}
-	return cleared, nil
+	return cleared, nil, nil
+}
+
+// clearFailureIsFatal decides whether a clearing that failed should refuse the
+// rebuild, or report and carry on.
+//
+// FATAL IS THE DEFAULT, and the exception is narrow on purpose. A bitmap the
+// image read found is one every previous version of vmsync could see too, and
+// a rebuild has always refused when it could not clear one; nothing about
+// asking qemu changes what that failure means. A bitmap only qemu reported is
+// different in kind: before this route existed it was invisible on a running
+// source, the rebuild succeeded over it, and the orphan simply stayed. Making
+// it visible must not convert that run into a refusal -- the operator gained
+// information and would lose the verb they reach for when a pair is already
+// broken.
+//
+// Nothing is lost by carrying on. ClearOrphanBitmap rolls its adoption back
+// metadata-only when the delete fails, so the state is exactly as found, and
+// the leftover report names every bitmap, its disk and its remedy.
+//
+// onlyQemu empty means the census did not run, which makes every failure fatal
+// again -- the behaviour before this route existed, reached without a special
+// case.
+func clearFailureIsFatal(failedBitmaps []string, onlyQemu map[string][]string) bool {
+	newlyVisible := map[string]bool{}
+	for _, names := range onlyQemu {
+		for _, n := range names {
+			newlyVisible[n] = true
+		}
+	}
+	for _, b := range failedBitmaps {
+		if !newlyVisible[b] {
+			return true
+		}
+	}
+	// Reached only when every failure was newly visible. An empty failure list
+	// cannot get here: the caller does not consult this unless clearing failed.
+	return len(failedBitmaps) == 0
+}
+
+// newlyVisibleClearFailureReport is what an operator is told when a clearing
+// failed over bitmaps only qemu could see, and the rebuild carried on anyway.
+//
+// Says the three things that decision rests on, because an operator reading
+// "could not clear" and a successful exit in the same run will otherwise
+// reasonably assume one of them is wrong.
+func newlyVisibleClearFailureReport(domain string, failedBitmaps []string, clearErr error) string {
+	if len(failedBitmaps) == 0 || clearErr == nil {
+		return ""
+	}
+	return fmt.Sprintf(`reinit could not clear %d orphaned checkpoint bitmap(s) on %s, and did NOT refuse the rebuild over them: %s
+
+The underlying failure: %v
+
+These were found by asking qemu, not by reading the images, so until this version they were invisible on a running source and a rebuild simply left them in place and reported success. Refusing now would take away the one verb an operator reaches for when a pair is already broken, over a leak that was always there.
+
+Nothing was half-done: an adoption whose delete fails is rolled back so the bitmap is left exactly as it was found. The rebuild is sound and the chain it started carries a new generation token, so these names cannot collide with it. What they cost is space in the qcow2. Clear them with the domain shut down, or run -reinit again once whatever refused the delete has been dealt with.`,
+		len(failedBitmaps), domain, strings.Join(failedBitmaps, ", "), clearErr)
 }
 
 // countBitmaps totals the bitmaps across every disk, for a log line that says

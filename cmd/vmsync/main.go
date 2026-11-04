@@ -4319,6 +4319,56 @@ func run(cfg syncConfig) (runErr error) {
 		trace.Info("disk info", "disk", d.TargetDev, "format", info.Format, "virtual_size", d.VirtualSize, "path", d.Source, "discard", d.DiscardMode)
 	}
 
+	// THE ONE CALL SITE of the unsupported monitor route.
+	//
+	// Deleting that route touches three things: this closure's body, the
+	// adapter in cmd/vmsync/unsupportedcensus.go, and the package it calls.
+	// This file does not import that package and names none of its
+	// identifiers -- everything goes through the adapter -- which is what
+	// keeps the deletion a bounded change rather than an audit of all 8,900
+	// lines here.
+	//
+	// Defined here because this is the first point at which every captured
+	// value exists: qcowDisks with its backing chains resolved immediately
+	// above, the source's SSH client, the domain handle, and the bounded-call
+	// helper that keeps an unresponsive qemu from parking the run while it
+	// holds the source's run lock.
+	//
+	// WHY THE IMAGE READ IS STILL HERE. Neither reader is a superset of the
+	// other: qemu-img reports the bitmap directory the FILE holds, so it
+	// cannot see one made during the running qemu's life, and the monitor
+	// reports what qemu HOLDS, so it cannot see one left in a file that qemu
+	// never reloaded. The census unions them and only ever adds.
+	//
+	// USED BY THE REINIT PATH ONLY -- the read after the chain drop and the
+	// re-read after a clearing. Deliberately not by the pre-drop read, which
+	// would mark a domain tainted on a run that may still refuse having
+	// changed nothing, and not by the per-sync dead-generation report, which
+	// runs on every sync of every pair.
+	bitmapCensusFor := func(ctx context.Context) (censusResult, error) {
+		fromFile, fileErr := leftoverCheckpointBitmaps(ctx, sourceNeedsSSH, sourceSSHClient, qcowDisks)
+		active, activeErr := libvirtsync.DomainActive(srcDom)
+		res := bitmapCensus(censusInput{
+			Domain:    cfg.SourceDomain,
+			Disks:     qcowDisks,
+			FromFile:  fromFile,
+			FileErr:   fileErr,
+			Active:    active,
+			ActiveErr: activeErr,
+			Query: func() (string, error) {
+				return censusQuery(srcDom, cfg.SourceDomain, callOnSrcDom, srcDomCallTimeout)
+			},
+		})
+		for _, n := range res.Notes {
+			if n.Level == censusInfo {
+				trace.Info(n.Text, "vm", cfg.SourceDomain)
+				continue
+			}
+			trace.Warning(n.Text, "vm", cfg.SourceDomain)
+		}
+		return res, fileErr
+	}
+
 	targetNeedsSSH := util.UriUsesSSH(cfg.TargetURI)
 	if !targetNeedsSSH {
 		return fmt.Errorf("target URI must be ssh-based for remote target file creation")
@@ -5223,9 +5273,20 @@ func run(cfg syncConfig) (runErr error) {
 		// source carrying one was refused for a reason that no longer applies
 		// -- fail-closed with nothing behind it, on the one verb an operator
 		// reaches for when a pair is already broken.
-		leftover, err := leftoverCheckpointBitmaps(ctx, sourceNeedsSSH, sourceSSHClient, qcowDisks)
+		census, err := bitmapCensusFor(ctx)
+		leftover, leftoverProven, leftoverOnlyQemu := census.Union, census.Proven, census.OnlyQemu
+
+		// A FAILED IMAGE READ NO LONGER ENDS THE MATTER, because the other
+		// reader may have answered completely. It is still said: the two reads
+		// fail for unrelated reasons, and an unreadable qcow2 is worth chasing
+		// whether or not this particular run needed it.
+		if err != nil && leftoverProven {
+			trace.Warning("could not read the source's disks for leftover checkpoint bitmaps, but qemu's own list covered every disk, so this run is not working blind -- the unreadable image is still worth looking at",
+				"vm", cfg.SourceDomain, "error", err)
+		}
+
 		switch {
-		case err != nil:
+		case err != nil && !leftoverProven:
 			// Not fatal on its own: this is a check, and failing to RUN the
 			// check is not evidence that anything is wrong. The sync proceeds
 			// and, if there really is an orphan, fails a moment later with
@@ -5233,6 +5294,24 @@ func run(cfg syncConfig) (runErr error) {
 			trace.Warning("could not check the source's disks for leftover checkpoint bitmaps after discarding the chain; if this sync fails with \"Bitmap already exists\", that is why",
 				"vm", cfg.SourceDomain, "error", err)
 		case len(leftover) == 0:
+			// NOTHING FOUND IS NOT NOTHING THERE. The read above returns the
+			// qcow2 bitmap directory as the FILE holds it, and qemu does not
+			// write a bitmap into the file until it closes the image, so on a
+			// running source an orphan made during this qemu's life cannot
+			// appear in it -- see leftoverCheckpointBitmaps for the
+			// measurements, and unprovenAbsenceReport for what that leaves an
+			// operator to do about it.
+			//
+			// Said here rather than at the pre-drop read: before the drop an
+			// empty set is ambiguous for a second reason as well, since
+			// libvirt may legitimately still hold the checkpoints. After the
+			// drop the only thing standing between this and a census is the
+			// file's staleness, so this is where the caveat is precise enough
+			// to act on.
+			srcActive, activeErr := libvirtsync.DomainActive(srcDom)
+			if report := unprovenAbsenceReport(cfg.SourceDomain, srcActive, activeErr, leftoverProven); report != "" {
+				trace.Warning(report, "vm", cfg.SourceDomain)
+			}
 		default:
 			srcActive, activeErr := libvirtsync.DomainActive(srcDom)
 			switch {
@@ -5254,12 +5333,24 @@ func run(cfg syncConfig) (runErr error) {
 				// there because REDEFINE demands the element, and nothing
 				// validates it, so every adoption may share it.
 				adoptedAt := time.Now().Unix()
-				cleared, clearErr := clearOrphanBitmapsOnline(cfg.SourceDomain, leftover, qcowDisks,
+				cleared, failedBitmaps, clearErr := clearOrphanBitmapsOnline(cfg.SourceDomain, leftover, qcowDisks,
 					func(bitmap string, devs []string) error {
 						return libvirtsync.ClearOrphanBitmap(srcDom, bitmap, adoptedAt, qcowDisks, devs)
 					})
 				if clearErr != nil {
-					return fmt.Errorf("refusing to rebuild %s: %w", cfg.SourceDomain, clearErr)
+					// A failure over a bitmap the image read also found
+					// refuses, as it always has. One over a bitmap only qemu
+					// reported is newly visible: before vmsync asked qemu the
+					// rebuild succeeded over it and the orphan stayed, and
+					// taking away the verb an operator reaches for when a pair
+					// is already broken -- over a leak that was always there --
+					// is the worse trade. The adoption is rolled back either
+					// way, so the state is exactly as it was found.
+					if clearFailureIsFatal(failedBitmaps, leftoverOnlyQemu) {
+						return fmt.Errorf("refusing to rebuild %s: %w", cfg.SourceDomain, clearErr)
+					}
+					trace.Warning(newlyVisibleClearFailureReport(cfg.SourceDomain, failedBitmaps, clearErr),
+						"vm", cfg.SourceDomain, "bitmaps", len(failedBitmaps))
 				}
 				trace.Info("cleared the source's orphaned checkpoint bitmaps", "vm", cfg.SourceDomain, "removed", cleared)
 
@@ -5267,12 +5358,18 @@ func run(cfg syncConfig) (runErr error) {
 				// clearing that reported success is the interesting case: it
 				// is not something another attempt at the same thing fixes,
 				// and the removals said they worked.
-				after, afterErr := leftoverCheckpointBitmaps(ctx, sourceNeedsSSH, sourceSSHClient, qcowDisks)
-				if afterErr != nil {
-					trace.Warning("could not re-read the source's disks after clearing its orphaned bitmaps, so this run cannot say whether any survived",
-						"vm", cfg.SourceDomain, "error", afterErr)
+				//
+				// QEMU'S LIST ALONE HERE, not the union, and that is a fix
+				// rather than a refinement. A bitmap qemu has just let go of
+				// stays in the qcow2 directory until the image closes, so
+				// reading the file after a successful clearing reports the
+				// orphan it just removed as a survivor.
+				afterCensus, _ := bitmapCensusFor(ctx)
+				if !afterCensus.Proven {
+					trace.Warning("could not ask qemu whether the source still holds the bitmaps just cleared, so this run cannot say whether any survived; the qcow2 directory is not an answer here, because a bitmap qemu has released stays in the file until the image closes",
+						"vm", cfg.SourceDomain)
 				} else {
-					reportLeftoverBitmaps(cfg.SourceDomain, after)
+					reportLeftoverBitmaps(cfg.SourceDomain, afterCensus.FromQemu)
 				}
 			}
 		}
