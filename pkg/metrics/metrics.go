@@ -493,7 +493,7 @@ func WriteTextfile(path string, disks []DiskMetric, run RunMetric) error {
 	// helper that is missing or version-skewed disables a default-on check
 	// for every run on that host while each sync still reports success.
 	if run.ChecksumRan {
-		fmt.Fprintln(&b, "# HELP vmsync_checksum_state What the pre-commit integrity check concluded: 0=ran and matched, 1=ran and the target's bytes differ from what was sent, 2=could not be performed or was skipped (no matching vmsync-bridge-helper, or -no-checksum). Alert on 2 with a `for:` clause to ignore transient failures.")
+		fmt.Fprintln(&b, "# HELP vmsync_checksum_state What the pre-commit integrity check concluded: 0=ran and matched, 1=ran and the target's bytes differ from what was sent, 2=could not be performed or was skipped, which now means -no-checksum: a run without a matching vmsync-bridge-helper on the target is refused outright and reports no state at all. Alert on 2 with a `for:` clause to ignore transient failures.")
 		fmt.Fprintln(&b, "# TYPE vmsync_checksum_state gauge")
 		fmt.Fprintf(&b, "vmsync_checksum_state{source_host=%q,target_host=%q,vm=%q} %d\n",
 			run.SourceHost, run.TargetHost, run.VM, run.ChecksumState)

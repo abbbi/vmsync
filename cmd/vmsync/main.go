@@ -421,10 +421,10 @@ type syncConfig struct {
 	// the estate that never reads the flag list.
 	//
 	// Not the whole decision on its own: the check also needs a matching
-	// vmsync-bridge-helper on the target, and is skipped with a warning when
-	// there isn't one -- a missing helper must not break a sync that never
-	// asked to bridge. See checksumEnabled in run(), the single place that
-	// resolves it.
+	// vmsync-bridge-helper on the target, and a run that did not pass this
+	// flag is REFUSED when there isn't one rather than quietly syncing
+	// without the check. See checksumEnabled in run(), the single place that
+	// resolves it, and helperMissingRefusal for the wording.
 	//
 	// Deliberately a bool rather than -checksum=<algo>. The digest algorithm
 	// is a wire-compatibility property of a matched vmsync/vmsync-bridge-helper
@@ -1196,6 +1196,25 @@ func main() {
 	// -verify it could clear a finding it never re-proved.
 	if cfg.VerifyFailureReinit && cfg.Verify == "" {
 		trace.Error("invalid verify configuration", "error", errors.New("-verify-failure-reinit needs -verify: it reacts to a verification failure, and without a verification there is nothing for it to react to"))
+		os.Exit(2)
+	}
+	// Same rule, and a worse no-op than the one above. -use-ssh tunnels the
+	// BRIDGED connection through the existing SSH connection, and the bridge
+	// is -compress/-netbuffer; with neither of those there is no bridge to
+	// tunnel, and every place that reads cfg.UseSSH sits inside a
+	// bridgeCfg.Enabled() branch. So the flag did nothing at all, silently,
+	// while the NBD traffic it was passed to protect crossed the network in
+	// the clear -- the one no-op whose cost is not merely a surprise later but
+	// a false belief about what is on the wire now.
+	//
+	// Refused because two other places already say it is: the agent's own
+	// profile validation (cmd/vmsync-agent/profile.go) and docs/HOWTO.md
+	// both state that -use-ssh without a bridge flag is rejected. The engine
+	// was the only one of the three that did not do it, so an operator
+	// invoking vmsync directly got the no-op its documentation told them was
+	// impossible.
+	if err := useSSHWithoutBridgeRefusal(cfg); err != nil {
+		trace.Error("invalid transport configuration", "error", err)
 		os.Exit(2)
 	}
 	// -test=corrupt-after-commit deliberately damages the replica, and -verify is
@@ -4540,15 +4559,24 @@ func run(cfg syncConfig) (runErr error) {
 			// replica nobody compared against its source while reporting
 			// success -- and whether that is acceptable is the operator's
 			// decision to state, not vmsync's to make on their behalf. Both
-			// ways of stating it are named below.
-			// Also refused in case any compression/buffering option is required since they require
-			// the helper on the counterpart hypervisor
+			// ways of stating it are named by helperMissingRefusal, which is a
+			// function rather than an Errorf here precisely because handing the
+			// decision over is the point and an incomplete message takes it
+			// back: the wording it replaced named the binary to deploy and
+			// never named -no-checksum at all.
+			//
+			// NOT the refusal for compression or buffering, though a comment
+			// here claimed to be: `case bridgeCfg.Enabled()` above is matched
+			// first, and that case IS -compress-or-netbuffer, so this arm is
+			// reachable only on a run that asked for neither. Those are
+			// refused by nbdbridge.CheckRemote, which -no-checksum does not
+			// get past; helperMissingRefusal says so rather than leaving an
+			// operator to discover it by passing the flag.
 			//
 			// Here rather than later because this is the last cheap moment: the
 			// target lock and everything destructive are still ahead, so a
 			// refusal costs an SSH round trip and changes nothing.
-			return fmt.Errorf("refusing to sync %s: vmsync-bridge-helper %s. Deploy a matching helper at %s on %s, or avoid using features that need the helper",
-				cfg.TargetDomain, st.Reason, cfg.BridgeHelperPath, util.HostFromURIOrLocal(cfg.TargetURI))
+			return helperMissingRefusal(cfg.TargetDomain, st.Reason, cfg.BridgeHelperPath, util.HostFromURIOrLocal(cfg.TargetURI))
 		}
 		checksumEnabled = true
 		trace.Info("checksum: pre-commit integrity check enabled", "algo", blockdigest.DefaultAlgo, "helper", cfg.BridgeHelperPath, "helper_version", st.Version)
@@ -8858,7 +8886,7 @@ func registerFlags(fs *flag.FlagSet, cfg *syncConfig) (compressArg, fenceSourceA
 	fs.StringVar(&cfg.TargetDiskOwner, "target-disk-owner", util.DiskOwnerAuto, fmt.Sprintf("owner for disks created on the target: %s|%s|user[:group]|:group", util.DiskOwnerAuto, util.DiskOwnerOff))
 
 	fs.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/local/bin/vmsync-bridge-helper", "path to vmsync-bridge-helper on the remote host")
-	fs.BoolVar(&cfg.UseSSH, "use-ssh", false, "tunnel bridged traffic through the existing ssh connection")
+	fs.BoolVar(&cfg.UseSSH, "use-ssh", false, "tunnel bridged traffic through the existing ssh connection; needs -compress or -netbuffer, and is refused without one")
 	fs.IntVar(&cfg.IODepth, "io-depth", 8, "NBD read/write pairs kept in flight during the copy")
 
 	fs.StringVar(&cfg.SourceNBDBind, "source-nbd-bind", "0.0.0.0", "bind address for the source's backup export")
@@ -8919,7 +8947,7 @@ func registerFlags(fs *flag.FlagSet, cfg *syncConfig) (compressArg, fenceSourceA
 	// is the only accurate thing to say before -compress is known.
 	// streamrelay.ResolveLevel turns empty into the right one.
 	fs.StringVar(&cfg.CompressLevel, "compress-level", "", "zstd 1-19 (default 3), or s2 default|better|best (default better)")
-	fs.Var(netBufferArg, "netbuffer", "buffer bridge traffic, as <blocksize>,<buffersize> (bare = 128k,1G)")
+	fs.Var(netBufferArg, "netbuffer", "buffer bridge traffic, as <blocksize>,<buffersize> (bare = 128k,1G); needs the bridge helper on the target")
 	fs.Var(fenceSourceArg, "fence-source", "with -promote: arm a fence on the displaced source (bare = from replica_source)")
 
 	return compressArg, fenceSourceArg, netBufferArg

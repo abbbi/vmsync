@@ -277,9 +277,14 @@ func (p SyncProfile) Validate() error {
 		}
 	}
 	if p.UseSSH && p.Compress == "" && p.NetBuffer == "" {
-		// vmsync documents -use-ssh as a no-op without bridging. Refusing
-		// is friendlier than silently ignoring a setting someone chose.
-		return fmt.Errorf("use_ssh has no effect without compress or netbuffer, which route traffic through the bridge it tunnels")
+		// vmsync refuses the same combination itself
+		// (useSSHWithoutBridgeRefusal), so this is a refusal at the place
+		// where a human typed it rather than one the operator discovers when
+		// the schedule next fires. It was here first: until 2026-11-05 the
+		// engine permitted it and silently dropped the flag, so an agent
+		// profile was the only thing standing between an operator and
+		// plaintext NBD traffic they believed was tunnelled.
+		return fmt.Errorf("use_ssh has no effect without compress or netbuffer, which route traffic through the bridge it tunnels, and vmsync refuses that combination")
 	}
 
 	if p.IODepth < 0 || p.IODepth > maxIODepth {

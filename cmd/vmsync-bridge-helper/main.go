@@ -16,9 +16,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 // vmsync-bridge-helper is vmsync's remote-side agent on the target host. It
-// has two entirely separate modes.
+// has SIX modes, listed in mode.go: version, hold-run-lock, checksum, relay,
+// supervise and usage. Supervise is the default when no mode is named; the
+// relay is selected by its own flags. The two described at length below are
+// the two with interesting wire behaviour, not the whole binary.
 //
-// The bridge relay (the default) is a long-lived process, started once (see
+// The bridge relay is a long-lived process, started once (see
 // pkg/nbdbridge/command.go), listening on -listen; for each accepted
 // connection it dials the real, plaintext NBD endpoint (-connect) and relays
 // bytes between the two, optionally compressing and/or buffering the
@@ -36,11 +39,32 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
 // This binary must be deployed to any target host by the user themselves
 // (e.g. via scp or configuration management) -- vmsync does not upload it.
-// See -bridge-helper-path in `vmsync`'s own flags. It is required for
-// --compress/--netbuffer, and because those are the only features that have
-// ever required it, vmsync treats one of them being in use as its only
-// evidence that this binary is present: without them the integrity check is
-// skipped rather than attempted and failed.
+// See -bridge-helper-path in `vmsync`'s own flags.
+//
+// WHAT NEEDS IT, and this paragraph used to say the opposite, which is why an
+// operator read a checksum refusal as "vmsync cannot be used at all without
+// this binary". vmsync no longer infers the helper's presence from
+// --compress/--netbuffer being in use; it ASKS the target, on every run (see
+// nbdbridge.ProbeHelper), and then:
+//
+//   - --compress/--netbuffer refuse the run without it, because the relay is
+//     this binary and nothing substitutes for it;
+//   - the pre-commit integrity check is on by DEFAULT and refuses the run
+//     without it, with -no-checksum as the stated way past -- it is not
+//     skipped silently, and has not been since that check stopped being tied
+//     to bridging;
+//   - taking the target's run lock needs it on a target whose login shell
+//     cannot prove a lock is the lock a path names, where the POSIX fallback
+//     refuses outright (pkg/util/remotelock.go);
+//   - -break-target-lock needs the lock to have been taken by the leased hold
+//     here, since only that one records who took it;
+//   - supervision of vmsync's target commands and the lease on that run lock
+//     degrade loudly without it, each with a working substitute;
+//   - -verify=fast|full lose their digest fast path and fall back to byte
+//     comparison.
+//
+// The version must match vmsync's EXACTLY on every one of those paths: an
+// older helper is refused like an absent one.
 package main
 
 import (

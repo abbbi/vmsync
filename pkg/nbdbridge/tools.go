@@ -63,12 +63,19 @@ type HelperStatus struct {
 // ProbeHelper reports whether the target's vmsync-bridge-helper is present,
 // executable and version-matched, WITHOUT failing.
 //
-// Split out of CheckRemote because two callers need the same two questions
-// answered and want opposite things done about the answer. CheckRemote is a
-// precondition for bridging: no helper means the run cannot do what was
-// asked, so it errors. The pre-commit integrity check is the other way
-// round: it is on by default, so a missing helper must not break a sync
-// nobody asked to bridge -- it just means no check, and a log line saying so.
+// Split out of CheckRemote because SEVERAL callers need the same two
+// questions answered and want different things done about the answer:
+//
+//   - CheckRemote refuses. The relay IS this binary, so no flag stands in for
+//     it and there is no way past the refusal except not bridging.
+//   - run()'s checksum gate refuses too, but it HAS a way past it
+//     (-no-checksum), so it is worded separately -- see helperMissingRefusal
+//     in cmd/vmsync.
+//   - target-command supervision and the leased target run lock read the same
+//     answer and merely degrade, loudly, with a working substitute each.
+//
+// So this function reports and never fails, and every caller decides. What it
+// must not do is assume which of those three is asking.
 //
 // The version equality is not fussiness. The helper is deployed by hand and
 // vmsync never uploads it, so its version drifts silently; and since the
@@ -98,6 +105,71 @@ func ProbeHelper(ctx context.Context, client CommandRunner, cfg Config, host str
 	return HelperStatus{Present: true, Version: helperVersion, Usable: true}
 }
 
+// requestedBy names the flag that made the relay a requirement, so a refusal
+// can say which of the operator's own flags needs the helper rather than
+// leaving them to work it out from a list of features.
+//
+// Enabled() is exactly these two, so there is no third case and no empty one:
+// CheckRemote has already returned nil when neither is set, and this is
+// unreachable from anywhere else.
+func requestedBy(c Config) string {
+	switch {
+	case c.Compress && c.NetBufferEnabled():
+		return "-compress and -netbuffer"
+	case c.Compress:
+		return "-compress"
+	default:
+		return "-netbuffer"
+	}
+}
+
+// relayHelperVerdict turns a probe result into CheckRemote's answer: nil for a
+// helper a bridged run can use, and otherwise what to say about it.
+//
+// The GATE is here rather than at the call site so that "a helper present but
+// unusable is still refused" is a thing a test can state. Usable, not Present,
+// is the condition: a helper one build old starts, listens and relays, and
+// relays wrongly, which is the case this whole probe exists for. Gating on
+// Present instead would compile, pass a test that only ever injects an absent
+// helper, and accept exactly the pairing ProbeHelper was written to reject.
+//
+// Two refusals, one shape, because the operator's next move differs by one
+// word -- deploy, or redeploy -- and everything else about them is identical,
+// including the two things both wordings used to leave out: WHICH of the
+// operator's own flags needs the helper, and that not passing that flag is
+// the other way on. Saying only "deploy this binary" is what made the
+// parallel refusal in cmd/vmsync/helperrefusal.go read as "vmsync cannot be
+// used without the helper".
+//
+// -no-checksum is named and ruled out on purpose. It is the first thing an
+// operator reaches for after meeting that other refusal, it is evaluated
+// BEFORE bridging in run()'s switch, and it does nothing for this one.
+func relayHelperVerdict(st HelperStatus, want, host string) error {
+	if st.Usable {
+		return nil
+	}
+	if !st.Present {
+		// ONE LINE, as every other refusal in the tree is. This carried an
+		// embedded newline until 2026-11-05, which put the half naming the
+		// remedy on a line of its own with no timestamp and no level -- so
+		// trace's key=value framing broke across it, anything shipping the
+		// log either dropped that half or filed it as a separate event, and a
+		// grep for the error vmsync died on found only the half that says
+		// what is missing and not the half that says what to do.
+		return fmt.Errorf("vmsync-bridge-helper %s -- "+
+			"%s needs it on %s: the NBD relay that compresses and buffers the wire IS that binary, and nothing here stands in for it -- -no-checksum does not get past this one. "+
+			"Build cmd/vmsync-bridge-helper and deploy it there yourself, or pass -bridge-helper-path to point at wherever you've placed it; or drop %s to sync without the relay",
+			st.Reason, want, host, want)
+	}
+	// An out-of-date helper still starts and still accepts connections, so any
+	// protocol or flag-handling difference between versions would otherwise
+	// only show up as a confusing failure (or worse, a silent one) deep inside
+	// a running sync. Fail up front instead.
+	return fmt.Errorf("vmsync-bridge-helper %s -- %s needs it on %s, and a version that does not match is refused exactly like one that is absent. "+
+		"Rebuild and redeploy vmsync-bridge-helper there so both match before syncing; or drop %s to sync without the relay",
+		st.Reason, want, host, want)
+}
+
 // CheckRemote verifies the remote side of the bridge is usable on host,
 // reached through client. It is a no-op when bridging isn't requested.
 func CheckRemote(ctx context.Context, client *remotessh.Client, cfg Config, host string) error {
@@ -105,22 +177,12 @@ func CheckRemote(ctx context.Context, client *remotessh.Client, cfg Config, host
 		return nil
 	}
 
-	// Both failures below were once checked inline here; they now come from
-	// ProbeHelper so that the integrity check's own, non-fatal use of the
-	// same two questions cannot drift from this one.
-	st := ProbeHelper(ctx, client, cfg, host)
-	if !st.Present {
-		return fmt.Errorf("vmsync-bridge-helper %s\n"+
-			"build cmd/vmsync-bridge-helper and deploy it there yourself, or pass -bridge-helper-path "+
-			"to point at wherever you've placed it", st.Reason)
-	}
-	if !st.Usable {
-		// An out-of-date helper still starts and still accepts connections,
-		// so any protocol or flag-handling difference between versions would
-		// otherwise only show up as a confusing failure (or worse, a silent
-		// one) deep inside a running sync. Fail up front instead.
-		return fmt.Errorf("vmsync-bridge-helper %s -- "+
-			"rebuild and redeploy vmsync-bridge-helper so both match before syncing", st.Reason)
+	// Both failures were once checked inline here; they now come from
+	// ProbeHelper so that the other two readers of the same two questions
+	// cannot drift from this one, and both the gate and the wording live in
+	// relayHelperVerdict so a test can hold them.
+	if err := relayHelperVerdict(ProbeHelper(ctx, client, cfg, host), requestedBy(cfg), host); err != nil {
+		return err
 	}
 
 	// Bridging bypasses SSH tunneling for the bridged connection entirely by
