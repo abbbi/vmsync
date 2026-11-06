@@ -32,6 +32,9 @@
       "interval_seconds": 300,
       "target_host": "dr01",
       "shutdown_timeout_sec": 900,
+      "ignore_disks": ["vdb"],
+      "drop_disks": ["sdc"],
+
       "profile": {
         "compress": "zstd",
         "compress_level": "9",
