@@ -586,6 +586,38 @@ const (
 	// that pins all of them at once.
 	MetadataFieldReplicaIncomplete = "replica_incomplete"
 
+	// MetadataFieldIgnoredDisks and MetadataFieldDroppedDisks are written on
+	// the TARGET and name the disks the replica deliberately does not have, as
+	// a comma-separated list of <target dev=>.
+	//
+	// The same question replica_incomplete answers, from the opposite
+	// direction: that one means an accident and lifts itself on the next
+	// successful sync, these mean a decision and nothing clears them. Without
+	// them a replica missing vdb reports a recent last_checkpoint, a recent
+	// last_sync_timestamp, replica_source set and failure_count zero -- every
+	// one of them true about the disks that WERE copied and silent about the
+	// one that was not, so -promote accepts it and the operator finds out from
+	// the guest.
+	//
+	// Two fields, not one, because the difference is what the replica's own
+	// definition says: a dev in ignored_disks still has its <disk> element
+	// (the storage is provided on the target by other means), a dev in
+	// dropped_disks does not. During a failover the definition is all there
+	// is, so "the device is missing from the XML" and "the device is there but
+	// nothing replicated it" must be distinguishable.
+	//
+	// Read from the replica's own XML on purpose: -promote runs on the DR host
+	// with the source gone, so anything a decision rests on has to be there.
+	//
+	// Same care as MetadataFieldReplicaWrittenAt about where they must be
+	// stripped: UpdateSyncMetadata merges into the SOURCE's XML, so a source
+	// that was once somebody's replica must not carry stale values onto a
+	// target -- and these are worse than most, because the stale list would
+	// name devices belonging to a different domain. See the strip lists named
+	// in that field's comment, and the test that pins all of them at once.
+	MetadataFieldIgnoredDisks = "ignored_disks"
+	MetadataFieldDroppedDisks = "dropped_disks"
+
 	// MetadataFieldVerifyState and MetadataFieldVerifyFailedAt record that
 	// -verify found this replica's contents differing from its source, so
 	// that the finding outlives the run that made it.
@@ -977,6 +1009,10 @@ var metadataFieldOrder = []string{
 	MetadataFieldLastCheckpoint,
 	MetadataFieldPendingCheckpoint,
 	MetadataFieldReplicaIncomplete,
+	// Beside replica_incomplete: the three answer "are these disks the whole
+	// replica?", so a reader of `virsh dumpxml` sees them together.
+	MetadataFieldIgnoredDisks,
+	MetadataFieldDroppedDisks,
 	MetadataFieldVerifyState,
 	MetadataFieldVerifyFailedAt,
 	MetadataFieldLastSync,
@@ -1350,7 +1386,10 @@ func planDefine(exists bool, targetUUID, sourceUUID string, checkpoints int) (de
 // memory so a subsequent failure to define the replacement -- a transient
 // libvirtd error, or the rewritten XML itself being rejected -- can restore
 // it instead of leaving the target permanently undefined.
-func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML string, targetDiskPath string, rootSourceByLiveSource map[string]string) error {
+// excluded says which of the source's disks this replica does not have, and
+// what its definition should say about each: Ignored keeps the <disk> exactly
+// as the source declares it, Dropped removes the element. See DiskExclusions.
+func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML string, targetDiskPath string, rootSourceByLiveSource map[string]string, excluded DiskExclusions) error {
 	exists, err := DomainExists(target.Conn, targetDomainName)
 	if err != nil {
 		return fmt.Errorf("check target domain existence: %w", err)
@@ -1489,8 +1528,43 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 		return rollback(fmt.Errorf("rewrite target domain xml: %w", err))
 	}
 
+	// Removal first, and NOT behind shouldRewriteDiskPaths. That gate is about
+	// relocation and root-source substitution; a disk the caller said to remove
+	// has to go whatever the paths are doing, and this function's own
+	// documentation invites a caller to pass no root sources at all.
+	//
+	// The baseline for the configuration-loss tripwire moves with it. Removing
+	// one <disk> drops the per-tag counts of disk, driver, source and target by
+	// one each, so comparing against the untouched source would log
+	// "something in the patching path has dropped configuration" on every
+	// successful sync of such a pair -- training operators out of believing the
+	// one alarm guarding the replica's definition. Suppressing those tag NAMES
+	// instead would permanently blind the check to a replicated disk losing its
+	// own <source>, which is the loss it exists to catch.
+	//
+	// What earns the right to move the baseline is the assertion below: the
+	// removal reports which devices it actually removed, and anything other
+	// than exactly what was asked for is an error, not a warning. Without it, a
+	// removal that matched the wrong disk would be invisible, having just been
+	// declared expected.
+	tripwireBaseline := sourceDomainXML
+	if len(excluded.Dropped) > 0 {
+		var removed []string
+		updatedXML, removed, err = removeDomainDisks(updatedXML, excluded.Dropped)
+		if err != nil {
+			return rollback(fmt.Errorf("remove dropped disks from target domain xml: %w", err))
+		}
+		if !sameDeviceSet(removed, excluded.Dropped) {
+			return rollback(fmt.Errorf("refusing to define %s: -drop-disk named %s but the definition yielded %s -- the two must match exactly, because the configuration-loss check is told these elements were meant to go",
+				targetDomainName, strings.Join(excluded.Dropped, ", "), listOrNoneDevs(removed)))
+		}
+		if tripwireBaseline, _, err = removeDomainDisks(sourceDomainXML, excluded.Dropped); err != nil {
+			return rollback(fmt.Errorf("prepare the configuration-loss baseline: %w", err))
+		}
+	}
+
 	if shouldRewriteDiskPaths(targetDiskPath, rootSourceByLiveSource) {
-		updatedXML, err = replaceDomainDiskPath(updatedXML, targetDiskPath, rootSourceByLiveSource)
+		updatedXML, err = replaceDomainDiskPath(updatedXML, targetDiskPath, rootSourceByLiveSource, excluded.Ignored)
 		if err != nil {
 			return rollback(fmt.Errorf("rewrite target domain xml: %w", err))
 		}
@@ -1514,7 +1588,7 @@ func DefineDomain(target *Manager, targetDomainName string, sourceDomainXML stri
 		}
 	}
 
-	warnIfXMLElementsDropped("DefineDomain", sourceDomainXML, updatedXML)
+	warnIfXMLElementsDropped("DefineDomain", tripwireBaseline, updatedXML)
 
 	// -test=failure-define corrupts the document rather than returning a
 	// synthetic error, so that libvirt is genuinely called, genuinely refuses,
@@ -2135,9 +2209,23 @@ var syncRedefineStrips = []string{
 	MetadataFieldRestoredFrom,
 	MetadataFieldRestoredAt,
 	MetadataFieldRestoredBy,
+	// NOT ignored_disks or dropped_disks, deliberately. SetMetadataFields
+	// applies removals AFTER updates, so a field named here can never be
+	// written by the same call -- naming them would silently make the record
+	// unwritable while every test about inheritance still passed. They take
+	// the same shape replica_written_at does instead: set when this run has a
+	// value, appended to the removal list when it does not, both in
+	// UpdateSyncMetadata. That covers inheritance just as completely, because
+	// a run with no exclusions removes them explicitly.
 }
 
-func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetRole string, checkpointAtUnix int64, sourceStopped bool, replicaWrittenAt, autostartIntent string) (string, error) {
+// excluded names the disks this replica deliberately does not have. Both of
+// its lists are recorded when non-empty and actively REMOVED when empty, for
+// the reason every set-or-remove branch here exists: this function merges into
+// the SOURCE's XML, so a source that was once somebody's replica carries its
+// own lists, and leaving the keys out would stamp one domain's missing devices
+// onto another domain's replica.
+func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetRole string, checkpointAtUnix int64, sourceStopped bool, replicaWrittenAt, autostartIntent string, excluded DiskExclusions) (string, error) {
 	updates := map[string]string{
 		MetadataFieldLastCheckpoint: checkpoint,
 		MetadataFieldLastSync:       strconv.FormatInt(time.Now().Unix(), 10),
@@ -2176,6 +2264,20 @@ func UpdateSyncMetadata(domainXML, checkpoint, sourceHost, sourceDomain, targetR
 		remove = append(remove, MetadataFieldReplicationRole)
 	} else {
 		updates[MetadataFieldReplicationRole] = targetRole
+	}
+	// The two partial-replica lists, each set or removed on its own. Separate
+	// branches rather than one, because an operator can move a dev from
+	// -ignore-disk to -drop-disk between runs, and the replica's definition
+	// has to stop claiming the old arrangement.
+	if len(excluded.Ignored) > 0 {
+		updates[MetadataFieldIgnoredDisks] = strings.Join(excluded.Ignored, ",")
+	} else {
+		remove = append(remove, MetadataFieldIgnoredDisks)
+	}
+	if len(excluded.Dropped) > 0 {
+		updates[MetadataFieldDroppedDisks] = strings.Join(excluded.Dropped, ",")
+	} else {
+		remove = append(remove, MetadataFieldDroppedDisks)
 	}
 	return SetMetadataFields(domainXML, updates, remove...)
 }

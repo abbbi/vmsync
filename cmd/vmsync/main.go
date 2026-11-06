@@ -271,6 +271,17 @@ type syncConfig struct {
 	// invites passing the wrong one, and because the discard-and-rebuild
 	// step is not conceptually tied to that one flag.
 	ReplacedDiskAction string
+	// IgnoreDisk and DropDisk are the disks this run does not copy, by
+	// <target dev=>. They differ only in what the replica's own definition
+	// says afterwards: IgnoreDisk leaves the <disk> exactly as the source
+	// declares it, DropDisk removes it. See cmd/vmsync/ignoredisk.go, which
+	// owns both the flags' parsing and the refusal that makes them necessary.
+	//
+	// Pointers because they are flag.Value implementations registered with
+	// fs.Var, and because a nil one is a programming error worth a panic
+	// rather than a silently empty set that would re-open the refusal.
+	IgnoreDisk *diskSet
+	DropDisk   *diskSet
 	// Retention is the raw -retention value; RetentionPolicy is it parsed.
 	// Both are kept because the raw string is what an error message should
 	// quote back at the operator.
@@ -524,8 +535,9 @@ var flagGroups = []struct {
 		"start", "reinit", "force-clean", "reinit-after-failures",
 		"ignore-external-snapshot", "timestamp-tolerance-sec",
 	}},
-	{"STORAGE", "where the replica's disks live and who owns them", []string{
+	{"STORAGE", "which of the replica's disks exist, where they live and who owns them", []string{
 		"target-disk-path", "replaced-disk-action", "target-disk-owner",
+		"ignore-disk", "drop-disk",
 		"remote-lock-lease",
 		"reclaim-leftovers-after",
 	}},
@@ -4256,10 +4268,59 @@ func run(cfg syncConfig) (runErr error) {
 	if err != nil {
 		return err
 	}
+
+	// THE GATE, and it is here for what has not happened yet. Nothing above
+	// this line has written to either host: ensureTargetDiskDirs is the first
+	// target write, journal.Intent the first durable record, and the target run
+	// lock is taken later still. A domain whose disks cannot all be replicated
+	// is refused having cost nothing -- no lock, no directory, no checkpoint.
+	//
+	// Above the len(qcowDisks) == 0 check below, deliberately: a domain whose
+	// ONLY disk is raw is the likeliest shape of this, and that check would
+	// otherwise answer it with "no qcow2 disks found", which reads as a domain
+	// with no storage rather than as one with storage vmsync cannot copy.
+	//
+	// Decided from the LIVE XML, as read above. The agent's inventory reads the
+	// persistent one, so `virsh attach-disk --config` without --live can make
+	// the two disagree; the refusal says which document it read so an operator
+	// seeing that disagreement knows which half to believe.
+	unreplicable, err := disk.UnreplicableDisks(srcXML)
+	if err != nil {
+		return fmt.Errorf("read the source domain's unreplicable disks: %w", err)
+	}
+	allDevs, err := disk.TargetDevs(srcXML)
+	if err != nil {
+		return fmt.Errorf("read the source domain's disk devices: %w", err)
+	}
+	selection := diskSelection{
+		domain:       cfg.SourceDomain,
+		all:          allDevs,
+		unreplicable: unreplicable,
+		ignore:       cfg.IgnoreDisk,
+		drop:         cfg.DropDisk,
+	}
+	if err := selection.check(); err != nil {
+		return err
+	}
+	// After the gate, so the list every later stage iterates is the set that
+	// was approved -- and before the emptiness check, so excluding every disk
+	// is caught by the gate's own message rather than by this one.
+	qcowDisks = replicatedDisks(qcowDisks, cfg.IgnoreDisk, cfg.DropDisk)
 	if len(qcowDisks) == 0 {
 		return fmt.Errorf("no qcow2 disks found for domain %s", cfg.SourceDomain)
 	}
 	trace.Info("discovered qcow2 disks", "count", len(qcowDisks))
+	if excluded := selection.excludedDevices(); len(excluded) > 0 {
+		// Every run, at WARNING, because a deliberately partial replica is a
+		// standing condition with nothing that clears it: unlike a failed
+		// sync, no later run makes it whole, so the only thing that can keep
+		// it visible is saying so each time.
+		trace.Warning("this replica is deliberately partial: the disks below are not copied, and a failover to it brings up a VM without them",
+			"domain", cfg.SourceDomain,
+			"not_replicated", strings.Join(excluded, ","),
+			"kept_in_definition", strings.Join(cfg.IgnoreDisk.Names(), ","),
+			"removed_from_definition", strings.Join(cfg.DropDisk.Names(), ","))
+	}
 
 	// Skipped under -reinit: a stuck block job is exactly the kind of state
 	// -reinit is meant to clear (via AbortActiveBlockJobs below), so failing
@@ -4455,12 +4516,23 @@ func run(cfg syncConfig) (runErr error) {
 	}
 
 	journal := newRecorder(cfg, targetSSHClient, util.SetTargetPath(cfg.TargetDiskPath, qcowDisks[0].RootSource), cfg.TargetDomain)
-	journal.Intent(ctx, journalVerbSync, map[string]string{
+	syncIntent := map[string]string{
 		"mode":          syncJournalMode(cfg),
 		"source":        util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName) + ":" + cfg.SourceDomain,
 		"disks":         strconv.Itoa(len(qcowDisks)),
 		"replaced_disk": cfg.ReplacedDiskAction,
-	})
+	}
+	// Named, not merely counted. "disks" above is the number this run copied,
+	// so a two-disk machine with one excluded records "1" -- the same record a
+	// genuinely one-disk machine writes. At failover time, beside the replica,
+	// those two have to be distinguishable.
+	if len(cfg.IgnoreDisk.Names()) > 0 {
+		syncIntent["ignored_disks"] = strings.Join(cfg.IgnoreDisk.Names(), ",")
+	}
+	if len(cfg.DropDisk.Names()) > 0 {
+		syncIntent["dropped_disks"] = strings.Join(cfg.DropDisk.Names(), ",")
+	}
+	journal.Intent(ctx, journalVerbSync, syncIntent)
 	// Registered AFTER the SSH client's own Close defer, so it runs BEFORE it:
 	// the outcome has to cross the connection the record is written over.
 	//
@@ -8657,7 +8729,7 @@ func run(cfg syncConfig) (runErr error) {
 
 	trace.Info("Adding metadata information")
 	var newXML string
-	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint, util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName), cfg.SourceDomain, currentTargetRole, checkpointAt.Unix(), sourceStoppedAtCheckpoint, replicaWrittenAt, autostartIntent)
+	newXML, err = libvirtsync.UpdateSyncMetadata(srcXML, effectiveCheckpoint, util.ReplicaHost(cfg.SourceURI, cfg.LocalHostName), cfg.SourceDomain, currentTargetRole, checkpointAt.Unix(), sourceStoppedAtCheckpoint, replicaWrittenAt, autostartIntent, libvirtsync.DiskExclusions{Ignored: cfg.IgnoreDisk.Names(), Dropped: cfg.DropDisk.Names()})
 	if err != nil {
 		// UpdateSyncMetadata is a pure in-memory XML transformation -- no
 		// network or libvirt call involved -- so a failure here is almost
@@ -8708,7 +8780,8 @@ func run(cfg syncConfig) (runErr error) {
 	defineDomainMu.Lock()
 	defineDomainInFlight = true
 	defineDomainMu.Unlock()
-	defineErr := libvirtsync.DefineDomain(tgtMgr, cfg.TargetDomain, newXML, cfg.TargetDiskPath, rootSourceByLiveSource)
+	defineErr := libvirtsync.DefineDomain(tgtMgr, cfg.TargetDomain, newXML, cfg.TargetDiskPath, rootSourceByLiveSource,
+		libvirtsync.DiskExclusions{Ignored: cfg.IgnoreDisk.Names(), Dropped: cfg.DropDisk.Names()})
 	defineDomainMu.Lock()
 	defineDomainInFlight = false
 	defineDomainMu.Unlock()
@@ -8746,7 +8819,7 @@ func run(cfg syncConfig) (runErr error) {
 			"vm", cfg.TargetDomain, "error", err)
 	} else if changed {
 		trace.Info("turned off autostart on the replica; the source's own setting is recorded so a promotion can restore it",
-			"vm", cfg.TargetDomain, "autostart_intent", autostartIntent)
+			"vm", cfg.TargetDomain, "autostart_intent", autostartIntent, libvirtsync.DiskExclusions{Ignored: cfg.IgnoreDisk.Names(), Dropped: cfg.DropDisk.Names()})
 	}
 
 	// The UEFI varstore, for a domain that has one. See nvram.go: the disks
@@ -8883,6 +8956,9 @@ func registerFlags(fs *flag.FlagSet, cfg *syncConfig) (compressArg, fenceSourceA
 	fs.StringVar(&cfg.TargetDiskPath, "target-disk-path", "", "directory for the replica's disks on the target")
 	fs.StringVar(&cfg.TargetRuntimeDir, "target-runtime-dir", util.TargetRuntimeDir, "directory on the TARGET for the exports' sockets and pidfiles; never one it polyinstantiates -- see HOWTO")
 	fs.StringVar(&cfg.ReplacedDiskAction, "replaced-disk-action", replacedDiskRename, fmt.Sprintf("what -reinit does with the disk it replaces: %s|%s", replacedDiskRename, replacedDiskDelete))
+	cfg.IgnoreDisk, cfg.DropDisk = &diskSet{}, &diskSet{}
+	fs.Var(cfg.IgnoreDisk, "ignore-disk", "disk(s) not to replicate, by target dev; kept in the replica's definition as declared")
+	fs.Var(cfg.DropDisk, "drop-disk", "disk(s) not to replicate, by target dev; removed from the replica's definition")
 	fs.StringVar(&cfg.TargetDiskOwner, "target-disk-owner", util.DiskOwnerAuto, fmt.Sprintf("owner for disks created on the target: %s|%s|user[:group]|:group", util.DiskOwnerAuto, util.DiskOwnerOff))
 
 	fs.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/bin/vmsync-bridge-helper", "path to vmsync-bridge-helper on the remote host")

@@ -362,7 +362,7 @@ func TestReplaceDomainDiskPath(t *testing.T) {
 		rootMap := map[string]string{
 			"/var/lib/libvirt/images/testvm.snap1": "/var/lib/libvirt/images/testvm.qcow2",
 		}
-		out, err := replaceDomainDiskPath(xmlStr, "/mnt/target", rootMap)
+		out, err := replaceDomainDiskPath(xmlStr, "/mnt/target", rootMap, nil)
 		if err != nil {
 			t.Fatalf("replaceDomainDiskPath() error = %v", err)
 		}
@@ -373,13 +373,13 @@ func TestReplaceDomainDiskPath(t *testing.T) {
 
 	t.Run("disk missing from a nil map is a hard error, not a silent fallback to its live source", func(t *testing.T) {
 		xmlStr := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/testvm.qcow2")
-		if _, err := replaceDomainDiskPath(xmlStr, "/mnt/target", nil); err == nil {
+		if _, err := replaceDomainDiskPath(xmlStr, "/mnt/target", nil, nil); err == nil {
 			t.Fatal("expected an error for a disk missing from rootSourceByLiveSource, got nil")
 		}
 	})
 
 	t.Run("malformed xml returns an error", func(t *testing.T) {
-		if _, err := replaceDomainDiskPath("not xml at all <<<", "/mnt/target", nil); err == nil {
+		if _, err := replaceDomainDiskPath("not xml at all <<<", "/mnt/target", nil, nil); err == nil {
 			t.Fatal("expected an error for malformed domain xml")
 		}
 	})
@@ -413,7 +413,7 @@ func TestReplaceDomainDiskPath(t *testing.T) {
 		rootMap := map[string]string{
 			"/var/lib/libvirt/images/testvm.snap1": "/var/lib/libvirt/images/testvm.qcow2",
 		}
-		out, err := replaceDomainDiskPath(xmlStr, "/mnt/target", rootMap)
+		out, err := replaceDomainDiskPath(xmlStr, "/mnt/target", rootMap, nil)
 		if err != nil {
 			t.Fatalf("replaceDomainDiskPath() error = %v", err)
 		}
@@ -451,7 +451,7 @@ func TestReplaceDomainDiskPath(t *testing.T) {
 		rootMap := map[string]string{
 			"/var/lib/libvirt/images/testvm.snap1": "/var/lib/libvirt/images/testvm.qcow2",
 		}
-		out, err := replaceDomainDiskPath(xmlStr, "", rootMap)
+		out, err := replaceDomainDiskPath(xmlStr, "", rootMap, nil)
 		if err != nil {
 			t.Fatalf("replaceDomainDiskPath() error = %v", err)
 		}
@@ -470,7 +470,7 @@ func TestReplaceDomainDiskPath(t *testing.T) {
 		rootMap := map[string]string{
 			"/var/lib/libvirt/images/testvm.snap1": "/var/lib/libvirt/images/testvm.qcow2",
 		}
-		out, err := replaceDomainDiskPath(xmlStr, "", rootMap)
+		out, err := replaceDomainDiskPath(xmlStr, "", rootMap, nil)
 		if err != nil {
 			t.Fatalf("replaceDomainDiskPath() error = %v", err)
 		}
@@ -755,7 +755,7 @@ func TestAllMetadataFieldsNoBlock(t *testing.T) {
 func TestUpdateSyncMetadata(t *testing.T) {
 	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
 	before := time.Now().Unix()
-	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "source-host.example.org", "sourcevm", "", 1700000000, false, "", AutostartIntentUnknown)
+	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "source-host.example.org", "sourcevm", "", 1700000000, false, "", AutostartIntentUnknown, DiskExclusions{})
 	after := time.Now().Unix()
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
@@ -825,7 +825,7 @@ func TestUpdateSyncMetadataDoesNotInheritSourceSideFields(t *testing.T) {
 		t.Fatalf("building source xml: %v", err)
 	}
 
-	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", "", 1700000000, false, "", AutostartIntentUnknown)
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", "", 1700000000, false, "", AutostartIntentUnknown, DiskExclusions{})
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
@@ -866,7 +866,7 @@ func TestUpdateSyncMetadataPreservesTheTargetsOwnRole(t *testing.T) {
 		t.Fatalf("building source xml: %v", err)
 	}
 
-	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", RoleTarget, 1700000000, false, "", AutostartIntentNo)
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", RoleTarget, 1700000000, false, "", AutostartIntentNo, DiskExclusions{})
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
@@ -881,7 +881,7 @@ func TestUpdateSyncMetadataPreservesTheTargetsOwnRole(t *testing.T) {
 func TestUpdateSyncMetadataRecordsWhetherTheSourceWasStopped(t *testing.T) {
 	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
 
-	stopped, err := UpdateSyncMetadata(base, "vmsync-cpt-000001", "src", "testvm", "", 1700000000, true, "", AutostartIntentUnknown)
+	stopped, err := UpdateSyncMetadata(base, "vmsync-cpt-000001", "src", "testvm", "", 1700000000, true, "", AutostartIntentUnknown, DiskExclusions{})
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata: %v", err)
 	}
@@ -891,7 +891,7 @@ func TestUpdateSyncMetadataRecordsWhetherTheSourceWasStopped(t *testing.T) {
 
 	// A later incremental from a RUNNING source must clear it, or the
 	// replica keeps claiming a completeness it no longer has.
-	running, err := UpdateSyncMetadata(stopped, "vmsync-cpt-000002", "src", "testvm", "", 1700000100, false, "", AutostartIntentUnknown)
+	running, err := UpdateSyncMetadata(stopped, "vmsync-cpt-000002", "src", "testvm", "", 1700000100, false, "", AutostartIntentUnknown, DiskExclusions{})
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata: %v", err)
 	}
@@ -929,7 +929,7 @@ func TestDomainRewritesArePreserving(t *testing.T) {
 	out, err = replaceDomainDiskPath(out, "/replicas", map[string]string{
 		disk1: disk1,
 		disk2: disk2,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("replaceDomainDiskPath: %v", err)
 	}
@@ -990,7 +990,7 @@ func TestDomainRewritesArePreserving(t *testing.T) {
 func TestReplaceDomainDiskPathRefusesAnUnresolvedDisk(t *testing.T) {
 	src := richDomainXML("web01", "4dea22b3-1d52-d8f3-2516-782e98ab3fa0",
 		"/var/lib/libvirt/images/vda.qcow2", "/var/lib/libvirt/images/vdb.qcow2")
-	if _, err := replaceDomainDiskPath(src, "/replicas", map[string]string{}); err == nil {
+	if _, err := replaceDomainDiskPath(src, "/replicas", map[string]string{}, nil); err == nil {
 		t.Fatal("accepted a replicated disk with no resolved root source")
 	}
 }
@@ -2211,7 +2211,7 @@ func TestReplaceDomainDiskPathPreservesRichConfiguration(t *testing.T) {
 		"/var/lib/libvirt/images/vda.qcow2": "/var/lib/libvirt/images/vda.qcow2",
 		"/var/lib/libvirt/images/vdb.qcow2": "/var/lib/libvirt/images/vdb.qcow2",
 	}
-	out, err := replaceDomainDiskPath(xmlStr, "/mnt/target", rootMap)
+	out, err := replaceDomainDiskPath(xmlStr, "/mnt/target", rootMap, nil)
 	if err != nil {
 		t.Fatalf("replaceDomainDiskPath() error = %v", err)
 	}
@@ -2883,7 +2883,7 @@ func TestElementDropWarningStillCatchesRealLosses(t *testing.T) {
 func TestUpdateSyncMetadataCarriesTheReplicaWriteRecord(t *testing.T) {
 	base := minimalDomainXML("testvm", "12345678-1234-1234-1234-123456789abc", "/var/lib/libvirt/images/x.qcow2")
 
-	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "src-host", "testvm", "", 1700000000, false, "vda=1756000000,vdb=1756000005", AutostartIntentUnknown)
+	out, err := UpdateSyncMetadata(base, "vmsync-cpt-000005", "src-host", "testvm", "", 1700000000, false, "vda=1756000000,vdb=1756000005", AutostartIntentUnknown, DiskExclusions{})
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
@@ -2918,7 +2918,7 @@ func TestUpdateSyncMetadataDoesNotInheritTheSourcesReplicaWriteRecord(t *testing
 		t.Fatalf("seed the source: %v", err)
 	}
 
-	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", "", 1700000000, false, "", AutostartIntentUnknown)
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000001", "src-host", "testvm", "", 1700000000, false, "", AutostartIntentUnknown, DiskExclusions{})
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}

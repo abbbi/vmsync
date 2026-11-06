@@ -248,7 +248,7 @@ func (c UIConfig) Complaints() []string {
 			}
 			seen[e.VM] = true
 		}
-		if err := e.Profile.Validate(); err != nil {
+		if err := e.Validate(); err != nil {
 			add("%s has an unusable profile and will be skipped every tick: %v", where, err)
 		}
 		// The verify cadence had no check at all on this path. Only the

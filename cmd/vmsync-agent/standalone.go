@@ -237,7 +237,7 @@ func validateStandaloneConfig(cfg UIConfig) error {
 			}
 			return fmt.Errorf("%s has interval_seconds %d; it must be greater than 0", where, e.IntervalSeconds)
 		}
-		if err := e.Profile.Validate(); err != nil {
+		if err := e.Validate(); err != nil {
 			return fmt.Errorf("%s: %w", where, err)
 		}
 		// The same rule the template enforces, from the same function: a

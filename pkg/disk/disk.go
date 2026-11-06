@@ -105,6 +105,92 @@ func ParseQcowDisksQuiet(domainXML string) ([]QcowDisk, error) {
 	return parseQcowDisks(domainXML, true)
 }
 
+// UnreplicableDisk is a device in a domain's XML that vmsync will not copy:
+// the other half of what ParseQcowDisks returns.
+//
+// ParseQcowDisks drops these and logs a line about each. A line is not a
+// decision, and the one the operator needs to make is whether a VM whose vdb
+// is raw should be replicated at all -- so the set has to be available as
+// data, not only as log output.
+type UnreplicableDisk struct {
+	// TargetDev is the <target dev=> name an operator would pass to
+	// -ignore-disk or -drop-disk. Empty for a malformed <disk> with no
+	// <target>, which is reported rather than hidden: a disk nobody can name
+	// is a disk nobody can opt out of.
+	TargetDev string
+	// Device is the <disk device=> kind: disk, cdrom, floppy, lun. A cdrom is
+	// expected on nearly every domain and carries no replicated data, so
+	// callers treat it differently from a disk; this type reports the kind
+	// rather than deciding for them.
+	Device string
+	// Format is <driver type=>, or "none" when the disk declares no driver at
+	// all -- which the schema allows and which cannot be confirmed qcow2.
+	Format string
+	// Source is <source file=>, empty for an empty drive or a non-file disk
+	// (block, network, volume). Carried so a refusal can say WHICH volume it
+	// is talking about on a domain with several raw disks.
+	Source string
+}
+
+// UnreplicableDisks returns every device in the domain XML that
+// ParseQcowDisks would drop, in the order the XML declares them.
+//
+// Shares util.IgnoreDevice with ParseQcowDisks rather than restating the rule:
+// the two must partition the domain's disks exactly, or a disk could be absent
+// from both and so be neither replicated nor reported.
+func UnreplicableDisks(domainXML string) ([]UnreplicableDisk, error) {
+	domcfg := &libvirtxml.Domain{}
+	if err := domcfg.Unmarshal(domainXML); err != nil {
+		return nil, err
+	}
+
+	var out []UnreplicableDisk
+	for _, d := range domcfg.Devices.Disks {
+		if !util.IgnoreDevice(d) {
+			continue
+		}
+		dev := ""
+		if d.Target != nil {
+			dev = d.Target.Dev
+		}
+		format := "none"
+		if d.Driver != nil && d.Driver.Type != "" {
+			format = d.Driver.Type
+		}
+		source := ""
+		if d.Source != nil && d.Source.File != nil {
+			source = d.Source.File.File
+		}
+		out = append(out, UnreplicableDisk{
+			TargetDev: dev,
+			Device:    d.Device,
+			Format:    format,
+			Source:    source,
+		})
+	}
+	return out, nil
+}
+
+// TargetDevs lists the <target dev=> names of a domain's disks, replicable or
+// not, in declaration order.
+//
+// For validating an operator's -ignore-disk/-drop-disk against the domain they
+// named: a device that is not in this list is a typo, and a typo that silently
+// does nothing is the whole failure mode those flags exist to close.
+func TargetDevs(domainXML string) ([]string, error) {
+	domcfg := &libvirtxml.Domain{}
+	if err := domcfg.Unmarshal(domainXML); err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, d := range domcfg.Devices.Disks {
+		if d.Target != nil && d.Target.Dev != "" {
+			out = append(out, d.Target.Dev)
+		}
+	}
+	return out, nil
+}
+
 func parseQcowDisks(domainXML string, cdromToDebug bool) ([]QcowDisk, error) {
 	domcfg := &libvirtxml.Domain{}
 	err := domcfg.Unmarshal(domainXML)

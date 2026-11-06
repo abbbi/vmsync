@@ -153,14 +153,54 @@ func stripDomainUUID(domainXML string) (string, error) {
 // A disk present here but missing from that map is fatal rather than passed
 // through: writing a live overlay path into the target's persistent
 // definition would point the domain at a file that was never replicated.
-func replaceDomainDiskPath(domainXML, targetDiskPath string, rootSourceByLiveSource map[string]string) (string, error) {
+// ignoredDevs are the disks the operator said to leave in the definition
+// exactly as the source declares them (-ignore-disk). They are not repathed:
+// no copy of them exists on the target, so there is no target-side name to
+// write, and the whole point of that flag is that the storage is provided
+// there by other means under the name the source already uses.
+func replaceDomainDiskPath(domainXML, targetDiskPath string, rootSourceByLiveSource map[string]string, ignoredDevs []string) (string, error) {
 	doc, err := parseDomainDoc(domainXML)
 	if err != nil {
 		return "", err
 	}
+	ignored := make(map[string]bool, len(ignoredDevs))
+	for _, dev := range ignoredDevs {
+		ignored[dev] = true
+	}
 
 	for _, disk := range doc.Root().FindElements("./devices/disk") {
-		if ignoreDiskElement(disk) {
+		dev := diskTargetDev(disk)
+		switch dispositionOf(disk) {
+		case dispositionCdrom:
+			// Verbatim, including its <source file> -- so a cdrom with an ISO
+			// keeps the SOURCE host's path in the replica's definition. That
+			// is pre-existing and deliberately left alone here: it is a
+			// decision about empty trays versus dangling paths, not about
+			// which disks get replicated. -drop-disk removes a cdrom like any
+			// other device for an operator who wants it gone.
+			continue
+		case dispositionUnreplicable:
+			if ignored[dev] {
+				continue
+			}
+			// THE BACKSTOP, and it is never supposed to fire. The gate in
+			// cmd/vmsync refuses this run long before any copy happens, with
+			// a message naming both flags. Reaching here means some caller
+			// skipped that gate, and a definition naming a disk nobody copied
+			// is the one outcome this package must not be able to produce:
+			// where the source's path happens to resolve on the target -- a
+			// shared mount, or the same images directory -- the promoted
+			// replica opens a file nobody replicated, and if that storage is
+			// shared with the source it writes into live source data.
+			name := dev
+			if name == "" {
+				name = "a disk with no <target dev=>"
+			}
+			return "", fmt.Errorf("refusing to write the target's definition: %s is not a qcow2 disk, so no copy of it exists, and it was not named in -ignore-disk or -drop-disk", name)
+		}
+		if ignored[dev] {
+			// A qcow2 disk the operator excluded: no copy, so nothing to
+			// repath, and -ignore-disk says to leave the element alone.
 			continue
 		}
 		source := disk.FindElement("./source")
@@ -189,21 +229,111 @@ func replaceDomainDiskPath(domainXML, targetDiskPath string, rootSourceByLiveSou
 	return doc.WriteToString()
 }
 
-// ignoreDiskElement mirrors util.IgnoreDevice for a parsed element: a cdrom,
-// or anything not confirmed qcow2, is not a disk vmsync replicates.
+// diskDisposition is what the target's definition should say about one disk.
+//
+// A boolean "is this ignored" conflated two cases the replica has to treat
+// differently: a cdrom carries no replicated data and is expected on nearly
+// every domain, while a non-qcow2 disk is storage the replica does not have.
+// Reading the same answer for both is what let the second pass unremarked.
+type diskDisposition int
+
+const (
+	// dispositionReplicate: a qcow2 disk whose bytes this run copied, so its
+	// path is rewritten to where the copy actually put them.
+	dispositionReplicate diskDisposition = iota
+	// dispositionCdrom: left verbatim. See the note in replaceDomainDiskPath
+	// about what that means for the ISO path.
+	dispositionCdrom
+	// dispositionUnreplicable: not qcow2, so no copy exists. Either the
+	// operator named it, or the definition must not be written at all.
+	dispositionUnreplicable
+)
+
+// dispositionOf mirrors util.IgnoreDevice, split into the reasons.
+//
+// It MUST stay a mirror: the gate in cmd/vmsync refuses from util.IgnoreDevice
+// via disk.UnreplicableDisks, and this decides what the definition says. A
+// disk the gate refuses but this one keeps stalls the run at the root-source
+// lookup below; a disk the gate accepts but this one treats as unreplicable
+// fails the define outright. Both directions are silent until they fire.
 //
 // Expressed against the tree rather than by unmarshalling into
-// libvirtxml.DomainDisk so that this file needs no typed model at all --
-// the point of it being here is that nothing gets reconstructed.
-func ignoreDiskElement(disk *etree.Element) bool {
+// libvirtxml.DomainDisk so that this file needs no typed model at all -- the
+// point of it being here is that nothing gets reconstructed.
+func dispositionOf(disk *etree.Element) diskDisposition {
 	if disk.SelectAttrValue("device", "") == "cdrom" {
-		return true
+		return dispositionCdrom
 	}
 	driver := disk.FindElement("./driver")
-	if driver == nil {
-		return true
+	if driver == nil || driver.SelectAttrValue("type", "") != "qcow2" {
+		return dispositionUnreplicable
 	}
-	return driver.SelectAttrValue("type", "") != "qcow2"
+	return dispositionReplicate
+}
+
+// diskTargetDev is the <target dev=> an operator names in -ignore-disk or
+// -drop-disk, or "" for a disk that declares none.
+//
+// An empty answer is not a lookup failure to paper over: libvirt's schema
+// allows a <disk> with no <target>, such a disk cannot be named by any flag,
+// and the gate in cmd/vmsync refuses rather than letting one through.
+func diskTargetDev(disk *etree.Element) string {
+	target := disk.FindElement("./target")
+	if target == nil {
+		return ""
+	}
+	return target.SelectAttrValue("dev", "")
+}
+
+// removeDomainDisks deletes the named disks from a domain document, and
+// reports which ones it actually removed.
+//
+// Its own pass, not folded into replaceDomainDiskPath, because that one runs
+// only when there are paths to rewrite (shouldRewriteDiskPaths). Removal has
+// to happen whatever the disk paths are doing, and a caller passing no root
+// sources -- which DefineDomain's own documentation invites -- would otherwise
+// get a definition still naming a disk it was told to remove.
+//
+// The removed set is returned rather than counted so the caller can assert it
+// is exactly what was asked for. That assertion is what makes it safe to tell
+// the configuration-loss tripwire that these elements were meant to go: a
+// removal that matched the wrong disk would otherwise be invisible, having
+// just been declared expected.
+func removeDomainDisks(domainXML string, devs []string) (string, []string, error) {
+	if len(devs) == 0 {
+		return domainXML, nil, nil
+	}
+	wanted := make(map[string]bool, len(devs))
+	for _, dev := range devs {
+		wanted[dev] = true
+	}
+
+	doc, err := parseDomainDoc(domainXML)
+	if err != nil {
+		return "", nil, fmt.Errorf("parse domain xml to remove disks: %w", err)
+	}
+	devices := doc.Root().FindElement("./devices")
+	if devices == nil {
+		return "", nil, fmt.Errorf("domain xml has no <devices> element, so %s cannot be removed from it", strings.Join(devs, ", "))
+	}
+
+	var removed []string
+	// FindElements returns a snapshot, so removing from the live child list
+	// while ranging over it does not disturb the iteration.
+	for _, disk := range devices.FindElements("./disk") {
+		dev := diskTargetDev(disk)
+		if dev == "" || !wanted[dev] {
+			continue
+		}
+		devices.RemoveChild(disk)
+		removed = append(removed, dev)
+	}
+
+	out, err := doc.WriteToString()
+	if err != nil {
+		return "", nil, err
+	}
+	return out, removed, nil
 }
 
 // setMetadataFieldsInDoc merges vmsync's metadata fields into a domain

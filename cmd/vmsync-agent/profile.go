@@ -435,6 +435,15 @@ type SyncRequest struct {
 	// Empty leaves vmsync on its own default rather than the agent asserting
 	// one, so the two binaries cannot disagree about it by default.
 	TargetRuntimeDir string
+	// IgnoreDisks and DropDisks come from the schedule ENTRY, not the profile,
+	// and become -ignore-disk/-drop-disk. A device letter is a property of one
+	// machine; see ScheduleEntry.IgnoreDisks.
+	//
+	// This is the first non-profile field CommandArgs reads, and it is
+	// deliberate rather than a slip: putting it in the profile would make a
+	// template's list apply to every VM the template covers.
+	IgnoreDisks []string
+	DropDisks   []string
 	// RunID joins the run lock vmsync writes to this agent's own run-log
 	// entry for having launched it, so an operator holding one can find the
 	// other. Set per launch, not per schedule entry.
@@ -483,6 +492,26 @@ func (r SyncRequest) CommandArgs() []string {
 
 	if p.TargetDiskPath != "" {
 		args = append(args, "-target-disk-path", p.TargetDiskPath)
+	}
+	// The "=" form, and one flag per device.
+	//
+	// "=" is not a style choice: a space-separated value is only safe for a
+	// flag Go does not treat as boolean, and getting that wrong leaves the
+	// value as a positional argument vmsync rejects outright -- which stops
+	// the pair replicating rather than failing visibly here.
+	//
+	// One flag per device rather than one comma-joined value, even though the
+	// flag accepts both, so that vmsync's own refusal can quote back a single
+	// bad device name instead of the whole list.
+	//
+	// Read from the REQUEST, not from the profile: a device letter belongs to
+	// one machine, and a profile is template-inheritable. See
+	// ScheduleEntry.IgnoreDisks for why that distinction is load-bearing.
+	for _, dev := range r.IgnoreDisks {
+		args = append(args, "-ignore-disk="+dev)
+	}
+	for _, dev := range r.DropDisks {
+		args = append(args, "-drop-disk="+dev)
 	}
 	if p.Retention != "" {
 		args = append(args, "-retention", p.Retention)

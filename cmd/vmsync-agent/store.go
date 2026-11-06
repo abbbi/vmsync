@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 
 	"vmsync/pkg/atomicjson"
 )
@@ -59,6 +60,48 @@ type CachedConfig struct {
 	Config        UIConfig `json:"config"`
 }
 
+// validDeviceName is the shape a <target dev=> can take: vda, sdb, hdc, xvdb,
+// nvme0n1. Deliberately conservative -- it rejects a path, a whitespace-joined
+// pair and an empty string, which are the three ways a hand-edited or
+// generated schedule gets this wrong.
+var validDeviceName = regexp.MustCompile(`^[a-z]+[0-9a-z]*$`)
+
+// Validate checks everything about one entry that can be checked without a
+// libvirt connection: the profile, and the SHAPE of its disk exclusions.
+//
+// Shape only, and that boundary is the point. Whether a device EXISTS on the
+// domain, and whether it is one vmsync cannot replicate, is decided by the
+// engine from the live domain XML -- the agent's own inventory reads the
+// persistent one, so an agent-side existence check would refuse syncs the
+// engine would run, and each would be blamed on the wrong half.
+//
+// Here rather than at the engine for the one thing that does belong here: a
+// schedule is written once and runs unattended for months, so a transposed
+// device letter caught when somebody saves costs a correction, and the same
+// letter caught at the target costs a pair that stops replicating at 02:00 on
+// the night the schedule next fires.
+func (e ScheduleEntry) Validate() error {
+	if err := e.Profile.Validate(); err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	for _, flagged := range []struct {
+		field string
+		devs  []string
+	}{{"ignore_disks", e.IgnoreDisks}, {"drop_disks", e.DropDisks}} {
+		for _, dev := range flagged.devs {
+			if !validDeviceName.MatchString(dev) {
+				return fmt.Errorf("%s names %q, which is not a target device: give the <target dev=> from the domain's XML, such as vdb", flagged.field, dev)
+			}
+			if seen[dev] {
+				return fmt.Errorf("%s names %q more than once, or it is in both ignore_disks and drop_disks: the two ask for opposite things about the replica's definition", flagged.field, dev)
+			}
+			seen[dev] = true
+		}
+	}
+	return nil
+}
+
 // ScheduleEntry is one VM the UI wants this agent to sync, and how.
 //
 // Note what is NOT here: no flag names, no command line, no credentials.
@@ -83,6 +126,23 @@ type ScheduleEntry struct {
 	// 0 to inherit it. How long a guest takes to stop cleanly is a property
 	// of what it runs, not of the estate.
 	ShutdownTimeoutSec int `json:"shutdown_timeout_sec,omitempty"`
+	// IgnoreDisks and DropDisks are the disks of THIS VM that must not be
+	// replicated, by <target dev=>. vmsync refuses to sync a domain carrying a
+	// disk it cannot copy, so without these an agent-driven pair whose vdb is
+	// raw is refused on every interval with no way to say it was meant.
+	//
+	// They differ only in what the replica's definition says afterwards --
+	// IgnoreDisks keeps the <disk> as the source declares it, DropDisks
+	// removes it -- and reach vmsync as -ignore-disk and -drop-disk.
+	//
+	// HERE AND NOT IN SyncProfile, which is where every other vmsync flag the
+	// agent emits lives. A profile is template-inheritable (resolveProfile),
+	// and a device letter is a property of ONE machine: a template saying
+	// "ignore vdb" would stop replicating a different disk on every VM it
+	// covered, and every one of those syncs would still succeed. Beside
+	// TargetHost and ShutdownTimeoutSec, which are per-VM for the same reason.
+	IgnoreDisks []string `json:"ignore_disks,omitempty"`
+	DropDisks   []string `json:"drop_disks,omitempty"`
 	// VerifyIntervalSeconds is how often a sync of this VM should ALSO
 	// verify, 0 meaning "on every run, if Profile.Verify names a mode".
 	//

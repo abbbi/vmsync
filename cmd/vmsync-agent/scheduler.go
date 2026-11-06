@@ -275,7 +275,7 @@ func (s *Scheduler) launchDue(ctx context.Context, wg *sync.WaitGroup) {
 			s.metrics.skip(skipForeignRun)
 			continue
 		}
-		if err := entry.Profile.Validate(); err != nil {
+		if err := entry.Validate(); err != nil {
 			// Loud and skipped, not fatal: one bad entry must not stop the
 			// rest of the schedule, and the message names the field so it
 			// can be fixed in the UI.
@@ -795,6 +795,8 @@ func buildSyncRequest(cfg agentConfig, entry ScheduleEntry) (syncPlan, error) {
 	plan.TargetURI = fmt.Sprintf(cfg.TargetURIPattern, host)
 	plan.TargetDomain = targetDomain
 	plan.Profile = entry.Profile
+	plan.IgnoreDisks = entry.IgnoreDisks
+	plan.DropDisks = entry.DropDisks
 	plan.SSHUser = cfg.SSHUser
 	plan.SSHKey = cfg.SSHKey
 	plan.SSHPort = cfg.SSHPort

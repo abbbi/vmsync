@@ -190,7 +190,7 @@ func TestReplicaIncompleteIsClearedEverywhereATargetOnlyFieldMustBe(t *testing.T
 		if err != nil {
 			t.Fatalf("SetMetadataFields: %v", err)
 		}
-		out, err := UpdateSyncMetadata(withField, "vmsync-cpt-000005", "src-host", "srcvm", RoleTarget, 1700000000, false, "", AutostartIntentUnknown)
+		out, err := UpdateSyncMetadata(withField, "vmsync-cpt-000005", "src-host", "srcvm", RoleTarget, 1700000000, false, "", AutostartIntentUnknown, DiskExclusions{})
 		if err != nil {
 			t.Fatalf("UpdateSyncMetadata: %v", err)
 		}

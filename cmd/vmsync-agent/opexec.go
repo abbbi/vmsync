@@ -483,7 +483,7 @@ func operationArgs(cfg agentConfig, uiCfg UIConfig, op Operation) ([]string, err
 		// out-of-range profile -- and it is the destructive one. The
 		// scheduled path logs and defers; here there is a caller waiting
 		// for an answer, so it is reported as a refusal instead.
-		if err := entry.Profile.Validate(); err != nil {
+		if err := entry.Validate(); err != nil {
 			return nil, fmt.Errorf("%s operation %s: %s's resolved sync profile is not usable: %w", op.Kind, op.ID, op.VM, err)
 		}
 		plan, err := buildSyncRequest(cfg, entry)

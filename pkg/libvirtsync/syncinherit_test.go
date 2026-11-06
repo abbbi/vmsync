@@ -149,7 +149,7 @@ func TestOnlyTheseMetadataFieldsSurviveASyncRedefine(t *testing.T) {
 		}
 	}
 
-	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", RoleTarget, 1700000000, false, "", AutostartIntentUnknown)
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", RoleTarget, 1700000000, false, "", AutostartIntentUnknown, DiskExclusions{})
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
@@ -220,7 +220,7 @@ func TestAReplicaCarriesNoOutwardReplicationHistory(t *testing.T) {
 		t.Fatalf("building the source xml: %v", err)
 	}
 
-	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", RoleTarget, 1700000000, false, "", AutostartIntentUnknown)
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", RoleTarget, 1700000000, false, "", AutostartIntentUnknown, DiskExclusions{})
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
@@ -250,7 +250,7 @@ func TestAReplicaDoesNotInheritItsSourcesRestoreRecord(t *testing.T) {
 		t.Fatalf("building the source xml: %v", err)
 	}
 
-	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", RoleTarget, 1700000000, false, "", AutostartIntentUnknown)
+	out, err := UpdateSyncMetadata(srcXML, "vmsync-cpt-000009", "src-host", "testvm", RoleTarget, 1700000000, false, "", AutostartIntentUnknown, DiskExclusions{})
 	if err != nil {
 		t.Fatalf("UpdateSyncMetadata() error = %v", err)
 	}
