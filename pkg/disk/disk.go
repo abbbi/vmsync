@@ -191,6 +191,36 @@ func TargetDevs(domainXML string) ([]string, error) {
 	return out, nil
 }
 
+// SourceByTargetDev maps each disk's <target dev=> to its <source file=>, for
+// every disk the domain declares -- replicable or not, any driver.
+//
+// For reading a path OUT of a definition rather than deciding anything about
+// it. Its one use is finding where a replica's disk file actually is, from the
+// replica's own definition: that path was written by the sync that created the
+// file, so it is right whatever the source's backing chain was doing at the
+// time, which a path derived from the source today would not be.
+//
+// Devices with no <target dev=> or no <source file=> are absent rather than
+// present-and-empty: a caller looking up a device wants "not here" to be
+// indistinguishable from "here with no path", because it can act on neither.
+func SourceByTargetDev(domainXML string) (map[string]string, error) {
+	domcfg := &libvirtxml.Domain{}
+	if err := domcfg.Unmarshal(domainXML); err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, d := range domcfg.Devices.Disks {
+		if d.Target == nil || d.Target.Dev == "" {
+			continue
+		}
+		if d.Source == nil || d.Source.File == nil || d.Source.File.File == "" {
+			continue
+		}
+		out[d.Target.Dev] = d.Source.File.File
+	}
+	return out, nil
+}
+
 func parseQcowDisks(domainXML string, cdromToDebug bool) ([]QcowDisk, error) {
 	domcfg := &libvirtxml.Domain{}
 	err := domcfg.Unmarshal(domainXML)

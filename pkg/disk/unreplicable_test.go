@@ -226,9 +226,65 @@ func TestTargetDevsListsEveryDeclaredDiskInOrder(t *testing.T) {
 	}
 }
 
+// Reading a path OUT of a definition. Its use is finding where a replica's
+// disk file is, from the replica's own definition -- which is the only exact
+// record, because that path was written by the sync that created the file and
+// so reflects whatever the source's backing chain was doing then.
+func TestSourceByTargetDevMapsEveryDiskThatHasBothAPathAndAName(t *testing.T) {
+	got, err := SourceByTargetDev(mixedDomainXML)
+	if err != nil {
+		t.Fatalf("SourceByTargetDev: %v", err)
+	}
+	// Any driver, replicable or not: the raw vdb is the whole point.
+	for dev, want := range map[string]string{
+		"vda": "/data/vm01-vda.qcow2",
+		"vdb": "/data/vm01-vdb.raw",
+		"sr0": "/isos/debian.iso",
+	} {
+		if got[dev] != want {
+			t.Errorf("%s = %q, want %q", dev, got[dev], want)
+		}
+	}
+	// A block-backed disk has <source dev=>, not <source file=>: absent
+	// rather than present-and-empty, so a caller cannot act on a path it
+	// does not have.
+	if _, ok := got["sdc"]; ok {
+		t.Errorf("sdc is present as %q; it has no <source file=>", got["sdc"])
+	}
+	// And a disk with no <source> at all.
+	if _, ok := got["vdd"]; ok {
+		t.Errorf("vdd is present as %q; it declares no source", got["vdd"])
+	}
+	if len(got) != 3 {
+		t.Errorf("got %d entries, want 3: %v", len(got), got)
+	}
+}
+
+func TestSourceByTargetDevSkipsADiskWithNoName(t *testing.T) {
+	const xml = `<domain type='kvm'>
+  <name>vm05</name>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/data/unnamed.qcow2'/>
+    </disk>
+  </devices>
+</domain>`
+	got, err := SourceByTargetDev(xml)
+	if err != nil {
+		t.Fatalf("SourceByTargetDev: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %v; a disk with no <target dev=> has no key to be found under", got)
+	}
+}
+
 func TestMalformedXMLIsAnErrorRatherThanAnEmptySet(t *testing.T) {
 	// An empty set reads as "this domain has no unreplicable disks", which
 	// would turn a parse failure into permission to sync.
+	if _, err := SourceByTargetDev("<domain"); err == nil {
+		t.Error("SourceByTargetDev accepted malformed XML")
+	}
 	if _, err := UnreplicableDisks("<domain"); err == nil {
 		t.Error("UnreplicableDisks accepted malformed XML and returned no disks")
 	}

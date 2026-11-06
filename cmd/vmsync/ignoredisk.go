@@ -49,10 +49,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"context"
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 	"vmsync/pkg/disk"
+	"vmsync/pkg/trace"
+	"vmsync/pkg/util"
 )
 
 // diskSet is the flag.Value behind -ignore-disk and -drop-disk: repeatable,
@@ -115,8 +119,46 @@ type diskSelection struct {
 	// since -drop-disk is a legitimate thing to do to a cdrom whose ISO does
 	// not exist on the target.
 	unreplicable []disk.UnreplicableDisk
-	ignore       *diskSet
-	drop         *diskSet
+	// sourceByDev is every disk's own <source file=> on the SOURCE, replicable
+	// or not. Kept because an excluded disk is removed from the list every
+	// later stage iterates, and this is then the only remaining record of what
+	// its replica file was called -- see candidateReplicaPaths.
+	sourceByDev map[string]string
+	ignore      *diskSet
+	drop        *diskSet
+}
+
+// candidateReplicaPaths is where the replica files of the excluded disks would
+// be, under this run's -target-disk-path.
+//
+// FOR ATTRIBUTION, not for acting on. The displaced-set sweep recognises a set
+// only as `<base>.vmsync-replaced-<unix>` where base is a file this replica
+// owns, which is what keeps a shared directory's answer per-domain. Once the
+// aside has been made, the base is no longer anywhere in the replica's
+// definition -- a dropped disk is gone from it, an ignored one names the
+// SOURCE's path -- so without these the set would be listed on every later run
+// and attributed to nobody, and `-reclaim-leftovers-after` could never reap it.
+// Reporting it once and then losing it would have turned one invisible orphan
+// into another with a different name.
+//
+// Derived from the source's own declared path, which is how every replica file
+// is named, and available on every run without touching the disk. A path that
+// does not exist costs nothing here: it is only ever used as a base name to
+// match against.
+//
+// The one case it cannot name is a disk whose source sits on a backing chain,
+// where the replica was named after the chain's ROOT rather than the overlay.
+// The run that makes the aside gets that name exactly, from the replica's own
+// definition; later runs would compute the overlay's. That leaves such a set
+// unattributed, which is where it was before any of this -- not worse.
+func (s diskSelection) candidateReplicaPaths(targetDiskPath string) []string {
+	var out []string
+	for _, dev := range s.excludedDevices() {
+		if src := s.sourceByDev[dev]; src != "" {
+			out = append(out, util.SetTargetPath(targetDiskPath, src))
+		}
+	}
+	return out
 }
 
 // check returns the first reason this selection cannot be acted on, or nil.
@@ -279,6 +321,89 @@ func replicatedDisks(all []disk.QcowDisk, ignore, drop *diskSet) []disk.QcowDisk
 		out = append(out, d)
 	}
 	return out
+}
+
+// asideExcludedReplicas renames aside the replica files of disks this run has
+// stopped copying, and returns the ordinary paths it displaced.
+//
+// WHAT IT IS FOR. A pair that replicated vdb for months and now excludes it
+// leaves a full-size file on the DR host that nothing ever touches again: the
+// -reinit rename loop, the full-sync preflight and the displaced-set sweep all
+// iterate the disks this run copies, so none of them asks about it -- and the
+// leftover reporting could not name it anyway, because it recognises a
+// displaced set only by the `<base>.vmsync-replaced-<unix>` shape and this file
+// still has the ordinary disk name. It is unreferenced under either flag: a
+// dropped disk is gone from the definition, and an ignored one points at the
+// SOURCE host's path.
+//
+// Renaming it aside turns it into an ordinary displaced set, which the sweep
+// already reports on every run and -reclaim-leftovers-after already removes
+// once an operator has said how old is old enough.
+//
+// Never deleted, whatever -replaced-disk-action says. That flag's own wording
+// is about the disk a -reinit replaces, and this is the last replica of a disk
+// somebody has just said they manage another way -- so it goes where an
+// operator can still find it, and leaves by the route they chose.
+//
+// THE PATH COMES FROM THE REPLICA'S OWN PREVIOUS DEFINITION, which is the only
+// place it is recorded exactly. Deriving it from the source's disk today would
+// be wrong wherever an external snapshot or a linked clone is in play, because
+// the replica was named after the backing chain's ROOT; and resolving that
+// chain here would mean running qemu-img against a disk -ignore-disk has just
+// promised to touch in no way.
+//
+// Only a path inside the replica's own disk directory is acted on, and that
+// guard is load-bearing rather than tidy: after the first excluded run an
+// IGNORED disk's entry in the definition names the SOURCE host's path, so
+// without it a second run could rename a file on the target that merely
+// happens to sit at the same path as something on the source.
+func asideExcludedReplicas(ctx context.Context, runner remoteRunner, targetXML string, excluded []string, replicaDir, stamp string) ([]string, error) {
+	if len(excluded) == 0 || targetXML == "" {
+		return nil, nil
+	}
+	byDev, err := disk.SourceByTargetDev(targetXML)
+	if err != nil {
+		// Not fatal: an unreadable target definition is already reported by
+		// everything that depends on it, and failing the sync over an orphan
+		// nobody is about to read would be the wrong trade.
+		trace.Warning("could not read the replica's definition to look for the disks this run stopped copying; a previously replicated disk may be left as an unreported file on the target",
+			"error", err)
+		return nil, nil
+	}
+
+	var displaced []string
+	for _, dev := range excluded {
+		p := byDev[dev]
+		if p == "" {
+			continue
+		}
+		if path.Dir(p) != replicaDir {
+			// The definition names a path outside the replica's own disk
+			// directory, which is what an ignored disk's entry looks like
+			// once this flag has been in force for a run. Nothing of this
+			// replica's is there to displace.
+			continue
+		}
+		exists, err := util.RemotePathExists(ctx, runner, p)
+		if err != nil {
+			return nil, fmt.Errorf("check whether the replica still has a file for the excluded disk %s at %s: %w", dev, p, err)
+		}
+		if !exists {
+			continue
+		}
+		aside := p + replacedDiskSuffix + stamp
+		trace.Warning("this disk is no longer replicated, so its replica file is being renamed aside rather than left as an unreported file on the target",
+			"device", dev, "path", p, "renamed_to", aside,
+			"note", "it is now an ordinary displaced set: every run reports it, and -reclaim-leftovers-after removes it once it is older than the duration you set")
+		// -n for the reason the reinit aside uses it: an existing file at the
+		// destination is never clobbered, so a set somebody kept deliberately
+		// survives and the run fails instead.
+		if out, err := runner.Run(ctx, "mv -n "+util.ShQuote(p)+" "+util.ShQuote(aside)); err != nil {
+			return nil, fmt.Errorf("rename aside the replica file of the excluded disk %s (%s -> %s): %w: %s", dev, p, aside, err, out)
+		}
+		displaced = append(displaced, p)
+	}
+	return displaced, nil
 }
 
 // unreplicableByDev answers whether a device is in the unreplicable set.

@@ -4292,10 +4292,15 @@ func run(cfg syncConfig) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("read the source domain's disk devices: %w", err)
 	}
+	sourceByDev, err := disk.SourceByTargetDev(srcXML)
+	if err != nil {
+		return fmt.Errorf("read the source domain's disk paths: %w", err)
+	}
 	selection := diskSelection{
 		domain:       cfg.SourceDomain,
 		all:          allDevs,
 		unreplicable: unreplicable,
+		sourceByDev:  sourceByDev,
 		ignore:       cfg.IgnoreDisk,
 		drop:         cfg.DropDisk,
 	}
@@ -4782,6 +4787,28 @@ func run(cfg syncConfig) (runErr error) {
 	// The error travels with the value: the sweep fails closed on it.
 	incompleteFields, incompleteErr := libvirtsync.ReadDomainMetadataFields(tgtMgr, cfg.TargetDomain, libvirtsync.MetadataFieldReplicaIncomplete)
 	replicaIncompleteAtStart := incompleteFields[libvirtsync.MetadataFieldReplicaIncomplete]
+
+	// The replica's definition as it stands BEFORE this run rewrites it, which
+	// is the only exact record of where each of its disk files is. Read only
+	// when this run excludes a disk, because that is the only thing that needs
+	// it: see asideExcludedReplicas for why a path derived from the source
+	// today would be the wrong one.
+	//
+	// Here, beside the marker read above, for the same two reasons -- inside
+	// the target run lock, and before -force-clean can undefine the domain. A
+	// missing domain is not an error: a first-ever sync has no replica, so
+	// there is no file of one to displace.
+	targetXMLAtStart := ""
+	if len(selection.excludedDevices()) > 0 {
+		if tgtDom, lookupErr := tgtMgr.LookupDomain(cfg.TargetDomain); lookupErr == nil {
+			if x, xmlErr := tgtDom.GetXMLDesc(libvirt.DOMAIN_XML_INACTIVE); xmlErr == nil {
+				targetXMLAtStart = x
+			} else {
+				trace.Warning("could not read the replica's definition; a disk this run stops copying may be left as an unreported file on the target", "error", xmlErr)
+			}
+			tgtDom.Free()
+		}
+	}
 
 	// Set by the lock gate before the commit, and read again before the define.
 	var commitErrFromLock error
@@ -8134,6 +8161,42 @@ func run(cfg syncConfig) (runErr error) {
 	stampDisks = stamps
 	stampMu.Unlock()
 
+	// A disk this run has stopped copying leaves its replica file behind, and
+	// nothing downstream would ever name it: every per-disk step iterates the
+	// disks being copied. Renamed aside here so it becomes an ordinary
+	// displaced set, which the sweep below reports on this very run.
+	//
+	// BEFORE that sweep, deliberately, so the operator is told on the run that
+	// made it rather than on the next one. The paths it displaced are added to
+	// what the sweep is given -- and only to that: a displaced set is
+	// attributed by the base name it sits beside, so without them the sweep
+	// would list the directory, see the file and be unable to say whose it is.
+	// They must NOT reach newRestorePoints below, which would start keeping
+	// restore points for a disk this replica does not have.
+	sweepDiskPaths := targetDiskPaths
+	if excluded := selection.excludedDevices(); len(excluded) > 0 {
+		replicaDir := ""
+		if len(targetDiskPaths) > 0 {
+			replicaDir = path.Dir(targetDiskPaths[0])
+		}
+		asideStamp := strconv.FormatInt(time.Now().Unix(), 10)
+		displacedNow, err := asideExcludedReplicas(ctx, targetSSHClient, targetXMLAtStart, excluded, replicaDir, asideStamp)
+		if err != nil {
+			return err
+		}
+		// EVERY run, not only the one that makes the aside. The sweep
+		// attributes a displaced set by a base name this replica owns, and
+		// after the rename that base is in neither the definition nor the disk
+		// list -- so a set reported once would then be listed and attributed
+		// to nobody for ever, and never reaped.
+		//
+		// Appended to a COPY: targetDiskPaths itself is the set of disks this
+		// replica HAS, and the restore-point store and the preflights read it.
+		// A disk this replica does not have must not acquire restore points.
+		sweepDiskPaths = append(append([]string{}, targetDiskPaths...), selection.candidateReplicaPaths(cfg.TargetDiskPath)...)
+		sweepDiskPaths = append(sweepDiskPaths, displacedNow...)
+	}
+
 	// Displaced sets, reported on every run and reclaimed when an operator has
 	// said how old is old enough.
 	//
@@ -8144,7 +8207,7 @@ func run(cfg syncConfig) (runErr error) {
 	// the copy that ran out of it is space reclaimed too late.
 	// The marker was read at the top of the run lock, deliberately: see there.
 	// It is a previous copy's unfinished state, never this run's own arm.
-	displaced = sweepDisplacedSets(ctx, cfg, targetSSHClient, replicaIncompleteAtStart, incompleteErr, targetDiskPaths, time.Now())
+	displaced = sweepDisplacedSets(ctx, cfg, targetSSHClient, replicaIncompleteAtStart, incompleteErr, sweepDiskPaths, time.Now())
 
 	rp, err := newRestorePoints(ctx, cfg.RetentionPolicy, targetSSHClient, targetDiskPaths, cfg.TargetDomain, checkpointName, checkpointAt)
 	if err != nil {
