@@ -679,8 +679,12 @@ What it asserts:
 - the fence actually **shuts the displaced source down**, within
   `FENCE_WAIT_SECONDS` (the agent sweeps once immediately at startup, so
   this mostly covers the guest's own shutdown rather than the 60s tick);
-- the fenced source is left **`paused`**, not merely stopped — without that
-  the next sync would start replicating it again;
+- the fenced source is left **`fenced`**, not merely stopped and not
+  `paused` — without that the next sync would start replicating it again,
+  and `paused` would say an operator chose this. Waited for, up to
+  `FENCE_ROLE_WAIT_SECONDS`: vmsync records the role only after its own
+  wait for the shutdown returns, so the domain going shut off is not the
+  moment to read it;
 - the agent recorded the fence in its **durable ledger** (`fences.json`)
   with state `done`, which is what makes a fence single-use and would stop
   a second attempt on the next sweep;
@@ -711,8 +715,9 @@ It puts the role back to `promoted` afterwards (which writes no promotion record
 and strips nothing) because everything below it needs a promoted target.
 
 Needs `SOURCE_AGENT_BIN` (the agent that gets fenced) and
-`TARGET_VMSYNC_BIN` (to promote). `TARGET_AGENT_BIN`,
-`AGENT_WORK_DIR` and `FENCE_WAIT_SECONDS` are optional — see
+`TARGET_VMSYNC_BIN` (to promote). `TARGET_AGENT_BIN`, `AGENT_WORK_DIR`,
+`FENCE_WAIT_SECONDS`, `FENCE_LEDGER_WAIT_SECONDS` and
+`FENCE_ROLE_WAIT_SECONDS` are optional — see
 `bench.conf.example`. Without the two required ones the stage skips rather
 than failing. When a fence does not fire, the agent's own log is at
 `$AGENT_WORK_DIR/agent.log` on the source host.
@@ -964,7 +969,7 @@ on the target that runs the real binary and then edits its reply. That
 exercises the whole comparison (request, response, header check, digest
 comparison, failure handling) without needing a fault injected into vmsync.
 
-Four sub-tests:
+Seven sub-tests:
 
 - **`clean`** — an ordinary incremental must report that the check *ran and
   matched*. The load-bearing one: if the check is silently off (no helper, a
@@ -983,6 +988,28 @@ Four sub-tests:
   a perfectly good 50 GiB VM on evidence that was never about the data.
 - **`off`** — `-no-checksum` must genuinely skip the check, so the escape
   hatch is real rather than a no-op.
+- **`refusal`** — a target with no usable helper must be refused, and the
+  refusal must **name `-no-checksum`**. `off` proves the escape hatch works;
+  this proves an operator can find out it exists. The defect it was written
+  for, 2026-11-04: the refusal named the binary to deploy and then said
+  "avoid using features that need the helper" without saying which flag does
+  that — the flag's name appeared only in a *different* error — and it was
+  read, correctly, as "vmsync cannot be used without the helper". Two greps
+  rather than one, because a gate downgraded from a refusal to a warning
+  prints the same words and syncs anyway: one matches the error vmsync died
+  *on*, the other the words anywhere in the log, and the pair tells a
+  downgraded gate apart from an absent one. Costs no sync — the probe runs
+  before the target lock and before anything destructive.
+- **`bridge-refusal`** — the *other* helper refusal, the one `-compress` and
+  `-netbuffer` hit, must name the flag that required the helper and name
+  dropping it. A different gate from `refusal`'s, which is the point:
+  `-no-checksum` is evaluated **first**, so a bridged run never reaches the
+  checksum refusal and is stopped later by the bridge's own preflight — an
+  operator who read the checksum refusal as "the helper is a checksum thing"
+  would pass `-no-checksum` and be refused anyway. Added 2026-11-05 with the
+  wording it checks; writing it immediately found that refusal carrying an
+  embedded newline, which put the half naming the remedy on a line with no
+  timestamp and no level.
 - **`real-corruption`** — the sub-test that makes `mismatch` mean something.
   `mismatch` edits the helper's **answer**, so it proves vmsync refuses a
   commit when *told* the digests disagree — the plumbing. It cannot prove the

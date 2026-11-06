@@ -38,6 +38,12 @@ extract() {
 	extract "$COMMON" results_row
 	extract "$BENCH" stage_pattern
 	extract "$BENCH" stage_verdict
+	# The two lists that have to agree about which stages exist: the one
+	# --stages accepts, and the one that gives each stage the number its
+	# report heading uses. Taken verbatim so neither can be restated here
+	# and drift from bench.sh.
+	grep -E '^ALL_STAGES="' "$BENCH"
+	extract "$BENCH" stage_number
 	extract "$BENCH" ungraded_row
 	extract "$BENCH" fo_check
 	# The fixture builder the two planting stages share, and the one-line rule
@@ -49,6 +55,10 @@ extract() {
 	# Tested directly rather than through a caller: what it has to get right
 	# is an exit status, and the whole defect was that the status was wrong.
 	extract "$BENCH" grep_q
+	# The wait for a metadata field another process writes. Its one read of
+	# the outside world is vmsync_meta_field, so stubbing that drives every
+	# outcome -- and what it has to get right is how MANY times it reads.
+	extract "$BENCH" meta_field_until
 } > "$WORK/lib.sh"
 for fn in results_row stage_pattern stage_verdict fo_check; do
 	grep -q "^$fn() {" "$WORK/lib.sh" || { echo "EXTRACT FAILED: $fn"; exit 2; }
@@ -63,6 +73,8 @@ for fn in plant_orphan probe_gone; do
 done
 HAVE_GREPQ=yes
 grep -q '^grep_q() {' "$WORK/lib.sh" || HAVE_GREPQ=no
+HAVE_META_UNTIL=yes
+grep -q '^meta_field_until() {' "$WORK/lib.sh" || HAVE_META_UNTIL=no
 # shellcheck disable=SC1090
 . "$WORK/lib.sh"
 
@@ -641,6 +653,233 @@ while IFS= read -r line; do
 	bare=$((bare + 1))
 done < <(grep -nE '^[[:space:]]*bench_sync_hint$|\{[[:space:]]*bench_sync_hint;' "$BENCH" || true)
 check "no stage calls bench_sync_hint as a bare statement" 0 "$bare"
+
+if [ "$HAVE_META_UNTIL" = no ]; then
+	echo
+	echo "=== meta_field_until: NOT PRESENT in this bench.sh, the wait cases are skipped ==="
+else
+	echo
+	echo "=== meta_field_until: a field not written YET is not a field never written ==="
+
+	# THE FINDING (stage 7, 2026-11-05). The fenced-source check read
+	# replication_role once, the instant the domain went shut off, and reported
+	# "got role ''" on a run whose fence had worked: vmsync writes that role
+	# only after its own wait for the shutdown returns, that wait polls every
+	# 2s, and this harness's polls every 5s. The empty value is what makes it
+	# so misleading -- nothing on the sync path writes replication_role=source,
+	# so an early read is not a stale value but an absent field, and the check
+	# accused the engine of recording nothing at all.
+	#
+	# What has to hold is how many times it READS, which is why every case
+	# below counts reads and sleeps rather than only checking the verdict.
+	META_TRACE="$WORK/meta.trace"
+	META_SEQ_FILE="$WORK/meta.seq"
+
+	# One value per call, '|'-separated, because the whole point is that the
+	# answer CHANGES between reads. An exhausted sequence reads empty for ever,
+	# which is exactly what an absent field does.
+	#
+	# The remaining sequence lives in a FILE for the same reason the trace does,
+	# and it is the sharper half: meta_field_until reads the field inside its
+	# own command substitution, so EVERY read is a fresh subshell. A sequence
+	# kept in a variable was rewound on each call, every read returned the first
+	# value, and the two cases about a field arriving late could not fail.
+	# shellcheck disable=SC2329 # called by the extracted meta_field_until, which shellcheck cannot follow
+	vmsync_meta_field() {
+		printf 'read:%s\n' "$*" >>"$META_TRACE"
+		local rest next
+		rest="$(cat "$META_SEQ_FILE")"
+		next="${rest%%|*}"
+		case "$rest" in
+		*'|'*) printf '%s' "${rest#*|}" >"$META_SEQ_FILE" ;;
+		*) : >"$META_SEQ_FILE" ;;
+		esac
+		printf '%s' "$next"
+	}
+	# Counted, not performed: these cases would otherwise take the wall-clock
+	# time they are asserting about.
+	# shellcheck disable=SC2329 # same: the extracted function is what sleeps
+	sleep() { printf 'sleep:%s\n' "$1" >>"$META_TRACE"; }
+	# The two refusals report through warn, so it has to be observable here --
+	# the stub at the top of this file throws it away. CONF is named in one of
+	# the messages.
+	# shellcheck disable=SC2329 # invoked by the extracted function, not from here
+	warn() { printf 'warn:%s\n' "$*" >>"$META_TRACE"; }
+	# shellcheck disable=SC2034 # read by the extracted function, which names it in one message
+	CONF="bench.conf"
+
+	# Traced to a FILE because the function runs inside a command substitution
+	# at its real call site and is driven the same way here -- a counter kept in
+	# a shell variable is written in that subshell and never comes back.
+	# drive SEQ LIMIT [WANT] -- WANT defaults to fenced, and is a parameter only
+	# so the empty-WANT refusal can be driven.
+	drive() {
+		printf '%s' "$1" >"$META_SEQ_FILE"
+		: >"$META_TRACE"
+		if OUT="$(meta_field_until qemu:///system vm1 replication_role "${3-fenced}" "$2")"; then RC=0; else RC=$?; fi
+		READS="$(grep -c '^read:' "$META_TRACE" || true)"
+		SLEEPS="$(grep -c '^sleep:' "$META_TRACE" || true)"
+		TRACE_TEXT="$(cat "$META_TRACE")"
+	}
+
+	# The ordinary case before the fix: the first read already has it.
+	drive "fenced" 60
+	check "a field already written is reported at once" "0 fenced" "$RC $OUT"
+	check "and read exactly once, with no wait at all" "1 0" "$READS $SLEEPS"
+
+	# THE CASE THE FIX IS FOR: absent, absent, then written.
+	drive "||fenced" 60
+	check "a field written two reads later is still found" "0 fenced" "$RC $OUT"
+	check "at the cost of exactly two waits" "3 2" "$READS $SLEEPS"
+	# The INTERVAL, not just the count. It is the other half of every budget
+	# claim: the loop adds 2 to its clock per iteration, so a sleep that is not
+	# 2 makes the clock and the wall disagree while every count above stays
+	# right -- "60s" becomes fifteen minutes at sleep 30, or a 31-read busy
+	# spin at sleep 0 that re-opens the race it was written to close.
+	check "and it waits two seconds, which is what its clock counts" \
+		"sleep:2 sleep:2" "$(grep '^sleep:' "$META_TRACE" | tr '\n' ' ' | sed 's/ $//')"
+
+	# And a genuine failure has to stay a failure, or the fix turns the check
+	# into a tautology that passes on an engine recording nothing.
+	drive "source|source|source|source" 4
+	check "a field that never becomes the wanted value fails" "1 source" "$RC $OUT"
+	# Three reads and two waits, not three waits: a loop that slept on its way
+	# out spent 2s per failing check for an answer it had already given up on,
+	# and at LIMIT=0 it waited where it had been told not to wait at all.
+	check "after reading at 0s, 2s and 4s, waiting only between them" "3 2" "$READS $SLEEPS"
+
+	# The value it prints on failure is the LAST thing it saw, not the first:
+	# a role that went to 'paused' is a different finding from one that stayed
+	# absent, and the message is where that difference reaches the reader.
+	drive "|paused" 2
+	check "the reported value is the last one read" "1 paused" "$RC $OUT"
+
+	# A near miss is not a match. Without this, a fix that compared prefixes
+	# would pass every case above.
+	drive "fence" 0
+	check "a value that merely resembles the wanted one does not pass" "1 fence" "$RC $OUT"
+
+	# LIMIT=0 is one read, not none. A caller who does not want to wait still
+	# wants the answer, and a loop that tested the limit first would give none.
+	drive "fenced" 0
+	check "LIMIT=0 still reads once" "0 fenced 1 0" "$RC $OUT $READS $SLEEPS"
+
+	# An absent field with no wait: the shape stage 7 used to have. It must
+	# report absence rather than fail to read at all -- and it must report it
+	# as EMPTY. That distinction is the whole finding: a role that is absent
+	# and a role that is stale are different, and '' is the evidence of the
+	# first. Anything substituted for it here ("<none>", "absent") would make
+	# the two unreportable, so the printed value is asserted, not just the
+	# counts. The angle brackets are what makes an empty value visible.
+	drive "" 0
+	check "an absent field with no wait reads empty, once" "1 <> 1 0" "$RC <$OUT> $READS $SLEEPS"
+
+	# The three identifiers have to reach the reader, or a wait could poll the
+	# wrong domain -- or the wrong field, which would read empty for ever and
+	# turn every one of these waits into its full timeout.
+	check "the field it polls is the one it was asked for" \
+		"read:qemu:///system vm1 replication_role" "$(head -1 "$META_TRACE")"
+
+	# --- the two things it must refuse to do --------------------------------
+	#
+	# Both are written as prose in the function's comment. Prose is not a
+	# guard: a later caller reads the signature, not the paragraph.
+
+	# An empty WANT would be satisfied by the first read -- including a read
+	# that failed, since vmsync_meta_field discards every error -- so a check
+	# resting on it would pass for ever, on any host, including one with no
+	# xmllint installed.
+	drive "source" 30 ""
+	check "an empty WANT is refused, not matched" "2 0 0" "$RC $READS $SLEEPS"
+	check "and it says what to do instead" yes \
+		"$(has 'Compare before against after' "$TRACE_TEXT")"
+
+	# A duration an operator would plausibly write. Left to the loop this
+	# HANGS: `[ 0 -ge 90s ]` exits 2 every pass and an `if` reads that as a
+	# budget not yet spent, so the run never reaches its report at all.
+	drive "source" 90s
+	check "a LIMIT that is not whole seconds reads once and does not wait" \
+		"1 source 1 0" "$RC $OUT $READS $SLEEPS"
+	check "and names the setting rather than the engine" yes \
+		"$(has 'whole number of seconds' "$TRACE_TEXT")"
+	check "and points at the file it is set in" yes "$(has 'bench.conf' "$TRACE_TEXT")"
+
+	unset -f vmsync_meta_field sleep
+	warn() { :; }
+fi
+
+# The call site, because every case above would pass just as well with stage 7
+# still sampling once. This is the assertion the wait was written for: the role
+# a FENCE writes, which is the only field in this file written by a process the
+# harness is not waiting on.
+#
+# Outside the guard above deliberately. That guard exists so this harness can
+# be pointed at an older bench.sh, and inside it a bench.sh with no
+# meta_field_until would skip the one check that says stage 7 needs one.
+#
+# The 7f read of the same field is deliberately NOT a wait: it asserts that
+# `virsh start` left the role alone, and polling for something that must not
+# change would pass on its first read.
+fence_body="$(extract "$BENCH" stage_fence_agent)"
+[ -n "$fence_body" ] || { echo "EXTRACT FAILED: stage_fence_agent"; exit 2; }
+# shellcheck disable=SC2016 # the needle is bench.sh's own source text: expanding $SOURCE_URI here would match nothing
+check "stage 7 waits for the fenced role rather than sampling it" yes \
+	"$(has 'meta_field_until "$SOURCE_URI" "$SOURCE_DOMAIN" replication_role fenced "$role_wait"' "$fence_body")"
+
+# The BUDGET it passes, pinned to its exact text, because a wait of zero is a
+# sample: LIMIT=0 is documented and tested as one read with no wait, so a
+# default of 0 restores the original defect in full with every assertion above
+# still green and the failure message reading "after 0s of polling".
+# shellcheck disable=SC2016 # same: the needle is source text, not a value to expand
+check "and the budget it passes is a real one, defaulting to the ledger wait" yes \
+	"$(has 'role_wait="${FENCE_ROLE_WAIT_SECONDS:-${FENCE_LEDGER_WAIT_SECONDS:-60}}"' "$fence_body")"
+
+# And it reports what it MEASURED, not what it asked for. The budget counts
+# only the sleeping; each read is an ssh round trip on top, so a 60s budget is
+# 75-105s of stage. The ledger check three lines below prints measured elapsed,
+# and a reader comparing two numbers in two adjacent failure messages will take
+# both for measurements.
+# shellcheck disable=SC2016 # source text again: the arithmetic must reach bench.sh unexpanded
+check "and reports the time it measured, as the ledger check does" yes \
+	"$(has 'after $((SECONDS - role_t0))s of polling' "$fence_body")"
+
+echo
+echo "=== every stage reaches the report ==="
+
+# THE FINDING. Two independent lists decide a stage's fate, and nothing tied
+# them together: ALL_STAGES says what --stages will RUN, and the "## Stage N:"
+# headings inside generate_report say what report.md will PRINT. Stage 25 ran
+# its dozen checks and had them graded into the summary table at the top of the
+# report -- and then had no section under it, so the report went from Stage 24
+# straight to Stage 26 and those rows were readable only by opening
+# results.csv. It was found by a reader asking where stage 25 had gone, which
+# was the only way left to find it.
+#
+# Source-level, because the sections cannot be produced without a bench run.
+# Driven from ALL_STAGES rather than from a list written here, so a stage added
+# tomorrow is covered by this without anybody remembering to add it.
+unnumbered=""
+unprinted=""
+for s in ${ALL_STAGES//,/ }; do
+	n="$(stage_number "$s")"
+	case "$n" in
+	'' | *[!0-9]*)
+		unnumbered="$unnumbered $s"
+		continue
+		;;
+	esac
+	grep -q "echo \"## Stage $n:" "$BENCH" || unprinted="$unprinted $s($n)"
+done
+check "every stage in ALL_STAGES has a number of its own" "" "$unnumbered"
+check "every stage in ALL_STAGES has a section in report.md" "" "$unprinted"
+
+# And the numbers have to be distinct, or one stage's rows print under another
+# stage's heading and the check above is satisfied by the wrong section.
+dups="$(for s in ${ALL_STAGES//,/ }; do
+	stage_number "$s"
+	echo
+done | sort | uniq -d | tr '\n' ' ')"
+check "no two stages claim the same number" "" "$dups"
 
 echo
 if [ "$SKIPPED" -ne 0 ]; then
