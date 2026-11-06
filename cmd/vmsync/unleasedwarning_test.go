@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	testHelperPath = "/usr/local/bin/vmsync-bridge-helper"
+	testHelperPath = "/usr/bin/vmsync-bridge-helper"
 	testTargetHost = "hyper-b"
 )
 

@@ -55,7 +55,7 @@ func TestLoadAgentFileAppliesDefaults(t *testing.T) {
 	for _, tc := range []struct{ name, got, want string }{
 		{"libvirt_uri", a.LibvirtURI, "qemu:///system"},
 		{"state_dir", a.StateDir, "/var/lib/vmsync-agent"},
-		{"vmsync_path", a.VmsyncPath, "/usr/local/bin/vmsync"},
+		{"vmsync_path", a.VmsyncPath, "/usr/bin/vmsync"},
 		{"target_uri_pattern", a.TargetURIPattern, "qemu+ssh://%s/system"},
 	} {
 		if tc.got != tc.want {

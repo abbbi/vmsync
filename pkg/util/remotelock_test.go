@@ -246,7 +246,7 @@ func TestAcquireRemoteRunLockReturnsAWorkingCloser(t *testing.T) {
 func TestALeasedLockIsPreferredWhenAHelperIsThere(t *testing.T) {
 	h := &fakeHolder{}
 	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
-		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		HelperPath: "/usr/bin/vmsync-bridge-helper",
 		Lease:      45 * time.Second,
 		Identity:   RunLockIdentity{Kind: "sync", SourceDomain: "web01", RunID: "run-abc"},
 	})
@@ -262,7 +262,7 @@ func TestALeasedLockIsPreferredWhenAHelperIsThere(t *testing.T) {
 		t.Errorf("lease = %s, want the configured 45s", lock.Lease())
 	}
 	for _, want := range []string{
-		"'/usr/local/bin/vmsync-bridge-helper'",
+		"'/usr/bin/vmsync-bridge-helper'",
 		"-hold-run-lock '" + RunLockPath("/run/vmsync-locks", "target-web01") + "'",
 		"-lock-lease '45s'",
 		`"kind":"sync"`,
@@ -285,7 +285,7 @@ func TestALeasedLockIsPreferredWhenAHelperIsThere(t *testing.T) {
 func TestAnUnusableHelperFallsBackToTheShell(t *testing.T) {
 	h := &fakeHolder{failWith: "flag provided but not defined: -hold-run-lock", failHelperOnly: true}
 	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
-		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		HelperPath: "/usr/bin/vmsync-bridge-helper",
 	})
 	if err != nil {
 		t.Fatalf("an old helper cost the lock entirely: %v -- concurrent runs would no longer be excluded", err)
@@ -308,7 +308,7 @@ func TestAnUnusableHelperFallsBackToTheShell(t *testing.T) {
 func TestHelperContentionIsReportedWithoutRetryingTheShell(t *testing.T) {
 	h := &fakeHolder{failWith: RemoteLockBusy}
 	_, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
-		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		HelperPath: "/usr/bin/vmsync-bridge-helper",
 	})
 	if !errors.Is(err, ErrLockHeld) {
 		t.Fatalf("err = %v, want ErrLockHeld", err)
@@ -324,7 +324,7 @@ func TestTheHeartbeatRunsAndItsFailureIsReportedAsLockLoss(t *testing.T) {
 	beat := &fakeCloser{}
 	h := &fakeHolder{handle: beat}
 	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
-		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		HelperPath: "/usr/bin/vmsync-bridge-helper",
 		Lease:      90 * time.Millisecond, // beats every 30ms
 	})
 	if err != nil {
@@ -365,7 +365,7 @@ func TestCloseStopsTheHeartbeatBeforeClosingTheHandle(t *testing.T) {
 	beat := &fakeCloser{}
 	h := &fakeHolder{handle: beat}
 	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
-		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		HelperPath: "/usr/bin/vmsync-bridge-helper",
 		Lease:      15 * time.Millisecond,
 	})
 	if err != nil {
@@ -398,7 +398,7 @@ func TestCloseStopsTheHeartbeatBeforeClosingTheHandle(t *testing.T) {
 func TestAHolderThatExitsIsReportedAtOnce(t *testing.T) {
 	h := &fakeHolder{handle: &fakeCloser{exited: make(chan error, 1)}}
 	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
-		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		HelperPath: "/usr/bin/vmsync-bridge-helper",
 		// Long, so nothing here can pass by way of a heartbeat tick.
 		Lease: time.Hour,
 	})
@@ -434,7 +434,7 @@ func TestAHolderThatExitsIsReportedAtOnce(t *testing.T) {
 func TestADeliberateCloseIsNotALoss(t *testing.T) {
 	h := &fakeHolder{handle: &fakeCloser{exited: make(chan error, 1)}}
 	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
-		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		HelperPath: "/usr/bin/vmsync-bridge-helper",
 		Lease:      time.Hour,
 	})
 	if err != nil {
@@ -519,7 +519,7 @@ func TestTheLossSaysWhyTheHolderLetGo(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := &fakeHolder{handle: &fakeCloser{exited: make(chan error, 1), said: tc.said}}
 			lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
-				HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+				HelperPath: "/usr/bin/vmsync-bridge-helper",
 				Lease:      time.Hour,
 			})
 			if err != nil {
@@ -571,7 +571,7 @@ func TestAnExplainedLossReplacesAnObservedOne(t *testing.T) {
 	}}
 	// Short, so a beat is attempted at once and the heartbeat path wins.
 	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
-		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		HelperPath: "/usr/bin/vmsync-bridge-helper",
 		Lease:      90 * time.Millisecond,
 	})
 	if err != nil {
@@ -623,7 +623,7 @@ func TestAPartitionKeepsTheHeartbeatsAccount(t *testing.T) {
 		said:   "this must never appear: nothing exited",
 	}}
 	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
-		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		HelperPath: "/usr/bin/vmsync-bridge-helper",
 		Lease:      90 * time.Millisecond,
 	})
 	if err != nil {
@@ -661,7 +661,7 @@ func TestACleanExitDoesNotReportItselfAsNil(t *testing.T) {
 		said:   "vmsync-bridge-helper: run lock lease expired",
 	}}
 	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
-		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		HelperPath: "/usr/bin/vmsync-bridge-helper",
 		Lease:      time.Hour,
 	})
 	if err != nil {
@@ -700,7 +700,7 @@ func TestAnObservationNeverOverwritesACause(t *testing.T) {
 		said:   "vmsync-bridge-helper: run lock lease expired",
 	}}
 	lock, err := AcquireRemoteRunLock(context.Background(), h, "/run/vmsync-locks", "target-web01", RemoteLockOptions{
-		HelperPath: "/usr/local/bin/vmsync-bridge-helper",
+		HelperPath: "/usr/bin/vmsync-bridge-helper",
 		// Short, so beats keep being attempted after the exit.
 		Lease: 90 * time.Millisecond,
 	})

@@ -318,7 +318,7 @@ func TestRunLogRotatesAndKeepsOneGeneration(t *testing.T) {
 	for i := 0; i < 40; i++ {
 		if err := l.Append(runLogRecord{
 			Event: runEventLaunch, RunID: "r", VM: "web01", Origin: runOriginScheduled,
-			Binary: "/usr/local/bin/vmsync",
+			Binary: "/usr/bin/vmsync",
 		}); err != nil {
 			t.Fatalf("append %d: %v", i, err)
 		}

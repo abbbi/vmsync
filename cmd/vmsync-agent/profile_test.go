@@ -152,7 +152,7 @@ func TestCommandArgsCarriesEndpointsAndCredentials(t *testing.T) {
 		SSHUser: "root", SSHKey: "/root/.ssh/id_vmsync", SSHPort: 2222,
 		SSHKnownHosts:      "/etc/vmsync/known_hosts",
 		PrometheusTextfile: "/var/lib/node_exporter/textfile_collector/vmsync_web01.prom",
-		BridgeHelperPath:   "/usr/local/bin/vmsync-bridge-helper",
+		BridgeHelperPath:   "/usr/bin/vmsync-bridge-helper",
 		Profile:            SyncProfile{TargetDiskPath: "/data/replicas", IODepth: 16},
 	}
 	args := req.CommandArgs()
@@ -167,7 +167,7 @@ func TestCommandArgsCarriesEndpointsAndCredentials(t *testing.T) {
 		"-ssh-key":             "/root/.ssh/id_vmsync",
 		"-ssh-port":            "2222",
 		"-ssh-known-hosts":     "/etc/vmsync/known_hosts",
-		"-bridge-helper-path":  "/usr/local/bin/vmsync-bridge-helper",
+		"-bridge-helper-path":  "/usr/bin/vmsync-bridge-helper",
 		"-io-depth":            "16",
 		"-prometheus-textfile": "/var/lib/node_exporter/textfile_collector/vmsync_web01.prom",
 	}

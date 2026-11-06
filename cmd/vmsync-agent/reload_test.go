@@ -87,7 +87,7 @@ func controlPlaneConfig(stateDir, vmsyncPath string) string {
 // --standalone agent whose configuration names no schedule file: a host that
 // looks healthy in the journal and replicates nothing.
 func TestReloadRefusesAFileThatNoLongerMatchesTheMode(t *testing.T) {
-	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/local/bin/vmsync"))
+	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/bin/vmsync"))
 
 	// The fixture's reloader runs in modeStandalone. This file is valid on its
 	// own terms -- it would start a --controlled agent perfectly -- and is
@@ -102,7 +102,7 @@ func TestReloadRefusesAFileThatNoLongerMatchesTheMode(t *testing.T) {
 	if cur.StandaloneFile != "/etc/vmsync/schedule.json" {
 		t.Errorf("schedule_file = %q; the agent lost the only thing telling it what to sync", cur.StandaloneFile)
 	}
-	if cur.VmsyncPath != "/usr/local/bin/vmsync" {
+	if cur.VmsyncPath != "/usr/bin/vmsync" {
 		t.Errorf("vmsync_path = %q; the allowed half of a refused reload was applied anyway", cur.VmsyncPath)
 	}
 }
@@ -140,8 +140,8 @@ func TestRefuseColdChangesOnMode(t *testing.T) {
 }
 
 func TestReloadAppliesAChange(t *testing.T) {
-	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/local/bin/vmsync"))
-	if got := f.lv.get().VmsyncPath; got != "/usr/local/bin/vmsync" {
+	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/bin/vmsync"))
+	if got := f.lv.get().VmsyncPath; got != "/usr/bin/vmsync" {
 		t.Fatalf("starting vmsync_path = %q", got)
 	}
 
@@ -160,7 +160,7 @@ func TestReloadAppliesAChange(t *testing.T) {
 // An unchanged file must not publish a generation. Otherwise the generation
 // gauge climbs every ten seconds forever and stops meaning anything.
 func TestReloadIgnoresAnUnchangedFile(t *testing.T) {
-	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/local/bin/vmsync"))
+	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/bin/vmsync"))
 	before := f.lv.get()
 
 	f.r.reload("test")
@@ -179,12 +179,12 @@ func TestReloadIgnoresAnUnchangedFile(t *testing.T) {
 // operator's finished edit -- saved a second later -- would be seen as
 // unchanged and silently never applied.
 func TestARefusedReloadIsRetriedOnceTheFileIsFixed(t *testing.T) {
-	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/local/bin/vmsync"))
+	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/bin/vmsync"))
 
 	// Mid-save: truncated JSON.
 	writeConfig(t, f.path, `{"config_version": 1, "vmsync_pa`)
 	f.r.reload("test")
-	if cur := f.lv.get(); cur.Gen != 0 || cur.VmsyncPath != "/usr/local/bin/vmsync" {
+	if cur := f.lv.get(); cur.Gen != 0 || cur.VmsyncPath != "/usr/bin/vmsync" {
 		t.Fatalf("a broken file changed the running configuration: gen=%d path=%q", cur.Gen, cur.VmsyncPath)
 	}
 
@@ -204,7 +204,7 @@ func TestARefusedReloadIsRetriedOnceTheFileIsFixed(t *testing.T) {
 // A file that parses but fails validation is refused just as completely --
 // nothing is half-applied.
 func TestAnInvalidConfigChangesNothing(t *testing.T) {
-	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/local/bin/vmsync"))
+	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/bin/vmsync"))
 
 	// A relative path: parses fine, fails rule 3.
 	writeConfig(t, f.path, `{"config_version":1,"schedule_file":"etc/schedule.json"}`)
@@ -223,7 +223,7 @@ func TestAnInvalidConfigChangesNothing(t *testing.T) {
 // would publish a generation that is neither the old file nor the new one,
 // and no operator could reason about what is actually running.
 func TestMovingStateDirRefusesTheEntireReload(t *testing.T) {
-	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/local/bin/vmsync"))
+	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/bin/vmsync"))
 
 	// Two changes at once: one allowed, one not.
 	writeConfig(t, f.path, standaloneConfig("/srv/vmsync", "/opt/vmsync/bin/vmsync"))
@@ -233,7 +233,7 @@ func TestMovingStateDirRefusesTheEntireReload(t *testing.T) {
 	if cur.StateDir != "/var/lib/vmsync-agent" {
 		t.Errorf("state_dir = %q; it must not move under a running agent", cur.StateDir)
 	}
-	if cur.VmsyncPath != "/usr/local/bin/vmsync" {
+	if cur.VmsyncPath != "/usr/bin/vmsync" {
 		t.Errorf("vmsync_path = %q; the allowed half of a refused reload was applied anyway, leaving a configuration that is neither file", cur.VmsyncPath)
 	}
 	if cur.Gen != 0 {
@@ -270,7 +270,7 @@ func TestRefuseColdChanges(t *testing.T) {
 // Losing them across a reload would reset every counter and orphan the run
 // log's open file handle.
 func TestReloadCarriesTheLiveObjectsForward(t *testing.T) {
-	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/local/bin/vmsync"))
+	f := newReloadFixture(t, standaloneConfig("/var/lib/vmsync-agent", "/usr/bin/vmsync"))
 	m := newAgentMetrics("test", "host01", modeStandalone)
 	rl := newRunLog(t.TempDir(), "session-1", m)
 
@@ -292,7 +292,7 @@ func TestReloadCarriesTheLiveObjectsForward(t *testing.T) {
 
 func TestDescribeChanges(t *testing.T) {
 	old := agentConfig{
-		Hostname: "prod01", VmsyncPath: "/usr/local/bin/vmsync",
+		Hostname: "prod01", VmsyncPath: "/usr/bin/vmsync",
 		SSHUser: "root", MaxConcurrentSyncs: 4, NoSchedule: false,
 	}
 	if got := describeChanges(old, old); len(got) != 0 {
@@ -336,7 +336,7 @@ func TestConfigDigest(t *testing.T) {
 // saying log.debug=false must not be able to switch it off mid-incident.
 func TestForcedDebugSurvivesAReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "agent.json")
-	writeConfig(t, path, standaloneConfig("/var/lib/vmsync-agent", "/usr/local/bin/vmsync"))
+	writeConfig(t, path, standaloneConfig("/var/lib/vmsync-agent", "/usr/bin/vmsync"))
 	af, _, err := LoadAgentFile(path)
 	if err != nil {
 		t.Fatal(err)

@@ -921,15 +921,20 @@ preflight_target_vmsync() {
 # uses: the one it checks in the preflight, the one the checksum shims wrap, and
 # the one it passes to every vmsync it launches as -bridge-helper-path.
 #
-# It is resolved in one place and passed EXPLICITLY rather than left to each
-# side's default, because the two defaults do not agree: vmsync's flag defaults
-# to /usr/local/bin/vmsync-bridge-helper (cmd/vmsync/main.go) and this harness
-# falls back to /usr/bin/vmsync-bridge-helper. Left to those defaults with
-# BRIDGE_HELPER_PATH unset, the preflight would version-check a binary vmsync
-# never opens, and report "integrity check available" for a helper that was not
-# the one in use -- the same shape of false green as testing a stale vmsync, and
-# just as invisible. Passing it everywhere means the binary this harness
-# verified is provably the binary the runs used.
+# It is resolved in one place and passed EXPLICITLY rather than left to any
+# side's default, because BRIDGE_HELPER_PATH may name anything -- a helper built
+# for the run, one in a home directory, a wrapper -- and the preflight, the
+# checksum shims and every vmsync launch have to name the SAME binary. Resolve
+# it twice and the preflight version-checks a binary vmsync never opens, then
+# reports "integrity check available" for a helper that was not the one in use:
+# the same shape of false green as testing a stale vmsync, and just as
+# invisible. Passing it everywhere means the binary this harness verified is
+# provably the binary the runs used.
+#
+# The fallback below equals vmsync's own flag default, which is where the
+# packages install the helper. That agreement is convenient, not relied on:
+# nothing here reads vmsync's default, so the two can be compared but never
+# substituted for each other.
 bridge_helper_path() {
 	printf '%s\n' "${BRIDGE_HELPER_PATH:-/usr/bin/vmsync-bridge-helper}"
 }
@@ -1038,9 +1043,10 @@ vmsync_common_args() {
         [ -n "${SSH_KEY:-}" ] && VMSYNC_ARGS+=(-ssh-key "$SSH_KEY")
         [ -n "${SSH_PORT:-}" ] && VMSYNC_ARGS+=(-ssh-port "$SSH_PORT")
         [ -n "${SSH_KNOWN_HOSTS:-}" ] && VMSYNC_ARGS+=(-ssh-known-hosts "$SSH_KNOWN_HOSTS")
-        # Always, not only when BRIDGE_HELPER_PATH is set: unset, the two sides
-        # default to different paths, so the preflight would check one helper and
-        # the run would use another. See bridge_helper_path.
+        # Always, not only when BRIDGE_HELPER_PATH is set: one resolution of the
+        # path has to reach the preflight, the checksum shims and every launch,
+        # or the harness verifies one helper and the runs open another. See
+        # bridge_helper_path.
         VMSYNC_ARGS+=(-bridge-helper-path "$(bridge_helper_path)")
         [ -n "${REPLACED_DISK_ACTION:-}" ] && VMSYNC_ARGS+=(-replaced-disk-action "$REPLACED_DISK_ACTION")
         return 0

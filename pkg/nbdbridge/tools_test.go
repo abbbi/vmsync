@@ -115,7 +115,7 @@ func (f *fakeRunner) Run(ctx context.Context, command string) (string, error) {
 }
 
 func TestProbeHelper(t *testing.T) {
-	cfg := Config{HelperPath: "/usr/local/bin/vmsync-bridge-helper"}
+	cfg := Config{HelperPath: "/usr/bin/vmsync-bridge-helper"}
 
 	t.Run("present and matching is usable", func(t *testing.T) {
 		f := &fakeRunner{version: version.Version}

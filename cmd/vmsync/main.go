@@ -8885,7 +8885,7 @@ func registerFlags(fs *flag.FlagSet, cfg *syncConfig) (compressArg, fenceSourceA
 	fs.StringVar(&cfg.ReplacedDiskAction, "replaced-disk-action", replacedDiskRename, fmt.Sprintf("what -reinit does with the disk it replaces: %s|%s", replacedDiskRename, replacedDiskDelete))
 	fs.StringVar(&cfg.TargetDiskOwner, "target-disk-owner", util.DiskOwnerAuto, fmt.Sprintf("owner for disks created on the target: %s|%s|user[:group]|:group", util.DiskOwnerAuto, util.DiskOwnerOff))
 
-	fs.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/local/bin/vmsync-bridge-helper", "path to vmsync-bridge-helper on the remote host")
+	fs.StringVar(&cfg.BridgeHelperPath, "bridge-helper-path", "/usr/bin/vmsync-bridge-helper", "path to vmsync-bridge-helper on the remote host")
 	fs.BoolVar(&cfg.UseSSH, "use-ssh", false, "tunnel bridged traffic through the existing ssh connection; needs -compress or -netbuffer, and is refused without one")
 	fs.IntVar(&cfg.IODepth, "io-depth", 8, "NBD read/write pairs kept in flight during the copy")
 

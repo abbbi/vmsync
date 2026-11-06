@@ -68,7 +68,11 @@ SSH_KNOWN_HOSTS=""
 # only actually used as the fixed -io-depth for Stage 2 (verify+tamper)
 # and Stage 3 (reinit-after-failures), which don't vary it.
 IO_DEPTH=8
-BRIDGE_HELPER_PATH=""   # empty = vmsync's own default (/usr/bin/vmsync-bridge-helper)
+# Empty means this harness's own fallback, /usr/bin/vmsync-bridge-helper (see
+# bridge_helper_path in bench.sh). It is always passed to vmsync explicitly, so
+# vmsync's flag default is never what answers here -- the two happen to be the
+# same path, and nothing in the harness reads vmsync's.
+BRIDGE_HELPER_PATH=""
 
 # What -reinit does with the target disk it is about to replace: "delete" or
 # "rename". This harness defaults to delete; vmsync itself defaults to rename.

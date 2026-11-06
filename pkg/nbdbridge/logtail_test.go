@@ -35,7 +35,7 @@ import (
 // from outside: "the port never reached LISTEN".
 func TestTheFailedStartReportsWhatTheHelperSaid(t *testing.T) {
 	t.Run("the helper's own words are quoted", func(t *testing.T) {
-		got := bridgeLogSentence("connect 10.0.0.5:10800: connection refused\n", nil, "/usr/local/bin/vmsync-bridge-helper")
+		got := bridgeLogSentence("connect 10.0.0.5:10800: connection refused\n", nil, "/usr/bin/vmsync-bridge-helper")
 		if !strings.Contains(got, "connection refused") {
 			t.Errorf("the helper's reason is not in the sentence: %q", got)
 		}

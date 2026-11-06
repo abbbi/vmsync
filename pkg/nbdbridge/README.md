@@ -22,7 +22,7 @@ and sync the VMs over a separate plain TCP connection.
 ### vmsync-bridge-helper
 
 When using compression or buffering, vmsync will need a helper binary, which needs to be put in
-`/usr/local/bin/vmsync-bridge-helper` on the target side.
+`/usr/bin/vmsync-bridge-helper` on the target side.
 This will allow two topologies:
 
 - SSH connection and plain TCP connection
@@ -85,7 +85,14 @@ Notes:
 ## vmsync-bridge-helper
 
 Compression and/or buffering features require to setup a helper binary on target system.
-Usually the helper binary needs to be deployed in `/usr/local/bin/vmsync-bridge-helper`
+Usually the helper binary needs to be deployed in `/usr/bin/vmsync-bridge-helper`
+
+That is also where the `vmsync-bridge-helper` package installs it, so copying
+one by hand onto a host that has the package overwrites a package-owned file —
+and a later upgrade puts the packaged one back. Since `CheckRemote` refuses a
+bridged sync whenever the helper's version differs from vmsync's, an upgrade
+that reverts one of the two halves shows up as every bridged sync being
+refused. Install one way per host.
 
 Once the helper binary is setup, you can use `-compress` or `-netbuffer` or `-use-ssh` parameters.
 
@@ -160,7 +167,7 @@ readiness (plain command execution -- the "control plane") regardless of -use-ss
 SSH, or directly.
 
 vmsync-bridge-helper must already be deployed at -bridge-helper-path (default
-/usr/local/bin/vmsync-bridge-helper) on any host --compress/--netbuffer will run
+/usr/bin/vmsync-bridge-helper) on any host --compress/--netbuffer will run
 against -- vmsync does not upload it itself. No other tool (socat included) needs to be
 installed on the remote host for bridging to work.
 
@@ -185,7 +192,7 @@ and redeploy vmsync-bridge-helper any time you upgrade vmsync itself.
   bounded in-memory buffer, native on both ends. Bare `-netbuffer` (no explicit value)
   defaults to `128k,1G`. Independent of `-compress` -- usable alone or combined with it.
 - `-bridge-helper-path` -- remote path to vmsync-bridge-helper (default
-  `/usr/local/bin/vmsync-bridge-helper`). Must already be deployed there by you (scp,
+  `/usr/bin/vmsync-bridge-helper`). Must already be deployed there by you (scp,
   config management, ...); vmsync never uploads it.
 - `-use-ssh` -- route the bridged NBD traffic through the existing SSH connection as an
   encrypted tunnel, instead of the default: vmsync-bridge-helper listening on all interfaces

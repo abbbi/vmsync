@@ -386,7 +386,7 @@ func (a AgentFile) withDefaults() AgentFile {
 		a.StateDir = "/var/lib/vmsync-agent"
 	}
 	if a.VmsyncPath == "" {
-		a.VmsyncPath = "/usr/local/bin/vmsync"
+		a.VmsyncPath = "/usr/bin/vmsync"
 	}
 	if a.TargetURIPattern == "" {
 		a.TargetURIPattern = "qemu+ssh://%s/system"

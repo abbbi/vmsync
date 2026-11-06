@@ -47,7 +47,7 @@ EnvironmentFile=-/etc/default/vmsync-agent
 # empty one. An empty string argument would be a mode the agent has to reject
 # by name; no argument at all is the "you did not say" path, which is the one
 # with the useful error.
-ExecStart=/usr/local/bin/vmsync-agent $VMSYNC_AGENT_MODE $VMSYNC_AGENT_OPTS --config /etc/vmsync/agent.json
+ExecStart=/usr/bin/vmsync-agent $VMSYNC_AGENT_MODE $VMSYNC_AGENT_OPTS --config /etc/vmsync/agent.json
 
 # Everything this agent needs lives in that file, so a reload re-reads it
 # instead of restarting the process -- no sync in flight is interrupted.

@@ -137,7 +137,7 @@ func BuildStopCommand(pidFile, logFile, helperPath string) string {
 	// helperPath is here for the comm half of that proof. The expected
 	// executable name is the installed helper's, which the operator chooses,
 	// so it cannot be a constant: a target running the helper from
-	// /usr/local/bin/vmsync-helper has comm "vmsync-helper". VerifiedKill
+	// /usr/bin/vmsync-helper has comm "vmsync-helper". VerifiedKill
 	// truncates it the way the kernel does.
 	return util.VerifiedKill{
 		PidFile: pidFile,

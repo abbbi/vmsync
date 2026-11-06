@@ -229,7 +229,7 @@ func TestBuildStopCommand(t *testing.T) {
 	const pidFile = "/run/vmsync-bridge/vmsync-bridge-20200.pid"
 	const logFile = "/run/vmsync-bridge/vmsync-bridge-20200.log"
 
-	const helperPath = "/usr/local/bin/vmsync-bridge-helper"
+	const helperPath = "/usr/bin/vmsync-bridge-helper"
 
 	got := BuildStopCommand(pidFile, logFile, helperPath)
 
@@ -360,7 +360,7 @@ func TestQuoteArgs(t *testing.T) {
 // one interface made every bridged transport (--compress, --netbuffer)
 // fail -- with the only trace in the helper's own log file on the far host.
 func TestBuildStartCommandDialsTheBoundAddress(t *testing.T) {
-	base := Config{HelperPath: "/usr/local/bin/vmsync-bridge-helper"}
+	base := Config{HelperPath: "/usr/bin/vmsync-bridge-helper"}
 
 	t.Run("unset means loopback, as before", func(t *testing.T) {
 		got := BuildStartCommand(base, 10809, 10800, "/run/p.pid", "/run/l.log")

@@ -32,7 +32,7 @@ import (
 const (
 	refusalDomain = "web01"
 	refusalReason = "not found"
-	refusalHelper = "/usr/local/bin/vmsync-bridge-helper"
+	refusalHelper = "/usr/bin/vmsync-bridge-helper"
 	refusalHost   = "hyperB"
 )
 

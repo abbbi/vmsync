@@ -35,7 +35,7 @@ func adoptFixture(t *testing.T, entries ...ScheduleEntry) (*Scheduler, *agentCon
 	dir := t.TempDir()
 	m := newAgentMetrics("test", "host01", modeStandalone)
 	cfg := agentConfig{
-		VmsyncPath: "/usr/local/bin/vmsync",
+		VmsyncPath: "/usr/bin/vmsync",
 		StateDir:   dir,
 		metrics:    m,
 		runLog:     newRunLog(dir, "session-2", m),

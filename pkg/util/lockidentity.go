@@ -266,7 +266,7 @@ func ParseProcStatStartTicks(stat string) (uint64, error) {
 
 // procExe resolves /proc/<pid>/exe, falling back to argv[0] when the binary
 // has been replaced underneath the running process -- which is precisely what
-// a package upgrade leaves behind, and reads as "/usr/local/bin/vmsync
+// a package upgrade leaves behind, and reads as "/usr/bin/vmsync
 // (deleted)".
 func procExe(pid int) (string, error) {
 	exe, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "exe"))

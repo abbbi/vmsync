@@ -196,10 +196,10 @@ func TestRunLockHeldRejectsAReusedPID(t *testing.T) {
 func TestSameBinaryComparesByBaseName(t *testing.T) {
 	// The agent knows its configured -vmsync-path; /proc/<pid>/exe reports the
 	// resolved target of every symlink along the way. Both are correct.
-	if !sameBinary("/usr/local/bin/vmsync", "/opt/vmsync-1.2.3/bin/vmsync") {
+	if !sameBinary("/usr/bin/vmsync", "/opt/vmsync-1.2.3/bin/vmsync") {
 		t.Error("two paths to the same program compared unequal")
 	}
-	if sameBinary("/usr/local/bin/vmsync", "/usr/bin/qemu-img") {
+	if sameBinary("/usr/bin/vmsync", "/usr/bin/qemu-img") {
 		t.Error("two different programs compared equal")
 	}
 }

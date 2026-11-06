@@ -87,7 +87,7 @@ arch_of() {
 }
 
 package_one() {
-	local bin_dir="$1" family arch stage
+	local bin_dir="$1" family arch
 	family="$(family_of "$bin_dir")"
 	arch="$(arch_of "$bin_dir")"
 
@@ -98,55 +98,40 @@ package_one() {
 		}
 	done
 
-	stage="$(mktemp -d)"
-	# shellcheck disable=SC2064  # $stage must expand now, not at trap time
-	trap "rm -rf '$stage'" RETURN
-
-	# The unit, with the package's own paths.
+	# The unit and the example config ship as they are checked in, because
+	# every path in them is already the path this package installs to:
+	# /usr/bin is both the engine's default (cmd/vmsync/main.go's
+	# -bridge-helper-path, cmd/vmsync-agent/agentfile.go's vmsync_path) and
+	# this package's destination, so there is nothing left to substitute.
 	#
-	# contrib/systemd/vmsync-agent.service names /usr/local/bin because that is
-	# where the hand-install documented in the READMEs puts the binaries. This
-	# package owns /usr/bin instead -- /usr/local is reserved for things the
-	# local admin installed, and a package writing there would silently
-	# overwrite a hand-built binary somebody is relying on. Substituting here
-	# keeps one unit file as the source of truth for both.
-	sed 's#/usr/local/bin/#/usr/bin/#g' \
-		"${ROOT}/contrib/systemd/vmsync-agent.service" >"${stage}/vmsync-agent.service"
-	grep -q '/usr/bin/vmsync-agent' "${stage}/vmsync-agent.service" || {
-		echo "build.sh: the unit substitution produced no /usr/bin ExecStart -- has the unit moved?" >&2
+	# Asserted rather than assumed, in both directions. A unit whose ExecStart
+	# drifted away from /usr/bin would install a service that cannot start, and
+	# an example config that names a path explicitly would pin one where the
+	# default already answers -- and would then have to be moved in lockstep
+	# with both this package's dst and the engine's defaults.
+	#
+	# The alternation accepts the binary with arguments or alone, matching what
+	# cmd/vmsync-agent/installpath_test.go accepts: two guards for one property
+	# that disagree about the property send whoever hits the stricter one
+	# looking for a mismatch the laxer one says is not there. It still refuses
+	# ExecStart=/usr/bin/vmsync-agent-wrapper, since neither a space nor the end
+	# of the line follows the name.
+	grep -qE '^ExecStart=/usr/bin/vmsync-agent( |$)' "${ROOT}/contrib/systemd/vmsync-agent.service" || {
+		echo "build.sh: contrib/systemd/vmsync-agent.service does not exec /usr/bin/vmsync-agent, which is where this package installs it" >&2
 		return 1
 	}
-
-	# The example config: the checked-in one, with the package's own binary
-	# paths spliced in.
-	#
-	# Derived rather than written out here, so contrib/agent/ stays the single
-	# source of truth and the two cannot drift -- a second copy in this script
-	# is one that gets a new key months late, or never. What the package has to
-	# change is exactly two lines: contrib/agent/ targets the hand-install the
-	# READMEs describe, whose defaults are /usr/local/bin, while this package
-	# owns /usr/bin. Left alone, a packaged agent would try to exec binaries
-	# its own package did not install.
-	#
-	# Inserted after config_version rather than appended, because trailing
-	# commas are not JSON and the last key is not a fixed thing to anchor on.
-	sed '/"config_version"/a\
-\
-  "vmsync_path": "/usr/bin/vmsync",\
-  "bridge_helper_path": "/usr/bin/vmsync-bridge-helper",' \
-		"${ROOT}/contrib/agent/agent-controlled.json.example" >"${stage}/agent.json.example"
-
-	# Proving it is still JSON, and still names the packaged paths. A sed that
-	# silently matched nothing would ship an example pointing at binaries this
-	# package does not install, which is precisely the failure the splice
-	# exists to prevent -- and it would look fine.
-	grep -q '"vmsync_path": "/usr/bin/vmsync"' "${stage}/agent.json.example" || {
-		echo "build.sh: the agent.json.example path splice matched nothing -- has contrib/agent/agent-controlled.json.example changed shape?" >&2
+	if grep -qE '"(vmsync_path|bridge_helper_path)"' "${ROOT}/contrib/agent/agent-controlled.json.example"; then
+		echo "build.sh: contrib/agent/agent-controlled.json.example now names vmsync_path or bridge_helper_path. Either the binaries moved -- in which case this package's dst and the engine's defaults have to move with them -- or the key is redundant and should come out. cmd/vmsync-agent/installpath_test.go asserts the same thing on every go test." >&2
 		return 1
-	}
+	fi
+	# Validity of the file as shipped, as a build-time backstop: the same file
+	# is parsed by cmd/vmsync-agent/installpath_test.go, which does not depend
+	# on python3 being on the packaging host. A /etc/vmsync/agent.json.example
+	# that does not parse is one an operator copies and then has to debug.
 	if command -v python3 >/dev/null 2>&1; then
-		python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "${stage}/agent.json.example" || {
-			echo "build.sh: the spliced agent.json.example is not valid JSON" >&2
+		python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
+			"${ROOT}/contrib/agent/agent-controlled.json.example" || {
+			echo "build.sh: contrib/agent/agent-controlled.json.example is not valid JSON" >&2
 			return 1
 		}
 	fi
@@ -165,7 +150,6 @@ package_one() {
 	for cfg in vmsync-bridge-helper vmsync vmsync-agent; do
 		ROOT="$ROOT" \
 			BIN_DIR="$bin_dir" \
-			STAGE_DIR="$stage" \
 			PKG_ARCH="$arch" \
 			PKG_VERSION="$PKG_VERSION" \
 			SYSCONFIG_DST="$sysconfig_dst" \
