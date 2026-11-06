@@ -332,6 +332,25 @@ DEFINE_ROLLBACK_WAIT_SECONDS=300
 # a perfectly good fence as a failure. Seconds, normally.
 #FENCE_LEDGER_WAIT_SECONDS=60
 
+# How long to wait for the fence to RECORD replication_role=fenced on the
+# source. Defaults to FENCE_LEDGER_WAIT_SECONDS, so raising that raises this
+# too -- the role is written on the way to that same record, and a host slow
+# enough to need one is slow enough to need the other.
+#
+# The same race as the one above, one step earlier: vmsync writes that role
+# only after its own wait for the domain to stop returns, and that wait polls
+# libvirt every 2s while the wait for the shutdown here polls every 5s. So the
+# shutdown is routinely observed before the role is written -- and because
+# nothing on the sync path writes replication_role=source, the field is not
+# merely stale at that instant, it is absent.
+#
+# Whole seconds. "90s" or "1m" is refused with a warning and no wait, rather
+# than silently becoming no wait at all the way the other two would.
+#
+# These two waits are spent one after the other, not shared: with both at 60
+# the worst case between the guest stopping and the ledger verdict is 120s.
+#FENCE_ROLE_WAIT_SECONDS=60
+
 # --- Output --------------------------------------------------------------
 
 RESULT_DIR=./results

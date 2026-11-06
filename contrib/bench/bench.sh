@@ -982,23 +982,25 @@ vmsync_said() {
 # preflight_bridge_helper reports what vmsync-bridge-helper is on the target
 # and whether its version matches the vmsync under test.
 #
-# Reported rather than fatal, because a missing helper is legitimate: it only
-# blocks -compress/-netbuffer, and BENCH_SYNC_ARGS="" is the documented way to
-# run without them.
+# Reported rather than fatal, because a run without the helper is legitimate
+# -- but only one that asks for nothing needing it, and that window is
+# narrower than this preflight used to claim.
 #
-# But it is worth saying out loud, because the consequence changed. The
-# pre-commit integrity check is now on by default and needs that binary at an
-# EXACTLY matching version -- so a stale helper does not fail anything, it
-# silently turns the check off for every run in the report. A harness that
-# quietly certifies an integrity check which never executed is worse than one
-# that never claimed to test it, and stage 13a is the only other place that
-# would notice.
+# WHAT IT USED TO SAY. "A stale helper does not fail anything, it silently
+# turns the check off for every run in the report." That stopped being true
+# when the pre-commit integrity check stopped being tied to bridging. The
+# check is on by DEFAULT, and a run that did not pass -no-checksum is REFUSED
+# when the helper is absent or version-skewed (cmd/vmsync/helperrefusal.go).
+# So a skewed helper does not quietly weaken this report, it fails every sync
+# in it -- louder, and far easier to misread as a vmsync defect if this
+# preflight has just promised the opposite. -compress/-netbuffer are refused
+# independently of that, and -no-checksum does not get past them.
 preflight_bridge_helper() {
 	local helper vmsync_version helper_version
 	helper="$(bridge_helper_path)"
 
 	if ! ssh_host_cmd "$TARGET_HOST" "test -x '$helper'" >/dev/null 2>&1; then
-		warn "vmsync-bridge-helper is not present (or not executable) at $helper on $TARGET_HOST. -compress/-netbuffer cannot run, and the pre-commit integrity check will be SKIPPED on every sync -- it is on by default but needs that binary. Deploy it, set BRIDGE_HELPER_PATH in $CONF, or set BENCH_SYNC_ARGS=\"\" to stop asking for compression."
+		warn "vmsync-bridge-helper is not present (or not executable) at $helper on $TARGET_HOST. Every sync in this report will be REFUSED unless BENCH_SYNC_ARGS carries -no-checksum -- the pre-commit integrity check is on by default and needs that binary -- and -compress/-netbuffer cannot run at all, with or without -no-checksum. Deploy it, set BRIDGE_HELPER_PATH in $CONF, or put -no-checksum in BENCH_SYNC_ARGS and take any compression flag out of it."
 		return 0
 	fi
 
@@ -1006,9 +1008,9 @@ preflight_bridge_helper() {
 	helper_version="$(version_from "$(ssh_host_cmd "$TARGET_HOST" "'$helper' -version" 2>&1)")"
 
 	if [ -z "$helper_version" ]; then
-		warn "vmsync-bridge-helper at $helper on $TARGET_HOST exists but would not report a version, so the integrity check may be skipped on every sync. Check it runs there by hand."
+		warn "vmsync-bridge-helper at $helper on $TARGET_HOST exists but would not report a version, which vmsync treats exactly like an absent helper -- so every sync will be refused unless BENCH_SYNC_ARGS carries -no-checksum. Check it runs there by hand."
 	elif [ -n "$vmsync_version" ] && [ "$helper_version" != "$vmsync_version" ]; then
-		warn "version skew: vmsync is $vmsync_version but vmsync-bridge-helper at $helper on $TARGET_HOST is $helper_version. vmsync refuses to use a mismatched helper, so the pre-commit integrity check will be SKIPPED on every sync in this report (and stage 13 cannot test it). Rebuild and redeploy the helper."
+		warn "version skew: vmsync is $vmsync_version but vmsync-bridge-helper at $helper on $TARGET_HOST is $helper_version. vmsync refuses a mismatched helper exactly as it refuses an absent one, so every sync in this report will FAIL unless BENCH_SYNC_ARGS carries -no-checksum (and -compress/-netbuffer cannot run either way). Rebuild and redeploy the helper."
 	else
 		log "preflight: vmsync-bridge-helper $helper_version at $helper on $TARGET_HOST matches vmsync -- integrity check available"
 	fi
@@ -1144,9 +1146,12 @@ vmsync_common_args "$iodepth_override"
 # verify modes compose with the bridge rather than working around it. Stage 3
 # already passed -compress unconditionally before this existed.
 #
-# Set BENCH_SYNC_ARGS="" to turn it off. -compress needs vmsync-bridge-helper
-# on the TARGET host; when it is missing every one of these stages fails at
-# its baseline, which is why those failures name this setting.
+# Set BENCH_SYNC_ARGS="" to turn it off -- which is no longer enough on its
+# own. -compress needs vmsync-bridge-helper on the TARGET host (and on the
+# source too, when SOURCE_URI is an ssh one), but so does the pre-commit
+# integrity check, which is on by default: without the helper, dropping
+# -compress leaves every baseline refused instead of failed. The pair that
+# actually runs helperless is BENCH_SYNC_ARGS="-no-checksum".
 read -ra BENCH_SYNC_EXTRA <<<"${BENCH_SYNC_ARGS--compress}"
 
 # bench_sync SCENARIO PHASE ARGS... -- run_vmsync plus those shared flags.
@@ -1198,7 +1203,7 @@ bench_sync_ok() { [ "${RUN_RC:-0}" = 0 ]; }
 bench_sync_hint() {
 	printf ' -- if that run ended in under a second having transferred nothing, vmsync REFUSED it at preflight rather than failing: check its log for a recorded verify_state (cleared only by -verify-failure-reinit or -force-clean), a replication_role, or an out-of-band-write refusal'
 	if [ ${#BENCH_SYNC_EXTRA[@]} -gt 0 ]; then
-		printf '. Otherwise, this stage adds "%s" to every sync (BENCH_SYNC_ARGS in %s); -compress needs vmsync-bridge-helper on %s, so set BENCH_SYNC_ARGS="" if that is not installed there' \
+		printf '. Otherwise, this stage adds "%s" to every sync (BENCH_SYNC_ARGS in %s); -compress needs vmsync-bridge-helper on %s, and so does the default-on integrity check, so a host without it needs BENCH_SYNC_ARGS="-no-checksum" rather than BENCH_SYNC_ARGS=""' \
 			"${BENCH_SYNC_EXTRA[*]}" "$CONF" "$TARGET_HOST"
 	fi
 }
@@ -1236,11 +1241,15 @@ load_axes() {
         return 0
 }
 
-# is_noop_combo COMPRESS NETBUFFER USE_SSH -> true when this combination is
-# a wasted duplicate of the plain "no bridge" case: -use-ssh is a
-# documented no-op unless -compress or -netbuffer is also active, so
-# compress=off + netbuffer=off + use_ssh=yes would just needlessly re-run
-# the exact same sync bench.sh already runs with use_ssh=no.
+# is_noop_combo COMPRESS NETBUFFER USE_SSH -> true when this combination
+# cannot be run: vmsync REFUSES -use-ssh without -compress or -netbuffer
+# (cmd/vmsync/helperrefusal.go, useSSHWithoutBridgeRefusal), because there is
+# no bridged connection for it to tunnel.
+#
+# The name predates the refusal and is kept: until 2026-11-05 the combination
+# was permitted and silently ignored, so the cell was a wasted duplicate of
+# the use_ssh=no run rather than an error. Either way it is skipped; what
+# changed is that running it now fails the stage instead of wasting a copy.
 is_noop_combo() {
         [ "$1" = off ] && [ "$2" = off ] && [ "$3" = yes ]
 }
@@ -1324,7 +1333,7 @@ stage_matrix() {
         done
 
         log "=== Stage 1: transport matrix (full + incremental sync, timed) ==="
-        log "$total combinations queued ($((total * 2)) vmsync invocations total), $skipped skipped as redundant (compress=off + netbuffer=off + use-ssh=yes is a no-op)"
+        log "$total combinations queued ($((total * 2)) vmsync invocations total), $skipped skipped as unrunnable (compress=off + netbuffer=off + use-ssh=yes: vmsync refuses -use-ssh with no bridge to tunnel)"
 
         local n=0 name
         for compress in "${COMPRESS_OPTS[@]}"; do
@@ -3476,6 +3485,64 @@ vmsync_meta_field() {
 		| xmllint --xpath "string(//*[local-name()='${field}']/@id)" - 2>/dev/null || true
 }
 
+# meta_field_until URI DOMAIN FIELD WANT LIMIT -- poll one vmsync metadata field
+# until it reads WANT, for up to LIMIT seconds. Prints the last value read, and
+# returns 0 the moment it matches, 1 if it never did, 2 if it was asked for
+# something it cannot answer.
+#
+# FOR A FIELD WRITTEN BY SOMETHING THIS HARNESS IS NOT WAITING ON. A metadata
+# field is written at some point inside another process's run, and observing
+# that run's SIDE EFFECTS -- a domain going shut off, a replica appearing --
+# says nothing about whether it has reached the write yet. Sampling once at
+# that moment reads the field as it was before, which for a field nothing has
+# ever written is empty, and reports a working engine as a broken one.
+#
+# Read, then stop if the answer is in, then stop if the budget is out: so
+# LIMIT=0 is one read rather than none -- a caller who will not wait still
+# wants the answer -- and a run that is out of budget does not sleep one more
+# time on its way to saying so.
+#
+# Not for a field that must NOT change. Polling for an absence would pass on
+# the first read, which is the same bug in the other direction -- compare
+# before against after instead, the way stage 25 does with last_checkpoint.
+# That restriction is enforced below rather than only written here.
+#
+# An empty value read from a reachable host and one read from a host that could
+# not be reached are the same empty string: vmsync_meta_field discards every
+# error it meets. So a wait that ends empty is not evidence that nothing was
+# written, and the caller's message has to say so.
+meta_field_until() {
+	local uri="$1" domain="$2" field="$3" want="$4" limit="$5" waited=0 got=""
+	# An empty WANT is a caller's mistake, not an operator's: the first read
+	# satisfies it, including a read that failed, so a check resting on it
+	# would pass for ever and nothing would ever say why.
+	if [ -z "$want" ]; then
+		warn "meta_field_until was asked to wait for an empty value of '$field' on $domain: the first read satisfies that, including a read that failed. Compare before against after instead."
+		return 2
+	fi
+	# A LIMIT that is not a whole number IS an operator's -- "90s", "1m" --
+	# and it is the one input that must not be left to the loop. `[ 0 -ge 90s ]`
+	# exits 2 on every pass and an `if` reads that as "the budget is not spent",
+	# so the wait would never end and the run would never reach its report. One
+	# read and a warning instead: every other wait in this file degrades to no
+	# wait at all on the same typo, and does it silently.
+	case $limit in
+	'' | *[!0-9]*)
+		warn "meta_field_until: the wait for '$field' on $domain must be a whole number of seconds, not '$limit' -- not waiting at all. Fix the setting in $CONF."
+		limit=0
+		;;
+	esac
+	while :; do
+		got="$(vmsync_meta_field "$uri" "$domain" "$field")"
+		if [ "$got" = "$want" ]; then break; fi
+		if [ "$waited" -ge "$limit" ]; then break; fi
+		sleep 2
+		waited=$((waited + 2))
+	done
+	printf '%s' "$got"
+	[ "$got" = "$want" ]
+}
+
 # vmsync_meta_set_field URI DOMAIN FIELD VALUE -- add or replace ONE field in a
 # domain's vmsync metadata, leaving every other field as it was. Prints the
 # element as it was BEFORE the change, for vmsync_meta_restore. Returns 1 and
@@ -4753,15 +4820,34 @@ stage_fence_agent() {
 	# force. A single word covering both would leave it unable to tell a domain
 	# a fence had stopped from one an operator had suspended by hand, and it
 	# would pass on either.
+	#
+	# POLLED, not sampled once, and for the same reason the ledger's own done
+	# check is: the domain reaching shutoff does not mean the fence has
+	# finished.
+	#
+	# The role is written by the vmsync the agent shells out to, and only after
+	# that process's own wait for the domain to stop returns -- a wait which
+	# polls libvirt every 2s (libvirtsync.ShutdownDomain). The wait above polls
+	# every 5s. So this harness routinely sees the domain stop before the
+	# process that records WHY has noticed anything, and a source domain
+	# carries no replication_role at all until a fence writes one, since
+	# nothing on the sync path writes `source`. The read came back EMPTY and
+	# the check reported a fence still being recorded as one never recorded:
+	# "got role ''", on a run whose fence had worked (2026-11-05).
+	#
+	# The write also lands strictly BEFORE the agent rewrites its ledger record
+	# to done, which the done poll below waits for as well -- so no wait here
+	# can need to outlast that one. The two are spent one after the other,
+	# though, so the worst case measured from the shutdown is their sum.
 	if [ "$state" = shutoff ]; then
-		local src_role
-		src_role="$(vmsync_meta_field "$SOURCE_URI" "$SOURCE_DOMAIN" replication_role)"
-		if [ "$src_role" = fenced ]; then fo_ok=0; else fo_ok=1; fi
-		fo_check "$sc" "the fenced source is left fenced not merely stopped" "$fo_ok" \
-			"got role '$src_role' -- without this the next sync would start it replicating again"
-
 		# The ledger is what makes a fence single-use. Its presence here is
 		# also what would stop a second attempt on the next sweep.
+		#
+		# FIRST, before the role wait below, so it still samples the ledger
+		# within a second of the shutdown. The agent writes this record BEFORE
+		# it shells out to vmsync, so its presence is a fact about the fence
+		# starting, and reading it after a wait would make it a fact about the
+		# fence starting at some point in the previous minute.
 		local ledger
 		ledger="$(run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "cat '$agent_dir/fences.json' 2>/dev/null || true")"
 		case "$ledger" in
@@ -4770,6 +4856,21 @@ stage_fence_agent() {
 		esac
 		fo_check "$sc" "the agent recorded the fence in its durable ledger" "$fo_ok" \
 			"fence id '$fence_id' not found in $agent_dir/fences.json"
+
+		# Defaults to the ledger wait, because this field is written on the way
+		# to that record: an operator who raises one has raised the thing both
+		# are waiting for. With its own fixed default, raising the ledger wait
+		# for a slow host would leave this one at 60s and the role check would
+		# fail first -- printing the very message this wait exists to stop.
+		local src_role role_t0=$SECONDS
+		local role_wait="${FENCE_ROLE_WAIT_SECONDS:-${FENCE_LEDGER_WAIT_SECONDS:-60}}"
+		if src_role="$(meta_field_until "$SOURCE_URI" "$SOURCE_DOMAIN" replication_role fenced "$role_wait")"; then fo_ok=0; else fo_ok=1; fi
+		# Elapsed, not the budget: the budget counts only the sleeping, and each
+		# read is an ssh round trip on top of it. The sibling check below prints
+		# measured time too, and two numbers side by side had better mean the
+		# same thing.
+		fo_check "$sc" "the fenced source is left fenced not merely stopped" "$fo_ok" \
+			"role read '$src_role' after $((SECONDS - role_t0))s of polling, not 'fenced'. An empty value is also what an unreadable source gives, so check $agent_dir/agent.log on $SOURCE_HOST before concluding the fence recorded nothing -- and unrecorded, the next sync would start this domain replicating again"
 
 		# Polled, not sampled once, because the domain reaching shutoff does
 		# NOT mean the agent has finished.
@@ -6146,6 +6247,8 @@ stage_checksum() {
 	checksum_mismatch_subtest "$target_path"
 	checksum_stale_helper_subtest
 	checksum_disabled_subtest
+	checksum_refusal_names_the_flag_subtest
+	checksum_bridge_refusal_names_the_flag_subtest
 	# Last, because it is the only sub-test whose corruption is REAL: on the
 	# -reinit fallback there is no overlay to discard, so it leaves the base
 	# damaged and heals after itself.
@@ -6546,6 +6649,118 @@ checksum_disabled_subtest() {
 		results_row "$CSV" checksum off-result 1 "" "" "" "" "" "FAIL no explanation in the log"
 	fi
 }
+
+# 13f: the refusal for a missing helper must NAME the escape hatch 13d proves
+# works.
+#
+# The defect this exists for, found 2026-11-04 by an operator who concluded
+# vmsync could no longer be used without the helper: the refusal named the
+# binary to deploy and then said "avoid using features that need the helper"
+# without saying which flag does that. -no-checksum's name appeared only in a
+# DIFFERENT error -- the one for a helper that answered the version probe and
+# then would not run -- so the message that stopped the run was the one message
+# that did not mention the way past it. 13d proves the flag works; nothing
+# proved an operator could find out it exists.
+#
+# No sync and no state: the probe runs before the target lock and before
+# anything destructive, so this costs one SSH round trip either way.
+#
+# run_vmsync rather than bench_sync, and no -reinit, for 24d's reason in
+# reverse: BENCH_SYNC_ARGS defaults to -compress, and a bridged run with no
+# helper dies in nbdbridge.CheckRemote instead, which is a different refusal
+# with a different message. The cost is that this run carries none of
+# BENCH_SYNC_ARGS, so it may well die of something unrelated AFTER the gate --
+# which is why what follows matches the line vmsync died ON rather than the
+# refusal's words anywhere in the log.
+checksum_refusal_names_the_flag_subtest() {
+	local ended remarked
+
+	log "--- 13f checksum/refusal: a missing helper must be refused in words that name -no-checksum ---"
+
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" checksum refusal-result DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+
+	run_vmsync checksum refusal -bridge-helper-path /nonexistent/vmsync-bridge-helper
+
+	# TWO greps, and the difference between them is the whole point. A gate
+	# downgraded from a refusal to a warning prints the same words and syncs
+	# anyway -- measured: matching the words alone passed that mutation. So
+	# "ended" matches the error vmsync reports as the one it died of, and
+	# "remarked" matches the words wherever they appear, which is what tells
+	# a downgraded gate apart from an absent one.
+	ended="$(grep -m1 'sync failed error=refusing to sync.*vmsync-bridge-helper' "$RUN_LOG" 2>/dev/null)"
+	remarked="$(grep -m1 'refusing to sync.*vmsync-bridge-helper' "$RUN_LOG" 2>/dev/null)"
+
+	if [ "$RUN_RC" = 0 ]; then
+		warn "FAIL: the sync SUCCEEDED with no helper on the target and no -no-checksum, so a run that asked for the integrity check got a replica nothing compared against its source. See $RUN_LOG"
+		results_row "$CSV" checksum refusal-result 1 "" "" "" "" "" "FAIL not refused at all"
+	elif [ -z "$ended" ] && [ -n "$remarked" ]; then
+		warn "FAIL: the missing helper was REMARKED ON rather than refused -- the words are in the log, the run carried on past them, and it died of something else afterwards. The check is on by default, so this run asked for it and would have committed a replica nothing compared against its source. The line was: $remarked"
+		results_row "$CSV" checksum refusal-result 1 "" "" "" "" "" "FAIL refusal downgraded to a warning"
+	elif [ -z "$ended" ]; then
+		warn "FAIL: the run failed, but not on the missing helper and without mentioning it, so this sub-test reached nothing it tests -- either it died earlier for an unrelated reason, or that gate is gone. See $RUN_LOG"
+		results_row "$CSV" checksum refusal-result 1 "" "" "" "" "" "FAIL refusal never reached"
+	elif printf '%s' "$ended" | grep_q -- '-no-checksum'; then
+		log "   PASS: refused, and the refusal named both ways on"
+		results_row "$CSV" checksum refusal-result 0 "" "" "" "" "" "PASS refusal names -no-checksum"
+	else
+		warn "FAIL: refused for the missing helper, but the refusal never named -no-checksum -- so an operator who wanted a sync rather than a digest is sent to deploy a binary with no way to learn the flag exists. The line was: $ended"
+		results_row "$CSV" checksum refusal-result 1 "" "" "" "" "" "FAIL refusal hides the -no-checksum remedy"
+	fi
+}
+
+# 13g: the OTHER helper refusal must name the flag that required the helper,
+# and name dropping it.
+#
+# Beside 13f rather than in the transport matrix because the two assert one
+# property between them -- that a helper refusal names the way past itself --
+# and they differ only in which way out exists. 13f's is a flag that turns the
+# requirement off; this one's is a flag to stop passing. Neither refusal said
+# so before 2026-11-05.
+#
+# This is a DIFFERENT gate from 13f's, which is the point: -no-checksum is
+# evaluated first (cmd/vmsync/main.go, `case cfg.NoChecksum:`), so a bridged
+# run never reaches helperMissingRefusal at all and is refused later by
+# nbdbridge.CheckRemote. An operator who read 13f's refusal as "the helper is
+# a checksum thing" would pass -no-checksum and be refused anyway.
+#
+# Costs no copy, but NOT free the way 13f is: this refusal lands after the
+# target disk directories, the journal intent and the target run lock, so it
+# is not the "last cheap moment" 13f's is. That ordering is recorded here
+# because it is the reason this sub-test runs last in the stage.
+checksum_bridge_refusal_names_the_flag_subtest() {
+	local ended
+
+	log "--- 13g checksum/bridge-refusal: a bridged run with no helper must be refused in words that name -compress ---"
+
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" checksum bridge-refusal-result DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+
+	run_vmsync checksum bridge-refusal -compress -bridge-helper-path /nonexistent/vmsync-bridge-helper
+
+	# Same two-grep shape as 13f, and for the same reason: the refusal has to
+	# be what ENDED the run, not words that appear in its log.
+	ended="$(grep -m1 'sync failed error=.*vmsync-bridge-helper' "$RUN_LOG" 2>/dev/null)"
+
+	if [ "$RUN_RC" = 0 ]; then
+		warn "FAIL: the sync SUCCEEDED with -compress and no helper on the target, so the NBD relay either ran without the binary that implements it or was silently dropped. See $RUN_LOG"
+		results_row "$CSV" checksum bridge-refusal-result 1 "" "" "" "" "" "FAIL bridged run not refused"
+	elif [ -z "$ended" ]; then
+		warn "FAIL: the run failed but not on the helper, so this sub-test reached nothing it tests -- either it died earlier for an unrelated reason, or nbdbridge.CheckRemote no longer refuses. See $RUN_LOG"
+		results_row "$CSV" checksum bridge-refusal-result 1 "" "" "" "" "" "FAIL bridge refusal never reached"
+	elif printf '%s' "$ended" | grep_q -- '-compress'; then
+		log "   PASS: refused, and the refusal named the flag that required the helper"
+		results_row "$CSV" checksum bridge-refusal-result 0 "" "" "" "" "" "PASS bridge refusal names -compress"
+	else
+		warn "FAIL: refused for the helper, but the refusal never named -compress -- so an operator is told to deploy a binary without being told which of their own flags asked for it, or that dropping it is the other way on. The line was: $ended"
+		results_row "$CSV" checksum bridge-refusal-result 1 "" "" "" "" "" "FAIL bridge refusal does not name its flag"
+	fi
+}
+
 
 # --- Stage 12: a failed run must not wedge the next one ----------------------
 
@@ -13368,6 +13583,16 @@ generate_report() {
                         awk -F, "$REPORT_AWK"'NR>1 && $1=="supervise" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
                 else
                         section_no_rows_note supervise "opt in with \`--stages supervise\`; it replaces one target command with one that cannot finish, so a sync fails on purpose, and it waits a full reporting interval to catch a liveness line"
+                fi
+                echo
+                echo "## Stage 25: the exclude metadata field"
+                echo
+                if awk -F, 'NR>1 && $1=="exclude" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="exclude" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                else
+                        section_no_rows_note exclude "opt in with \`--stages exclude\`; it sets the field with virsh the way an operator would, then checks that vmsync's own reader agrees with what virsh wrote, that a sync is refused and names the field, that the refusal is not counted as a sync failure, and that removing the field lifts it again. Needs a shut-off target and a source that has synced at least once"
                 fi
                 echo
                 echo "## Stage 26: a rebuilt chain is a new generation, and the old one's leftovers are reported"
