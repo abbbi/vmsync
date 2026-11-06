@@ -124,6 +124,39 @@ package_one() {
 		echo "build.sh: contrib/agent/agent-controlled.json.example now names vmsync_path or bridge_helper_path. Either the binaries moved -- in which case this package's dst and the engine's defaults have to move with them -- or the key is redundant and should come out. cmd/vmsync-agent/installpath_test.go asserts the same thing on every go test." >&2
 		return 1
 	fi
+	# Every ${VAR} the manifests reference has to be one this script exports.
+	#
+	# nfpm expands an unset variable to the EMPTY STRING, so a manifest naming
+	# a variable that is no longer passed does not fail where the mistake is --
+	# it fails as a path with a hole in it. A reference to a removed
+	# ${STAGE_DIR} reported itself as
+	#
+	#     Matching "/vmsync-agent.service": file does not exist
+	#
+	# which names neither the variable, nor the manifest, nor the script that
+	# stopped exporting it. The manifest and this script are a matched pair, so
+	# the failure mode is applying one without the other; this turns that into
+	# a sentence that says so.
+	local exported="ROOT BIN_DIR PKG_ARCH PKG_VERSION SYSCONFIG_DST VMSYNC_FULL_VERSION"
+	local manifest ref unknown=""
+	for manifest in "${ROOT}"/contrib/packaging/nfpm/*.yaml; do
+		# Comments are stripped first: the manifests explain the expansion
+		# rules by quoting ${BIN_DIR}, and prose must not be mistaken for a
+		# reference.
+		# shellcheck disable=SC2016 # the ${...} here is the pattern being searched for, not an expansion
+		for ref in $(sed 's/#.*$//' "$manifest" | grep -o '${[A-Z_][A-Z_0-9]*}' | tr -d '${}' | sort -u); do
+			case " $exported " in
+			*" $ref "*) ;;
+			*) unknown="$unknown $(basename "$manifest"):\$$ref" ;;
+			esac
+		done
+	done
+	if [ -n "$unknown" ]; then
+		echo "build.sh: the nfpm manifests reference variables this script does not export:${unknown}." >&2
+		echo "          nfpm expands an unset variable to the empty string, so this would have failed as a path with a hole in it rather than here. Either export it beside ROOT and BIN_DIR below, or -- if it was removed -- apply the matching manifest change: the two are one edit." >&2
+		return 1
+	fi
+
 	# Validity of the file as shipped, as a build-time backstop: the same file
 	# is parsed by cmd/vmsync-agent/installpath_test.go, which does not depend
 	# on python3 being on the packaging host. A /etc/vmsync/agent.json.example
