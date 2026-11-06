@@ -101,7 +101,7 @@ STAGES="matrix,verify,reinit,snapshot,journal,retention"
 # The "want ..." list this was first copied from had checksum third, for
 # historical reasons, which made `--stages all` run stage 13 before stage 3
 # while --help promised stage-number order.
-ALL_STAGES="matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,checksum,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease,redefine-probe,reinit-orphan,supervise,exclude,generation,qmp-census"
+ALL_STAGES="matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,checksum,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease,redefine-probe,reinit-orphan,supervise,exclude,generation,qmp-census,ignore-disk"
 
 # INTERRUPTED: vmsync catches SIGINT/SIGTERM itself (cleanup, then a plain
 # os.Exit(1) -- see cmd/vmsync/main.go's own signal handling), so a Ctrl+C
@@ -195,6 +195,7 @@ Options:
                                                      25  exclude
                                                      26  generation
                                                      27  qmp-census
+                                                     28  ignore-disk
                            Or one of two shorthands, used on their own rather
                            than inside a list:
                              all             every stage above, in that order
@@ -623,6 +624,26 @@ unrecognised value still refuses, fail-closed; and removing the field makes the 
 sync again, which is the property that makes the feature usable at all. It writes to
 the bench SOURCE domain, so it restores the element verbatim on EXIT as well as
 RETURN -- an exclusion left behind would refuse every sync in every later stage.
+
+Stage 28 (ignore-disk) is opt-in and is the only stage that changes the SOURCE
+domain's device list: it attaches a raw disk, which is the one thing vmsync now
+refuses to replicate, and detaches it again from a RETURN/EXIT trap. Run it on a
+fixture you are willing to have a disk attached to and detached from.
+
+It stands down rather than running if the source ALREADY carries a non-qcow2
+disk -- planting a second one would leave two to clean up and make every
+assertion ambiguous about which was refused. If a run dies badly enough to leave
+the planted disk attached, EVERY later stage's syncs are refused and nothing
+names the cause: the warning the stage prints on its way out says exactly which
+virsh command removes it.
+
+Seven sub-tests: the refusal fires and names the disk, its format and its path;
+-ignore-disk lets the run through and leaves the disk in the replica's
+definition with the source's own path; -drop-disk lets it through and removes
+the element; each records its own metadata field on the replica; a dropped disk
+does NOT trip the configuration-loss warning; a transposed device name is
+refused and lists the devices the domain has; and the same device in both flags
+is refused.
 
 Stage 27 (qmp-census) is a PROBE, like stage 22, and asks the PLATFORM rather than
 grading vmsync: a FAIL is this libvirt and this qemu answering differently from the
@@ -5046,7 +5067,7 @@ stage_fence_agent() {
 # counting as one of its own transport runs -- so a full --stages all run
 # reported Stage 1 as FAILED, with a count of "N of M vmsync runs exited
 # non-zero" that no transport combination in the matrix table accounts for.
-NON_MATRIX_SCENARIOS='^(generation$|verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$|colocated$|leftovers$|reinit-order$|lock-lease$|redefine-probe$|reinit-orphan$|supervise$|exclude$|qmp-census$)'
+NON_MATRIX_SCENARIOS='^(generation$|verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$|colocated$|leftovers$|reinit-order$|lock-lease$|redefine-probe$|reinit-orphan$|supervise$|exclude$|qmp-census$|ignore-disk$)'
 
 # stage_pattern STAGE -> the regex matching that stage's scenario column.
 # --- Stage 8: verify after a long incremental chain --------------------------
@@ -12838,6 +12859,301 @@ stage_exclude() {
 	return 0
 }
 
+# ignore_disk_restore -- detach the raw disk this stage planted.
+#
+# From a RETURN and EXIT trap, like stage_exclude's own restore, because the
+# consequence of not restoring is not local: the planted disk is RAW, so
+# source_qcow_devs cannot see it and stage 15's disk count, the base
+# fingerprints and the target paths all still look right -- while every sync in
+# every later stage is refused and the report names nothing.
+ignore_disk_restore() {
+	[ -n "${IGNORE_DISK_PLANTED:-}" ] || return 0
+	virsh_uri "$SOURCE_URI" detach-disk "$SOURCE_DOMAIN" "$IGNORE_DISK_PLANTED" --persistent >/dev/null 2>&1
+	# Verified, not assumed. A detach that silently failed leaves the fixture
+	# unsyncable for every stage after this one.
+	if source_nonqcow_devs | grep_q -x "$IGNORE_DISK_PLANTED"; then
+		warn "stage 28 could NOT detach the raw disk it planted: $SOURCE_DOMAIN still carries $IGNORE_DISK_PLANTED, so EVERY later sync in this run will be REFUSED for it. Remove it with 'virsh -c $SOURCE_URI detach-disk $SOURCE_DOMAIN $IGNORE_DISK_PLANTED --persistent' and delete ${IGNORE_DISK_FILE:-the planted file} on $SOURCE_HOST."
+		results_row "$CSV" ignore-disk cleanup "" "" "" "" "" "" "FAIL the planted raw disk is still attached"
+	else
+		run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "rm -f '${IGNORE_DISK_FILE}'" >/dev/null 2>&1 || true
+		IGNORE_DISK_PLANTED=""
+	fi
+}
+
+# source_nonqcow_devs -> the target devs of the source's disks vmsync will not
+# replicate: anything that is not a cdrom and not qcow2.
+#
+# The sibling of source_qcow_devs, and the reason this stage can assert which
+# dev it planted and which dev the refusal must name rather than trusting its
+# own bookkeeping.
+source_nonqcow_devs() {
+	virsh_uri "$SOURCE_URI" dumpxml --inactive "$SOURCE_DOMAIN" 2>/dev/null |
+		xmllint --xpath "//disk[not(@device='cdrom')][not(driver/@type='qcow2')]/target/@dev" - 2>/dev/null |
+		tr ' ' '\n' | sed -n "s/^dev=\"\(.*\)\"$/\1/p"
+}
+
+# source_disk_path DEV -> that disk's <source file> on the source domain.
+source_disk_path() {
+	virsh_uri "$SOURCE_URI" dumpxml --inactive "$SOURCE_DOMAIN" 2>/dev/null |
+		xmllint --xpath "string(//disk[target/@dev='$1']/source/@file)" - 2>/dev/null
+}
+
+# target_file_exists GLOB -> true when the replica's disk directory on the
+# target has a file matching it.
+#
+# A glob rather than a literal so the aside's unix stamp does not have to be
+# guessed, and run on the TARGET because that is where the file is.
+target_file_exists() {
+	run_shell_on "$TARGET_HOST" no "ls -d ${TARGET_DISK_PATH}/$1 >/dev/null 2>&1 && echo YES || echo NO" 2>/dev/null |
+		grep_q -x YES
+}
+
+# target_aside_count BASE -> how many displaced sets of that disk there are.
+target_aside_count() {
+	run_shell_on "$TARGET_HOST" no "ls -d ${TARGET_DISK_PATH}/$1.vmsync-replaced-* 2>/dev/null | wc -l" 2>/dev/null | tr -d '[:space:]'
+}
+
+stage_ignore_disk() {
+	log "=== Stage 28: a disk vmsync cannot replicate is refused, not skipped ==="
+	local sc=ignore-disk ok out dev="vdz" meta
+	IGNORE_DISK_PLANTED=""
+	IGNORE_DISK_FILE=""
+
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" "$sc" dryrun DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+	if [ -z "${SOURCE_HOST:-}" ]; then
+		warn "SKIP stage 28: needs SOURCE_HOST in $CONF -- it creates a raw disk file on the source host and attaches it to $SOURCE_DOMAIN."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP no SOURCE_HOST"
+		return 0
+	fi
+	stage_needs_target_shutoff "$CSV" "$sc" "stage ignore-disk" || return 0
+
+	# A fixture that ALREADY has one: planting a second would leave two to
+	# clean up and make every assertion below ambiguous about which disk the
+	# refusal was for.
+	local existing
+	existing="$(source_nonqcow_devs | tr '\n' ' ' | sed 's/ $//')"
+	if [ -n "$existing" ]; then
+		warn "SKIP stage 28: $SOURCE_DOMAIN already carries a disk vmsync cannot replicate ($existing). This stage plants its own and would leave two. Every other stage's syncs are refused while that disk is attached -- remove it, or set BENCH_SYNC_ARGS to name it in -ignore-disk."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP the source already has a non-qcow2 disk: $existing"
+		return 0
+	fi
+	if source_qcow_devs | grep_q -x "$dev"; then
+		warn "SKIP stage 28: $SOURCE_DOMAIN already has a disk at $dev, which is the name this stage plants under."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP $dev is taken"
+		return 0
+	fi
+
+	# --- plant it -----------------------------------------------------------
+	#
+	# --persistent, which is live AND config, and it matters: the engine
+	# refuses on the LIVE domain XML while the agent's inventory reads the
+	# persistent one. A --config-only attach would make the refusal invisible
+	# to this stage and a --live-only one invisible to the next run.
+	IGNORE_DISK_FILE="${TARGET_DISK_PATH:-/var/tmp}/vmsync-bench-ignore-disk.raw"
+	trap 'ignore_disk_restore' RETURN EXIT
+	if ! run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "qemu-img create -f raw '$IGNORE_DISK_FILE' 8M" >/dev/null 2>&1; then
+		warn "SKIP stage 28: could not create $IGNORE_DISK_FILE on $SOURCE_HOST."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP could not create the raw file"
+		trap - EXIT
+		return 0
+	fi
+	if ! virsh_uri "$SOURCE_URI" attach-disk "$SOURCE_DOMAIN" "$IGNORE_DISK_FILE" "$dev" --subdriver raw --persistent >/dev/null 2>&1; then
+		warn "SKIP stage 28: could not attach $IGNORE_DISK_FILE to $SOURCE_DOMAIN as $dev."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP could not attach the raw disk"
+		run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "rm -f '$IGNORE_DISK_FILE'" >/dev/null 2>&1 || true
+		trap - EXIT
+		return 0
+	fi
+	IGNORE_DISK_PLANTED="$dev"
+	# The plant is the fixture, so it is asserted rather than assumed: an
+	# attach that reported success and produced nothing would make every
+	# refusal below pass for the wrong reason (no disk, no refusal).
+	if source_nonqcow_devs | grep_q -x "$dev"; then ok=0; else ok=1; fi
+	fo_check "$sc" "the planted raw disk is visible in the source's definition" "$ok" \
+		"$dev is not among the source's non-qcow2 disks after the attach, so nothing below would be testing a refusal"
+	if [ "$ok" != 0 ]; then
+		return 0
+	fi
+	log_state "with a raw $dev attached to $SOURCE_DOMAIN"
+
+	# --- 28a: the refusal ---------------------------------------------------
+	bench_sync "$sc" refused
+	if [ "$RUN_RC" != 0 ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "a sync is refused while the source has an unnamed raw disk" "$ok" \
+		"the run exited 0 with a raw $dev on $SOURCE_DOMAIN -- the replica is missing that disk and reported success, which is the defect this stage exists for. $(log_reason "$RUN_LOG")"
+
+	# NAMED, not merely refused. A refusal that does not say which disk, in
+	# what format, leaves an operator reading it as a vmsync defect rather
+	# than as a fact about their domain.
+	ok=1
+	if grep_q "$dev" "$RUN_LOG" && grep_q "format raw" "$RUN_LOG"; then ok=0; fi
+	fo_check "$sc" "the refusal names the disk and its format" "$ok" \
+		"no mention of both '$dev' and 'format raw' in $RUN_LOG"
+
+	ok=1
+	if grep_q -- "-ignore-disk" "$RUN_LOG" && grep_q -- "-drop-disk" "$RUN_LOG"; then ok=0; fi
+	fo_check "$sc" "the refusal offers both flags" "$ok" \
+		"the refusal in $RUN_LOG does not name both -ignore-disk and -drop-disk, so it says what is wrong and not what to do"
+
+	# --- 28b: a transposed name ---------------------------------------------
+	#
+	# ERROR INJECTION. The mistake an operator actually makes, and the one
+	# that must not silently do nothing: with vzd accepted, vdz would stay
+	# unaccounted and the run would refuse for the very disk they excluded.
+	bench_sync "$sc" typo -ignore-disk=vzd
+	if [ "$RUN_RC" != 0 ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "a device the domain does not have is refused" "$ok" \
+		"the run accepted -ignore-disk=vzd for a domain whose disks do not include it"
+	ok=1
+	if grep_q "no such disk" "$RUN_LOG"; then ok=0; fi
+	fo_check "$sc" "and the refusal lists the devices it does have" "$ok" \
+		"no 'no such disk' in $RUN_LOG, so the operator is not told what to write instead"
+
+	# --- 28c: both flags on one disk ----------------------------------------
+	bench_sync "$sc" conflict -ignore-disk="$dev" -drop-disk="$dev"
+	if [ "$RUN_RC" != 0 ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "the same disk in both flags is refused" "$ok" \
+		"the run accepted $dev in both -ignore-disk and -drop-disk, so one of the two did nothing"
+
+	# --- 28d: -ignore-disk lets it through ----------------------------------
+	bench_sync "$sc" ignored -ignore-disk="$dev"
+	if bench_sync_ok; then ok=0; else ok=1; fi
+	fo_check "$sc" "-ignore-disk lets the sync through" "$ok" \
+		"exit=$RUN_RC with -ignore-disk=$dev. $(log_reason "$RUN_LOG")$(bench_sync_hint)"
+
+	if [ "$ok" = 0 ]; then
+		# THE DIFFERENCE BETWEEN THE TWO FLAGS, read off the replica itself.
+		# -ignore-disk means vmsync touched the disk in no way, so the element
+		# is still there -- which is what makes the replica usable where the
+		# target provides that storage by other means.
+		if virsh_uri "$TARGET_URI" dumpxml --inactive "$TARGET_DOMAIN" 2>/dev/null | grep_q "dev='$dev'"; then ok=0; else ok=1; fi
+		fo_check "$sc" "an ignored disk stays in the replica's definition" "$ok" \
+			"$TARGET_DOMAIN's definition has no $dev after -ignore-disk, which is what -drop-disk is for"
+
+		meta="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" ignored_disks)"
+		if [ "$meta" = "$dev" ]; then ok=0; else ok=1; fi
+		fo_check "$sc" "and the replica records that it is deliberately partial" "$ok" \
+			"ignored_disks is '$meta', want '$dev'. During a failover the replica's own metadata is all there is, and without it a replica missing a disk reports a recent checkpoint and failure_count 0"
+	fi
+
+	# --- 28e: -drop-disk removes it -----------------------------------------
+	bench_sync "$sc" dropped -drop-disk="$dev"
+	if bench_sync_ok; then ok=0; else ok=1; fi
+	fo_check "$sc" "-drop-disk lets the sync through" "$ok" \
+		"exit=$RUN_RC with -drop-disk=$dev. $(log_reason "$RUN_LOG")$(bench_sync_hint)"
+
+	if [ "$ok" = 0 ]; then
+		if virsh_uri "$TARGET_URI" dumpxml --inactive "$TARGET_DOMAIN" 2>/dev/null | grep_q "dev='$dev'"; then ok=1; else ok=0; fi
+		fo_check "$sc" "a dropped disk is gone from the replica's definition" "$ok" \
+			"$TARGET_DOMAIN's definition still names $dev after -drop-disk, so the replica points at a file on the SOURCE host that nothing replicated"
+
+		meta="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" dropped_disks)"
+		if [ "$meta" = "$dev" ]; then ok=0; else ok=1; fi
+		fo_check "$sc" "and dropped_disks records it" "$ok" \
+			"dropped_disks is '$meta', want '$dev'"
+
+		# The previous run's field has to be gone, not merely stale: a dev
+		# moved from one flag to the other must move in the record too, or the
+		# replica claims an arrangement it does not have.
+		meta="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" ignored_disks)"
+		if [ -z "$meta" ]; then ok=0; else ok=1; fi
+		fo_check "$sc" "moving a disk between the flags moves it in the record" "$ok" \
+			"ignored_disks still reads '$meta' after a run that passed only -drop-disk"
+
+		# THE TRIPWIRE. Removing one <disk> drops the counts of disk, driver,
+		# source, target and usually address and alias, so a baseline taken
+		# from the untouched source would log the configuration-loss warning
+		# on every successful run of such a pair -- training operators out of
+		# believing the one alarm that guards the replica's definition.
+		if grep_q "dropped configuration" "$RUN_LOG"; then ok=1; else ok=0; fi
+		fo_check "$sc" "dropping a disk does not trip the configuration-loss alarm" "$ok" \
+			"$RUN_LOG carries 'something in the patching path has dropped configuration' on a successful -drop-disk run. That alarm is the only guard on the replica's definition, and one that cries on every ordinary run of a deliberately partial pair is one nobody reads"
+	fi
+
+	# --- 28g: the replica file of a disk that stops being copied ------------
+	#
+	# A pair that replicated a disk and then excludes it leaves a full-size
+	# file on the DR host that no later run asks about: every per-disk step
+	# iterates the disks being copied, and the leftover reporting recognises a
+	# displaced set only by the `<base>.vmsync-replaced-<unix>` shape, which a
+	# file still under the ordinary disk name does not have.
+	#
+	# Done with a QCOW2 disk, not the planted raw one: the raw disk was never
+	# replicated, so there is no replica file of it to displace. This is the
+	# case where the disk WAS being copied, which is the only one that leaves
+	# an orphan. It needs a second qcow2 disk, so it stands down without one
+	# rather than reporting a pass it did not earn.
+	local second_dev second_base
+	second_dev="$(source_qcow_devs | sed -n 2p)"
+	if [ -z "$second_dev" ]; then
+		log "   SKIP 28g: $SOURCE_DOMAIN has only one qcow2 disk, so no disk can stop being copied while the pair still syncs"
+		results_row "$CSV" "$sc" aside "" "" "" "" "" "" "SKIP needs a second qcow2 disk"
+	else
+		second_base="$(basename "$(source_disk_path "$second_dev")")"
+		bench_sync "$sc" aside -ignore-disk="$dev" -ignore-disk="$second_dev"
+		if bench_sync_ok; then ok=0; else ok=1; fi
+		fo_check "$sc" "a sync excluding a previously replicated disk succeeds" "$ok" \
+			"exit=$RUN_RC with -ignore-disk=$second_dev. $(log_reason "$RUN_LOG")$(bench_sync_hint)"
+
+		if [ "$ok" = 0 ]; then
+			# The ordinary name must be GONE and an aside must exist: a file
+			# left under the ordinary name is the orphan this closes, and no
+			# aside at all means nothing was displaced.
+			if target_file_exists "$second_base"; then ok=1; else ok=0; fi
+			fo_check "$sc" "its replica file no longer sits under the ordinary disk name" "$ok" \
+				"$second_base is still in the replica's disk directory on $TARGET_HOST, which is the unreported full-size orphan this check exists for"
+
+			if target_file_exists "${second_base}.vmsync-replaced-"'*'; then ok=0; else ok=1; fi
+			fo_check "$sc" "it was renamed aside rather than deleted" "$ok" \
+				"no ${second_base}.vmsync-replaced-* on $TARGET_HOST -- it is the last replica of a disk somebody has just said they manage another way, so it must go where an operator can still find it"
+
+			# REPORTED, and on this run rather than the next: an aside nothing
+			# names is the same orphan under a different spelling.
+			if grep_q "displaced sets beside the replica" "$RUN_LOG"; then ok=0; else ok=1; fi
+			fo_check "$sc" "and the run that made it reports it as a displaced set" "$ok" \
+				"$RUN_LOG does not report a displaced set on the run that created one"
+
+			# AND ON EVERY LATER RUN. The sweep attributes a set by a base name
+			# the replica owns, and after the rename that base is in neither the
+			# definition nor the disk list -- so a set reported once and then
+			# lost is one -reclaim-leftovers-after can never reap.
+			bench_sync "$sc" aside-again -ignore-disk="$dev" -ignore-disk="$second_dev"
+			if grep_q "displaced sets beside the replica" "$RUN_LOG"; then ok=0; else ok=1; fi
+			fo_check "$sc" "a later run still attributes the set to this replica" "$ok" \
+				"the next run no longer reports the displaced set, so nothing will ever reclaim it. $(log_reason "$RUN_LOG")"
+
+			# And no SECOND aside: the ordinary name is gone, so there is
+			# nothing left to displace and every run must not make another.
+			if [ "$(target_aside_count "$second_base")" = 1 ]; then ok=0; else ok=1; fi
+			fo_check "$sc" "and makes no second aside of the same disk" "$ok" \
+				"there are $(target_aside_count "$second_base") asides of $second_base; a run that displaces an already-displaced disk would make one per run"
+		fi
+	fi
+
+	# --- 28f: the fixture comes back ----------------------------------------
+	#
+	# Through the same restore the teardown uses, so this also proves the
+	# teardown works: a stage that left the raw disk attached would have every
+	# later stage refusing its syncs with nothing naming the cause.
+	ignore_disk_restore
+	if source_nonqcow_devs | grep_q -x "$dev"; then ok=1; else ok=0; fi
+	fo_check "$sc" "detaching the planted disk restores the fixture" "$ok" \
+		"$dev is still attached to $SOURCE_DOMAIN; every sync after this stage would be refused"
+
+	if [ "$ok" = 0 ]; then
+		bench_sync "$sc" lifted
+		if bench_sync_ok; then ok=0; else ok=1; fi
+		fo_check "$sc" "an ordinary sync works again once the disk is gone" "$ok" \
+			"exit=$RUN_RC with no raw disk and no flags. $(log_reason "$RUN_LOG")$(bench_sync_hint)"
+	fi
+
+	trap - EXIT
+	return 0
+}
+
 stage_pattern() {
 	case "$1" in
 	# Anchored to the named sub-tests rather than a bare ^verify- , so a
@@ -12888,6 +13204,10 @@ stage_pattern() {
 	reinit-orphan) printf '^(reinit-orphan|precondition|stood-down|cleanup)$' ;;
 	generation) printf '^(generation|precondition|stood-down|cleanup)$' ;;
 	qmp-census) printf '^(qmp-census|precondition|stood-down|cleanup)$' ;;
+	# Stage 28 attaches a raw disk to the SOURCE domain, so its stand-down and
+	# cleanup rows belong to its own verdict: a stage that could not restore
+	# the fixture is a failure of this stage, not of whichever ran next.
+	ignore-disk) printf '^(ignore-disk|precondition|stood-down|cleanup)$' ;;
 	supervise) printf '^(supervise|precondition)$' ;;
 	exclude) printf '^(exclude|precondition)$' ;;
 	*) printf '$^' ;; # matches nothing
@@ -12935,6 +13255,7 @@ stage_number() {
 	exclude) printf '25' ;;
 	generation) printf '26' ;;
 	qmp-census) printf '27' ;;
+	ignore-disk) printf '28' ;;
 	*) printf '?' ;;
 	esac
 }
@@ -13625,6 +13946,16 @@ generate_report() {
                         section_no_rows_note qmp-census "opt in with \`--stages qmp-census\`; it asks qemu directly for the source's dirty-bitmap list and compares that against the qcow2 directory, and needs SOURCE_HOST and TAMPER_DISK_DEV set and a running source"
                 fi
                 echo
+                echo "## Stage 28: a disk vmsync cannot replicate is refused, not skipped"
+                echo
+                if awk -F, 'NR>1 && $1=="ignore-disk" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="ignore-disk" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                else
+                        section_no_rows_note ignore-disk "opt in with \`--stages ignore-disk\`; it attaches a RAW disk to the source domain, proves the sync is refused for it, then proves -ignore-disk and -drop-disk each let the run through with the replica's definition saying the right thing. Needs SOURCE_HOST and a shut-off target"
+                fi
+                echo
                 echo "Full machine-readable data: \`results.csv\`. Per-run logs: \`logs/\`. Raw prometheus textfiles: \`prom/\`."
         } >"$report"
         # Only the report reads it, and a stale one left in the run directory
@@ -13702,6 +14033,7 @@ for s in "${stage_list[@]}"; do
         reinit-orphan) stage_reinit_orphan || stage_rc=$? ;;
         generation) stage_generation || stage_rc=$? ;;
         qmp-census) stage_qmp_census || stage_rc=$? ;;
+        ignore-disk) stage_ignore_disk || stage_rc=$? ;;
         supervise) stage_supervise || stage_rc=$? ;;
         exclude) stage_exclude || stage_rc=$? ;;
         *) die "unknown stage '$s' in --stages (want one of: $ALL_STAGES -- or the shorthands 'all' and 'all-but-matrix', which stand alone rather than inside a list)" ;;
