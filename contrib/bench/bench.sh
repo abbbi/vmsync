@@ -84,6 +84,31 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 
+# XTRACE ON STDERR CANNOT BE USED HERE, and it has to be refused rather than
+# tolerated.
+#
+# This harness folds a virsh command's stderr into its stdout on purpose, so
+# that a failure's own text reaches $VIRSH_ERR instead of arriving as a bare
+# "cannot query state" -- see dom_state in lib/common.sh. xtrace also writes to
+# stderr, and inside those command substitutions the two meet: the trace lines
+# land in the captured VALUE. dom_state then returns a transcript of itself
+# rather than "shut off", and the preflight dies reporting
+#
+#   target domain 'x' is '+++localuri=...domstate...shutoff', expected 'shut off'
+#
+# which sends whoever reads it to the hypervisor to look at a domain that was
+# fine. Every function following that documented pattern has the same problem,
+# so there is nothing to fix locally -- only a way to trace that does not route
+# through fd 2.
+case $- in
+*x*)
+	if [ -z "${BASH_XTRACEFD:-}" ] || [ "${BASH_XTRACEFD:-}" = 2 ]; then
+		die "xtrace is on and going to stderr, which this harness cannot survive: it folds virsh's stderr into captured output deliberately (see dom_state), so the trace would be read back as a domain's state and the run would refuse against a healthy fixture. Send the trace somewhere else instead:
+    exec 9>/tmp/bench.trace; BASH_XTRACEFD=9 bash -x $0 $*"
+	fi
+	;;
+esac
+
 CONF="$SCRIPT_DIR/bench.conf"
 SCENARIOS="$SCRIPT_DIR/scenarios.conf"
 DRY_RUN=no
@@ -12887,9 +12912,20 @@ ignore_disk_restore() {
 # dev it planted and which dev the refusal must name rather than trusting its
 # own bookkeeping.
 source_nonqcow_devs() {
+	# `|| true` on the XPath stage ALONE, and the scoping is the point.
+	#
+	# An empty nodeset is the ORDINARY answer here: most fixtures have no
+	# non-qcow2 disk at all. xmllint reports that by exiting 11, which under
+	# `set -o pipefail` fails the whole pipeline -- and at any call site not
+	# already inside an `if`, that ends the run. source_qcow_devs has the same
+	# shape and never meets it, because a fixture always has a qcow2 disk.
+	#
+	# Scoped to the one component rather than the pipeline, so a virsh that
+	# cannot answer still fails: "this domain could not be read" and "this
+	# domain has no such disk" must not arrive as the same empty string.
 	virsh_uri "$SOURCE_URI" dumpxml --inactive "$SOURCE_DOMAIN" 2>/dev/null |
-		xmllint --xpath "//disk[not(@device='cdrom')][not(driver/@type='qcow2')]/target/@dev" - 2>/dev/null |
-		tr ' ' '\n' | sed -n "s/^dev=\"\(.*\)\"$/\1/p"
+		{ xmllint --xpath "//disk[not(@device='cdrom')][not(driver/@type='qcow2')]/target/@dev" - 2>/dev/null || true; } |
+		tr ' ' '\n' | sed -n 's/.*dev="\([^"]*\)".*/\1/p'
 }
 
 # source_disk_path DEV -> that disk's <source file> on the source domain.
@@ -12975,6 +13011,11 @@ stage_ignore_disk() {
 	fo_check "$sc" "the planted raw disk is visible in the source's definition" "$ok" \
 		"$dev is not among the source's non-qcow2 disks after the attach, so nothing below would be testing a refusal"
 	if [ "$ok" != 0 ]; then
+		# The RETURN trap still detaches the disk on the way out. Clearing the
+		# EXIT half is what stops the rest of the run inheriting it: the next
+		# stage to set its own EXIT trap would replace this one, and the detach
+		# would be lost with it.
+		trap - EXIT
 		return 0
 	fi
 	log_state "with a raw $dev attached to $SOURCE_DOMAIN"
