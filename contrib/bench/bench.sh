@@ -100,11 +100,26 @@ source "$SCRIPT_DIR/lib/common.sh"
 # fine. Every function following that documented pattern has the same problem,
 # so there is nothing to fix locally -- only a way to trace that does not route
 # through fd 2.
+# MOVED, not refused. `bash -x ./bench.sh` is the reflex, and a harness that
+# answers it by telling the operator to re-run it differently has made them do
+# a two-step dance for an answer it could simply have given. The trace is still
+# produced in full -- it goes to a file, named below, which also stops it
+# interleaving with the report.
+#
+# Only when it is on stderr: an operator who has already pointed
+# BASH_XTRACEFD somewhere has solved this themselves and is left alone.
 case $- in
 *x*)
 	if [ -z "${BASH_XTRACEFD:-}" ] || [ "${BASH_XTRACEFD:-}" = 2 ]; then
-		die "xtrace is on and going to stderr, which this harness cannot survive: it folds virsh's stderr into captured output deliberately (see dom_state), so the trace would be read back as a domain's state and the run would refuse against a healthy fixture. Send the trace somewhere else instead:
-    exec 9>/tmp/bench.trace; BASH_XTRACEFD=9 bash -x $0 $*"
+		bench_xtrace_file="${TMPDIR:-/tmp}/vmsync-bench-xtrace.$$"
+		if exec 9>"$bench_xtrace_file"; then
+			BASH_XTRACEFD=9
+			export BASH_XTRACEFD
+			warn "xtrace was going to stderr, where this harness cannot survive it -- virsh's stderr is folded into captured output on purpose (see dom_state), so the trace would be read back as a domain's state and the run would refuse against a healthy fixture. The trace is now going to $bench_xtrace_file instead; everything else is unaffected."
+		else
+			die "xtrace is on and going to stderr, which this harness cannot survive: it folds virsh's stderr into captured output deliberately (see dom_state), so the trace would be read back as a domain's state and the run would refuse against a healthy fixture. The trace could not be redirected to $bench_xtrace_file either -- point it somewhere writable yourself:
+    exec 9>/some/writable/path; BASH_XTRACEFD=9 bash -x $0 $*"
+		fi
 	fi
 	;;
 esac

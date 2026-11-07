@@ -273,6 +273,48 @@ want_lines="$(wc -l < "$BENCH" | tr -d ' ')"
 check "--version reports this file's own sha256 and line count" \
 	"bench.sh sha256:$want_sum ($want_lines lines)" "$ident"
 
+# `bash -x ./bench.sh` HAS TO WORK, and it is behavioural rather than a grep
+# because what matters is the outcome, not the spelling of the preamble.
+#
+# The harness folds virsh's stderr into captured output on purpose, so that a
+# failure's own text reaches $VIRSH_ERR (lib/common.sh, dom_state). xtrace also
+# writes to stderr, and inside those command substitutions the two meet: the
+# trace lands in the captured VALUE. dom_state then returns a transcript of
+# itself instead of "shut off", and the preflight dies reporting
+#
+#   target domain 'x' is '+++localuri=...domstate...shutoff', expected 'shut off'
+#
+# which sends whoever reads it to the hypervisor to look at a domain that was
+# fine. bench.sh moves the trace to a file rather than refusing to run, because
+# `bash -x` is the reflex and a harness that answers it with "re-run it
+# differently" has made somebody do a two-step dance for an answer it had.
+#
+# --version is used because it needs no config and no hosts.
+traced="$(bash -x "$BENCH" --version 2>&1)"
+traced_rc=$?
+check "bash -x still exits 0" "0" "$traced_rc"
+case "$traced" in
+*"bench.sh sha256:$want_sum"*)
+	PASS=$((PASS + 1))
+	printf '  ok    bash -x still produces the harness identity, uncontaminated\n'
+	;;
+*)
+	FAIL=$((FAIL + 1))
+	printf '  FAIL  bash -x did not produce the identity line; the xtrace guard no longer moves the trace off stderr, so every captured virsh value will carry the trace:\n%s\n' "$traced"
+	;;
+esac
+case "$traced" in
+*"xtrace was going to stderr"*)
+	PASS=$((PASS + 1))
+	printf '  ok    and says where the trace went instead\n'
+	;;
+*)
+	FAIL=$((FAIL + 1))
+	printf '  FAIL  bash -x produced no word about the trace being moved; an operator reading a run with no trace in it would not know where to look\n'
+	;;
+esac
+rm -f "${TMPDIR:-/tmp}"/vmsync-bench-xtrace.*
+
 # Source-level, because the report and the run directory cannot be produced
 # without a bench run. Both of these are a single line that is easy to drop.
 if grep -A1 'echo "- Run: \$RUN_ID"' "$BENCH" | grep -q 'Harness'; then

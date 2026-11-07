@@ -195,6 +195,37 @@ remembering to report one: every stage but the matrix records `PASS`/`FAIL`/
 `SKIP` per assertion in the notes column, and the matrix — which has no
 assertions, only timings — fails if any `vmsync` exited non-zero.
 
+### Tracing a run
+
+`bash -x ./bench.sh …` works, but the trace does **not** go to your terminal —
+the harness moves it to `/tmp/vmsync-bench-xtrace.<pid>` and says so on the
+first line. That is not tidiness. This harness folds a `virsh` command's stderr
+into its stdout on purpose, so that a failure's own text reaches `$VIRSH_ERR`
+instead of arriving as a bare "cannot query state" (`lib/common.sh`,
+`dom_state`). `xtrace` also writes to stderr, and inside those command
+substitutions the two meet: the trace lands in the captured **value**.
+`dom_state` then returns a transcript of itself rather than `shut off`, and the
+preflight refuses with
+
+```
+FATAL: target domain 'web01' is '+++localuri=qemu+ssh://…domstate…shutoff',
+       expected 'shut off' -- refusing to continue.
+```
+
+against a domain that was perfectly healthy. Every helper following that
+documented pattern has the same exposure, so there is nothing to fix locally —
+only a trace that does not route through fd 2.
+
+If you would rather choose the destination, do it yourself and the harness
+leaves you alone:
+
+```bash
+exec 9>/var/tmp/bench.trace; BASH_XTRACEFD=9 bash -x ./bench.sh --stages ignore-disk
+```
+
+`./selftest.sh` asserts that `bash -x` still works and still says where the
+trace went.
+
 ## Transport: every stage but the matrix
 
 Every stage **except Stage 1** adds `-compress` to its syncs, via
@@ -1796,6 +1827,48 @@ distinguishes the two cases without touching the source twice.
 
 All six outcomes, and that call sequence, are driven without hardware by
 `./selftest.sh`.
+
+### Stage 28 (`ignore-disk`), opt-in — a disk vmsync cannot replicate
+
+The only stage that changes the **source** domain's device list. It attaches a
+raw disk — the one thing vmsync now refuses to replicate — and detaches it again
+from a `RETURN`/`EXIT` trap.
+
+Before this refusal existed, such a disk was skipped with one `INFO` line and
+the run carried on: the replica had a definition, a checkpoint chain and a green
+exit code while missing a volume, and nothing reported it. Two flags say it was
+meant, and they differ only in what the replica's own definition ends up saying:
+`-ignore-disk` leaves the `<disk>` exactly as the source declares it,
+`-drop-disk` removes the element.
+
+| check | what the answer decides |
+| --- | --- |
+| the planted raw disk is visible in the source's definition | the fixture. An attach that reported success and produced nothing would make every refusal below pass for the wrong reason — no disk, no refusal |
+| **a sync is refused while the source has an unnamed raw disk** | **the whole point.** The old behaviour was to skip it and succeed |
+| the refusal names the disk and its format | that the message is a fact about the domain rather than a vmsync defect an operator goes looking for |
+| the refusal offers both flags | that it says what to do and not only what is wrong |
+| **a device the domain does not have is refused** | error injection: `-ignore-disk=vzd` for `vdz`. A silently-accepted typo leaves the real disk unaccounted, so the run refuses for the very disk the operator had just excluded |
+| the same disk in both flags is refused | they ask opposite things about the definition; picking one silently would make the other flag do nothing |
+| `-ignore-disk` lets the sync through, and the disk **stays** in the replica's definition | the flag's own meaning. This is what makes the replica usable where the target provides that storage by other means |
+| `-drop-disk` lets it through, and the disk is **gone** | the other flag's meaning. Left in, the replica would point at a file on the source host that nothing replicated |
+| each records its own metadata field, and moving a disk between the flags moves the record | during a failover the replica's metadata is all there is. Without it a replica missing a disk reports a recent checkpoint and `failure_count` 0 |
+| **dropping a disk does not trip the configuration-loss alarm** | removing one `<disk>` drops the counts of `disk`, `driver`, `source`, `target` and usually `address` and `alias`. Compared against the untouched source that logs "something in the patching path has dropped configuration" on **every** successful run of such a pair — and that alarm is the only guard on the replica's definition |
+| detaching the planted disk restores the fixture, and an ordinary sync works again | the teardown, asserted rather than hoped for |
+
+**Attached `--persistent`**, which is live *and* config, deliberately: the
+engine refuses on the **live** domain XML while the agent's inventory reads the
+persistent one, so a `--config`-only attach would make the refusal invisible to
+this stage and a `--live`-only one invisible to the next run.
+
+**It stands down** rather than running if the source already carries a non-qcow2
+disk, or already has a disk at `vdz`. Planting a second would leave two to clean
+up and make every assertion ambiguous about which disk was refused.
+
+**If a run dies badly enough to leave the planted disk attached**, every later
+stage's syncs are refused and nothing names the cause — the disk is raw, so
+`source_qcow_devs` cannot see it and stage 15's count, the base fingerprints and
+the target paths all still look right. The warning the stage prints on its way
+out gives the exact `virsh detach-disk` that removes it.
 
 ## Files
 
