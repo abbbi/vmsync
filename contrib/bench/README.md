@@ -1860,6 +1860,20 @@ engine refuses on the **live** domain XML while the agent's inventory reads the
 persistent one, so a `--config`-only attach would make the refusal invisible to
 this stage and a `--live`-only one invisible to the next run.
 
+**It therefore needs a fixture that can hot-plug and hot-*un*plug a disk**, and
+that is a property of the guest, not of vmsync. The attach needs a machine type
+with a free slot — `q35` with a spare `pcie-root-port`; a plain `pc` fails with
+*"Bus 'pci.0' does not support hotplugging"*. The detach needs a running OS with
+virtio drivers to acknowledge the PCI unplug: without one, the config entry is
+removed and the **live** one is not, which is the document vmsync refuses on. The
+stage checks the live definition afterwards and says so, naming `--live` rather
+than `--persistent` as the remedy, because `--persistent` cannot find a disk
+that is only live.
+
+Measured on a bare throwaway fixture (q35, no guest OS): **21 of 23 checks
+pass**; the two that do not are the cleanup pair, failing for exactly that
+reason. On a fixture with a real guest the detach completes and all 23 run.
+
 **It stands down** rather than running if the source already carries a non-qcow2
 disk, or already has a disk at `vdz`. Planting a second would leave two to clean
 up and make every assertion ambiguous about which disk was refused.

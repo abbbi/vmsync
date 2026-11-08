@@ -59,6 +59,12 @@ extract() {
 	# the outside world is vmsync_meta_field, so stubbing that drives every
 	# outcome -- and what it has to get right is how MANY times it reads.
 	extract "$BENCH" meta_field_until
+	# The two settings that used to go wrong in opposite ways: one ended the
+	# run on an unbound variable, the other was read in one place and never
+	# passed to vmsync at all.
+	extract "$COMMON" ssh_host_cmd
+	extract "$BENCH" vmsync_common_args
+	extract "$BENCH" bridge_helper_path
 } > "$WORK/lib.sh"
 for fn in results_row stage_pattern stage_verdict fo_check; do
 	grep -q "^$fn() {" "$WORK/lib.sh" || { echo "EXTRACT FAILED: $fn"; exit 2; }
@@ -886,6 +892,107 @@ check "and reports the time it measured, as the ledger check does" yes \
 	"$(has 'after $((SECONDS - role_t0))s of polling' "$fence_body")"
 
 echo
+echo "=== the two settings that failed in opposite ways ==="
+
+# A SILENT EXIT. ssh_host_cmd built its destination as "${SSH_USER}@${host}"
+# with no default, so a bench.conf omitting SSH_USER ended the run on an
+# unbound variable under `set -u` -- and silently, because the first caller
+# (preflight_bridge_helper) redirects this function's stderr to /dev/null, so
+# the diagnostic went with it. A harness that had just printed five healthy
+# preflight lines exited 1 with nothing after them.
+#
+# Driven with a stubbed ssh, under the same `set -u` bench.sh runs with, and
+# with SSH_USER deliberately absent.
+# The REAL ssh_host_cmd, re-extracted here: the orphan-export sweep section
+# above replaces it with a stub that runs the command locally, and that stub is
+# still in effect -- so without this the assertions below would be testing the
+# sweep's fixture rather than the function.
+eval "$(extract "$COMMON" ssh_host_cmd)"
+sshargs=""
+# shellcheck disable=SC2329 # invoked by the extracted ssh_host_cmd
+ssh() { sshargs="$*"; }
+(
+	set -u
+	unset SSH_USER SSH_KEY SSH_PORT SSH_KNOWN_HOSTS
+	ssh_host_cmd target-host "test -x /x" >/dev/null 2>&1
+) && u_rc=0 || u_rc=$?
+check "ssh_host_cmd survives a conf with no SSH_USER" 0 "$u_rc"
+
+# And addresses the host the way plain ssh would, rather than as "@host",
+# which ssh rejects with an error of its own.
+unset SSH_USER SSH_KEY SSH_PORT SSH_KNOWN_HOSTS
+ssh_host_cmd target-host "test -x /x" >/dev/null 2>&1
+case "$sshargs" in
+*" @target-host "*) check "and does not address the host as @host" "no @host" "got @host: $sshargs" ;;
+*" target-host "*) check "and does not address the host as @host" "no @host" "no @host" ;;
+*) check "and does not address the host as @host" "no @host" "unexpected: $sshargs" ;;
+esac
+
+# With one set, it is used.
+# shellcheck disable=SC2034 # read by the extracted ssh_host_cmd, which shellcheck cannot follow
+SSH_USER=someuser
+ssh_host_cmd target-host "test -x /x" >/dev/null 2>&1
+case "$sshargs" in
+*someuser@target-host*) check "an SSH_USER that is set is used" yes yes ;;
+*) check "an SSH_USER that is set is used" yes "no: $sshargs" ;;
+esac
+unset SSH_USER
+
+# bench.sh itself must still refuse an incomplete conf up front, which is what
+# turns the operator's omission into a sentence rather than a survivable
+# default they never chose.
+# shellcheck disable=SC2016 # the needle is bench.sh's own source text, not an expansion
+if grep -q '"${SSH_USER:?set in \$CONF' "$BENCH"; then
+	PASS=$((PASS + 1))
+	printf '  ok    bench.sh refuses a conf with no SSH_USER, by name\n'
+else
+	FAIL=$((FAIL + 1))
+	printf '  FAIL  bench.sh no longer requires SSH_USER, so an omission is silently whoever ran the harness\n'
+fi
+
+# AN IGNORED SETTING, the same bug from the other side: TARGET_RUNTIME_DIR was
+# read by the orphan-export sweep and never passed to vmsync, so a conf that
+# set it was swept in one place and ignored in the other -- every sync still
+# used /run/vmsync, which needs root on the target.
+# shellcheck disable=SC2034 # every one of these is read by the extracted vmsync_common_args
+{
+	SOURCE_URI=qemu:///system
+	TARGET_URI=qemu+ssh://t/system
+	SOURCE_DOMAIN=src
+	TARGET_DOMAIN=tgt
+	TARGET_RUNTIME_DIR=/var/tmp/bench-run
+}
+VMSYNC_ARGS=()
+vmsync_common_args
+case " ${VMSYNC_ARGS[*]} " in
+*" -target-runtime-dir /var/tmp/bench-run "*)
+	PASS=$((PASS + 1))
+	printf '  ok    TARGET_RUNTIME_DIR reaches vmsync\n'
+	;;
+*)
+	FAIL=$((FAIL + 1))
+	printf '  FAIL  TARGET_RUNTIME_DIR is set but no -target-runtime-dir reaches vmsync; every sync would use /run/vmsync while the sweep looked where the conf said:\n        %s\n' "${VMSYNC_ARGS[*]}"
+	;;
+esac
+
+# Unset, vmsync is left on its own default rather than the harness asserting
+# one -- so the two binaries cannot disagree about it by default.
+unset TARGET_RUNTIME_DIR
+VMSYNC_ARGS=()
+vmsync_common_args
+case " ${VMSYNC_ARGS[*]} " in
+*" -target-runtime-dir "*)
+	FAIL=$((FAIL + 1))
+	printf '  FAIL  an unset TARGET_RUNTIME_DIR still passed -target-runtime-dir\n'
+	;;
+*)
+	PASS=$((PASS + 1))
+	printf '  ok    and an unset one leaves vmsync on its own default\n'
+	;;
+esac
+unset -f ssh
+
+echo
 echo "=== every stage reaches the report ==="
 
 # THE FINDING. Two independent lists decide a stage's fate, and nothing tied
@@ -922,6 +1029,41 @@ dups="$(for s in ${ALL_STAGES//,/ }; do
 	echo
 done | sort | uniq -d | tr '\n' ' ')"
 check "no two stages claim the same number" "" "$dups"
+
+echo
+echo "=== stage 28 reads one document, and says why it stood down ==="
+
+# THE FINDING. source_qcow_devs and source_nonqcow_devs read the LIVE
+# definition, deliberately: that is the document vmsync refuses from, and a
+# cleanup checked against the persistent one would report a clean fixture
+# while the live domain still carried the disk. source_disk_path read the
+# PERSISTENT one -- and every dev it is ever handed comes out of one of those
+# two. So the pair asked which disks the live domain has and then where the
+# persistent one keeps them: on a domain whose definitions agree, the same
+# answer, and on one where they do not, a path for a disk that is not there.
+# Its answer decides the directory the stage plants an 8M raw file in.
+#
+# Checked on the dumpxml invocation and not the whole function, because two of
+# the three say "--inactive" in a comment explaining why they do not pass it.
+crossed=""
+for f in source_qcow_devs source_nonqcow_devs source_disk_path; do
+	if extract "$BENCH" "$f" | grep -- dumpxml | grep -q -- --inactive; then
+		crossed="$crossed $f"
+	fi
+done
+check "stage 28's three disk readers all read the live definition" "" "$crossed"
+
+# And a stand-down has to say what went wrong IN THE ROW. report.md is what
+# survives a run; the warn is in a scrollback that a dead tmux takes with it.
+# Measured the hard way: a precondition reading "could not create the raw
+# file" came back from hardware with nothing in it to act on, while the attach
+# branch three lines below it had carried virsh's words all along. Both are
+# pinned, so the next edit cannot quietly drop either.
+stage28="$(extract "$BENCH" stage_ignore_disk)"
+check "the create stand-down carries qemu-img's words into the row" 1 \
+	"$(printf '%s' "$stage28" | grep -c 'SKIP could not create the raw file: \$attach_err')"
+check "the attach stand-down carries virsh's words into the row" 1 \
+	"$(printf '%s' "$stage28" | grep -c 'SKIP could not attach the raw disk: \$attach_err')"
 
 echo
 if [ "$SKIPPED" -ne 0 ]; then

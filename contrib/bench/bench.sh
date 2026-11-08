@@ -760,6 +760,13 @@ source "$CONF"
 : "${TARGET_DOMAIN:?set in $CONF}"
 : "${SOURCE_HOST:?set in $CONF}"
 : "${TARGET_HOST:?set in $CONF}"
+# Required like the hosts it reaches them as, and for a reason worth stating:
+# every ssh_host_cmd builds its destination from it, so a conf without it used
+# to end the run on an unbound variable inside a call whose stderr the caller
+# had redirected -- exit 1, nothing printed, from a harness that had reported
+# five healthy preflight lines. bench.conf.example ships it uncommented, so an
+# omission is a mistake rather than a choice.
+: "${SSH_USER:?set in $CONF (every remote command and tunnel authenticates as this user; bench.conf.example ships SSH_USER=root)}"
 : "${TAMPER_DISK_DEV:?set in $CONF}"
 : "${TAMPER_OFFSET:?set in $CONF}"
 : "${TAMPER_LENGTH:?set in $CONF}"
@@ -1100,6 +1107,14 @@ vmsync_common_args() {
                 -io-depth "$iodepth"
         )
         [ -n "${TARGET_DISK_PATH:-}" ] && VMSYNC_ARGS+=(-target-disk-path "$TARGET_DISK_PATH")
+        # The setting existed and reached only the orphan-export sweep, which
+        # reads ${TARGET_RUNTIME_DIR:-/run/vmsync} to know where to look. It
+        # never reached vmsync, so a conf that set it was swept in one place
+        # and ignored in the other: every run still used /run/vmsync, and on a
+        # host where that is not writable -- any run not as root -- every sync
+        # failed on `mkdir /run/vmsync` while the harness looked elsewhere for
+        # the exports it had just told vmsync not to put there.
+        [ -n "${TARGET_RUNTIME_DIR:-}" ] && VMSYNC_ARGS+=(-target-runtime-dir "$TARGET_RUNTIME_DIR")
         [ -n "${SSH_USER:-}" ] && VMSYNC_ARGS+=(-ssh-user "$SSH_USER")
         [ -n "${SSH_KEY:-}" ] && VMSYNC_ARGS+=(-ssh-key "$SSH_KEY")
         [ -n "${SSH_PORT:-}" ] && VMSYNC_ARGS+=(-ssh-port "$SSH_PORT")
@@ -10423,6 +10438,16 @@ plant_orphan() {
 # helper; stage 23 had almost none of it, which left its one interesting result
 # buried among the vmsync command lines.
 log_state() {
+	# PROBE_ACTIVE is the probe stages' own context -- the source's active
+	# image path, set by stages 22, 23, 26 and 27. A caller without it used to
+	# end the run on an unbound variable under `set -u`, with the message
+	# swallowed wherever the call site redirected stderr: a silent exit 1 from
+	# an evidence line. Said rather than fatal, because evidence is not the
+	# assertion and losing it must not lose the stage.
+	if [ -z "${PROBE_ACTIVE:-}" ]; then
+		warn "log_state was called without PROBE_ACTIVE set, so it has no image to read bitmaps from: it prints a bitmap probe's evidence and only the probe stages have that context. Use log for anything else. Label was: $1"
+		return 0
+	fi
 	log "   EVIDENCE $1:"
 	log "     virsh checkpoint-list --name: $(virsh_uri "$SOURCE_URI" checkpoint-list "$SOURCE_DOMAIN" --name 2>&1 | grep -v '^$' | tr '\n' ' ' || true)"
 	log "     qemu-img bitmaps in $PROBE_ACTIVE: $(raw_bitmaps)"
@@ -12912,7 +12937,16 @@ ignore_disk_restore() {
 	# Verified, not assumed. A detach that silently failed leaves the fixture
 	# unsyncable for every stage after this one.
 	if source_nonqcow_devs | grep_q -x "$IGNORE_DISK_PLANTED"; then
-		warn "stage 28 could NOT detach the raw disk it planted: $SOURCE_DOMAIN still carries $IGNORE_DISK_PLANTED, so EVERY later sync in this run will be REFUSED for it. Remove it with 'virsh -c $SOURCE_URI detach-disk $SOURCE_DOMAIN $IGNORE_DISK_PLANTED --persistent' and delete ${IGNORE_DISK_FILE:-the planted file} on $SOURCE_HOST."
+		# The remedy depends on WHICH document still carries it, and getting
+		# that wrong wastes the reader's time: a detach the guest never
+		# acknowledged removes the config entry and leaves the live one, so
+		# `--persistent` then fails with "no disk found whose source or target
+		# is vdz" against a domain that visibly still has it.
+		local still_persistent="--live"
+		if virsh_uri "$SOURCE_URI" dumpxml --inactive "$SOURCE_DOMAIN" 2>/dev/null | grep_q "dev='$IGNORE_DISK_PLANTED'"; then
+			still_persistent="--persistent"
+		fi
+		warn "stage 28 could NOT detach the raw disk it planted: $SOURCE_DOMAIN still carries $IGNORE_DISK_PLANTED in its $([ "$still_persistent" = --live ] && printf 'LIVE definition only' || printf 'definition'), so EVERY later sync in this run will be REFUSED for it -- vmsync reads the live XML. The usual cause is a guest that did not acknowledge the PCI hot-unplug, which needs a running OS with virtio drivers; a fixture with no guest never will. Remove it with 'virsh -c $SOURCE_URI detach-disk $SOURCE_DOMAIN $IGNORE_DISK_PLANTED $still_persistent' (or restart the domain, which clears a live-only leftover) and delete ${IGNORE_DISK_FILE:-the planted file} on $SOURCE_HOST."
 		results_row "$CSV" ignore-disk cleanup "" "" "" "" "" "" "FAIL the planted raw disk is still attached"
 	else
 		run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "rm -f '${IGNORE_DISK_FILE}'" >/dev/null 2>&1 || true
@@ -12938,14 +12972,36 @@ source_nonqcow_devs() {
 	# Scoped to the one component rather than the pipeline, so a virsh that
 	# cannot answer still fails: "this domain could not be read" and "this
 	# domain has no such disk" must not arrive as the same empty string.
-	virsh_uri "$SOURCE_URI" dumpxml --inactive "$SOURCE_DOMAIN" 2>/dev/null |
+	# THE LIVE DOCUMENT, not --inactive, and the difference is the whole point.
+	# vmsync refuses from GetXMLDesc(0) -- the live definition -- so that is
+	# the only document that decides whether a sync is refused. A disk can sit
+	# in one and not the other: `virsh attach-disk --config` puts it only in
+	# the persistent one, and a hot-UNPLUG the guest never acknowledges leaves
+	# it only in the live one.
+	#
+	# This function is both the stage's precondition and its cleanup check, so
+	# reading the persistent document would let the restore report a clean
+	# fixture while the live domain still carried the disk -- wedging every
+	# later sync in the run with nothing naming the cause.
+	virsh_uri "$SOURCE_URI" dumpxml "$SOURCE_DOMAIN" 2>/dev/null |
 		{ xmllint --xpath "//disk[not(@device='cdrom')][not(driver/@type='qcow2')]/target/@dev" - 2>/dev/null || true; } |
 		tr ' ' '\n' | sed -n 's/.*dev="\([^"]*\)".*/\1/p'
 }
 
 # source_disk_path DEV -> that disk's <source file> on the source domain.
+#
+# THE LIVE DOCUMENT, like source_qcow_devs and source_nonqcow_devs above, and
+# for a plainer reason than theirs: every dev that reaches this comes out of
+# one of those two, so reading the path from the persistent definition would
+# answer a question about a different document than the one the dev was read
+# from. A disk can sit in one and not the other -- `attach-disk --config` puts
+# it only in the persistent one, a hot-unplug the guest never acknowledges
+# leaves it only in the live one -- and where the two disagree about a path,
+# the live one is the one that says where qemu actually has a file open. That
+# is what this answer is used for: picking a directory on the host that this
+# libvirt and its qemu can already write in.
 source_disk_path() {
-	virsh_uri "$SOURCE_URI" dumpxml --inactive "$SOURCE_DOMAIN" 2>/dev/null |
+	virsh_uri "$SOURCE_URI" dumpxml "$SOURCE_DOMAIN" 2>/dev/null |
 		xmllint --xpath "string(//disk[target/@dev='$1']/source/@file)" - 2>/dev/null
 }
 
@@ -13003,17 +13059,49 @@ stage_ignore_disk() {
 	# refuses on the LIVE domain XML while the agent's inventory reads the
 	# persistent one. A --config-only attach would make the refusal invisible
 	# to this stage and a --live-only one invisible to the next run.
-	IGNORE_DISK_FILE="${TARGET_DISK_PATH:-/var/tmp}/vmsync-bench-ignore-disk.raw"
+	# Beside the SOURCE's own disks, not under TARGET_DISK_PATH: that directory
+	# belongs to the other host and need not exist here at all. The source's
+	# own disk directory is, by construction, one this libvirt and its qemu can
+	# already open -- which a generic scratch path is not, since a file root
+	# owns 0644 in /var/tmp is one a qemu running as another user cannot write.
+	local src_disk_dir
+	src_disk_dir="$(dirname "$(source_disk_path "$(source_qcow_devs | sed -n 1p)")")"
+	if [ -z "$src_disk_dir" ] || [ "$src_disk_dir" = "." ]; then
+		warn "SKIP stage 28: could not work out which directory $SOURCE_DOMAIN's disks live in, so there is nowhere to put the raw disk this stage plants."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP no source disk directory"
+		return 0
+	fi
+	IGNORE_DISK_FILE="$src_disk_dir/vmsync-bench-ignore-disk.raw"
 	trap 'ignore_disk_restore' RETURN EXIT
-	if ! run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "qemu-img create -f raw '$IGNORE_DISK_FILE' 8M" >/dev/null 2>&1; then
-		warn "SKIP stage 28: could not create $IGNORE_DISK_FILE on $SOURCE_HOST."
-		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP could not create the raw file"
+	local attach_err
+	if ! attach_err="$(run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "qemu-img create -f raw '$IGNORE_DISK_FILE' 8M" 2>&1)"; then
+		# qemu-img's own words in the ROW and not only in the warn, for the
+		# same reason the attach branch below carries virsh's: "could not
+		# create the raw file" cannot tell a full filesystem from a directory
+		# root may not write to from a qemu-img that is not installed, and the
+		# warn exists only in the operator's scrollback. report.md is what
+		# survives the run, and a stage that stood down for a reason nobody
+		# can read afterwards has to be run again to find out why.
+		attach_err="$(printf '%s' "$attach_err" | tr '\n' ' ')"
+		warn "SKIP stage 28: could not create $IGNORE_DISK_FILE on $SOURCE_HOST: $attach_err"
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP could not create the raw file: $attach_err"
 		trap - EXIT
 		return 0
 	fi
-	if ! virsh_uri "$SOURCE_URI" attach-disk "$SOURCE_DOMAIN" "$IGNORE_DISK_FILE" "$dev" --subdriver raw --persistent >/dev/null 2>&1; then
-		warn "SKIP stage 28: could not attach $IGNORE_DISK_FILE to $SOURCE_DOMAIN as $dev."
-		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP could not attach the raw disk"
+	# virsh's own words, carried into the stand-down reason. "could not attach"
+	# alone cannot tell a permissions problem from a machine type whose bus has
+	# no hotplug -- and the second is a property of the FIXTURE that an
+	# operator can fix, so it has to reach them.
+	if ! attach_err="$(virsh_uri "$SOURCE_URI" attach-disk "$SOURCE_DOMAIN" "$IGNORE_DISK_FILE" "$dev" --subdriver raw --persistent 2>&1)"; then
+		attach_err="$(printf '%s' "$attach_err" | tr '\n' ' ')"
+		# The hint only where it applies: appended to every failure it reads as
+		# a non-sequitur beside "target 'vdz' duplicated".
+		local attach_hint=""
+		case "$attach_err" in
+		*hotplug*) attach_hint=" -- this fixture's machine type has no bus that can take a disk while the domain runs; q35 with a free pcie-root-port can." ;;
+		esac
+		warn "SKIP stage 28: could not attach $IGNORE_DISK_FILE to $SOURCE_DOMAIN as $dev: $attach_err$attach_hint"
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP could not attach the raw disk: $attach_err"
 		run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "rm -f '$IGNORE_DISK_FILE'" >/dev/null 2>&1 || true
 		trap - EXIT
 		return 0
@@ -13033,7 +13121,9 @@ stage_ignore_disk() {
 		trap - EXIT
 		return 0
 	fi
-	log_state "with a raw $dev attached to $SOURCE_DOMAIN"
+	# A plain line, not log_state: that one prints a bitmap probe's evidence
+	# and needs the probe stages' own context. Nothing here is about bitmaps.
+	log "   the fixture now carries a raw $dev at $IGNORE_DISK_FILE on $SOURCE_HOST"
 
 	# --- 28a: the refusal ---------------------------------------------------
 	bench_sync "$sc" refused

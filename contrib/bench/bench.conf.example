@@ -52,6 +52,16 @@ TARGET_DOMAIN=vmsync-bench-vm
 # virsh-dumpxml-based disk path lookup (used for tampering) to be reliable.
 TARGET_DISK_PATH=/data/vmsync-bench
 
+# Where the target keeps the exports' sockets and pidfiles, passed through as
+# vmsync's -target-runtime-dir. Unset leaves vmsync on its own default,
+# /run/vmsync, which needs root on the target -- set this to somewhere
+# writable for a bench run that is not root.
+#
+# Never a directory the target polyinstantiates per SSH session: SELinux with
+# pam_namespace does that to /tmp and /var/tmp, and an export started by one
+# command is then invisible to the next. See docs/HOWTO.md.
+#TARGET_RUNTIME_DIR=/run/vmsync
+
 # --- SSH ---------------------------------------------------------------
 # Shared between vmsync's own -ssh-* flags and the harness's own direct ssh
 # calls to SOURCE_HOST/TARGET_HOST.

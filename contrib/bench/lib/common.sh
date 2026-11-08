@@ -57,7 +57,25 @@ ssh_host_cmd() {
 	# "$*" rather than "$@": ssh already flattens its argv into a single string
 	# for the remote shell to re-parse, so joining here changes nothing about
 	# how a call behaves -- it only puts the export in front of it.
-	ssh "${opts[@]}" "${SSH_USER}@${host}" "export LC_ALL=C LANG=C; $*"
+	# `${SSH_USER:-}`, and the destination built around it rather than
+	# interpolating it blindly.
+	#
+	# Unguarded, this line ended the whole run on an unbound variable whenever
+	# a bench.conf omitted SSH_USER -- and did it SILENTLY, because the early
+	# callers redirect this function's stderr (`ssh_host_cmd … >/dev/null 2>&1`
+	# in preflight_bridge_helper), so `set -u`'s own diagnostic went to
+	# /dev/null and the harness exited 1 having printed nothing at all.
+	# bench.sh now names SSH_USER among its required settings, which catches
+	# the operator's mistake with a sentence; this keeps the library itself
+	# incapable of that death, because lib/common.sh is sourced by things that
+	# are not bench.sh -- selftest.sh among them.
+	#
+	# An empty one means "whoever I am", which is what plain `ssh host` does,
+	# rather than `ssh @host` -- a destination ssh rejects with its own
+	# confusing error.
+	local dest="$host"
+	[ -n "${SSH_USER:-}" ] && dest="${SSH_USER}@${host}"
+	ssh "${opts[@]}" "$dest" "export LC_ALL=C LANG=C; $*"
 }
 
 # maybe_ssh_cmd IS_LOCAL HOST CMD... - runs CMD directly on this machine
