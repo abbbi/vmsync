@@ -173,9 +173,24 @@ graceful_shutdown() {
 	# asked again promptly, long enough not to fill the log.
 	local resend_every=15
 
+	# Validated here rather than trusted, exactly as wait_for_domain_ready
+	# validates its own: every comparison below is an INTEGER test, and bash
+	# answers a non-numeric one with exit status 2 AND a line of its own on
+	# stderr. Untreated, a mistyped SOURCE_SHUTDOWN_WAIT_SECONDS stood stages
+	# 11 and 26 down with "did not shut down within 120s" after polling
+	# nothing at all, and dumped `[: 120s : integer expression expected` into
+	# the run with nothing to connect it to the setting that caused it. The
+	# degradation to a single read is right; being silent about it is not.
+	case "$limit" in
+	'' | *[!0-9]*)
+		warn "graceful_shutdown was given a budget of '$limit' seconds for $what, which is not a whole number -- asking once and not waiting. Fix the setting that produced it (SOURCE_SHUTDOWN_WAIT_SECONDS or TARGET_SHUTDOWN_WAIT_SECONDS in bench.conf)."
+		limit=0
+		;;
+	esac
+
 	virsh_uri "$uri" shutdown "$domain" >/dev/null 2>&1 || true
 
-	while [ "$waited" -lt "$limit" ]; do
+	while :; do
 		state="$(dom_state "$uri" "$domain" 2>/dev/null || true)"
 		if [ "$state" = shutoff ]; then
 			SHUTDOWN_WAITED="$waited"
@@ -183,6 +198,15 @@ graceful_shutdown() {
 			log "   $what stopped after ${waited}s (${sent} shutdown request(s) sent)"
 			return 0
 		fi
+		# The budget is checked HERE, at the bottom, so LIMIT=0 means "ask it
+		# to stop, then read its state once" rather than "return failure
+		# without having looked". The request above has always been sent
+		# unconditionally, so the old top-of-loop test gave the worst of both:
+		# the domain was asked to shut down and then reported as having
+		# refused, by a function that never read its state. Same trade
+		# wait_for_domain_ready documents -- the cost is at most one extra
+		# poll, and it is the cheap direction to be wrong in.
+		[ "$waited" -lt "$limit" ] || break
 		sleep 3
 		waited=$((waited + 3))
 		since_send=$((since_send + 3))

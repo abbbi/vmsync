@@ -1268,6 +1268,205 @@ unset -f sleep dom_state virsh_uri ready_run ready_says ready_in_range
 warn() { :; }
 
 echo
+echo "=== graceful_shutdown: the budget it is given, and the one poll it owes ==="
+
+# THE SHUTDOWN HALF OF THE LIFECYCLE HAD NO TESTS AT ALL. It is committed code,
+# older than the wait_for_domain_ready counterpart above, and the 35 checks
+# there cover only the counterpart. This section starts closing that, with the
+# defect that costs a VERDICT rather than a few seconds.
+#
+# WHAT WAS WRONG. The budget was never validated and was tested at the TOP of
+# the loop, so a mistyped SOURCE_SHUTDOWN_WAIT_SECONDS -- '120s', or empty --
+# made every integer comparison exit 2, which `while` reads as "spent". The
+# function then returned "it did not shut down" having never once looked at the
+# domain. It had already SENT the shutdown request, so the domain was asked to
+# stop and then reported as refusing, by a function that never checked whether
+# it had. Stages 11 and 26 stood down on that, quoting a budget of 0s, and bash
+# additionally printed `[: 120s : integer expression expected` into the run
+# with nothing to tie it to the setting that caused it.
+#
+# WHY THE STDERR ASSERTION IS THE LOAD-BEARING ONE, and the reason this section
+# exists in this shape: once the budget test moves to the bottom of the loop, a
+# non-numeric limit degrades to a single pass EITHER WAY -- with the validation
+# or without it. The exit status therefore does not discriminate, and a test
+# checking only rc would still pass with the validation deleted. What separates
+# them is the warning text and the ABSENCE of bash's own complaint on stderr,
+# so both are asserted. warn is stubbed into a variable here rather than left
+# to write to stderr, which is what makes an empty stderr mean "bash said
+# nothing" instead of "nothing was said at all".
+#
+# DELIBERATELY NOT COVERED, because it is not fixed: `waited` is still a sum of
+# sleeps rather than real elapsed time, so the function overruns the budget it
+# advertises. That is a separate finding with its own measurement. Two
+# consequences for whoever takes it. First, every timing assertion below is an
+# EXACT equality and can afford to be, precisely because the clock is synthetic
+# -- when the real clock goes in they become ranges, and a test that still
+# demands exact equality afterwards is testing the harness. Second, the stub
+# advances SECONDS and SEEDS IT AWAY FROM ZERO on purpose: a `begun="$SECONDS"`
+# mutated to `begun=0` is invisible to a harness that starts the clock at zero,
+# and that mutation makes the function poll once and fail every call.
+eval "$(extract "$COMMON" graceful_shutdown)"
+
+gs_idx="$WORK/gs.idx"
+gs_iter="$WORK/gs.iter"
+gs_polls="$WORK/gs.polls"
+gs_err="$WORK/gs.err"
+
+sleep() {
+	local n
+	read -r n <"$gs_iter"
+	n=$((n + 1))
+	printf '%s' "$n" >"$gs_iter"
+	if [ "$n" -gt 200 ]; then
+		printf '  FAIL  graceful_shutdown did not terminate in 200 iterations\n'
+		FAIL=$((FAIL + 1))
+		return 1
+	fi
+	SECONDS=$((SECONDS + 3))
+}
+# Cursor and poll count both in files: dom_state is called inside `$(...)`, so
+# anything it assigns to a variable dies with the subshell.
+dom_state() {
+	local i s last n
+	read -r n <"$gs_polls"
+	printf '%s' "$((n + 1))" >"$gs_polls"
+	read -r i <"$gs_idx"
+	last=$((${#GS_SEQ[@]} - 1))
+	[ "$i" -le "$last" ] || i="$last"
+	s="${GS_SEQ[$i]}"
+	printf '%s' "$((i + 1))" >"$gs_idx"
+	# X stands for "libvirt could not be asked at all".
+	[ "$s" != X ] || return 1
+	printf '%s' "$s"
+}
+virsh_uri() {
+	local _uri="$1" verb="$2"
+	GS_VERBS="$GS_VERBS $verb"
+	return 0
+}
+log() { :; }
+warn() { GS_WARNED="$GS_WARNED|$*"; }
+
+gs_in_range() {
+	if [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]; then printf 'in range'; else printf '%s' "$1"; fi
+}
+gs_said() {
+	case "$2" in
+	*"$1"*) printf 'yes' ;;
+	*) printf 'no -- %s' "$2" ;;
+	esac
+}
+gs_run() {
+	# shellcheck disable=SC2206 # deliberate word splitting: the state sequence
+	GS_SEQ=($1)
+	GS_VERBS="" GS_WARNED=""
+	printf '0' >"$gs_idx"
+	printf '0' >"$gs_iter"
+	printf '0' >"$gs_polls"
+	: >"$gs_err"
+	SECONDS=1000
+	GS_RC=0
+	# stderr to a file, and the call is NOT in a subshell, so the stubbed
+	# warn's variable survives while bash's own diagnostics are captured.
+	graceful_shutdown qemu:///x dom "$2" "the vm" 2>"$gs_err" || GS_RC=$?
+	read -r GS_POLLS <"$gs_polls"
+	read -r GS_SLEEPS <"$gs_iter"
+	GS_VERBS="${GS_VERBS# }"
+	# shellcheck disable=SC2086 # deliberate: split the verb list into lines
+	GS_SHUTDOWNS="$(printf '%s\n' $GS_VERBS | grep -c '^shutdown$')"
+	GS_STDERR="$(cat "$gs_err")"
+}
+
+# THE DEFECT, stated as the thing the function owes its caller: it has already
+# asked the domain to stop, so it owes one look at whether that worked.
+gs_run "shutoff" 0
+check "a budget of 0 on a stopped domain: rc 0" 0 "$GS_RC"
+check "a budget of 0 on a stopped domain: it looked, exactly once" 1 "$GS_POLLS"
+check "a budget of 0 on a stopped domain: and slept not at all" 0 "$GS_SLEEPS"
+check "a budget of 0 on a stopped domain: one shutdown request" 1 "$GS_SHUTDOWNS"
+check "a budget of 0 on a stopped domain: reports 0s waited" 0 "$SHUTDOWN_WAITED"
+
+gs_run "running" 0
+check "a budget of 0 on a running domain: rc 1" 1 "$GS_RC"
+check "a budget of 0 on a running domain: it still looked once" 1 "$GS_POLLS"
+check "a budget of 0 on a running domain: no bash noise" "" "$GS_STDERR"
+
+# THE NON-NUMERIC BUDGETS. rc cannot tell these from the unvalidated version,
+# so what is asserted is the warning and the clean stderr. '-5' and '1.5' are
+# in the list because a budget can be mistyped in more ways than one and all
+# of them reach the same integer comparison.
+for gs_bad in '120s' '' '-5' '1.5' 'abc'; do
+	gs_run "shutoff" "$gs_bad"
+	check "a budget of '$gs_bad': answers rather than hanging, rc 0" 0 "$GS_RC"
+	check "a budget of '$gs_bad': said out loud" yes "$(gs_said 'not a whole number' "$GS_WARNED")"
+	check "a budget of '$gs_bad': names a setting to go and fix" yes "$(gs_said 'SHUTDOWN_WAIT_SECONDS' "$GS_WARNED")"
+	check "a budget of '$gs_bad': bash printed nothing of its own" "" "$GS_STDERR"
+	check "a budget of '$gs_bad': it read the domain once" 1 "$GS_POLLS"
+	# AND AGAIN ON A DOMAIN THAT HAS NOT STOPPED, which is the only case that
+	# actually REACHES the comparison. A stopped domain returns on the first
+	# poll, so it never evaluates the budget and cannot tell a validated limit
+	# from an unvalidated one -- the arms above pass either way. This one is
+	# what catches a validation that warns and then leaves the bad value in
+	# place: `[ 0 -lt '120s' ]` puts bash's own complaint on stderr.
+	gs_run "running" "$gs_bad"
+	check "a budget of '$gs_bad' on a running domain: rc 1" 1 "$GS_RC"
+	check "a budget of '$gs_bad' on a running domain: one poll, no spin" 1 "$GS_POLLS"
+	check "a budget of '$gs_bad' on a running domain: and still no bash noise" "" "$GS_STDERR"
+done
+
+# A VALID BUDGET IS STILL NOT WARNED ABOUT -- otherwise the warning above
+# could be satisfied by warning always, which proves nothing.
+gs_run "shutoff" 30
+check "a valid budget: nothing is warned" "" "$GS_WARNED"
+
+# THE ORDINARY PATH, which the change must leave alone.
+gs_run "running running shutoff" 30
+check "a guest that stops on the third poll: rc 0" 0 "$GS_RC"
+check "a guest that stops on the third poll: three polls, two sleeps" "3/2" "$GS_POLLS/$GS_SLEEPS"
+check "a guest that stops on the third poll: one request only" 1 "$GS_SHUTDOWNS"
+check "a guest that stops on the third poll: 6s on the synthetic clock" 6 "$SHUTDOWN_WAITED"
+
+gs_run "running" 30
+check "a guest that never stops: rc 1" 1 "$GS_RC"
+check "a guest that never stops: it spends the whole budget" 30 "$SHUTDOWN_WAITED"
+
+# The re-send is the reason this function exists rather than being one virsh
+# call: libvirt does not retry a request a booting guest dropped. At 3s per
+# poll and a 15s cadence, a 45s budget sends the first plus three more.
+gs_run "running" 45
+check "a guest that never stops: the request is re-sent on a cadence" 4 "$GS_SHUTDOWNS"
+check "a guest that never stops: and the cadence is not every poll" "in range" "$(gs_in_range "$GS_SHUTDOWNS" 2 5)"
+
+# An unreadable state is not "shutoff". Reporting a domain stopped on the
+# strength of a query that failed is the one error direction that matters here.
+# (The transient-domain case, where an absent domain really has stopped, is a
+# separate finding and is deliberately not asserted either way.)
+gs_run "X" 12
+check "an unreadable state: not mistaken for stopped" 1 "$GS_RC"
+check "an unreadable state: it kept asking" "in range" "$(gs_in_range "$GS_POLLS" 4 6)"
+
+# --- the pins ----------------------------------------------------------------
+gs_src="$(extract "$COMMON" graceful_shutdown)"
+# shellcheck disable=SC2016 # the needles are source text, not values to expand
+{
+	check "the budget is validated against a whole-number pattern" yes \
+		"$(has "'' | *[!0-9]*)" "$gs_src")"
+	check "the loop itself is unconditional" yes "$(has 'while :; do' "$gs_src")"
+	check "and the budget is tested at the bottom of it" yes \
+		"$(has '[ "$waited" -lt "$limit" ] || break' "$gs_src")"
+	# The request has always gone out before the loop; the defect was that
+	# nothing then read the result. Pinned so a future edit cannot make the
+	# first poll conditional again without failing here too.
+	check "the shutdown request still precedes the loop" yes \
+		"$(has 'shutdown "$domain" >/dev/null 2>&1 || true
+
+	while :; do' "$gs_src")"
+}
+
+unset -f sleep dom_state virsh_uri graceful_shutdown gs_run gs_in_range gs_said
+warn() { :; }
+
+echo
 echo "=== the guest-agent wait, and the three stages that asked without it ==="
 
 # TWO FIXES TESTED TOGETHER, because the first is what makes the second
