@@ -272,6 +272,28 @@ GUEST_DIRTY_MIB=64
 TARGET_SHUTDOWN_WAIT_SECONDS=120
 SOURCE_SHUTDOWN_WAIT_SECONDS=120
 
+# The OTHER half of the same journey, and it had no setting at all until the
+# probe that needed it existed: how long to wait for a domain that has been
+# started to be usable again.
+#
+# "Usable" means its qemu-guest-agent answered a ping, not that libvirt says
+# "running". `virsh start` returns as soon as libvirt has launched qemu and
+# domstate reads "running" from that instant -- tens of seconds before anything
+# inside the guest exists. Stage 26 stops and starts the source to flush a
+# bitmap into its image and then syncs it, and a sync handed a guest still in
+# its bootloader gets no filesystem freeze: vmsync says so, calls the copy
+# crash-consistent, and still exits 0. So the wait is what keeps a pass from
+# being earned on a degraded copy.
+#
+# A guest whose definition has no org.qemu.guest_agent channel is answered at
+# once rather than after this whole budget -- there is nothing to wait for, and
+# the stage says readiness is unproven and carries on where its own check reads
+# the image rather than the guest.
+#
+# Longer than the shutdown wait on purpose: booting takes longer than stopping,
+# and nothing is retried for free here.
+SOURCE_READY_WAIT_SECONDS=180
+
 # How long to wait for each in-guest write to finish. guest-exec is
 # asynchronous -- it returns a pid immediately -- so the harness polls
 # guest-exec-status rather than letting the next checkpoint be taken while dd

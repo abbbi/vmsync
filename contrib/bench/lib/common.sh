@@ -203,6 +203,200 @@ graceful_shutdown() {
 	return 1
 }
 
+# domain_agent_channel URI DOMAIN -> 0 when DOMAIN's definition carries an
+# org.qemu.guest_agent channel, 1 when it plainly does not, 2 when the
+# definition could not be read at all.
+#
+# STRUCTURAL, deliberately. libvirt refuses an agent command on a channel-less
+# domain at once -- "argument unsupported: QEMU guest agent is not configured"
+# -- and that refusal cannot change while the domain runs, so there is nothing
+# to wait for. But libvirtd formats its OWN messages in the daemon's locale, so
+# matching that text would answer correctly on an English host and wrongly on
+# the French one this was written against; only qemu's half of a libvirt error
+# comes through untranslated. The XML reads the same in every locale.
+#
+# No pipe into grep: the left-hand side is a command, and a reader that exits
+# before the writer finishes kills it -- see grep_q's comment in bench.sh for
+# the 2026-11-03 measurement that cost stage 23 a wrong verdict. A capture plus
+# a case is immune to that and needs nothing from bench.sh, which matters
+# because this library is sourced by things that are not bench.sh.
+domain_agent_channel() {
+	local uri="$1" domain="$2" xml
+	xml="$(virsh_uri "$uri" dumpxml "$domain" 2>/dev/null)" || return 2
+	case "$xml" in
+	*org.qemu.guest_agent*) return 0 ;;
+	esac
+	return 1
+}
+
+# wait_for_domain_ready URI DOMAIN LIMIT_SECONDS LABEL -> 0 once DOMAIN is
+# running AND something inside it answered a guest-agent ping, 1 when libvirt
+# says it is not running, 2 when neither could be established. Sets
+# STARTUP_WAITED, STARTUP_STATE and STARTUP_WHY for the caller's message.
+#
+# THE COUNTERPART OF graceful_shutdown, and like it this one ACTS: it issues
+# the verb the domain's current state needs. That is half the reason it exists
+# rather than being three lines at each call site. Every start in this harness
+# is spelled `virsh_uri ... start ... >/dev/null 2>&1 || true` -- seven of them,
+# waiting for nothing -- so a refused start is indistinguishable from one that
+# worked right up until something later fails naming the wrong component.
+#
+# WHY THE AGENT AND NOT domstate. `virsh start` returns as soon as libvirt has
+# launched qemu, and domstate says "running" from that instant, tens of seconds
+# before anything inside the guest exists. Measured through its absence: before
+# wait_for_guest_agent existed, stage 8 skipped itself with "guest-exec
+# unavailable" in every run that included stage 7 -- which restarts the source
+# on its way out -- and reported it as a guest misconfiguration.
+#
+# THREE-WAY, for the reason probe_gone gives about qemu_holds_probe: "running,
+# but nothing in the guest answered" is not "it failed to start". A guest with
+# no agent never answers at all, so folding that into a failure stands a stage
+# down on a working host, while folding it into success hands the caller a guest
+# that may still be in its bootloader. Only the caller knows which it needs --
+# a check that reads the IMAGE is served by 0 and 2 alike, one that runs a
+# command inside the guest only by 0.
+#
+# guest-ping rather than guest-info or guest-exec: the cheapest RPC that proves
+# the agent is answering, and the only one enabled wherever the agent runs at
+# all. RHEL-family packages ship guest-exec and guest-file-* in BLOCK_RPCS (see
+# guest_exec_available), so a readiness probe built on either would report "not
+# ready" for a guest that had booted perfectly. What this proves is that the
+# guest booted far enough to run its agent, which is all a readiness probe can
+# honestly claim; whether a particular RPC is permitted stays
+# guest_exec_available's question, asked after this one.
+#
+# REAL ELAPSED TIME, never a sum of sleeps, because libvirt blocks its own
+# agent-command call for seconds when nothing answers: a loop adding up only
+# its own sleeps overruns the limit it advertises by whatever virsh spent --
+# exactly in the case the limit exists to bound. graceful_shutdown above still
+# counts sleeps and does overrun; this is not the place to copy it.
+#
+# The limit is an ARGUMENT and is never defaulted from a bench.conf setting in
+# here: this library is sourced by things that are not bench.sh, and reaching
+# for an unset variable under `set -u` is the death ssh_host_cmd's own comment
+# says it has to stay incapable of.
+#
+# The budget is checked at the BOTTOM of the loop, so LIMIT=0 means "ask once,
+# do not wait" rather than "return without having asked". A probe that reports
+# failure for a healthy guest it never questioned is the worse trade; the cost
+# is an overrun of at most one poll.
+wait_for_domain_ready() {
+	local uri="$1" domain="$2" limit="$3" what="$4"
+	local begun="$SECONDS" elapsed=0
+	local state="" verb="" last_verb="" nudges=0 last_nudge=0
+	local saw_running=no announced=no chan
+	# Re-issue the verb this often: graceful_shutdown's resend_every in mirror
+	# image, and for the mirror-image reason. A start can race a domain that is
+	# still "inshutdown" and has to be tried again, while a guest that boots
+	# and dies must not be relaunched on every poll.
+	local nudge_every=15
+	STARTUP_WAITED=0
+	STARTUP_STATE=""
+	STARTUP_WHY=""
+
+	# Validated here rather than trusted, like meta_field_until's own limit: a
+	# non-numeric one makes every `[ ... -lt ... ]` below exit 2, which an `if`
+	# reads as "the budget is spent" and turns the whole wait into a single
+	# pass. That is the right degradation, but it has to be said out loud.
+	case "$limit" in
+	'' | *[!0-9]*)
+		warn "wait_for_domain_ready was asked to wait '$limit' seconds for $what, which is not a whole number -- asking once and not waiting. Fix the setting that produced it."
+		limit=0
+		;;
+	esac
+
+	while :; do
+		state="$(dom_state "$uri" "$domain" 2>/dev/null || true)"
+		STARTUP_STATE="$state"
+		STARTUP_WAITED="$elapsed"
+		verb=""
+
+		case "$state" in
+		running)
+			saw_running=yes
+			domain_agent_channel "$uri" "$domain" && chan=0 || chan=$?
+			if [ "$chan" = 0 ] && virsh_uri "$uri" qemu-agent-command "$domain" \
+				'{"execute":"guest-ping"}' >/dev/null 2>&1; then
+				if [ "$nudges" = 0 ]; then
+					log "   $what is running and its guest agent answered after ${elapsed}s"
+				else
+					log "   $what is running and its guest agent answered after ${elapsed}s (${nudges} ${last_verb} request(s) sent)"
+				fi
+				return 0
+			fi
+			if [ "$chan" = 1 ]; then
+				STARTUP_WHY="$what is running, but its definition carries no org.qemu.guest_agent channel, so nothing inside it can be asked whether it is ready. Answered at once rather than after ${limit}s, because a channel cannot appear while the domain runs. Readiness is UNPROVEN, not refused: a caller that only needs qemu to have reopened the image may carry on, one that runs commands in the guest cannot."
+				log "   $what is running after ${elapsed}s, and its definition has no guest agent channel -- readiness cannot be proven"
+				return 2
+			fi
+			;;
+		paused)
+			# resume, never start: a paused domain IS active, just not
+			# scheduled, and `start` is refused on it. Reachable for real --
+			# stage 22 suspends the source and only warns when its own resume
+			# fails, so a later stage can inherit a paused source.
+			verb=resume
+			;;
+		pmsuspended)
+			# A guest-initiated S3. Neither start nor resume applies; without
+			# this arm the probe burns the whole limit and then reports "it did
+			# not start" about a guest that is merely asleep.
+			verb=dompmwakeup
+			;;
+		"")
+			# Unreadable. Keep asking: a transport blip during a boot is common
+			# and cures itself a poll later. The verdict below decides what an
+			# unreadable state STILL unreadable at the limit means.
+			;;
+		*)
+			# shutoff, crashed, inshutdown, and anything this libvirt invents
+			# later. Deliberately not an exhaustive list: an unanticipated
+			# state ends in a verdict naming the actual string rather than in a
+			# silent fallthrough.
+			verb=start
+			;;
+		esac
+
+		if [ -n "$verb" ] && { [ "$nudges" = 0 ] || [ $((elapsed - last_nudge)) -ge "$nudge_every" ]; }; then
+			virsh_uri "$uri" "$verb" "$domain" >/dev/null 2>&1 || true
+			nudges=$((nudges + 1))
+			last_nudge="$elapsed"
+			last_verb="$verb"
+		fi
+
+		# Once, on the first pass that is going to wait, so a guest that is
+		# genuinely booting explains the pause instead of looking like a hang.
+		if [ "$announced" = no ] && [ "$limit" -gt 0 ]; then
+			log "   waiting up to ${limit}s for $what to come back and answer (it is '${state:-unreadable}')"
+			announced=yes
+		fi
+
+		[ "$elapsed" -lt "$limit" ] || break
+		sleep 3
+		elapsed=$((SECONDS - begun))
+	done
+
+	STARTUP_WAITED="$elapsed"
+	case "$STARTUP_STATE" in
+	running)
+		STARTUP_WHY="$what is running, but nothing inside it answered a guest-agent ping within ${elapsed}s -- either its agent is not running or the guest is still booting. Which of the two is guest_exec_available's question, and its answer names the difference."
+		return 2
+		;;
+	"")
+		STARTUP_WHY="$what's state could not be read from $uri within ${elapsed}s, so this run cannot say whether it came back. A transient domain ceases to exist when it stops, and a transport or authentication failure reads the same way here -- deliberately NOT reported as 'it did not start', which is a different thing to go and fix."
+		return 2
+		;;
+	*)
+		if [ "$saw_running" = yes ]; then
+			STARTUP_WHY="$what came up and is '$STARTUP_STATE' again after ${elapsed}s: the start was accepted and the domain stopped anyway, so the fault is inside it rather than in the request."
+		else
+			STARTUP_WHY="$what is still '$STARTUP_STATE' after ${elapsed}s and ${nudges} ${last_verb:-start} request(s), so libvirt never brought it up at all."
+		fi
+		return 1
+		;;
+	esac
+}
+
 # domain_uuid URI DOMAIN -> the domain's UUID (whitespace collapsed), or
 # empty + non-zero exit on failure (see dom_state's own VIRSH_ERR comment).
 domain_uuid() {

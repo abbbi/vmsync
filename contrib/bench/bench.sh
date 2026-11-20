@@ -2174,6 +2174,16 @@ heal_target() {
 # agent is answering, and it is enabled wherever the agent runs at all.
 # Costs nothing when the agent is already up -- the first ping answers -- so
 # this is safe to call unconditionally before any guest-agent work.
+#
+# THIS ONE ONLY ASKS. wait_for_domain_ready (lib/common.sh) is the one that
+# ACTS: it takes a URI and a domain, issues whatever verb the current state
+# needs, and answers three ways. The difference is load-bearing rather than
+# stylistic -- two of this function's three callers (stages 10 and 16) have no
+# state check in front of them, so making this a wrapper would hand them the
+# power to start the source as a side effect of wanting guest writes. A stage
+# that powers on the source without saying so is the harness doing a real
+# intervention off the books, which is what PROBE_MAY_STOP_SOURCE gates in the
+# other direction. Hence two functions.
 wait_for_guest_agent() {
 	local timeout="${1:-${GUEST_AGENT_TIMEOUT:-120}}" start=$SECONDS elapsed=0
 	# Real elapsed time, not a count of sleeps: libvirt blocks its own
@@ -11525,9 +11535,16 @@ stage_generation() {
 		log "   (would plant a dead generation's bitmap on $SOURCE_DOMAIN and sync over it)"
 		fo_check "$sc" "the chain carries a generation token" 0
 		fo_check "$sc" "an ordinary sync succeeds with a dead generation's bitmap present" 0
-		fo_check "$sc" "the dead generation is named in the report" 0
+		fo_check "$sc" "the image-only report cannot see a bitmap only qemu holds" 0
 		fo_check "$sc" "an ordinary sync does not clear it" 0
 		fo_check "$sc" "an incremental against another generation is refused" 0
+		# 26e's two rows. Mirrored here deliberately: stage_verdict is awk over
+		# the CSV, so a row that exists only in a live run moves the
+		# denominator between --dry-run and a real one -- the failure
+		# ungraded_row's own comment exists for. Every stand-down path in 26e
+		# writes both of these too, for the same reason.
+		fo_check "$sc" "stopping the source puts the dead generation's bitmap in the image" 0
+		fo_check "$sc" "the dead generation is named in the report once it is in the image" 0
 		return 0
 	fi
 
@@ -11565,7 +11582,28 @@ stage_generation() {
 	write_probe_fixture
 
 	stage_cleanup_generation() {
-		if cp_listed "$probe" || qemu_holds_probe; then
+		local held
+		# THE DOMAIN HAS TO BE UP, and since 26e power-cycles it that is no
+		# longer a given. Both oracles go through checkpoint-create and the
+		# removal through checkpoint-delete, and libvirt refuses both on an
+		# inactive domain -- so against a source that did not come back this
+		# function would ask questions nothing can answer and then report
+		# success. Said loudly instead, with the by-hand recipe, because after
+		# 26e the leftover is in the image as well as in qemu and therefore
+		# survives reboots.
+		if [ "$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN" 2>/dev/null || true)" != running ]; then
+			warn "stage 26 cannot clear $probe: $SOURCE_DOMAIN is not running, and both the existence oracle and the adoption need a live domain. Start it and clear the leftover with 'virsh -c $SOURCE_URI checkpoint-create $SOURCE_DOMAIN --xmlfile $PROBE_XML.adopt --redefine' then 'virsh -c $SOURCE_URI checkpoint-delete $SOURCE_DOMAIN --checkpointname $probe'; or, with the domain down, 'qemu-img bitmap --remove -f qcow2 $active $probe'."
+			results_row "$CSV" "$sc" cleanup 1 "" "" "" "" "" "FAIL left $probe behind, source not running"
+			return 0
+		fi
+		# Three-way, and the guard has to read it that way. `cp_listed ||
+		# qemu_holds_probe` made an INCONCLUSIVE oracle (2) falsify the
+		# condition, so the whole cleanup was skipped and nothing was said --
+		# a silent leave-behind, which is the error direction probe_gone was
+		# written to prevent, reintroduced through the guard instead of the
+		# body. An unanswered question now leads to an attempt.
+		qemu_holds_probe && held=0 || held=$?
+		if cp_listed "$probe" || [ "$held" != 1 ]; then
 			if adopt_and_delete && probe_gone; then
 				log "   cleanup: $probe is gone"
 				return 0
@@ -11635,15 +11673,33 @@ stage_generation() {
 			"exit $rc_report. A leftover from a dead generation cannot collide with the names this chain mints, so it must not stop a sync -- if this failed, something is still treating an orphan as an obstacle. $(log_reason "$log_report")"
 	fi
 
-	# The generation has to be NAMED. A count would say something is wrong and
-	# nothing about which chain it came from or how old it is, which is the
-	# whole difference between this report and the bare refusal it replaced.
-	if grep -q "$dead_token" "$log_report" 2>/dev/null &&
-		grep -q 'no libvirt checkpoint accounts for' "$log_report" 2>/dev/null; then
-		fo_check "$sc" "the dead generation is named in the report" 0
+	# AND IT CANNOT SEE THE ORPHAN YET -- asserted as a pass, not left as a
+	# standing failure.
+	#
+	# vmsync's per-sync report reads the qcow2 bitmap directory ON DISK
+	# (cmd/vmsync/main.go -> leftoverCheckpointBitmaps -> qemu-img info), and a
+	# bitmap qemu made during its own process life is not in that directory
+	# yet. The orphan planted above is therefore invisible to it, which is
+	# finding 3.11 of docs/design/orphan-bitmap-adoption.md and is BY DESIGN:
+	# the QMP census that can see it is wired to the -reinit path alone, so a
+	# pair that never reinits is never marked custom-monitor.
+	#
+	# This was spelled as a FAIL of "the dead generation is named in the
+	# report" and could not pass; three hardware runs duly failed it
+	# (2026-11-03, 2026-11-04, 2026-11-07). A row that can only fail teaches a
+	# reader to skip it. Spelled this way it carries the same fact and moves
+	# when the FACT moves: a build that names an in-memory-only bitmap here has
+	# gained a reader it did not have, and that is worth a failure of its own.
+	#
+	# 26e below measures the other half -- that once the bitmap IS in the
+	# image, the report names it. Keeping both is the point: asserting only
+	# 26e's half would let a reader diff a 4-of-5 run against a 5-of-5 one and
+	# read the newly passing row as the GAP having closed.
+	if grep -q -- "$probe" "$log_report" 2>/dev/null; then
+		fo_check "$sc" "the image-only report cannot see a bitmap only qemu holds" 1 \
+			"$log_report names $probe, which at that moment existed only in qemu's memory -- plant_orphan's own oracle had just confirmed qemu held it, and nothing had flushed it to $active. If vmsync can now see such a bitmap on the ordinary sync path it has gained a reader it did not have: finding 3.11 is closed, this check is the wrong shape, and 26e's measurement is redundant rather than wrong. See $log_report"
 	else
-		fo_check "$sc" "the dead generation is named in the report" 1 \
-			"the run did not name generation $dead_token as unaccounted for. Nothing else in vmsync mentions such a bitmap -- virsh checkpoint-list cannot see it and no sync fails over it -- so a report that omits it means the leak is invisible. See $log_report"
+		fo_check "$sc" "the image-only report cannot see a bitmap only qemu holds" 0
 	fi
 
 	# AND NOT CLEARED. Removing one needs the domain down or an adoption
@@ -11696,8 +11752,180 @@ stage_generation() {
 		fi
 	fi
 
+	# --- 26e. and once the bitmap IS in the image, the report names it ------
+	#
+	# THE OTHER HALF OF 26c's BLINDNESS. 26c measured that the per-sync report
+	# cannot see a bitmap qemu is still holding; this measures whether it names
+	# one that has REACHED the image, which is the report's actual capability
+	# and the thing an operator's space leak turns on.
+	#
+	# WHAT MOVES IT: the qemu process ending. Measured on npftest 2026-11-08,
+	# libvirt 12.0.0 / qemu 10.2.2, on a throwaway domain -- invisible to
+	# qemu-img for the whole life of the qemu that made it; present with
+	# flags=['auto'] once the domain had stopped; present with
+	# flags=['in-use','auto'] once it had been started again, because qemu
+	# reloads a persistent bitmap when it reopens the image. The same answer
+	# whether libvirt's checkpoint metadata was still there across the stop or
+	# had already been stripped -- which is what tells `start` apart from the
+	# `restore` this repo measured NOT reloading one.
+	#
+	# That reload is what keeps 26c's third check honest rather than making it
+	# a liar: qemu holds the name again afterwards, so the oracle still answers
+	# "held" and the cleanup below can still adopt and delete the leftover.
+	#
+	# A REAL INTERVENTION, gated by the knob that already authorises exactly
+	# this -- PROBE_MAY_STOP_SOURCE, which settle_stopped and sweep_offline
+	# already read. One knob and not a second: the operator decision is
+	# identical ("this harness may power-cycle your source domain") and two
+	# names meaning the same thing drift apart. What IS different from stages
+	# 22 and 23 is that there the stop is recovery and no verdict depends on
+	# it, while here the restart is on the critical path -- which is why 26c
+	# keeps the unperturbed measurement and this row says in its own label
+	# that it was graded after a deliberate flush.
+	#
+	# IT NEVER DESTROYS THE SOURCE. Stage 11's precedent, not stage 7's: this
+	# is the domain standing in for production, and a destroy would also risk
+	# leaving the live chain's own bitmap unflushed or in-use, which libvirt
+	# refuses the next incremental over outright -- a bitmap must be
+	# persistent, recording and not inconsistent in every layer where it
+	# appears. A shutdown that times out stands the measurement down instead.
+	#
+	# A GUEST WITH NO OS CANNOT BE MEASURED HERE AT ALL, and that is recorded
+	# rather than worked around: an ACPI power button needs something inside
+	# the guest to honour it. npftest's own fixture has a 196 KiB disk and no
+	# channel of any kind, so seven requests over 90s left it running -- which
+	# is why this check stands down there and is only exercisable against a
+	# fixture with a real OS.
+	local flush_check="the dead generation is named in the report once it is in the image"
+	local flush_hinge="stopping the source puts the dead generation's bitmap in the image"
+
+	# BOTH rows on every path out. stage_verdict is awk over the CSV, so a
+	# check that returns without leaving a row is indistinguishable from one
+	# that was never in the suite -- the denominator simply moves. Used only
+	# BEFORE the hinge has a verdict of its own; after that only the flush row
+	# is still owed.
+	generation_flush_stood_down() {
+		ungraded_row "$sc" "$flush_hinge" SKIP "$1"
+		ungraded_row "$sc" "$flush_check" SKIP "$1"
+	}
+
+	if [ "${PROBE_MAY_STOP_SOURCE:-no}" != yes ]; then
+		generation_flush_stood_down "26c has just measured that the report cannot see a bitmap qemu made during its own life; proving it CAN name one needs the bitmap flushed into $active, and what flushes it is the qemu process ending. Re-run with PROBE_MAY_STOP_SOURCE=yes to have this stage stop $SOURCE_DOMAIN and start it again, or do it by hand: 'virsh -c $SOURCE_URI shutdown $SOURCE_DOMAIN', wait for it to reach shut off, then 'virsh -c $SOURCE_URI start $SOURCE_DOMAIN'"
+		stage_cleanup_generation
+		return 0
+	fi
+
+	# A transient domain ceases to exist the moment it stops, so stopping it to
+	# flush the bitmap would destroy the fixture outright and leave nothing to
+	# start again. Asked before anything is stopped rather than discovered
+	# afterwards. virsh_uri forces LC_ALL=C, so the field name is English here
+	# whatever the daemon's locale.
+	if ! virsh_uri "$SOURCE_URI" dominfo "$SOURCE_DOMAIN" 2>/dev/null |
+		grep_q -E '^Persistent:[[:space:]]+yes'; then
+		generation_flush_stood_down "$SOURCE_DOMAIN is not a persistent domain, or its dominfo could not be read. A transient domain ceases to exist when it stops, so stopping it to flush the bitmap would destroy this stage's own fixture and leave nothing to start again"
+		stage_cleanup_generation
+		return 0
+	fi
+
+	# Puts the source back on every way out, including a signal. bench.sh traps
+	# INT/TERM into a flag that RETURNS through the stage, so a Ctrl-C inside
+	# graceful_shutdown's poll must not leave the source powered off for every
+	# later stage in the run. EXIT rather than RETURN for the reason stage 11's
+	# invert_cleanup gives, and cleared by hand once the domain is back.
+	generation_restore_source() {
+		[ "${GENERATION_STOPPED_SOURCE:-no}" = yes ] || return 0
+		GENERATION_STOPPED_SOURCE=no
+		local rc=0
+		wait_for_domain_ready "$SOURCE_URI" "$SOURCE_DOMAIN" \
+			"${SOURCE_READY_WAIT_SECONDS:-180}" "source $SOURCE_DOMAIN" || rc=$?
+		case "$rc" in
+		0) ;;
+		2) warn "stage 26: $STARTUP_WHY" ;;
+		*) warn "stage 26 could not bring $SOURCE_DOMAIN back up, and every later stage in this run syncs that source: $STARTUP_WHY Start it by hand with 'virsh -c $SOURCE_URI start $SOURCE_DOMAIN'." ;;
+		esac
+		return "$rc"
+	}
+
+	log "   26e: stopping $SOURCE_DOMAIN to flush $probe into $active, then starting it again"
+	GENERATION_STOPPED_SOURCE=yes
+	trap 'generation_restore_source || true' EXIT
+
+	if ! graceful_shutdown "$SOURCE_URI" "$SOURCE_DOMAIN" \
+		"${SOURCE_SHUTDOWN_WAIT_SECONDS:-120}" "source $SOURCE_DOMAIN"; then
+		generation_flush_stood_down "$SOURCE_DOMAIN did not reach shut off within ${SHUTDOWN_WAITED}s despite ${SHUTDOWN_ATTEMPTS} shutdown request(s), so nothing flushed the bitmap -- and this stage will not destroy the source to force it. A guest with nothing listening for an ACPI power button cannot be stopped this way at all. Raise SOURCE_SHUTDOWN_WAIT_SECONDS if this guest is legitimately slow to stop"
+		generation_restore_source || true
+		trap - EXIT
+		stage_cleanup_generation
+		return 0
+	fi
+
+	# THE HINGE, and the one read in this stage that nothing holds the image
+	# during. If the orphan is not in the file with the domain off then the
+	# premise does not hold on this host -- qemu wrote nothing on its way out
+	# -- and grading the report against it would charge vmsync for a qemu's
+	# behaviour. Its own row, because three verdicts are conditioned on it.
+	log "     bitmaps with $SOURCE_DOMAIN SHUT OFF: $(raw_bitmaps)"
+	if bitmap_present "$probe"; then
+		fo_check "$sc" "$flush_hinge" 0
+	else
+		fo_check "$sc" "$flush_hinge" 1 \
+			"$probe is not in $active with $SOURCE_DOMAIN shut off, and a clean stop is exactly when qemu writes a persistent bitmap there. So either the bitmap was never persistent, or this qemu does not store one on exit -- and nothing downstream can be graded against an image that never carried it"
+		ungraded_row "$sc" "$flush_check" SKIP "the bitmap never reached $active, so there is nothing in the image for the report to name and this would be grading vmsync on a qemu that wrote nothing"
+		generation_restore_source || true
+		trap - EXIT
+		stage_cleanup_generation
+		return 0
+	fi
+
+	local ready_rc=0
+	generation_restore_source || ready_rc=$?
+	trap - EXIT
+	if [ "$ready_rc" = 1 ] || { [ "$ready_rc" = 2 ] && [ "${STARTUP_STATE:-}" != running ]; }; then
+		ungraded_row "$sc" "$flush_check" SKIP "$SOURCE_DOMAIN did not come back, so there is no sync to read a report from: $STARTUP_WHY"
+		stage_cleanup_generation
+		return 0
+	fi
+	if [ "$ready_rc" = 2 ]; then
+		# Deliberately NOT a stand-down: this check reads the IMAGE, not the
+		# guest. What an unproven-ready guest costs is the sync's own
+		# filesystem freeze, which vmsync reports as a crash-consistent copy
+		# and still exits 0 -- and nothing in this stage reads data.
+		log "   26e: carrying on with readiness unproven, because this check reads the image rather than the guest -- $STARTUP_WHY"
+	fi
+
+	# `virsh start` applies the PERSISTENT definition, which need not name the
+	# file the live one did. Everything below quotes $active, and so does the
+	# cleanup's by-hand recipe, so a path that moved under the restart would
+	# have this stage describing an image that never carried the orphan.
+	local active_after=""
+	active_after="$(disk_source_path "$SOURCE_URI" "$SOURCE_DOMAIN" "$TAMPER_DISK_DEV")" || true
+	if [ "$active_after" != "$active" ]; then
+		ungraded_row "$sc" "$flush_check" SKIP "$SOURCE_DOMAIN's $TAMPER_DISK_DEV came back as '${active_after:-<unreadable>}' rather than '$active': a start applies the persistent definition, so the restart adopted a different image and nothing here would be reading the one the bitmap was flushed into"
+		stage_cleanup_generation
+		return 0
+	fi
+
+	bench_sync "$sc" flushed
+	local rc_flush="${RUN_RC:-0}" log_flush="$RUN_LOG"
+	if [ "$rc_flush" != 0 ]; then
+		ungraded_row "$sc" "$flush_check" SKIP "the sync after the restart exited $rc_flush, so the report it would have carried was never produced. $(log_reason "$log_flush")"
+	# THREE greps, each carrying its own weight: the header says an orphan was
+	# reported at all, the full name says it was THIS bitmap rather than any
+	# bitmap the restart made visible, and the generation clause -- quoted from
+	# the report's own rendering -- says it was ATTRIBUTED and not merely
+	# counted. The token alone is too loose: it is a substring of both names
+	# this stage mints.
+	elif grep -q 'no libvirt checkpoint accounts for' "$log_flush" 2>/dev/null &&
+		grep -q -- "$probe" "$log_flush" 2>/dev/null &&
+		grep -q -- "from generation $dead_token" "$log_flush" 2>/dev/null; then
+		fo_check "$sc" "$flush_check" 0
+	else
+		fo_check "$sc" "$flush_check" 1 \
+			"$probe is in $active and $SOURCE_DOMAIN has been restarted, so the report had everything it needed and $log_flush still does not carry all three of 'no libvirt checkpoint accounts for', '$probe' and 'from generation $dead_token'. Nothing else in vmsync mentions such a bitmap -- virsh checkpoint-list cannot see it and no sync fails over it -- so a report that omits it means the leak is invisible"
+	fi
+
 	stage_cleanup_generation
-	unset -f stage_cleanup_generation
+	unset -f stage_cleanup_generation generation_flush_stood_down generation_restore_source
 	return 0
 }
 

@@ -1718,7 +1718,9 @@ asked.
 | --- | --- |
 | the chain carries a generation token | that names are tokenised at all. Everything below reads the token to tell this chain from a dead one |
 | an ordinary sync succeeds with a dead generation's bitmap present | that a leftover is not an obstacle. It cannot collide with the names this chain mints, so a sync that fails here is still treating an orphan as a blocker |
-| **the dead generation is named in the report** | **the whole trade.** A count would say something is wrong and nothing about which chain it came from or how old it is. This greps for the planted token, not for a number |
+| **the image-only report cannot see a bitmap only qemu holds** | **the known limit, asserted as a pass.** The per-sync report reads the qcow2 bitmap directory on disk, and a bitmap qemu made during its own process life is not in it yet — finding 3.11, by design, since the QMP census is wired to `-reinit` alone. A row that can only fail teaches a reader to skip it; this one moves when the fact moves |
+| **stopping the source puts the dead generation's bitmap in the image** | **the hinge of 26e,** and the one read in the stage that nothing holds the image during. If a clean stop did not write the bitmap, the premise does not hold on this host and everything after it is ungraded rather than failed |
+| **the dead generation is named in the report once it is in the image** | **the whole trade,** measured where it can be measured. A count would say something is wrong and nothing about which chain it came from or how old it is. Three greps: the header, the full 33-character bitmap name, and `from generation <token>` in the report's own wording — so the pass is about the planted bitmap and its attribution, not about a token appearing somewhere in a log |
 | **an ordinary sync does not clear it** | that clearing stays an explicit verb (`-reinit`, stage 23). A sync that removes a bitmap unasked can also remove one it misread |
 | **an incremental against another generation is refused** | **the defect the whole design closes.** The target is made to record a checkpoint from a chain that no longer exists. Before tokens both names were spelled `vmsync-cpt-000001`, the chain check compared them equal, and a delta landed on a replica no bitmap described |
 
@@ -1757,6 +1759,49 @@ What changed around it is that the leak is no longer invisible everywhere:
 stage 23 now clears the orphan, so an existing one is findable by running
 `-reinit`. It is still not findable by watching ordinary syncs, which is what
 this check is about. Finding 3.11.
+
+**Third hardware answer (2026-11-07): the same 4 of 5, unchanged.** Same cause,
+and the run's own log confirms it from the other side — no `could not read the
+source's disks for dirty bitmaps` warning, so the image read worked and simply
+found nothing in the file.
+
+**What the stage does about it now (2026-11-08).** A row that can only ever fail
+is a row people learn to skip, so the one check became three, and the stage
+measures both sides of the limit instead of asserting the half that cannot hold:
+
+- **Before anything is flushed,** the report's blindness is asserted as a
+  *pass*. It carries the same fact finding 3.11 does, and it fails if a build
+  ever starts naming a bitmap that exists only in qemu's memory — which would
+  mean the engine had gained a reader it does not have.
+- **Then 26e stops the source and starts it again,** which is what moves a
+  persistent bitmap out of qemu and into the qcow2, and asserts that an ordinary
+  sync then names the generation. Behind `PROBE_MAY_STOP_SOURCE=yes`, the knob
+  that already authorises stopping the source for stages 22 and 23; without it
+  both of 26e's rows stand down naming the knob, rather than failing.
+
+Keeping both halves is the point. Asserting only the second would let a reader
+diff a 4-of-5 run against a 5-of-5 one and read the newly passing row as the
+*gap* having closed, when all that changed is that the harness flushed the
+image first.
+
+Measured on `npftest` 2026-11-08 (libvirt 12.0.0 / qemu 10.2.2, throwaway
+domain) before building it, because two of the stage's existing checks depend on
+the answer: the bitmap is invisible to `qemu-img` for the whole life of the qemu
+that made it, present with `flags=['auto']` once the domain has stopped, and
+present with `flags=['in-use','auto']` once it has been **started again** —
+qemu reloads a persistent bitmap when it reopens the image, and does so whether
+or not libvirt's checkpoint metadata survived the stop. So `start` is *not* the
+`virsh restore` this project measured leaving a bitmap unloaded, and 26c's
+`an ordinary sync does not clear it` survives the power cycle: the live oracle
+still finds qemu holding the name afterwards.
+
+**It cannot be measured on `npftest` itself.** An ACPI power button needs
+something inside the guest to honour it, and that fixture has a 196 KiB disk and
+no channel of any kind — seven requests over 90s left it `running`. 26e stands
+down there rather than destroying the source to force a flush, because a destroy
+would also risk leaving the live chain's own bitmap unflushed or `in-use`, which
+libvirt refuses the next incremental over outright. This one needs a fixture with
+a real OS and a guest agent.
 
 This stage also seeds with `-reinit` rather than a plain full sync, for the same
 reason stage 23 does: a full sync refuses to overwrite a target disk that already

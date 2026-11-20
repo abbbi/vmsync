@@ -1066,6 +1066,208 @@ check "the attach stand-down carries virsh's words into the row" 1 \
 	"$(printf '%s' "$stage28" | grep -c 'SKIP could not attach the raw disk: \$attach_err')"
 
 echo
+echo "=== wait_for_domain_ready: the start half of the lifecycle ==="
+
+# The counterpart of graceful_shutdown, and the one that answers three ways.
+# Exercised entirely against stubs, which is the whole reason it is testable:
+# what it has to get right is an exit status and a sentence, and every input it
+# reads comes through dom_state, virsh_uri or its own arguments.
+#
+# TWO TRAPS THIS SECTION EXISTS TO STAY OUT OF, both paid for once already:
+#
+# 1. dom_state is called inside `$(...)`, so a stub that walks a state sequence
+#    by mutating a shell variable loses the mutation with the subshell and
+#    returns its first state for ever. The probe then looks stuck when it is
+#    the test that is. The cursor lives in a file, read and written with
+#    builtins so the stub forks nothing.
+# 2. SECONDS is a REAL timer, so the sleep stub has to ADVANCE it or the loop
+#    never terminates. An unbounded version of this test wrote 40.6 GB of the
+#    string "30" into a task output file and filled the volume. Hence both the
+#    clock advance and the iteration cap, which aborts loudly.
+#
+# Timing is therefore asserted as a RANGE and the re-issue behaviour as a
+# PROPERTY (periodic, not once per poll): elapsed is three seconds per stubbed
+# sleep plus however long the test itself took, so exact equality on time is
+# flaky by construction.
+eval "$(extract "$COMMON" domain_agent_channel)"
+eval "$(extract "$COMMON" wait_for_domain_ready)"
+
+ready_idx="$WORK/ready.idx"
+ready_iter="$WORK/ready.iter"
+
+sleep() {
+	local n
+	read -r n <"$ready_iter"
+	n=$((n + 1))
+	printf '%s' "$n" >"$ready_iter"
+	if [ "$n" -gt 200 ]; then
+		printf '  FAIL  wait_for_domain_ready did not terminate in 200 iterations\n'
+		FAIL=$((FAIL + 1))
+		return 1
+	fi
+	SECONDS=$((SECONDS + 3))
+}
+dom_state() {
+	local i s last
+	read -r i <"$ready_idx"
+	last=$((${#READY_SEQ[@]} - 1))
+	[ "$i" -le "$last" ] || i="$last"
+	s="${READY_SEQ[$i]}"
+	printf '%s' "$((i + 1))" >"$ready_idx"
+	# X stands for "libvirt could not be asked at all".
+	[ "$s" != X ] || return 1
+	printf '%s' "$s"
+}
+virsh_uri() {
+	local _uri="$1" verb="$2"
+	shift 2
+	case "$verb" in
+	dumpxml)
+		case "$READY_CHANNEL" in
+		unreadable) return 1 ;;
+		yes) printf "<domain><devices><channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel></devices></domain>" ;;
+		*) printf '<domain><devices></devices></domain>' ;;
+		esac
+		;;
+	qemu-agent-command)
+		READY_CALLS="$READY_CALLS ping"
+		[ "$READY_PING" = yes ] || return 1
+		;;
+	*) READY_CALLS="$READY_CALLS $verb" ;;
+	esac
+	return 0
+}
+warn() { READY_WARNED="$READY_WARNED|$*"; }
+
+ready_in_range() {
+	if [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]; then printf 'in range'; else printf '%s' "$1"; fi
+}
+ready_says() {
+	case "$2" in
+	*"$1"*) printf 'yes' ;;
+	*) printf 'no -- %s' "$2" ;;
+	esac
+}
+ready_run() {
+	# shellcheck disable=SC2206 # deliberate word splitting: the state sequence
+	READY_SEQ=($1)
+	READY_CHANNEL="$2" READY_PING="$3"
+	READY_CALLS="" READY_WARNED=""
+	printf '0' >"$ready_idx"
+	printf '0' >"$ready_iter"
+	SECONDS=0
+	READY_RC=0
+	wait_for_domain_ready qemu:///x dom "$4" "the vm" || READY_RC=$?
+	READY_CALLS="${READY_CALLS# }"
+	# shellcheck disable=SC2086 # deliberate: split the verb list into lines so
+	# the starts can be counted. Quoting it would make one line of the lot and
+	# the count would be 0 or 1 whatever happened.
+	READY_STARTS="$(printf '%s\n' $READY_CALLS | grep -c '^start$')"
+}
+
+ready_run "running" yes yes 180
+check "an already-running guest with its agent up: rc 0" 0 "$READY_RC"
+check "an already-running guest: no verb is issued at all" "ping" "$READY_CALLS"
+check "an already-running guest: nothing is waited for" 0 "$STARTUP_WAITED"
+
+ready_run "shutoff running" yes yes 180
+check "shutoff then running: rc 0" 0 "$READY_RC"
+check "shutoff then running: one start, then the ping" "start ping" "$READY_CALLS"
+
+# One start and not two: the re-issue interval is 15s and the polls are 3s
+# apart, so a start refused because the domain was still shutting down is
+# retried on the interval rather than on the next poll. That is
+# graceful_shutdown's own semantics for the mirror-image request, and it is
+# what stops a flapping domain from being relaunched every three seconds.
+ready_run "inshutdown shutoff running" yes yes 180
+check "in shutdown first: still reaches rc 0" 0 "$READY_RC"
+check "in shutdown first: one start on the interval, not one per poll" "start ping" "$READY_CALLS"
+
+# THE CASE THAT COSTS 120 SECONDS TODAY. A domain whose definition has no
+# org.qemu.guest_agent channel can never answer, and libvirt says so instantly
+# -- so the answer is given at once instead of after the whole limit.
+ready_run "running" no yes 180
+check "no agent channel: 2, the unknown, not 1" 2 "$READY_RC"
+check "no agent channel: answered at once, not after the limit" 0 "$STARTUP_WAITED"
+check "no agent channel: the state is still reported" running "$STARTUP_STATE"
+check "no agent channel: the reason names the channel" yes "$(ready_says 'no org.qemu.guest_agent channel' "$STARTUP_WHY")"
+check "no agent channel: it never pinged" "" "$READY_CALLS"
+
+ready_run "running" yes no 30
+check "a channel but a silent agent: 2" 2 "$READY_RC"
+check "a channel but a silent agent: running is reported, not guessed at" running "$STARTUP_STATE"
+check "a channel but a silent agent: it stops at the limit" "in range" "$(ready_in_range "$STARTUP_WAITED" 30 44)"
+
+# resume and dompmwakeup, never start: both states are ACTIVE, and start is
+# refused on them. Reachable for real -- stage 22 suspends the source and only
+# warns when its own resume fails.
+ready_run "paused paused running" yes yes 180
+check "paused: rc 0" 0 "$READY_RC"
+check "paused: resume, never start" "resume ping" "$READY_CALLS"
+ready_run "pmsuspended running" yes yes 180
+check "pmsuspended: dompmwakeup, never start" "dompmwakeup ping" "$READY_CALLS"
+
+# A transient domain ceases to exist when it stops, and a transport failure
+# reads the same way. Neither is "it failed to start", which is a different
+# thing to go and fix.
+ready_run "X" yes yes 30
+check "an unreadable state: 2, never 1" 2 "$READY_RC"
+check "an unreadable state: reported empty rather than guessed" "" "$STARTUP_STATE"
+check "an unreadable state: the reason says so" yes "$(ready_says 'could not be read' "$STARTUP_WHY")"
+
+ready_run "shutoff" yes yes 40
+check "never comes up: 1, a definite no" 1 "$READY_RC"
+check "never comes up: the state is named" shutoff "$STARTUP_STATE"
+check "never comes up: it blames the request, not the guest" yes "$(ready_says 'never brought it up at all' "$STARTUP_WHY")"
+check "never comes up: the start is retried, not spammed" "in range" "$(ready_in_range "$READY_STARTS" 2 5)"
+
+# The opposite attribution, and it has to be the other sentence: libvirt
+# accepted the start and the domain stopped anyway, so the fault is inside it.
+ready_run "shutoff running shutoff" yes no 40
+check "boots then dies: 1, not 2" 1 "$READY_RC"
+check "boots then dies: it says the start was accepted" yes "$(ready_says 'came up and is' "$STARTUP_WHY")"
+
+ready_run "crashed running" yes yes 180
+check "crashed: started rather than given up on" "start ping" "$READY_CALLS"
+
+# LIMIT=0 asks once rather than returning without having asked: the budget
+# check is at the bottom of the loop for exactly this.
+ready_run "running" yes yes 0
+check "limit 0 with a healthy guest: rc 0" 0 "$READY_RC"
+check "limit 0 with a healthy guest: it did ask" "ping" "$READY_CALLS"
+ready_run "running" yes no 0
+check "limit 0 with a silent agent: 2 after one ask" 2 "$READY_RC"
+
+# A non-numeric limit makes every `[ -lt ]` exit 2, which an `if` reads as
+# "spent". That degradation is right and has to be audible.
+ready_run "running" yes no "90s"
+check "a non-numeric limit: answers rather than hangs" 2 "$READY_RC"
+check "a non-numeric limit: said out loud" yes "$(ready_says 'not a whole number' "$READY_WARNED")"
+
+# An unreadable definition must not be reported as "no channel": one is a
+# permanent property of the domain, the other a transport blip that cures
+# itself a poll later.
+#
+# THE RC AND THE STATE ARE THE SAME EITHER WAY, which is what made the first
+# version of this check vacuous -- a mutation turning domain_agent_channel's
+# "could not read the XML" into "there is no channel" survived it. What
+# actually differs is the WAIT and the REASON: the no-channel answer is given
+# at once and names the channel, while this one has to poll to the limit and
+# say nothing inside the guest answered.
+ready_run "running" unreadable yes 30
+check "an unreadable definition: keeps polling, then 2" 2 "$READY_RC"
+check "an unreadable definition: not reported as 'no channel'" running "$STARTUP_STATE"
+check "an unreadable definition: polls rather than answering at once" "in range" "$(ready_in_range "$STARTUP_WAITED" 30 44)"
+check "an unreadable definition: the reason is not the no-channel one" no-channel-not-claimed \
+	"$(case "$STARTUP_WHY" in *'no org.qemu.guest_agent channel'*) printf 'claimed there is no channel' ;; *) printf 'no-channel-not-claimed' ;; esac)"
+
+# Put the harness back. Leaving these defined would hand every later section a
+# stubbed sleep, dom_state, virsh_uri and warn -- the mistake the orphan-sweep
+# section's own ssh_host_cmd stub already caused once in this file.
+unset -f sleep dom_state virsh_uri ready_run ready_says ready_in_range
+warn() { :; }
+
+echo
 if [ "$SKIPPED" -ne 0 ]; then
 	printf '%d passed, %d failed -- the sweep cases were SKIPPED on this machine, so a clean run here does not mean the sweep is safe\n' "$PASS" "$FAIL"
 else
