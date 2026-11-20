@@ -1268,6 +1268,234 @@ unset -f sleep dom_state virsh_uri ready_run ready_says ready_in_range
 warn() { :; }
 
 echo
+echo "=== the guest-agent wait, and the three stages that asked without it ==="
+
+# TWO FIXES TESTED TOGETHER, because the first is what makes the second
+# affordable.
+#
+# (1) wait_for_guest_agent pinged blind. A domain whose definition carries no
+#     org.qemu.guest_agent channel can never answer, so a call against one
+#     spent the whole GUEST_AGENT_TIMEOUT reaching the conclusion a single
+#     dumpxml hands over. With six call sites and a 120s default that is up to
+#     twelve minutes a run. npftest's own fixture is exactly such a domain,
+#     which is why this half is measurable anywhere.
+#
+# (2) Stages 12, 13 and 15 asked the guest with nothing in front of them,
+#     while stages 8, 10 and 16 all waited first. 12 and 15 SKIP on the false
+#     negative; 13 degrades to -reinit and still reports PASS, dropping the
+#     overlay-discard assertion that is the only reason 13b exists. All three
+#     messages blame the operator's guest agent for the harness asking early.
+#
+# Without (1), (2) would have added those twelve minutes to a --stages all run
+# on an agentless source and changed no outcome at all.
+#
+# THE TWO TRAPS the wait_for_domain_ready section above documents apply here
+# unchanged. The sleep stub must ADVANCE SECONDS, because the loop measures
+# real elapsed time and a stub clock that stands still never terminates. And
+# the counters live in FILES, because guest_exec_available captures its virsh
+# call in `$(...)` and a variable counter dies with the subshell.
+#
+# THE STAGE BODIES ARE PINNED TO THEIR SOURCE TEXT rather than transcribed. A
+# transcription tests the transcription: delete the three inserted lines from
+# bench.sh and every behavioural arm below still passes, which is the trap
+# stage 28's disk readers are pinned against further up. The pins are what
+# make deleting a line a FAILURE, and they pin ORDER as well as presence --
+# a wait that runs after the probe it is meant to precede is no wait at all.
+eval "$(extract "$BENCH" wait_for_guest_agent)"
+eval "$(extract "$BENCH" guest_exec_available)"
+eval "$(extract "$COMMON" domain_agent_channel)"
+
+ga_pings="$WORK/ga.pings"
+ga_sleeps="$WORK/ga.sleeps"
+ga_xml="$WORK/ga.xml"
+SOURCE_URI=qemu:///ga
+SOURCE_DOMAIN=ga-dom
+
+ga_bump() {
+	local n
+	read -r n <"$1"
+	printf '%s' "$((n + 1))" >"$1"
+}
+ga_in_range() {
+	if [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]; then printf 'in range'; else printf '%s' "$1"; fi
+}
+sleep() {
+	local n
+	ga_bump "$ga_sleeps"
+	read -r n <"$ga_sleeps"
+	if [ "$n" -gt 200 ]; then
+		printf '  FAIL  wait_for_guest_agent did not terminate in 200 iterations\n'
+		FAIL=$((FAIL + 1))
+		return 1
+	fi
+	# The clock advances, which is the whole reason the real loop terminates.
+	SECONDS=$((SECONDS + 5))
+}
+virsh_uri() {
+	local _uri="$1" verb="$2"
+	shift 2
+	case "$verb" in
+	dumpxml)
+		ga_bump "$ga_xml"
+		case "$GA_CHANNEL" in
+		unreadable) return 1 ;;
+		yes) printf "<domain><devices><channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel></devices></domain>" ;;
+		*) printf '<domain><devices></devices></domain>' ;;
+		esac
+		;;
+	qemu-agent-command)
+		ga_bump "$ga_pings"
+		# A channel-less domain's agent call is refused by libvirt outright,
+		# so the stub refuses it too. Modelling it as answerable would let
+		# the gate look load-bearing for the wrong reason -- the exit status
+		# would differ where in reality it does not, and the PING AND SLEEP
+		# COUNTS are what actually prove the function short-circuited.
+		# "unreadable" is not "absent": a definition that could not be read
+		# may well have a channel, so only a definite no refuses here.
+		[ "$GA_CHANNEL" != no ] || return 1
+		[ "$SECONDS" -ge "$GA_READY_AT" ] || return 1
+		case "$*" in
+		*guest-info*) printf '{"return":{"supported_commands":[{"name":"guest-exec","enabled":true,"success-response":true}]}}' ;;
+		esac
+		;;
+	esac
+	return 0
+}
+warn() { GA_WARNED="$GA_WARNED|$*"; }
+
+ga_run() {
+	GA_CHANNEL="$1" GA_READY_AT="$2"
+	GA_WARNED=""
+	printf '0' >"$ga_pings"
+	printf '0' >"$ga_sleeps"
+	printf '0' >"$ga_xml"
+	SECONDS=0
+	GA_RC=0
+	wait_for_guest_agent "$3" || GA_RC=$?
+	read -r GA_PINGS <"$ga_pings"
+	read -r GA_SLEEPS <"$ga_sleeps"
+	read -r GA_XML <"$ga_xml"
+	GA_WAITED="$SECONDS"
+}
+
+# THE FIX (1) CASE. A channel-less domain is answered without a single ping
+# and without a single sleep -- zero is the assertion, not "fewer".
+ga_run no 0 120
+check "no agent channel: it does not wait" 1 "$GA_RC"
+check "no agent channel: not one ping is sent" 0 "$GA_PINGS"
+check "no agent channel: not one sleep is spent" 0 "$GA_SLEEPS"
+check "no agent channel: one dumpxml answered it" 1 "$GA_XML"
+case "$GA_WARNED" in
+*"no org.qemu.guest_agent channel"*) check "no agent channel: the warning names the channel" yes yes ;;
+*) check "no agent channel: the warning names the channel" yes "no -- $GA_WARNED" ;;
+esac
+
+# AND THE THIRD ANSWER IS NOT FOLDED IN. An unreadable definition is a
+# transport blip, not evidence about the domain, so it must still poll.
+ga_run unreadable 99999 30
+check "an unreadable definition: still polls rather than giving up" 1 "$GA_RC"
+check "an unreadable definition: it did ping" yes "$([ "$GA_PINGS" -gt 0 ] && echo yes || echo no)"
+check "an unreadable definition: it spent its budget" "in range" "$(ga_in_range "$GA_WAITED" 30 44)"
+
+# COSTS NOTHING WHEN THE AGENT IS ALREADY UP. This is the arm that stops the
+# fix from being tested only in its failing direction: a wait that is wrong in
+# the other direction (bad timeout variable, an early return) fails here while
+# the channel-less arm above still passes.
+ga_run yes 0 120
+check "an agent already answering: rc 0" 0 "$GA_RC"
+check "an agent already answering: exactly one ping" 1 "$GA_PINGS"
+check "an agent already answering: nothing slept" 0 "$GA_SLEEPS"
+check "an agent already answering: nothing waited" 0 "$GA_WAITED"
+
+# A GUEST STILL BOOTING is waited for, which is the whole point of the
+# function and the reason stages 12, 13 and 15 now call it.
+ga_run yes 30 120
+check "an agent that comes up at 30s: rc 0" 0 "$GA_RC"
+check "an agent that comes up at 30s: it waited for it" "in range" "$(ga_in_range "$GA_WAITED" 30 44)"
+check "an agent that comes up at 30s: it pinged more than once" yes "$([ "$GA_PINGS" -gt 1 ] && echo yes || echo no)"
+
+# AND A CHANNEL THAT NEVER ANSWERS still times out, loudly. The gate must not
+# have turned a genuine timeout into a silent pass.
+ga_run yes 99999 30
+check "a channel but no answer: rc 1 at the limit" 1 "$GA_RC"
+check "a channel but no answer: it spent the budget" "in range" "$(ga_in_range "$GA_WAITED" 30 44)"
+case "$GA_WARNED" in
+*"did not answer within"*) check "a channel but no answer: said out loud" yes yes ;;
+*) check "a channel but no answer: said out loud" yes "no -- $GA_WARNED" ;;
+esac
+
+# The probe the wait exists to protect still works on a ready guest, so the
+# two are wired together rather than merely both present.
+ga_run yes 0 120
+check "guest_exec_available agrees once the agent answers" 0 "$(guest_exec_available && echo 0 || echo 1)"
+
+# --- the pins ----------------------------------------------------------------
+ga_wait_src="$(extract "$BENCH" wait_for_guest_agent)"
+ga_wedge="$(extract "$BENCH" stage_wedge)"
+ga_checksum="$(extract "$BENCH" stage_checksum)"
+ga_barrier="$(extract "$BENCH" stage_commit_barrier)"
+
+ga_before() {
+	local a b body
+	# COMMENT LINES ARE STRIPPED FIRST. Every one of these functions MENTIONS
+	# guest_exec_available in the comment explaining why the wait precedes it
+	# -- "on timeout, fall through to guest_exec_available anyway" -- and a
+	# prose mention is not a call. Without this, the pin reads the order of
+	# the explanation rather than the order of the code, and it fails on
+	# stage 8, which has had the wait all along.
+	body="$(printf '%s\n' "$3" | grep -v '^[[:space:]]*#')"
+	a="$(printf '%s\n' "$body" | grep -n -F -- "$1" | head -1 | cut -d: -f1)"
+	b="$(printf '%s\n' "$body" | grep -n -F -- "$2" | head -1 | cut -d: -f1)"
+	if [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; then printf 'yes'; else printf 'no'; fi
+}
+
+# shellcheck disable=SC2016 # the needles are source text, not values to expand
+{
+	check "the wait asks for the channel before it pings anything" yes \
+		"$(ga_before 'domain_agent_channel' 'guest-ping' "$ga_wait_src")"
+	# Pinned to the exact comparison: `!= 0` or `-ne 0` here would fold the
+	# unreadable-XML answer into "no channel", which the behavioural arm above
+	# catches -- but the text pin says WHICH of the three answers is allowed to
+	# short-circuit, where the arm only says one of them must not.
+	check "and only a definite no short-circuits it" yes \
+		"$(has '[ "$chan" = 1 ]' "$ga_wait_src")"
+
+	check "stage 12 waits for the agent before it probes guest-exec" yes \
+		"$(ga_before 'wait_for_guest_agent || true' 'if ! guest_exec_available' "$ga_wedge")"
+	# Bare on purpose: stage 12 probes and dirties unconditionally, so a
+	# GUEST_DIRTY guard copied from its siblings would skip the wait on
+	# exactly the path that cannot proceed without it.
+	check "stage 12's wait is unconditional, like its own probe" no \
+		"$(has '[ "$GUEST_DIRTY" = yes ] && { wait_for_guest_agent' "$ga_wedge")"
+
+	# Stages 13 and 15 guard inline instead of returning early on DRY_RUN, so
+	# the prefix is load-bearing: without it a --dry-run blocks for the whole
+	# GUEST_AGENT_TIMEOUT pinging a guest it will never touch. Pinned as one
+	# string so dropping just the prefix fails.
+	check "stage 13 waits, and not during a dry run" yes \
+		"$(has '[ "$DRY_RUN" != yes ] && [ "$GUEST_DIRTY" = yes ] && { wait_for_guest_agent || true; }' "$ga_checksum")"
+	check "stage 13 waits before it probes" yes \
+		"$(ga_before 'wait_for_guest_agent' 'guest_exec_available' "$ga_checksum")"
+	check "stage 15 waits, and not during a dry run" yes \
+		"$(has '[ "$DRY_RUN" != yes ] && [ "$GUEST_DIRTY" = yes ] && { wait_for_guest_agent || true; }' "$ga_barrier")"
+	check "stage 15 waits before it probes" yes \
+		"$(ga_before 'wait_for_guest_agent' 'guest_exec_available' "$ga_barrier")"
+
+	# The siblings the three were copied from, pinned so a future edit cannot
+	# quietly take the wait away from the stages that already had it.
+	for ga_s in stage_verify_long stage_restore stage_interrupted_reinit; do
+		check "$ga_s still waits before it probes" yes \
+			"$(ga_before 'wait_for_guest_agent' 'guest_exec_available' "$(extract "$BENCH" "$ga_s")")"
+	done
+}
+
+# Put the harness back, and the two source globals with it: a later section
+# that read SOURCE_URI would otherwise get this stub's fake URI.
+unset -f sleep virsh_uri wait_for_guest_agent guest_exec_available ga_run ga_bump ga_before ga_in_range
+unset SOURCE_URI SOURCE_DOMAIN
+warn() { :; }
+
+echo
 if [ "$SKIPPED" -ne 0 ]; then
 	printf '%d passed, %d failed -- the sweep cases were SKIPPED on this machine, so a clean run here does not mean the sweep is safe\n' "$PASS" "$FAIL"
 else

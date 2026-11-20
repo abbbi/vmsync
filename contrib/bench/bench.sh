@@ -2178,14 +2178,37 @@ heal_target() {
 # THIS ONE ONLY ASKS. wait_for_domain_ready (lib/common.sh) is the one that
 # ACTS: it takes a URI and a domain, issues whatever verb the current state
 # needs, and answers three ways. The difference is load-bearing rather than
-# stylistic -- two of this function's three callers (stages 10 and 16) have no
-# state check in front of them, so making this a wrapper would hand them the
-# power to start the source as a side effect of wanting guest writes. A stage
-# that powers on the source without saying so is the harness doing a real
-# intervention off the books, which is what PROBE_MAY_STOP_SOURCE gates in the
-# other direction. Hence two functions.
+# stylistic -- four of this function's six callers (stages 10, 13, 15 and 16)
+# have no state check in front of them, so making this a wrapper would hand
+# them the power to start the source as a side effect of wanting guest writes.
+# A stage that powers on the source without saying so is the harness doing a
+# real intervention off the books, which is what PROBE_MAY_STOP_SOURCE gates in
+# the other direction. Hence two functions.
 wait_for_guest_agent() {
 	local timeout="${1:-${GUEST_AGENT_TIMEOUT:-120}}" start=$SECONDS elapsed=0
+
+	# ANSWERED AT ONCE WHEN THE ANSWER CANNOT CHANGE. A domain whose
+	# definition carries no org.qemu.guest_agent channel has nothing for an
+	# agent to speak over, and a channel cannot appear while the domain runs,
+	# so polling one spends the entire budget to learn what a single dumpxml
+	# already knows. With six call sites and a 120s default that is up to
+	# twelve minutes of a run pinging a socket that does not exist -- and the
+	# stage then stands down with exactly the message it would have printed
+	# immediately. wait_for_domain_ready keeps the same guard for the same
+	# reason (lib/common.sh, its chan check).
+	#
+	# ONLY a definite "no" short-circuits. domain_agent_channel answers three
+	# ways and the third is load-bearing: 2 means the XML could not be read,
+	# which is a transport blip that cures itself a poll later and says
+	# nothing about the domain. Folding it in here would turn a dropped
+	# connection into a permanent verdict about the guest.
+	local chan=0
+	domain_agent_channel "$SOURCE_URI" "$SOURCE_DOMAIN" || chan=$?
+	if [ "$chan" = 1 ]; then
+		warn "the guest agent on $SOURCE_DOMAIN cannot answer: its definition has no org.qemu.guest_agent channel, so there is nothing to wait for"
+		return 1
+	fi
+
 	# Real elapsed time, not a count of sleeps: libvirt blocks its own
 	# agent-command call for seconds when nothing answers, so a loop that
 	# added up only its sleeps would overrun the timeout it advertises by
@@ -6315,6 +6338,18 @@ stage_checksum() {
 	# an overlay. Slower and narrower, but a real test rather than a vacuous
 	# pass.
 	CHECKSUM_INCREMENTAL=no
+	# Stage 10's and stage 16's line with `[ "$DRY_RUN" != yes ] &&`
+	# prepended. The prefix is not decoration: those two return early on
+	# DRY_RUN so their copies never reach it, while this stage guards each
+	# action inline and would otherwise make a --dry-run block for the whole
+	# GUEST_AGENT_TIMEOUT pinging a guest it is never going to touch.
+	#
+	# This stage DEGRADES rather than skips, which is why the wait matters
+	# more here than it looks: without it the sub-tests drop to -reinit and
+	# the stage still reports PASS, so the overlay-discard behaviour 13b
+	# exists to prove goes untested with only a note in two detail columns to
+	# say so.
+	[ "$DRY_RUN" != yes ] && [ "$GUEST_DIRTY" = yes ] && { wait_for_guest_agent || true; }
 	if [ "$DRY_RUN" != yes ] && [ "$GUEST_DIRTY" = yes ] && guest_exec_available; then
 		CHECKSUM_INCREMENTAL=yes
 		log "guest-exec is available: sub-tests will dirty the guest and run genuine incrementals"
@@ -7423,6 +7458,23 @@ stage_wedge() {
 		results_row "$CSV" wedge precondition "" "" "" "" "" "" "SKIP source domain not running"
 		return 0
 	fi
+	# Waited for, not merely probed. Any earlier stage in the list may have
+	# restarted the source -- stage 11's invert_cleanup does exactly that --
+	# and an agent still finishing its boot turns this stage's one real
+	# assertion into a SKIP whose message blames the guest's configuration.
+	# Stages 8, 10, 13, 15 and 16 carry the same line.
+	#
+	# BARE, with no GUEST_DIRTY guard, unlike the other five: this stage has
+	# no fallback. guest_exec_available here and guest_dirty below are both
+	# unconditional, because a failing run that writes nothing leaves the
+	# mtime untouched and there is no wedge left to test. The guest is a hard
+	# requirement, so the wait is unconditional too.
+	#
+	# `|| true` deliberately: on timeout fall through to
+	# guest_exec_available, because it is the one that says WHICH of the two
+	# problems this is -- no agent answering at all, or an agent that answers
+	# but blocks guest-exec. Returning early here would swallow that.
+	wait_for_guest_agent || true
 	if ! guest_exec_available; then
 		warn "SKIP stage wedge: $GUEST_EXEC_WHY -- without guest writes the failing run copies nothing, leaves the mtime untouched, and this stage would report a green result having tested nothing"
 		results_row "$CSV" wedge precondition "" "" "" "" "" "" "SKIP guest-exec unavailable"
@@ -8181,6 +8233,12 @@ stage_commit_barrier() {
 	# fires, and the stage passes having tested nothing -- the same vacuous
 	# pass stage 13 documents.
 	local dirtied=no
+	# Stage 13's line, DRY_RUN prefix and all, and for the same reason: this
+	# stage guards inline rather than returning early. Here the cost of not
+	# waiting is the SKIP below -- "could not dirty the guest" -- which reads
+	# as the operator's guest being broken when it is the harness having
+	# asked while the agent was still coming up.
+	[ "$DRY_RUN" != yes ] && [ "$GUEST_DIRTY" = yes ] && { wait_for_guest_agent || true; }
 	if [ "$DRY_RUN" != yes ] && [ "$GUEST_DIRTY" = yes ] && guest_exec_available; then
 		if guest_dirty; then
 			dirtied=yes

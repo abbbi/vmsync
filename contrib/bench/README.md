@@ -812,6 +812,24 @@ run `dd`. The harness probes `guest-info` for this and **skips the stage**
 with a message naming the file, rather than spending an hour proving that
 vmsync can copy nothing twenty times.
 
+**It waits before it probes, and that is not a nicety.** `virsh domstate`
+reads `running` the instant qemu is up — tens of seconds before anything
+inside the guest exists — so a stage that asks the guest straight after an
+earlier stage restarted the source is interrogating a bootloader. Six stages
+ask (8, 10, 12, 13, 15 and 16) and all six now wait first, bounded by
+`GUEST_AGENT_TIMEOUT`. Without the wait, stages 12 and 15 skipped themselves
+and stage 13 quietly dropped to full copies — losing the one assertion that
+needs a real incremental while still reporting `PASS` — and all three blamed
+the guest's own agent for the harness having asked too early.
+
+The wait costs nothing when it is not needed: an agent that is already
+answering replies to the first ping, and a domain whose definition carries no
+`org.qemu.guest_agent` channel is answered by **one `dumpxml`** instead of by
+polling a socket that cannot exist. That last part matters more than it
+sounds — it is the difference between a bounded check and six stages each
+burning the full timeout on a fixture that was never going to answer, which
+is exactly what `npftest`'s own OS-less fixture is.
+
 Two details that would otherwise make the chain meaningless: the write uses
 `conv=fsync`, because the dirty bitmap tracks writes that reach the virtual
 block device and a `dd` whose data is still in the guest's page cache leaves

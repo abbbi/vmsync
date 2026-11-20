@@ -294,6 +294,28 @@ SOURCE_SHUTDOWN_WAIT_SECONDS=120
 # and nothing is retried for free here.
 SOURCE_READY_WAIT_SECONDS=180
 
+# How long a stage waits for the guest's own agent to start answering before
+# it gives up and asks anyway. Undocumented until now, which was its own bug:
+# six stages depend on it and the timeout message quoted the number without
+# ever naming the setting, so the obvious response -- raising it -- meant
+# guessing what to raise.
+#
+# This is the IN-GUEST half of SOURCE_READY_WAIT_SECONDS above, and the reason
+# both exist is that libvirt cannot tell you about the first. `virsh domstate`
+# says "running" the instant qemu is up, tens of seconds before the guest's
+# agent exists, so any stage that restarts the source and then asks the guest
+# to do something is asking a bootloader. Six stages ask (8, 10, 12, 13, 15
+# and 16) and they all wait first; without the wait, 12 and 15 skip themselves
+# and 13 silently drops to full copies, each reporting it as the guest agent
+# being broken.
+#
+# Raising it is rarely the answer, and it costs nothing when it is not needed:
+# an agent that is already up answers the first ping, and a domain whose
+# definition has no org.qemu.guest_agent channel at all is answered by a
+# single dumpxml rather than by polling a socket that does not exist. What
+# this bounds is only the genuinely-still-booting case.
+#GUEST_AGENT_TIMEOUT=120
+
 # How long to wait for each in-guest write to finish. guest-exec is
 # asynchronous -- it returns a pid immediately -- so the harness polls
 # guest-exec-status rather than letting the next checkpoint be taken while dd
