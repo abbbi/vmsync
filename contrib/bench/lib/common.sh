@@ -175,12 +175,16 @@ graceful_shutdown() {
 
 	# Validated here rather than trusted, exactly as wait_for_domain_ready
 	# validates its own: every comparison below is an INTEGER test, and bash
-	# answers a non-numeric one with exit status 2 AND a line of its own on
-	# stderr. Untreated, a mistyped SOURCE_SHUTDOWN_WAIT_SECONDS stood stages
-	# 11 and 26 down with "did not shut down within 120s" after polling
-	# nothing at all, and dumped `[: 120s : integer expression expected` into
-	# the run with nothing to connect it to the setting that caused it. The
-	# degradation to a single read is right; being silent about it is not.
+	# answers a non-numeric one with exit status 2 plus a line of its own on
+	# stderr -- which an `if` reads as "the budget is spent", so the domain
+	# gets asked to stop and then reported as having refused by a function
+	# that never read its state.
+	#
+	# TWO LAYERS, on purpose. bench.sh refuses a bad budget from bench.conf at
+	# startup, where it can name the setting and the file; this one catches
+	# every other caller, because this library is sourced by things that are
+	# not bench.sh and cannot know where its argument came from. Degrading to
+	# a single read is right; doing it silently is not.
 	case "$limit" in
 	'' | *[!0-9]*)
 		warn "graceful_shutdown was given a budget of '$limit' seconds for $what, which is not a whole number -- asking once and not waiting. Fix the setting that produced it (SOURCE_SHUTDOWN_WAIT_SECONDS or TARGET_SHUTDOWN_WAIT_SECONDS in bench.conf)."

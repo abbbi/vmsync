@@ -1463,6 +1463,55 @@ gs_src="$(extract "$COMMON" graceful_shutdown)"
 	while :; do' "$gs_src")"
 }
 
+# AND THE SAME TYPO IS REFUSED AT STARTUP, which is the layer that can name the
+# line of bench.conf to go and fix. The function-level validation above cannot:
+# lib/common.sh is sourced by things that are not bench.sh and does not know
+# where its argument came from, so the most it can do is warn and degrade.
+#
+# Pinned against the FILE rather than a function, because this is top-level
+# configuration code with nothing to extract. Each knob must be defaulted and
+# then checked with the `2>/dev/null` form -- without that redirect the die
+# message arrives with bash's own integer-expression complaint stapled to it,
+# which is the noise the whole finding was about.
+for gs_knob in TARGET_SHUTDOWN_WAIT_SECONDS SOURCE_SHUTDOWN_WAIT_SECONDS SOURCE_READY_WAIT_SECONDS; do
+	# Split in two so a failure says WHICH half broke. As one exact-line pin
+	# these caught every mutation and reported the same thing for all of them,
+	# which is a pin doing its job badly: the shape of the test and the
+	# consequence of failing it are different mistakes to make.
+	check "$gs_knob is checked at startup, zero allowed, bash kept quiet" yes \
+		"$(grep -qF "[ \"\$$gs_knob\" -ge 0 ] 2>/dev/null" "$BENCH" && echo yes || echo no)"
+	check "$gs_knob's refusal ends the run and names the config file" yes \
+		"$(grep -qF "|| die \"\$CONF: $gs_knob must be a non-negative integer" "$BENCH" && echo yes || echo no)"
+	# The drift guard, counted rather than forbidden: EXACTLY ONE
+	# `${KNOB:-...}` is correct and it is the startup line that sets the
+	# default. A second one at a call site is dead text that still reads as
+	# authoritative, and the two copies can disagree with nothing to say which
+	# wins; none at all means the default was dropped and `set -u` ends the run
+	# on an unset variable instead. So the count is the assertion.
+	check "$gs_knob takes its default in exactly one place" 1 \
+		"$(grep -cF "\${$gs_knob:-" "$BENCH")"
+done
+# The idiom predates this change; pinned so the three above cannot be the only
+# ones checked if a later edit drops it.
+check "GUEST_AGENT_TIMEOUT is still refused at startup too" yes \
+	"$(grep -qF '[ "$GUEST_AGENT_TIMEOUT" -ge 0 ] 2>/dev/null || die' "$BENCH" && echo yes || echo no)"
+
+# The guard EXERCISED, not just pinned: a pin says the line is there, this says
+# the line does what it is there for. Negative values matter as much as
+# unparseable ones -- a budget of -5 is not a whole number of seconds either.
+gs_guard() {
+	local rc=0
+	[ "$1" -ge 0 ] 2>/dev/null || rc=1
+	printf '%s' "$rc"
+}
+for gs_ok in 0 1 120 180 999; do
+	check "a budget of '$gs_ok' passes the startup guard" 0 "$(gs_guard "$gs_ok")"
+done
+for gs_no in '120s' '' '-5' '1.5' 'abc' ' ' '0x10'; do
+	check "a budget of '$gs_no' is rejected by the startup guard" 1 "$(gs_guard "$gs_no")"
+done
+unset -f gs_guard
+
 unset -f sleep dom_state virsh_uri graceful_shutdown gs_run gs_in_range gs_said
 warn() { :; }
 

@@ -864,6 +864,24 @@ GUEST_DIRTY_MIB="${GUEST_DIRTY_MIB:-64}"
 GUEST_AGENT_TIMEOUT="${GUEST_AGENT_TIMEOUT:-120}"
 [ "$GUEST_AGENT_TIMEOUT" -ge 0 ] 2>/dev/null || die "$CONF: GUEST_AGENT_TIMEOUT must be a non-negative integer"
 
+# --- domain lifecycle waits --------------------------------------------------
+
+# The budgets that bound a domain stopping, or coming back. Checked here so a
+# typo ends the run at startup naming the line of bench.conf to fix, instead of
+# reaching an integer comparison mid-stage where the most it can do is warn.
+# graceful_shutdown and wait_for_domain_ready still validate their own
+# arguments, because lib/common.sh is sourced by things that are not bench.sh;
+# this is the layer that knows the setting's NAME.
+#
+# Defaulted here and only here. The call sites pass these through unchanged, so
+# the default has one home and no second copy to drift from it.
+TARGET_SHUTDOWN_WAIT_SECONDS="${TARGET_SHUTDOWN_WAIT_SECONDS:-120}"
+[ "$TARGET_SHUTDOWN_WAIT_SECONDS" -ge 0 ] 2>/dev/null || die "$CONF: TARGET_SHUTDOWN_WAIT_SECONDS must be a non-negative integer of seconds"
+SOURCE_SHUTDOWN_WAIT_SECONDS="${SOURCE_SHUTDOWN_WAIT_SECONDS:-120}"
+[ "$SOURCE_SHUTDOWN_WAIT_SECONDS" -ge 0 ] 2>/dev/null || die "$CONF: SOURCE_SHUTDOWN_WAIT_SECONDS must be a non-negative integer of seconds"
+SOURCE_READY_WAIT_SECONDS="${SOURCE_READY_WAIT_SECONDS:-180}"
+[ "$SOURCE_READY_WAIT_SECONDS" -ge 0 ] 2>/dev/null || die "$CONF: SOURCE_READY_WAIT_SECONDS must be a non-negative integer of seconds"
+
 # --- Stage 8 (verify-long) ---------------------------------------------------
 
 # Copies per MODE, not per stage: each mode gets its own chain, because the
@@ -4777,7 +4795,7 @@ stage_fence_agent() {
 			# handle -- see graceful_shutdown, which re-sends.
 			log "   shutting the promoted target down again (this stage started it by promoting it)"
 			if ! graceful_shutdown "$TARGET_URI" "$TARGET_DOMAIN" \
-				"${TARGET_SHUTDOWN_WAIT_SECONDS:-120}" "the promoted target"; then
+				"$TARGET_SHUTDOWN_WAIT_SECONDS" "the promoted target"; then
 				warn "the promoted target did not shut down gracefully within ${SHUTDOWN_WAITED}s despite ${SHUTDOWN_ATTEMPTS} shutdown request(s) -- destroying it. It is a disposable replica and the next stage reinitialises it anyway, but leaving it running would make every later stage refuse to sync. Raise TARGET_SHUTDOWN_WAIT_SECONDS if this guest is legitimately slow to stop."
 				virsh_uri "$TARGET_URI" destroy "$TARGET_DOMAIN" >/dev/null 2>&1 || true
 			fi
@@ -7739,7 +7757,7 @@ stage_invert() {
 		INVERT_STOPPED_SOURCE=yes
 		local now_state="$src_state"
 		if graceful_shutdown "$SOURCE_URI" "$SOURCE_DOMAIN" \
-			"${SOURCE_SHUTDOWN_WAIT_SECONDS:-120}" "the source"; then
+			"$SOURCE_SHUTDOWN_WAIT_SECONDS" "the source"; then
 			now_state=shutoff
 		fi
 		local waited="$SHUTDOWN_WAITED"
@@ -11895,7 +11913,7 @@ stage_generation() {
 		GENERATION_STOPPED_SOURCE=no
 		local rc=0
 		wait_for_domain_ready "$SOURCE_URI" "$SOURCE_DOMAIN" \
-			"${SOURCE_READY_WAIT_SECONDS:-180}" "source $SOURCE_DOMAIN" || rc=$?
+			"$SOURCE_READY_WAIT_SECONDS" "source $SOURCE_DOMAIN" || rc=$?
 		case "$rc" in
 		0) ;;
 		2) warn "stage 26: $STARTUP_WHY" ;;
@@ -11909,7 +11927,7 @@ stage_generation() {
 	trap 'generation_restore_source || true' EXIT
 
 	if ! graceful_shutdown "$SOURCE_URI" "$SOURCE_DOMAIN" \
-		"${SOURCE_SHUTDOWN_WAIT_SECONDS:-120}" "source $SOURCE_DOMAIN"; then
+		"$SOURCE_SHUTDOWN_WAIT_SECONDS" "source $SOURCE_DOMAIN"; then
 		generation_flush_stood_down "$SOURCE_DOMAIN did not reach shut off within ${SHUTDOWN_WAITED}s despite ${SHUTDOWN_ATTEMPTS} shutdown request(s), so nothing flushed the bitmap -- and this stage will not destroy the source to force it. A guest with nothing listening for an ACPI power button cannot be stopped this way at all. Raise SOURCE_SHUTDOWN_WAIT_SECONDS if this guest is legitimately slow to stop"
 		generation_restore_source || true
 		trap - EXIT
