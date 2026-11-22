@@ -168,7 +168,14 @@ dom_state() {
 # guest that has just finished booting is exactly what was wanted.
 graceful_shutdown() {
 	local uri="$1" domain="$2" limit="$3" what="$4"
-	local waited=0 since_send=0 sent=1 state=""
+	# REAL elapsed time, never a sum of sleeps. Every poll costs a virsh round
+	# trip on top of its sleep -- 1.16x to 1.25x the budget over a qemu+ssh URI,
+	# and near enough nothing over a local one -- so a loop adding up only its
+	# own sleeps runs past the limit it advertises and then reports the LIMIT as
+	# what it waited. Every caller quotes that number while telling the operator
+	# to raise the setting, and stage 26 writes it into the CSV, so it has to be
+	# the measured figure rather than the requested one.
+	local begun="$SECONDS" waited=0 last_send=0 sent=1 state=""
 	# Re-send this often. Short enough that a guest finishing its boot is
 	# asked again promptly, long enough not to fill the log.
 	local resend_every=15
@@ -204,17 +211,17 @@ graceful_shutdown() {
 		fi
 		# The budget is checked HERE, at the bottom, so LIMIT=0 means "ask it
 		# to stop, then read its state once" rather than "return failure
-		# without having looked". The request above has always been sent
-		# unconditionally, so the old top-of-loop test gave the worst of both:
-		# the domain was asked to shut down and then reported as having
-		# refused, by a function that never read its state. Same trade
-		# wait_for_domain_ready documents -- the cost is at most one extra
-		# poll, and it is the cheap direction to be wrong in.
+		# without having looked": the request above goes out unconditionally,
+		# so a top-of-loop test reports a domain as having refused without ever
+		# asking whether it had. Same trade wait_for_domain_ready makes, and the
+		# cost is the same -- at most one extra poll.
 		[ "$waited" -lt "$limit" ] || break
 		sleep 3
-		waited=$((waited + 3))
-		since_send=$((since_send + 3))
-		if [ "$since_send" -ge "$resend_every" ]; then
+		waited=$((SECONDS - begun))
+		# Off the same clock, so the cadence is 15s of wall time rather than
+		# 15s of sleeps -- otherwise the re-send drifts exactly as the budget
+		# did, and by more the slower the transport.
+		if [ $((waited - last_send)) -ge "$resend_every" ]; then
 			# Said once, the first time, because it is the explanation an
 			# operator reading this log actually needs: a guest ignoring the
 			# first request is almost always one that was still booting when
@@ -222,7 +229,7 @@ graceful_shutdown() {
 			[ "$sent" = 1 ] && log "   $what has not reacted to the shutdown request; re-sending every ${resend_every}s (a guest still booting cannot honour an ACPI shutdown, and the first request is not retried by libvirt)"
 			virsh_uri "$uri" shutdown "$domain" >/dev/null 2>&1 || true
 			sent=$((sent + 1))
-			since_send=0
+			last_send="$waited"
 		fi
 	done
 
@@ -296,8 +303,9 @@ domain_agent_channel() {
 # REAL ELAPSED TIME, never a sum of sleeps, because libvirt blocks its own
 # agent-command call for seconds when nothing answers: a loop adding up only
 # its own sleeps overruns the limit it advertises by whatever virsh spent --
-# exactly in the case the limit exists to bound. graceful_shutdown above still
-# counts sleeps and does overrun; this is not the place to copy it.
+# exactly in the case the limit exists to bound. graceful_shutdown above reads
+# the same clock, for the same reason but a milder cause: its own calls return
+# promptly and the drift is per-poll round-trip latency instead.
 #
 # The limit is an ARGUMENT and is never defaulted from a bench.conf setting in
 # here: this library is sourced by things that are not bench.sh, and reaching

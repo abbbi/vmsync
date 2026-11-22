@@ -1094,38 +1094,65 @@ eval "$(extract "$COMMON" wait_for_domain_ready)"
 
 ready_idx="$WORK/ready.idx"
 ready_iter="$WORK/ready.iter"
+ready_cap="$WORK/ready.cap"
 
 sleep() {
 	local n
 	read -r n <"$ready_iter"
 	n=$((n + 1))
 	printf '%s' "$n" >"$ready_iter"
-	if [ "$n" -gt 200 ]; then
-		printf '  FAIL  wait_for_domain_ready did not terminate in 200 iterations\n'
-		FAIL=$((FAIL + 1))
-		return 1
-	fi
 	SECONDS=$((SECONDS + 3))
 }
 dom_state() {
-	local i s last
-	read -r i <"$ready_idx"
+	local n s last
+	# THE POLL COUNT AND THE CURSOR ARE DIFFERENT NUMBERS, and conflating them
+	# is what stopped the brake below from ever firing: the clamp that repeats
+	# the sequence's last state also pinned the stored value, so against a
+	# one-state sequence the counter sat at 1 for ever. The count advances
+	# unconditionally; only the array index is clamped.
+	read -r n <"$ready_idx"
+	printf '%s' "$((n + 1))" >"$ready_idx"
+	# THE BRAKE, and it cannot live in the sleep stub: the code calls `sleep 3`
+	# bare and never reads its status, so a `return 1` there stops nothing and
+	# a mutation that leaves `elapsed` unadvanced loops for ever. It has to
+	# force a path the loop actually leaves, so past the cap the domain reports
+	# running and the ping answers -- together this function's one
+	# unconditional success. The flag file carries the failure out, because
+	# dom_state runs inside `$(...)`.
+	if [ "$n" -gt 200 ]; then
+		printf 'capped' >"$ready_cap"
+		printf 'running'
+		return 0
+	fi
 	last=$((${#READY_SEQ[@]} - 1))
-	[ "$i" -le "$last" ] || i="$last"
-	s="${READY_SEQ[$i]}"
-	printf '%s' "$((i + 1))" >"$ready_idx"
+	if [ "$n" -le "$last" ]; then s="${READY_SEQ[$n]}"; else s="${READY_SEQ[$last]}"; fi
 	# X stands for "libvirt could not be asked at all".
 	[ "$s" != X ] || return 1
 	printf '%s' "$s"
 }
+READY_CHAN_XML="<domain><devices><channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel></devices></domain>"
 virsh_uri() {
 	local _uri="$1" verb="$2"
 	shift 2
+	# PAST THE BRAKE EVERY STUB TELLS THE SAME STORY: a running domain with a
+	# readable definition carrying a channel, and an agent that answers. Only
+	# that combination makes wait_for_domain_ready return, so a brake that
+	# forces just one of the three does not stop the loop -- which is how the
+	# `unreadable` scenario kept spinning with the domain reporting running but
+	# its definition still unreadable, leaving chan=2 and no exit.
+	if [ -s "$ready_cap" ]; then
+		case "$verb" in
+		dumpxml) printf '%s' "$READY_CHAN_XML" ;;
+		qemu-agent-command) READY_CALLS="$READY_CALLS ping" ;;
+		*) READY_CALLS="$READY_CALLS $verb" ;;
+		esac
+		return 0
+	fi
 	case "$verb" in
 	dumpxml)
 		case "$READY_CHANNEL" in
 		unreadable) return 1 ;;
-		yes) printf "<domain><devices><channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel></devices></domain>" ;;
+		yes) printf '%s' "$READY_CHAN_XML" ;;
 		*) printf '<domain><devices></devices></domain>' ;;
 		esac
 		;;
@@ -1155,6 +1182,7 @@ ready_run() {
 	READY_CALLS="" READY_WARNED=""
 	printf '0' >"$ready_idx"
 	printf '0' >"$ready_iter"
+	: >"$ready_cap"
 	SECONDS=0
 	READY_RC=0
 	wait_for_domain_ready qemu:///x dom "$4" "the vm" || READY_RC=$?
@@ -1163,6 +1191,8 @@ ready_run() {
 	# the starts can be counted. Quoting it would make one line of the lot and
 	# the count would be 0 or 1 whatever happened.
 	READY_STARTS="$(printf '%s\n' $READY_CALLS | grep -c '^start$')"
+	# Reported out here, because dom_state set the flag inside a subshell.
+	[ -s "$ready_cap" ] && check "wait_for_domain_ready terminated without hitting the 200-poll brake" yes no
 }
 
 ready_run "running" yes yes 180
@@ -1295,41 +1325,67 @@ echo "=== graceful_shutdown: the budget it is given, and the one poll it owes ==
 # to write to stderr, which is what makes an empty stderr mean "bash said
 # nothing" instead of "nothing was said at all".
 #
-# DELIBERATELY NOT COVERED, because it is not fixed: `waited` is still a sum of
-# sleeps rather than real elapsed time, so the function overruns the budget it
-# advertises. That is a separate finding with its own measurement. Two
-# consequences for whoever takes it. First, every timing assertion below is an
-# EXACT equality and can afford to be, precisely because the clock is synthetic
-# -- when the real clock goes in they become ranges, and a test that still
-# demands exact equality afterwards is testing the harness. Second, the stub
-# advances SECONDS and SEEDS IT AWAY FROM ZERO on purpose: a `begun="$SECONDS"`
-# mutated to `begun=0` is invisible to a harness that starts the clock at zero,
-# and that mutation makes the function poll once and fail every call.
+# THE CLOCK, which is the other half of this function's budget problem.
+# `waited` is real elapsed time, not a sum of its own sleeps: every poll costs a
+# virsh round trip on top of its sleep, so a sleep-summing loop runs past the
+# budget it advertises and then reports the budget as what it waited. Measured
+# against a real libvirt at 1.16x to 1.25x over a qemu+ssh URI and 1.00x to
+# 1.03x over a local one -- so the caller that quotes the number while saying
+# "raise the setting" was quoting the one figure it could not have measured.
+#
+# Three things follow for this harness, each load-bearing:
+#
+# The stub clock steps by GS_STEP, deliberately NOT the 3 the code sleeps. Were
+# they equal, `SECONDS - begun` and `waited + 3` would compute the same number
+# and the defect would be invisible to every assertion below.
+#
+# The POLL COUNT is what discriminates a real clock from a sleep-counting one.
+# SHUTDOWN_WAITED does not: both stop at the limit, so both report roughly the
+# limit. What differs is how many polls it took to get there.
+#
+# Timing is asserted as RANGES, because SECONDS is the real clock and whatever
+# the test itself spends lands in `waited` beside the stub's steps.
+#
+# SECONDS is seeded AWAY FROM ZERO: `begun="$SECONDS"` mutated to `begun=0` is
+# invisible to a harness that starts the clock at zero, and in production that
+# mutation makes the function poll once and fail every call.
 eval "$(extract "$COMMON" graceful_shutdown)"
 
 gs_idx="$WORK/gs.idx"
 gs_iter="$WORK/gs.iter"
 gs_polls="$WORK/gs.polls"
 gs_err="$WORK/gs.err"
+gs_cap="$WORK/gs.cap"
+# Seconds of stub clock per sleep. Must differ from the 3 the code sleeps --
+# see the note above -- and larger is better here, because it swamps whatever
+# real time the test itself spends and keeps the poll counts far apart.
+GS_STEP=10
 
 sleep() {
 	local n
 	read -r n <"$gs_iter"
 	n=$((n + 1))
 	printf '%s' "$n" >"$gs_iter"
-	if [ "$n" -gt 200 ]; then
-		printf '  FAIL  graceful_shutdown did not terminate in 200 iterations\n'
-		FAIL=$((FAIL + 1))
-		return 1
-	fi
-	SECONDS=$((SECONDS + 3))
+	SECONDS=$((SECONDS + GS_STEP))
 }
 # Cursor and poll count both in files: dom_state is called inside `$(...)`, so
 # anything it assigns to a variable dies with the subshell.
 dom_state() {
 	local i s last n
 	read -r n <"$gs_polls"
-	printf '%s' "$((n + 1))" >"$gs_polls"
+	n=$((n + 1))
+	printf '%s' "$n" >"$gs_polls"
+	# THE CAP THAT ACTUALLY CAPS, and it has to live here. A `return 1` from
+	# the sleep stub stops nothing, because the code calls `sleep 3` bare and
+	# never reads its status -- so a mutation that leaves `waited` unadvanced
+	# loops for ever, which is how this was found. Reporting shutoff is the one
+	# exit every path through the loop shares, so the brake goes on that, and
+	# the flag file carries the failure out of this subshell.
+	if [ "$n" -gt 200 ]; then
+		printf 'capped' >"$gs_cap"
+		printf 'shutoff'
+		return 0
+	fi
 	read -r i <"$gs_idx"
 	last=$((${#GS_SEQ[@]} - 1))
 	[ "$i" -le "$last" ] || i="$last"
@@ -1364,6 +1420,7 @@ gs_run() {
 	printf '0' >"$gs_iter"
 	printf '0' >"$gs_polls"
 	: >"$gs_err"
+	: >"$gs_cap"
 	SECONDS=1000
 	GS_RC=0
 	# stderr to a file, and the call is NOT in a subshell, so the stubbed
@@ -1375,6 +1432,9 @@ gs_run() {
 	# shellcheck disable=SC2086 # deliberate: split the verb list into lines
 	GS_SHUTDOWNS="$(printf '%s\n' $GS_VERBS | grep -c '^shutdown$')"
 	GS_STDERR="$(cat "$gs_err")"
+	# Reported here rather than inside the stub, because dom_state runs in a
+	# subshell and cannot touch the counters.
+	[ -s "$gs_cap" ] && check "graceful_shutdown terminated without hitting the 200-poll brake" yes no
 }
 
 # THE DEFECT, stated as the thing the function owes its caller: it has already
@@ -1423,19 +1483,50 @@ check "a valid budget: nothing is warned" "" "$GS_WARNED"
 gs_run "running running shutoff" 30
 check "a guest that stops on the third poll: rc 0" 0 "$GS_RC"
 check "a guest that stops on the third poll: three polls, two sleeps" "3/2" "$GS_POLLS/$GS_SLEEPS"
-check "a guest that stops on the third poll: one request only" 1 "$GS_SHUTDOWNS"
-check "a guest that stops on the third poll: 6s on the synthetic clock" 6 "$SHUTDOWN_WAITED"
+# Three polls is two stub steps, which is PAST the 15s cadence, so a second
+# request here is correct -- the cadence is wall time, not poll count. The
+# no-spam property is the case below, where the guest stops inside the window.
+check "a guest that stops on the third poll: re-asked once the cadence passed" 2 "$GS_SHUTDOWNS"
+check "a guest that stops on the third poll: reports the two steps it slept" "in range" \
+	"$(gs_in_range "$SHUTDOWN_WAITED" "$((GS_STEP * 2))" "$((GS_STEP * 2 + 9))")"
+
+# THE NO-SPAM PROPERTY, which is the whole reason there is a cadence rather
+# than a request per poll: a guest that stops inside the first window is asked
+# exactly once.
+gs_run "running shutoff" 30
+check "a guest that stops inside the cadence window: rc 0" 0 "$GS_RC"
+check "a guest that stops inside the cadence window: asked exactly once" 1 "$GS_SHUTDOWNS"
+check "a guest that stops inside the cadence window: two polls, one sleep" "2/1" "$GS_POLLS/$GS_SLEEPS"
 
 gs_run "running" 30
 check "a guest that never stops: rc 1" 1 "$GS_RC"
-check "a guest that never stops: it spends the whole budget" 30 "$SHUTDOWN_WAITED"
+check "a guest that never stops: it spends the whole budget" "in range" "$(gs_in_range "$SHUTDOWN_WAITED" 30 39)"
+# THE ASSERTION THAT CATCHES A SLEEP-COUNTING CLOCK, and the only one that
+# can. The stub steps the clock by GS_STEP while the code sleeps 3, so a loop
+# reading the real clock needs about limit/GS_STEP polls to spend its budget
+# and one summing its own sleeps needs limit/3 -- four against eleven here.
+# Both still stop at the limit and both still report roughly 30, which is why
+# SHUTDOWN_WAITED above cannot tell them apart.
+check "a guest that never stops: polls on the clock, not on its own sleeps" "in range" \
+	"$(gs_in_range "$GS_POLLS" 3 5)"
 
 # The re-send is the reason this function exists rather than being one virsh
 # call: libvirt does not retry a request a booting guest dropped. At 3s per
 # poll and a 15s cadence, a 45s budget sends the first plus three more.
-gs_run "running" 45
-check "a guest that never stops: the request is re-sent on a cadence" 4 "$GS_SHUTDOWNS"
-check "a guest that never stops: and the cadence is not every poll" "in range" "$(gs_in_range "$GS_SHUTDOWNS" 2 5)"
+# A long budget, so the RATE is what is asserted rather than a count that two
+# different cadence bugs can both land inside. At 15s cadence over ~95s of
+# stub clock a correct loop asks about six times; one that never resets its
+# cadence asks on every poll past the first window (ten), and one that resends
+# only once asks twice. The range excludes both.
+gs_run "running" 95
+check "a guest that never stops: the request is re-sent on a cadence" "in range" \
+	"$(gs_in_range "$GS_SHUTDOWNS" 4 8)"
+# The cadence is measured off the same clock as the budget. Were it still
+# counting sleeps it would drift exactly as the budget did, and by more the
+# slower the transport -- so a stub stepping 10 against a 15s cadence sends on
+# every second poll, where a sleep-counting one sends on every fifth.
+check "a guest that never stops: and not on every poll" yes \
+	"$([ "$GS_SHUTDOWNS" -lt "$GS_POLLS" ] && echo yes || echo no)"
 
 # An unreadable state is not "shutoff". Reporting a domain stopped on the
 # strength of a query that failed is the one error direction that matters here.
@@ -1443,7 +1534,7 @@ check "a guest that never stops: and the cadence is not every poll" "in range" "
 # separate finding and is deliberately not asserted either way.)
 gs_run "X" 12
 check "an unreadable state: not mistaken for stopped" 1 "$GS_RC"
-check "an unreadable state: it kept asking" "in range" "$(gs_in_range "$GS_POLLS" 4 6)"
+check "an unreadable state: it kept asking" "in range" "$(gs_in_range "$GS_POLLS" 2 4)"
 
 # --- the pins ----------------------------------------------------------------
 gs_src="$(extract "$COMMON" graceful_shutdown)"
@@ -1461,6 +1552,21 @@ gs_src="$(extract "$COMMON" graceful_shutdown)"
 		"$(has 'shutdown "$domain" >/dev/null 2>&1 || true
 
 	while :; do' "$gs_src")"
+
+	# The clock, pinned as well as exercised. The behavioural check above
+	# catches a sleep-counting loop by its poll count; these say which line is
+	# supposed to be there, so a failure points at the edit rather than at a
+	# number.
+	check "the budget counts from a captured SECONDS" yes \
+		"$(has 'local begun="$SECONDS"' "$gs_src")"
+	check "and is read off the clock, never accumulated" yes \
+		"$(has 'waited=$((SECONDS - begun))' "$gs_src")"
+	check "nothing adds up its own sleeps" no "$(has 'waited + 3' "$gs_src")"
+	# The cadence has to move with the budget. Left summing sleeps it would
+	# drift exactly as the budget did, which is the same bug in a second place.
+	check "the re-send cadence is measured off that clock too" yes \
+		"$(has '[ $((waited - last_send)) -ge "$resend_every" ]' "$gs_src")"
+	check "and nothing tracks it by accumulation" no "$(has 'since_send' "$gs_src")"
 }
 
 # AND THE SAME TYPO IS REFUSED AT STARTUP, which is the layer that can name the
@@ -1556,6 +1662,7 @@ eval "$(extract "$COMMON" domain_agent_channel)"
 ga_pings="$WORK/ga.pings"
 ga_sleeps="$WORK/ga.sleeps"
 ga_xml="$WORK/ga.xml"
+ga_cap="$WORK/ga.cap"
 SOURCE_URI=qemu:///ga
 SOURCE_DOMAIN=ga-dom
 
@@ -1568,19 +1675,13 @@ ga_in_range() {
 	if [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]; then printf 'in range'; else printf '%s' "$1"; fi
 }
 sleep() {
-	local n
 	ga_bump "$ga_sleeps"
-	read -r n <"$ga_sleeps"
-	if [ "$n" -gt 200 ]; then
-		printf '  FAIL  wait_for_guest_agent did not terminate in 200 iterations\n'
-		FAIL=$((FAIL + 1))
-		return 1
-	fi
 	# The clock advances, which is the whole reason the real loop terminates.
+	# The runaway brake is on the ping, not here -- see virsh_uri below.
 	SECONDS=$((SECONDS + 5))
 }
 virsh_uri() {
-	local _uri="$1" verb="$2"
+	local _uri="$1" verb="$2" _gan
 	shift 2
 	case "$verb" in
 	dumpxml)
@@ -1593,6 +1694,16 @@ virsh_uri() {
 		;;
 	qemu-agent-command)
 		ga_bump "$ga_pings"
+		# THE BRAKE, on the ping rather than on the sleep: the code calls
+		# `sleep 5` bare and never reads its status, so a `return 1` from the
+		# sleep stub stops nothing and a mutation that leaves `elapsed`
+		# unadvanced loops for ever. An answering agent is this loop's one
+		# unconditional exit, so that is what the cap forces.
+		read -r _gan <"$ga_pings"
+		if [ "$_gan" -gt 200 ]; then
+			printf 'capped' >"$ga_cap"
+			return 0
+		fi
 		# A channel-less domain's agent call is refused by libvirt outright,
 		# so the stub refuses it too. Modelling it as answerable would let
 		# the gate look load-bearing for the wrong reason -- the exit status
@@ -1617,6 +1728,7 @@ ga_run() {
 	printf '0' >"$ga_pings"
 	printf '0' >"$ga_sleeps"
 	printf '0' >"$ga_xml"
+	: >"$ga_cap"
 	SECONDS=0
 	GA_RC=0
 	wait_for_guest_agent "$3" || GA_RC=$?
@@ -1624,6 +1736,7 @@ ga_run() {
 	read -r GA_SLEEPS <"$ga_sleeps"
 	read -r GA_XML <"$ga_xml"
 	GA_WAITED="$SECONDS"
+	[ -s "$ga_cap" ] && check "wait_for_guest_agent terminated without hitting the 200-ping brake" yes no
 }
 
 # THE FIX (1) CASE. A channel-less domain is answered without a single ping
