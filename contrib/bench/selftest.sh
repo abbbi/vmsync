@@ -2012,6 +2012,287 @@ unset SOURCE_URI SOURCE_DOMAIN
 warn() { :; }
 
 echo
+echo "=== stage 28: the disk it plants, and giving it back ==="
+
+# THE RUN THIS SECTION COMES FROM. A --stages all run on an agentless fixture
+# ended at stage 28 with no per-stage verdict, no BENCH RESULT banner and no
+# report -- 42 minutes of work and no verdict at all -- because the stage's
+# teardown trap re-entered on the stage's own `return 0`, its bare detach
+# failed a second time, and errexit inside a trap body is not covered by the
+# dispatcher's `stage_ignore_disk || stage_rc=$?`. The disk it could not detach
+# then sat in the source's LIVE definition, where it refuses every sync in the
+# run AND the next one, since only a stop clears a live-only entry.
+#
+# Three fixes, tested together because they are one chain: do not plant a disk
+# this fixture cannot give back (ignore_disk_plantable); when the detach leaves
+# one anyway and the operator allows it, clear it with a stop
+# (ignore_disk_clear_live_leftover); and never let the teardown end the run.
+#
+# The two gates are extracted and driven directly, because what they have to
+# get right is a decision. The trap is reproduced with the REAL body and both
+# the fixed and the old trap line, because what it has to get right is
+# surviving -- and a test that only pins the source text could not tell which
+# of the two lines actually saves the run.
+eval "$(extract "$BENCH" ignore_disk_plantable)"
+eval "$(extract "$BENCH" ignore_disk_clear_live_leftover)"
+eval "$(extract "$COMMON" domain_agent_channel)"
+
+s28_calls="$WORK/s28.calls"
+SOURCE_URI=qemu:///s28
+SOURCE_DOMAIN=s28-dom
+SOURCE_HOST=s28host
+SOURCE_LOCAL=yes
+# Set here because bench.sh validates and defaults it at startup, so the clear
+# can read it bare -- which is also why that startup guard is pinned above.
+SOURCE_SHUTDOWN_WAIT_SECONDS=120
+
+# Every virsh verb this section drives, recorded in a FILE: source_nonqcow_devs
+# and dom_state are both captured in `$(...)`, so a variable recorder would die
+# with the subshell that wrote it.
+s28_virsh_uri() {
+	local _uri="$1" verb="$2"
+	shift 2
+	printf '%s %s\n' "$verb" "$*" >>"$s28_calls"
+	case "$verb" in
+	domstate) printf '%s' "$S28_STATE" ;;
+	dumpxml)
+		case "$1" in
+		--inactive)
+			# The persistent document. A leftover that is in BOTH is one a
+			# restart would not clear, which is the case the clear declines.
+			[ "$S28_PERSISTENT" = yes ] && printf "<domain><disk><target dev='vdz'/></disk></domain>"
+			;;
+		*)
+			case "$S28_CHANNEL" in
+			unreadable) return 1 ;;
+			yes) printf "<domain><channel><target name='org.qemu.guest_agent.0'/></channel></domain>" ;;
+			*) printf '<domain></domain>' ;;
+			esac
+			;;
+		esac
+		;;
+	destroy)
+		S28_STATE=shutoff
+		S28_LIVE=no
+		;;
+	start) S28_STATE=running ;;
+	detach-disk) return "$S28_DETACH_RC" ;;
+	esac
+	return 0
+}
+
+# --- ignore_disk_plantable: two reasons to stand down, told apart -----------
+#
+# THE SHUT-OFF ARM IS HERE BECAUSE A LIVE RUN REFUTED THE OBVIOUS DESIGN. A
+# shut-off source looks like the easy way out -- the attach and the detach are
+# both config-only, so no guest is needed -- but vmsync refuses an inactive
+# source before it looks at any disk, and the stage then reported six failures
+# that were all the fixture being down, with 28a asserting the wrong refusal.
+# So "not running" is its own answer, not a way past the detach problem.
+s28_plantable() {
+	S28_STATE="$1" S28_CHANNEL="$2" PROBE_MAY_STOP_SOURCE="$3"
+	local rc=0
+	ignore_disk_plantable || rc=$?
+	case "$rc" in
+	0) printf 'go' ;;
+	1) printf 'cannot-detach' ;;
+	2) printf 'not-running' ;;
+	*) printf 'rc%s' "$rc" ;;
+	esac
+}
+eval 'virsh_uri() { s28_virsh_uri "$@"; }'
+eval "$(extract "$COMMON" dom_state)"
+
+check "a shut-off source is not something this stage can use" not-running \
+	"$(s28_plantable shutoff yes yes)"
+check "nor a paused one, whatever else is true of it" not-running \
+	"$(s28_plantable paused yes yes)"
+check "a running source with an agent channel is fine" go \
+	"$(s28_plantable running yes no)"
+check "a running source with neither cannot give the disk back" cannot-detach \
+	"$(s28_plantable running no no)"
+check "unless PROBE_MAY_STOP_SOURCE=yes lets the teardown stop it" go \
+	"$(s28_plantable running no yes)"
+# rc 2 from domain_agent_channel is not a yes. A definition that cannot be read
+# is not evidence of a guest, and treating it as one is how the stage came to
+# plant on a fixture that could never give the disk back.
+check "an unreadable definition is not taken for a guest" cannot-detach \
+	"$(s28_plantable running unreadable no)"
+check "and still defers to the knob" go \
+	"$(s28_plantable running unreadable yes)"
+S28_STATE=paused S28_CHANNEL=no PROBE_MAY_STOP_SOURCE=no
+ignore_disk_plantable || true
+check "it reports the state it saw, for the stand-down message" paused \
+	"$IGNORE_DISK_PLANT_STATE"
+
+# --- ignore_disk_clear_live_leftover: a stop, but only when allowed -------
+s28_clear() {
+	S28_STATE=running S28_LIVE=yes IGNORE_DISK_PLANTED=vdz
+	S28_PERSISTENT="$1" PROBE_MAY_STOP_SOURCE="$2" S28_GRACEFUL="$3"
+	: >"$s28_calls"
+	if ignore_disk_clear_live_leftover; then printf 'cleared'; else printf 'declined'; fi
+}
+# The leftover, read the way the real function reads it: from the LIVE document.
+source_nonqcow_devs() {
+	[ "$S28_LIVE" = yes ] && printf 'vdz\n'
+	return 0
+}
+graceful_shutdown() {
+	SHUTDOWN_WAITED=7
+	[ "$S28_GRACEFUL" = yes ] || return 1
+	S28_STATE=shutoff
+	S28_LIVE=no
+	return 0
+}
+s28_did() { grep -c "^$1" "$s28_calls"; }
+
+check "without the knob it declines" declined "$(s28_clear no no yes)"
+check "and stops nothing" 0 "$(s28_did destroy)"
+check "and does not even ask the domain to shut down" 0 "$(s28_did domstate)"
+# A leftover in the persistent document comes back with the domain, so a stop
+# would cost an outage and fix nothing.
+check "a persistent leftover is not worth a stop" declined "$(s28_clear yes yes yes)"
+check "and nothing was stopped for it" 0 "$(s28_did destroy)"
+
+check "a live-only leftover clears on a graceful stop" cleared "$(s28_clear no yes yes)"
+check "and no destroy was needed" 0 "$(s28_did destroy)"
+check "and the domain was started again" 1 "$(s28_did start)"
+# The fixture that gets here has no guest to answer ACPI -- a guest that could
+# answer would have acknowledged the unplug -- so the escalation is the path
+# that actually runs on this rig.
+check "a guest that cannot answer ACPI is destroyed instead" cleared "$(s28_clear no yes no)"
+check "and that is one destroy, announced" 1 "$(s28_did destroy)"
+check "and it is started again afterwards too" 1 "$(s28_did start)"
+
+# It owns getting the domain back even when the clear failed: a source left
+# shut off fails every later stage for a reason unrelated to what they test.
+S28_STATE=running S28_LIVE=yes S28_PERSISTENT=no PROBE_MAY_STOP_SOURCE=yes S28_GRACEFUL=no
+IGNORE_DISK_PLANTED=vdz
+: >"$s28_calls"
+s28_stuck_clear() {
+	# A stop that does not clear it: the disk is still in the live document
+	# afterwards, which is the one outcome that must still report failure.
+	S28_STATE=running S28_LIVE=yes IGNORE_DISK_PLANTED=vdz
+	if ignore_disk_clear_live_leftover; then printf 'cleared'; else printf 'declined'; fi
+}
+s28_virsh_uri_keep() {
+	local verb="$2"
+	shift 2
+	printf '%s %s\n' "$verb" "$*" >>"$s28_calls"
+	case "$verb" in
+	domstate) printf '%s' "$S28_STATE" ;;
+	dumpxml) printf '<domain></domain>' ;;
+	destroy) S28_STATE=shutoff ;;
+	start) S28_STATE=running ;;
+	esac
+	return 0
+}
+eval 'virsh_uri() { s28_virsh_uri_keep "$@"; }'
+check "a stop that does not clear it still reports failure" declined "$(s28_stuck_clear)"
+check "and the domain is running again regardless" 1 "$(s28_did start)"
+eval 'virsh_uri() { s28_virsh_uri "$@"; }'
+
+# --- the teardown must never end the run ----------------------------------
+#
+# THE DEFECT, reproduced with the real body and both trap lines. errexit is
+# live inside a trap body and the dispatcher's `|| stage_rc=$?` does not reach
+# it, so the bare detach on the body's first line ended the script. `|| true`
+# on the INVOCATION suspends errexit for the whole body, which is why the body
+# also finishes and reports -- without it the warn never even printed, which is
+# exactly what the failing run looked like.
+eval "$(extract "$BENCH" ignore_disk_restore)"
+s28_teardown() {
+	# $1 yes = the fixed trap line, no = the old one. In a subshell so the
+	# fatal arm cannot take the suite with it.
+	(
+		set -euo pipefail
+		S28_DETACH_RC=1 S28_LIVE=yes S28_PERSISTENT=no
+		PROBE_MAY_STOP_SOURCE=no
+		IGNORE_DISK_PLANTED=vdz
+		IGNORE_DISK_FILE=/tmp/s28.raw
+		CSV="$WORK/s28.csv"
+		warn() { printf 'warned\n' >>"$s28_calls"; }
+		run_shell_on() { return 0; }
+		staged() {
+			if [ "$1" = yes ]; then
+				trap 'ignore_disk_restore || true' RETURN
+			else
+				trap 'ignore_disk_restore' RETURN
+			fi
+			return 0
+		}
+		staged "$1"
+		printf 'survived'
+	)
+}
+: >"$s28_calls"
+check "the fixed trap line lets the run continue" survived "$(s28_teardown yes 2>/dev/null)"
+check "and the body ran to its warning" 1 "$(s28_did warned)"
+: >"$s28_calls"
+check "the old trap line killed it" "" "$(s28_teardown no 2>/dev/null)"
+check "and killed it before the warning, as the failing run showed" 0 "$(s28_did warned)"
+
+# --- the source text, so deleting a fix is a failure ----------------------
+stage28="$(extract "$BENCH" stage_ignore_disk)"
+restore28="$(extract "$BENCH" ignore_disk_restore)"
+# Comment lines stripped first: this stage's prose names the very functions and
+# phases the order pins look for, so an unstripped grep matches the commentary
+# rather than the code.
+s28_code() { printf '%s' "$1" | grep -v '^[[:space:]]*#'; }
+s28_line() { s28_code "$1" | grep -n -- "$2" | sed -n '1s/:.*//p'; }
+
+check "the teardown trap cannot end the run" 1 \
+	"$(s28_code "$stage28" | grep -c "trap 'ignore_disk_restore || true' RETURN EXIT")"
+check "and the tail clears RETURN as well as EXIT, so it runs once" 1 \
+	"$(s28_code "$stage28" | grep -c '^	trap - RETURN EXIT$')"
+check "the plant is gated on being able to give the disk back" 1 \
+	"$(s28_code "$stage28" | grep -c 'ignore_disk_plantable || plant_rc=\$?')"
+check "the gate is called bare, so its state reaches the message" 0 \
+	"$(s28_code "$stage28" | grep -c '\$(ignore_disk_plantable')"
+check "the gate runs before anything is planted" yes \
+	"$([ "$(s28_line "$stage28" 'ignore_disk_plantable')" -lt "$(s28_line "$stage28" 'qemu-img create -f raw')" ] && echo yes || echo no)"
+# The two stand-downs are separate branches with separate rows, so a reader of
+# report.md can tell "the fixture was down" from "the fixture could not give
+# the disk back" without going to the log.
+check "a source that is not running stands down on its own branch" 1 \
+	"$(s28_code "$stage28" | grep -c 'if \[ "\$plant_rc" = 2 \]; then')"
+check "and says so in the row" 1 \
+	"$(s28_code "$stage28" | grep -c 'SKIP source domain not running')"
+check "while an undetachable one says that instead" 1 \
+	"$(s28_code "$stage28" | grep -c 'SKIP the fixture cannot give a planted disk back')"
+check "the teardown tries a stop before it gives up" 1 \
+	"$(s28_code "$restore28" | grep -c 'ignore_disk_clear_live_leftover || true')"
+
+# The second-run checks. The replica's definition is rebuilt from the SOURCE's
+# live XML on every successful sync, so an exclusion is re-applied each run
+# rather than inherited -- which is why run 2 needs asserting at all.
+check "a second -ignore-disk run is exercised" 1 \
+	"$(s28_code "$stage28" | grep -c 'bench_sync "\$sc" ignored-again -ignore-disk="\$dev"')"
+check "a second -drop-disk run is exercised" 1 \
+	"$(s28_code "$stage28" | grep -c 'bench_sync "\$sc" dropped-again -drop-disk="\$dev"')"
+check "and a run with the flag withdrawn" 1 \
+	"$(s28_code "$stage28" | grep -c 'bench_sync "\$sc" withdrawn$')"
+check "the second ignore run comes after the first" yes \
+	"$([ "$(s28_line "$stage28" 'ignored -ignore-disk')" -lt "$(s28_line "$stage28" 'ignored-again')" ] && echo yes || echo no)"
+check "the withdrawal comes after the drop it withdraws" yes \
+	"$([ "$(s28_line "$stage28" 'dropped-again')" -lt "$(s28_line "$stage28" 'withdrawn')" ] && echo yes || echo no)"
+
+# THE VACUOUS-CHECK FIXES. Each of these reads a field that is empty both when
+# vmsync moved the record and when vmsync writes no record at all, so each has
+# to assert the OTHER field in the same breath or it passes against an engine
+# that records nothing -- which is precisely what it did against the build that
+# was on the bench host.
+check "the move check cannot pass on two empty fields" 1 \
+	"$(s28_code "$stage28" | grep -c 'if \[ -z "\$meta" \] && \[ "\$dropped_rec" = "\$dev" \]; then')"
+check "and the withdrawal check reads both fields too" 1 \
+	"$(s28_code "$stage28" | grep -c 'if \[ "\$dropped_rec" = "\$dev" \] && \[ -z "\$meta" \]; then')"
+check "the ignore run asserts dropped_disks stays empty" 1 \
+	"$(s28_code "$stage28" | grep -c 'and records nothing in dropped_disks')"
+
+unset -f virsh_uri source_nonqcow_devs graceful_shutdown s28_virsh_uri s28_virsh_uri_keep s28_plantable s28_clear s28_did s28_teardown s28_stuck_clear s28_code s28_line ignore_disk_plantable ignore_disk_clear_live_leftover ignore_disk_restore dom_state domain_agent_channel
+unset SOURCE_URI SOURCE_DOMAIN SOURCE_HOST SOURCE_LOCAL PROBE_MAY_STOP_SOURCE
+
+echo
 if [ "$SKIPPED" -ne 0 ]; then
 	printf '%d passed, %d failed -- the sweep cases were SKIPPED on this machine, so a clean run here does not mean the sweep is safe\n' "$PASS" "$FAIL"
 else

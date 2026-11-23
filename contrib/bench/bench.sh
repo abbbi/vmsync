@@ -13248,9 +13248,102 @@ stage_exclude() {
 # source_qcow_devs cannot see it and stage 15's disk count, the base
 # fingerprints and the target paths all still look right -- while every sync in
 # every later stage is refused and the report names nothing.
+# ignore_disk_plantable -> 0 to go ahead, 2 when the source is not running at
+# all, 1 when it is running but a disk attached to it could not be taken off
+# again. Sets IGNORE_DISK_PLANT_STATE to the state it read.
+#
+# TWO SEPARATE REASONS TO STAND DOWN, because the remedies have nothing to do
+# with each other and one message covering both would send the reader the wrong
+# way.
+#
+# rc 2 -- not running. Every sync in this stage needs a running source: vmsync
+# refuses an inactive one outright ("require running state before sync"), so
+# the refusals the stage asserts would be THAT refusal rather than the
+# unreplicable-disk one it is testing. Measured, not assumed: against a shut
+# off source the stage reported six failures, every one of them the fixture
+# being down.
+#
+# rc 1 -- running, but nothing in there can release the disk. Detaching a
+# --persistent attach from a running domain needs the guest to acknowledge a
+# PCI hot-unplug, and a fixture with no OS never will. The leftover then sits
+# in the LIVE definition, where it refuses every sync for the rest of the run
+# and the next one too, because the live document belongs to the running qemu
+# and only a stop clears it. Two ways past it:
+#   - an org.qemu.guest_agent channel, so there is a guest in there that can
+#     answer the unplug. Structural, and the same question
+#     wait_for_guest_agent asks -- rc 2 there, an unreadable definition, is not
+#     a yes, so it falls through to the knob rather than assuming a guest;
+#   - PROBE_MAY_STOP_SOURCE=yes, which lets ignore_disk_clear_live_leftover
+#     stop the domain during the teardown and clear the leftover that way.
+#
+# BARE, not captured, like target_persistence: the caller needs the answer and
+# the state it rests on, and a captured call would lose the assignment to its
+# subshell.
+ignore_disk_plantable() {
+	IGNORE_DISK_PLANT_STATE="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN" 2>/dev/null || true)"
+	[ "$IGNORE_DISK_PLANT_STATE" = running ] || return 2
+	domain_agent_channel "$SOURCE_URI" "$SOURCE_DOMAIN" && return 0
+	[ "${PROBE_MAY_STOP_SOURCE:-no}" = yes ] && return 0
+	return 1
+}
+
+# ignore_disk_clear_live_leftover -> 0 once the planted disk is gone from the
+# source's LIVE definition, non-zero when it is still there or when clearing it
+# was not permitted.
+#
+# THE THIRD WAY OUT of stage 28's plant gate, and the only one that works on a
+# fixture with no guest. A hot-unplug the guest never acknowledges takes the
+# disk out of the PERSISTENT definition and leaves it in the live one, and
+# nothing but a stop clears that: the live document belongs to the running
+# qemu, which will not drop a device the guest never released.
+#
+# Only for a live-ONLY leftover: a disk still in the persistent definition
+# comes back with the domain, so stopping it would cost an outage and fix
+# nothing. And only on PROBE_MAY_STOP_SOURCE=yes, the same knob the probe
+# stages use for the same intervention -- stopping somebody's source is theirs
+# to authorise, not this stage's to decide.
+#
+# graceful first and destroy second, announced rather than silent. The fixture
+# that reaches here is by construction one with no guest to answer ACPI: a
+# guest that could answer would have acknowledged the unplug and left nothing
+# to clear. Both are stops the knob authorises, and the alternative is leaving
+# the rig refusing every sync until somebody restarts the domain by hand.
+ignore_disk_clear_live_leftover() {
+	[ "${PROBE_MAY_STOP_SOURCE:-no}" = yes ] || return 1
+	if virsh_uri "$SOURCE_URI" dumpxml --inactive "$SOURCE_DOMAIN" 2>/dev/null | grep_q "dev='$IGNORE_DISK_PLANTED'"; then
+		return 1
+	fi
+	log "   PROBE_MAY_STOP_SOURCE=yes: stopping $SOURCE_DOMAIN to clear the live-only $IGNORE_DISK_PLANTED its guest never released"
+	graceful_shutdown "$SOURCE_URI" "$SOURCE_DOMAIN" "$SOURCE_SHUTDOWN_WAIT_SECONDS" "source $SOURCE_DOMAIN" || true
+	local state
+	state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN" 2>/dev/null || true)"
+	if [ "$state" != shutoff ]; then
+		log "     no ACPI answer in ${SHUTDOWN_WAITED:-?}s, so destroying it -- this fixture has no guest to ask"
+		virsh_uri "$SOURCE_URI" destroy "$SOURCE_DOMAIN" >/dev/null 2>&1 || true
+	fi
+	# Owns getting it back, like settle_stopped: a source left shut off fails
+	# every later stage for a reason that has nothing to do with what they test.
+	virsh_uri "$SOURCE_URI" start "$SOURCE_DOMAIN" >/dev/null 2>&1 || true
+	state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN" 2>/dev/null || true)"
+	if [ "$state" != running ]; then
+		warn "could not restart $SOURCE_DOMAIN after clearing $IGNORE_DISK_PLANTED (state=$state) -- start it by hand ('virsh -c $SOURCE_URI start $SOURCE_DOMAIN')"
+	fi
+	if source_nonqcow_devs | grep_q -x "$IGNORE_DISK_PLANTED"; then
+		return 1
+	fi
+	return 0
+}
+
 ignore_disk_restore() {
 	[ -n "${IGNORE_DISK_PLANTED:-}" ] || return 0
 	virsh_uri "$SOURCE_URI" detach-disk "$SOURCE_DOMAIN" "$IGNORE_DISK_PLANTED" --persistent >/dev/null 2>&1
+	# The stop is the second attempt, not the first: a guest that acknowledges
+	# the unplug needs no outage, and this only runs when the detach above left
+	# something behind. It declines on its own when it is not permitted or when
+	# the leftover is one a restart would not clear.
+	if source_nonqcow_devs | grep_q -x "$IGNORE_DISK_PLANTED"; then
+		ignore_disk_clear_live_leftover || true
+	fi
 	# Verified, not assumed. A detach that silently failed leaves the fixture
 	# unsyncable for every stage after this one.
 	if source_nonqcow_devs | grep_q -x "$IGNORE_DISK_PLANTED"; then
@@ -13339,9 +13432,10 @@ target_aside_count() {
 
 stage_ignore_disk() {
 	log "=== Stage 28: a disk vmsync cannot replicate is refused, not skipped ==="
-	local sc=ignore-disk ok out dev="vdz" meta
+	local sc=ignore-disk ok out dev="vdz" meta dropped_rec
 	IGNORE_DISK_PLANTED=""
 	IGNORE_DISK_FILE=""
+	IGNORE_DISK_PLANT_STATE=""
 
 	if [ "$DRY_RUN" = yes ]; then
 		results_row "$CSV" "$sc" dryrun DRYRUN "" "" "" "" "" "SKIP dry run"
@@ -13370,6 +13464,21 @@ stage_ignore_disk() {
 		return 0
 	fi
 
+	# DO NOT PLANT A DISK THIS FIXTURE CANNOT GIVE BACK -- the one precondition
+	# this stage used to leave unchecked, and the one that cost a whole run.
+	local plant_rc=0
+	ignore_disk_plantable || plant_rc=$?
+	if [ "$plant_rc" = 2 ]; then
+		warn "SKIP stage 28: $SOURCE_DOMAIN is '$IGNORE_DISK_PLANT_STATE', but every sync in this stage needs a running source -- vmsync refuses an inactive one before it looks at any disk, so the refusals this stage asserts would be that refusal instead of the one it is testing."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP source domain not running"
+		return 0
+	fi
+	if [ "$plant_rc" != 0 ]; then
+		warn "SKIP stage 28: $SOURCE_DOMAIN is running but has no org.qemu.guest_agent channel, so a disk attached to it cannot be detached again -- the guest has to acknowledge the hot-unplug and there is nobody in there to do it. Planting one anyway would leave it in the live definition, where it refuses every sync in this run AND the next, since only a stop clears it. Give the fixture an agent channel, or set PROBE_MAY_STOP_SOURCE=yes to let the teardown stop the domain and clear it."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP the fixture cannot give a planted disk back"
+		return 0
+	fi
+
 	# --- plant it -----------------------------------------------------------
 	#
 	# --persistent, which is live AND config, and it matters: the engine
@@ -13389,7 +13498,13 @@ stage_ignore_disk() {
 		return 0
 	fi
 	IGNORE_DISK_FILE="$src_disk_dir/vmsync-bench-ignore-disk.raw"
-	trap 'ignore_disk_restore' RETURN EXIT
+	# `|| true` because errexit is live inside a trap body: the dispatcher's
+	# `stage_ignore_disk || stage_rc=$?` suppresses it for the stage, not for
+	# this, so one fallible line in ignore_disk_restore would end the whole run
+	# -- before announce_stage_verdict, generate_report and final_verdict, which
+	# is a 28-stage run reporting no verdict at all. The body already verifies
+	# its own outcome rather than trusting any single command's status.
+	trap 'ignore_disk_restore || true' RETURN EXIT
 	local attach_err
 	if ! attach_err="$(run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "qemu-img create -f raw '$IGNORE_DISK_FILE' 8M" 2>&1)"; then
 		# qemu-img's own words in the ROW and not only in the warn, for the
@@ -13500,6 +13615,39 @@ stage_ignore_disk() {
 		if [ "$meta" = "$dev" ]; then ok=0; else ok=1; fi
 		fo_check "$sc" "and the replica records that it is deliberately partial" "$ok" \
 			"ignored_disks is '$meta', want '$dev'. During a failover the replica's own metadata is all there is, and without it a replica missing a disk reports a recent checkpoint and failure_count 0"
+
+		# The mirror of 28e's move check, and untested until now: a run that
+		# named only -ignore-disk must leave dropped_disks absent. Free, in
+		# that it reads the same definition the check above just read.
+		meta="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" dropped_disks)"
+		if [ -z "$meta" ]; then ok=0; else ok=1; fi
+		fo_check "$sc" "and records nothing in dropped_disks" "$ok" \
+			"dropped_disks reads '$meta' after a run that passed only -ignore-disk, so the replica claims an arrangement nobody asked for"
+
+		# --- 28d-again: the same flag a SECOND time -----------------------
+		#
+		# IDEMPOTENCE, which is not free here. The replica's definition is
+		# rebuilt from the SOURCE's live XML on every successful sync -- one
+		# unconditional DefineDomain at the end of each run -- so the element
+		# and the record are re-derived each time rather than inherited. A
+		# change that made either first-run-only would leave run 2 of a
+		# long-standing pair describing a complete replica of a partial one,
+		# and no other check in this stage looks twice.
+		bench_sync "$sc" ignored-again -ignore-disk="$dev"
+		if bench_sync_ok; then ok=0; else ok=1; fi
+		fo_check "$sc" "a second -ignore-disk run still succeeds" "$ok" \
+			"exit=$RUN_RC on the second consecutive -ignore-disk=$dev. $(log_reason "$RUN_LOG")$(bench_sync_hint)"
+
+		if [ "$ok" = 0 ]; then
+			if virsh_uri "$TARGET_URI" dumpxml --inactive "$TARGET_DOMAIN" 2>/dev/null | grep_q "dev='$dev'"; then ok=0; else ok=1; fi
+			fo_check "$sc" "and the ignored disk is still in the replica's definition" "$ok" \
+				"$dev left $TARGET_DOMAIN's definition on the second run, so the element survives one sync and not two"
+
+			meta="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" ignored_disks)"
+			if [ "$meta" = "$dev" ]; then ok=0; else ok=1; fi
+			fo_check "$sc" "and ignored_disks still records it" "$ok" \
+				"ignored_disks is '$meta' after the second -ignore-disk=$dev run, want '$dev'. A record that survives one sync and not two is worse than none: the replica reads as complete from the second run onwards"
+		fi
 	fi
 
 	# --- 28e: -drop-disk removes it -----------------------------------------
@@ -13513,18 +13661,23 @@ stage_ignore_disk() {
 		fo_check "$sc" "a dropped disk is gone from the replica's definition" "$ok" \
 			"$TARGET_DOMAIN's definition still names $dev after -drop-disk, so the replica points at a file on the SOURCE host that nothing replicated"
 
-		meta="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" dropped_disks)"
-		if [ "$meta" = "$dev" ]; then ok=0; else ok=1; fi
+		dropped_rec="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" dropped_disks)"
+		if [ "$dropped_rec" = "$dev" ]; then ok=0; else ok=1; fi
 		fo_check "$sc" "and dropped_disks records it" "$ok" \
-			"dropped_disks is '$meta', want '$dev'"
+			"dropped_disks is '$dropped_rec', want '$dev'"
 
 		# The previous run's field has to be gone, not merely stale: a dev
 		# moved from one flag to the other must move in the record too, or the
 		# replica claims an arrangement it does not have.
+		#
+		# BOTH fields in one check, because an empty ignored_disks is what a
+		# move and a vmsync that records nothing at all look like alike -- so
+		# `[ -z "$meta" ]` on its own passes against an engine that writes
+		# neither field, which is the one outcome this check must not bless.
 		meta="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" ignored_disks)"
-		if [ -z "$meta" ]; then ok=0; else ok=1; fi
+		if [ -z "$meta" ] && [ "$dropped_rec" = "$dev" ]; then ok=0; else ok=1; fi
 		fo_check "$sc" "moving a disk between the flags moves it in the record" "$ok" \
-			"ignored_disks still reads '$meta' after a run that passed only -drop-disk"
+			"after a run that passed only -drop-disk, ignored_disks reads '$meta' (want empty) and dropped_disks reads '$dropped_rec' (want '$dev')"
 
 		# THE TRIPWIRE. Removing one <disk> drops the counts of disk, driver,
 		# source, target and usually address and alias, so a baseline taken
@@ -13534,6 +13687,68 @@ stage_ignore_disk() {
 		if grep_q "dropped configuration" "$RUN_LOG"; then ok=1; else ok=0; fi
 		fo_check "$sc" "dropping a disk does not trip the configuration-loss alarm" "$ok" \
 			"$RUN_LOG carries 'something in the patching path has dropped configuration' on a successful -drop-disk run. That alarm is the only guard on the replica's definition, and one that cries on every ordinary run of a deliberately partial pair is one nobody reads"
+
+		# --- 28e-again: the same drop a SECOND time -----------------------
+		#
+		# The removal is re-applied from the source's document every run, never
+		# remembered: it is gated only on a non-empty -drop-disk set, and the
+		# configuration-loss baseline is rebuilt minus that set each time. So
+		# run 2 must be as quiet as run 1, and the two ways it could go wrong
+		# are opposite -- the disk back in the definition, or still gone but
+		# measured against an untouched baseline so the alarm cries.
+		bench_sync "$sc" dropped-again -drop-disk="$dev"
+		if bench_sync_ok; then ok=0; else ok=1; fi
+		fo_check "$sc" "a second -drop-disk run still succeeds" "$ok" \
+			"exit=$RUN_RC on the second consecutive -drop-disk=$dev. $(log_reason "$RUN_LOG")$(bench_sync_hint)"
+
+		if [ "$ok" = 0 ]; then
+			if virsh_uri "$TARGET_URI" dumpxml --inactive "$TARGET_DOMAIN" 2>/dev/null | grep_q "dev='$dev'"; then ok=1; else ok=0; fi
+			fo_check "$sc" "and the dropped disk has not come back" "$ok" \
+				"$dev is in $TARGET_DOMAIN's definition again after a second -drop-disk=$dev run, pointing at a file on the SOURCE host that nothing replicated"
+
+			dropped_rec="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" dropped_disks)"
+			if [ "$dropped_rec" = "$dev" ]; then ok=0; else ok=1; fi
+			fo_check "$sc" "and dropped_disks still records it" "$ok" \
+				"dropped_disks is '$dropped_rec' after the second -drop-disk=$dev run, want '$dev'"
+
+			if grep_q "dropped configuration" "$RUN_LOG"; then ok=1; else ok=0; fi
+			fo_check "$sc" "and the second run is as quiet as the first" "$ok" \
+				"the second -drop-disk run logs 'something in the patching path has dropped configuration', so a later run is taking its baseline from the untouched source"
+		fi
+
+		# --- 28h: the flag goes missing -----------------------------------
+		#
+		# THE QUESTION AN OPERATOR ACTUALLY ASKS: what happens on the next run
+		# if the flag is lost -- an edited cron line, a wrapper that dropped an
+		# argument. For a disk vmsync cannot replicate the answer is that the
+		# run is refused before it does any work, and NOT because of the
+		# record: nothing in vmsync reads ignored_disks or dropped_disks back,
+		# so what refuses is the same unnamed-unreplicable-disk gate 28a
+		# exercises. The record is a statement for a human and for this
+		# harness, never an interlock, and a check that treated it as one
+		# would be asserting something vmsync does not promise.
+		#
+		# Deliberately reading the record after a run that FAILED, which this
+		# stage does nowhere else: the whole point is that a refused run
+		# changed nothing, so the previous run's record must still stand. Both
+		# fields together, because "the engine stopped writing them" and "the
+		# refused run retracted them" look identical in either one alone.
+		bench_sync "$sc" withdrawn
+		if [ "$RUN_RC" != 0 ]; then ok=0; else ok=1; fi
+		fo_check "$sc" "withdrawing the flag is refused, not silently honoured" "$ok" \
+			"the run exited 0 with $dev attached and neither flag passed, so the pair quietly stopped being the deliberately partial one its own metadata describes"
+
+		if [ "$ok" = 0 ]; then
+			if virsh_uri "$TARGET_URI" dumpxml --inactive "$TARGET_DOMAIN" 2>/dev/null | grep_q "dev='$dev'"; then ok=1; else ok=0; fi
+			fo_check "$sc" "and the refused run left the replica's definition alone" "$ok" \
+				"$dev is back in $TARGET_DOMAIN's definition after a run that was refused, so something wrote that definition before the gate that refused it"
+
+			dropped_rec="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" dropped_disks)"
+			meta="$(vmsync_meta_field "$TARGET_URI" "$TARGET_DOMAIN" ignored_disks)"
+			if [ "$dropped_rec" = "$dev" ] && [ -z "$meta" ]; then ok=0; else ok=1; fi
+			fo_check "$sc" "and left the last successful run's record intact" "$ok" \
+				"after a refused run, dropped_disks reads '$dropped_rec' (want '$dev') and ignored_disks reads '$meta' (want empty). The record is as of the last SUCCESSFUL sync, and a run that was refused must not be able to retract it"
+		fi
 	fi
 
 	# --- 28g: the replica file of a disk that stops being copied ------------
@@ -13613,7 +13828,11 @@ stage_ignore_disk() {
 			"exit=$RUN_RC with no raw disk and no flags. $(log_reason "$RUN_LOG")$(bench_sync_hint)"
 	fi
 
-	trap - EXIT
+	# BOTH halves, unlike the early returns above: 28f has just run the restore
+	# explicitly, so leaving RETURN armed would run it a second time on the way
+	# out -- warning twice and writing a second cleanup row for one leftover.
+	# The early returns keep RETURN on purpose; it is what detaches for them.
+	trap - RETURN EXIT
 	return 0
 }
 

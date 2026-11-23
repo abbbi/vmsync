@@ -1915,6 +1915,9 @@ meant, and they differ only in what the replica's own definition ends up saying:
 | `-ignore-disk` lets the sync through, and the disk **stays** in the replica's definition | the flag's own meaning. This is what makes the replica usable where the target provides that storage by other means |
 | `-drop-disk` lets it through, and the disk is **gone** | the other flag's meaning. Left in, the replica would point at a file on the source host that nothing replicated |
 | each records its own metadata field, and moving a disk between the flags moves the record | during a failover the replica's metadata is all there is. Without it a replica missing a disk reports a recent checkpoint and `failure_count` 0 |
+| **the same flag a second time keeps the disk out and the record intact**, for both flags | the replica's definition is rebuilt from the **source's** XML on every successful sync, so an exclusion is re-applied each run rather than inherited. A removal that became first-run-only would leave run 2 of a long-standing pair describing a complete replica of a partial one |
+| and the second `-drop-disk` run is as quiet as the first | the configuration-loss baseline is rebuilt minus the dropped set each run too. One taken from the untouched source on a later run brings the alarm back on every ordinary sync |
+| **withdrawing the flag is refused, and the refused run changes nothing** | the question an operator actually asks — an edited cron line, a wrapper that lost an argument. Nothing in vmsync *reads* these two fields back, so what refuses is the unnamed-unreplicable-disk gate, and the record of the last **successful** run has to survive the refusal |
 | **dropping a disk does not trip the configuration-loss alarm** | removing one `<disk>` drops the counts of `disk`, `driver`, `source`, `target` and usually `address` and `alias`. Compared against the untouched source that logs "something in the patching path has dropped configuration" on **every** successful run of such a pair — and that alarm is the only guard on the replica's definition |
 | detaching the planted disk restores the fixture, and an ordinary sync works again | the teardown, asserted rather than hoped for |
 
@@ -1928,14 +1931,27 @@ that is a property of the guest, not of vmsync. The attach needs a machine type
 with a free slot — `q35` with a spare `pcie-root-port`; a plain `pc` fails with
 *"Bus 'pci.0' does not support hotplugging"*. The detach needs a running OS with
 virtio drivers to acknowledge the PCI unplug: without one, the config entry is
-removed and the **live** one is not, which is the document vmsync refuses on. The
-stage checks the live definition afterwards and says so, naming `--live` rather
-than `--persistent` as the remedy, because `--persistent` cannot find a disk
-that is only live.
+removed and the **live** one is not, which is the document vmsync refuses on —
+and only a stop clears a live-only entry, because that document belongs to the
+running qemu.
 
-Measured on a bare throwaway fixture (q35, no guest OS): **21 of 23 checks
-pass**; the two that do not are the cleanup pair, failing for exactly that
-reason. On a fixture with a real guest the detach completes and all 23 run.
+**So it will not plant a disk the fixture cannot give back.** The source has to
+be running, since vmsync refuses an inactive one before it looks at any disk,
+and one of two things has to hold:
+
+- the source has an `org.qemu.guest_agent` channel, so there is a guest in
+  there that can answer the unplug; or
+- `PROBE_MAY_STOP_SOURCE=yes`, which lets the teardown stop the domain to clear
+  a live-only leftover — gracefully if ACPI is answered, by `destroy` if it is
+  not, and started again either way.
+
+Without one of them the stage stands down, naming which to arrange, and plants
+nothing. The alternative is a disk left in the live definition, refusing every
+sync for the rest of the run **and the next one**.
+
+Measured on a bare throwaway fixture (q35, no guest OS, `PROBE_MAY_STOP_SOURCE=yes`):
+**28 checks pass and 1 skips** — the skip is 28g, which needs a second qcow2
+disk. Two consecutive runs both pass and leave the fixture as they found it.
 
 **It stands down** rather than running if the source already carries a non-qcow2
 disk, or already has a disk at `vdz`. Planting a second would leave two to clean
