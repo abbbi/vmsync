@@ -127,23 +127,46 @@ virsh_uri() {
 	LC_ALL=C virsh -c "$uri" "$@"
 }
 
-# dom_state/domain_exists both leave virsh's own stderr text (if any) in
-# $VIRSH_ERR on failure -- without it, "-source-uri has the wrong scheme",
-# "the domain genuinely doesn't exist" and "SSH auth failed" are
-# indistinguishable: each reaches the caller as a bare "not found"/"cannot
-# query state" with nothing else to go on. Callers that die/warn on failure
-# should fold ${VIRSH_ERR:+: $VIRSH_ERR} into their own message.
+# WHY A FAILED QUERY HAS TO CARRY VIRSH'S OWN WORDS. Without them,
+# "-source-uri has the wrong scheme", "the domain genuinely doesn't exist" and
+# "SSH auth failed" are indistinguishable: each reaches the caller as a bare
+# "not found" or "cannot query state" with nothing to act on.
+#
+# TWO DIFFERENT CHANNELS, decided by whether the function has a value to
+# return, and the distinction is the whole design:
+#
+#   dom_state and domain_uuid return their value on STDOUT, so on failure --
+#   when there is no value -- stdout carries virsh's text instead. The caller
+#   already holds it in the variable it captured, and folds
+#   ${var:+: $var} into its own message. A GLOBAL CANNOT WORK HERE: these are
+#   always called as `v="$(f ...)"`, which is a subshell, so anything they
+#   assign is discarded with it.
+#
+#   domain_exists returns nothing on stdout, so it uses the global $VIRSH_ERR
+#   and is ALWAYS CALLED BARE -- `if domain_exists ...`, never captured. It is
+#   the only function that sets VIRSH_ERR, and virsh_err_is_not_found is only
+#   meaningful immediately after one of its calls.
+#
+# THE SENTINEL IS THE EXIT STATUS, NEVER EMPTINESS. A caller that reads "empty
+# means unreadable" breaks the moment the text arrives, so callers that need
+# that distinction normalise it explicitly -- see wait_for_domain_ready.
+#
+# Not stderr: wait_for_domain_ready polls a domain that may be unreachable for
+# the whole of its budget, and a line per poll would bury the run.
 
-# dom_state URI DOMAIN -> "running", "shut off", etc (whitespace collapsed).
+# dom_state URI DOMAIN -> "running", "shutoff", etc (whitespace collapsed) and
+# 0, or virsh's own text and non-zero.
 dom_state() {
 	local uri="$1" domain="$2"
 	local out
 	if out="$(virsh_uri "$uri" domstate "$domain" 2>&1)"; then
-		VIRSH_ERR=""
 		printf '%s' "$out" | tr -d '[:space:]'
 		return 0
 	fi
-	VIRSH_ERR="$out"
+	# Collapsed, not raw: a bad scheme or a dead transport answers in two
+	# lines, and results_row strips commas but not newlines -- an uncollapsed
+	# value reaching a message that reaches the CSV would split the row.
+	printf '%s' "$out" | tr -s '[:space:]' ' '
 	return 1
 }
 
@@ -319,7 +342,7 @@ domain_agent_channel() {
 wait_for_domain_ready() {
 	local uri="$1" domain="$2" limit="$3" what="$4"
 	local begun="$SECONDS" elapsed=0
-	local state="" verb="" last_verb="" nudges=0 last_nudge=0
+	local state="" unreadable="" verb="" last_verb="" nudges=0 last_nudge=0
 	local saw_running=no announced=no chan
 	# Re-issue the verb this often: graceful_shutdown's resend_every in mirror
 	# image, and for the mirror-image reason. A start can race a domain that is
@@ -342,7 +365,19 @@ wait_for_domain_ready() {
 	esac
 
 	while :; do
-		state="$(dom_state "$uri" "$domain" 2>/dev/null || true)"
+		# THE SENTINEL IS THE EXIT STATUS. dom_state returns virsh's own text
+		# when it cannot answer, so "empty" no longer means "unreadable" --
+		# normalise here rather than letting an error string fall through the
+		# case below as if it were a state. Without this the `""` arms stop
+		# firing, an unreadable domain is reported as "it never started", and
+		# the probe issues `virsh start` at a domain it cannot even query.
+		# The text is kept: it is the one detail STARTUP_WHY never had.
+		if state="$(dom_state "$uri" "$domain" 2>/dev/null)"; then
+			unreadable=""
+		else
+			unreadable="$state"
+			state=""
+		fi
 		STARTUP_STATE="$state"
 		STARTUP_WAITED="$elapsed"
 		verb=""
@@ -419,7 +454,10 @@ wait_for_domain_ready() {
 		return 2
 		;;
 	"")
-		STARTUP_WHY="$what's state could not be read from $uri within ${elapsed}s, so this run cannot say whether it came back. A transient domain ceases to exist when it stops, and a transport or authentication failure reads the same way here -- deliberately NOT reported as 'it did not start', which is a different thing to go and fix."
+		# Carrying libvirt's own words is the point: "the domain does not
+		# exist" and "SSH auth failed" land on this same arm and are different
+		# things to go and fix.
+		STARTUP_WHY="$what's state could not be read from $uri within ${elapsed}s, so this run cannot say whether it came back${unreadable:+ -- $unreadable}. A transient domain ceases to exist when it stops, and a transport or authentication failure reads the same way here -- deliberately NOT reported as 'it did not start', which is a different thing to go and fix."
 		return 2
 		;;
 	*)
@@ -433,20 +471,23 @@ wait_for_domain_ready() {
 	esac
 }
 
-# domain_uuid URI DOMAIN -> the domain's UUID (whitespace collapsed), or
-# empty + non-zero exit on failure (see dom_state's own VIRSH_ERR comment).
+# domain_uuid URI DOMAIN -> the domain's UUID (whitespace collapsed) and 0, or
+# virsh's own text and non-zero. Same two-channel rule as dom_state above.
 domain_uuid() {
 	local uri="$1" domain="$2"
 	local out
 	if out="$(virsh_uri "$uri" domuuid "$domain" 2>&1)"; then
-		VIRSH_ERR=""
 		printf '%s' "$out" | tr -d '[:space:]'
 		return 0
 	fi
-	VIRSH_ERR="$out"
+	printf '%s' "$out" | tr -s '[:space:]' ' '
 	return 1
 }
 
+# domain_exists URI DOMAIN -> 0 when the domain is defined, 1 otherwise, with
+# virsh's own text in $VIRSH_ERR. THE ONLY SETTER OF VIRSH_ERR, and it must be
+# called BARE: it returns nothing on stdout, so the global is its only channel,
+# and a captured call would discard it with the subshell.
 domain_exists() {
 	local uri="$1" domain="$2"
 	local out
@@ -458,8 +499,17 @@ domain_exists() {
 	return 1
 }
 
-# virsh_err_is_not_found -- true if $VIRSH_ERR (as just set by
-# domain_exists/dom_state) looks like libvirt's own "no such domain"
+# virsh_err_is_not_found -- true if $VIRSH_ERR looks like libvirt's own "no
+# such domain" error rather than some other failure.
+#
+# ONLY MEANINGFUL IMMEDIATELY AFTER A BARE domain_exists, which is the one
+# function that sets VIRSH_ERR and the one that is never captured. The global
+# is not cleared by anything else, so reading it anywhere else returns whatever
+# the last bare call left -- which is how a message about the source once
+# carried an error about the target. dom_state and domain_uuid hand their text
+# back in their captured value instead; see their comment above.
+#
+# Longer form: it looks like libvirt's own "no such domain"
 # error rather than some other failure (bad URI, auth, connection
 # refused, ...). virsh ALWAYS writes something to stderr on any failure,
 # so a bare "VIRSH_ERR is non-empty" check can never tell "doesn't exist"
@@ -476,7 +526,7 @@ virsh_err_is_not_found() {
 require_dom_shutoff() {
 	local uri="$1" domain="$2" label="$3"
 	local state
-	state="$(dom_state "$uri" "$domain")" || die "cannot query state of $label domain '$domain' via $uri${VIRSH_ERR:+: $VIRSH_ERR}"
+	state="$(dom_state "$uri" "$domain")" || die "cannot query state of $label domain '$domain' via $uri${state:+: $state}"
 	[ "$state" = "shutoff" ] || die "$label domain '$domain' is '$state', expected 'shut off' -- refusing to continue. This harness never starts the target VM itself; see README.md."
 }
 
@@ -531,7 +581,7 @@ stage_needs_target_shutoff() {
 	fi
 
 	if ! state="$(dom_state "$uri" "$domain")"; then
-		warn "SKIP $label: cannot query state of target domain '$domain' via $uri${VIRSH_ERR:+: $VIRSH_ERR}"
+		warn "SKIP $label: cannot query state of target domain '$domain' via $uri${state:+: $state}"
 		results_row "$csv" "$scenario" precondition "" "" "" "" "" "" "SKIP target state could not be queried"
 		return 1
 	fi
@@ -552,7 +602,7 @@ stage_needs_target_shutoff() {
 require_dom_running() {
 	local uri="$1" domain="$2" label="$3"
 	local state
-	state="$(dom_state "$uri" "$domain")" || die "cannot query state of $label domain '$domain' via $uri${VIRSH_ERR:+: $VIRSH_ERR}"
+	state="$(dom_state "$uri" "$domain")" || die "cannot query state of $label domain '$domain' via $uri${state:+: $state}"
 	[ "$state" = "running" ] || die "$label domain '$domain' is '$state', expected 'running' for the external-snapshot lifecycle test -- see README.md's Stage 4 section."
 }
 

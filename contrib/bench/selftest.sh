@@ -283,7 +283,7 @@ check "--version reports this file's own sha256 and line count" \
 # because what matters is the outcome, not the spelling of the preamble.
 #
 # The harness folds virsh's stderr into captured output on purpose, so that a
-# failure's own text reaches $VIRSH_ERR (lib/common.sh, dom_state). xtrace also
+# failure's own text reaches the caller (lib/common.sh, dom_state). xtrace also
 # writes to stderr, and inside those command substitutions the two meet: the
 # trace lands in the captured VALUE. dom_state then returns a transcript of
 # itself instead of "shut off", and the preflight dies reporting
@@ -1066,6 +1066,139 @@ check "the attach stand-down carries virsh's words into the row" 1 \
 	"$(printf '%s' "$stage28" | grep -c 'SKIP could not attach the raw disk: \$attach_err')"
 
 echo
+echo "=== a failed query, and which channel carries virsh's words ==="
+
+# THE RULE, decided by whether the function has a value to return:
+#
+#   dom_state and domain_uuid return theirs on STDOUT, so every caller writes
+#   `v="$(f ...)"` -- a subshell. Anything they assign to a global dies with
+#   it, which is why VIRSH_ERR read EMPTY at nine of the fourteen places that
+#   interpolated it. Their failure text comes back in the captured value, where
+#   the caller already has it.
+#
+#   domain_exists returns nothing on stdout and is always called bare, so the
+#   global reaches the caller. It is the only function that sets VIRSH_ERR, and
+#   virsh_err_is_not_found is only meaningful straight after one of its calls.
+#
+# TWO FAILURE MODES PINNED HERE. Blank: `${VIRSH_ERR:+: $VIRSH_ERR}` after a
+# captured call, which can never produce text. Stale: VIRSH_ERR is a global
+# that a captured call cannot clear either, so a message about the source could
+# quote an error about the target -- asserted below by poisoning it first,
+# because that one actively sends an operator to the wrong machine.
+eval "$(extract "$COMMON" dom_state)"
+eval "$(extract "$COMMON" domain_uuid)"
+eval "$(extract "$COMMON" domain_exists)"
+eval "$(extract "$COMMON" virsh_err_is_not_found)"
+
+# Two lines each, which is what virsh really does and what makes the collapse
+# load-bearing: results_row strips commas but not newlines.
+VQ_NOTFOUND="error: failed to get domain 'ghost'
+error: Domain not found"
+VQ_AUTH="error: failed to connect to the hypervisor
+error: Cannot recv data: Permission denied"
+VQ_MODE=ok
+VQ_ERR=""
+
+# The error goes to STDERR, as virsh's does: dom_state folds it in with 2>&1,
+# and domain_exists with `2>&1 >/dev/null`, so one stub shape serves both.
+virsh_uri() {
+	local _uri="$1" verb="$2"
+	if [ "$VQ_MODE" != ok ]; then
+		printf '%s\n' "$VQ_ERR" >&2
+		return 1
+	fi
+	case "$verb" in
+	domstate) printf ' shutoff \n' ;;
+	domuuid) printf ' 4e1b-0000 \n' ;;
+	*) printf 'Name: x\n' ;;
+	esac
+	return 0
+}
+vq_mode() { VQ_MODE="$1" VQ_ERR="${2-}"; }
+vq_says() { case "$2" in *"$1"*) printf 'yes' ;; *) printf 'no' ;; esac; }
+vq_lines() { printf '%s\n' "$1" | grep -c ''; }
+
+vq_mode ok
+VQ_RC=0
+VQ_STATE="$(dom_state qemu:///x dom)" || VQ_RC=$?
+check "dom_state on success: rc 0 and the state, whitespace stripped" "0/shutoff" "$VQ_RC/$VQ_STATE"
+
+vq_mode fail "$VQ_NOTFOUND"
+VQ_RC=0
+VQ_STATE="$(dom_state qemu:///x dom)" || VQ_RC=$?
+check "dom_state on failure: rc 1" 1 "$VQ_RC"
+check "dom_state on failure: virsh's words come back in the value" yes \
+	"$(vq_says "failed to get domain 'ghost'" "$VQ_STATE")"
+check "dom_state on failure: collapsed to one line, so a CSV row cannot split" 1 "$(vq_lines "$VQ_STATE")"
+
+# It must not touch VIRSH_ERR at all. That global belongs to domain_exists, and
+# a captured call could not deliver it anyway -- leaving an assignment in would
+# be a promise the call shape cannot keep.
+VIRSH_ERR=POISON
+vq_mode fail "$VQ_NOTFOUND"
+VQ_STATE="$(dom_state qemu:///x dom)" || true
+check "dom_state leaves VIRSH_ERR alone" POISON "$VIRSH_ERR"
+
+# THE CROSS-CONTAMINATION, reproduced and then shown closed. A poisoned global
+# read after a captured call is what put a target's error into a fatal about
+# the source; building the detail from the captured value cannot do that.
+VIRSH_ERR="error: failed to get domain 'the-target'"
+vq_mode fail "$VQ_AUTH"
+VQ_STATE="$(dom_state qemu:///x the-source)" || true
+VQ_MSG="cannot query state of source domain 'the-source' via qemu:///x${VQ_STATE:+: $VQ_STATE}"
+check "a failed source query does not quote the target's error" no "$(vq_says 'the-target' "$VQ_MSG")"
+check "a failed source query quotes its own" yes "$(vq_says 'Permission denied' "$VQ_MSG")"
+
+vq_mode ok
+VQ_RC=0
+VQ_UUID="$(domain_uuid qemu:///x dom)" || VQ_RC=$?
+check "domain_uuid on success: rc 0 and the uuid" "0/4e1b-0000" "$VQ_RC/$VQ_UUID"
+vq_mode fail "$VQ_NOTFOUND"
+VQ_RC=0
+VQ_UUID="$(domain_uuid qemu:///x dom)" || VQ_RC=$?
+check "domain_uuid on failure: rc 1 and virsh's words in the value" "1/yes" \
+	"$VQ_RC/$(vq_says 'Domain not found' "$VQ_UUID")"
+check "domain_uuid on failure: collapsed too" 1 "$(vq_lines "$VQ_UUID")"
+
+# domain_exists is the one where the global is correct, because it has no value
+# on stdout and is never captured.
+VIRSH_ERR=POISON
+vq_mode ok
+VQ_RC=0
+domain_exists qemu:///x dom || VQ_RC=$?
+check "domain_exists on success: rc 0, and it clears VIRSH_ERR" "0/" "$VQ_RC/$VIRSH_ERR"
+
+vq_mode fail "$VQ_NOTFOUND"
+VQ_RC=0
+domain_exists qemu:///x dom || VQ_RC=$?
+check "domain_exists on failure: rc 1, with virsh's words in VIRSH_ERR" "1/yes" \
+	"$VQ_RC/$(vq_says 'Domain not found' "$VIRSH_ERR")"
+# The distinction the whole function exists for: virsh writes to stderr on
+# EVERY failure, so "VIRSH_ERR is non-empty" cannot tell these apart.
+check "a missing domain is recognised as missing" yes "$(virsh_err_is_not_found && echo yes || echo no)"
+vq_mode fail "$VQ_AUTH"
+domain_exists qemu:///x dom || true
+check "an auth failure is NOT read as 'does not exist'" no "$(virsh_err_is_not_found && echo yes || echo no)"
+
+# --- the rule, pinned -------------------------------------------------------
+# shellcheck disable=SC2016 # the needles are source text, not values to expand
+{
+	check "dom_state sets no global" no "$(has 'VIRSH_ERR=' "$(extract "$COMMON" dom_state)")"
+	check "domain_uuid sets no global" no "$(has 'VIRSH_ERR=' "$(extract "$COMMON" domain_uuid)")"
+	check "domain_exists is the one that does" yes "$(has 'VIRSH_ERR=' "$(extract "$COMMON" domain_exists)")"
+	# The guard that makes the whole finding unrepeatable: no line may both
+	# capture one of these calls and interpolate the global.
+	check "no reader interpolates VIRSH_ERR after a captured call" 0 \
+		"$(grep -hcE '"\$\((dom_state|domain_uuid|target_persistence)[^)]*\)".*VIRSH_ERR' "$COMMON" "$BENCH" | awk '{s+=$1} END {print s+0}')"
+	check "target_persistence is never captured" 0 "$(grep -c '"\$(target_persistence)"' "$BENCH")"
+	check "and it answers through a global instead" yes \
+		"$(grep -q 'TARGET_PERSIST=unknown' "$BENCH" && echo yes || echo no)"
+}
+
+unset -f virsh_uri dom_state domain_uuid domain_exists virsh_err_is_not_found vq_mode vq_says vq_lines
+unset VIRSH_ERR
+
+echo
 echo "=== wait_for_domain_ready: the start half of the lifecycle ==="
 
 # The counterpart of graceful_shutdown, and the one that answers three ways.
@@ -1095,6 +1228,11 @@ eval "$(extract "$COMMON" wait_for_domain_ready)"
 ready_idx="$WORK/ready.idx"
 ready_iter="$WORK/ready.iter"
 ready_cap="$WORK/ready.cap"
+# What the real dom_state hands back when it cannot answer: virsh's own words,
+# on stdout, because the value channel is free when there is no value. The stub
+# must do the same -- one that printed nothing would leave the caller's
+# normalisation untested and let a regression ship with this suite green.
+READY_UNREADABLE="error: failed to get domain 'dom'"
 
 sleep() {
 	local n
@@ -1126,8 +1264,12 @@ dom_state() {
 	fi
 	last=$((${#READY_SEQ[@]} - 1))
 	if [ "$n" -le "$last" ]; then s="${READY_SEQ[$n]}"; else s="${READY_SEQ[$last]}"; fi
-	# X stands for "libvirt could not be asked at all".
-	[ "$s" != X ] || return 1
+	# X stands for "libvirt could not be asked at all" -- and the real function
+	# prints its reason on stdout there, so this one does too.
+	if [ "$s" = X ]; then
+		printf '%s' "$READY_UNREADABLE"
+		return 1
+	fi
 	printf '%s' "$s"
 }
 READY_CHAN_XML="<domain><devices><channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel></devices></domain>"
@@ -1244,6 +1386,14 @@ ready_run "X" yes yes 30
 check "an unreadable state: 2, never 1" 2 "$READY_RC"
 check "an unreadable state: reported empty rather than guessed" "" "$STARTUP_STATE"
 check "an unreadable state: the reason says so" yes "$(ready_says 'could not be read' "$STARTUP_WHY")"
+# THE NORMALISATION, asserted from both sides. dom_state now answers with
+# virsh's words rather than with nothing, so the caller must recognise failure
+# by EXIT STATUS: treat the text as a state and it falls through to the `*)`
+# arm, which reports "it never started" and issues `virsh start` at a domain it
+# cannot even query. The state must come back empty AND the words must survive.
+check "an unreadable state: the error text is not mistaken for a state" "" "$STARTUP_STATE"
+check "an unreadable state: and libvirt's own words reach the reason" yes \
+	"$(ready_says "$READY_UNREADABLE" "$STARTUP_WHY")"
 
 ready_run "shutoff" yes yes 40
 check "never comes up: 1, a definite no" 1 "$READY_RC"
@@ -1391,8 +1541,13 @@ dom_state() {
 	[ "$i" -le "$last" ] || i="$last"
 	s="${GS_SEQ[$i]}"
 	printf '%s' "$((i + 1))" >"$gs_idx"
-	# X stands for "libvirt could not be asked at all".
-	[ "$s" != X ] || return 1
+	# X stands for "libvirt could not be asked at all", and the real dom_state
+	# prints virsh's words on stdout there -- so the stub does, and the check
+	# below proves the error text is not mistaken for a state.
+	if [ "$s" = X ]; then
+		printf "error: failed to get domain 'dom'"
+		return 1
+	fi
 	printf '%s' "$s"
 }
 virsh_uri() {

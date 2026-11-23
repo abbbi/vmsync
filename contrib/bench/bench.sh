@@ -88,7 +88,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 # tolerated.
 #
 # This harness folds a virsh command's stderr into its stdout on purpose, so
-# that a failure's own text reaches $VIRSH_ERR instead of arriving as a bare
+# that a failure's own text reaches the caller instead of arriving as a bare
 # "cannot query state" -- see dom_state in lib/common.sh. xtrace also writes to
 # stderr, and inside those command substitutions the two meet: the trace lines
 # land in the captured VALUE. dom_state then returns a transcript of itself
@@ -3255,8 +3255,8 @@ stage_define_domain_uuid_collision() {
         fi
 
         local src_uuid target_uuid_before
-        src_uuid="$(domain_uuid "$SOURCE_URI" "$SOURCE_DOMAIN")" || { warn "could not read source domain UUID via $SOURCE_URI: $VIRSH_ERR"; return 1; }
-        target_uuid_before="$(domain_uuid "$TARGET_URI" "$TARGET_DOMAIN")" || { warn "could not read target domain UUID via $TARGET_URI: $VIRSH_ERR"; return 1; }
+        src_uuid="$(domain_uuid "$SOURCE_URI" "$SOURCE_DOMAIN")" || { warn "could not read source domain UUID via $SOURCE_URI${src_uuid:+: $src_uuid}"; return 1; }
+        target_uuid_before="$(domain_uuid "$TARGET_URI" "$TARGET_DOMAIN")" || { warn "could not read target domain UUID via $TARGET_URI${target_uuid_before:+: $target_uuid_before}"; return 1; }
         [ "$target_uuid_before" = "$src_uuid" ] || warn "target UUID ($target_uuid_before) doesn't match source UUID ($src_uuid) right after a fresh -reinit baseline -- unexpected, but continuing"
 
         # The target replica ($TARGET_DOMAIN) itself is still defined at this
@@ -3301,7 +3301,7 @@ stage_define_domain_uuid_collision() {
                         [ "$target_uuid_after" != "$src_uuid" ] || { pass=no; reason="target UUID unchanged ($target_uuid_after) -- the uuid-collision fallback does not appear to have been exercised"; }
                 else
                         pass=no
-                        reason="could not read target UUID after the run: $VIRSH_ERR"
+                        reason="could not read target UUID after the run${target_uuid_after:+: $target_uuid_after}"
                 fi
         fi
 
@@ -4745,7 +4745,7 @@ stage_fence_agent() {
 	# starting the source ourselves, the same way Stage 4 does.
 	local src_state
 	src_state="$(dom_state "$SOURCE_URI" "$SOURCE_DOMAIN")" || {
-		warn "cannot query the source domain's state${VIRSH_ERR:+: $VIRSH_ERR}"
+		warn "cannot query the source domain's state${src_state:+: $src_state}"
 		# Recorded for the same reason as the baseline abort below.
 		results_row "$CSV" "$sc" stood-down 1 "" "" "" "" "" "FAIL could not query the source domain state"
 		return 1
@@ -9591,7 +9591,14 @@ stage_reinit_order() {
 	# shellcheck disable=SC2064
 	trap "REPLACED_DISK_ACTION='$saved_action'" RETURN
 
-	# target_persistence -> prints "yes", "no" or "unknown".
+	# target_persistence -> sets TARGET_PERSIST to "yes", "no" or "unknown",
+	# and TARGET_PERSIST_WHY to virsh's own words when the answer is unknown.
+	#
+	# SET, NOT PRINTED, and called BARE for that reason: "unknown" is a real
+	# answer, so stdout is taken by the value and the reason needs a channel of
+	# its own. A global only reaches the caller if the call is not a command
+	# substitution -- captured, the subshell discards it, which is what left
+	# both of this function's "could not tell" warnings blank.
 	#
 	# Not domain_exists: dominfo succeeds for a TRANSIENT domain too, which is
 	# exactly the state a -force-clean that undefined a running domain leaves
@@ -9621,10 +9628,13 @@ stage_reinit_order() {
 	# first, then decide on the status and the text separately.
 	target_persistence() {
 		local out rc
+		TARGET_PERSIST=unknown
+		TARGET_PERSIST_WHY=""
 		out="$(virsh_uri "$TARGET_URI" dominfo "$TARGET_DOMAIN" 2>&1)" && rc=0 || rc=$?
 		if [ "$rc" != 0 ]; then
-			VIRSH_ERR="$out"
-			printf 'unknown\n'
+			# Collapsed: this reaches a warn and a results_row note, and
+			# results_row strips commas but not newlines.
+			TARGET_PERSIST_WHY="$(printf '%s' "$out" | tr -s '[:space:]' ' ')"
 			return 0
 		fi
 		# The Persistent LINE, not a substring of the whole table: dominfo
@@ -9638,9 +9648,9 @@ stage_reinit_order() {
 			"")
 				# dominfo exited 0 without the field at all: not a transient
 				# domain, an output shape this check does not understand.
-				VIRSH_ERR="$out"; printf 'unknown\n' ;;
-			*yes*) printf 'yes\n' ;;
-			*)     printf 'no\n' ;;
+				TARGET_PERSIST_WHY="$(printf '%s' "$out" | tr -s '[:space:]' ' ')" ;;
+			*yes*) TARGET_PERSIST=yes ;;
+			*)     TARGET_PERSIST=no ;;
 		esac
 	}
 
@@ -9686,9 +9696,10 @@ stage_reinit_order() {
 		# when it had not, which is a worse outcome than saying nothing: it
 		# blames the engine for a question the harness failed to ask.
 		local persist
-		persist="$(target_persistence)"
+		target_persistence
+		persist="$TARGET_PERSIST"
 		if [ "$persist" = unknown ]; then
-			warn "could not tell whether $TARGET_DOMAIN is still persistent, so nothing is claimed about it${VIRSH_ERR:+: $VIRSH_ERR}"
+			warn "could not tell whether $TARGET_DOMAIN is still persistent, so nothing is claimed about it${TARGET_PERSIST_WHY:+: $TARGET_PERSIST_WHY}"
 		fi
 		if [ "$persist" = no ]; then
 			# Only reachable when a sub-test below already failed: destroying a
@@ -9725,14 +9736,15 @@ stage_reinit_order() {
 		# Only -force-clean can undefine, so only it is asked.
 		if [ "$verb" = "-force-clean" ]; then
 			local persist
-			persist="$(target_persistence)"
+			target_persistence
+			persist="$TARGET_PERSIST"
 			if [ "$persist" = unknown ]; then
 				# Asserted on nothing rather than guessed. A failed query is
 				# not evidence that the engine undefined anything, and
 				# recording it as a FAIL is how a harness bug gets reported as
 				# an engine regression -- which is exactly what happened on
 				# 2026-10-06.
-				warn "SKIP 20f: could not determine whether $TARGET_DOMAIN is still persistent${VIRSH_ERR:+: $VIRSH_ERR}"
+				warn "SKIP 20f: could not determine whether $TARGET_DOMAIN is still persistent${TARGET_PERSIST_WHY:+: $TARGET_PERSIST_WHY}"
 				results_row "$CSV" "$sc" the_refused_force_clean_left_the_target_domain_defined SKIP "" "" "" "" "" "SKIP persistence query did not answer"
 				[ -n "$phase" ] || true
 				return 0
@@ -9765,6 +9777,7 @@ stage_reinit_order() {
 		|| warn "stage 20 could not leave $TARGET_DOMAIN with a freshly written replica; the next stage starts from a replica whose qcow2 headers were touched by a paused boot"
 
 	unset -f target_persistence ro_cleanup ro_assert_nothing_destroyed
+	unset TARGET_PERSIST TARGET_PERSIST_WHY
 	return 0
 }
 
