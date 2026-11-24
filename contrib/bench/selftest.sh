@@ -43,6 +43,10 @@ extract() {
 	# report heading uses. Taken verbatim so neither can be restated here
 	# and drift from bench.sh.
 	grep -E '^ALL_STAGES="' "$BENCH"
+	# The regex that keeps every other stage's rows out of the matrix's own
+	# verdict. Taken verbatim for the same reason as ALL_STAGES: restated here
+	# it would drift from the one stage_verdict actually uses.
+	grep -E "^NON_MATRIX_SCENARIOS='" "$BENCH"
 	extract "$BENCH" stage_number
 	extract "$BENCH" ungraded_row
 	extract "$BENCH" fo_check
@@ -1021,6 +1025,27 @@ for s in ${ALL_STAGES//,/ }; do
 done
 check "every stage in ALL_STAGES has a number of its own" "" "$unnumbered"
 check "every stage in ALL_STAGES has a section in report.md" "" "$unprinted"
+
+# AND no stage's rows may land in the MATRIX's verdict. Stage 1's verdict is
+# awk over results.csv filtered by NON_MATRIX_SCENARIOS, and it is the one
+# verdict that is a COUNT rather than a list of named checks -- "172 of 176
+# vmsync runs exited non-zero" -- so a stage missing from that regex moves the
+# denominator and nothing else in the report disagrees with it.
+#
+# Driven from ALL_STAGES and from each stage's OWN stage_pattern, so a stage
+# added tomorrow is covered without anybody remembering this exists. The
+# representative row name is the first literal alternative of that pattern:
+# ^(no-helper|precondition)$ -> no-helper, ^verify-(guard|fast)$ ->
+# verify-guard, ^ext-snapshot$ -> itself.
+leaked=""
+for s in ${ALL_STAGES//,/ }; do
+	[ "$s" = matrix ] && continue
+	pat="$(stage_pattern "$s")"
+	[ -n "$pat" ] || continue
+	row="$(printf '%s' "$pat" | sed -e 's/^\^//' -e 's/\$$//' -e 's/(\([^|)]*\)[^)]*)/\1/')"
+	printf '%s\n' "$row" | grep -Eq "$NON_MATRIX_SCENARIOS" || leaked="$leaked $s($row)"
+done
+check "no stage's rows are counted into the matrix verdict" "" "$leaked"
 
 # And the numbers have to be distinct, or one stage's rows print under another
 # stage's heading and the check above is satisfied by the wrong section.
@@ -2292,6 +2317,174 @@ check "the ignore run asserts dropped_disks stays empty" 1 \
 unset -f virsh_uri source_nonqcow_devs graceful_shutdown s28_virsh_uri s28_virsh_uri_keep s28_plantable s28_clear s28_did s28_teardown s28_stuck_clear s28_code s28_line ignore_disk_plantable ignore_disk_clear_live_leftover ignore_disk_restore dom_state domain_agent_channel
 unset SOURCE_URI SOURCE_DOMAIN SOURCE_HOST SOURCE_LOCAL PROBE_MAY_STOP_SOURCE
 
+
+echo
+echo "=== stage 29: syncing with no bridge helper on the target ==="
+
+# THE CLAIM THIS STAGE EXISTS FOR: vmsync is usable on an estate that has not
+# deployed vmsync-bridge-helper. The pre-commit integrity check is on by
+# default and needs that binary, so the first thing such an estate meets is a
+# refusal -- and the stage asserts both that the refusal names its own way past
+# and that the way past actually works, twice, with both degradations
+# announced.
+#
+# nobridge_sync is driven directly, because what it has to get right is which
+# flags reach vmsync: BENCH_SYNC_EXTRA defaults to -compress, and -compress
+# against a missing helper is refused by a DIFFERENT check that -no-checksum
+# does not get past, so inheriting it would make every run in the stage fail
+# for the wrong reason while the stage still reported a refusal.
+#
+# The stage body itself is pinned to its source text. Its four refusal claims
+# are four separate greps of one line, and a run on hardware cannot tell a
+# dropped claim from a refusal that stopped making it -- which is the whole
+# reason the claims are asserted one by one rather than as a single match.
+eval "$(extract "$BENCH" nobridge_sync)"
+
+nb_args="$WORK/nb.args"
+run_vmsync() {
+	# The recorder. Everything after the scenario and phase is what vmsync
+	# would be given.
+	shift 2
+	printf '%s\n' "$*" >"$nb_args"
+}
+nb_sent() {
+	BENCH_SYNC_EXTRA=()
+	[ -n "$1" ] && read -ra BENCH_SYNC_EXTRA <<<"$1"
+	nobridge_sync scen phase -no-checksum
+	cat "$nb_args"
+}
+
+check "a plain -compress is dropped" \
+	"-no-checksum -target-disk-owner=off" \
+	"$(nb_sent "-compress -target-disk-owner=off")"
+check "and so is -compress=zstd with a level beside it" \
+	"-no-checksum -target-disk-owner=off" \
+	"$(nb_sent "-compress=zstd -compress-level=19 -target-disk-owner=off")"
+check "and -netbuffer in both spellings" \
+	"-no-checksum -target-disk-owner=off" \
+	"$(nb_sent "-netbuffer -netbuffer=64k,256M -target-disk-owner=off")"
+# -use-ssh without one of the other two is refused by vmsync in its own right,
+# so carrying it into a helperless run buys a third unrelated refusal.
+check "and -use-ssh, which has nothing left to tunnel" \
+	"-no-checksum -target-disk-owner=off" \
+	"$(nb_sent "-use-ssh -target-disk-owner=off")"
+# THE OTHER HALF, and the one a careless filter breaks: everything that is not
+# a bridge flag has to survive. -target-disk-owner=off is what makes a sync
+# work at all under a session libvirt, so a stage that dropped it would fail
+# for a reason that has nothing to do with the helper.
+check "every other flag is kept, in order" \
+	"-no-checksum -target-runtime-dir=/r -target-disk-owner=off -io-depth 8" \
+	"$(nb_sent "-target-runtime-dir=/r -target-disk-owner=off -io-depth 8")"
+check "an empty BENCH_SYNC_ARGS sends just the stage's own flags" \
+	"-no-checksum" "$(nb_sent "")"
+check "and a bridge-only one sends the same" \
+	"-no-checksum" "$(nb_sent "-compress")"
+unset -f run_vmsync
+
+# --- the source text, so a deleted claim is a failure ----------------------
+stage29="$(extract "$BENCH" stage_no_helper)"
+s29_code() { printf '%s' "$stage29" | grep -v '^[[:space:]]*#'; }
+s29_line() { s29_code | grep -n -- "$1" | sed -n '1s/:.*//p'; }
+
+# THE ONE THAT MAKES THE STAGE MEAN ANYTHING. Pointed at the real helper path,
+# every run below succeeds for the ordinary reason and all fourteen checks pass
+# while testing nothing at all.
+check "the stage points the helper path at something that cannot exist" 1 \
+	"$(s29_code | grep -c 'local absent=/nonexistent/vmsync-bridge-helper')"
+check "and uses it on the runs that must be helperless" 3 \
+	"$(s29_code | grep -c -- '-bridge-helper-path "\$absent"')"
+# 29d is the mirror and must NOT be helperless, or it compares nothing.
+check "while the supervised comparison run does not" 1 \
+	"$(s29_code | grep -c 'nobridge_sync "\$sc" supervised -no-checksum$')"
+
+check "every sync in the stage goes through nobridge_sync" 4 \
+	"$(s29_code | grep -c 'nobridge_sync "\$sc"')"
+check "and none through bench_sync, which would add -compress" 0 \
+	"$(s29_code | grep -c 'bench_sync "\$sc"')"
+
+# The refusal has to be what ENDED the run. A plain grep of the whole log
+# passes on a message that was printed and then recovered from.
+check "the refusal is read from the line that ended the run" 1 \
+	"$(s29_code | grep -c "grep -m1 'sync failed error=.\*vmsync-bridge-helper'")"
+check "and each of its four claims is checked against that line" 4 \
+	"$(s29_code | grep -c 'printf .%s. "\$ended" | grep_q')"
+
+check "the full copy a reinit asks for is asserted" 1 \
+	"$(s29_code | grep -c "grep_q 'starting full pull backup'")"
+check "and the second run is asserted to be incremental" 1 \
+	"$(s29_code | grep -c "grep_q 'starting incremental pull backup'")"
+check "the unsupervised degradation is asserted to be announced" 1 \
+	"$(s29_code | grep -c 'grep_q "UNSUPERVISED" "\$RUN_LOG"; then ok=0')"
+check "and the unleased lock too" 1 \
+	"$(s29_code | grep -c 'grep_q "run lock is NOT leased"')"
+# The mirror reads the SAME grep and wants the opposite answer. Two one-sided
+# pins could both pass against a vmsync that never prints the line; the pair
+# cannot.
+check "and the mirror wants that same warning ABSENT" 1 \
+	"$(s29_code | grep -c 'grep_q "UNSUPERVISED" "\$RUN_LOG"; then ok=1')"
+check "the helperless runs come before the supervised comparison" yes \
+	"$([ "$(s29_line 'baseline -reinit -no-checksum')" -lt "$(s29_line 'supervised -no-checksum')" ] && echo yes || echo no)"
+
+# --- and which transport every other stage actually uses --------------------
+#
+# THE SILENT REPLACEMENT. BENCH_SYNC_EXTRA is `${BENCH_SYNC_ARGS--compress}`,
+# so setting BENCH_SYNC_ARGS at all drops the -compress default -- and a
+# session-libvirt rig MUST set it, for -target-disk-owner=off alone. The flags
+# appear in every logged command line, where an absence is not something a
+# reader notices, so the harness said nothing and a rig copied uncompressed
+# for weeks while its config comment said compression was "left out for a
+# first run".
+eval "$(extract "$BENCH" preflight_transport)"
+TARGET_HOST=t29
+CONF=/etc/bench.conf
+pt_said() {
+	# $1 is BENCH_SYNC_ARGS, or the word UNSET for a config that never sets it.
+	BENCH_SYNC_EXTRA=()
+	if [ "$1" = UNSET ]; then
+		unset BENCH_SYNC_ARGS
+	else
+		BENCH_SYNC_ARGS="$1"
+		[ -n "$1" ] && read -ra BENCH_SYNC_EXTRA <<<"$1"
+	fi
+	log() { printf '%s\n' "$*"; }
+	preflight_transport
+}
+
+check "a bare -compress reads as bridged" bridged \
+	"$(pt_said "-compress -target-disk-owner=off" | grep -oE 'bridged|UNCOMPRESSED|-compress default' | head -1)"
+check "and so does -compress=zstd" bridged \
+	"$(pt_said "-compress=zstd -compress-level=19" | grep -oE 'bridged|UNCOMPRESSED|-compress default' | head -1)"
+check "and -netbuffer on its own" bridged \
+	"$(pt_said "-netbuffer=64k,256M" | grep -oE 'bridged|UNCOMPRESSED|-compress default' | head -1)"
+# -use-ssh creates no bridge -- it tunnels one that -compress/-netbuffer made,
+# and vmsync refuses it on its own without them. Reporting it as bridged would
+# promise a relay that cannot exist.
+check "-use-ssh alone is not a bridge" UNCOMPRESSED \
+	"$(pt_said "-use-ssh -target-disk-owner=off" | grep -oE 'bridged|UNCOMPRESSED|-compress default' | head -1)"
+check "a config with no bridge flag says so plainly" UNCOMPRESSED \
+	"$(pt_said "-target-runtime-dir=/r -target-disk-owner=off" | grep -oE 'bridged|UNCOMPRESSED|-compress default' | head -1)"
+# NAMED, so the reader can see the line to edit rather than being told that
+# one exists.
+check "and quotes the setting that replaced the default" 1 \
+	"$(pt_said "-target-disk-owner=off" | grep -c -- '"-target-disk-owner=off"')"
+check "and says where it is" 1 \
+	"$(pt_said "-target-disk-owner=off" | grep -c '/etc/bench.conf')"
+# Unset and empty are different: unset takes the default, empty is a choice.
+check "an unset BENCH_SYNC_ARGS takes the default" "-compress default" \
+	"$(pt_said UNSET | grep -oE 'bridged|UNCOMPRESSED|-compress default' | head -1)"
+check "while an empty one is a deliberate no" UNCOMPRESSED \
+	"$(pt_said "" | grep -oE 'bridged|UNCOMPRESSED|-compress default' | head -1)"
+unset -f log pt_said preflight_transport
+unset TARGET_HOST CONF BENCH_SYNC_ARGS
+
+# And said on a DRY RUN too, which is when somebody is checking what the real
+# run would do. Everything else in preflight needs a host to ask; this needs
+# only the config, so it goes in front of the skip.
+pf_body="$(extract "$BENCH" preflight | grep -v '^[[:space:]]*#')"
+pf_at() { printf '%s' "$pf_body" | grep -n -- "$1" | sed -n '1s/:.*//p'; }
+check "the transport line is printed before the dry-run skip" yes \
+	"$([ "$(pf_at preflight_transport)" -lt "$(pf_at 'DRY_RUN')" ] && echo yes || echo no)"
+unset -f pf_at
 echo
 if [ "$SKIPPED" -ne 0 ]; then
 	printf '%d passed, %d failed -- the sweep cases were SKIPPED on this machine, so a clean run here does not mean the sweep is safe\n' "$PASS" "$FAIL"

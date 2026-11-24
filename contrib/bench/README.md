@@ -245,10 +245,22 @@ design, reserving 4N target ports when both are on, so the verify modes
 compose with the bridge rather than working around it. Stage 3 already
 passed `-compress` unconditionally before this was a setting.
 
-`-compress` needs `vmsync-bridge-helper` on the **target** host. Without it
-every affected stage fails at its baseline — and says so, naming this
-setting. Set `BENCH_SYNC_ARGS=""` to turn it off, or to any vmsync transport
-flags (`"-compress=zstd -compress-level 3"`, `"-compress -netbuffer 128k,1G"`).
+`-compress` needs `vmsync-bridge-helper` on the **target** host, and a
+**writable bridge state directory** there — `/run/vmsync-bridge`, which is a
+compile-time constant (`pkg/nbdbridge/remote.go`) with no flag to relocate it,
+so on a rig where `/run` is root-owned it needs a `tmpfiles.d` line exactly
+like `/run/vmsync-locks` does. Without either, every affected stage fails at
+its baseline — and says so, naming this setting. Set `BENCH_SYNC_ARGS=""` to
+turn it off, or to any vmsync transport flags
+(`"-compress=zstd -compress-level 3"`, `"-compress -netbuffer 128k,1G"`).
+
+**Setting `BENCH_SYNC_ARGS` REPLACES the `-compress` default rather than
+adding to it.** A rig that has to set it for other reasons — and a
+`qemu:///session` rig must, for `-target-disk-owner=off` alone — silently
+stops compressing. Every run now states the transport it is actually using in
+one line at preflight, including on a `--dry-run`, because the flags appear in
+every logged command line and an absence there is not something a reader
+notices.
 
 ## What this does and does not control
 
@@ -1962,6 +1974,45 @@ stage's syncs are refused and nothing names the cause — the disk is raw, so
 `source_qcow_devs` cannot see it and stage 15's count, the base fingerprints and
 the target paths all still look right. The warning the stage prints on its way
 out gives the exact `virsh detach-disk` that removes it.
+
+### Stage 29 (`no-helper`), opt-in — syncing with no `vmsync-bridge-helper`
+
+The claim: **vmsync is usable on an estate that has not deployed the helper**,
+and is honest about what that costs.
+
+`cmd/vmsync/helperrefusal.go` keeps the list of what the helper is for — six
+things refused without it, two more that degrade. The pre-commit integrity
+check is the one that is **on by default**, so it is the one a helperless
+estate meets first, and whether its refusal hands the decision over or takes
+it is the difference between "vmsync needs a binary on every target" and "pass
+`-no-checksum`".
+
+The stage points `-bridge-helper-path` at a path that cannot exist rather than
+moving the real binary, so a run that dies midway leaves the rig untouched.
+
+| check | what the answer decides |
+| --- | --- |
+| **a sync with no helper and no `-no-checksum` is refused**, and the helper is what ended the run | that the check cannot be skipped silently. Two greps, not one: a message that appears in a log is not the same as the message that stopped the run |
+| the refusal names the integrity check, `-no-checksum`, both bridge flags as still refused, and the unsupervised/unleased costs | four claims, four checks. An operator reading this line is deciding whether to deploy a binary to every target they own, and a refusal that states part of the picture has made that decision while claiming to hand it over |
+| **`-no-checksum` then syncs with no helper at all**, and really takes the full copy `-reinit` asks for | that the way past the refusal is not a dead end. Without this the refusal is advice nobody has checked |
+| and a **second** helperless sync succeeds and is **incremental** | that the baseline is continuable. The checkpoint is written by the same run that copies, so a run that copied and failed to record looks identical until the next one — a helperless estate would re-copy every disk on every run while reporting success |
+| both degradations are **announced**: `UNSUPERVISED` and `run lock is NOT leased` | the half that cannot be inferred from behaviour. A wedged target command parks the run with no symptom on this side, and an unleased lock looks exactly like a leased one until the host dies, so the log line is the only thing that tells anyone afterwards which kind of run it was |
+| **and `-no-checksum` does *not* silence supervision** on a target that *does* have the helper | the mirror, and the reason vmsync's helper probe runs on every path. Supervision has nothing to do with checksums. Two one-sided pins would both pass against a vmsync that never prints the line; the pair cannot |
+
+Stage 13g covers the *other* refusal — the one a **bridged** run gets from
+`nbdbridge.CheckRemote`. This stage is about running with no bridging at all,
+which is the configuration a helperless estate actually has.
+
+Its syncs go through `nobridge_sync`, which is `bench_sync` with
+`-compress`/`-netbuffer`/`-use-ssh` filtered out of `BENCH_SYNC_ARGS` and
+everything else kept: those flags need the very binary this stage removes, and
+`-no-checksum` does not get past *their* refusal — so inheriting one would make
+every run here fail for the wrong reason while the stage still saw a refusal
+and still passed.
+
+Measured on npftest: **14 of 14 checks pass**. 29d skips cleanly on a target
+that has no helper to compare against — which is itself the configuration
+29a–c test.
 
 ## Files
 

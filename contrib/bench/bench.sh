@@ -141,7 +141,7 @@ STAGES="matrix,verify,reinit,snapshot,journal,retention"
 # The "want ..." list this was first copied from had checksum third, for
 # historical reasons, which made `--stages all` run stage 13 before stage 3
 # while --help promised stage-number order.
-ALL_STAGES="matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,checksum,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease,redefine-probe,reinit-orphan,supervise,exclude,generation,qmp-census,ignore-disk"
+ALL_STAGES="matrix,verify,reinit,snapshot,define,failover,fence-agent,verify-long,retention,restore,invert,wedge,checksum,verify-failure,commit-barrier,interrupted-reinit,journal,colocated,leftovers,reinit-order,lock-lease,redefine-probe,reinit-orphan,supervise,exclude,generation,qmp-census,ignore-disk,no-helper"
 
 # INTERRUPTED: vmsync catches SIGINT/SIGTERM itself (cleanup, then a plain
 # os.Exit(1) -- see cmd/vmsync/main.go's own signal handling), so a Ctrl+C
@@ -236,6 +236,7 @@ Options:
                                                      26  generation
                                                      27  qmp-census
                                                      28  ignore-disk
+                                                     29  no-helper
                            Or one of two shorthands, used on their own rather
                            than inside a list:
                              all             every stage above, in that order
@@ -253,7 +254,8 @@ Options:
                            invert, wedge, checksum, verify-failure,
                            commit-barrier, interrupted-reinit, colocated,
                            leftovers, reinit-order, lock-lease,
-                           redefine-probe, reinit-orphan, supervise, exclude and generation are
+                           redefine-probe, reinit-orphan, supervise, exclude,
+                           generation and no-helper are
                            opt-in, see below. commit-barrier additionally
                            needs a source domain with two or more qcow2 disks,
                            and skips cleanly without one. colocated needs
@@ -939,6 +941,10 @@ fi
 # --- preflight -------------------------------------------------------------
 
 preflight() {
+        # Before the dry-run skip, because it reads nothing but the config and a
+        # dry run is exactly when somebody is checking what the real one would
+        # do. Everything below this needs a host to ask.
+        preflight_transport
         if [ "$DRY_RUN" = yes ]; then
                 log "preflight: skipped entirely (--dry-run needs nothing but bash itself)"
                 return
@@ -967,6 +973,39 @@ preflight() {
         preflight_bridge_helper
         preflight_target_vmsync
         log "preflight OK"
+}
+
+# preflight_transport says which transport flags every stage except the matrix
+# will actually use, once per run.
+#
+# BECAUSE THE DEFAULT IS A REPLACEMENT, NOT A MERGE. BENCH_SYNC_EXTRA is
+# `${BENCH_SYNC_ARGS--compress}`, so a rig that has to set BENCH_SYNC_ARGS at
+# all -- and a session-libvirt rig must, for -target-disk-owner=off alone --
+# silently loses the -compress default and copies uncompressed for the rest of
+# its life. Nothing in the report said so: the flags appear in every logged
+# command line, where an absence is not something a reader notices.
+#
+# A plain line and not a warning: running uncompressed is a legitimate choice,
+# and a warning on every run of a deliberate configuration is one nobody reads.
+# What was missing was the statement, not an opinion about it.
+preflight_transport() {
+	local flag have_bridge=no
+	if [ ${#BENCH_SYNC_EXTRA[@]} -gt 0 ]; then
+		for flag in "${BENCH_SYNC_EXTRA[@]}"; do
+			case "$flag" in
+			-compress | -compress=* | -netbuffer | -netbuffer=*) have_bridge=yes ;;
+			esac
+		done
+	fi
+	if [ "$have_bridge" = yes ]; then
+		log "transport: stages other than the matrix add ${BENCH_SYNC_EXTRA[*]} -- bridged, so they need vmsync-bridge-helper on $TARGET_HOST and a writable bridge state directory there"
+		return 0
+	fi
+	if [ -z "${BENCH_SYNC_ARGS+x}" ]; then
+		log "transport: no BENCH_SYNC_ARGS in $CONF, so stages other than the matrix take the -compress default"
+		return 0
+	fi
+	log "transport: stages other than the matrix copy UNCOMPRESSED -- BENCH_SYNC_ARGS in $CONF is \"${BENCH_SYNC_ARGS}\", which REPLACES the harness's -compress default rather than adding to it. Put -compress back in that line to restore it."
 }
 
 # preflight_target_vmsync reports what vmsync is on the TARGET host, which is
@@ -5173,7 +5212,7 @@ stage_fence_agent() {
 # counting as one of its own transport runs -- so a full --stages all run
 # reported Stage 1 as FAILED, with a count of "N of M vmsync runs exited
 # non-zero" that no transport combination in the matrix table accounts for.
-NON_MATRIX_SCENARIOS='^(generation$|verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$|colocated$|leftovers$|reinit-order$|lock-lease$|redefine-probe$|reinit-orphan$|supervise$|exclude$|qmp-census$|ignore-disk$)'
+NON_MATRIX_SCENARIOS='^(generation$|verify-|reinit-after-failures$|ext-snapshot$|define-|failover$|fence-agent$|retention$|restore$|invert$|wedge$|checksum$|commit-barrier$|interrupted-reinit$|journal$|colocated$|leftovers$|reinit-order$|lock-lease$|redefine-probe$|reinit-orphan$|supervise$|exclude$|qmp-census$|ignore-disk$|no-helper$)'
 
 # stage_pattern STAGE -> the regex matching that stage's scenario column.
 # --- Stage 8: verify after a long incremental chain --------------------------
@@ -13836,6 +13875,189 @@ stage_ignore_disk() {
 	return 0
 }
 
+# nobridge_sync SCENARIO PHASE ARGS... -- bench_sync with the bridge flags
+# taken out of BENCH_SYNC_EXTRA.
+#
+# PAIRED WITH stage 29, which runs against a target that has no
+# vmsync-bridge-helper. -compress and -netbuffer need that binary on that host:
+# nbdbridge.CheckRemote refuses a bridged run without it and -no-checksum does
+# not get past that refusal, so a stage testing the helperless path must not
+# inherit one of them or every run fails for the wrong reason. Everything else
+# in BENCH_SYNC_ARGS stays, because flags like -target-disk-owner=off are what
+# make a sync work on a given rig at all.
+#
+# Filters on each call rather than preparing a global once: it is a handful of
+# string comparisons next to a sync, and the alternative is a function with an
+# ordering requirement nobody can see at the call site. The empty cases are
+# spelled out for the reason bench_sync spells them out -- "${arr[@]}" on an
+# empty array is an unbound variable under `set -u` on bash before 4.4.
+nobridge_sync() {
+	local scenario="$1" phase="$2"
+	shift 2
+	local -a keep=()
+	local a
+	if [ ${#BENCH_SYNC_EXTRA[@]} -gt 0 ]; then
+		for a in "${BENCH_SYNC_EXTRA[@]}"; do
+			case "$a" in
+			-compress | -compress=* | -compress-level=* | -netbuffer | -netbuffer=* | -use-ssh) continue ;;
+			esac
+			keep+=("$a")
+		done
+	fi
+	if [ ${#keep[@]} -gt 0 ]; then
+		run_vmsync "$scenario" "$phase" "$@" "${keep[@]}"
+	else
+		run_vmsync "$scenario" "$phase" "$@"
+	fi
+}
+
+# --- Stage 29: a target with no vmsync-bridge-helper -------------------------
+#
+# THE CLAIM: vmsync is usable on an estate that has not deployed
+# vmsync-bridge-helper, and is honest about what that costs.
+#
+# cmd/vmsync/helperrefusal.go keeps the list of what the helper is for -- six
+# things refused without it, two more that degrade -- and this stage exists
+# because that list is long enough that the first refusal an operator meets
+# reads as "vmsync cannot be used without this binary". The pre-commit
+# integrity check is the one that is ON BY DEFAULT, so it is the one they meet,
+# and whether its refusal hands the decision over or takes it is exactly the
+# difference between those two readings.
+#
+# Both halves are asserted: the refusal names the way past AND what the way
+# past does not cover, and then the way past is actually taken -- twice, since
+# a baseline nothing can extend is not a working sync.
+#
+# Stage 13g covers the OTHER refusal, the one a BRIDGED run gets from
+# nbdbridge.CheckRemote. This stage is about running with no bridging at all,
+# which is the configuration an estate without the helper actually has.
+stage_no_helper() {
+	log "=== Stage 29: a sync against a target with no vmsync-bridge-helper ==="
+	local sc=no-helper ok ended helper
+	# A path that cannot exist, rather than moving the real binary: the helper
+	# belongs to the operator and a stage that renamed it would leave the rig
+	# broken if the run died in between. vmsync treats absent and unreadable
+	# alike, so pointing at nothing tests the same branch.
+	local absent=/nonexistent/vmsync-bridge-helper
+
+	if [ "$DRY_RUN" = yes ]; then
+		results_row "$CSV" "$sc" dryrun DRYRUN "" "" "" "" "" "SKIP dry run"
+		return 0
+	fi
+	if [ -z "${TARGET_HOST:-}" ]; then
+		warn "SKIP stage 29: needs TARGET_HOST in $CONF -- 29d asks the target whether the real helper is there, to compare a supervised run against the helperless ones."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP no TARGET_HOST"
+		return 0
+	fi
+	stage_needs_target_shutoff "$CSV" "$sc" "stage no-helper" || return 0
+
+	# --- 29a: refused, and the refusal hands the decision over --------------
+	nobridge_sync "$sc" refused -bridge-helper-path "$absent"
+	if [ "$RUN_RC" != 0 ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "a sync with no helper and no -no-checksum is refused" "$ok" \
+		"the run exited 0 with no helper at $absent, so the integrity check that is on by default either did not run or ran without the binary that implements it. $(log_reason "$RUN_LOG")"
+
+	# The refusal has to be what ENDED the run, not words that appear
+	# somewhere in its log -- 13g's shape, and for the same reason.
+	ended="$(grep -m1 'sync failed error=.*vmsync-bridge-helper' "$RUN_LOG" 2>/dev/null || true)"
+	if [ -n "$ended" ]; then ok=0; else ok=1; fi
+	fo_check "$sc" "and it is the helper that ended the run" "$ok" \
+		"no 'sync failed error=...vmsync-bridge-helper' in $RUN_LOG, so this stage reached nothing it tests: either the run died earlier for an unrelated reason, or the check no longer needs the helper"
+
+	# FOUR THINGS THE REFUSAL MUST SAY, each asserted on its own because each
+	# was missing from a previous wording of it. An operator reading this line
+	# is deciding whether to deploy a binary to every target they own, and a
+	# refusal that states part of the picture has made that decision while
+	# claiming to hand it over.
+	if printf '%s' "$ended" | grep_q "integrity check"; then ok=0; else ok=1; fi
+	fo_check "$sc" "the refusal says what THIS run needed the helper for" "$ok" \
+		"the refusal never names the integrity check, so it reads as a property of vmsync rather than of this run's own flags. The line was: $ended"
+
+	if printf '%s' "$ended" | grep_q -- "-no-checksum"; then ok=0; else ok=1; fi
+	fo_check "$sc" "and names the flag that syncs without it" "$ok" \
+		"the refusal never names -no-checksum, so it says a binary is required rather than that there is a way past. The line was: $ended"
+
+	ok=1
+	if printf '%s' "$ended" | grep_q -- "-compress" && printf '%s' "$ended" | grep_q -- "-netbuffer"; then ok=0; fi
+	fo_check "$sc" "and that -no-checksum does not cover the bridge flags" "$ok" \
+		"the refusal does not name both -compress and -netbuffer as refused on their own, so an operator finds that out by passing one and being refused again. The line was: $ended"
+
+	ok=1
+	if printf '%s' "$ended" | grep_q "unsupervised" && printf '%s' "$ended" | grep_q "unleased"; then ok=0; fi
+	fo_check "$sc" "and what a helperless sync gives up" "$ok" \
+		"the refusal does not name both the unsupervised target commands and the unleased run lock, so -no-checksum reads as free when it is the smaller of two costs. The line was: $ended"
+
+	# --- 29b: and the way past actually works -------------------------------
+	nobridge_sync "$sc" baseline -reinit -no-checksum -bridge-helper-path "$absent"
+	if bench_sync_ok; then ok=0; else ok=1; fi
+	fo_check "$sc" "-no-checksum syncs with no helper at all" "$ok" \
+		"exit=$RUN_RC with -no-checksum and no helper -- which is the configuration the refusal above tells an operator to use, so a failure here makes that refusal a dead end. $(log_reason "$RUN_LOG")$(bench_sync_hint)"
+
+	if [ "$ok" = 0 ]; then
+		if grep_q 'starting full pull backup' "$RUN_LOG"; then ok=0; else ok=1; fi
+		fo_check "$sc" "and really copied, rather than finding nothing to do" "$ok" \
+			"no 'starting full pull backup' in $RUN_LOG after -reinit, so the run reported success without taking the full copy a reinit asks for"
+
+		# ANNOUNCED, not silent, and this is the half that cannot be inferred
+		# from behaviour. Both degradations are invisible in their
+		# consequences -- a target command that wedges parks the run with no
+		# symptom on this side, and an unleased lock looks exactly like a
+		# leased one until this host dies -- so the log line is the only thing
+		# that lets anyone tell afterwards which kind of run it was.
+		if grep_q "UNSUPERVISED" "$RUN_LOG"; then ok=0; else ok=1; fi
+		fo_check "$sc" "and says its target commands are unsupervised" "$ok" \
+			"no UNSUPERVISED warning in $RUN_LOG, so a helperless run is indistinguishable afterwards from a supervised one"
+
+		if grep_q "run lock is NOT leased" "$RUN_LOG"; then ok=0; else ok=1; fi
+		fo_check "$sc" "and that its lock on the target is not leased" "$ok" \
+			"no 'run lock is NOT leased' warning in $RUN_LOG -- the line docs/RUNBOOK.md calls the inventory of hosts where a disaster costs two hours"
+
+		# --- 29c: the baseline is continuable -------------------------------
+		#
+		# A baseline nothing can extend is not a working sync, and exit 0 does
+		# not tell the two apart: the checkpoint that makes the next run
+		# incremental is written on the target by the same run that copies, so
+		# a helperless run that copied and failed to record would look
+		# identical here and diverge only on the run after.
+		nobridge_sync "$sc" incremental -no-checksum -bridge-helper-path "$absent"
+		if bench_sync_ok; then ok=0; else ok=1; fi
+		fo_check "$sc" "a second helperless sync succeeds too" "$ok" \
+			"exit=$RUN_RC on the second -no-checksum run against the same replica. $(log_reason "$RUN_LOG")$(bench_sync_hint)"
+
+		if [ "$ok" = 0 ]; then
+			if grep_q 'starting incremental pull backup' "$RUN_LOG"; then ok=0; else ok=1; fi
+			fo_check "$sc" "and continues the chain rather than copying again" "$ok" \
+				"the second helperless run was not incremental, so the first left no checkpoint the next could extend -- a helperless estate would re-copy every disk on every run while reporting success"
+		fi
+	fi
+
+	# --- 29d: -no-checksum must not silence supervision ---------------------
+	#
+	# THE MIRROR, and the reason vmsync's helper probe runs on every path
+	# instead of only when the check is on. Supervision has nothing to do with
+	# checksums, so an estate passing -no-checksum for speed must still be told
+	# its commands ARE supervised -- and the way that regresses is for
+	# -no-checksum to skip the probe and report the absence of an answer as a
+	# degradation, which would put the warning above on every run and make it
+	# mean nothing.
+	helper="$(bridge_helper_path)"
+	if ! ssh_host_cmd "$TARGET_HOST" "test -x '$helper'" >/dev/null 2>&1; then
+		log "   SKIP 29d: no executable $helper on $TARGET_HOST, so there is no supervised run to compare the helperless ones against. This rig IS the configuration 29a-c test."
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP no bridge helper on target"
+		return 0
+	fi
+	nobridge_sync "$sc" supervised -no-checksum
+	if bench_sync_ok; then ok=0; else ok=1; fi
+	fo_check "$sc" "-no-checksum with the helper present still syncs" "$ok" \
+		"exit=$RUN_RC with -no-checksum and a usable helper at $helper. $(log_reason "$RUN_LOG")$(bench_sync_hint)"
+
+	if [ "$ok" = 0 ]; then
+		if grep_q "UNSUPERVISED" "$RUN_LOG"; then ok=1; else ok=0; fi
+		fo_check "$sc" "and does not report itself unsupervised" "$ok" \
+			"$RUN_LOG warns UNSUPERVISED on a target that has a usable helper, so -no-checksum has switched the helper probe off and every such run now reports a degradation it does not have"
+	fi
+}
+
 stage_pattern() {
 	case "$1" in
 	# Anchored to the named sub-tests rather than a bare ^verify- , so a
@@ -13890,6 +14112,9 @@ stage_pattern() {
 	# cleanup rows belong to its own verdict: a stage that could not restore
 	# the fixture is a failure of this stage, not of whichever ran next.
 	ignore-disk) printf '^(ignore-disk|precondition|stood-down|cleanup)$' ;;
+	# Stage 29 stands down on two preconditions (no TARGET_HOST, and 29d on a
+	# target with no helper to compare against), and both belong to its verdict.
+	no-helper) printf '^(no-helper|precondition)$' ;;
 	supervise) printf '^(supervise|precondition)$' ;;
 	exclude) printf '^(exclude|precondition)$' ;;
 	*) printf '$^' ;; # matches nothing
@@ -13938,6 +14163,7 @@ stage_number() {
 	generation) printf '26' ;;
 	qmp-census) printf '27' ;;
 	ignore-disk) printf '28' ;;
+	no-helper) printf '29' ;;
 	*) printf '?' ;;
 	esac
 }
@@ -14637,6 +14863,17 @@ generate_report() {
                 else
                         section_no_rows_note ignore-disk "opt in with \`--stages ignore-disk\`; it attaches a RAW disk to the source domain, proves the sync is refused for it, then proves -ignore-disk and -drop-disk each let the run through with the replica's definition saying the right thing. Needs SOURCE_HOST and a shut-off target"
                 fi
+
+                echo
+                echo "## Stage 29: a target with no vmsync-bridge-helper"
+                echo
+                if awk -F, 'NR>1 && $1=="no-helper" { found=1 } END { exit !found }' "$CSV"; then
+                        echo "| result | check | exit | wall (s) | detail | log |"
+                        echo "|---|---|---|---|---|---|"
+                        awk -F, "$REPORT_AWK"'NR>1 && $1=="no-helper" { ph = $2; gsub(/_/, " ", ph); printf "| %s | %s | %s | %s | %s | %s |\n", verdict($9), ph, $3, $4, detail($9), runlog($1,$2,$4) }' "$CSV"
+                else
+                        section_no_rows_note no-helper "opt in with \`--stages no-helper\`; it points -bridge-helper-path at nothing and proves the refusal names its own way past, that -no-checksum then syncs and can be continued, that both degradations are announced, and that -no-checksum does NOT silence supervision on a target that does have the helper. Needs TARGET_HOST and a shut-off target"
+                fi
                 echo
                 echo "Full machine-readable data: \`results.csv\`. Per-run logs: \`logs/\`. Raw prometheus textfiles: \`prom/\`."
         } >"$report"
@@ -14716,6 +14953,7 @@ for s in "${stage_list[@]}"; do
         generation) stage_generation || stage_rc=$? ;;
         qmp-census) stage_qmp_census || stage_rc=$? ;;
         ignore-disk) stage_ignore_disk || stage_rc=$? ;;
+        no-helper) stage_no_helper || stage_rc=$? ;;
         supervise) stage_supervise || stage_rc=$? ;;
         exclude) stage_exclude || stage_rc=$? ;;
         *) die "unknown stage '$s' in --stages (want one of: $ALL_STAGES -- or the shorthands 'all' and 'all-but-matrix', which stand alone rather than inside a list)" ;;
