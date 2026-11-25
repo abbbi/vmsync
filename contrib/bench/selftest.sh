@@ -2319,6 +2319,105 @@ unset SOURCE_URI SOURCE_DOMAIN SOURCE_HOST SOURCE_LOCAL PROBE_MAY_STOP_SOURCE
 
 
 echo
+echo "=== stage 28's plant: saying why the attach failed, in C ==="
+
+# WHAT THIS SECTION IS FOR. A run stood down with the row "could not attach the
+# raw disk: erreur interne : Plus d'emplacements PCI disponibles" and nothing
+# else. Two separate defects produced that: the hint beside it was appended to
+# the warn only, so report.md -- the thing that survives the run -- carried a
+# translated libvirt string and no fix; and the only hint that existed matched
+# on *hotplug*, which that refusal is not and which no localized daemon would
+# have matched anyway. Both halves are pinned here.
+eval "$(extract "$BENCH" source_pcie_ports_full)"
+SOURCE_URI=stub
+SOURCE_DOMAIN=stub
+
+# The topology that produced the refusal, reduced to what decides it: root
+# ports at 1, 2 and 9, a pcie-to-pci-bridge at index 8 sitting ON root port 1,
+# and a device in every port.
+cat >"$WORK/pci-full.xml" <<'XML'
+<domain><devices>
+  <controller type='pci' index='0' model='pcie-root'/>
+  <controller type='pci' index='1' model='pcie-root-port'><address type='pci' bus='0x00' slot='0x02' function='0x0'/></controller>
+  <controller type='pci' index='2' model='pcie-root-port'><address type='pci' bus='0x00' slot='0x02' function='0x1'/></controller>
+  <controller type='pci' index='8' model='pcie-to-pci-bridge'><address type='pci' bus='0x01' slot='0x00' function='0x0'/></controller>
+  <controller type='pci' index='9' model='pcie-root-port'><address type='pci' bus='0x00' slot='0x02' function='0x7'/></controller>
+  <disk><target dev='vda' bus='virtio'/><address type='pci' bus='0x02' slot='0x00' function='0x0'/></disk>
+  <disk><target dev='vdb' bus='virtio'/><address type='pci' bus='0x09' slot='0x00' function='0x0'/></disk>
+</devices></domain>
+XML
+# The bench fixture's shape: two root ports, one spare. This is why the plant
+# works on the bench host and not on the one that reported the refusal.
+cat >"$WORK/pci-free.xml" <<'XML'
+<domain><devices>
+  <controller type='pci' index='0' model='pcie-root'/>
+  <controller type='pci' index='1' model='pcie-root-port'><address type='pci' bus='0x00' slot='0x01' function='0x0'/></controller>
+  <controller type='pci' index='2' model='pcie-root-port'><address type='pci' bus='0x00' slot='0x01' function='0x1'/></controller>
+  <disk><target dev='vda' bus='virtio'/><address type='pci' bus='0x01' slot='0x00' function='0x0'/></disk>
+</devices></domain>
+XML
+# THE ONE A COUNT GETS WRONG, which is the whole reason the function compares
+# bus numbers instead of counting controllers. vdb sits on 0x08 -- the bridge's
+# OWN bus, not a root port -- leaving root port 9 free. Three root ports and
+# three occupied buses would read "full" and send the operator to add a port
+# they already have.
+cat >"$WORK/pci-bridgebus.xml" <<'XML'
+<domain><devices>
+  <controller type='pci' index='0' model='pcie-root'/>
+  <controller type='pci' index='1' model='pcie-root-port'><address type='pci' bus='0x00' slot='0x02' function='0x0'/></controller>
+  <controller type='pci' index='2' model='pcie-root-port'><address type='pci' bus='0x00' slot='0x02' function='0x1'/></controller>
+  <controller type='pci' index='8' model='pcie-to-pci-bridge'><address type='pci' bus='0x01' slot='0x00' function='0x0'/></controller>
+  <controller type='pci' index='9' model='pcie-root-port'><address type='pci' bus='0x00' slot='0x02' function='0x7'/></controller>
+  <disk><target dev='vda' bus='virtio'/><address type='pci' bus='0x02' slot='0x00' function='0x0'/></disk>
+  <disk><target dev='vdb' bus='virtio'/><address type='pci' bus='0x08' slot='0x00' function='0x0'/></disk>
+</devices></domain>
+XML
+# i440fx, where a virtio disk goes on the legacy bus: claiming a full set here
+# would name a fix that has nothing to do with the refusal.
+cat >"$WORK/pci-noports.xml" <<'XML'
+<domain><devices>
+  <controller type='pci' index='0' model='pci-root'/>
+  <disk><target dev='vda' bus='virtio'/><address type='pci' bus='0x00' slot='0x05' function='0x0'/></disk>
+</devices></domain>
+XML
+# A virsh that exits 0 and prints nothing is not the same failure as a virsh
+# that exits non-zero, and the two guards that catch them are separate lines.
+: >"$WORK/pci-empty.xml"
+
+s28_pci_xml=""
+virsh_uri() { [ -n "$s28_pci_xml" ] && cat "$s28_pci_xml" || return 1; }
+s28_ports() {
+	local rc=0
+	s28_pci_xml="$1"
+	source_pcie_ports_full || rc=$?
+	echo "$rc"
+}
+
+check "every root port taken is a full set" 0 "$(s28_ports "$WORK/pci-full.xml")"
+check "one spare port is not" 1 "$(s28_ports "$WORK/pci-free.xml")"
+check "a device on the bridge's own bus fills no root port" 1 \
+	"$(s28_ports "$WORK/pci-bridgebus.xml")"
+check "and a domain with no root ports is not a full set either" 1 \
+	"$(s28_ports "$WORK/pci-noports.xml")"
+check "a virsh that fails says so rather than guessing" 2 "$(s28_ports "")"
+check "and so does one that exits 0 with an empty document" 2 \
+	"$(s28_ports "$WORK/pci-empty.xml")"
+
+s28_attach="$(extract "$BENCH" stage_ignore_disk | grep -v '^[[:space:]]*#')"
+# THE DEFECT THAT MADE THE ROW USELESS: the hint existed and went nowhere the
+# reader could find it afterwards.
+check "the hint reaches the row, not only the operator's scrollback" 1 \
+	"$(printf '%s' "$s28_attach" | grep -c 'could not attach the raw disk: \$attach_err\$attach_hint')"
+check "the slot answer comes from the topology, not from libvirt's prose" 1 \
+	"$(printf '%s' "$s28_attach" | grep -c 'if source_pcie_ports_full; then')"
+check "and the machine-type hint is still there for its own case" 1 \
+	"$(printf '%s' "$s28_attach" | grep -c '\*hotplug\*)')"
+
+unset -f virsh_uri source_pcie_ports_full s28_ports
+unset SOURCE_URI SOURCE_DOMAIN s28_pci_xml s28_attach
+
+
+echo
 echo "=== stage 29: syncing with no bridge helper on the target ==="
 
 # THE CLAIM THIS STAGE EXISTS FOR: vmsync is usable on an estate that has not

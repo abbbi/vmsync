@@ -1947,6 +1947,20 @@ removed and the **live** one is not, which is the document vmsync refuses on —
 and only a stop clears a live-only entry, because that document belongs to the
 running qemu.
 
+**A `q35` whose root ports are all taken fails too**, with *"No more available
+PCI slots"* — a different refusal from the machine-type one, and the one a
+fixture that has grown actually meets. A virtio disk is a PCIe device, so
+libvirt will only place it in a free `pcie-root-port`, never on a legacy PCI
+bus; an empty `pcie-to-pci-bridge` is no help, and root ports cannot be
+hot-added. The stage answers this from the **topology** and not from that
+message, because `libvirtd` formats its own errors in the daemon's locale — and
+a daemon with an idle timeout is restarted by whichever client next wakes it, so
+the language is not stable even on one host. The stand-down names the fix in the
+**row** as well as the log, since `report.md` is what survives the run: add
+another `<controller type='pci' model='pcie-root-port'/>` to the definition and
+cold-restart the domain, a guest reboot keeping the same qemu and not picking it
+up.
+
 **So it will not plant a disk the fixture cannot give back.** The source has to
 be running, since vmsync refuses an inactive one before it looks at any disk,
 and one of two things has to hold:

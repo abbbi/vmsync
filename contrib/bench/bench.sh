@@ -13437,6 +13437,49 @@ source_nonqcow_devs() {
 		tr ' ' '\n' | sed -n 's/.*dev="\([^"]*\)".*/\1/p'
 }
 
+# source_pcie_ports_full -> 0 when every pcie-root-port on the source already
+# has a device, 1 when at least one is free or the domain has none at all, 2
+# when the definition could not be read.
+#
+# Why it is asked: the plant is a virtio disk, which on q35 is a PCIe device,
+# and libvirt will only place one in a free pcie-root-port -- never on a legacy
+# PCI bus, so an empty pcie-to-pci-bridge is no help. Root ports come from the
+# definition and cannot be hot-added, which makes a full set a property of the
+# FIXTURE that no run can fix, and the one thing the operator has to be told.
+#
+# Read from the XML and not from libvirt's refusal, for the reason
+# domain_agent_channel gives: the daemon formats its own messages in its own
+# locale, so "No more available PCI slots" arrives in whatever language
+# libvirtd was started in -- and a daemon with an idle timeout is restarted by
+# whichever client next wakes it, so that language is not even stable per host.
+#
+# A pci controller's index IS the bus it provides, which is why this compares
+# rather than counts: one of those indices may be a pcie-to-pci-bridge, and a
+# device on ITS bus would make a count read one port too full.
+source_pcie_ports_full() {
+	local xml buses port seen=no
+	xml="$(virsh_uri "$SOURCE_URI" dumpxml "$SOURCE_DOMAIN" 2>/dev/null)" || return 2
+	[ -n "$xml" ] || return 2
+	# Space-padded on both sides so a case match cannot see 0x01 inside 0x010.
+	buses=" $(printf '%s' "$xml" |
+		{ xmllint --xpath "//address[@type='pci']/@bus" - 2>/dev/null || true; } |
+		tr ' ' '\n' | sed -n 's/.*bus="\([^"]*\)".*/\1/p' | tr '\n' ' ')"
+	for port in $(printf '%s' "$xml" |
+		{ xmllint --xpath "//controller[@type='pci'][@model='pcie-root-port']/@index" - 2>/dev/null || true; } |
+		tr ' ' '\n' | sed -n 's/.*index="\([^"]*\)".*/\1/p'); do
+		seen=yes
+		case "$buses" in
+		*" $(printf '0x%02x' "$port") "*) ;;
+		*) return 1 ;;
+		esac
+	done
+	# No root ports at all is not a full set: on i440fx a virtio disk goes on
+	# the legacy bus, so claiming the ports are full would name a fix that has
+	# nothing to do with that fixture's refusal.
+	[ "$seen" = yes ] || return 1
+	return 0
+}
+
 # source_disk_path DEV -> that disk's <source file> on the source domain.
 #
 # THE LIVE DOCUMENT, like source_qcow_devs and source_nonqcow_devs above, and
@@ -13570,9 +13613,23 @@ stage_ignore_disk() {
 		local attach_hint=""
 		case "$attach_err" in
 		*hotplug*) attach_hint=" -- this fixture's machine type has no bus that can take a disk while the domain runs; q35 with a free pcie-root-port can." ;;
+		*)
+			# The common q35 refusal, and the one the case above cannot catch:
+			# "no more available PCI slots" is not a hotplug-support error, and
+			# it is the daemon's own prose, so it arrives translated. Asked of
+			# the topology instead. Only rc 0 earns the hint -- rc 1 is a free
+			# port, rc 2 a definition that could not be read, and neither says
+			# the ports are the problem.
+			if source_pcie_ports_full; then
+				# No commas: results_row rewrites them as semicolons to keep
+				# the CSV field intact, which is why the hint above is written
+				# without any either.
+				attach_hint=" -- every pcie-root-port on $SOURCE_DOMAIN already has a device and a root port cannot be hot-added. A virtio disk therefore has nowhere to go: add another <controller type='pci' model='pcie-root-port'/> to its definition and cold-restart it (a guest reboot keeps the same qemu and will not pick it up)."
+			fi
+			;;
 		esac
 		warn "SKIP stage 28: could not attach $IGNORE_DISK_FILE to $SOURCE_DOMAIN as $dev: $attach_err$attach_hint"
-		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP could not attach the raw disk: $attach_err"
+		results_row "$CSV" "$sc" precondition "" "" "" "" "" "" "SKIP could not attach the raw disk: $attach_err$attach_hint"
 		run_shell_on "$SOURCE_HOST" "$SOURCE_LOCAL" "rm -f '$IGNORE_DISK_FILE'" >/dev/null 2>&1 || true
 		trap - EXIT
 		return 0
